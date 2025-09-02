@@ -740,10 +740,15 @@ async fn try_to_broadcast(
                 "PUT operation complete - initiating node is also target (broadcast_to empty, last hop)"
             );
 
-            // Handle subscription if requested (similar to SuccessfulPut handler)
+            // NOTE: We do NOT start a network subscription here when we're the target.
+            // Client subscriptions are handled independently through the WebSocket API
+            // and contract executor, not through the ring operations layer.
+            // See: https://github.com/freenet/freenet-core/issues/1782
             if subscribe {
-                tracing::debug!("Starting subscription request for initiating node as target");
-                super::start_subscription_request(op_manager, key, false, HashSet::new()).await;
+                tracing::debug!(
+                    "Subscription requested but not starting network subscription (we are the target). \
+                     Client subscriptions are handled through WebSocket/contract executor layer"
+                );
             }
 
             new_state = Some(PutState::Finished { key });
@@ -893,6 +898,30 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
 
     // Transition to AwaitingResponse state (similar to GET operation)
     let key = contract.key();
+
+    // ALWAYS cache locally first when initiating a PUT (per Nacho's requirement)
+    // "If you are doing a PUT, shouldn't we always be caching that locally no matter if is or not an optimal location?"
+    tracing::debug!(
+        tx = %id,
+        %key,
+        "Caching contract locally first (initiating node always caches)"
+    );
+
+    put_contract(
+        op_manager,
+        key,
+        value.clone(),
+        related_contracts.clone(),
+        &contract,
+    )
+    .await?;
+
+    tracing::debug!(
+        tx = %id,
+        %key,
+        "Successfully cached contract locally"
+    );
+
     put_op.state = Some(PutState::AwaitingResponse {
         key,
         upstream: None, // No upstream since we're initiating
@@ -901,7 +930,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         subscribe,
     });
 
-    // Create the initial RequestPut message to trigger the operation flow
+    // Create the initial RequestPut message to trigger the operation flow for network propagation
     let msg = PutMsg::RequestPut {
         id,
         contract,
@@ -912,7 +941,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
     };
 
     // Use notify_op_change to trigger the operation processing
-    // This will cause the operation to be processed through process_message
+    // This will cause the operation to be processed through process_message for network propagation
     op_manager
         .notify_op_change(NetMessage::from(msg), OpEnum::Put(put_op))
         .await?;
