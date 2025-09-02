@@ -171,8 +171,10 @@ impl Operation for PutOp {
                     };
 
                     let modified_value = if is_initiator {
-                        // Cache locally when initiating a PUT per Nacho's requirement:
-                        // "If you are doing a PUT, shouldn't we always be caching that locally"
+                        // Cache locally when initiating a PUT. This ensures:
+                        // 1. Nodes with no connections can still cache contracts
+                        // 2. Nodes that are the optimal location cache locally
+                        // 3. Initiators always have the data they're putting (per Nacho's requirement)
                         let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
 
                         // Always cache unless we're already seeding (to avoid duplicate work)
