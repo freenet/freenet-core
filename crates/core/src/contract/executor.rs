@@ -214,10 +214,13 @@ pub(crate) fn executor_channel(
     ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     ExecutorToEventLoopChannel<ExecutorHalve>,
 ) {
-    // todo: use sensible values for channel buf sizes based on number concurrent tasks running
-    // when we are able to suspend execution of a request while waiting for a callback
-    let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(10);
-    let (response_for_tx, response_for_rx) = mpsc::channel(10);
+    // Increased buffer size from 10 to 100 to handle CI resource constraints
+    // Research shows CI environments (2 cores) have different scheduling than local (8+ cores)
+    // Larger buffers prevent backpressure from causing sender drops
+    let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(100);
+    let (response_for_tx, response_for_rx) = mpsc::channel(100);
+
+    tracing::debug!("Created executor channels with buffer size 100");
 
     let listener_halve = ExecutorToEventLoopChannel {
         op_manager: op_manager.clone(),
@@ -290,12 +293,18 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
 
 impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
     pub async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+        tracing::trace!("Waiting to receive transaction from executor channel");
         let tx = self
             .end
             .waiting_for_op_rx
             .recv()
             .await
-            .ok_or(anyhow::anyhow!("channel closed"))?;
+            .ok_or_else(|| {
+                tracing::error!("Executor channel closed - all senders have been dropped");
+                tracing::error!("This typically happens when: 1) The executor task panicked/exited, 2) Network timeout cascaded to channel closure, 3) Resource constraints in CI");
+                anyhow::anyhow!("channel closed")
+            })?;
+        tracing::trace!("Successfully received transaction from executor channel");
         Ok(tx)
     }
 
