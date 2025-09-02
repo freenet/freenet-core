@@ -214,13 +214,14 @@ pub(crate) fn executor_channel(
     ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     ExecutorToEventLoopChannel<ExecutorHalve>,
 ) {
-    // Increased buffer size from 10 to 100 to handle CI resource constraints
-    // Research shows CI environments (2 cores) have different scheduling than local (8+ cores)
-    // Larger buffers prevent backpressure from causing sender drops
-    let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(100);
-    let (response_for_tx, response_for_rx) = mpsc::channel(100);
+    // Channel buffer size: These channels coordinate transaction IDs between executor and network listener.
+    // Size 10 should be sufficient as each operation quickly completes its coordination.
+    // If this backs up, it indicates a real problem with the consumer not processing messages.
+    // The CI failures were due to task exits (sender drops), not buffer exhaustion.
+    let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(10);
+    let (response_for_tx, response_for_rx) = mpsc::channel(10);
 
-    tracing::debug!("Created executor channels with buffer size 100");
+    tracing::debug!("Created executor channels with buffer size 10");
 
     let listener_halve = ExecutorToEventLoopChannel {
         op_manager: op_manager.clone(),
