@@ -166,35 +166,51 @@ impl Operation for PutOp {
                     // This ensures the initiating node has immediate access to the contract
                     // and prevents data loss if the network propagation fails
 
-                    // Always cache locally (should_seed = true) per Nacho's requirement:
-                    // "If you are doing a PUT, shouldn't we always be caching that locally"
-                    tracing::debug!(
-                        tx = %id,
-                        %key,
-                        peer = %sender.peer,
-                        "Caching contract locally in initiating node before propagation"
-                    );
+                    // Check if we're already seeding this contract
+                    let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
 
-                    // Put the contract locally first
-                    // IMPORTANT: Use the modified value returned from put_contract
-                    let modified_value = put_contract(
-                        op_manager,
-                        key,
-                        value.clone(),
-                        related_contracts.clone(),
-                        contract,
-                    )
-                    .await?;
+                    // Use the value as-is initially
+                    let modified_value = if !is_already_seeding {
+                        // Always cache locally (should_seed = true) per Nacho's requirement:
+                        // "If you are doing a PUT, shouldn't we always be caching that locally"
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            "Caching contract locally in initiating node before propagation"
+                        );
 
-                    // Mark as seeded locally (in case it wasn't already)
-                    op_manager.ring.seed_contract(key);
+                        // Put the contract locally first
+                        // IMPORTANT: Use the modified value returned from put_contract
+                        let result = put_contract(
+                            op_manager,
+                            key,
+                            value.clone(),
+                            related_contracts.clone(),
+                            contract,
+                        )
+                        .await?;
 
-                    tracing::debug!(
-                        tx = %id,
-                        %key,
-                        peer = %sender.peer,
-                        "Successfully cached contract locally before propagation"
-                    );
+                        // Mark as seeded locally
+                        op_manager.ring.seed_contract(key);
+
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            "Successfully cached contract locally before propagation"
+                        );
+
+                        result
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            "Contract already seeded locally, skipping local cache"
+                        );
+                        value.clone()
+                    };
 
                     // Create a SeekNode message to find the target node
                     // fixme: this node should filter out incoming redundant puts since is the one initiating the request
