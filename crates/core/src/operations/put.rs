@@ -162,12 +162,11 @@ impl Operation for PutOp {
                         target.peer
                     );
 
-                    // Always cache locally when initiating a PUT
-                    // This ensures the initiating node has immediate access to the contract
-                    // and prevents data loss if the network propagation fails
-
-                    // Always cache/update locally per Nacho's requirement:
+                    // Always cache/update locally when initiating a PUT per Nacho's requirement:
                     // "If you are doing a PUT, shouldn't we always be caching that locally"
+                    // This ensures the initiating node has immediate access to the contract
+                    // and handles both new PUTs and updates to existing contracts
+
                     let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
 
                     tracing::debug!(
@@ -175,10 +174,10 @@ impl Operation for PutOp {
                         %key,
                         peer = %sender.peer,
                         is_already_seeding,
-                        "Caching/updating contract locally in initiating node before propagation"
+                        "Processing PUT operation locally before propagation"
                     );
 
-                    // Put the contract locally first (creates new or updates existing)
+                    // Always put the contract locally (creates new or updates existing)
                     // IMPORTANT: Use the modified value returned from put_contract
                     let modified_value = put_contract(
                         op_manager,
@@ -189,14 +188,15 @@ impl Operation for PutOp {
                     )
                     .await?;
 
-                    // Mark as seeded locally if not already
+                    // Mark as seeded locally if not already seeding
+                    // This ensures we keep track of contracts we're caching
                     if !is_already_seeding {
                         op_manager.ring.seed_contract(key);
                         tracing::debug!(
                             tx = %id,
                             %key,
                             peer = %sender.peer,
-                            "Marked contract as seeded locally"
+                            "Marked contract as newly seeded locally"
                         );
                     }
 
@@ -204,7 +204,7 @@ impl Operation for PutOp {
                         tx = %id,
                         %key,
                         peer = %sender.peer,
-                        "Successfully cached/updated contract locally before propagation"
+                        "Successfully processed contract locally before propagation"
                     );
 
                     // Create a SeekNode message to find the target node
