@@ -173,19 +173,15 @@ impl Operation for PutOp {
                     let modified_value = if is_initiator {
                         // Cache locally when initiating a PUT per Nacho's requirement:
                         // "If you are doing a PUT, shouldn't we always be caching that locally"
-                        let should_seed = op_manager.ring.should_seed(&key);
                         let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
 
-                        // Cache locally if we're not already seeding OR if we're not the optimal location
+                        // Always cache unless we're already seeding (to avoid duplicate work)
                         // This ensures we always have it locally per Nacho's requirement
-                        let should_cache = !is_already_seeding || !should_seed;
-
-                        if should_cache {
+                        if !is_already_seeding {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
                                 peer = %sender.peer,
-                                should_seed,
                                 is_already_seeding,
                                 "Caching contract locally in initiating node"
                             );
@@ -219,7 +215,7 @@ impl Operation for PutOp {
                                 tx = %id,
                                 %key,
                                 peer = %sender.peer,
-                                "Already seeding at optimal location, using existing value"
+                                "Already seeding contract, skipping duplicate caching"
                             );
                             value.clone()
                         }
