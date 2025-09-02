@@ -229,6 +229,8 @@ pub(crate) fn executor_channel(
     // 2. Ensuring the executor task gets scheduled with higher priority
     // 3. Breaking up large operations to yield more frequently
     //
+    // See: https://github.com/freenet/freenet-core/issues/1790
+    //
     // This is a pragmatic mitigation for CI's resource constraints - in normal operation
     // these channels shouldn't back up as they only coordinate transaction IDs.
     let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(1000);
