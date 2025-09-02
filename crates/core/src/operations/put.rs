@@ -162,56 +162,73 @@ impl Operation for PutOp {
                         target.peer
                     );
 
-                    // Cache locally when initiating a PUT per Nacho's requirement:
-                    // "If you are doing a PUT, shouldn't we always be caching that locally"
-                    // We cache if: not already seeding OR not an optimal location
-                    let should_seed = op_manager.ring.should_seed(&key);
-                    let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
+                    // Check if we're the initiator of this PUT operation
+                    // We only cache locally when WE initiate the PUT, not when forwarding
+                    let is_initiator = match &self.state {
+                        Some(PutState::PrepareRequest { .. }) => true,
+                        Some(PutState::AwaitingResponse { upstream, .. }) => upstream.is_none(),
+                        _ => false,
+                    };
 
-                    // Cache locally if we're not already seeding OR if we're not the optimal location
-                    // This ensures we always have it locally per Nacho's requirement
-                    let should_cache = !is_already_seeding || !should_seed;
+                    let modified_value = if is_initiator {
+                        // Cache locally when initiating a PUT per Nacho's requirement:
+                        // "If you are doing a PUT, shouldn't we always be caching that locally"
+                        let should_seed = op_manager.ring.should_seed(&key);
+                        let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
 
-                    let modified_value = if should_cache {
-                        tracing::debug!(
-                            tx = %id,
-                            %key,
-                            peer = %sender.peer,
-                            should_seed,
-                            is_already_seeding,
-                            "Caching contract locally in initiating node"
-                        );
+                        // Cache locally if we're not already seeding OR if we're not the optimal location
+                        // This ensures we always have it locally per Nacho's requirement
+                        let should_cache = !is_already_seeding || !should_seed;
 
-                        // Put the contract locally
-                        // IMPORTANT: Use the modified value returned from put_contract
-                        let result = put_contract(
-                            op_manager,
-                            key,
-                            value.clone(),
-                            related_contracts.clone(),
-                            contract,
-                        )
-                        .await?;
+                        if should_cache {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                peer = %sender.peer,
+                                should_seed,
+                                is_already_seeding,
+                                "Caching contract locally in initiating node"
+                            );
 
-                        // Mark as seeded locally if not already
-                        if !is_already_seeding {
-                            op_manager.ring.seed_contract(key);
+                            // Put the contract locally
+                            // IMPORTANT: Use the modified value returned from put_contract
+                            let result = put_contract(
+                                op_manager,
+                                key,
+                                value.clone(),
+                                related_contracts.clone(),
+                                contract,
+                            )
+                            .await?;
+
+                            // Mark as seeded locally if not already
+                            if !is_already_seeding {
+                                op_manager.ring.seed_contract(key);
+                            }
+
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                peer = %sender.peer,
+                                "Successfully cached contract locally"
+                            );
+
+                            result
+                        } else {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                peer = %sender.peer,
+                                "Already seeding at optimal location, using existing value"
+                            );
+                            value.clone()
                         }
-
-                        tracing::debug!(
-                            tx = %id,
-                            %key,
-                            peer = %sender.peer,
-                            "Successfully cached contract locally"
-                        );
-
-                        result
                     } else {
                         tracing::debug!(
                             tx = %id,
                             %key,
                             peer = %sender.peer,
-                            "Already seeding at optimal location, using existing value"
+                            "Not initiator, skipping local caching"
                         );
                         value.clone()
                     };
