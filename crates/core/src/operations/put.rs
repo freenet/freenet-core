@@ -155,22 +155,23 @@ impl Operation for PutOp {
                     );
 
                     // Check if we're the initiator of this PUT operation
-                    // We only cache locally when WE initiate the PUT, not when forwarding
-                    let is_initiator = match &self.state {
+                    // We only cache locally when either WE initiate the PUT, or when forwarding just of the peer should be seeding
+                    let should_seed = match &self.state {
                         Some(PutState::PrepareRequest { .. }) => true,
-                        Some(PutState::AwaitingResponse { upstream, .. }) => upstream.is_none(),
-                        _ => false,
+                        Some(PutState::AwaitingResponse { upstream, .. }) => {
+                            upstream.is_none() || op_manager.ring.should_seed(&key)
+                        }
+                        _ => op_manager.ring.should_seed(&key),
                     };
 
-                    let modified_value = if is_initiator {
+                    let modified_value = if should_seed {
                         // Cache locally when initiating a PUT. This ensures:
                         // 1. Nodes with no connections can still cache contracts
                         // 2. Nodes that are the optimal location cache locally
-                        // 3. Initiators always have the data they're putting (per Nacho's requirement)
+                        // 3. Initiators always have the data they're putting
                         let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
 
                         // Always cache unless we're already seeding (to avoid duplicate work)
-                        // This ensures we always have it locally per Nacho's requirement
                         if !is_already_seeding {
                             tracing::debug!(
                                 tx = %id,
