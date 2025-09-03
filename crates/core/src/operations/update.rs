@@ -611,14 +611,12 @@ pub(crate) async fn request_update(
             .pop()
             .ok_or(OpError::RingError(RingError::NoLocation))?
     } else {
-        // Check if we have any other peers that can cache contracts
-        let closest = op_manager
+        // Find the best peer to send the update to
+        let remote_target = op_manager
             .ring
-            .closest_potentially_caching(key, [sender.peer.clone()].as_slice())
-            .into_iter()
-            .next();
+            .closest_potentially_caching(key, [sender.peer.clone()].as_slice());
 
-        if let Some(target) = closest {
+        if let Some(target) = remote_target {
             // Subscribe to the contract
             op_manager
                 .ring
@@ -627,28 +625,14 @@ pub(crate) async fn request_update(
 
             target
         } else {
-            // Check if we actually have any connected peers at all
-            let has_connections = op_manager.ring.connection_manager.num_connections() > 0;
+            // No remote peers available, handle locally
+            tracing::debug!(
+                "UPDATE: No remote peers available for contract {}, handling locally",
+                key
+            );
 
-            if has_connections {
-                // We have connections but no suitable peer for this contract
-                return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
-            } else {
-                // We truly have no peers, handle locally
-                tracing::debug!(
-                    "UPDATE: No peer connections available, handling contract {} locally",
-                    key
-                );
-
-                // If no other peers, we should be subscribed and handle locally
-                op_manager
-                    .ring
-                    .add_subscriber(key, sender.clone())
-                    .map_err(|_| RingError::NoCachingPeers(*key))?;
-
-                // Target ourselves
-                sender.clone()
-            }
+            // Target ourselves for the update
+            sender.clone()
         }
     };
 

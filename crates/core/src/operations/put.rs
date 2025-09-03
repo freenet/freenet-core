@@ -16,7 +16,7 @@ use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, Operat
 use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
-    contract::{ContractHandlerEvent, StoreResponse},
+    contract::ContractHandlerEvent,
     message::{InnerMessage, NetMessage, NetMessageV1, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation},
@@ -25,7 +25,6 @@ use crate::{
 pub(crate) struct PutOp {
     pub id: Transaction,
     state: Option<PutState>,
-    stats: Option<PutStats>,
 }
 
 impl PutOp {
@@ -76,10 +75,6 @@ impl PutOp {
     }
 }
 
-struct PutStats {
-    target: Option<PeerKeyLocation>,
-}
-
 impl IsOperationCompleted for PutOp {
     fn is_completed(&self) -> bool {
         matches!(self.state, Some(put::PutState::Finished { .. }))
@@ -116,7 +111,6 @@ impl Operation for PutOp {
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(PutState::ReceivedRequest),
-                        stats: None, // don't care for stats in the target peers
                         id: tx,
                     },
                     sender,
@@ -139,7 +133,6 @@ impl Operation for PutOp {
         Box::pin(async move {
             let return_msg;
             let new_state;
-            let stats = self.stats;
 
             match input {
                 PutMsg::RequestPut {
@@ -161,22 +154,36 @@ impl Operation for PutOp {
                         target.peer
                     );
 
-                    // Cache the contract locally BEFORE propagating to network
-                    // This ensures the initiating node has immediate access to the contract
-                    // and prevents data loss if the network propagation fails
-                    let should_seed = op_manager.ring.should_seed(&key);
-                    let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
+                    // Check if we're the initiator of this PUT operation
+                    // We only cache locally when either WE initiate the PUT, or when forwarding just of the peer should be seeding
+                    let should_seed = match &self.state {
+                        Some(PutState::PrepareRequest { .. }) => true,
+                        Some(PutState::AwaitingResponse { upstream, .. }) => {
+                            upstream.is_none() || op_manager.ring.should_seed(&key)
+                        }
+                        _ => op_manager.ring.should_seed(&key),
+                    };
 
-                    if should_seed && !is_already_seeding {
+                    let modified_value = if should_seed {
+                        // Cache locally when initiating a PUT. This ensures:
+                        // 1. Nodes with no connections can still cache contracts
+                        // 2. Nodes that are the optimal location cache locally
+                        // 3. Initiators always have the data they're putting (per Nacho's requirement)
+                        // 4. States are properly merged (Freenet states are commutative monoids)
+                        let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
+
                         tracing::debug!(
                             tx = %id,
                             %key,
                             peer = %sender.peer,
-                            "Caching contract locally in initiating node before propagation"
+                            is_already_seeding,
+                            "Processing local PUT in initiating node"
                         );
 
-                        // Put the contract locally first
-                        put_contract(
+                        // Always call put_contract to ensure proper state merging
+                        // Since Freenet states are commutative monoids, merging is always safe
+                        // and necessary to maintain consistency
+                        let result = put_contract(
                             op_manager,
                             key,
                             value.clone(),
@@ -185,16 +192,35 @@ impl Operation for PutOp {
                         )
                         .await?;
 
-                        // Mark as seeded locally
-                        op_manager.ring.seed_contract(key);
+                        // Mark as seeded locally if not already
+                        if !is_already_seeding {
+                            op_manager.ring.seed_contract(key);
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                peer = %sender.peer,
+                                "Marked contract as seeding locally"
+                            );
+                        }
 
                         tracing::debug!(
                             tx = %id,
                             %key,
                             peer = %sender.peer,
-                            "Successfully cached contract locally before propagation"
+                            was_already_seeding = is_already_seeding,
+                            "Successfully processed contract locally with merge"
                         );
-                    }
+
+                        result
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            "Not initiator, skipping local caching"
+                        );
+                        value.clone()
+                    };
 
                     // Create a SeekNode message to find the target node
                     // fixme: this node should filter out incoming redundant puts since is the one initiating the request
@@ -202,7 +228,7 @@ impl Operation for PutOp {
                         id: *id,
                         sender,
                         target: target.clone(),
-                        value: value.clone(),
+                        value: modified_value, // Use the modified value from put_contract
                         contract: contract.clone(),
                         related_contracts: related_contracts.clone(),
                         htl: *htl,
@@ -263,7 +289,9 @@ impl Operation for PutOp {
                         );
 
                         tracing::debug!(tx = %id, "Attempting contract value put");
-                        put_contract(
+                        // We don't need to capture the return value here since the value
+                        // has already been processed at the initiating node
+                        let _ = put_contract(
                             op_manager,
                             key,
                             value.clone(),
@@ -288,7 +316,7 @@ impl Operation for PutOp {
                             skip_list.insert(target.peer.clone());
                         }
 
-                        super::start_subscription_request(op_manager, key, false, skip_list).await;
+                        super::start_subscription_request(op_manager, key).await;
                         op_manager.ring.seed_contract(key);
 
                         true
@@ -498,13 +526,7 @@ impl Operation for PutOp {
                                 // TODO: Make put operation atomic by linking it to the completion of this subscription request.
                                 // Currently we can't link one transaction to another transaction's result, which would be needed
                                 // to make this fully atomic. This should be addressed in a future refactoring.
-                                super::start_subscription_request(
-                                    op_manager,
-                                    key,
-                                    false,
-                                    HashSet::new(),
-                                )
-                                .await;
+                                super::start_subscription_request(op_manager, key).await;
                             }
 
                             tracing::info!(
@@ -572,7 +594,7 @@ impl Operation for PutOp {
                     };
 
                     // Determine if this is the last hop and handle forwarding
-                    let (last_hop, new_skip_list) = if let Some(new_htl) = htl.checked_sub(1) {
+                    let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         // Create updated skip list
                         let mut new_skip_list = skip_list.clone();
                         new_skip_list.insert(sender.peer.clone());
@@ -589,10 +611,10 @@ impl Operation for PutOp {
                         )
                         .await;
 
-                        (put_here, new_skip_list)
+                        put_here
                     } else {
                         // Last hop, no more forwarding
-                        (true, skip_list.clone())
+                        true
                     };
 
                     // Handle subscription and local storage if this is the last hop
@@ -611,13 +633,7 @@ impl Operation for PutOp {
 
                         // Start subscription and handle dropped contracts
                         let (dropped_contract, old_subscribers) = {
-                            super::start_subscription_request(
-                                op_manager,
-                                key,
-                                true,
-                                new_skip_list.clone(),
-                            )
-                            .await;
+                            super::start_subscription_request(op_manager, key).await;
                             op_manager.ring.seed_contract(key)
                         };
 
@@ -675,7 +691,7 @@ impl Operation for PutOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, stats)
+            build_op_result(self.id, new_state, return_msg)
         })
     }
 }
@@ -701,12 +717,10 @@ fn build_op_result(
     id: Transaction,
     state: Option<PutState>,
     msg: Option<PutMsg>,
-    stats: Option<PutStats>,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|op| PutOp {
         id,
         state: Some(op),
-        stats,
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
@@ -727,6 +741,31 @@ async fn try_to_broadcast(
     let return_msg;
 
     match state {
+        // Handle initiating node that's also the target (single node or targeting self)
+        Some(PutState::AwaitingResponse {
+            upstream: None,
+            subscribe,
+            ..
+        }) if broadcast_to.is_empty() && last_hop => {
+            // We're the initiating node and the target - operation complete
+            tracing::debug!(
+                "PUT operation complete - initiating node is also target (broadcast_to empty, last hop)"
+            );
+
+            // NOTE: We do NOT start a network subscription here when we're the target.
+            // Client subscriptions are handled independently through the WebSocket API
+            // and contract executor, not through the ring operations layer.
+            // See: https://github.com/freenet/freenet-core/issues/1782
+            if subscribe {
+                tracing::debug!(
+                    "Subscription requested but not starting network subscription (we are the target). \
+                     Client subscriptions are handled through WebSocket/contract executor layer"
+                );
+            }
+
+            new_state = Some(PutState::Finished { key });
+            return_msg = None;
+        }
         Some(PutState::ReceivedRequest | PutState::BroadcastOngoing) => {
             if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
@@ -760,7 +799,6 @@ async fn try_to_broadcast(
                 let op = PutOp {
                     id,
                     state: new_state,
-                    stats: None,
                 };
                 op_manager
                     .notify_op_change(NetMessage::from(return_msg.unwrap()), OpEnum::Put(op))
@@ -803,11 +841,7 @@ pub(crate) fn start_op(
         subscribe,
     });
 
-    PutOp {
-        id,
-        state,
-        stats: Some(PutStats { target: None }),
-    }
+    PutOp { id, state }
 }
 
 pub enum PutState {
@@ -838,148 +872,68 @@ pub enum PutState {
 
 /// Request to insert/update a value into a contract.
 pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Result<(), OpError> {
-    let (key, ..) = if let Some(PutState::PrepareRequest { contract, .. }) = &put_op.state {
-        (contract.key(), contract.clone())
-    } else {
-        return Err(OpError::UnexpectedOpState);
-    };
-
-    let sender = op_manager.ring.connection_manager.own_location();
-
-    // Check if we have any other peers that can cache contracts
-    // If not, we should handle the PUT locally without the SeekNode dance
-    let target = op_manager
-        .ring
-        .closest_potentially_caching(&key, [&sender.peer].as_slice())
-        .into_iter()
-        .next();
-
-    // If no suitable target found, handle locally
-    if target.is_none() {
-        tracing::debug!(
-            "PUT: No other peers available to cache contract {}, handling locally",
-            key
-        );
-
-        // Store the contract locally
-        if let Some(PutState::PrepareRequest {
-            contract,
-            value,
-            related_contracts,
-            ..
-        }) = &put_op.state
-        {
-            // Check if contract already exists locally
-            let get_result = op_manager
-                .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                    key,
-                    return_contract_code: false,
-                })
-                .await;
-
-            let contract_exists = matches!(
-                get_result,
-                Ok(ContractHandlerEvent::GetResponse {
-                    response: Ok(StoreResponse { state: Some(_), .. }),
-                    ..
-                })
-            );
-
-            if contract_exists {
-                // Contract already exists, update it
-                tracing::debug!("Contract {} already exists locally, updating", key);
-                match op_manager
-                    .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
-                        key,
-                        data: UpdateData::State(value.clone().into()),
-                        related_contracts: related_contracts.clone(),
-                    })
-                    .await
-                {
-                    Ok(ContractHandlerEvent::UpdateResponse {
-                        new_value: Ok(_), ..
-                    }) => {
-                        tracing::debug!("Successfully updated existing contract {}", key);
-                    }
-                    Ok(ContractHandlerEvent::UpdateResponse {
-                        new_value: Err(err),
-                        ..
-                    }) => {
-                        tracing::error!("Failed to update existing contract {}: {}", key, err);
-                        return Err(OpError::from(err));
-                    }
-                    Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
-                        tracing::debug!("No change needed for contract {}", key);
-                    }
-                    Err(err) => return Err(err.into()),
-                    Ok(_) => return Err(OpError::UnexpectedOpState),
-                }
-            } else {
-                // New contract, use PutQuery which will handle it properly
-                tracing::debug!("Contract {} is new, storing locally", key);
-                put_contract(
-                    op_manager,
-                    key,
-                    value.clone(),
-                    related_contracts.clone(),
-                    contract,
-                )
-                .await?;
-            }
-
-            // Mark operation as successful
-            put_op.state = Some(PutState::Finished { key });
-            return Ok(());
-        } else {
-            return Err(OpError::UnexpectedOpState);
-        }
-    }
-
-    let target = target.unwrap();
-
-    tracing::debug!("PUT: Selected target {} for contract {}", target.peer, key);
-
-    let id = put_op.id;
-    if let Some(stats) = &mut put_op.stats {
-        stats.target = Some(target.clone());
-    }
-
-    match put_op.state {
+    // Process PrepareRequest state and transition to next state
+    let (id, contract, value, related_contracts, htl, subscribe, target) = match &put_op.state {
         Some(PutState::PrepareRequest {
             contract,
-            related_contracts,
             value,
+            related_contracts,
             htl,
             subscribe,
         }) => {
-            let new_state = Some(PutState::AwaitingResponse {
-                key,
-                upstream: None,
-                contract: contract.clone(),
-                state: value.clone(),
-                subscribe,
-            });
-            let msg = PutMsg::RequestPut {
-                id,
-                contract,
-                related_contracts,
-                value,
-                htl,
-                target: target.clone(),
-            };
+            let key = contract.key();
+            let own_location = op_manager.ring.connection_manager.own_location();
 
-            let op = PutOp {
-                id,
-                state: new_state,
-                stats: put_op.stats,
-            };
+            // Find the optimal target for this contract
+            let target = op_manager
+                .ring
+                .closest_potentially_caching(&key, [&own_location.peer].as_slice())
+                .unwrap_or(own_location); // If no other peers, target ourselves
 
-            op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Put(op))
-                .await?;
+            (
+                put_op.id,
+                contract.clone(),
+                value.clone(),
+                related_contracts.clone(),
+                *htl,
+                *subscribe,
+                target,
+            )
         }
-        _ => return Err(OpError::invalid_transition(put_op.id)),
-    }
+        _ => return Err(OpError::UnexpectedOpState),
+    };
+
+    // Transition to AwaitingResponse state (similar to GET operation)
+    let key = contract.key();
+
+    // Don't cache locally here - it will be cached in process_message when handling RequestPut
+    // Caching here synchronously blocks the network protocol and causes timing issues
+    // The caching happens in process_message lines 165-217 which runs asynchronously
+    let modified_value = value.clone();
+
+    put_op.state = Some(PutState::AwaitingResponse {
+        key,
+        upstream: None, // No upstream since we're initiating
+        contract: contract.clone(),
+        state: modified_value.clone(),
+        subscribe,
+    });
+
+    // Create the initial RequestPut message to trigger the operation flow for network propagation
+    let msg = PutMsg::RequestPut {
+        id,
+        contract,
+        related_contracts,
+        value: modified_value, // Use the modified value from put_contract
+        htl,
+        target,
+    };
+
+    // Use notify_op_change to trigger the operation processing
+    // This will cause the operation to be processed through process_message for network propagation
+    op_manager
+        .notify_op_change(NetMessage::from(msg), OpEnum::Put(put_op))
+        .await?;
 
     Ok(())
 }
@@ -1035,7 +989,7 @@ where
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
-    let forward_to = op_manager
+    let target_peer = op_manager
         .ring
         .closest_potentially_caching(&key, &skip_list);
     let own_pkloc = op_manager.ring.connection_manager.own_location();
@@ -1050,7 +1004,7 @@ where
         "Evaluating PUT forwarding decision"
     );
 
-    if let Some(peer) = forward_to {
+    if let Some(peer) = target_peer {
         let other_loc = peer.location.as_ref().expect("infallible");
         let other_distance = contract_loc.distance(other_loc);
         let self_distance = contract_loc.distance(own_loc);
@@ -1106,7 +1060,7 @@ where
         tracing::debug!(
             tx = %id,
             %key,
-            "No forward target found - this peer will store"
+            "No peers available for forwarding - caching locally"
         );
     }
     true

@@ -1,6 +1,6 @@
 #[cfg(debug_assertions)]
 use std::backtrace::Backtrace as StdTrace;
-use std::{collections::HashSet, pin::Pin, time::Duration};
+use std::{pin::Pin, time::Duration};
 
 use freenet_stdlib::prelude::ContractKey;
 use futures::Future;
@@ -307,27 +307,30 @@ impl<T> From<SendError<T>> for OpError {
 }
 
 /// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
-async fn start_subscription_request(
-    op_manager: &OpManager,
-    key: ContractKey,
-    try_get: bool,
-    skip_list: HashSet<PeerId>,
-) {
-    let sub_op = subscribe::start_op(key);
-    if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
-        if !try_get {
-            tracing::warn!(%error, "Error subscribing to contract");
+async fn start_subscription_request(op_manager: &OpManager, key: ContractKey) {
+    // Check if we are the optimal location for this contract
+    // If we are and no other peers are suitable, skip subscription for now
+    // TODO: In the future, still find next-best peers for redundancy (issue #1793)
+    let own_location = op_manager.ring.connection_manager.own_location();
+    let closest = op_manager
+        .ring
+        .closest_potentially_caching(&key, [&own_location.peer].as_slice());
+
+    if closest.is_none() {
+        // No other peers available for caching
+        // Check if we should be caching this locally
+        if op_manager.ring.should_seed(&key) {
+            tracing::debug!(
+                %key,
+                "Skipping subscription - node is optimal location and no other peers available"
+            );
             return;
         }
-        if let OpError::ContractError(ContractError::ContractNotFound(key)) = &error {
-            tracing::debug!(%key, "Contract not found, trying to get it first");
-            let get_op = get::start_op(*key, true, true);
-            if let Err(error) = get::request_get(op_manager, get_op, skip_list).await {
-                tracing::warn!(%error, "Error getting contract");
-            }
-        } else {
-            tracing::warn!(%error, "Error subscribing to contract");
-        }
+    }
+
+    let sub_op = subscribe::start_op(key);
+    if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
+        tracing::warn!(%error, "Error subscribing to contract");
     }
 }
 

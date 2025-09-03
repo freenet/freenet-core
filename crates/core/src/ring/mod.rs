@@ -28,6 +28,7 @@ use crate::message::TransactionType;
 use crate::topology::rate::Rate;
 use crate::topology::TopologyAdjustment;
 use crate::tracing::{NetEventLog, NetEventRegister};
+
 use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
@@ -246,7 +247,9 @@ impl Ring {
         filtered.into_iter()
     }
 
-    /// Return the most optimal peer caching a given contract.
+    /// Return the most optimal peer for caching a given contract.
+    ///
+    /// This function only considers connected peers, not the node itself.
     #[inline]
     pub fn closest_potentially_caching(
         &self,
@@ -254,7 +257,6 @@ impl Ring {
         skip_list: impl Contains<PeerId>,
     ) -> Option<PeerKeyLocation> {
         let router = self.router.read();
-
         self.connection_manager
             .routing(Location::from(contract_key), None, skip_list, &router)
     }

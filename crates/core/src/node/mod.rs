@@ -38,7 +38,7 @@ use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::{Address, GatewayConfig, WebsocketApiConfig},
     contract::{
-        Callback, ClientResponsesSender, ContractError, ExecutorError, ExecutorToEventLoopChannel,
+        Callback, ClientResponsesSender, ExecutorError, ExecutorToEventLoopChannel,
         NetworkContractHandler, WaitingTransaction,
     },
     local_node::Executor,
@@ -775,7 +775,6 @@ pub async fn subscribe(
     key: ContractKey,
     client_id: Option<ClientId>,
 ) -> Result<Transaction, OpError> {
-    const TIMEOUT: Duration = Duration::from_secs(30);
     let op = subscribe::start_op(key);
     let id = op.id;
     if let Some(client_id) = client_id {
@@ -791,59 +790,11 @@ pub async fn subscribe(
     }
     // Initialize a subscribe op.
     match subscribe::request_subscribe(&op_manager, op).await {
-        Err(OpError::ContractError(ContractError::ContractNotFound(key))) => {
-            tracing::info!(%key, "Trying to subscribe to a contract not present, requesting it first");
-            let get_op = get::start_op(key, true, false);
-            if let Err(error) = get::request_get(&op_manager, get_op, HashSet::new()).await {
-                tracing::error!(%key, %error, "Failed getting the contract while previously trying to subscribe; bailing");
-                return Err(error);
-            }
-        }
         Err(err) => {
             tracing::error!("{}", err);
-            return Err(err);
+            Err(err)
         }
-        Ok(()) => {
-            return Ok(id);
-        }
-    }
-
-    let timeout = tokio::time::timeout(TIMEOUT, async move {
-        loop {
-            // just start a new op to check if contract is present
-            let op = subscribe::start_op(key);
-            match subscribe::request_subscribe(&op_manager, op).await {
-                Err(OpError::ContractError(ContractError::ContractNotFound(_))) => {
-                    tracing::warn!("Still waiting for {key} contract");
-                    tokio::time::sleep(Duration::from_secs(2)).await
-                }
-                Err(error) => {
-                    tracing::error!(%key, %error, "Error while subscribing to contract");
-                    break Err(error);
-                }
-                Ok(()) => {
-                    tracing::debug!(%key,
-                        "Got back the missing contract while subscribing"
-                    );
-                    tracing::debug!(%key, "Starting subscribe request");
-                    break Ok(id);
-                }
-            }
-        }
-    });
-    match timeout.await {
-        Err(_) => {
-            tracing::error!(%key, "Timeout while waiting for contract to start subscription");
-            Err(OpError::OpNotPresent(id))
-        }
-        Ok(Err(error)) => {
-            tracing::error!(%key, %error, "Error while subscribing to contract");
-            Err(error)
-        }
-        Ok(Ok(op_id)) => {
-            tracing::debug!(%key, "Started subscription to contract");
-            Ok(op_id)
-        }
+        Ok(()) => Ok(id),
     }
 }
 
