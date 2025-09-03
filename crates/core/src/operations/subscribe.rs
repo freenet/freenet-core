@@ -66,16 +66,7 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // TODO: Handle local subscriptions properly
-        // Currently, if a contract is cached locally, subscriptions still go through
-        // the network protocol by finding a remote peer. This works but is inefficient.
-        // A proper implementation would handle local subscriptions without network messages.
-        // The challenge is ensuring clients get proper notification when subscribing locally.
-        // See: https://github.com/freenet/freenet-core/issues/1782
-
         // Find a remote peer to handle the subscription
-        // TODO: This is a workaround - subscriptions to locally cached contracts
-        // still go through the network protocol to find a remote peer
         const EMPTY: &[PeerId] = &[];
         let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
             Some(peer) => peer,
@@ -375,10 +366,6 @@ impl Operation for SubscribeOp {
                     target,
                     ..
                 } => match self.state {
-                    // LocalSubscription handling temporarily disabled - see TODO in request_subscribe
-                    // Some(SubscribeState::LocalSubscription { .. }) => {
-                    //     ...
-                    // }
                     Some(SubscribeState::AwaitingResponse {
                         upstream_subscriber,
                         ..
