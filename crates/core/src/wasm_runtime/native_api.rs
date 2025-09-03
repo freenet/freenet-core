@@ -1,8 +1,9 @@
 //! Implementation of native API's exported and available in the WASM modules.
 
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use wasmer::{Function, Imports};
+
+use std::sync::LazyLock;
 
 use super::runtime::InstanceInfo;
 
@@ -10,7 +11,8 @@ use super::runtime::InstanceInfo;
 ///
 /// A hackish way of having the information necessary to compute the address
 /// at which bytes must be written when calling host functions from the WASM modules.
-pub(super) static MEM_ADDR: Lazy<DashMap<InstanceId, InstanceInfo>> = Lazy::new(DashMap::default);
+pub(super) static MEM_ADDR: LazyLock<DashMap<InstanceId, InstanceInfo>> =
+    LazyLock::new(DashMap::default);
 
 type InstanceId = i64;
 

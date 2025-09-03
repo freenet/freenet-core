@@ -2,12 +2,11 @@
 use std::{
     collections::HashMap,
     io::Cursor,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
 use crossbeam::channel::{self, Receiver, Sender};
-use once_cell::sync::OnceCell;
 use rand::{prelude::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use tokio::sync::Mutex;
 
@@ -97,8 +96,8 @@ struct MessageOnTransit {
     data: Vec<u8>,
 }
 
-static NETWORK_WIRES: OnceCell<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
-    OnceCell::new();
+static NETWORK_WIRES: LazyLock<(Sender<MessageOnTransit>, Receiver<MessageOnTransit>)> =
+    LazyLock::new(crossbeam::channel::unbounded);
 
 #[derive(Clone, Debug)]
 struct InMemoryTransport {
@@ -112,7 +111,7 @@ struct InMemoryTransport {
 impl InMemoryTransport {
     fn new(interface_peer: PeerId, add_noise: bool) -> Self {
         let msg_stack_queue = Arc::new(Mutex::new(Vec::new()));
-        let (network_tx, network_rx) = NETWORK_WIRES.get_or_init(crossbeam::channel::unbounded);
+        let (network_tx, network_rx) = &*NETWORK_WIRES;
 
         // store messages incoming from the network in the msg stack
         let msg_stack_queue_cp = msg_stack_queue.clone();
