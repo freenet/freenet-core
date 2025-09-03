@@ -168,52 +168,50 @@ impl Operation for PutOp {
                         // Cache locally when initiating a PUT. This ensures:
                         // 1. Nodes with no connections can still cache contracts
                         // 2. Nodes that are the optimal location cache locally
-                        // 3. Initiators always have the data they're putting
+                        // 3. Initiators always have the data they're putting (per Nacho's requirement)
+                        // 4. States are properly merged (Freenet states are commutative monoids)
                         let is_already_seeding = op_manager.ring.is_seeding_contract(&key);
 
-                        // Always cache unless we're already seeding (to avoid duplicate work)
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            is_already_seeding,
+                            "Processing local PUT in initiating node"
+                        );
+
+                        // Always call put_contract to ensure proper state merging
+                        // Since Freenet states are commutative monoids, merging is always safe
+                        // and necessary to maintain consistency
+                        let result = put_contract(
+                            op_manager,
+                            key,
+                            value.clone(),
+                            related_contracts.clone(),
+                            contract,
+                        )
+                        .await?;
+
+                        // Mark as seeded locally if not already
                         if !is_already_seeding {
+                            op_manager.ring.seed_contract(key);
                             tracing::debug!(
                                 tx = %id,
                                 %key,
                                 peer = %sender.peer,
-                                is_already_seeding,
-                                "Caching contract locally in initiating node"
+                                "Marked contract as seeding locally"
                             );
-
-                            // Put the contract locally
-                            // IMPORTANT: Use the modified value returned from put_contract
-                            let result = put_contract(
-                                op_manager,
-                                key,
-                                value.clone(),
-                                related_contracts.clone(),
-                                contract,
-                            )
-                            .await?;
-
-                            // Mark as seeded locally if not already
-                            if !is_already_seeding {
-                                op_manager.ring.seed_contract(key);
-                            }
-
-                            tracing::debug!(
-                                tx = %id,
-                                %key,
-                                peer = %sender.peer,
-                                "Successfully cached contract locally"
-                            );
-
-                            result
-                        } else {
-                            tracing::debug!(
-                                tx = %id,
-                                %key,
-                                peer = %sender.peer,
-                                "Already seeding contract, skipping duplicate caching"
-                            );
-                            value.clone()
                         }
+
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            was_already_seeding = is_already_seeding,
+                            "Successfully processed contract locally with merge"
+                        );
+
+                        result
                     } else {
                         tracing::debug!(
                             tx = %id,
