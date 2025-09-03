@@ -38,6 +38,7 @@ pub struct BaseConfig {
 
 #[derive(clap::Subcommand, Clone)]
 pub enum SubCommand {
+    Init(InitPackageConfig),
     New(NewPackageConfig),
     Build(BuildToolConfig),
     Inspect(crate::inspect::InspectConfig),
@@ -146,7 +147,9 @@ pub struct BuildToolConfig {
     #[arg(long, value_enum, default_value_t=PackageType::default())]
     pub(crate) package_type: PackageType,
 
-    /// Compile in debug mode instead of release.
+    /// Compile in debug mode instead of release. Warning: Debug mode produces WASM files that are
+    /// typically 40-50x larger than release mode (e.g., 10MB vs 200KB), which may exceed WebSocket
+    /// message size limits and cause deployment failures. Use only for development and debugging.
     #[arg(long)]
     pub(crate) debug: bool,
 }
@@ -191,11 +194,31 @@ fn parse_version(src: &str) -> Result<Version, String> {
     Version::parse(src).map_err(|e| e.to_string())
 }
 
+/// Initialize a new Freenet contract and/or app in the CWD by default.
+#[derive(clap::Parser, Clone)]
+pub struct InitPackageConfig {
+    #[arg(id = "type", value_enum)]
+    pub(crate) kind: ContractKind,
+    #[arg(short, long, value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
+    pub(crate) path: Option<PathBuf>,
+}
+
+impl From<NewPackageConfig> for InitPackageConfig {
+    fn from(NewPackageConfig { kind, path }: NewPackageConfig) -> Self {
+        Self {
+            kind,
+            path: path.into(),
+        }
+    }
+}
+
 /// Create a new Freenet contract and/or app.
 #[derive(clap::Parser, Clone)]
 pub struct NewPackageConfig {
     #[arg(id = "type", value_enum)]
     pub(crate) kind: ContractKind,
+    #[arg(value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
+    pub(crate) path: PathBuf,
 }
 
 #[derive(clap::ValueEnum, Clone)]

@@ -166,24 +166,20 @@ async fn test_small_network_get_failure() -> TestResult {
         // or make the maintenance interval configurable for tests.
 
         // Connect to gateway first
-        let uri_gw = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            _ws_api_port_gw
-        );
+        let uri_gw =
+            format!("ws://127.0.0.1:{_ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
         let (stream_gw, _) = connect_async(&uri_gw).await?;
         let mut client_gw = WebApi::start(stream_gw);
 
         // Connect to nodes
         let uri_node1 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node1
+            "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
         let (stream_node1, _) = connect_async(&uri_node1).await?;
         let mut client_node1 = WebApi::start(stream_node1);
 
         let uri_node2 = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node2
+            "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
         let (stream_node2, _) = connect_async(&uri_node2).await?;
         let mut client_node2 = WebApi::start(stream_node2);
@@ -229,11 +225,11 @@ async fn test_small_network_get_failure() -> TestResult {
                 println!("✅ Node1 successfully published contract");
             }
             Ok(Ok(resp)) => {
-                println!("Got unexpected response: {:?}", resp);
+                println!("Got unexpected response: {resp:?}");
                 // Continue anyway - maybe the contract is already there
             }
             Ok(Err(e)) => {
-                println!("Error receiving put response: {:?}", e);
+                println!("Error receiving put response: {e:?}");
                 return Err(anyhow!("Failed to get put response - error: {}", e));
             }
             Err(_) => {
@@ -292,7 +288,7 @@ async fn test_small_network_get_failure() -> TestResult {
         // Now Node2 tries to GET the contract
         let get_start = std::time::Instant::now();
         println!("📥 Node2 attempting to GET the contract...");
-        println!("   Contract key: {}", contract_key);
+        println!("   Contract key: {contract_key}");
 
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -334,7 +330,7 @@ async fn test_small_network_get_failure() -> TestResult {
                 return Err(anyhow!("Unexpected response type"));
             }
             Ok(Err(e)) => {
-                println!("❌ Error during get: {}", e);
+                println!("❌ Error during get: {e}");
                 return Err(anyhow!("Get operation failed: {}", e));
             }
             Err(_) => {
@@ -372,11 +368,11 @@ async fn test_small_network_get_failure() -> TestResult {
                 }
             }
             Ok(Ok(resp)) => {
-                println!("Got unexpected response: {:?}", resp);
+                println!("Got unexpected response: {resp:?}");
                 return Err(anyhow!("Unexpected response type"));
             }
             Ok(Err(e)) => {
-                println!("❌ Error during second get: {}", e);
+                println!("❌ Error during second get: {e}");
                 return Err(anyhow!("Second GET operation failed: {}", e));
             }
             Err(_) => {

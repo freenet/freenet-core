@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 jobs:
   test_all:
@@ -41,10 +42,9 @@ jobs:
 
       - name: Build
         run: |
-          cargo install --locked --force --path ./crates/core
-          cargo install --locked --force --path ./crates/fdev
-          make -C apps/freenet-ping -f run-ping.mk build
           cargo build --locked
+          export PATH="$PWD/target/debug:$PATH"
+          make -C apps/freenet-ping -f run-ping.mk build
 
       - name: Test - features
         run: cargo test --workspace ${{ matrix.args }}
@@ -79,7 +79,8 @@ jobs:
 
       - name: Build
         run: |
-          cargo install --locked --force --path ../../crates/fdev
+          cargo build --locked --bin fdev --manifest-path ../../crates/fdev/Cargo.toml
+          export PATH="$PWD/../../target/debug:$PATH"
           make -f run-ping.mk build
         working-directory: apps/freenet-ping
 

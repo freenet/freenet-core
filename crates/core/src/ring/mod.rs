@@ -265,9 +265,22 @@ impl Ring {
         contract_key: &ContractKey,
         skip_list: impl Contains<PeerId> + Clone,
         k: usize,
+        include_self: bool,
     ) -> Vec<PeerKeyLocation> {
         let router = self.router.read();
         let target_location = Location::from(contract_key);
+
+        // Get own location if we should include self
+        let own_loc = if include_self {
+            let loc = self.connection_manager.own_location();
+            if !skip_list.has_element(loc.peer.clone()) {
+                Some(loc)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Get all connected peers through the connection manager
         let connections = self.connection_manager.get_connections_by_location();
@@ -277,8 +290,15 @@ impl Ring {
             (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
         });
 
+        // Chain own location if it should be included
+        let all_peers: Vec<PeerKeyLocation> = if let Some(ref own) = own_loc {
+            peers.chain(std::iter::once(own)).cloned().collect()
+        } else {
+            peers.cloned().collect()
+        };
+
         router
-            .select_k_best_peers(peers, target_location, k)
+            .select_k_best_peers(all_peers.iter(), target_location, k)
             .into_iter()
             .cloned()
             .collect()
@@ -304,7 +324,7 @@ impl Ring {
     pub fn subscribers_of(
         &self,
         contract: &ContractKey,
-    ) -> Option<DmRef<ContractKey, Vec<PeerKeyLocation>>> {
+    ) -> Option<DmRef<'_, ContractKey, Vec<PeerKeyLocation>>> {
         self.seeding_manager.subscribers_of(contract)
     }
 

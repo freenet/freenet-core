@@ -20,7 +20,7 @@ pub(crate) struct UpdateOp {
 }
 
 impl UpdateOp {
-    pub fn outcome(&self) -> OpOutcome {
+    pub fn outcome(&self) -> OpOutcome<'_> {
         OpOutcome::Irrelevant
     }
 
@@ -30,6 +30,12 @@ impl UpdateOp {
 
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(UpdateState::Finished { key, summary }) = &self.state {
+            tracing::debug!(
+                "Creating UpdateResponse for transaction {} with key {} and summary length {}",
+                self.id,
+                key,
+                summary.size()
+            );
             Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::UpdateResponse {
                     key: *key,
@@ -37,6 +43,11 @@ impl UpdateOp {
                 },
             ))
         } else {
+            tracing::error!(
+                "UPDATE operation {} failed to finish successfully, current state: {:?}",
+                self.id,
+                self.state
+            );
             Err(ErrorKind::OperationError {
                 cause: "update didn't finish successfully".into(),
             }
@@ -133,7 +144,7 @@ impl Operation for UpdateOp {
                     let sender = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!(
-                        "Requesting update for contract {} from {} to {}",
+                        "UPDATE RequestUpdate: forwarding update for contract {} from {} to {}",
                         key,
                         sender.peer,
                         target.peer
@@ -159,20 +170,27 @@ impl Operation for UpdateOp {
                     target,
                     sender,
                 } => {
-                    let is_subscribed_contract = op_manager.ring.is_seeding_contract(key);
+                    // Check if we're seeding or subscribed to this contract
+                    let is_seeding = op_manager.ring.is_seeding_contract(key);
+                    let has_subscribers = op_manager.ring.subscribers_of(key).is_some();
+                    let should_handle_update = is_seeding || has_subscribers;
 
                     tracing::debug!(
                         tx = %id,
                         %key,
                         target = %target.peer,
                         sender = %sender.peer,
+                        is_seeding = %is_seeding,
+                        has_subscribers = %has_subscribers,
                         "Updating contract at target peer",
                     );
 
                     let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
 
-                    if is_subscribed_contract {
-                        tracing::debug!("Peer is subscribed to contract. About to update it");
+                    if should_handle_update {
+                        tracing::debug!(
+                            "Peer is seeding or has subscribers for contract. About to update it"
+                        );
                         update_contract(op_manager, *key, value.clone(), related_contracts.clone())
                             .await?;
                         tracing::debug!(
@@ -182,7 +200,7 @@ impl Operation for UpdateOp {
                             target.location
                         );
                     } else {
-                        tracing::debug!("contract not found in this peer. Should throw an error");
+                        tracing::debug!("contract not found in this peer (not seeding and no subscribers). Should throw an error");
                         return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
                     }
 
@@ -332,14 +350,25 @@ impl Operation for UpdateOp {
                                 tx = %id,
                                 %key,
                                 this_peer = ?op_manager.ring.connection_manager.get_peer_key(),
+                                ?upstream,
                                 "Peer completed contract value update - SuccessfulUpdate",
                             );
 
+                            tracing::debug!(
+                                "UPDATE operation {} transitioning to Finished state for key {} with summary length {}",
+                                id,
+                                key,
+                                summary.size()
+                            );
                             new_state = Some(UpdateState::Finished {
                                 key,
                                 summary: summary.clone(),
                             });
                             if let Some(upstream) = upstream {
+                                tracing::debug!(
+                                    "UPDATE: Sending SuccessfulUpdate to upstream peer {:?}",
+                                    upstream
+                                );
                                 return_msg = Some(UpdateMsg::SuccessfulUpdate {
                                     id: *id,
                                     target: upstream,
@@ -348,9 +377,23 @@ impl Operation for UpdateOp {
                                     sender: op_manager.ring.connection_manager.own_location(),
                                 });
                             } else {
-                                // this means op finalized
+                                // Operation originated locally (no upstream peer)
+                                // The operation is complete - the framework will notify any waiting clients
+                                tracing::debug!(
+                                    "UPDATE: Operation {} completed successfully (originated locally)",
+                                    id
+                                );
                                 return_msg = None;
                             }
+                        }
+                        Some(UpdateState::ReceivedRequest) => {
+                            // This is the target node that processed the update
+                            // It should have already sent the response, this shouldn't happen
+                            tracing::error!(
+                                tx = %id,
+                                "UPDATE: Unexpected SuccessfulUpdate in ReceivedRequest state",
+                            );
+                            return Err(OpError::invalid_transition(self.id));
                         }
                         _ => {
                             tracing::error!(
@@ -568,19 +611,45 @@ pub(crate) async fn request_update(
             .pop()
             .ok_or(OpError::RingError(RingError::NoLocation))?
     } else {
+        // Check if we have any other peers that can cache contracts
         let closest = op_manager
             .ring
             .closest_potentially_caching(key, [sender.peer.clone()].as_slice())
             .into_iter()
-            .next()
-            .ok_or_else(|| RingError::EmptyRing)?;
+            .next();
 
-        op_manager
-            .ring
-            .add_subscriber(key, sender)
-            .map_err(|_| RingError::NoCachingPeers(*key))?;
+        if let Some(target) = closest {
+            // Subscribe to the contract
+            op_manager
+                .ring
+                .add_subscriber(key, sender)
+                .map_err(|_| RingError::NoCachingPeers(*key))?;
 
-        closest
+            target
+        } else {
+            // Check if we actually have any connected peers at all
+            let has_connections = op_manager.ring.connection_manager.num_connections() > 0;
+
+            if has_connections {
+                // We have connections but no suitable peer for this contract
+                return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
+            } else {
+                // We truly have no peers, handle locally
+                tracing::debug!(
+                    "UPDATE: No peer connections available, handling contract {} locally",
+                    key
+                );
+
+                // If no other peers, we should be subscribed and handle locally
+                op_manager
+                    .ring
+                    .add_subscriber(key, sender.clone())
+                    .map_err(|_| RingError::NoCachingPeers(*key))?;
+
+                // Target ourselves
+                sender.clone()
+            }
+        }
     };
 
     let id = update_op.id;

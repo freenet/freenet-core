@@ -19,7 +19,7 @@ use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::{
     collections::HashSet,
     io,
@@ -36,12 +36,11 @@ use serde::{Deserialize, Serialize};
 
 const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
 
-pub static RNG: once_cell::sync::Lazy<Mutex<rand::rngs::StdRng>> =
-    once_cell::sync::Lazy::new(|| {
-        Mutex::new(rand::rngs::StdRng::from_seed(
-            *b"0102030405060708090a0b0c0d0e0f10",
-        ))
-    });
+pub static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
+    Mutex::new(rand::rngs::StdRng::from_seed(
+        *b"0102030405060708090a0b0c0d0e0f10",
+    ))
+});
 
 #[derive(Debug)]
 pub struct PresetConfig {
@@ -174,10 +173,7 @@ const WASM_FILE_NAME: &str = "freenet-ping-contract";
 pub const APP_TAG: &str = "ping-app";
 
 pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
-    let uri = format!(
-        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-        ws_port
-    );
+    let uri = format!("ws://127.0.0.1:{ws_port}/v1/contract/command?encodingProtocol=native");
     let (stream, _) = connect_async(&uri).await?;
     Ok(WebApi::start(stream))
 }
@@ -334,7 +330,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
         let reader = std::io::BufReader::new(c_stderr);
         for line in reader.lines() {
             let line = line?;
-            writeln!(stderr, "{}", line)?;
+            writeln!(stderr, "{line}")?;
         }
         Ok(())
     };
@@ -345,7 +341,7 @@ pub(crate) fn pipe_std_streams(mut child: Child) -> anyhow::Result<()> {
         let reader = std::io::BufReader::new(c_stdout);
         for line in reader.lines() {
             let line = line?;
-            writeln!(stdout, "{}", line)?;
+            writeln!(stdout, "{line}")?;
         }
         Ok(())
     };

@@ -1,10 +1,12 @@
 use std::hash::Hasher;
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{LazyCell, RefCell},
+    rc::Rc,
+};
 
 use dioxus::prelude::*;
 use freenet_stdlib::prelude::ContractKey;
 use identity_management::IdentityManagement;
-use once_cell::unsync::Lazy;
 use rand::rngs::OsRng;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};
 
@@ -34,8 +36,8 @@ fn login_header(cx: Scope) -> Element {
 }
 
 thread_local! {
-    static ALIASES: Lazy<Rc<RefCell<Vec<Identity >>>> = Lazy::new(|| {
-        Rc::new(RefCell::new(Vec::default()))
+    static ALIASES: LazyCell<Rc<RefCell<Vec<Identity>>>> = LazyCell::new(|| {
+        Default::default()
     });
 }
 
@@ -129,7 +131,7 @@ impl Identity {
 
     pub(crate) fn get_alias(alias: impl AsRef<str>) -> Option<Identity> {
         let alias = alias.as_ref();
-        ALIASES.with(|aliases: &Lazy<Rc<RefCell<Vec<Identity>>>>| {
+        ALIASES.with(|aliases: &LazyCell<Rc<RefCell<Vec<Identity>>>>| {
             let aliases = &*aliases.borrow();
             aliases.iter().find(|a| &*a.alias == alias).cloned()
         })

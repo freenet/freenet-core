@@ -166,7 +166,7 @@ pub trait ClientEventsProxy {
         &mut self,
         id: ClientId,
         response: Result<HostResponse, ClientError>,
-    ) -> BoxFuture<Result<(), ClientError>>;
+    ) -> BoxFuture<'_, Result<(), ClientError>>;
 }
 
 /// Process client events.
@@ -434,26 +434,28 @@ async fn process_open_request(
                             ?data,
                             "Starting update op",
                         );
-                        let new_state = match op_manager
+                        let update_response = op_manager
                             .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
                                 key,
                                 data,
                                 related_contracts: related_contracts.clone(),
                             })
-                            .await
-                        {
-                            Ok(ContractHandlerEvent::UpdateResponse {
+                            .await?;
+
+                        let new_state = match update_response {
+                            ContractHandlerEvent::UpdateResponse {
                                 new_value: Ok(new_val),
-                            }) => Ok(new_val),
-                            Ok(ContractHandlerEvent::UpdateResponse {
+                            } => Ok(new_val),
+                            ContractHandlerEvent::UpdateResponse {
                                 new_value: Err(err),
-                            }) => Err(OpError::from(err)),
-                            Ok(ContractHandlerEvent::UpdateNoChange { key }) => {
-                                tracing::debug!(%key, "update with no change, do not start op");
-                                return Ok(None);
+                            } => Err(OpError::from(err)),
+                            ContractHandlerEvent::UpdateNoChange { key } => {
+                                // This should not happen anymore since we now return UpdateResponse
+                                // from the contract handler even for NoChange cases
+                                tracing::warn!(%key, "Unexpected UpdateNoChange event - this should have been converted to UpdateResponse");
+                                return Err(OpError::UnexpectedOpState.into());
                             }
-                            Err(err) => Err(err.into()),
-                            Ok(_) => Err(OpError::UnexpectedOpState),
+                            _ => return Err(OpError::UnexpectedOpState.into()),
                         }
                         .inspect_err(|err| tracing::error!(%key, "update query failed: {}", err))?;
 
@@ -862,7 +864,7 @@ pub(crate) mod test {
             self.events_to_gen.extend(events)
         }
 
-        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest> {
+        fn generate_deterministic_event(&mut self, id: &EventId) -> Option<ClientRequest<'_>> {
             self.events_to_gen.remove(id)
         }
     }

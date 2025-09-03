@@ -1,3 +1,4 @@
+use bytesize::ByteSize;
 use freenet::server::WebApp;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -102,13 +103,19 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyho
     };
 
     let package_type = cli_config.package_type;
-    println!("Compiling {package_type} with rust");
+    tracing::info!("Compiling {package_type} with rust, args: {:?}", cmd_args);
 
     // Set CARGO_TARGET_DIR if not already set to ensure consistent output location
     let mut command = Command::new("cargo");
     if env::var("CARGO_TARGET_DIR").is_err() {
         command.env("CARGO_TARGET_DIR", get_workspace_target_dir());
     }
+
+    tracing::info!(
+        command = ?"cargo",
+        args = ?cmd_args,
+        "Executing cargo command"
+    );
 
     let child = command
         .args(&cmd_args)
@@ -186,7 +193,7 @@ mod contract {
                 build_web_state(&config, embedded, cwd)?
             }
             ContractType::Standard => {
-                println!("Packaging generic contract type");
+                tracing::warn!("Packaging generic contract type");
                 build_generic_state(&mut config, cwd)?
             }
         }
@@ -425,13 +432,20 @@ mod contract {
             .map(Ok)
             .unwrap_or_else(|| get_default_ouput_dir(cwd).map(|p| p.join(DEFAULT_OUTPUT_NAME)))?;
 
-        println!("Bundling contract state");
+        tracing::info!("Bundling contract state");
         let state: PathBuf = (sources.len() == 1)
             .then(|| sources.pop().unwrap())
             .ok_or_else(|| Error::MissConfiguration(REQ_ONE_FILE_ERR.into()))?
             .into();
-        std::fs::copy(cwd.join(state), output_path)?;
-        println!("Finished bundling state");
+        let src_path = cwd.join(&state);
+        let bytes_written = std::fs::copy(&src_path, &output_path)?;
+        let human_size = bytesize::ByteSize(bytes_written).to_string();
+        tracing::info!(
+            path = ?output_path,
+            human_size = %human_size,
+            "Wrote contract state file"
+        );
+        tracing::info!("Finished bundling state");
         Ok(())
     }
 
@@ -483,8 +497,40 @@ mod contract {
                     get_default_ouput_dir(cwd)?.join(package_name)
                 };
                 let output = get_versioned_contract(&output_lib, cli_config)?;
-                let mut file = File::create(out_file)?;
+                let mut file = File::create(&out_file)?;
                 file.write_all(output.as_slice())?;
+                let size = output.len();
+                let human_size = ByteSize(size as u64).to_string();
+
+                // Warn about large contract sizes
+                const WARN_SIZE: usize = 5 * 1024 * 1024; // 5MB
+                const ERROR_SIZE: usize = 10 * 1024 * 1024; // 10MB
+
+                if size > ERROR_SIZE {
+                    tracing::error!(
+                        path = ?out_file,
+                        size = %human_size,
+                        "Contract size exceeds 10MB! This may cause issues with WebSocket transmission (16MB limit). Consider building in release mode with --release flag."
+                    );
+                    if cli_config.debug {
+                        tracing::warn!("Contract was built in debug mode. Release mode typically reduces size by 40-50x.");
+                    }
+                } else if size > WARN_SIZE {
+                    tracing::warn!(
+                        path = ?out_file,
+                        size = %human_size,
+                        "Contract size exceeds 5MB. Consider optimizing or building in release mode if not already."
+                    );
+                    if cli_config.debug {
+                        tracing::info!("Contract was built in debug mode. Use --release flag for smaller size.");
+                    }
+                } else {
+                    tracing::info!(
+                        path = ?out_file,
+                        size = %human_size,
+                        "Wrote contract output file"
+                    );
+                }
             }
             None => println!("no lang specified, skipping contract compilation"),
         }
@@ -726,8 +772,43 @@ mod delegate {
         }
         let out_file = get_default_ouput_dir(cwd)?.join(package_name);
         let output = get_versioned_contract(&output_lib, &cli_config)?;
-        let mut file = File::create(out_file)?;
+        let mut file = File::create(&out_file)?;
         file.write_all(output.as_slice())?;
+
+        // Warn about large delegate sizes
+        let size = output.len();
+        let human_size = ByteSize(size as u64).to_string();
+        const WARN_SIZE: usize = 5 * 1024 * 1024; // 5MB
+        const ERROR_SIZE: usize = 10 * 1024 * 1024; // 10MB
+
+        if size > ERROR_SIZE {
+            tracing::error!(
+                path = ?out_file,
+                size = %human_size,
+                "Delegate size exceeds 10MB! This may cause issues with WebSocket transmission (16MB limit). Consider building in release mode with --release flag."
+            );
+            if cli_config.debug {
+                tracing::warn!("Delegate was built in debug mode. Release mode typically reduces size by 40-50x.");
+            }
+        } else if size > WARN_SIZE {
+            tracing::warn!(
+                path = ?out_file,
+                size = %human_size,
+                "Delegate size exceeds 5MB. Consider optimizing or building in release mode if not already."
+            );
+            if cli_config.debug {
+                tracing::info!(
+                    "Delegate was built in debug mode. Use --release flag for smaller size."
+                );
+            }
+        } else {
+            tracing::info!(
+                path = ?out_file,
+                size = %human_size,
+                "Wrote delegate output file"
+            );
+        }
+
         Ok(())
     }
 

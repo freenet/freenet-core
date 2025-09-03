@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, LazyLock},
     time::Duration,
 };
 
@@ -13,7 +13,6 @@ use anyhow::Context;
 use directories::ProjectDirs;
 use either::Either;
 use itertools::Itertools;
-use once_cell::sync::Lazy;
 use pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
@@ -44,7 +43,7 @@ pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 pub(crate) const PCK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Initialize the executor once.
-static ASYNC_RT: Lazy<Option<Runtime>> = Lazy::new(GlobalExecutor::initialize_async_rt);
+static ASYNC_RT: LazyLock<Option<Runtime>> = LazyLock::new(GlobalExecutor::initialize_async_rt);
 
 const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
@@ -181,7 +180,7 @@ impl ConfigArgs {
                     }
                     ext => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Invalid configuration file extension: {}", ext),
+                        format!("Invalid configuration file extension: {ext}"),
                     )),
                 }
             }
@@ -815,7 +814,7 @@ impl ConfigPaths {
         self
     }
 
-    pub fn iter(&self) -> ConfigPathsIter {
+    pub fn iter(&self) -> ConfigPathsIter<'_> {
         ConfigPathsIter {
             curr: 0,
             config_paths: self,

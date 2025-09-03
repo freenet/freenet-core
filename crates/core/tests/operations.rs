@@ -19,6 +19,7 @@ use serde::Deserialize;
 use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 use testresult::TestResult;
@@ -27,12 +28,11 @@ use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
-static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::StdRng>> =
-    once_cell::sync::Lazy::new(|| {
-        std::sync::Mutex::new(rand::rngs::StdRng::from_seed(
-            *b"0102030405060708090a0b0c0d0e0f10",
-        ))
-    });
+static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
+    Mutex::new(rand::rngs::StdRng::from_seed(
+        *b"0102030405060708090a0b0c0d0e0f10",
+    ))
+});
 
 struct PresetConfig {
     temp_dir: tempfile::TempDir,
@@ -126,7 +126,7 @@ async fn get_contract(
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_put_contract() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -189,7 +189,7 @@ async fn test_put_contract() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(120), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         tracing::info!("Waiting for nodes to start up...");
         tokio::time::sleep(Duration::from_secs(15)).await;
@@ -197,8 +197,7 @@ async fn test_put_contract() -> TestResult {
 
         // Connect to node A's websocket API
         let uri = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_peer_a
+            "ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native"
         );
         let (stream, _) = connect_async(&uri).await?;
         let mut client_api_a = WebApi::start(stream);
@@ -211,10 +210,12 @@ async fn test_put_contract() -> TestResult {
         )
         .await?;
 
-        // Wait for put response
-        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_a.recv()).await;
+        // Wait for put response (increased timeout for CI environments)
+        tracing::info!("Waiting for PUT response...");
+        let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                tracing::info!("PUT successful for contract: {}", key);
                 assert_eq!(key, contract_key);
             }
             Ok(Ok(other)) => {
@@ -224,7 +225,7 @@ async fn test_put_contract() -> TestResult {
                 bail!("Error receiving put response: {}", e);
             }
             Err(_) => {
-                bail!("Timeout waiting for put response");
+                bail!("Timeout waiting for put response after 120 seconds");
             }
         }
 
@@ -244,8 +245,7 @@ async fn test_put_contract() -> TestResult {
         {
             // Connect to node B's websocket API
             let uri = format!(
-                "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-                ws_api_port_peer_b
+                "ws://127.0.0.1:{ws_api_port_peer_b}/v1/contract/command?encodingProtocol=native"
             );
             let (stream, _) = connect_async(&uri).await?;
             let mut client_api_b = WebApi::start(stream);
@@ -368,15 +368,13 @@ async fn test_update_contract() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(20)).await; // Increased sleep duration
 
         // Connect to node A websocket API
-        let uri = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port
-        );
+        let uri =
+            format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
         let (stream, _) = connect_async(&uri).await?;
         let mut client_api_a = WebApi::start(stream);
 
@@ -389,10 +387,12 @@ async fn test_update_contract() -> TestResult {
         )
         .await?;
 
-        // Wait for put response
-        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_a.recv()).await;
+        // Wait for put response (increased timeout for CI environments)
+        tracing::info!("Waiting for PUT response...");
+        let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                tracing::info!("PUT successful for contract: {}", key);
                 assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
             }
             Ok(Ok(other)) => {
@@ -402,7 +402,7 @@ async fn test_update_contract() -> TestResult {
                 bail!("Error receiving put response: {}", e);
             }
             Err(_) => {
-                bail!("Timeout waiting for put response");
+                bail!("Timeout waiting for put response after 120 seconds");
             }
         }
 
@@ -637,10 +637,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
         // Connect first client to node A's websocket API
         tracing::info!("Starting WebSocket connections after 40s startup wait");
         let start_time = std::time::Instant::now();
-        let uri_a = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_a
-        );
+        let uri_a =
+            format!("ws://127.0.0.1:{ws_api_port_a}/v1/contract/command?encodingProtocol=native");
         let (stream1, _) = connect_async(&uri_a).await?;
         let mut client_api1_node_a = WebApi::start(stream1);
 
@@ -649,10 +647,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
         let mut client_api2_node_a = WebApi::start(stream2);
 
         // Connect third client to node C's websocket API (different node)
-        let uri_c = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_b
-        );
+        let uri_c =
+            format!("ws://127.0.0.1:{ws_api_port_b}/v1/contract/command?encodingProtocol=native");
         let (stream3, _) = connect_async(&uri_c).await?;
         let mut client_api_node_b = WebApi::start(stream3);
 
@@ -793,18 +789,30 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
 
         // Third client gets the contract from node C (without subscribing)
+        // Add delay to allow contract to propagate from Node A to Node B/C
+        tracing::info!("Waiting 5 seconds for contract to propagate across nodes...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        tracing::info!(
+            "Client 3: Sending GET request for contract {} to Node B",
+            contract_key
+        );
+        let get_start = std::time::Instant::now();
         make_get(&mut client_api_node_b, contract_key, true, false).await?;
 
         // Wait for get response on third client
+        // Note: Contract propagation from Node A to Node B can take 5-10s locally, longer in CI
         loop {
             let resp =
-                tokio::time::timeout(Duration::from_secs(30), client_api_node_b.recv()).await;
+                tokio::time::timeout(Duration::from_secs(60), client_api_node_b.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                     key,
                     contract: Some(_),
                     state: _,
                 }))) => {
+                    let elapsed = get_start.elapsed();
+                    tracing::info!("Client 3: Received GET response after {:?}", elapsed);
                     assert_eq!(
                         key, contract_key,
                         "Contract key mismatch in GET response for client 3"
@@ -821,7 +829,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
                     bail!("Client 3: Error receiving get response: {}", e);
                 }
                 Err(_) => {
-                    bail!("Client 3: Timeout waiting for get response");
+                    let elapsed = get_start.elapsed();
+                    bail!("Client 3: Timeout waiting for get response after {:?}. Contract may not have propagated from Node A to Node B", elapsed);
                 }
             }
         }
@@ -832,7 +841,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         // Wait for subscribe response
         loop {
             let resp =
-                tokio::time::timeout(Duration::from_secs(30), client_api_node_b.recv()).await;
+                tokio::time::timeout(Duration::from_secs(60), client_api_node_b.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                     key,
@@ -1289,8 +1298,7 @@ async fn test_get_with_subscribe_flag() -> TestResult {
 
         // Connect first client to node A's websocket API (for putting the contract)
         let uri_a = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_a
+            "ws://127.0.0.1:{ws_api_port_a}/v1/contract/command?encodingProtocol=native"
         );
         let (stream1, _) = connect_async(&uri_a).await?;
         let mut client_api1_node_a = WebApi::start(stream1);
@@ -1584,15 +1592,13 @@ async fn test_put_with_subscribe_flag() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Connect first client to node A's websocket API (for putting with auto-subscribe)
-        let uri_a = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_a
-        );
+        let uri_a =
+            format!("ws://127.0.0.1:{ws_api_port_a}/v1/contract/command?encodingProtocol=native");
         let (stream1, _) = connect_async(&uri_a).await?;
         let mut client_api1 = WebApi::start(stream1);
 
@@ -1896,14 +1902,13 @@ async fn test_delegate_request() -> TestResult {
     .boxed_local();
 
     // Wait for the nodes to start and run the test
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Connect to the client node's WebSocket API
         let uri = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_client
+            "ws://127.0.0.1:{ws_api_port_client}/v1/contract/command?encodingProtocol=native"
         );
         let (stream, _) = connect_async(&uri).await?;
         let mut client = WebApi::start(stream);
@@ -1927,7 +1932,7 @@ async fn test_delegate_request() -> TestResult {
                     key, delegate_key,
                     "Delegate key mismatch in register response"
                 );
-                println!("Successfully registered delegate with key: {}", key);
+                println!("Successfully registered delegate with key: {key}");
             }
             other => {
                 bail!(
@@ -1990,7 +1995,7 @@ async fn test_delegate_request() -> TestResult {
                     OutboundAppMessage::TestResponse(text, data) => {
                         assert_eq!(
                             text,
-                            format!("Processed: {}", request_data),
+                            format!("Processed: {request_data}"),
                             "Response text doesn't match expected format"
                         );
                         assert_eq!(
@@ -2153,8 +2158,7 @@ async fn test_gateway_packet_size_change_after_60s() -> TestResult {
 
         // Connect to client node
         let uri = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_client
+            "ws://127.0.0.1:{ws_api_port_client}/v1/contract/command?encodingProtocol=native"
         );
         let (stream, _) = connect_async(&uri).await?;
         let mut client = WebApi::start(stream);
@@ -2345,8 +2349,7 @@ async fn test_production_decryption_error_scenario() -> TestResult {
 
         // Connect to client node
         let uri = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_client
+            "ws://127.0.0.1:{ws_api_port_client}/v1/contract/command?encodingProtocol=native"
         );
         let (stream, _) = connect_async(&uri).await?;
         let mut client = WebApi::start(stream);
@@ -2573,22 +2576,19 @@ async fn test_subscription_introspection() -> TestResult {
     }
     .boxed_local();
 
-    let test = tokio::time::timeout(Duration::from_secs(60), async {
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
         // Wait for nodes to start and connect
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Connect to gateway websocket API
-        let uri_gw = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_gw
-        );
+        let uri_gw =
+            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
         let (stream_gw, _) = connect_async(&uri_gw).await?;
         let mut client_gw = WebApi::start(stream_gw);
 
         // Connect to node websocket API
         let uri_node = format!(
-            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
-            ws_api_port_node
+            "ws://127.0.0.1:{ws_api_port_node}/v1/contract/command?encodingProtocol=native"
         );
         let (stream_node, _) = connect_async(&uri_node).await?;
         let _client_node = WebApi::start(stream_node);
@@ -2640,6 +2640,176 @@ async fn test_subscription_introspection() -> TestResult {
         }
         r = test => {
             r??
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_update_no_change_notification() -> TestResult {
+    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+
+    // Load test contract that properly handles NoChange
+    const TEST_CONTRACT: &str = "test-contract-update-nochange";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    // Create initial state - a simple state that we can update
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SimpleState {
+        value: String,
+        counter: u64,
+    }
+
+    let initial_state = SimpleState {
+        value: "initial".to_string(),
+        counter: 1,
+    };
+    let initial_state_bytes = serde_json::to_vec(&initial_state)?;
+    let wrapped_state = WrappedState::from(initial_state_bytes);
+
+    // Create network sockets
+    let network_socket_b = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_a = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_b = TcpListener::bind("127.0.0.1:0")?;
+
+    // Configure gateway node B
+    let (config_b, preset_cfg_b, config_b_gw) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![],
+            Some(network_socket_b.local_addr()?.port()),
+            ws_api_port_socket_b.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    // Configure client node A
+    let (config_a, preset_cfg_a) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&config_b_gw)?],
+        None,
+        ws_api_port_socket_a.local_addr()?.port(),
+    )
+    .await?;
+    let ws_api_port = config_a.ws_api.ws_api_port.unwrap();
+
+    // Log data directories for debugging
+    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
+
+    // Free ports so they don't fail on initialization
+    std::mem::drop(ws_api_port_socket_a);
+    std::mem::drop(network_socket_b);
+    std::mem::drop(ws_api_port_socket_b);
+
+    // Start node A (client)
+    let node_a = async move {
+        let config = config_a.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start node B (gateway)
+    let node_b = async {
+        let config = config_b.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
+        // Wait for nodes to start up
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        // Connect to node A websocket API
+        let uri =
+            format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
+        let (stream, _) = connect_async(&uri).await?;
+        let mut client_api_a = WebApi::start(stream);
+
+        // Put contract with initial state
+        make_put(
+            &mut client_api_a,
+            wrapped_state.clone(),
+            contract.clone(),
+            false,
+        )
+        .await?;
+
+        // Wait for put response
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!("unexpected response while waiting for put: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Error receiving put response: {}", e);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for put response");
+            }
+        }
+
+        // Now update with the EXACT SAME state (should trigger UpdateNoChange)
+        tracing::info!("Sending UPDATE with identical state to trigger UpdateNoChange");
+        make_update(&mut client_api_a, contract_key, wrapped_state.clone()).await?;
+
+        // Wait for update response - THIS SHOULD NOT TIMEOUT
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key,
+                summary: _,
+            }))) => {
+                assert_eq!(
+                    key, contract_key,
+                    "Contract key mismatch in UPDATE response"
+                );
+                tracing::info!("SUCCESS: Received UpdateResponse for no-change update");
+            }
+            Ok(Ok(other)) => {
+                bail!("Unexpected response while waiting for update: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Error receiving update response: {}", e);
+            }
+            Err(_) => {
+                // This is where the test will currently fail
+                bail!("TIMEOUT waiting for update response - UpdateNoChange bug: client not notified when update results in no state change");
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    select! {
+        a = node_a => {
+            let Err(a) = a;
+            return Err(anyhow!(a).into());
+        }
+        b = node_b => {
+            let Err(b) = b;
+            return Err(anyhow!(b).into());
+        }
+        r = test => {
+            r??;
+            // Give time for cleanup before dropping nodes
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 

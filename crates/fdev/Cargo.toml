@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -9,6 +9,7 @@ license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet"
 
 [dependencies]
+bytesize = "1.3"
 anyhow = "1"
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
 bincode = "1"
@@ -19,10 +20,9 @@ dashmap = { workspace = true }
 either = { workspace = true }
 futures = { workspace = true }
 glob = "0.3"
-pico-args = "0.5"
 prettytable-rs = "0.10"
 rand = { workspace = true }
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = { workspace = true }
 semver = { workspace = true }
@@ -30,7 +30,7 @@ tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
 tokio-tungstenite = "0.26.1"
-toml = { version = "0.8", features = ["default", "preserve_order"] }
+toml = { version = "0.9", features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 xz2 = { version = "0.1", features = ["tokio"] }
@@ -38,7 +38,7 @@ reqwest = { version = "0.12", features = ["json"] }
 http = "1.2"
 
 # internal
-freenet = { path = "../core", version = "0.1.14" }
+freenet = { path = "../core", version = "0.1.21" }
 freenet-stdlib = { workspace = true }
 
 [features]
