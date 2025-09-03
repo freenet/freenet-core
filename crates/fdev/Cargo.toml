@@ -20,7 +20,6 @@ dashmap = { workspace = true }
 either = { workspace = true }
 futures = { workspace = true }
 glob = "0.3"
-pico-args = "0.5"
 prettytable-rs = "0.10"
 rand = { workspace = true }
 serde = { version = "1", features = ["derive"] }

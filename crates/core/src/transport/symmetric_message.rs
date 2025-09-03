@@ -1,8 +1,11 @@
-use std::{borrow::Cow, net::SocketAddr, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    net::SocketAddr,
+    sync::{LazyLock, OnceLock},
+};
 
 use crate::transport::packet_data::SymmetricAES;
 use aes_gcm::Aes128Gcm;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -43,7 +46,7 @@ impl SymmetricMessage {
     };
 
     pub(crate) fn short_message_overhead() -> usize {
-        static OVERHEAD: Lazy<usize> = Lazy::new(|| {
+        static OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
             let blank = SymmetricMessage {
                 packet_id: u32::MAX,
                 confirm_receipt: vec![],
@@ -56,7 +59,7 @@ impl SymmetricMessage {
     }
 
     pub(crate) fn noop_message_overhead() -> usize {
-        static OVERHEAD: Lazy<usize> = Lazy::new(|| {
+        static OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
             let blank = SymmetricMessage {
                 packet_id: u32::MAX,
                 confirm_receipt: vec![],
@@ -69,7 +72,7 @@ impl SymmetricMessage {
     }
 
     pub(crate) fn max_num_of_confirm_receipts_of_noop_message() -> usize {
-        static MAX_NUM_CONFIRM_RECEIPTS: Lazy<usize> = Lazy::new(|| {
+        static MAX_NUM_CONFIRM_RECEIPTS: LazyLock<usize> = LazyLock::new(|| {
             let overhead = SymmetricMessage::noop_message_overhead() as u64;
             let max_elems = (MAX_DATA_SIZE as u64 - overhead) / core::mem::size_of::<u32>() as u64;
             max_elems as usize
