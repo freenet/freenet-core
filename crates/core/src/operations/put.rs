@@ -25,7 +25,6 @@ use crate::{
 pub(crate) struct PutOp {
     pub id: Transaction,
     state: Option<PutState>,
-    stats: Option<PutStats>,
 }
 
 impl PutOp {
@@ -76,11 +75,6 @@ impl PutOp {
     }
 }
 
-struct PutStats {
-    #[allow(dead_code)]
-    target: Option<PeerKeyLocation>,
-}
-
 impl IsOperationCompleted for PutOp {
     fn is_completed(&self) -> bool {
         matches!(self.state, Some(put::PutState::Finished { .. }))
@@ -117,7 +111,6 @@ impl Operation for PutOp {
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(PutState::ReceivedRequest),
-                        stats: None, // don't care for stats in the target peers
                         id: tx,
                     },
                     sender,
@@ -140,7 +133,6 @@ impl Operation for PutOp {
         Box::pin(async move {
             let return_msg;
             let new_state;
-            let stats = self.stats;
 
             match input {
                 PutMsg::RequestPut {
@@ -163,14 +155,16 @@ impl Operation for PutOp {
                     );
 
                     // Check if we're the initiator of this PUT operation
-                    // We only cache locally when WE initiate the PUT, not when forwarding
-                    let is_initiator = match &self.state {
+                    // We only cache locally when either WE initiate the PUT, or when forwarding just of the peer should be seeding
+                    let should_seed = match &self.state {
                         Some(PutState::PrepareRequest { .. }) => true,
-                        Some(PutState::AwaitingResponse { upstream, .. }) => upstream.is_none(),
-                        _ => false,
+                        Some(PutState::AwaitingResponse { upstream, .. }) => {
+                            upstream.is_none() || op_manager.ring.should_seed(&key)
+                        }
+                        _ => op_manager.ring.should_seed(&key),
                     };
 
-                    let modified_value = if is_initiator {
+                    let modified_value = if should_seed {
                         // Cache locally when initiating a PUT. This ensures:
                         // 1. Nodes with no connections can still cache contracts
                         // 2. Nodes that are the optimal location cache locally
@@ -322,7 +316,7 @@ impl Operation for PutOp {
                             skip_list.insert(target.peer.clone());
                         }
 
-                        super::start_subscription_request(op_manager, key, false, skip_list).await;
+                        super::start_subscription_request(op_manager, key).await;
                         op_manager.ring.seed_contract(key);
 
                         true
@@ -532,13 +526,7 @@ impl Operation for PutOp {
                                 // TODO: Make put operation atomic by linking it to the completion of this subscription request.
                                 // Currently we can't link one transaction to another transaction's result, which would be needed
                                 // to make this fully atomic. This should be addressed in a future refactoring.
-                                super::start_subscription_request(
-                                    op_manager,
-                                    key,
-                                    false,
-                                    HashSet::new(),
-                                )
-                                .await;
+                                super::start_subscription_request(op_manager, key).await;
                             }
 
                             tracing::info!(
@@ -606,7 +594,7 @@ impl Operation for PutOp {
                     };
 
                     // Determine if this is the last hop and handle forwarding
-                    let (last_hop, new_skip_list) = if let Some(new_htl) = htl.checked_sub(1) {
+                    let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
                         // Create updated skip list
                         let mut new_skip_list = skip_list.clone();
                         new_skip_list.insert(sender.peer.clone());
@@ -623,10 +611,10 @@ impl Operation for PutOp {
                         )
                         .await;
 
-                        (put_here, new_skip_list)
+                        put_here
                     } else {
                         // Last hop, no more forwarding
-                        (true, skip_list.clone())
+                        true
                     };
 
                     // Handle subscription and local storage if this is the last hop
@@ -645,13 +633,7 @@ impl Operation for PutOp {
 
                         // Start subscription and handle dropped contracts
                         let (dropped_contract, old_subscribers) = {
-                            super::start_subscription_request(
-                                op_manager,
-                                key,
-                                true,
-                                new_skip_list.clone(),
-                            )
-                            .await;
+                            super::start_subscription_request(op_manager, key).await;
                             op_manager.ring.seed_contract(key)
                         };
 
@@ -709,7 +691,7 @@ impl Operation for PutOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, stats)
+            build_op_result(self.id, new_state, return_msg)
         })
     }
 }
@@ -735,12 +717,10 @@ fn build_op_result(
     id: Transaction,
     state: Option<PutState>,
     msg: Option<PutMsg>,
-    stats: Option<PutStats>,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|op| PutOp {
         id,
         state: Some(op),
-        stats,
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
@@ -819,7 +799,6 @@ async fn try_to_broadcast(
                 let op = PutOp {
                     id,
                     state: new_state,
-                    stats: None,
                 };
                 op_manager
                     .notify_op_change(NetMessage::from(return_msg.unwrap()), OpEnum::Put(op))
@@ -862,11 +841,7 @@ pub(crate) fn start_op(
         subscribe,
     });
 
-    PutOp {
-        id,
-        state,
-        stats: Some(PutStats { target: None }),
-    }
+    PutOp { id, state }
 }
 
 pub enum PutState {
