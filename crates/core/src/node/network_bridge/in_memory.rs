@@ -119,7 +119,8 @@ impl InMemoryTransport {
         let ip = interface_peer.clone();
         GlobalExecutor::spawn(async move {
             const MAX_DELAYED_MSG: usize = 10;
-            let mut rng = StdRng::from_entropy();
+            use rand::Rng;
+            let mut rng = StdRng::from_os_rng();
             // delayed messages per target
             let mut delayed: HashMap<_, Vec<_>> = HashMap::with_capacity(MAX_DELAYED_MSG);
             let last_drain = Instant::now();

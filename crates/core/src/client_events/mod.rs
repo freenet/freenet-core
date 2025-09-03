@@ -1191,10 +1191,12 @@ pub(crate) mod test {
         }
 
         fn choose<'a, T>(&mut self, vec: &'a [T]) -> Option<&'a T> {
+            use rand::seq::SliceRandom;
             vec.choose(self)
         }
 
         fn seed_from_u64(seed: u64) -> Self {
+            use rand::SeedableRng;
             <Self as SeedableRng>::seed_from_u64(seed)
         }
     }

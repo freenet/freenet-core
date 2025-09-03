@@ -2,10 +2,10 @@ use std::marker::PhantomData;
 use std::{cell::RefCell, sync::Arc};
 
 use aes_gcm::{
-    aead::{generic_array::GenericArray, rand_core::SeedableRng, AeadInPlace},
+    aead::{generic_array::GenericArray, AeadInPlace},
     Aes128Gcm,
 };
-use rand::{prelude::SmallRng, thread_rng, Rng};
+use rand::{prelude::SmallRng, Rng, SeedableRng};
 
 use crate::transport::crypto::TransportPublicKey;
 
@@ -25,9 +25,10 @@ const UDP_HEADER_SIZE: usize = 8;
 
 thread_local! {
     // This must be very fast, but doesn't need to be cryptographically secure.
-    static RNG: RefCell<SmallRng> = RefCell::new(
-        SmallRng::from_rng(thread_rng()).expect("failed to create RNG")
-    );
+    static RNG: RefCell<SmallRng> = RefCell::new({
+        let mut rng = rand::rng();
+        SmallRng::from_rng(&mut rng).expect("failed to create RNG")
+    });
 }
 
 struct AssertSize<const N: usize>;

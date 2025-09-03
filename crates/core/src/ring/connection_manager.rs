@@ -1,4 +1,5 @@
 use parking_lot::Mutex;
+use rand::seq::SliceRandom;
 
 use crate::topology::{Limits, TopologyManager};
 
@@ -364,10 +365,9 @@ impl ConnectionManager {
         skip_list: impl Contains<PeerId>,
         router: &Router,
     ) -> Option<PeerKeyLocation> {
-        use rand::seq::SliceRandom;
         let connections = self.connections_by_location.read();
         let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::thread_rng())?;
+            let conn = conns.choose(&mut rand::rng())?;
             if let Some(requester) = requesting {
                 if requester == &conn.location.peer {
                     return None;

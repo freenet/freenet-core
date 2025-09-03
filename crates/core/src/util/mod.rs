@@ -240,7 +240,7 @@ where
         assert!(matches!(upper, Some(s) if s == size));
         Shuffle {
             inner: self,
-            rng: StdRng::from_entropy(),
+            rng: StdRng::from_os_rng(),
             memorized: BTreeMap::new(),
             done: HashSet::with_capacity(size),
             done_counter: 0,

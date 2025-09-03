@@ -137,7 +137,10 @@ impl<S> EventChain<S> {
             user_ev_controller,
             total_events,
             count: 0,
-            rng: rand::rngs::SmallRng::seed_from_u64(SEED),
+            rng: {
+                use rand::SeedableRng;
+                <rand::rngs::SmallRng as SeedableRng>::seed_from_u64(SEED)
+            },
             clean_up_tmp_dirs,
             choice: None,
         }
