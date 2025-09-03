@@ -1,10 +1,11 @@
 use super::*;
 
 mod token_assignment {
+    use std::sync::LazyLock;
+
     use super::*;
     use chrono::{NaiveDate, Timelike};
     use freenet_aft_interface::Tier;
-    use once_cell::sync::Lazy;
     use rsa::{pkcs1v15::Signature, RsaPublicKey};
 
     fn get_assignment_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
@@ -19,11 +20,11 @@ mod token_assignment {
     const MAX_DURATION_1Y: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
 
     const RSA_4096_PUB_PEM: &str = include_str!("../../../interfaces/examples/rsa4096-pub.pem");
-    static PK: Lazy<RsaPublicKey> = Lazy::new(|| {
+    static PK: LazyLock<RsaPublicKey> = LazyLock::new(|| {
         <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM).unwrap()
     });
 
-    static ID: Lazy<ContractInstanceId> = Lazy::new(|| {
+    static ID: LazyLock<ContractInstanceId> = LazyLock::new(|| {
         let rnd = [1; 32];
         let mut gen = arbitrary::Unstructured::new(&rnd);
         gen.arbitrary().unwrap()
