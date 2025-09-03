@@ -147,7 +147,9 @@ pub struct BuildToolConfig {
     #[arg(long, value_enum, default_value_t=PackageType::default())]
     pub(crate) package_type: PackageType,
 
-    /// Compile in debug mode instead of release.
+    /// Compile in debug mode instead of release. Warning: Debug mode produces WASM files that are
+    /// typically 40-50x larger than release mode (e.g., 10MB vs 200KB), which may exceed WebSocket
+    /// message size limits and cause deployment failures. Use only for development and debugging.
     #[arg(long)]
     pub(crate) debug: bool,
 }

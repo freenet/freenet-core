@@ -119,14 +119,14 @@ fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
         &BuildToolConfig {
             features: None,
             package_type: PackageType::Contract,
-            debug: true,
+            debug: false,
         },
         &contract_path,
     )?;
 
     let output_file = target
         .join(WASM_TARGET)
-        .join("debug")
+        .join("release")
         .join(name.replace('-', "_"))
         .with_extension("wasm");
     println!("output file: {output_file:?}");
