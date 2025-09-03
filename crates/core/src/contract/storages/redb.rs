@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use freenet_stdlib::prelude::*;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 
 use crate::wasm_runtime::StateStorage;
 
