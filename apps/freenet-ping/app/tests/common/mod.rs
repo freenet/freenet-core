@@ -19,7 +19,7 @@ use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::{
     collections::HashSet,
     io,
@@ -36,12 +36,11 @@ use serde::{Deserialize, Serialize};
 
 const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
 
-pub static RNG: once_cell::sync::Lazy<Mutex<rand::rngs::StdRng>> =
-    once_cell::sync::Lazy::new(|| {
-        Mutex::new(rand::rngs::StdRng::from_seed(
-            *b"0102030405060708090a0b0c0d0e0f10",
-        ))
-    });
+pub static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
+    Mutex::new(rand::rngs::StdRng::from_seed(
+        *b"0102030405060708090a0b0c0d0e0f10",
+    ))
+});
 
 #[derive(Debug)]
 pub struct PresetConfig {

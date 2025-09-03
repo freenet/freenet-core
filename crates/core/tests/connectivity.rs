@@ -14,6 +14,7 @@ use futures::FutureExt;
 use rand::{Rng, SeedableRng};
 use std::{
     net::{Ipv4Addr, TcpListener},
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 use testresult::TestResult;
@@ -21,12 +22,11 @@ use tokio::select;
 use tokio_tungstenite::connect_async;
 use tracing::level_filters::LevelFilter;
 
-static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::StdRng>> =
-    once_cell::sync::Lazy::new(|| {
-        std::sync::Mutex::new(rand::rngs::StdRng::from_seed(
-            *b"0102030405060708090a0b0c0d0e0f10",
-        ))
-    });
+static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
+    Mutex::new(rand::rngs::StdRng::from_seed(
+        *b"0102030405060708090a0b0c0d0e0f10",
+    ))
+});
 
 /// Test gateway reconnection:
 /// 1. Start a gateway and a peer connected to it

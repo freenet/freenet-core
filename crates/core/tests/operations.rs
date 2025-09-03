@@ -19,6 +19,7 @@ use serde::Deserialize;
 use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 use testresult::TestResult;
@@ -27,12 +28,11 @@ use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
-static RNG: once_cell::sync::Lazy<std::sync::Mutex<rand::rngs::StdRng>> =
-    once_cell::sync::Lazy::new(|| {
-        std::sync::Mutex::new(rand::rngs::StdRng::from_seed(
-            *b"0102030405060708090a0b0c0d0e0f10",
-        ))
-    });
+static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
+    Mutex::new(rand::rngs::StdRng::from_seed(
+        *b"0102030405060708090a0b0c0d0e0f10",
+    ))
+});
 
 struct PresetConfig {
     temp_dir: tempfile::TempDir,
