@@ -501,11 +501,36 @@ mod contract {
                 file.write_all(output.as_slice())?;
                 let size = output.len();
                 let human_size = ByteSize(size as u64).to_string();
-                tracing::info!(
-                    path = ?out_file,
-                    size = %human_size,
-                    "Wrote contract output file"
-                );
+
+                // Warn about large contract sizes
+                const WARN_SIZE: usize = 5 * 1024 * 1024; // 5MB
+                const ERROR_SIZE: usize = 10 * 1024 * 1024; // 10MB
+
+                if size > ERROR_SIZE {
+                    tracing::error!(
+                        path = ?out_file,
+                        size = %human_size,
+                        "Contract size exceeds 10MB! This may cause issues with WebSocket transmission (16MB limit). Consider building in release mode with --release flag."
+                    );
+                    if cli_config.debug {
+                        tracing::warn!("Contract was built in debug mode. Release mode typically reduces size by 40-50x.");
+                    }
+                } else if size > WARN_SIZE {
+                    tracing::warn!(
+                        path = ?out_file,
+                        size = %human_size,
+                        "Contract size exceeds 5MB. Consider optimizing or building in release mode if not already."
+                    );
+                    if cli_config.debug {
+                        tracing::info!("Contract was built in debug mode. Use --release flag for smaller size.");
+                    }
+                } else {
+                    tracing::info!(
+                        path = ?out_file,
+                        size = %human_size,
+                        "Wrote contract output file"
+                    );
+                }
             }
             None => println!("no lang specified, skipping contract compilation"),
         }
@@ -747,8 +772,43 @@ mod delegate {
         }
         let out_file = get_default_ouput_dir(cwd)?.join(package_name);
         let output = get_versioned_contract(&output_lib, &cli_config)?;
-        let mut file = File::create(out_file)?;
+        let mut file = File::create(&out_file)?;
         file.write_all(output.as_slice())?;
+
+        // Warn about large delegate sizes
+        let size = output.len();
+        let human_size = ByteSize(size as u64).to_string();
+        const WARN_SIZE: usize = 5 * 1024 * 1024; // 5MB
+        const ERROR_SIZE: usize = 10 * 1024 * 1024; // 10MB
+
+        if size > ERROR_SIZE {
+            tracing::error!(
+                path = ?out_file,
+                size = %human_size,
+                "Delegate size exceeds 10MB! This may cause issues with WebSocket transmission (16MB limit). Consider building in release mode with --release flag."
+            );
+            if cli_config.debug {
+                tracing::warn!("Delegate was built in debug mode. Release mode typically reduces size by 40-50x.");
+            }
+        } else if size > WARN_SIZE {
+            tracing::warn!(
+                path = ?out_file,
+                size = %human_size,
+                "Delegate size exceeds 5MB. Consider optimizing or building in release mode if not already."
+            );
+            if cli_config.debug {
+                tracing::info!(
+                    "Delegate was built in debug mode. Use --release flag for smaller size."
+                );
+            }
+        } else {
+            tracing::info!(
+                path = ?out_file,
+                size = %human_size,
+                "Wrote delegate output file"
+            );
+        }
+
         Ok(())
     }
 
