@@ -22,7 +22,7 @@ use either::Either;
 use freenet_stdlib::prelude::ContractKey;
 use itertools::Itertools;
 use parking_lot::RwLock;
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 use rand::Rng;
 
 use crate::message::TransactionType;
@@ -355,7 +355,6 @@ impl Ring {
         location: Location,
         skip_list: HashSet<PeerId>,
     ) -> Option<PeerKeyLocation> {
-        use rand::seq::SliceRandom;
         self.connection_manager
             .get_connections_by_location()
             .iter()

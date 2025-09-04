@@ -177,7 +177,7 @@ pub fn get_free_port() -> Result<u16, ()> {
 fn get_dynamic_port() -> u16 {
     const FIRST_DYNAMIC_PORT: u16 = 49152;
     const LAST_DYNAMIC_PORT: u16 = 65535;
-    rand::thread_rng().gen_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
+    rand::rng().random_range(FIRST_DYNAMIC_PORT..LAST_DYNAMIC_PORT)
 }
 
 // This is extremely inefficient for large sizes but is not what
@@ -207,7 +207,7 @@ where
             return None;
         }
         let pick = loop {
-            let pick = self.rng.gen_range(0..self.size);
+            let pick = self.rng.random_range(0..self.size);
             if !self.done.contains(&pick) {
                 self.done.insert(pick);
                 break pick;
@@ -312,7 +312,7 @@ pub(crate) mod test {
             #[inline]
             #[allow(unused_braces)]
             pub(crate) fn $name() -> [u8; $size] {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let mut rnd_bytes = [0u8; $size];
                 rng.fill(rnd_bytes.as_mut_slice());
                 rnd_bytes
@@ -322,7 +322,7 @@ pub(crate) mod test {
             #[inline]
             #[allow(unused_braces)]
             pub(crate) fn $name() -> Vec<u8> {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let mut rnd_bytes = vec![0u8; $size];
                 rng.fill(rnd_bytes.as_mut_slice());
                 rnd_bytes

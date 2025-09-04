@@ -27,7 +27,7 @@ thread_local! {
     // This must be very fast, but doesn't need to be cryptographically secure.
     static RNG: RefCell<SmallRng> = RefCell::new({
         let mut rng = rand::rng();
-        SmallRng::from_rng(&mut rng).expect("failed to create RNG")
+        SmallRng::from_rng(&mut rng)
     });
 }
 
@@ -152,7 +152,7 @@ impl<const N: usize> PacketData<Plaintext, N> {
         _check_valid_size::<N>();
         debug_assert!(self.size <= MAX_DATA_SIZE);
 
-        let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().gen());
+        let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().random());
 
         let mut buffer = [0u8; N];
         buffer[..NONCE_SIZE].copy_from_slice(&nonce);

@@ -7,7 +7,7 @@ use std::{
 };
 
 use crossbeam::channel::{self, Receiver, Sender};
-use rand::{prelude::StdRng, seq::SliceRandom, Rng, SeedableRng};
+use rand::{prelude::StdRng, seq::SliceRandom, SeedableRng};
 use tokio::sync::Mutex;
 
 use super::{ConnectionError, NetworkBridge, PeerId};
@@ -132,7 +132,7 @@ impl InMemoryTransport {
                             ip,
                             msg.origin
                         );
-                        if rng.gen_bool(0.5) && delayed.len() < MAX_DELAYED_MSG && add_noise {
+                        if rng.random_bool(0.5) && delayed.len() < MAX_DELAYED_MSG && add_noise {
                             delayed
                                 .entry(msg.target.clone())
                                 .or_default()
@@ -141,7 +141,7 @@ impl InMemoryTransport {
                         } else {
                             let mut queue = msg_stack_queue_cp.lock().await;
                             queue.push(msg);
-                            if add_noise && rng.gen_bool(0.2) {
+                            if add_noise && rng.random_bool(0.2) {
                                 queue.shuffle(&mut rng);
                             }
                         }
@@ -158,7 +158,7 @@ impl InMemoryTransport {
                         tokio::time::sleep(Duration::from_millis(10)).await
                     }
                 }
-                if (last_drain.elapsed() > Duration::from_millis(rng.gen_range(1_000..5_000))
+                if (last_drain.elapsed() > Duration::from_millis(rng.random_range(1_000..5_000))
                     && !delayed.is_empty())
                     || delayed.len() == MAX_DELAYED_MSG
                 {

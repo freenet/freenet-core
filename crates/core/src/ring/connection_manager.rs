@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 
 use crate::topology::{Limits, TopologyManager};
 
@@ -337,13 +337,13 @@ impl ConnectionManager {
         if amount == 0 {
             return None;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut attempts = 0;
         loop {
             if attempts >= amount * 2 {
                 return None;
             }
-            let selected = rng.gen_range(0..amount);
+            let selected = rng.random_range(0..amount);
             let (peer, loc) = peers.iter().nth(selected).expect("infallible");
             if !filter_fn(peer) {
                 attempts += 1;
