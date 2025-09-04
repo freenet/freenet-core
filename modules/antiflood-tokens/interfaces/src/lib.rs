@@ -728,7 +728,7 @@ impl TokenAssignment {
             TokenAssignment::signature_content(&self.time_slot, self.tier, &self.assignment_hash);
         if verifying_key.verify(&msg, &self.signature).is_err() {
             // not signed by the private key of this generator
-            #[cfg(all(target_family = "wasm", features = "contract"))]
+            #[cfg(all(target_family = "wasm", feature = "contract"))]
             {
                 freenet_stdlib::log::info(&format!(
                     "failed verification of message `{msg:?}` with signature: `{sig}`",
@@ -743,7 +743,7 @@ impl TokenAssignment {
 
 impl PartialOrd for TokenAssignment {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.time_slot.cmp(&other.time_slot))
+        Some(self.cmp(other))
     }
 }
 
