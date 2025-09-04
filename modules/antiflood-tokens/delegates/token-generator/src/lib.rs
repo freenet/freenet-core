@@ -310,7 +310,7 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
             Some(currently_assigned) => {
                 let mut oldest_valid_observed = None;
                 let mut first_valid = None;
-                for (_idx, assignment) in currently_assigned.iter().enumerate() {
+                for assignment in currently_assigned.iter() {
                     // dbg!(
                     //     oldest_valid_observed.map(|a: &TokenAssignment| a.time_slot),
                     //     first_valid,
