@@ -20,5 +20,5 @@ serde = "1"
 serde_json = "1"
 
 # freenet-stdlib = { version = "0.0.7" }
-freenet-stdlib = { version = "0.1.6" }
+freenet-stdlib = { version = "0.1.14" }
 freenet-aft-interface = { path = "../../modules/antiflood-tokens/interfaces" }

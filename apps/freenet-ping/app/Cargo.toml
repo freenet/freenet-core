@@ -10,7 +10,7 @@ testing = ["freenet-stdlib/testing", "freenet/testing"]
 anyhow = "1.0"
 chrono = { workspace = true, features = ["default"] }
 clap = { version = "4.5", features = ["derive"] }
-freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", branch = "main", features = ["net"] }
+freenet-stdlib = { version = "0.1.14"}
 freenet-ping-types = { path = "../types", features = ["std", "clap"] }
 futures = "0.3.31"
 rand = "0.9.1"
