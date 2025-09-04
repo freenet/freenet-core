@@ -6,7 +6,7 @@ resolver = "2"
 bincode = { version = "1" }
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false }
-freenet-stdlib = { version = "0.1.6" }
+freenet-stdlib = { workspace = true }
 rsa = { version = "0.9", default-features = false, features = ["serde", "pem"] }
 serde = { version = "1" }
 serde_json = { version = "1" }
