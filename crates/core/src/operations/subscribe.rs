@@ -7,7 +7,6 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
-    contract::ContractError,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
@@ -66,45 +65,39 @@ pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
-    let (target, _id) = if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        if !super::has_contract(op_manager, *key).await? {
-            tracing::debug!(%key, "Contract not found, trying other peer");
-            return Err(OpError::ContractError(ContractError::ContractNotFound(
-                *key,
-            )));
-        }
+    if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
+        // Find a remote peer to handle the subscription
         const EMPTY: &[PeerId] = &[];
-        (
-            op_manager
-                .ring
-                .closest_potentially_caching(key, EMPTY)
-                .into_iter()
-                .next()
-                .ok_or_else(|| RingError::NoCachingPeers(*key))?,
-            *id,
-        )
+        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
+            Some(peer) => peer,
+            None => {
+                // No remote peers available
+                tracing::debug!(%key, "No remote peers available for subscription");
+                return Err(RingError::NoCachingPeers(*key).into());
+            }
+        };
+
+        // Forward to remote peer
+        let new_state = Some(SubscribeState::AwaitingResponse {
+            skip_list: vec![].into_iter().collect(),
+            retries: 0,
+            current_hop: op_manager.ring.max_hops_to_live,
+            upstream_subscriber: None,
+        });
+        let msg = SubscribeMsg::RequestSub {
+            id: *id,
+            key: *key,
+            target,
+        };
+        let op = SubscribeOp {
+            id: *id,
+            state: new_state,
+        };
+        op_manager
+            .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
+            .await?;
     } else {
         return Err(OpError::UnexpectedOpState);
-    };
-
-    match sub_op.state {
-        Some(SubscribeState::PrepareRequest { id, key, .. }) => {
-            let new_state = Some(SubscribeState::AwaitingResponse {
-                skip_list: vec![].into_iter().collect(),
-                retries: 0,
-                current_hop: op_manager.ring.max_hops_to_live,
-                upstream_subscriber: None,
-            });
-            let msg = SubscribeMsg::RequestSub { id, key, target };
-            let op = SubscribeOp {
-                id,
-                state: new_state,
-            };
-            op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
-                .await?;
-        }
-        _ => return Err(OpError::invalid_transition(sub_op.id)),
     }
 
     Ok(())
@@ -243,7 +236,7 @@ impl Operation for SubscribeOp {
                         let Some(new_target) =
                             op_manager.ring.closest_potentially_caching(key, skip_list)
                         else {
-                            tracing::warn!(tx = %id, %key, "No target peer found while trying getting contract");
+                            tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
                             return Ok(return_not_subbed());
                         };
                         let new_htl = htl - 1;
@@ -332,11 +325,8 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
-                                if let Some(target) = op_manager
-                                    .ring
-                                    .closest_potentially_caching(key, &skip_list)
-                                    .into_iter()
-                                    .next()
+                                if let Some(target) =
+                                    op_manager.ring.closest_potentially_caching(key, &skip_list)
                                 {
                                     let subscriber =
                                         op_manager.ring.connection_manager.own_location();

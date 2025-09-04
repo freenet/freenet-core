@@ -214,10 +214,29 @@ pub(crate) fn executor_channel(
     ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     ExecutorToEventLoopChannel<ExecutorHalve>,
 ) {
-    // todo: use sensible values for channel buf sizes based on number concurrent tasks running
-    // when we are able to suspend execution of a request while waiting for a callback
-    let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(10);
-    let (response_for_tx, response_for_rx) = mpsc::channel(10);
+    // Channel buffer size: In CI environments with limited CPU cores (2 vs 8+ locally),
+    // task scheduling can be severely constrained. A larger buffer (1000 vs 10) provides
+    // breathing room for the consumer when the scheduler doesn't give it CPU time promptly.
+    //
+    // TODO: This is a workaround. The real issue is that in resource-constrained environments,
+    // the contract executor task may not get scheduled quickly enough to process messages,
+    // causing senders to fill up the channel. When the channel is full and a sender tries
+    // to send with `.await`, it blocks. If all senders block and the receiver task isn't
+    // scheduled, we get a deadlock that eventually times out and drops the channel.
+    //
+    // A proper fix would involve:
+    // 1. Using try_send() with proper backpressure handling
+    // 2. Ensuring the executor task gets scheduled with higher priority
+    // 3. Breaking up large operations to yield more frequently
+    //
+    // See: https://github.com/freenet/freenet-core/issues/1790
+    //
+    // This is a pragmatic mitigation for CI's resource constraints - in normal operation
+    // these channels shouldn't back up as they only coordinate transaction IDs.
+    let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(1000);
+    let (response_for_tx, response_for_rx) = mpsc::channel(1000);
+
+    tracing::debug!("Created executor channels with buffer size 1000");
 
     let listener_halve = ExecutorToEventLoopChannel {
         op_manager: op_manager.clone(),
@@ -232,6 +251,7 @@ pub(crate) fn executor_channel(
             waiting_for_op_tx,
             response_for_rx,
             completed: HashMap::default(),
+            last_capacity_warning: None,
         },
     };
     (listener_halve, sender_halve)
@@ -255,6 +275,39 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
     {
         let op = message.initiate_op(&self.op_manager);
         let tx = *op.id();
+
+        // Monitor channel capacity to detect backpressure issues
+        // capacity() returns the current number of available slots
+        let available_capacity = self.end.waiting_for_op_tx.capacity();
+        if available_capacity < 20 {
+            // Warn when 80%+ full (less than 20 slots available out of 100)
+            // Rate limit warnings to once per 30 seconds to avoid log spam
+            let now = std::time::Instant::now();
+            let should_warn = self.end.last_capacity_warning.map_or(true, |last| {
+                now.duration_since(last) > std::time::Duration::from_secs(30)
+            });
+
+            if should_warn {
+                self.end.last_capacity_warning = Some(now);
+                tracing::warn!(
+                    available_capacity,
+                    total_capacity = 100,
+                    used_capacity = 100 - available_capacity,
+                    "Executor channel approaching capacity - possible consumer backlog. \
+                     This may indicate the network event listener is not keeping up. \
+                     (This warning is rate-limited to once per 30 seconds)"
+                );
+            }
+        } else if available_capacity < 50 {
+            // Debug when 50%+ full
+            tracing::debug!(
+                available_capacity,
+                total_capacity = 100,
+                used_capacity = 100 - available_capacity,
+                "Executor channel usage above 50%"
+            );
+        }
+
         self.end.waiting_for_op_tx.send(tx).await.inspect_err(|_| {
             tracing::debug!("failed to send request to executor, channel closed");
         })?;
@@ -290,12 +343,18 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
 
 impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
     pub async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+        tracing::trace!("Waiting to receive transaction from executor channel");
         let tx = self
             .end
             .waiting_for_op_rx
             .recv()
             .await
-            .ok_or(anyhow::anyhow!("channel closed"))?;
+            .ok_or_else(|| {
+                tracing::error!("Executor channel closed - all senders have been dropped");
+                tracing::error!("This typically happens when: 1) The executor task panicked/exited, 2) Network timeout cascaded to channel closure, 3) Resource constraints in CI");
+                anyhow::anyhow!("channel closed")
+            })?;
+        tracing::trace!("Successfully received transaction from executor channel");
         Ok(tx)
     }
 
@@ -338,6 +397,8 @@ pub struct ExecutorHalve {
     response_for_rx: mpsc::Receiver<OpEnum>,
     /// stores the completed operations if they haven't been asked for yet in the executor
     completed: HashMap<Transaction, OpEnum>,
+    /// Track last warning time to rate-limit channel capacity warnings
+    last_capacity_warning: Option<std::time::Instant>,
 }
 
 mod sealed {

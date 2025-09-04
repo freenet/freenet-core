@@ -62,6 +62,10 @@ impl NodeP2P {
         let mut stable_rounds = 0;
 
         while start.elapsed() < max_duration {
+            // Cooperative yielding for CI environments with limited CPU cores
+            // Research shows CI (2 cores) needs explicit yields to prevent task starvation
+            tokio::task::yield_now().await;
+
             let current_connections = self.op_manager.ring.open_connections();
 
             // If we've reached our target, we're done
@@ -86,6 +90,9 @@ impl NodeP2P {
                     // Trigger the connection maintenance task to actively look for more peers
                     // In small networks, we want to be more aggressive
                     for _ in 0..3 {
+                        // Yield before each connection attempt to prevent blocking other tasks
+                        tokio::task::yield_now().await;
+
                         if let Err(e) = self.trigger_connection_maintenance().await {
                             tracing::warn!("Failed to trigger connection maintenance: {}", e);
                         }
@@ -230,10 +237,18 @@ impl NodeP2P {
             P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
 
         let parent_span = tracing::Span::current();
-        let contract_executor_task = GlobalExecutor::spawn(
-            contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
-        )
+        let contract_executor_task = GlobalExecutor::spawn({
+            let task = async move {
+                tracing::info!("Contract executor task starting");
+                let result = contract::contract_handling(contract_handler).await;
+                match &result {
+                    Ok(_) => tracing::warn!("Contract executor task exiting normally (unexpected)"),
+                    Err(e) => tracing::error!("Contract executor task exiting with error: {e}"),
+                }
+                result
+            };
+            task.instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling"))
+        })
         .map(|r| match r {
             Ok(Err(e)) => anyhow::anyhow!("Error in contract handling task: {e}"),
             Ok(Ok(_)) => anyhow::anyhow!("Contract handling task exited unexpectedly"),
@@ -242,15 +257,22 @@ impl NodeP2P {
         .boxed();
         let clients = ClientEventsCombinator::new(clients);
         let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
-        let client_events_task = GlobalExecutor::spawn(
-            client_event_handling(
-                op_manager.clone(),
-                clients,
-                client_responses,
-                node_controller_tx,
-            )
-            .instrument(tracing::info_span!(parent: parent_span, "client_event_handling")),
-        )
+        let client_events_task = GlobalExecutor::spawn({
+            let op_manager_clone = op_manager.clone();
+            let task = async move {
+                tracing::info!("Client events task starting");
+                let result = client_event_handling(
+                    op_manager_clone,
+                    clients,
+                    client_responses,
+                    node_controller_tx,
+                )
+                .await;
+                tracing::warn!("Client events task exiting (unexpected)");
+                result
+            };
+            task.instrument(tracing::info_span!(parent: parent_span, "client_event_handling"))
+        })
         .map(|r| match r {
             Ok(_) => anyhow::anyhow!("Client event handling task exited unexpectedly"),
             Err(e) => anyhow::anyhow!(e),

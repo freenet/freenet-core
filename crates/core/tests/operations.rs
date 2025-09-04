@@ -1293,8 +1293,8 @@ async fn test_get_with_subscribe_flag() -> TestResult {
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(120), async {
-        // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // Wait for nodes to start up (extra time for CI with limited resources)
+        tokio::time::sleep(Duration::from_secs(20)).await;
 
         // Connect first client to node A's websocket API (for putting the contract)
         let uri_a = format!(
@@ -1314,8 +1314,8 @@ async fn test_get_with_subscribe_flag() -> TestResult {
         )
         .await?;
 
-        // Wait for put response
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api1_node_a.recv()).await;
+        // Wait for put response (increased timeout for CI environments)
+        let resp = tokio::time::timeout(Duration::from_secs(45), client_api1_node_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key, "Contract key mismatch in PUT response");

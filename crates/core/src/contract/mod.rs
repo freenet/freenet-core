@@ -280,8 +280,6 @@ where
 pub(crate) enum ContractError {
     #[error("handler channel dropped")]
     ChannelDropped(Box<ContractHandlerEvent>),
-    #[error("contract {0} not found in storage")]
-    ContractNotFound(ContractKey),
     #[error("{0}")]
     IOError(#[from] std::io::Error),
     #[error("no response received from handler")]
