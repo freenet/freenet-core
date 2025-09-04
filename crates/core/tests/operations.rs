@@ -1800,7 +1800,8 @@ async fn test_put_with_subscribe_flag() -> TestResult {
             "Client 1 did not receive update notification within timeout period (auto-subscribe via PUT failed)"
         );
 
-        Ok::<_, anyhow::Error>(())
+        // Return the clients to keep them alive
+        Ok::<_, anyhow::Error>((client_api1, client_api2))
     });
 
     // Wait for test completion or node failures
@@ -1814,7 +1815,7 @@ async fn test_put_with_subscribe_flag() -> TestResult {
             return Err(anyhow!("Node B failed: {}", b).into());
         }
         r = test => {
-            r??;
+            let (_client1, _client2) = r??;  // Keep clients alive
             // Keep nodes alive for pending operations to complete
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
