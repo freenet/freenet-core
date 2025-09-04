@@ -1,4 +1,5 @@
 use parking_lot::Mutex;
+use rand::prelude::IndexedRandom;
 
 use crate::topology::{Limits, TopologyManager};
 
@@ -336,13 +337,13 @@ impl ConnectionManager {
         if amount == 0 {
             return None;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut attempts = 0;
         loop {
             if attempts >= amount * 2 {
                 return None;
             }
-            let selected = rng.gen_range(0..amount);
+            let selected = rng.random_range(0..amount);
             let (peer, loc) = peers.iter().nth(selected).expect("infallible");
             if !filter_fn(peer) {
                 attempts += 1;
@@ -364,10 +365,9 @@ impl ConnectionManager {
         skip_list: impl Contains<PeerId>,
         router: &Router,
     ) -> Option<PeerKeyLocation> {
-        use rand::seq::SliceRandom;
         let connections = self.connections_by_location.read();
         let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::thread_rng())?;
+            let conn = conns.choose(&mut rand::rng())?;
             if let Some(requester) = requesting {
                 if requester == &conn.location.peer {
                     return None;

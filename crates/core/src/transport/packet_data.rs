@@ -2,10 +2,10 @@ use std::marker::PhantomData;
 use std::{cell::RefCell, sync::Arc};
 
 use aes_gcm::{
-    aead::{generic_array::GenericArray, rand_core::SeedableRng, AeadInPlace},
+    aead::{generic_array::GenericArray, AeadInPlace},
     Aes128Gcm,
 };
-use rand::{prelude::SmallRng, thread_rng, Rng};
+use rand::{prelude::SmallRng, rng, Rng, SeedableRng};
 
 use crate::transport::crypto::TransportPublicKey;
 
@@ -26,7 +26,7 @@ const UDP_HEADER_SIZE: usize = 8;
 thread_local! {
     // This must be very fast, but doesn't need to be cryptographically secure.
     static RNG: RefCell<SmallRng> = RefCell::new(
-        SmallRng::from_rng(thread_rng()).expect("failed to create RNG")
+        SmallRng::from_rng(&mut rng())
     );
 }
 
@@ -151,7 +151,7 @@ impl<const N: usize> PacketData<Plaintext, N> {
         _check_valid_size::<N>();
         debug_assert!(self.size <= MAX_DATA_SIZE);
 
-        let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().gen());
+        let nonce: [u8; NONCE_SIZE] = RNG.with(|rng| rng.borrow_mut().random());
 
         let mut buffer = [0u8; N];
         buffer[..NONCE_SIZE].copy_from_slice(&nonce);
@@ -261,15 +261,14 @@ impl<DT: Encryption, const N: usize> PartialEq for PacketData<DT, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::rand_core::RngCore;
+
     use aes_gcm::KeyInit;
-    use rand::rngs::OsRng;
 
     #[test]
     fn test_encryption_decryption() {
         // Generate a random 128-bit (16 bytes) key
         let mut key = [0u8; 16];
-        OsRng.fill_bytes(&mut key);
+        rand::rng().fill(&mut key);
 
         // Create a key object for AES-GCM
         let key = GenericArray::from_slice(&key);
@@ -290,7 +289,7 @@ mod tests {
     fn test_encryption_decryption_corrupted() {
         // Generate a random 128-bit (16 bytes) key
         let mut key = [0u8; 16];
-        OsRng.fill_bytes(&mut key);
+        rand::rng().fill(&mut key);
 
         // Create a key object for AES-GCM
         let key = GenericArray::from_slice(&key);

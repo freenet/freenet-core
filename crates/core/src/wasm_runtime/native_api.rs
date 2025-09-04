@@ -48,7 +48,7 @@ pub(crate) mod log {
 }
 
 pub(crate) mod rand {
-    use ::rand::{thread_rng, RngCore};
+    use ::rand::{rng, RngCore};
 
     use super::*;
 
@@ -67,7 +67,7 @@ pub(crate) mod rand {
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
         let ptr = compute_ptr::<u8>(ptr, info.start_ptr);
         let slice = unsafe { &mut *std::ptr::slice_from_raw_parts_mut(ptr, len as usize) };
-        let mut rng = thread_rng();
+        let mut rng = rng();
         rng.fill_bytes(slice);
     }
 }

@@ -913,7 +913,7 @@ impl PeerId {
     pub fn random() -> Self {
         use rand::Rng;
         let mut addr = [0; 4];
-        rand::thread_rng().fill(&mut addr[..]);
+        rand::rng().fill(&mut addr[..]);
         let port = crate::util::get_free_port().unwrap();
 
         let pub_key = PEER_ID.with(|peer_id| {

@@ -1,7 +1,7 @@
 use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::Future;
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 use std::{
     collections::{HashMap, HashSet},
     net::Ipv6Addr,

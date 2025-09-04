@@ -71,7 +71,7 @@ impl AuthToken {
 
     pub fn generate() -> AuthToken {
         use rand::Rng;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut token = [0u8; 32];
         rng.fill(&mut token);
         let token_str = bs58::encode(token).into_string();
@@ -767,7 +767,7 @@ pub(crate) mod test {
         prelude::*,
     };
     use futures::{FutureExt, StreamExt};
-    use rand::{seq::SliceRandom, SeedableRng};
+    use rand::SeedableRng;
     use tokio::net::TcpStream;
     use tokio::sync::watch::Receiver;
     use tokio::sync::Mutex;
@@ -1181,13 +1181,15 @@ pub(crate) mod test {
         }
     }
 
+    use rand::prelude::IndexedRandom;
+
     impl RandomEventGenerator for rand::rngs::SmallRng {
         fn gen_u8(&mut self) -> u8 {
-            <Self as rand::Rng>::gen(self)
+            <Self as rand::Rng>::random(self)
         }
 
         fn gen_range(&mut self, range: std::ops::Range<usize>) -> usize {
-            <Self as rand::Rng>::gen_range(self, range)
+            <Self as rand::Rng>::random_range(self, range)
         }
 
         fn choose<'a, T>(&mut self, vec: &'a [T]) -> Option<&'a T> {

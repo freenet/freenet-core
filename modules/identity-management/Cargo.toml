@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 p384 =  { version = "0.13", default-features = false, features = ["serde", "pem", "pkcs8", "arithmetic"] }
-freenet-stdlib = { version = "0.1.6" }
+freenet-stdlib = { version = "0.1.14" }
 serde = "1"
 serde_json = "1"
 
@@ -16,7 +16,7 @@ serde_json = "1"
 p384 = { version = "0.13", default-features = true }
 ecdsa = "0.16"
 pico-args = "0.5"
-rand = "0.8"
+rand = "0.9"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
