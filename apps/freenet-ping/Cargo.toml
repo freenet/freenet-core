@@ -4,7 +4,7 @@ members = ["contracts/ping", "app", "types"]
 
 [workspace.dependencies]
 # freenet-stdlib = { path = "./../../stdlib/rust", features = ["contract"] }
-freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", tag = "v0.1.14" } 
+freenet-stdlib = { version = "0.1.14" } 
 freenet-ping-types = { path = "types", default-features = false }
 chrono = { version = "0.4", default-features = false }
 testresult = "0.4"

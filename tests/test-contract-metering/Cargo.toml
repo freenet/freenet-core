@@ -9,7 +9,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", tag = "v0.1.14", features = ["contract"] }
+freenet-stdlib = { version = "0.1.14", features = ["contract"] }
 serde = { version = "1", features = ["derive"] }
 
 [features]
