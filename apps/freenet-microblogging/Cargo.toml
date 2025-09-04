@@ -14,7 +14,7 @@ panic = 'abort'
 strip = true
 
 [workspace.dependencies]
-freenet-stdlib = { workspace = true, default-features = false, features = ["contract"] }
+freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", tag = "v0.1.14", default-features = false, features = ["contract"] }
 
 #[target.wasm32-unknown-unknown]
 #rustflags = ["-C", "link-arg=--import-memory"]
