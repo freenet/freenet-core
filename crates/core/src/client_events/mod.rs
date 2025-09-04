@@ -767,7 +767,6 @@ pub(crate) mod test {
         prelude::*,
     };
     use futures::{FutureExt, StreamExt};
-    use rand::SeedableRng;
     use tokio::net::TcpStream;
     use tokio::sync::watch::Receiver;
     use tokio::sync::Mutex;

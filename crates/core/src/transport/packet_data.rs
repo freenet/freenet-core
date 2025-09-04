@@ -262,15 +262,14 @@ impl<DT: Encryption, const N: usize> PartialEq for PacketData<DT, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::rand_core::RngCore;
     use aes_gcm::KeyInit;
-    use rand::rngs::OsRng;
+    use rand::prelude::*;
 
     #[test]
     fn test_encryption_decryption() {
         // Generate a random 128-bit (16 bytes) key
         let mut key = [0u8; 16];
-        OsRng.fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
 
         // Create a key object for AES-GCM
         let key = GenericArray::from_slice(&key);
@@ -291,7 +290,7 @@ mod tests {
     fn test_encryption_decryption_corrupted() {
         // Generate a random 128-bit (16 bytes) key
         let mut key = [0u8; 16];
-        OsRng.fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
 
         // Create a key object for AES-GCM
         let key = GenericArray::from_slice(&key);

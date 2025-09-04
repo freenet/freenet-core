@@ -1239,7 +1239,7 @@ mod test {
             match &self.packet_drop_policy {
                 PacketDropPolicy::ReceiveAll => {}
                 PacketDropPolicy::Factor(factor) => {
-                    if *factor > self.rng.try_lock().unwrap().gen::<f64>() {
+                    if *factor > self.rng.try_lock().unwrap().random::<f64>() {
                         tracing::trace!(id=%packet_idx, %self.this, "drop packet");
                         return Ok(buf.len());
                     }
@@ -1918,7 +1918,7 @@ mod test {
         let mut test_no = 0;
         for _ in 0..2 {
             for factor in std::iter::repeat(())
-                .map(|_| rng.gen::<f64>())
+                .map(|_| rng.random::<f64>())
                 .filter(|x| *x > 0.05 && *x < 0.25)
                 .take(3)
             {

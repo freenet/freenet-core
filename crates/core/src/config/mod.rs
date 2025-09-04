@@ -1080,7 +1080,8 @@ mod tests {
 
         let url = server.url_str("/gateways");
 
-        let key = rsa::RsaPrivateKey::new(&mut rand::rng(), 256).unwrap();
+        use rsa::rand_core::OsRng;
+        let key = rsa::RsaPrivateKey::new(&mut OsRng, 256).unwrap();
         let key = key
             .to_public_key()
             .to_public_key_pem(pkcs8::LineEnding::default())

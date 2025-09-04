@@ -84,7 +84,6 @@ impl TestConfig {
     fn seed(&self) -> u64 {
         use rand::RngCore;
         self.seed.unwrap_or_else(|| {
-            use rand::RngCore;
             let mut rng = rand::rng();
             rng.next_u64()
         })
