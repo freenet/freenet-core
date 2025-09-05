@@ -52,7 +52,7 @@ stretto = { features = ["async", "sync"], version = "0.8" }
 tar = { version = "0.4" }
 thiserror = "2"
 tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], version = "1" }
-tokio-tungstenite = "0.26.2"
+tokio-tungstenite = "0.27.0"
 tower-http = { features = ["fs", "trace"], version = "0.6" }
 ulid = { features = ["serde"], version = "1.1" }
 wasmer = { features = ["sys"], workspace = true }
