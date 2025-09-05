@@ -884,7 +884,7 @@ impl P2pConnManager {
                     // Don't propagate channel closed errors - just log and continue
                     // The receiver may have timed out or been cancelled, which shouldn't crash the node
                     if let Err(e) = r.send_result(Err(error)).await {
-                        tracing::debug!(%peer_id, "Failed to send connection error notification: {:?}", e);
+                        tracing::warn!(%peer_id, "Failed to send connection error notification - receiver may have timed out: {:?}", e);
                     }
                 }
             }
