@@ -741,11 +741,15 @@ impl P2pConnManager {
             if blocked_addrs.contains(&peer.addr) {
                 tracing::info!(tx = %tx, remote = %peer.addr, "Outgoing connection to peer blocked by local policy");
                 // Don't propagate channel closed errors when notifying about blocked connections
-                let _ = callback
+                callback
                     .send_result(Err(HandshakeError::ConnectionError(
                         crate::node::network_bridge::ConnectionError::AddressBlocked(peer.addr),
                     )))
-                    .await;
+                    .await
+                    .inspect_err(|e| {
+                        tracing::debug!("Failed to send blocked connection notification: {:?}", e)
+                    })
+                    .ok();
                 return Ok(());
             }
             tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
@@ -883,9 +887,12 @@ impl P2pConnManager {
                 if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
                     // Don't propagate channel closed errors - just log and continue
                     // The receiver may have timed out or been cancelled, which shouldn't crash the node
-                    if let Err(e) = r.send_result(Err(error)).await {
-                        tracing::warn!(%peer_id, "Failed to send connection error notification - receiver may have timed out: {:?}", e);
-                    }
+                    r.send_result(Err(error))
+                        .await
+                        .inspect_err(|e| {
+                            tracing::warn!(%peer_id, "Failed to send connection error notification - receiver may have timed out: {:?}", e);
+                        })
+                        .ok();
                 }
             }
             HandshakeEvent::RemoveTransaction(tx) => {
