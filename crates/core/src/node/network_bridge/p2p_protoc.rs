@@ -740,12 +740,16 @@ impl P2pConnManager {
         if let Some(blocked_addrs) = &self.blocked_addresses {
             if blocked_addrs.contains(&peer.addr) {
                 tracing::info!(tx = %tx, remote = %peer.addr, "Outgoing connection to peer blocked by local policy");
-                // Ensure ConnectionError is correctly namespaced if HandshakeError::ConnectionError expects it directly
+                // Don't propagate channel closed errors when notifying about blocked connections
                 callback
                     .send_result(Err(HandshakeError::ConnectionError(
                         crate::node::network_bridge::ConnectionError::AddressBlocked(peer.addr),
                     )))
-                    .await?;
+                    .await
+                    .inspect_err(|e| {
+                        tracing::debug!("Failed to send blocked connection notification: {:?}", e)
+                    })
+                    .ok();
                 return Ok(());
             }
             tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
@@ -864,24 +868,23 @@ impl P2pConnManager {
                 tracing::info!(%peer_id, "Connection failed: {:?}", error);
                 if self.check_version {
                     if let HandshakeError::TransportError(
-                        TransportError::ProtocolVersionMismatch { expected, actual },
+                        TransportError::ProtocolVersionMismatch { .. },
                     ) = &error
                     {
-                        tracing::error!(
-                            %peer_id,
-                            "Protocol version mismatch: expected {}, got {}",
-                            expected,
-                            actual
-                        );
-                        return Err(anyhow::anyhow!(
-                            "Protocol version mismatch: expected {}, got {}",
-                            expected,
-                            actual
-                        ));
+                        // The TransportError already has a user-friendly error message
+                        // Just propagate it without additional logging to avoid duplication
+                        return Err(error.into());
                     }
                 }
                 if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
-                    r.send_result(Err(error)).await?;
+                    // Don't propagate channel closed errors - just log and continue
+                    // The receiver may have timed out or been cancelled, which shouldn't crash the node
+                    r.send_result(Err(error))
+                        .await
+                        .inspect_err(|e| {
+                            tracing::warn!(%peer_id, "Failed to send connection error notification - receiver may have timed out: {:?}", e);
+                        })
+                        .ok();
                 }
             }
             HandshakeEvent::RemoveTransaction(tx) => {
@@ -890,7 +893,10 @@ impl P2pConnManager {
             HandshakeEvent::OutboundGatewayConnectionRejected { peer_id } => {
                 tracing::info!(%peer_id, "Connection rejected by peer");
                 if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
-                    r.send_result(Err(HandshakeError::ChannelClosed)).await?;
+                    // Don't propagate channel closed errors - just log and continue
+                    if let Err(e) = r.send_result(Err(HandshakeError::ChannelClosed)).await {
+                        tracing::debug!(%peer_id, "Failed to send rejection notification: {:?}", e);
+                    }
                 }
             }
             HandshakeEvent::InboundConnectionRejected { peer_id } => {

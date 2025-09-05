@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -29,7 +29,7 @@ semver = { workspace = true }
 tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
-tokio-tungstenite = "0.26.1"
+tokio-tungstenite = "0.27.0"
 toml = { version = "0.9", features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
@@ -38,7 +38,7 @@ reqwest = { version = "0.12", features = ["json"] }
 http = "1.2"
 
 # internal
-freenet = { path = "../core", version = "0.1.21" }
+freenet = { path = "../core", version = "0.1.22" }
 freenet-stdlib = { workspace = true }
 
 [features]
