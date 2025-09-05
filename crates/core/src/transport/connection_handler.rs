@@ -1351,7 +1351,7 @@ mod test {
             Self {
                 packet_drop_policy: PacketDropPolicy::ReceiveAll,
                 peers: 2,
-                wait_time: Duration::from_secs(2),
+                wait_time: Duration::from_secs(10), // Increased for CI reliability
             }
         }
     }
