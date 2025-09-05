@@ -54,7 +54,7 @@ pub(crate) async fn request_get(
     get_op: GetOp,
     skip_list: HashSet<PeerId>,
 ) -> Result<(), OpError> {
-    let (mut candidates, id, key_val, _fetch_contract) = if let Some(GetState::PrepareRequest {
+    let (mut candidates, id, key_val, fetch_contract) = if let Some(GetState::PrepareRequest {
         key,
         id,
         fetch_contract,
@@ -130,6 +130,69 @@ pub(crate) async fn request_get(
 
     // Take the first candidate as the target
     let target = candidates.remove(0);
+
+    // Check if the target is self (no other peers available)
+    let own_peer = op_manager
+        .ring
+        .connection_manager
+        .get_peer_key()
+        .ok_or(OpError::UnexpectedOpState)?;
+
+    if target.peer == own_peer {
+        // Target is self - this means no other peers are available
+        // Try to get the contract from local storage instead of attempting network communication
+        tracing::debug!(
+            tx = %id,
+            key = %key_val,
+            "GET: No other peers available (target is self), checking local storage",
+        );
+
+        let get_result = op_manager
+            .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                key: key_val,
+                return_contract_code: fetch_contract,
+            })
+            .await;
+
+        match get_result {
+            Ok(ContractHandlerEvent::GetResponse {
+                response:
+                    Ok(StoreResponse {
+                        state: Some(state),
+                        contract,
+                    }),
+                ..
+            }) => {
+                // Contract found locally, complete the operation
+                tracing::debug!("GET: Contract {} found locally", key_val);
+
+                // Mark operation as successful
+                let completed_op = GetOp {
+                    id,
+                    state: Some(GetState::Finished { key: key_val }),
+                    result: Some(GetResult {
+                        key: key_val,
+                        state,
+                        contract,
+                    }),
+                    stats: get_op.stats,
+                };
+
+                // Push the completed operation to be processed
+                op_manager.push(id, OpEnum::Get(completed_op)).await?;
+                return Ok(());
+            }
+            _ => {
+                // Contract not found locally and no peers to query
+                tracing::warn!(
+                    "GET: Contract {} not found locally and no other peers available",
+                    key_val
+                );
+                return Err(RingError::EmptyRing.into());
+            }
+        }
+    }
+
     tracing::debug!(
         tx = %id,
         target = %target.peer,
