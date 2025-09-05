@@ -1632,7 +1632,7 @@ dependencies = [
  "tempfile",
  "testresult",
  "tokio",
- "tokio-tungstenite 0.26.2",
+ "tokio-tungstenite 0.27.0",
  "tracing",
  "tracing-subscriber",
 ]

@@ -740,12 +740,12 @@ impl P2pConnManager {
         if let Some(blocked_addrs) = &self.blocked_addresses {
             if blocked_addrs.contains(&peer.addr) {
                 tracing::info!(tx = %tx, remote = %peer.addr, "Outgoing connection to peer blocked by local policy");
-                // Ensure ConnectionError is correctly namespaced if HandshakeError::ConnectionError expects it directly
-                callback
+                // Don't propagate channel closed errors when notifying about blocked connections
+                let _ = callback
                     .send_result(Err(HandshakeError::ConnectionError(
                         crate::node::network_bridge::ConnectionError::AddressBlocked(peer.addr),
                     )))
-                    .await?;
+                    .await;
                 return Ok(());
             }
             tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
@@ -881,7 +881,11 @@ impl P2pConnManager {
                     }
                 }
                 if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
-                    r.send_result(Err(error)).await?;
+                    // Don't propagate channel closed errors - just log and continue
+                    // The receiver may have timed out or been cancelled, which shouldn't crash the node
+                    if let Err(e) = r.send_result(Err(error)).await {
+                        tracing::debug!(%peer_id, "Failed to send connection error notification: {:?}", e);
+                    }
                 }
             }
             HandshakeEvent::RemoveTransaction(tx) => {
@@ -890,7 +894,10 @@ impl P2pConnManager {
             HandshakeEvent::OutboundGatewayConnectionRejected { peer_id } => {
                 tracing::info!(%peer_id, "Connection rejected by peer");
                 if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
-                    r.send_result(Err(HandshakeError::ChannelClosed)).await?;
+                    // Don't propagate channel closed errors - just log and continue
+                    if let Err(e) = r.send_result(Err(HandshakeError::ChannelClosed)).await {
+                        tracing::debug!(%peer_id, "Failed to send rejection notification: {:?}", e);
+                    }
                 }
             }
             HandshakeEvent::InboundConnectionRejected { peer_id } => {
