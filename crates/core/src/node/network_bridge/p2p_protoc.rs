@@ -868,20 +868,12 @@ impl P2pConnManager {
                 tracing::info!(%peer_id, "Connection failed: {:?}", error);
                 if self.check_version {
                     if let HandshakeError::TransportError(
-                        TransportError::ProtocolVersionMismatch { expected, actual },
+                        TransportError::ProtocolVersionMismatch { .. },
                     ) = &error
                     {
-                        tracing::error!(
-                            %peer_id,
-                            "Protocol version mismatch: expected {}, got {}",
-                            expected,
-                            actual
-                        );
-                        return Err(anyhow::anyhow!(
-                            "Protocol version mismatch: expected {}, got {}",
-                            expected,
-                            actual
-                        ));
+                        // The TransportError already has a user-friendly error message
+                        // Just propagate it without additional logging to avoid duplication
+                        return Err(error.into());
                     }
                 }
                 if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
