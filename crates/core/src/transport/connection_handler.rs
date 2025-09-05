@@ -172,7 +172,10 @@ impl OutboundConnectionHandler {
         // for this purpose (default: 3 MB/s).
         task::spawn(bw_tracker.rate_limiter(None, socket));
         task::spawn(RANDOM_U64.scope(
-            StdRng::seed_from_u64(rand::random()).random(),
+            {
+                let mut rng = StdRng::seed_from_u64(rand::random());
+                rng.random()
+            },
             transport.listen(),
         ));
 
