@@ -48,7 +48,7 @@ pub(crate) enum TransportError {
     ConnectionClosed(SocketAddr),
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
-    #[error("wrong version of the protocol for gateway, expected {expected}, got {actual}")]
+    #[error("Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core")]
     ProtocolVersionMismatch {
         expected: String,
         actual: &'static str,
