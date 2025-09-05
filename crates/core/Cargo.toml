@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.21"
+version = "0.1.23"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -89,6 +89,7 @@ statrs = "0.18"
 tempfile = "3"
 test-log = "0.2"
 testresult.workspace = true
+tokio-tungstenite = "0.27.0"
 # console-subscriber = { version = "0.4" }
 
 [features]

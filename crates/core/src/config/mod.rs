@@ -276,33 +276,62 @@ impl ConfigArgs {
         } else {
             Gateways::default()
         };
-        let mut gateways = match File::open(&*gateways_file) {
-            Ok(mut file) => {
-                let mut content = String::new();
-                file.read_to_string(&mut content)?;
-                toml::from_str::<Gateways>(&content).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                })?
-            }
-            Err(err) => {
-                if peer_id.is_none()
-                    && mode == OperationMode::Network
-                    && remotely_loaded_gateways.gateways.is_empty()
-                {
-                    tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
 
-                    return Err(anyhow::Error::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "Cannot initialize node without gateways",
-                    )));
-                }
-                if remotely_loaded_gateways.gateways.is_empty() {
-                    tracing::warn!("No gateways file found, initializing disjoint gateway, initializing a new network.");
-                }
-                Gateways { gateways: vec![] }
+        // Decide which gateways to use based on whether we fetched from network
+        let gateways = if !self.network_api.skip_load_from_network
+            && !remotely_loaded_gateways.gateways.is_empty()
+        {
+            // When we successfully fetch gateways from the network, replace local ones entirely
+            // This ensures users always use the current active gateways
+            // TODO: This behavior will likely change once we release a stable version
+            tracing::info!(
+                "Replacing local gateways with {} gateway(s) from remote index",
+                remotely_loaded_gateways.gateways.len()
+            );
+
+            // Save the updated gateways to the local file for next time
+            if let Err(e) = remotely_loaded_gateways.save_to_file(&gateways_file) {
+                tracing::warn!("Failed to save updated gateways to file: {}", e);
             }
+
+            remotely_loaded_gateways
+        } else {
+            // When skip_load_from_network is set or remote fetch failed, use local gateways
+            let mut gateways = match File::open(&*gateways_file) {
+                Ok(mut file) => {
+                    let mut content = String::new();
+                    file.read_to_string(&mut content)?;
+                    toml::from_str::<Gateways>(&content).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?
+                }
+                Err(err) => {
+                    if peer_id.is_none()
+                        && mode == OperationMode::Network
+                        && remotely_loaded_gateways.gateways.is_empty()
+                    {
+                        tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
+
+                        return Err(anyhow::Error::new(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "Cannot initialize node without gateways",
+                        )));
+                    }
+                    if remotely_loaded_gateways.gateways.is_empty() {
+                        tracing::warn!("No gateways file found, initializing disjoint gateway, initializing a new network.");
+                    }
+                    Gateways { gateways: vec![] }
+                }
+            };
+
+            // If we have remotely loaded gateways but skip_load_from_network was not set,
+            // it means the remote fetch failed but we got default/inline gateways
+            if !remotely_loaded_gateways.gateways.is_empty() {
+                gateways.merge_and_deduplicate(remotely_loaded_gateways);
+            }
+
+            gateways
         };
-        gateways.merge_and_deduplicate(remotely_loaded_gateways);
 
         let this = Config {
             mode,
