@@ -380,16 +380,16 @@ mod tests {
 
         // Create NUM_EVENTS random events
         let mut events = vec![];
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..NUM_EVENTS {
-            let peer = peers[rng.gen_range(0..NUM_PEERS)].clone();
+            let peer = peers[rng.random_range(0..NUM_PEERS)].clone();
             let contract_location = Location::random();
             let simulated_prediction =
                 simulate_prediction(&mut rng, peer.clone(), contract_location);
             let event = RouteEvent {
                 peer,
                 contract_location,
-                outcome: if rng.gen_range(0.0..1.0) > simulated_prediction.failure_probability {
+                outcome: if rng.random_range(0.0..1.0) > simulated_prediction.failure_probability {
                     RouteOutcome::Success {
                         time_to_response_start: Duration::from_secs_f64(
                             simulated_prediction.time_to_response_start,
@@ -523,7 +523,7 @@ mod tests {
         let time_to_response_start = 2.0 * distance.as_f64();
         let failure_prob = distance.as_f64();
         let transfer_speed = 100.0 - (100.0 * distance.as_f64());
-        let payload_size = random.gen_range(100..1000);
+        let payload_size = random.random_range(100..1000);
         let transfer_time = transfer_speed * (payload_size as f64);
         RoutingPrediction {
             failure_probability: failure_prob,

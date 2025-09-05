@@ -83,14 +83,14 @@ impl TestConfig {
 
     fn seed(&self) -> u64 {
         use rand::RngCore;
-        self.seed.unwrap_or_else(|| rand::rngs::OsRng.next_u64())
+        self.seed.unwrap_or_else(|| rand::rng().next_u64())
     }
 }
 
 fn randomize_test_name() -> String {
     const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz";
     use rand::seq::IteratorRandom;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut name = String::with_capacity(16);
     for _ in 0..16 {
         name.push(ALPHABET.chars().choose(&mut rng).expect("non empty"));

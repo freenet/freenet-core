@@ -22,7 +22,7 @@ use either::Either;
 use freenet_stdlib::prelude::ContractKey;
 use itertools::Itertools;
 use parking_lot::RwLock;
-use rand::Rng;
+use rand::{prelude::IndexedRandom, Rng};
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -287,8 +287,7 @@ impl Ring {
         // Get all connected peers through the connection manager
         let connections = self.connection_manager.get_connections_by_location();
         let peers = connections.values().filter_map(|conns| {
-            use rand::seq::SliceRandom;
-            let conn = conns.choose(&mut rand::thread_rng())?;
+            let conn = conns.choose(&mut rand::rng())?;
             (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
         });
 
@@ -355,7 +354,6 @@ impl Ring {
         location: Location,
         skip_list: HashSet<PeerId>,
     ) -> Option<PeerKeyLocation> {
-        use rand::seq::SliceRandom;
         self.connection_manager
             .get_connections_by_location()
             .iter()
@@ -364,7 +362,7 @@ impl Ring {
             })
             .find_map(|(_, conns)| {
                 for _ in 0..conns.len() {
-                    let conn = conns.choose(&mut rand::thread_rng()).unwrap();
+                    let conn = conns.choose(&mut rand::rng()).unwrap();
                     let selected =
                         (!skip_list.contains(&conn.location.peer)).then_some(conn.location.clone());
                     if selected.is_some() {

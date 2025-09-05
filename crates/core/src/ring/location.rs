@@ -51,8 +51,8 @@ impl Location {
     /// Returns a new random location.
     pub fn random() -> Self {
         use rand::prelude::*;
-        let mut rng = rand::thread_rng();
-        Location(rng.gen_range(0.0..=1.0))
+        let mut rng = rand::rng();
+        Location(rng.random_range(0.0..=1.0))
     }
 
     /// Compute the distance between two locations.
@@ -259,7 +259,7 @@ mod test {
         // Generate 100 random IP addresses wih seeded RNG
         let ips = (0..100)
             .map(|_| {
-                let ip = Ipv4Addr::new(rng.gen(), rng.gen(), rng.gen(), rng.gen());
+                let ip = Ipv4Addr::new(rng.random(), rng.random(), rng.random(), rng.random());
                 SocketAddr::new(IpAddr::V4(ip), 12345)
             })
             .collect::<Vec<_>>();

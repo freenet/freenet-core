@@ -1,7 +1,10 @@
 use std::path::Path;
 
-use rand::rngs::OsRng;
-use rsa::{pkcs8, rand_core::CryptoRngCore, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+use rsa::{
+    pkcs8,
+    rand_core::{CryptoRngCore, OsRng},
+    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
