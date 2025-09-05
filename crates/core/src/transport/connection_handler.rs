@@ -481,7 +481,16 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                         }
                         Err((error, remote_addr)) => {
-                            tracing::error!(%error, ?remote_addr, "Failed to establish connection");
+                            // Only log non-version-mismatch errors at error level
+                            // Version mismatches have their own user-friendly error message
+                            match &error {
+                                TransportError::ProtocolVersionMismatch { .. } => {
+                                    tracing::info!(?remote_addr, "Connection failed due to version mismatch");
+                                }
+                                _ => {
+                                    tracing::error!(%error, ?remote_addr, "Failed to establish connection");
+                                }
+                            }
                             if let Some((_, result_sender)) = ongoing_connections.remove(&remote_addr) {
                                 let _ = result_sender.send(Err(error));
                             }
