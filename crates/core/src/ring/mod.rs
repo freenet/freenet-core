@@ -267,22 +267,12 @@ impl Ring {
         contract_key: &ContractKey,
         skip_list: impl Contains<PeerId> + Clone,
         k: usize,
-        include_self: bool,
     ) -> Vec<PeerKeyLocation> {
         let router = self.router.read();
         let target_location = Location::from(contract_key);
 
-        // Get own location if we should include self
-        let own_loc = if include_self {
-            let loc = self.connection_manager.own_location();
-            if !skip_list.has_element(loc.peer.clone()) {
-                Some(loc)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Never include self - callers should check local storage before network operations
+        let own_loc = None;
 
         // Get all connected peers through the connection manager
         let connections = self.connection_manager.get_connections_by_location();
