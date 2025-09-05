@@ -1589,6 +1589,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "tokio-tungstenite 0.26.2",
+ "tokio-tungstenite 0.27.0",
  "toml",
  "tower-http",
  "tracing",
