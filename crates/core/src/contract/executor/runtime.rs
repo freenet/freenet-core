@@ -72,10 +72,27 @@ impl ContractExecutor for Executor<Runtime> {
             let code = code.ok_or_else(|| {
                 ExecutorError::request(StdContractError::MissingContract { key: key.into() })
             })?;
+            // DEBUG: Log before and after store_contract
+            tracing::debug!(
+                "DEBUG PUT: Before store_contract - key={}, key.code_hash={:?}",
+                key,
+                key.code_hash()
+            );
+
             self.runtime
                 .contract_store
                 .store_contract(code.clone())
                 .map_err(ExecutorError::other)?;
+
+            // Immediately verify the contract was stored
+            let fetch_result = self.runtime.contract_store.fetch_contract(&key, &params);
+            tracing::debug!(
+                "DEBUG PUT: After store_contract - key={}, stored successfully={}, immediate fetch result={}",
+                key,
+                true,
+                fetch_result.is_some()
+            );
+
             true
         } else {
             false
@@ -943,6 +960,15 @@ impl Executor<Runtime> {
                     contract = %trying_key,
                     "storing contract in runtime store"
                 );
+                // DEBUG: Log contract details before storing
+                tracing::debug!(
+                    "DEBUG PUT: verify_and_store_contract - key={}, key.code_hash={:?}, contract.key={}, contract.key.code_hash={:?}",
+                    key,
+                    key.code_hash(),
+                    contract.key(),
+                    contract.key().code_hash()
+                );
+
                 self.runtime
                     .contract_store
                     .store_contract(contract)
