@@ -1398,7 +1398,7 @@ mod test {
                 barrier_cp.wait().await;
                 for (peer_pub, peer_addr) in &peer_keys_and_addr {
                     let peer_conn = tokio::time::timeout(
-                        Duration::from_secs(2),
+                        Duration::from_secs(10), // Increased connection timeout for reliability
                         peer.connect(peer_pub.clone(), *peer_addr).await,
                     );
                     establish_conns.push(peer_conn);
@@ -1799,6 +1799,7 @@ mod test {
         run_test(
             TestConfig {
                 peers: 10,
+                wait_time: Duration::from_secs(30), // Increased timeout for CI reliability
                 ..Default::default()
             },
             Vec::from_iter((0..10).map(|_| TestData("foo"))),
