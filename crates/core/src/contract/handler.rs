@@ -177,6 +177,7 @@ pub(crate) enum WaitingTransaction {
 
 /// Session message definitions for actor-based client management
 #[allow(dead_code)]
+#[derive(Debug)]
 pub enum SessionMessage {
     #[allow(dead_code)]
     RegisterClient {
@@ -196,6 +197,11 @@ pub enum SessionMessage {
     DeliverResult {
         tx: Transaction,
         result: Box<QueryResult>,
+    },
+    #[allow(dead_code)]
+    DeliverHostResponse {
+        tx: Transaction,
+        response: Box<HostResult>,
     },
     #[allow(dead_code)]
     ClientDisconnect {

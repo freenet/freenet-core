@@ -405,6 +405,29 @@ async fn report_result(
                 );
             }
 
+            // NEW: Send to result router if feature flag is enabled and transaction exists
+            // (independent of legacy callback presence)
+            if let (Some(transaction), Some(router_tx)) = (tx, &op_manager.result_router_tx) {
+                let host_result = op_res.to_host_result();
+                let router_tx_clone = router_tx.clone();
+
+                // Spawn fire-and-forget task to avoid blocking report_result()
+                // while still guaranteeing message delivery
+                tokio::spawn(async move {
+                    if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
+                        tracing::error!(
+                            "CRITICAL: Result router channel closed - dual-path delivery broken. \
+                             Router or session actor has crashed. Transaction: {}. Error: {}. \
+                             Consider restarting node or disabling FREENET_ACTOR_CLIENTS flag.",
+                            transaction,
+                            e
+                        );
+                        // TODO: Consider implementing circuit breaker or automatic recovery
+                    }
+                });
+            }
+
+            // EXISTING: Legacy client delivery (preserved)
             if let Some((client_ids, cb)) = client_req_handler_callback {
                 for client_id in client_ids {
                     // Enhanced logging for UPDATE operations
