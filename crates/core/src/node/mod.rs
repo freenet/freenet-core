@@ -405,21 +405,36 @@ async fn report_result(
                 );
             }
 
-            if let Some((client_ids, cb)) = client_req_handler_callback {
-                // NEW: Send to result router if feature flag is enabled and transaction exists
-                if let (Some(transaction), Some(router_tx)) = (tx, &op_manager.result_router_tx) {
-                    if let Err(e) = router_tx.send((transaction, op_res.to_host_result())).await {
+            // NEW: Send to result router if feature flag is enabled and transaction exists
+            // (independent of legacy callback presence)
+            if let (Some(transaction), Some(router_tx)) = (tx, &op_manager.result_router_tx) {
+                let host_result = op_res.to_host_result();
+                match router_tx.try_send((transaction, host_result)) {
+                    Ok(_) => {
+                        // Success - router received the result
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            "Router channel full - result delivery delayed. \
+                             Session actor may be overloaded. Transaction: {}", 
+                            transaction
+                        );
+                        // TODO: Add metric for channel full events
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         tracing::error!(
                             "CRITICAL: Result router channel closed - dual-path delivery broken. \
-                             Router or session actor has crashed. Error: {}. \
+                             Router or session actor has crashed. Transaction: {}. \
                              Consider restarting node or disabling FREENET_ACTOR_CLIENTS flag.", 
-                            e
+                            transaction
                         );
                         // TODO: Consider implementing circuit breaker or automatic recovery
                     }
                 }
-                
-                // EXISTING: Legacy client delivery (preserved)
+            }
+
+            // EXISTING: Legacy client delivery (preserved)
+            if let Some((client_ids, cb)) = client_req_handler_callback {
                 for client_id in client_ids {
                     // Enhanced logging for UPDATE operations
                     if let crate::operations::OpEnum::Update(ref update_op) = op_res {
