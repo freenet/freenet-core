@@ -32,10 +32,22 @@ impl ResultRouter {
                 tx,
                 response: Box::new(host_result),
             };
-            if let Err(e) = self.session_actor_tx.try_send(msg) {
-                tracing::warn!("Failed to route result to session actor: {}", e);
+            if let Err(e) = self.session_actor_tx.send(msg).await {
+                tracing::error!(
+                    "CRITICAL: Session actor channel closed - result routing failed. \
+                     Session actor has crashed. Transaction {}: {}. \
+                     Actor-based client delivery is broken.",
+                    tx, e
+                );
+                // Router can't continue without session actor - exit loop
+                break;
             }
         }
+        
+        tracing::error!(
+            "CRITICAL: ResultRouter shutting down due to session actor failure. \
+             Dual-path delivery compromised. Consider restarting node."
+        );
     }
 }
 
