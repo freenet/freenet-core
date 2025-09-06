@@ -272,8 +272,6 @@ impl Ring {
         let target_location = Location::from(contract_key);
 
         // Never include self - callers should check local storage before network operations
-        let own_loc = None;
-
         // Get all connected peers through the connection manager
         let connections = self.connection_manager.get_connections_by_location();
         let peers = connections.values().filter_map(|conns| {
@@ -281,15 +279,9 @@ impl Ring {
             (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
         });
 
-        // Chain own location if it should be included
-        let all_peers: Vec<PeerKeyLocation> = if let Some(ref own) = own_loc {
-            peers.chain(std::iter::once(own)).cloned().collect()
-        } else {
-            peers.cloned().collect()
-        };
-
+        // Pass peers directly to select_k_best_peers since we never include self
         router
-            .select_k_best_peers(all_peers.iter(), target_location, k)
+            .select_k_best_peers(peers, target_location, k)
             .into_iter()
             .cloned()
             .collect()
