@@ -137,6 +137,7 @@ pub struct Runtime {
     /// loaded contract modules
     pub(super) contract_modules: HashMap<ContractKey, Module>,
     pub(crate) enabled_metering: bool,
+    pub(super) max_execution_seconds: f64,
 }
 
 impl Runtime {
@@ -175,6 +176,7 @@ impl Runtime {
             contract_store,
             delegate_modules: HashMap::new(),
             enabled_metering: config.enable_metering,
+            max_execution_seconds: config.max_execution_seconds,
         })
     }
 
