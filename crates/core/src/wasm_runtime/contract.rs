@@ -307,7 +307,7 @@ fn handle_execution_call(
 ) -> Result<i64, Errors> {
     // Calculate timeout iterations: max_execution_seconds * 100 (since we check every 10ms)
     let timeout_iterations = (rt.max_execution_seconds * 100.0) as u64;
-    
+
     // Check if we're in a tokio runtime context
     if tokio::runtime::Handle::try_current().is_ok() {
         // We're in an async context, use block_in_place to avoid blocking the executor

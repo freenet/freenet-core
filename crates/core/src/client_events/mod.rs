@@ -27,11 +27,11 @@ use crate::operations::{get, put, update, OpError};
 use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 pub(crate) mod combinator;
+#[cfg(test)]
+mod integration_verification;
 pub(crate) mod result_router;
 #[cfg(test)]
 mod test_correlation;
-#[cfg(test)]
-mod integration_verification;
 #[cfg(feature = "websocket")]
 pub(crate) mod websocket;
 
@@ -394,9 +394,9 @@ async fn process_open_request(
                             subscribe,
                         );
                         let op_id = op.id;
-                        
+
                         tracing::debug!(
-                            request_id = %request_id, 
+                            request_id = %request_id,
                             transaction_id = %op_id,
                             operation = "put",
                             "Request-Transaction correlation"
@@ -505,9 +505,9 @@ async fn process_open_request(
                             "Sending update op",
                         );
                         let op = update::start_op(key, new_state, related_contracts);
-                        
+
                         tracing::debug!(
-                            request_id = %request_id, 
+                            request_id = %request_id,
                             transaction_id = %op.id,
                             operation = "update",
                             "Request-Transaction correlation"
@@ -625,9 +625,9 @@ async fn process_open_request(
                             );
 
                             let op = get::start_op(key, return_contract_code, subscribe);
-                            
+
                             tracing::debug!(
-                                request_id = %request_id, 
+                                request_id = %request_id,
                                 transaction_id = %op.id,
                                 operation = "get",
                                 "Request-Transaction correlation"
@@ -658,9 +658,9 @@ async fn process_open_request(
                                 .inspect_err(|err| {
                                     tracing::error!("Subscribe error: {}", err);
                                 })?;
-                                
+
                         tracing::debug!(
-                            request_id = %request_id, 
+                            request_id = %request_id,
                             transaction_id = %op_id,
                             operation = "subscribe",
                             "Request-Transaction correlation"

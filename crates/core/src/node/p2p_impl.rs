@@ -222,7 +222,7 @@ impl NodeP2P {
 
         // Prepare session adapter channel for actor-based client management
         let (_session_tx, _session_rx) = tokio::sync::mpsc::channel(1000);
-        
+
         // Install session adapter in contract handler if migration enabled
         if std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true" {
             ch_outbound.with_session_adapter(_session_tx);

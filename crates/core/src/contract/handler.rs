@@ -303,30 +303,27 @@ impl ContractHandlerChannel<SenderHalve> {
         client_id: ClientId,
     ) -> Result<(), ContractError> {
         let waiting_tx = transaction.into();
-        
+
         // Call legacy implementation first
         self.end
             .wait_for_res_tx
             .send((client_id, waiting_tx))
             .await
             .map_err(|_| ContractError::NoEvHandlerResponse)?;
-        
+
         // Optionally route to session actor if migration enabled
         if std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true" {
             if let Some(session_tx) = &self.session_adapter_tx {
                 // Only mirror Transaction variants, handle Subscription separately later
                 if let WaitingTransaction::Transaction(tx) = waiting_tx {
-                    let msg = SessionMessage::RegisterTransaction { 
-                        tx, 
-                        client_id 
-                    };
+                    let msg = SessionMessage::RegisterTransaction { tx, client_id };
                     if let Err(e) = session_tx.try_send(msg) {
                         tracing::warn!("Failed to notify session actor: {}", e);
                     }
                 }
             }
         }
-        
+
         Ok(())
     }
 }
