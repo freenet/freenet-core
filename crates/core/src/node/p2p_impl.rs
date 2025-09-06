@@ -217,8 +217,19 @@ impl NodeP2P {
         ER: NetEventRegister + Clone,
     {
         let (notification_channel, notification_tx) = event_loop_notification_channel();
-        let (ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
+        let (mut ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::client_responses_channel();
+
+        // Prepare session adapter channel for actor-based client management
+        let (_session_tx, _session_rx) = tokio::sync::mpsc::channel(1000);
+        
+        // Install session adapter in contract handler if migration enabled
+        if std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true" {
+            ch_outbound.with_session_adapter(_session_tx);
+            tracing::info!("Actor-based client management infrastructure installed");
+        } else {
+            tracing::debug!("Actor-based client management disabled");
+        }
 
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
