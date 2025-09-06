@@ -231,13 +231,13 @@ impl NodeP2P {
                 // Create result router channel for dual-path result delivery
                 let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(1000);
 
-                // Spawn Session Actor Stub
-                use crate::client_events::session_actor::SessionActorStub;
-                let session_actor = SessionActorStub::new(session_rx);
+                // Spawn Session Actor
+                use crate::client_events::session_actor::SessionActor;
+                let session_actor = SessionActor::new(session_rx, cli_response_sender.clone());
                 GlobalExecutor::spawn(async move {
-                    tracing::info!("Session actor stub starting");
+                    tracing::info!("Session actor starting");
                     session_actor.run().await;
-                    tracing::warn!("Session actor stub stopped");
+                    tracing::warn!("Session actor stopped");
                 });
 
                 // Spawn ResultRouter task
