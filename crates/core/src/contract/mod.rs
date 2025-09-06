@@ -88,6 +88,23 @@ where
                 related_contracts,
                 contract,
             } => {
+                // DEBUG: Log contract details in PutQuery handler
+                if let Some(ref contract_container) = contract {
+                    tracing::debug!(
+                        "DEBUG PUT: In PutQuery handler - key={}, key.code_hash={:?}, contract.key={}, contract.key.code_hash={:?}, data_len={}",
+                        key,
+                        key.code_hash(),
+                        contract_container.key(),
+                        contract_container.key().code_hash(),
+                        contract_container.data().len()
+                    );
+                } else {
+                    tracing::debug!(
+                        "DEBUG PUT: In PutQuery handler - contract is None for key={}",
+                        key
+                    );
+                }
+
                 let put_result = contract_handler
                     .executor()
                     .upsert_contract_state(

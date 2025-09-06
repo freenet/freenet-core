@@ -132,7 +132,7 @@ impl ConfigArgs {
                     if filename.starts_with("config") {
                         match ext.as_str() {
                             "toml" => {
-                                tracing::info!("Found configuration file: {filename}.{ext}");
+                                tracing::info!("Found configuration file: {filename}");
                                 return Some((filename, ext));
                             }
                             "json" => {
