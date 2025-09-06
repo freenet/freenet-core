@@ -9,11 +9,13 @@
 use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
 
 use dashmap::{DashMap, DashSet};
+use tokio::sync::mpsc;
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
 use tracing::Instrument;
 
 use crate::{
+    client_events::HostResult,
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
@@ -63,6 +65,9 @@ pub(crate) struct OpManager {
     to_event_listener: EventLoopNotificationsSender,
     pub ch_outbound: ContractHandlerChannel<SenderHalve>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
+    pub result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
+    // TODO: Add circuit breaker state for router failures
+    // pub router_circuit_breaker: Arc<AtomicBool>,
 }
 
 impl OpManager {
@@ -72,6 +77,7 @@ impl OpManager {
         config: &NodeConfig,
         event_register: ER,
         connection_manager: ConnectionManager,
+        result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
     ) -> anyhow::Result<Self> {
         let ring = Ring::new(
             config,
@@ -106,6 +112,7 @@ impl OpManager {
             to_event_listener: notification_channel,
             ch_outbound,
             new_transactions,
+            result_router_tx,
         })
     }
 

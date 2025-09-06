@@ -345,6 +345,7 @@ pub struct NetworkDebugInfo {
     pub connected_peers: Vec<PeerId>,
 }
 
+#[derive(Debug)]
 pub(crate) enum QueryResult {
     Connections(Vec<PeerId>),
     GetResult {

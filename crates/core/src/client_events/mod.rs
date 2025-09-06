@@ -30,6 +30,7 @@ pub(crate) mod combinator;
 #[cfg(test)]
 mod integration_verification;
 pub(crate) mod result_router;
+pub(crate) mod session_actor;
 #[cfg(test)]
 mod test_correlation;
 #[cfg(feature = "websocket")]

@@ -3,21 +3,20 @@
 //! This module provides infrastructure for routing transaction results
 //! from the network layer to the session actor.
 
+use crate::client_events::HostResult;
 use crate::contract::SessionMessage;
-use crate::message::{QueryResult, Transaction};
+use crate::message::Transaction;
 use tokio::sync::mpsc;
 
 /// Result router for transaction results
-#[allow(dead_code)]
 pub struct ResultRouter {
-    network_results: mpsc::Receiver<(Transaction, QueryResult)>,
+    network_results: mpsc::Receiver<(Transaction, HostResult)>,
     session_actor_tx: mpsc::Sender<SessionMessage>,
 }
 
 impl ResultRouter {
-    #[allow(dead_code)]
     pub fn new(
-        network_results: mpsc::Receiver<(Transaction, QueryResult)>,
+        network_results: mpsc::Receiver<(Transaction, HostResult)>,
         session_actor_tx: mpsc::Sender<SessionMessage>,
     ) -> Self {
         Self {
@@ -27,12 +26,11 @@ impl ResultRouter {
     }
 
     /// Main routing loop
-    #[allow(dead_code)]
     pub async fn run(mut self) {
-        while let Some((tx, result)) = self.network_results.recv().await {
-            let msg = SessionMessage::DeliverResult {
+        while let Some((tx, host_result)) = self.network_results.recv().await {
+            let msg = SessionMessage::DeliverHostResponse {
                 tx,
-                result: Box::new(result),
+                response: Box::new(host_result),
             };
             if let Err(e) = self.session_actor_tx.try_send(msg) {
                 tracing::warn!("Failed to route result to session actor: {}", e);

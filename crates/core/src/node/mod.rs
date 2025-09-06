@@ -406,6 +406,20 @@ async fn report_result(
             }
 
             if let Some((client_ids, cb)) = client_req_handler_callback {
+                // NEW: Send to result router if feature flag is enabled and transaction exists
+                if let (Some(transaction), Some(router_tx)) = (tx, &op_manager.result_router_tx) {
+                    if let Err(e) = router_tx.send((transaction, op_res.to_host_result())).await {
+                        tracing::error!(
+                            "CRITICAL: Result router channel closed - dual-path delivery broken. \
+                             Router or session actor has crashed. Error: {}. \
+                             Consider restarting node or disabling FREENET_ACTOR_CLIENTS flag.", 
+                            e
+                        );
+                        // TODO: Consider implementing circuit breaker or automatic recovery
+                    }
+                }
+                
+                // EXISTING: Legacy client delivery (preserved)
                 for client_id in client_ids {
                     // Enhanced logging for UPDATE operations
                     if let crate::operations::OpEnum::Update(ref update_op) = op_res {
