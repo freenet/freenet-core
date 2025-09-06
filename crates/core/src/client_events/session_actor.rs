@@ -21,53 +21,67 @@ impl SessionActorStub {
     pub async fn run(mut self) {
         tracing::info!("Session actor stub starting");
 
-        while let Some(message) = self.message_rx.recv().await {
-            match message {
-                SessionMessage::DeliverHostResponse { tx, response } => {
-                    tracing::debug!(
-                        "Session actor received DeliverHostResponse for transaction {}: {:?}",
-                        tx,
-                        match *response {
-                            Ok(_) => "Success",
-                            Err(_) => "Error",
+        loop {
+            match self.message_rx.recv().await {
+                Some(message) => {
+                    match message {
+                        SessionMessage::DeliverHostResponse { tx, response } => {
+                            tracing::debug!(
+                                "Session actor received DeliverHostResponse for transaction {}: {:?}",
+                                tx,
+                                match *response {
+                                    Ok(_) => "Success",
+                                    Err(_) => "Error",
+                                }
+                            );
+                            // Future: This will route to client sessions
                         }
-                    );
-                    // Future: This will route to client sessions
+                        SessionMessage::RegisterClient {
+                            client_id,
+                            request_id,
+                            ..
+                        } => {
+                            tracing::debug!(
+                                "Session actor received RegisterClient: client={}, request={}",
+                                client_id,
+                                request_id
+                            );
+                            // Future: This will create client sessions
+                        }
+                        SessionMessage::RegisterTransaction { tx, client_id } => {
+                            tracing::debug!(
+                                "Session actor received RegisterTransaction: tx={}, client={}",
+                                tx,
+                                client_id
+                            );
+                            // Future: This will track client-transaction relationships
+                        }
+                        SessionMessage::ClientDisconnect { client_id } => {
+                            tracing::debug!(
+                                "Session actor received ClientDisconnect: client={}",
+                                client_id
+                            );
+                            // Future: This will clean up client sessions
+                        }
+                        SessionMessage::DeliverResult { tx, result: _ } => {
+                            tracing::debug!(
+                                "Session actor received legacy DeliverResult for transaction {}: {:?}",
+                                tx,
+                                "QueryResult" // Don't log full QueryResult as it doesn't implement Display
+                            );
+                            // Legacy variant - will be removed in future refactoring
+                        }
+                    }
                 }
-                SessionMessage::RegisterClient {
-                    client_id,
-                    request_id,
-                    ..
-                } => {
-                    tracing::debug!(
-                        "Session actor received RegisterClient: client={}, request={}",
-                        client_id,
-                        request_id
+                None => {
+                    // Channel closed - this is a critical system failure
+                    tracing::error!(
+                        "CRITICAL: Session actor message channel closed. \
+                         Result router or network layer has disconnected. \
+                         Actor-based client delivery is broken. \
+                         Session actor shutting down."
                     );
-                    // Future: This will create client sessions
-                }
-                SessionMessage::RegisterTransaction { tx, client_id } => {
-                    tracing::debug!(
-                        "Session actor received RegisterTransaction: tx={}, client={}",
-                        tx,
-                        client_id
-                    );
-                    // Future: This will track client-transaction relationships
-                }
-                SessionMessage::ClientDisconnect { client_id } => {
-                    tracing::debug!(
-                        "Session actor received ClientDisconnect: client={}",
-                        client_id
-                    );
-                    // Future: This will clean up client sessions
-                }
-                SessionMessage::DeliverResult { tx, result: _ } => {
-                    tracing::debug!(
-                        "Session actor received legacy DeliverResult for transaction {}: {:?}",
-                        tx,
-                        "QueryResult" // Don't log full QueryResult as it doesn't implement Display
-                    );
-                    // Legacy variant - will be removed in future refactoring
+                    break;
                 }
             }
         }
