@@ -9,9 +9,9 @@
 use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
 
 use dashmap::{DashMap, DashSet};
-use tokio::sync::mpsc;
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
+use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use crate::{

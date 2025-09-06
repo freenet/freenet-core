@@ -224,36 +224,39 @@ impl NodeP2P {
         let (session_tx, session_rx) = tokio::sync::mpsc::channel(1000);
 
         // Install session adapter in contract handler if migration enabled
-        let result_router_tx = if std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true" {
-            ch_outbound.with_session_adapter(session_tx.clone());
+        let result_router_tx =
+            if std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true" {
+                ch_outbound.with_session_adapter(session_tx.clone());
 
-            // Create result router channel for dual-path result delivery
-            let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(1000);
+                // Create result router channel for dual-path result delivery
+                let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(1000);
 
-            // Spawn Session Actor Stub
-            use crate::client_events::session_actor::SessionActorStub;
-            let session_actor = SessionActorStub::new(session_rx);
-            GlobalExecutor::spawn(async move {
-                tracing::info!("Session actor stub starting");
-                session_actor.run().await;
-                tracing::warn!("Session actor stub stopped");
-            });
+                // Spawn Session Actor Stub
+                use crate::client_events::session_actor::SessionActorStub;
+                let session_actor = SessionActorStub::new(session_rx);
+                GlobalExecutor::spawn(async move {
+                    tracing::info!("Session actor stub starting");
+                    session_actor.run().await;
+                    tracing::warn!("Session actor stub stopped");
+                });
 
-            // Spawn ResultRouter task
-            use crate::client_events::result_router::ResultRouter;
-            let router = ResultRouter::new(result_router_rx, session_tx);
-            GlobalExecutor::spawn(async move {
-                tracing::info!("Result router starting");
-                router.run().await;
-                tracing::warn!("Result router stopped");
-            });
+                // Spawn ResultRouter task
+                use crate::client_events::result_router::ResultRouter;
+                let router = ResultRouter::new(result_router_rx, session_tx);
+                GlobalExecutor::spawn(async move {
+                    tracing::info!("Result router starting");
+                    router.run().await;
+                    tracing::warn!("Result router stopped");
+                });
 
-            tracing::info!("Actor-based client management infrastructure installed with result router");
-            Some(result_router_tx)
-        } else {
-            tracing::debug!("Actor-based client management disabled");
-            None
-        };
+                tracing::info!(
+                    "Actor-based client management infrastructure installed with result router"
+                );
+                Some(result_router_tx)
+            } else {
+                tracing::debug!("Actor-based client management disabled");
+                None
+            };
 
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(

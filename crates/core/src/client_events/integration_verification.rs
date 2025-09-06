@@ -77,33 +77,35 @@ async fn test_result_router_receives_host_responses() {
 
     // Create test transaction and result
     use crate::operations::put::PutMsg;
-    use freenet_stdlib::prelude::{WrappedContract, ContractCode, Parameters};
+    use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
     use std::sync::Arc;
-    
+
     let tx = Transaction::new::<PutMsg>();
     let contract = WrappedContract::new(
         Arc::new(ContractCode::from(vec![1, 2, 3])),
         Parameters::from(vec![4u8, 5u8]),
     );
     let success_response = Ok(HostResponse::ContractResponse(
-        freenet_stdlib::client_api::ContractResponse::PutResponse { 
-            key: *contract.key() 
-        }
+        freenet_stdlib::client_api::ContractResponse::PutResponse {
+            key: *contract.key(),
+        },
     ));
 
     // Send result through router
     network_tx.send((tx, success_response)).await.unwrap();
 
     // Verify router forwards to session actor
-    if let Ok(msg) = tokio::time::timeout(
-        tokio::time::Duration::from_millis(100), 
-        session_rx.recv()
-    ).await {
+    if let Ok(msg) =
+        tokio::time::timeout(tokio::time::Duration::from_millis(100), session_rx.recv()).await
+    {
         match msg.unwrap() {
-            SessionMessage::DeliverHostResponse { tx: received_tx, response } => {
+            SessionMessage::DeliverHostResponse {
+                tx: received_tx,
+                response,
+            } => {
                 assert_eq!(received_tx, tx);
                 assert!((*response).is_ok());
-            },
+            }
             other => panic!("Expected DeliverHostResponse, got {:?}", other),
         }
     } else {
@@ -118,24 +120,24 @@ async fn test_result_router_receives_host_responses() {
 #[tokio::test]
 async fn test_flag_disabled_no_router() {
     // Test that router is not spawned when flag is false
-    
+
     // Save original state
     let original = std::env::var("FREENET_ACTOR_CLIENTS").ok();
-    
+
     // Disable flag
     std::env::remove_var("FREENET_ACTOR_CLIENTS");
-    
+
     // Verify flag is disabled
     let enabled = std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true";
     assert!(!enabled, "Flag should be disabled");
-    
+
     // When flag is disabled, router should not be active
     // This is tested by the NodeP2P::build() logic - when flag is false,
     // result_router_tx is None, so no router is spawned
-    
+
     // In a real scenario, we would test NodeP2P::build() directly,
     // but for this unit test, we verify the flag behavior
-    
+
     // Restore original state
     match original {
         Some(val) => std::env::set_var("FREENET_ACTOR_CLIENTS", val),
@@ -151,54 +153,55 @@ async fn test_dual_path_identical_results() {
     use crate::message::Transaction;
     use freenet_stdlib::client_api::HostResponse;
     use tokio::sync::mpsc;
-    
+
     // Create channels for both paths
     let (router_tx, mut router_rx) = mpsc::channel::<(Transaction, HostResult)>(100);
-    let (legacy_tx, mut legacy_rx) = mpsc::channel::<(crate::client_events::ClientId, HostResult)>(100);
-    
+    let (legacy_tx, mut legacy_rx) =
+        mpsc::channel::<(crate::client_events::ClientId, HostResult)>(100);
+
     // Create test data
     use crate::operations::put::PutMsg;
-    use freenet_stdlib::prelude::{WrappedContract, ContractCode, Parameters};
+    use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
     use std::sync::Arc;
-    
+
     let tx = Transaction::new::<PutMsg>();
     let client_id = crate::client_events::ClientId::FIRST;
     let contract = WrappedContract::new(
         Arc::new(ContractCode::from(vec![1, 2, 3])),
         Parameters::from(vec![4u8, 5u8]),
     );
-    
+
     // Create separate but equivalent results for both paths (since HostResult doesn't implement Clone)
     let host_result_1 = Ok(HostResponse::ContractResponse(
-        freenet_stdlib::client_api::ContractResponse::PutResponse { 
-            key: *contract.key() 
-        }
+        freenet_stdlib::client_api::ContractResponse::PutResponse {
+            key: *contract.key(),
+        },
     ));
     let host_result_2 = Ok(HostResponse::ContractResponse(
-        freenet_stdlib::client_api::ContractResponse::PutResponse { 
-            key: *contract.key() 
-        }
+        freenet_stdlib::client_api::ContractResponse::PutResponse {
+            key: *contract.key(),
+        },
     ));
-    
+
     // Router path
     router_tx.send((tx, host_result_1)).await.unwrap();
-    // Legacy path  
+    // Legacy path
     legacy_tx.send((client_id, host_result_2)).await.unwrap();
-    
+
     // Verify both paths receive the same result
     let router_result = router_rx.recv().await.unwrap();
     let legacy_result = legacy_rx.recv().await.unwrap();
-    
+
     // Transaction should match
     assert_eq!(router_result.0, tx);
-    
+
     // Results should be equivalent (though we can't directly compare due to clone limitations)
     match (&router_result.1, &legacy_result.1) {
-        (Ok(_), Ok(_)) => {}, // Both successful
-        (Err(_), Err(_)) => {}, // Both error
+        (Ok(_), Ok(_)) => {}   // Both successful
+        (Err(_), Err(_)) => {} // Both error
         _ => panic!("Results should have same success/error state"),
     }
-    
+
     // Client ID should match
     assert_eq!(legacy_result.0, client_id);
 }
@@ -211,32 +214,32 @@ async fn test_router_receives_results_without_legacy_callback() {
     use crate::message::Transaction;
     use freenet_stdlib::client_api::HostResponse;
     use tokio::sync::mpsc;
-    
+
     // Create router channel (simulating what happens in report_result)
     let (router_tx, mut router_rx) = mpsc::channel::<(Transaction, HostResult)>(100);
-    
+
     // Create test data
     use crate::operations::put::PutMsg;
-    use freenet_stdlib::prelude::{WrappedContract, ContractCode, Parameters};
+    use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
     use std::sync::Arc;
-    
+
     let tx = Transaction::new::<PutMsg>();
     let contract = WrappedContract::new(
         Arc::new(ContractCode::from(vec![1, 2, 3])),
         Parameters::from(vec![4u8, 5u8]),
     );
     let host_result = Ok(HostResponse::ContractResponse(
-        freenet_stdlib::client_api::ContractResponse::PutResponse { 
-            key: *contract.key() 
-        }
+        freenet_stdlib::client_api::ContractResponse::PutResponse {
+            key: *contract.key(),
+        },
     ));
-    
+
     // Simulate the router path from report_result (without legacy callback)
     // This is what happens when tx is present but client_req_handler_callback is None
     if let Ok(_) = router_tx.try_send((tx, host_result)) {
         // Router should receive the result even without legacy callback
     }
-    
+
     // Verify router receives the result
     let router_result = router_rx.recv().await.unwrap();
     assert_eq!(router_result.0, tx);

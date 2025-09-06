@@ -35,10 +35,10 @@ impl ResultRouter {
             if let Err(e) = self.session_actor_tx.send(msg).await {
                 // TODO: Add metric for router send failures
                 // metrics::ROUTER_SEND_FAILURES.increment();
-                
+
                 // mpsc::error::SendError only occurs when channel is closed
                 let error_reason = "channel_closed";
-                
+
                 tracing::error!(
                     error_reason = error_reason,
                     transaction = %tx,
@@ -50,7 +50,7 @@ impl ResultRouter {
                 break;
             }
         }
-        
+
         tracing::error!(
             "CRITICAL: ResultRouter shutting down due to session actor failure. \
              Dual-path delivery compromised. Consider restarting node."

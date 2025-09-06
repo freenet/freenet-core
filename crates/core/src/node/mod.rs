@@ -410,7 +410,7 @@ async fn report_result(
             if let (Some(transaction), Some(router_tx)) = (tx, &op_manager.result_router_tx) {
                 let host_result = op_res.to_host_result();
                 let router_tx_clone = router_tx.clone();
-                
+
                 // Spawn fire-and-forget task to avoid blocking report_result()
                 // while still guaranteeing message delivery
                 tokio::spawn(async move {
@@ -418,8 +418,9 @@ async fn report_result(
                         tracing::error!(
                             "CRITICAL: Result router channel closed - dual-path delivery broken. \
                              Router or session actor has crashed. Transaction: {}. Error: {}. \
-                             Consider restarting node or disabling FREENET_ACTOR_CLIENTS flag.", 
-                            transaction, e
+                             Consider restarting node or disabling FREENET_ACTOR_CLIENTS flag.",
+                            transaction,
+                            e
                         );
                         // TODO: Consider implementing circuit breaker or automatic recovery
                     }
