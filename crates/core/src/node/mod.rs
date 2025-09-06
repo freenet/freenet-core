@@ -409,28 +409,21 @@ async fn report_result(
             // (independent of legacy callback presence)
             if let (Some(transaction), Some(router_tx)) = (tx, &op_manager.result_router_tx) {
                 let host_result = op_res.to_host_result();
-                match router_tx.try_send((transaction, host_result)) {
-                    Ok(_) => {
-                        // Success - router received the result
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        tracing::warn!(
-                            "Router channel full - result delivery delayed. \
-                             Session actor may be overloaded. Transaction: {}", 
-                            transaction
-                        );
-                        // TODO: Add metric for channel full events
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                let router_tx_clone = router_tx.clone();
+                
+                // Spawn fire-and-forget task to avoid blocking report_result()
+                // while still guaranteeing message delivery
+                tokio::spawn(async move {
+                    if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
                         tracing::error!(
                             "CRITICAL: Result router channel closed - dual-path delivery broken. \
-                             Router or session actor has crashed. Transaction: {}. \
+                             Router or session actor has crashed. Transaction: {}. Error: {}. \
                              Consider restarting node or disabling FREENET_ACTOR_CLIENTS flag.", 
-                            transaction
+                            transaction, e
                         );
                         // TODO: Consider implementing circuit breaker or automatic recovery
                     }
-                }
+                });
             }
 
             // EXISTING: Legacy client delivery (preserved)
