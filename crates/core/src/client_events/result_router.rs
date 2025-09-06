@@ -33,11 +33,18 @@ impl ResultRouter {
                 response: Box::new(host_result),
             };
             if let Err(e) = self.session_actor_tx.send(msg).await {
+                // TODO: Add metric for router send failures
+                // metrics::ROUTER_SEND_FAILURES.increment();
+                
+                // mpsc::error::SendError only occurs when channel is closed
+                let error_reason = "channel_closed";
+                
                 tracing::error!(
-                    "CRITICAL: Session actor channel closed - result routing failed. \
-                     Session actor has crashed. Transaction {}: {}. \
-                     Actor-based client delivery is broken.",
-                    tx, e
+                    error_reason = error_reason,
+                    transaction = %tx,
+                    error = %e,
+                    "CRITICAL: Session actor channel send failed - result routing failed. \
+                     Session actor has crashed. Actor-based client delivery is broken."
                 );
                 // Router can't continue without session actor - exit loop
                 break;
