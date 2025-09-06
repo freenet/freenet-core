@@ -271,8 +271,7 @@ impl Ring {
         let router = self.router.read();
         let target_location = Location::from(contract_key);
 
-        // Never include self - callers should check local storage before network operations
-        // Get all connected peers through the connection manager
+        // Get all connected peers through the connection manager (never includes self)
         let connections = self.connection_manager.get_connections_by_location();
         let peers = connections.values().filter_map(|conns| {
             let conn = conns.choose(&mut rand::rng())?;
