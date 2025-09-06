@@ -41,6 +41,7 @@ CLAUDE.md
 **/CLAUDE.md
 CI_STATUS.md
 claude_notes/
+.claude/**
 
 # Temporary test outputs and logs
 *.log

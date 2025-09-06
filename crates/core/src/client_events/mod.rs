@@ -12,7 +12,7 @@ use futures::stream::FuturesUnordered;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use std::collections::HashSet;
 use std::fmt::Display;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{convert::Infallible, fmt::Debug};
 use tracing::Instrument;
@@ -27,11 +27,41 @@ use crate::operations::{get, put, update, OpError};
 use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 pub(crate) mod combinator;
+#[cfg(test)]
+mod integration_verification;
+pub(crate) mod result_router;
+#[cfg(test)]
+mod test_correlation;
 #[cfg(feature = "websocket")]
 pub(crate) mod websocket;
 
 pub(crate) type BoxedClient = Box<dyn ClientEventsProxy + Send + 'static>;
 pub type HostResult = Result<HostResponse, ClientError>;
+
+/// Request correlation ID for end-to-end tracing
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct RequestId(u64);
+
+static REQUEST_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+impl RequestId {
+    pub fn new() -> Self {
+        Self(REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) as u64)
+    }
+}
+
+impl Default for RequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "req-{}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
@@ -106,6 +136,7 @@ impl From<String> for AuthToken {
 #[non_exhaustive]
 pub struct OpenRequest<'a> {
     pub client_id: ClientId,
+    pub request_id: RequestId,
     pub request: Box<ClientRequest<'a>>,
     pub notification_channel: Option<UnboundedSender<HostResult>>,
     pub token: Option<AuthToken>,
@@ -116,8 +147,8 @@ impl Display for OpenRequest<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "client request {{ client: {}, req: {} }}",
-            &self.client_id, &*self.request
+            "client request {{ client: {}, request_id: {}, req: {} }}",
+            &self.client_id, &self.request_id, &*self.request
         )
     }
 }
@@ -133,6 +164,7 @@ impl<'a> OpenRequest<'a> {
     pub fn new(id: ClientId, request: Box<ClientRequest<'a>>) -> Self {
         Self {
             client_id: id,
+            request_id: RequestId::new(),
             request,
             notification_channel: None,
             token: None,
@@ -328,6 +360,7 @@ async fn process_open_request(
     // this will indirectly start actions on the local contract executor
     let fut = async move {
         let client_id = request.client_id;
+        let request_id = request.request_id;
 
         let subscription_listener: Option<UnboundedSender<HostResult>> =
             request.notification_channel.take();
@@ -361,6 +394,13 @@ async fn process_open_request(
                             subscribe,
                         );
                         let op_id = op.id;
+
+                        tracing::debug!(
+                            request_id = %request_id,
+                            transaction_id = %op_id,
+                            operation = "put",
+                            "Request-Transaction correlation"
+                        );
 
                         op_manager
                             .ch_outbound
@@ -465,6 +505,13 @@ async fn process_open_request(
                             "Sending update op",
                         );
                         let op = update::start_op(key, new_state, related_contracts);
+
+                        tracing::debug!(
+                            request_id = %request_id,
+                            transaction_id = %op.id,
+                            operation = "update",
+                            "Request-Transaction correlation"
+                        );
 
                         op_manager
                             .ch_outbound
@@ -579,6 +626,13 @@ async fn process_open_request(
 
                             let op = get::start_op(key, return_contract_code, subscribe);
 
+                            tracing::debug!(
+                                request_id = %request_id,
+                                transaction_id = %op.id,
+                                operation = "get",
+                                "Request-Transaction correlation"
+                            );
+
                             op_manager
                                 .ch_outbound
                                 .waiting_for_transaction_result(op.id, client_id)
@@ -604,6 +658,13 @@ async fn process_open_request(
                                 .inspect_err(|err| {
                                     tracing::error!("Subscribe error: {}", err);
                                 })?;
+
+                        tracing::debug!(
+                            request_id = %request_id,
+                            transaction_id = %op_id,
+                            operation = "subscribe",
+                            "Request-Transaction correlation"
+                        );
 
                         let Some(subscriber_listener) = subscription_listener else {
                             tracing::error!(%op_id, %client_id, "No subscriber listener");
@@ -881,6 +942,7 @@ pub(crate) mod test {
                         if self.rng.is_some() && pk == self.key {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
+                                request_id: RequestId::new(),
                                 request: self
                                     .generate_rand_event()
                                     .await
@@ -894,6 +956,7 @@ pub(crate) mod test {
                         } else if pk == self.key {
                             let res = OpenRequest {
                                 client_id: ClientId::FIRST,
+                                request_id: RequestId::new(),
                                 request: self
                                     .generate_deterministic_event(&ev_id)
                                     .expect("event not found")
@@ -983,6 +1046,7 @@ pub(crate) mod test {
                                 if pub_key == self.id {
                                     let res = OpenRequest {
                                         client_id: ClientId::FIRST,
+                                        request_id: RequestId::new(),
                                         request: self
                                             .memory_event_generator
                                             .generate_rand_event()
