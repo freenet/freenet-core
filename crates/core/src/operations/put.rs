@@ -908,42 +908,85 @@ pub enum PutState {
 /// Request to insert/update a value into a contract.
 pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Result<(), OpError> {
     // Process PrepareRequest state and transition to next state
-    let (id, contract, value, related_contracts, htl, subscribe, target) = match &put_op.state {
+    let (id, contract, value, related_contracts, htl, subscribe) = match &put_op.state {
         Some(PutState::PrepareRequest {
             contract,
             value,
             related_contracts,
             htl,
             subscribe,
-        }) => {
-            let key = contract.key();
-            let own_location = op_manager.ring.connection_manager.own_location();
-
-            // Find the optimal target for this contract
-            let target = op_manager
-                .ring
-                .closest_potentially_caching(&key, [&own_location.peer].as_slice())
-                .unwrap_or(own_location); // If no other peers, target ourselves
-
-            (
-                put_op.id,
-                contract.clone(),
-                value.clone(),
-                related_contracts.clone(),
-                *htl,
-                *subscribe,
-                target,
-            )
-        }
+        }) => (
+            put_op.id,
+            contract.clone(),
+            value.clone(),
+            related_contracts.clone(),
+            *htl,
+            *subscribe,
+        ),
         _ => return Err(OpError::UnexpectedOpState),
     };
 
-    // Transition to AwaitingResponse state (similar to GET operation)
     let key = contract.key();
+    let own_location = op_manager.ring.connection_manager.own_location();
 
-    // Don't cache locally here - it will be cached in process_message when handling RequestPut
-    // Caching here synchronously blocks the network protocol and causes timing issues
-    // The caching happens in process_message lines 165-217 which runs asynchronously
+    // Find the optimal target for this contract
+    let target = op_manager
+        .ring
+        .closest_potentially_caching(&key, [&own_location.peer].as_slice());
+
+    // If no other peers available, handle locally without network operations
+    if target.is_none() {
+        tracing::debug!(tx = %id, %key, "No other peers available, handling put operation locally");
+
+        // Update the contract locally
+        let updated_value =
+            put_contract(op_manager, key, value, related_contracts.clone(), &contract).await?;
+
+        tracing::debug!(tx = %id, %key, "Contract successfully updated locally");
+
+        // Broadcast changes to subscribers (same as BroadcastTo case)
+        let broadcast_to = op_manager.get_broadcast_targets(&key, &own_location.peer);
+        tracing::debug!(
+            tx = %id,
+            %key,
+            location = ?own_location.location,
+            "Successfully updated contract value locally"
+        );
+
+        // Try to broadcast the changes to subscribers
+        let sender = own_location.clone();
+        match try_to_broadcast(
+            id,
+            false, // not last_hop since we're handling locally
+            op_manager,
+            put_op.state,
+            (broadcast_to, sender),
+            key,
+            (contract.clone(), updated_value),
+        )
+        .await
+        {
+            Ok((new_state, return_msg)) => {
+                // Update the operation state
+                put_op.state = new_state;
+
+                // Send any return message if needed
+                if let Some(msg) = return_msg {
+                    op_manager
+                        .notify_op_change(NetMessage::from(msg), OpEnum::Put(put_op))
+                        .await?;
+                } else {
+                    // Complete the operation locally if no further messages needed
+                    put_op.state = Some(PutState::Finished { key });
+                }
+            }
+            Err(err) => return Err(err),
+        }
+
+        return Ok(());
+    }
+
+    // Network path: proceed with normal network propagation
     let modified_value = value.clone();
 
     put_op.state = Some(PutState::AwaitingResponse {
@@ -959,9 +1002,9 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         id,
         contract,
         related_contracts,
-        value: modified_value, // Use the modified value from put_contract
+        value: modified_value,
         htl,
-        target,
+        target: target.unwrap(), // Safe to unwrap since we checked is_none() above
     };
 
     // Use notify_op_change to trigger the operation processing

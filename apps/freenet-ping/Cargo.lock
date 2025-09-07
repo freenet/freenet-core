@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.21"
+version = "0.1.24"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1274,7 +1274,7 @@ dependencies = [
  "parking_lot",
  "pav_regression",
  "pkcs8",
- "rand 0.8.5",
+ "rand 0.9.1",
  "redb",
  "reqwest",
  "rsa",
@@ -1286,7 +1286,7 @@ dependencies = [
  "tar",
  "thiserror 2.0.12",
  "tokio",
- "tokio-tungstenite 0.26.2",
+ "tokio-tungstenite 0.27.0",
  "toml",
  "tower-http",
  "tracing",
@@ -1323,13 +1323,13 @@ dependencies = [
  "freenet-stdlib",
  "futures",
  "humantime",
- "rand 0.8.5",
+ "rand 0.9.1",
  "serde",
  "serde_json",
  "tempfile",
  "testresult",
  "tokio",
- "tokio-tungstenite 0.26.2",
+ "tokio-tungstenite 0.27.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1357,9 +1357,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef791f340c26ee1dc720e8b68960fc405dfc3cd52fd2e9868da8f5d87233fb4f"
+checksum = "087695bd49a28e00d95260dec3ce66eec0955efd258b494d353f9d4e2ce93a22"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -1380,7 +1380,7 @@ dependencies = [
  "serde_with",
  "thiserror 1.0.69",
  "tokio",
- "tokio-tungstenite 0.26.2",
+ "tokio-tungstenite 0.27.0",
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",
@@ -3010,9 +3010,9 @@ dependencies = [
 
 [[package]]
 name = "redb"
-version = "2.6.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cef6a6d3a65ea334d6cdfb31fa2525c20184b7aa7bd1ad1e2e37502610d4609f"
+checksum = "3fefa3e5ff4a369819c3d6df4195873d6f9abad109f13c0d505dbe119cfabb10"
 dependencies = [
  "libc",
 ]
@@ -3837,15 +3837,15 @@ checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 
 [[package]]
 name = "tempfile"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8a64e3985349f2441a1a9ef0b853f869006c3855f2cda6862a94d26ebb9d6a1"
+checksum = "15b61f8f20e3a6f7e0649d825294eaf317edce30f82cf6026e7e4cb9222a7d1e"
 dependencies = [
  "fastrand",
  "getrandom 0.3.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4034,14 +4034,14 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.26.2"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
+checksum = "489a59b6730eda1b0171fcfda8b121f4bee2b35cba8645ca35c5f7ba3eb736c1"
 dependencies = [
  "futures-util",
  "log",
  "tokio",
- "tungstenite 0.26.2",
+ "tungstenite 0.27.0",
 ]
 
 [[package]]
@@ -4250,9 +4250,9 @@ dependencies = [
 
 [[package]]
 name = "tungstenite"
-version = "0.26.2"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
+checksum = "eadc29d668c91fcc564941132e17b28a7ceb2f3ebf0b9dae3e03fd7a6748eb0d"
 dependencies = [
  "bytes",
  "data-encoding",
