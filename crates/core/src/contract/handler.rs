@@ -201,7 +201,7 @@ pub enum SessionMessage {
     #[allow(dead_code)]
     DeliverHostResponse {
         tx: Transaction,
-        response: Box<HostResult>,
+        response: Arc<HostResult>,
     },
     #[allow(dead_code)]
     ClientDisconnect {
