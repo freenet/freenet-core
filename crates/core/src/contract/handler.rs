@@ -29,7 +29,7 @@ use crate::config::Config;
 use crate::message::{QueryResult, Transaction};
 use crate::{client_events::ClientId, wasm_runtime::Runtime};
 
-pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
+pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, RequestId, HostResult)>);
 
 pub(crate) fn client_responses_channel() -> (ClientResponsesReceiver, ClientResponsesSender) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -37,7 +37,7 @@ pub(crate) fn client_responses_channel() -> (ClientResponsesReceiver, ClientResp
 }
 
 impl std::ops::Deref for ClientResponsesReceiver {
-    type Target = UnboundedReceiver<(ClientId, HostResult)>;
+    type Target = UnboundedReceiver<(ClientId, RequestId, HostResult)>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -51,10 +51,10 @@ impl std::ops::DerefMut for ClientResponsesReceiver {
 }
 
 #[derive(Clone)]
-pub(crate) struct ClientResponsesSender(UnboundedSender<(ClientId, HostResult)>);
+pub(crate) struct ClientResponsesSender(UnboundedSender<(ClientId, RequestId, HostResult)>);
 
 impl std::ops::Deref for ClientResponsesSender {
-    type Target = UnboundedSender<(ClientId, HostResult)>;
+    type Target = UnboundedSender<(ClientId, RequestId, HostResult)>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -192,6 +192,8 @@ pub enum SessionMessage {
         tx: Transaction,
         #[allow(dead_code)]
         client_id: ClientId,
+        #[allow(dead_code)]
+        request_id: RequestId,
     },
     #[allow(dead_code)]
     DeliverResult {
@@ -307,6 +309,7 @@ impl ContractHandlerChannel<SenderHalve> {
         &self,
         transaction: impl Into<WaitingTransaction>,
         client_id: ClientId,
+        request_id: RequestId,
     ) -> Result<(), ContractError> {
         let waiting_tx = transaction.into();
 
@@ -322,7 +325,7 @@ impl ContractHandlerChannel<SenderHalve> {
             if let Some(session_tx) = &self.session_adapter_tx {
                 // Only mirror Transaction variants, handle Subscription separately later
                 if let WaitingTransaction::Transaction(tx) = waiting_tx {
-                    let msg = SessionMessage::RegisterTransaction { tx, client_id };
+                    let msg = SessionMessage::RegisterTransaction { tx, client_id, request_id };
                     if let Err(e) = session_tx.try_send(msg) {
                         tracing::warn!("Failed to notify session actor: {}", e);
                     }

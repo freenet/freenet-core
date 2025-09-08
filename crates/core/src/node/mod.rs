@@ -462,7 +462,9 @@ async fn report_result(
                         } else {
                             tracing::debug!(?tx, %client_id,  "Sending response to client");
                         }
-                        let _ = cb.send((client_id, op_res.to_host_result()));
+                        // Legacy delivery needs a RequestId - generate one for backward compatibility
+                        use crate::client_events::RequestId;
+                        let _ = cb.send((client_id, RequestId::new(), op_res.to_host_result()));
                     }
                 } else {
                     // Log when no client callback is found for UPDATE operations
@@ -806,6 +808,9 @@ pub async fn subscribe(
     let op = subscribe::start_op(key);
     let id = op.id;
     if let Some(client_id) = client_id {
+        use crate::client_events::RequestId;
+        // Generate a default RequestId for internal subscription operations
+        let request_id = RequestId::new();
         let _ = op_manager
             .ch_outbound
             .waiting_for_transaction_result(
@@ -813,6 +818,7 @@ pub async fn subscribe(
                     contract_key: *key.id(),
                 },
                 client_id,
+                request_id,
             )
             .await;
     }

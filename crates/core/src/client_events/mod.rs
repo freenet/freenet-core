@@ -254,7 +254,7 @@ where
                 });
             }
             res = client_responses.recv() => {
-                if let Some((cli_id, res)) = res {
+                if let Some((cli_id, _request_id, res)) = res {
                     if let Ok(result) = &res {
                         tracing::debug!(%result, "sending client response");
                     }
@@ -405,7 +405,7 @@ async fn process_open_request(
 
                         op_manager
                             .ch_outbound
-                            .waiting_for_transaction_result(op_id, client_id)
+                            .waiting_for_transaction_result(op_id, client_id, request_id)
                             .await
                             .inspect_err(|err| {
                                 tracing::error!("Error waiting for transaction result: {}", err);
@@ -516,7 +516,7 @@ async fn process_open_request(
 
                         op_manager
                             .ch_outbound
-                            .waiting_for_transaction_result(op.id, client_id)
+                            .waiting_for_transaction_result(op.id, client_id, request_id)
                             .await
                             .inspect_err(|err| {
                                 tracing::error!("Error waiting for transaction result: {}", err);
@@ -636,7 +636,7 @@ async fn process_open_request(
 
                             op_manager
                                 .ch_outbound
-                                .waiting_for_transaction_result(op.id, client_id)
+                                .waiting_for_transaction_result(op.id, client_id, request_id)
                                 .await
                                 .inspect_err(|err| {
                                     tracing::error!(
@@ -706,7 +706,7 @@ async fn process_open_request(
 
                         op_manager
                             .ch_outbound
-                            .waiting_for_transaction_result(op_id, client_id)
+                            .waiting_for_transaction_result(op_id, client_id, request_id)
                             .await
                             .inspect_err(|err| {
                                 tracing::error!("Error waiting for transaction result: {}", err);

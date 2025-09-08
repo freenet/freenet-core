@@ -568,8 +568,10 @@ impl P2pConnManager {
                                     continue;
                                 };
                                 for client in clients {
+                                    // Legacy delivery needs a RequestId - generate one for error cases
+                                    use crate::client_events::RequestId;
                                     cli_response_sender
-                                        .send((client, Err(ErrorKind::FailedOperation.into())))?;
+                                        .send((client, RequestId::new(), Err(ErrorKind::FailedOperation.into())))?;
                                 }
                             }
                             NodeEvent::Disconnect { cause } => {
