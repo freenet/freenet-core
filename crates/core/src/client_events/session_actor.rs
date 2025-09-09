@@ -163,7 +163,7 @@ mod tests {
     use crate::message::Transaction;
     use crate::operations::put::PutMsg;
     use freenet_stdlib::client_api::HostResponse;
-    use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
+    use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract, ContractContainer, ContractWasmAPIVersion};
     use std::sync::Arc;
     use std::collections::HashSet;
     use tokio::sync::mpsc;
@@ -373,15 +373,25 @@ mod tests {
             tx: tx2, client_id, request_id: request_id2 
         }).await.unwrap();
 
+        // Create test contract keys
+        let contract1 = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from([1u8; 32].to_vec())),
+            Parameters::from([].as_slice()),
+        )));
+        let contract2 = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from([2u8; 32].to_vec())),
+            Parameters::from([].as_slice()),
+        )));
+
         // Create test results
         let result1 = Ok(HostResponse::ContractResponse(
             freenet_stdlib::client_api::ContractResponse::PutResponse {
-                key: ContractKey::from([1u8; 32]),
+                key: contract1.key(),
             },
         ));
         let result2 = Ok(HostResponse::ContractResponse(
             freenet_stdlib::client_api::ContractResponse::PutResponse {
-                key: ContractKey::from([2u8; 32]),
+                key: contract2.key(),
             },
         ));
 
