@@ -26,9 +26,12 @@ use crate::node::OpManager;
 use crate::operations::{get, put, update, OpError};
 use crate::{config::GlobalExecutor, contract::StoreResponse};
 
+// pub(crate) mod admin_endpoints; // TODO: Add axum dependencies
 pub(crate) mod combinator;
 #[cfg(test)]
 mod integration_verification;
+pub(crate) mod message_journal;
+pub(crate) mod migration_controller;
 pub(crate) mod result_router;
 pub(crate) mod session_actor;
 #[cfg(test)]
