@@ -325,7 +325,11 @@ impl ContractHandlerChannel<SenderHalve> {
             if let Some(session_tx) = &self.session_adapter_tx {
                 // Only mirror Transaction variants, handle Subscription separately later
                 if let WaitingTransaction::Transaction(tx) = waiting_tx {
-                    let msg = SessionMessage::RegisterTransaction { tx, client_id, request_id };
+                    let msg = SessionMessage::RegisterTransaction {
+                        tx,
+                        client_id,
+                        request_id,
+                    };
                     if let Err(e) = session_tx.try_send(msg) {
                         tracing::warn!("Failed to notify session actor: {}", e);
                     }

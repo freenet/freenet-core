@@ -41,15 +41,19 @@ impl SessionActor {
                 SessionMessage::DeliverHostResponse { tx, response } => {
                     self.handle_result_delivery(tx, response).await;
                 }
-                SessionMessage::RegisterTransaction { tx, client_id, request_id } => {
+                SessionMessage::RegisterTransaction {
+                    tx,
+                    client_id,
+                    request_id,
+                } => {
                     self.client_transactions
                         .entry(tx)
                         .or_default()
                         .insert(client_id);
-                    
+
                     // Track RequestId correlation
                     self.client_request_ids.insert((tx, client_id), request_id);
-                    
+
                     tracing::debug!(
                         "Registered transaction {} for client {} (request {}), total clients: {}",
                         tx,
@@ -105,20 +109,26 @@ impl SessionActor {
             // Optimized 1→N delivery with RequestId correlation
             for client_id in waiting_clients {
                 // Look up the RequestId for this (transaction, client) pair
-                let request_id = self.client_request_ids
-                    .remove(&(tx, client_id))
-                    .unwrap_or_else(|| {
-                        tracing::warn!(
+                let request_id =
+                    self.client_request_ids
+                        .remove(&(tx, client_id))
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
                             "No RequestId found for transaction {} and client {}, using default", 
                             tx, client_id
                         );
-                        RequestId::new()
-                    });
-                
-                if let Err(e) = self.client_responses.send((client_id, request_id, (*result).clone())) {
+                            RequestId::new()
+                        });
+
+                if let Err(e) =
+                    self.client_responses
+                        .send((client_id, request_id, (*result).clone()))
+                {
                     tracing::warn!(
-                        "Failed to deliver result to client {} (request {}): {}", 
-                        client_id, request_id, e
+                        "Failed to deliver result to client {} (request {}): {}",
+                        client_id,
+                        request_id,
+                        e
                     );
                 } else {
                     tracing::debug!(
@@ -150,7 +160,7 @@ impl SessionActor {
             }
             !clients.is_empty()
         });
-        
+
         // Clean up RequestId mappings for this client across all transactions
         self.client_request_ids.retain(|(_, c), _| *c != client_id);
     }
@@ -163,9 +173,11 @@ mod tests {
     use crate::message::Transaction;
     use crate::operations::put::PutMsg;
     use freenet_stdlib::client_api::HostResponse;
-    use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract, ContractContainer, ContractWasmAPIVersion};
-    use std::sync::Arc;
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+    };
     use std::collections::HashSet;
+    use std::sync::Arc;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -190,7 +202,11 @@ mod tests {
             let request_id = RequestId::new();
             request_ids.push(request_id);
             session_tx
-                .send(SessionMessage::RegisterTransaction { tx, client_id, request_id })
+                .send(SessionMessage::RegisterTransaction {
+                    tx,
+                    client_id,
+                    request_id,
+                })
                 .await
                 .unwrap();
         }
@@ -217,29 +233,36 @@ mod tests {
         let mut received_count = 0;
         let mut received_clients = HashSet::new();
         let mut received_request_ids = HashSet::new();
-        
+
         while let Ok(timeout_result) = tokio::time::timeout(
             tokio::time::Duration::from_millis(100),
             client_responses_rx.recv(),
-        ).await {
+        )
+        .await
+        {
             if let Some((client_id, request_id, received_result)) = timeout_result {
                 assert!(clients.contains(&client_id));
                 assert!(request_ids.contains(&request_id));
-                
+
                 // Verify result structure without full equality (since PartialEq might not be fully implemented)
                 match (&received_result, &host_result) {
-                    (Ok(_), Ok(_)) => {}, // Both are Ok variants
-                    (Err(_), Err(_)) => {}, // Both are Err variants
+                    (Ok(_), Ok(_)) => {}   // Both are Ok variants
+                    (Err(_), Err(_)) => {} // Both are Err variants
                     _ => panic!("Result type mismatch: expected same variant (Ok/Err)"),
                 }
-                
+
                 received_clients.insert(client_id);
                 received_request_ids.insert(request_id);
                 received_count += 1;
-                
-                tracing::debug!("Test: Client {} received result with RequestId {} ({}/{})", 
-                    client_id, request_id, received_count, clients.len());
-                
+
+                tracing::debug!(
+                    "Test: Client {} received result with RequestId {} ({}/{})",
+                    client_id,
+                    request_id,
+                    received_count,
+                    clients.len()
+                );
+
                 if received_count == clients.len() {
                     break;
                 }
@@ -247,10 +270,23 @@ mod tests {
                 panic!("Expected client to receive result but channel was closed");
             }
         }
-        
-        assert_eq!(received_count, clients.len(), "All {} clients should receive result", clients.len());
-        assert_eq!(received_clients.len(), clients.len(), "Each client should receive result exactly once");
-        assert_eq!(received_request_ids.len(), clients.len(), "Each RequestId should be correlated exactly once");
+
+        assert_eq!(
+            received_count,
+            clients.len(),
+            "All {} clients should receive result",
+            clients.len()
+        );
+        assert_eq!(
+            received_clients.len(),
+            clients.len(),
+            "Each client should receive result exactly once"
+        );
+        assert_eq!(
+            received_request_ids.len(),
+            clients.len(),
+            "Each RequestId should be correlated exactly once"
+        );
 
         // Clean up
         drop(session_tx);
@@ -269,7 +305,7 @@ mod tests {
         let tx = Transaction::new::<PutMsg>();
         let client_id = ClientId::FIRST;
         let request_id = RequestId::new();
-        
+
         actor
             .client_transactions
             .entry(tx)
@@ -325,7 +361,11 @@ mod tests {
         let tx = Transaction::new::<PutMsg>();
         let request_id = RequestId::new();
         session_tx
-            .send(SessionMessage::RegisterTransaction { tx, client_id, request_id })
+            .send(SessionMessage::RegisterTransaction {
+                tx,
+                client_id,
+                request_id,
+            })
             .await
             .unwrap();
 
@@ -346,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_id_correlation_isolation() {
         use crate::contract::client_responses_channel;
-        
+
         let (session_tx, session_rx) = mpsc::channel(100);
         let (mut client_responses_rx, client_responses_tx) = client_responses_channel();
         let actor = SessionActor::new(session_rx, client_responses_tx);
@@ -358,20 +398,30 @@ mod tests {
 
         // Test RequestId correlation isolation between different transactions
         let tx1 = Transaction::new::<PutMsg>();
-        let tx2 = Transaction::new::<PutMsg>(); 
+        let tx2 = Transaction::new::<PutMsg>();
         let client_id = ClientId::FIRST;
-        
+
         let request_id1 = RequestId::new();
         let request_id2 = RequestId::new();
 
         // Register same client for two different transactions with different RequestIds
-        session_tx.send(SessionMessage::RegisterTransaction { 
-            tx: tx1, client_id, request_id: request_id1 
-        }).await.unwrap();
-        
-        session_tx.send(SessionMessage::RegisterTransaction { 
-            tx: tx2, client_id, request_id: request_id2 
-        }).await.unwrap();
+        session_tx
+            .send(SessionMessage::RegisterTransaction {
+                tx: tx1,
+                client_id,
+                request_id: request_id1,
+            })
+            .await
+            .unwrap();
+
+        session_tx
+            .send(SessionMessage::RegisterTransaction {
+                tx: tx2,
+                client_id,
+                request_id: request_id2,
+            })
+            .await
+            .unwrap();
 
         // Create test contract keys
         let contract1 = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
@@ -396,25 +446,32 @@ mod tests {
         ));
 
         // Send results for both transactions
-        session_tx.send(SessionMessage::DeliverHostResponse {
-            tx: tx1,
-            response: std::sync::Arc::new(result1.clone()),
-        }).await.unwrap();
+        session_tx
+            .send(SessionMessage::DeliverHostResponse {
+                tx: tx1,
+                response: std::sync::Arc::new(result1.clone()),
+            })
+            .await
+            .unwrap();
 
-        session_tx.send(SessionMessage::DeliverHostResponse {
-            tx: tx2,
-            response: std::sync::Arc::new(result2.clone()),
-        }).await.unwrap();
+        session_tx
+            .send(SessionMessage::DeliverHostResponse {
+                tx: tx2,
+                response: std::sync::Arc::new(result2.clone()),
+            })
+            .await
+            .unwrap();
 
         // Verify RequestId correlation is preserved correctly
         let mut received_correlations = Vec::new();
-        
+
         for _ in 0..2 {
-            if let Ok(Some((received_client_id, received_request_id, _received_result))) = 
+            if let Ok(Some((received_client_id, received_request_id, _received_result))) =
                 tokio::time::timeout(
                     tokio::time::Duration::from_millis(100),
-                    client_responses_rx.recv()
-                ).await 
+                    client_responses_rx.recv(),
+                )
+                .await
             {
                 assert_eq!(received_client_id, client_id);
                 received_correlations.push(received_request_id);
@@ -422,13 +479,16 @@ mod tests {
                 panic!("Expected to receive result with RequestId correlation");
             }
         }
-        
+
         // Verify both RequestIds were received
         assert!(received_correlations.contains(&request_id1));
         assert!(received_correlations.contains(&request_id2));
         assert_eq!(received_correlations.len(), 2);
 
-        tracing::debug!("RequestId correlation isolation test passed: {:?}", received_correlations);
+        tracing::debug!(
+            "RequestId correlation isolation test passed: {:?}",
+            received_correlations
+        );
 
         // Clean up
         drop(session_tx);
