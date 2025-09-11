@@ -33,7 +33,7 @@ tracing-subscriber = "0.3"
 wasmer = "5.0.4"
 wasmer-compiler-singlepass = "5.0.4"
 
-freenet-stdlib = { path = "../freenet-stdlib/rust" }
+freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", branch = "main", package = "freenet-stdlib" }
 
 [profile.dev.package."*"]
 opt-level = 3
