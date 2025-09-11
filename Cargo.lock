@@ -1432,7 +1432,7 @@ dependencies = [
  "dashmap",
  "either",
  "freenet",
- "freenet-stdlib 0.1.14 (git+https://github.com/freenet/freenet-stdlib.git?branch=main)",
+ "freenet-stdlib",
  "futures 0.3.31",
  "glob",
  "http 1.3.1",
@@ -1557,7 +1557,7 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers",
- "freenet-stdlib 0.1.14 (git+https://github.com/freenet/freenet-stdlib.git?branch=main)",
+ "freenet-stdlib",
  "futures 0.3.31",
  "headers",
  "hickory-resolver",
@@ -1605,17 +1605,6 @@ dependencies = [
 
 [[package]]
 name = "freenet-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.104",
-]
-
-[[package]]
-name = "freenet-macros"
 version = "0.1.2"
 source = "git+https://github.com/freenet/freenet-stdlib.git?branch=main#3557c9508607be9101ad274816bb88760355317a"
 dependencies = [
@@ -1633,7 +1622,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.1.14 (registry+https://github.com/rust-lang/crates.io-index)",
+ "freenet-stdlib",
  "futures 0.3.31",
  "humantime",
  "rand 0.9.1",
@@ -1652,7 +1641,7 @@ name = "freenet-ping-contract"
 version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.1.14 (git+https://github.com/freenet/freenet-stdlib.git?branch=main)",
+ "freenet-stdlib",
  "serde_json",
 ]
 
@@ -1662,42 +1651,10 @@ version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.1.14 (git+https://github.com/freenet/freenet-stdlib.git?branch=main)",
+ "freenet-stdlib",
  "humantime",
  "humantime-serde",
  "serde",
-]
-
-[[package]]
-name = "freenet-stdlib"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "087695bd49a28e00d95260dec3ce66eec0955efd258b494d353f9d4e2ce93a22"
-dependencies = [
- "arbitrary",
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "chrono",
- "flatbuffers",
- "freenet-macros 0.1.1",
- "futures 0.3.31",
- "js-sys",
- "once_cell",
- "semver",
- "serde",
- "serde-wasm-bindgen 0.6.5",
- "serde_bytes",
- "serde_json",
- "serde_with",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.27.0",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -1712,7 +1669,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers",
- "freenet-macros 0.1.2",
+ "freenet-macros",
  "futures 0.3.31",
  "js-sys",
  "once_cell",
@@ -4996,7 +4953,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.11"
 dependencies = [
- "freenet-stdlib 0.1.14 (git+https://github.com/freenet/freenet-stdlib.git?branch=main)",
+ "freenet-stdlib",
  "serde",
  "serde_json",
 ]
@@ -5005,7 +4962,7 @@ dependencies = [
 name = "test-contract-update-nochange"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.1.14 (git+https://github.com/freenet/freenet-stdlib.git?branch=main)",
+ "freenet-stdlib",
  "serde",
  "serde_json",
 ]
