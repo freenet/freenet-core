@@ -30,8 +30,6 @@ use crate::{config::GlobalExecutor, contract::StoreResponse};
 pub(crate) mod combinator;
 #[cfg(test)]
 mod integration_verification;
-pub(crate) mod message_journal;
-pub(crate) mod migration_controller;
 pub(crate) mod result_router;
 pub(crate) mod session_actor;
 #[cfg(test)]
