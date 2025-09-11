@@ -236,14 +236,14 @@ async fn test_router_receives_results_without_legacy_callback() {
 
     // Simulate the router path from report_result (without legacy callback)
     // This is what happens when tx is present but client_req_handler_callback is None
-    if let Ok(_) = router_tx.try_send((tx, host_result)) {
+    if router_tx.try_send((tx, host_result)).is_ok() {
         // Router should receive the result even without legacy callback
     }
 
     // Verify router receives the result
     let router_result = router_rx.recv().await.unwrap();
     assert_eq!(router_result.0, tx);
-    assert!(matches!(router_result.1, Ok(_)));
+    assert!(router_result.1.is_ok());
 }
 
 #[test]

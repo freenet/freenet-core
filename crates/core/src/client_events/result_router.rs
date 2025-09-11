@@ -30,7 +30,7 @@ impl ResultRouter {
         while let Some((tx, host_result)) = self.network_results.recv().await {
             let msg = SessionMessage::DeliverHostResponse {
                 tx,
-                response: Box::new(host_result),
+                response: std::sync::Arc::new(host_result),
             };
             if let Err(e) = self.session_actor_tx.send(msg).await {
                 // TODO: Add metric for router send failures

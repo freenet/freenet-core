@@ -427,49 +427,56 @@ async fn report_result(
                 });
             }
 
-            // EXISTING: Legacy client delivery (preserved)
-            if let Some((client_ids, cb)) = client_req_handler_callback {
-                for client_id in client_ids {
-                    // Enhanced logging for UPDATE operations
-                    if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                        tracing::debug!(
-                            "Sending UPDATE response to client {} for transaction {}",
-                            client_id,
-                            update_op.id
-                        );
+            // EXISTING: Legacy client delivery (skip only in router_only mode)
+            let router_mode = std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default();
+            let skip_legacy_delivery = router_mode == "router_only";
+            if !skip_legacy_delivery {
+                if let Some((client_ids, cb)) = client_req_handler_callback {
+                    for client_id in client_ids {
+                        // Enhanced logging for UPDATE operations
+                        if let crate::operations::OpEnum::Update(ref update_op) = op_res {
+                            tracing::debug!(
+                                "Sending UPDATE response to client {} for transaction {}",
+                                client_id,
+                                update_op.id
+                            );
 
-                        // Log the result being sent
-                        let host_result = op_res.to_host_result();
-                        match &host_result {
-                            Ok(response) => {
-                                tracing::debug!(
+                            // Log the result being sent
+                            let host_result = op_res.to_host_result();
+                            match &host_result {
+                                Ok(response) => {
+                                    tracing::debug!(
                                     "Client {} callback found, sending successful UPDATE response: {:?}",
                                     client_id,
                                     response
                                 );
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        "Client {} callback found, sending UPDATE error: {:?}",
+                                        client_id,
+                                        error
+                                    );
+                                }
                             }
-                            Err(error) => {
-                                tracing::error!(
-                                    "Client {} callback found, sending UPDATE error: {:?}",
-                                    client_id,
-                                    error
-                                );
-                            }
+                        } else {
+                            tracing::debug!(?tx, %client_id,  "Sending response to client");
                         }
-                    } else {
-                        tracing::debug!(?tx, %client_id,  "Sending response to client");
+                        // Legacy delivery needs a RequestId - generate one for backward compatibility
+                        use crate::client_events::RequestId;
+                        let _ = cb.send((client_id, RequestId::new(), op_res.to_host_result()));
                     }
-                    let _ = cb.send((client_id, op_res.to_host_result()));
-                }
-            } else {
-                // Log when no client callback is found for UPDATE operations
-                if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                    tracing::debug!(
+                } else {
+                    // Log when no client callback is found for UPDATE operations
+                    if let crate::operations::OpEnum::Update(ref update_op) = op_res {
+                        tracing::debug!(
                         "No client callback found for UPDATE transaction {} - this may indicate a missing client subscription",
                         update_op.id
                     );
+                    }
                 }
-            }
+            } // End skip_legacy_delivery check
+
             // check operations.rs:handle_op_result to see what's the meaning of each state
             // in case more cases want to be handled when feeding information to the OpManager
 
@@ -801,6 +808,9 @@ pub async fn subscribe(
     let op = subscribe::start_op(key);
     let id = op.id;
     if let Some(client_id) = client_id {
+        use crate::client_events::RequestId;
+        // Generate a default RequestId for internal subscription operations
+        let request_id = RequestId::new();
         let _ = op_manager
             .ch_outbound
             .waiting_for_transaction_result(
@@ -808,6 +818,7 @@ pub async fn subscribe(
                     contract_key: *key.id(),
                 },
                 client_id,
+                request_id,
             )
             .await;
     }
