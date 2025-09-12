@@ -103,7 +103,7 @@ pub async fn base_node_test_config_with_rng(
         tempfile::Builder::new().prefix(data_dir_suffix).tempdir()?
     };
 
-    let key = TransportKeypair::new_with_rng(rng);
+    let key = TransportKeypair::new();
     let transport_keypair = temp_dir.path().join("private.pem");
     key.save(&transport_keypair)?;
     key.public().save(temp_dir.path().join("public.pem"))?;
@@ -119,7 +119,7 @@ pub async fn base_node_test_config_with_rng(
             is_gateway,
             skip_load_from_network: true,
             gateways: Some(gateways),
-            location: Some(rng.gen()),
+            location: Some(rng.random()),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port, // if None, node will pick a free one or use default
@@ -150,7 +150,7 @@ pub fn gw_config_from_path_with_rng(
 ) -> Result<InlineGwConfig> {
     Ok(InlineGwConfig {
         address: (Ipv4Addr::LOCALHOST, port).into(),
-        location: Some(rng.gen()),
+        location: Some(rng.random()),
         public_key_path: path.join("public.pem"),
     })
 }

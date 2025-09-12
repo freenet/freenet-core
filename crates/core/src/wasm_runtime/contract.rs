@@ -305,13 +305,16 @@ fn handle_execution_call(
     r: JoinHandle<(Result<i64, wasmer::RuntimeError>, Store)>,
     rt: &mut super::Runtime,
 ) -> Result<i64, Errors> {
+    // Calculate timeout iterations: max_execution_seconds * 100 (since we check every 10ms)
+    let timeout_iterations = (rt.max_execution_seconds * 100.0) as u64;
+
     // Check if we're in a tokio runtime context
     if tokio::runtime::Handle::try_current().is_ok() {
         // We're in an async context, use block_in_place to avoid blocking the executor
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                // Check every 10ms for up to 5 seconds using async sleep
-                for _ in 0..500 {
+                // Check every 10ms for the configured timeout duration
+                for _ in 0..timeout_iterations {
                     if r.is_finished() {
                         break;
                     }
@@ -331,8 +334,7 @@ fn handle_execution_call(
         })
     } else {
         // We're not in an async context (e.g., in tests), fall back to thread::sleep
-        // This is still better than the original 1-second sleep
-        for _ in 0..500 {
+        for _ in 0..timeout_iterations {
             if r.is_finished() {
                 break;
             }

@@ -51,7 +51,7 @@ async fn test_gateway_reconnection() -> TestResult {
 
     // Gateway configuration
     let temp_dir_gw = tempfile::tempdir()?;
-    let gateway_key = TransportKeypair::new_with_rng(&mut *RNG.lock().unwrap());
+    let gateway_key = TransportKeypair::new();
     let gateway_transport_keypair = temp_dir_gw.path().join("private.pem");
     gateway_key.save(&gateway_transport_keypair)?;
     gateway_key
@@ -73,7 +73,7 @@ async fn test_gateway_reconnection() -> TestResult {
             is_gateway: true,
             skip_load_from_network: true,
             gateways: Some(vec![]),
-            location: Some(RNG.lock().unwrap().gen()),
+            location: Some(RNG.lock().unwrap().random()),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: Some(gateway_port),
@@ -93,13 +93,13 @@ async fn test_gateway_reconnection() -> TestResult {
 
     // Peer configuration
     let temp_dir_peer = tempfile::tempdir()?;
-    let peer_key = TransportKeypair::new_with_rng(&mut *RNG.lock().unwrap());
+    let peer_key = TransportKeypair::new();
     let peer_transport_keypair = temp_dir_peer.path().join("private.pem");
     peer_key.save(&peer_transport_keypair)?;
 
     let gateway_info = InlineGwConfig {
         address: (Ipv4Addr::LOCALHOST, gateway_port).into(),
-        location: Some(RNG.lock().unwrap().gen()),
+        location: Some(RNG.lock().unwrap().random()),
         public_key_path: temp_dir_gw.path().join("public.pem"),
     };
 
@@ -114,7 +114,7 @@ async fn test_gateway_reconnection() -> TestResult {
             is_gateway: false,
             skip_load_from_network: true,
             gateways: Some(vec![serde_json::to_string(&gateway_info)?]),
-            location: Some(RNG.lock().unwrap().gen()),
+            location: Some(RNG.lock().unwrap().random()),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: None,
@@ -321,7 +321,7 @@ async fn test_basic_gateway_connectivity() -> TestResult {
 
     // Create a simple gateway configuration
     let temp_dir = tempfile::tempdir()?;
-    let key = TransportKeypair::new_with_rng(&mut *RNG.lock().unwrap());
+    let key = TransportKeypair::new();
     let transport_keypair = temp_dir.path().join("private.pem");
     key.save(&transport_keypair)?;
 
@@ -336,7 +336,7 @@ async fn test_basic_gateway_connectivity() -> TestResult {
             is_gateway: true,
             skip_load_from_network: true,
             gateways: Some(vec![]),
-            location: Some(RNG.lock().unwrap().gen()),
+            location: Some(RNG.lock().unwrap().random()),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: Some(gateway_port),

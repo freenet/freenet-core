@@ -180,6 +180,16 @@ impl Operation for PutOp {
                             "Processing local PUT in initiating node"
                         );
 
+                        // DEBUG: Log contract key/hash details before put_contract
+                        tracing::debug!(
+                            "DEBUG PUT: Before put_contract - key={}, key.code_hash={:?}, contract.key={}, contract.key.code_hash={:?}, code_len={}",
+                            key,
+                            key.code_hash(),
+                            contract.key(),
+                            contract.key().code_hash(),
+                            contract.data().len()
+                        );
+
                         // Always call put_contract to ensure proper state merging
                         // Since Freenet states are commutative monoids, merging is always safe
                         // and necessary to maintain consistency

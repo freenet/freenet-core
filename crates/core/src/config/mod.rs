@@ -132,7 +132,7 @@ impl ConfigArgs {
                     if filename.starts_with("config") {
                         match ext.as_str() {
                             "toml" => {
-                                tracing::info!("Found configuration file: {filename}.{ext}");
+                                tracing::info!("Found configuration file: {filename}");
                                 return Some((filename, ext));
                             }
                             "json" => {
@@ -1109,7 +1109,7 @@ mod tests {
 
         let url = server.url_str("/gateways");
 
-        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 256).unwrap();
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 256).unwrap();
         let key = key
             .to_public_key()
             .to_public_key_pem(pkcs8::LineEnding::default())

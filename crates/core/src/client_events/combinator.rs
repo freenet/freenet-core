@@ -76,6 +76,7 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                     match res {
                         Ok(OpenRequest {
                             client_id: external,
+                            request_id,
                             request,
                             notification_channel,
                             token,
@@ -92,6 +93,7 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                             tracing::debug!("received request for proxy #{idx}; internal_id={id}; external_id={external}; req={request}");
                             Ok(OpenRequest {
                                 client_id: id,
+                                request_id,  // Pass through correlation ID
                                 request,
                                 notification_channel,
                                 token,
@@ -155,9 +157,9 @@ async fn client_fn(
             }
             client_msg = client.recv() => {
                 match client_msg {
-                    Ok(OpenRequest { client_id,  request, notification_channel, token, attested_contract }) => {
+                    Ok(OpenRequest { client_id, request_id, request, notification_channel, token, attested_contract }) => {
                         tracing::debug!("received msg @ combinator from external id {client_id}, msg: {request}");
-                        if tx_host.send(Ok(OpenRequest { client_id,  request, notification_channel, token, attested_contract })).await.is_err() {
+                        if tx_host.send(Ok(OpenRequest { client_id, request_id, request, notification_channel, token, attested_contract })).await.is_err() {
                             break;
                         }
                     }

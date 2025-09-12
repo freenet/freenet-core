@@ -24,12 +24,12 @@ use super::{
     executor::{ContractExecutor, Executor},
     ContractError,
 };
-use crate::client_events::HostResult;
+use crate::client_events::{AuthToken, HostResult, RequestId};
 use crate::config::Config;
 use crate::message::{QueryResult, Transaction};
 use crate::{client_events::ClientId, wasm_runtime::Runtime};
 
-pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, HostResult)>);
+pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, RequestId, HostResult)>);
 
 pub(crate) fn client_responses_channel() -> (ClientResponsesReceiver, ClientResponsesSender) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -37,7 +37,7 @@ pub(crate) fn client_responses_channel() -> (ClientResponsesReceiver, ClientResp
 }
 
 impl std::ops::Deref for ClientResponsesReceiver {
-    type Target = UnboundedReceiver<(ClientId, HostResult)>;
+    type Target = UnboundedReceiver<(ClientId, RequestId, HostResult)>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -51,10 +51,10 @@ impl std::ops::DerefMut for ClientResponsesReceiver {
 }
 
 #[derive(Clone)]
-pub(crate) struct ClientResponsesSender(UnboundedSender<(ClientId, HostResult)>);
+pub(crate) struct ClientResponsesSender(UnboundedSender<(ClientId, RequestId, HostResult)>);
 
 impl std::ops::Deref for ClientResponsesSender {
-    type Target = UnboundedSender<(ClientId, HostResult)>;
+    type Target = UnboundedSender<(ClientId, RequestId, HostResult)>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -155,6 +155,8 @@ impl Hash for EventId {
 /// and sends the corresponding response to the listener of the operation.
 pub(crate) struct ContractHandlerChannel<End: sealed::ChannelHalve> {
     end: End,
+    /// Optional session actor communication
+    session_adapter_tx: Option<mpsc::Sender<SessionMessage>>,
 }
 
 pub(crate) struct ContractHandlerHalve {
@@ -167,10 +169,47 @@ pub(crate) struct SenderHalve {
     wait_for_res_tx: mpsc::Sender<(ClientId, WaitingTransaction)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum WaitingTransaction {
     Transaction(Transaction),
     Subscription { contract_key: ContractInstanceId },
+}
+
+/// Session message definitions for actor-based client management
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum SessionMessage {
+    #[allow(dead_code)]
+    RegisterClient {
+        client_id: ClientId,
+        request_id: RequestId,
+        transport_tx: UnboundedSender<HostResult>,
+        token: Option<AuthToken>,
+    },
+    #[allow(dead_code)]
+    RegisterTransaction {
+        #[allow(dead_code)]
+        tx: Transaction,
+        #[allow(dead_code)]
+        client_id: ClientId,
+        #[allow(dead_code)]
+        request_id: RequestId,
+    },
+    #[allow(dead_code)]
+    DeliverResult {
+        tx: Transaction,
+        result: Box<QueryResult>,
+    },
+    #[allow(dead_code)]
+    DeliverHostResponse {
+        tx: Transaction,
+        response: Arc<HostResult>,
+    },
+    #[allow(dead_code)]
+    ClientDisconnect {
+        #[allow(dead_code)]
+        client_id: ClientId,
+    },
 }
 
 impl From<Transaction> for WaitingTransaction {
@@ -206,15 +245,18 @@ pub(crate) fn contract_handler_channel() -> (
                 event_sender,
                 wait_for_res_tx,
             },
+            session_adapter_tx: None,
         },
         ContractHandlerChannel {
             end: ContractHandlerHalve {
                 event_receiver,
                 waiting_response: BTreeMap::new(),
             },
+            session_adapter_tx: None,
         },
         ContractHandlerChannel {
             end: WaitingResolution { wait_for_res_rx },
+            session_adapter_tx: None,
         },
     )
 }
@@ -258,16 +300,44 @@ impl ContractHandlerChannel<SenderHalve> {
         }
     }
 
+    /// Install session adapter for migration
+    pub fn with_session_adapter(&mut self, session_tx: mpsc::Sender<SessionMessage>) {
+        self.session_adapter_tx = Some(session_tx);
+    }
+
     pub async fn waiting_for_transaction_result(
         &self,
         transaction: impl Into<WaitingTransaction>,
         client_id: ClientId,
+        request_id: RequestId,
     ) -> Result<(), ContractError> {
+        let waiting_tx = transaction.into();
+
+        // Call legacy implementation first
         self.end
             .wait_for_res_tx
-            .send((client_id, transaction.into()))
+            .send((client_id, waiting_tx))
             .await
-            .map_err(|_| ContractError::NoEvHandlerResponse)
+            .map_err(|_| ContractError::NoEvHandlerResponse)?;
+
+        // Optionally route to session actor if migration enabled
+        if std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true" {
+            if let Some(session_tx) = &self.session_adapter_tx {
+                // Only mirror Transaction variants, handle Subscription separately later
+                if let WaitingTransaction::Transaction(tx) = waiting_tx {
+                    let msg = SessionMessage::RegisterTransaction {
+                        tx,
+                        client_id,
+                        request_id,
+                    };
+                    if let Err(e) = session_tx.try_send(msg) {
+                        tracing::warn!("Failed to notify session actor: {}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

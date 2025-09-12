@@ -1,6 +1,6 @@
 #[cfg(test)]
 pub(super) mod test_utils {
-    use rand::Rng;
+    use rand::random;
 
     use crate::ring::Distance;
 
@@ -9,7 +9,7 @@ pub(super) mod test_utils {
         let d_max = 0.5;
 
         // Generate a uniform random number between 0 and 1
-        let u: f64 = rand::thread_rng().gen_range(0.0..1.0);
+        let u: f64 = random();
 
         // Correct Inverse CDF: F^{-1}(u) = d_min * (d_max / d_min).powf(u)
         let d = d_min.as_f64() * (d_max / d_min.as_f64()).powf(u);

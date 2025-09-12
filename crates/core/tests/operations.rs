@@ -51,7 +51,7 @@ async fn base_node_test_config(
     }
 
     let temp_dir = tempfile::tempdir()?;
-    let key = TransportKeypair::new_with_rng(&mut *RNG.lock().unwrap());
+    let key = TransportKeypair::new();
     let transport_keypair = temp_dir.path().join("private.pem");
     key.save(&transport_keypair)?;
     key.public().save(temp_dir.path().join("public.pem"))?;
@@ -66,7 +66,7 @@ async fn base_node_test_config(
             is_gateway,
             skip_load_from_network: true,
             gateways: Some(gateways),
-            location: Some(RNG.lock().unwrap().gen()),
+            location: Some(RNG.lock().unwrap().random()),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port,

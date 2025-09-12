@@ -217,8 +217,46 @@ impl NodeP2P {
         ER: NetEventRegister + Clone,
     {
         let (notification_channel, notification_tx) = event_loop_notification_channel();
-        let (ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
+        let (mut ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::client_responses_channel();
+
+        // Prepare session adapter channel for actor-based client management
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(1000);
+
+        // Install session adapter in contract handler if migration enabled
+        let result_router_tx =
+            if std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true" {
+                ch_outbound.with_session_adapter(session_tx.clone());
+
+                // Create result router channel for dual-path result delivery
+                let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(1000);
+
+                // Spawn Session Actor
+                use crate::client_events::session_actor::SessionActor;
+                let session_actor = SessionActor::new(session_rx, cli_response_sender.clone());
+                GlobalExecutor::spawn(async move {
+                    tracing::info!("Session actor starting");
+                    session_actor.run().await;
+                    tracing::warn!("Session actor stopped");
+                });
+
+                // Spawn ResultRouter task
+                use crate::client_events::result_router::ResultRouter;
+                let router = ResultRouter::new(result_router_rx, session_tx);
+                GlobalExecutor::spawn(async move {
+                    tracing::info!("Result router starting");
+                    router.run().await;
+                    tracing::warn!("Result router stopped");
+                });
+
+                tracing::info!(
+                    "Actor-based client management infrastructure installed with result router"
+                );
+                Some(result_router_tx)
+            } else {
+                tracing::debug!("Actor-based client management disabled");
+                None
+            };
 
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
@@ -227,6 +265,7 @@ impl NodeP2P {
             &config,
             event_register.clone(),
             connection_manager,
+            result_router_tx,
         )?);
         let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
