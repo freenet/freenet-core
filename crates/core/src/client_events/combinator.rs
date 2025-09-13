@@ -169,9 +169,7 @@ async fn client_fn(
                         break;
                     }
                     Err(err) => {
-                        tracing::debug!("Client error: {err}");
-                        let _ = tx_host.send(Err(err)).await;
-                        break;
+                        panic!("Error of kind: {err} not handled");
                     }
                 }
             }
