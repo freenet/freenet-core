@@ -535,23 +535,7 @@ impl Operation for PutOp {
                                     "Starting subscription for contract after successful PUT"
                                 );
 
-                                // The contract should now be stored locally. We need to:
-                                // 1. Verify the contract is queryable locally
-                                // 2. Start a subscription request to register with peers
-
-                                // Verify contract is stored and queryable
-                                let has_contract =
-                                    super::has_contract(op_manager, key).await.unwrap_or(false);
-
-                                if !has_contract {
-                                    tracing::warn!(
-                                        tx = %id,
-                                        %key,
-                                        "Contract not queryable after PUT storage, attempting subscription anyway"
-                                    );
-                                }
-
-                                // Start subscription request
+                                // Start subscription request to register with peers
                                 super::start_subscription_request(op_manager, key).await;
 
                                 // Also ensure we're registered as a subscriber locally
