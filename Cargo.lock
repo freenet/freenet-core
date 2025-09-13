@@ -1174,7 +1174,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.0",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]
@@ -1606,7 +1606,8 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.1.2"
-source = "git+https://github.com/freenet/freenet-stdlib.git?branch=main#3557c9508607be9101ad274816bb88760355317a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3357fc23a41e5eca883901009e0c509e9c500d66d87da970767a2ca9fd6ddeef"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1659,8 +1660,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.14"
-source = "git+https://github.com/freenet/freenet-stdlib.git?branch=main#3557c9508607be9101ad274816bb88760355317a"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34eceef281df7747dc9f813a632d2d25eaa37a80732bbe2d729775ffe842dea8"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -2532,7 +2534,7 @@ checksum = "e04d7f318608d35d4b61ddd75cbdaee86b023ebe2bd5a66ee0915f0bf93095a9"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4115,7 +4117,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6131,7 +6133,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
