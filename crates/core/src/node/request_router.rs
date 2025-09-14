@@ -33,9 +33,7 @@ pub enum RequestResource {
         subscribe: bool,
     },
     /// SUBSCRIBE requests - multiple clients subscribing to same contract should be deduplicated
-    Subscribe {
-        key: ContractKey,
-    },
+    Subscribe { key: ContractKey },
     /// UPDATE requests with their parameters that affect the operation
     Update {
         key: ContractKey,
@@ -110,6 +108,7 @@ impl Hash for RequestResource {
 
 /// A client request that can be deduplicated
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Subscribe and Update variants will be used when integrated
 pub enum DeduplicatedRequest {
     Get {
         key: ContractKey,
@@ -292,8 +291,12 @@ impl RequestRouter {
         match request {
             DeduplicatedRequest::Get { .. } => Transaction::new::<crate::operations::get::GetMsg>(),
             DeduplicatedRequest::Put { .. } => Transaction::new::<crate::operations::put::PutMsg>(),
-            DeduplicatedRequest::Subscribe { .. } => Transaction::new::<crate::operations::subscribe::SubscribeMsg>(),
-            DeduplicatedRequest::Update { .. } => Transaction::new::<crate::operations::update::UpdateMsg>(),
+            DeduplicatedRequest::Subscribe { .. } => {
+                Transaction::new::<crate::operations::subscribe::SubscribeMsg>()
+            }
+            DeduplicatedRequest::Update { .. } => {
+                Transaction::new::<crate::operations::update::UpdateMsg>()
+            }
         }
     }
 }

@@ -127,7 +127,9 @@ mod tests {
         Err(crate::node::OpError::InvalidStateTransition {
             tx,
             #[cfg(debug_assertions)]
-            state: Some(Box::new("test_state".to_string()) as Box<dyn std::fmt::Debug + Send + Sync>),
+            state: Some(
+                Box::new("test_state".to_string()) as Box<dyn std::fmt::Debug + Send + Sync>
+            ),
             #[cfg(debug_assertions)]
             trace: std::backtrace::Backtrace::capture(),
         })
@@ -157,7 +159,10 @@ mod tests {
         // Verify message was sent to SessionActor
         let received_msg = session_rx.recv().await.expect("Should receive message");
         match received_msg {
-            SessionMessage::DeliverHostResponse { tx: received_tx, response: _ } => {
+            SessionMessage::DeliverHostResponse {
+                tx: received_tx,
+                response: _,
+            } => {
                 assert_eq!(received_tx, tx);
             }
             _ => panic!("Expected DeliverHostResponse message"),
@@ -202,7 +207,10 @@ mod tests {
         // Verify error was converted to ClientError and sent
         let received_msg = session_rx.recv().await.expect("Should receive message");
         match received_msg {
-            SessionMessage::DeliverHostResponse { tx: received_tx, response } => {
+            SessionMessage::DeliverHostResponse {
+                tx: received_tx,
+                response,
+            } => {
                 assert_eq!(received_tx, tx);
                 // Response should be an error
                 assert!(response.is_err());
