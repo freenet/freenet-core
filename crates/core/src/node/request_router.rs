@@ -32,6 +32,16 @@ pub enum RequestResource {
         state: freenet_stdlib::prelude::WrappedState,
         subscribe: bool,
     },
+    /// SUBSCRIBE requests - multiple clients subscribing to same contract should be deduplicated
+    Subscribe {
+        key: ContractKey,
+    },
+    /// UPDATE requests with their parameters that affect the operation
+    Update {
+        key: ContractKey,
+        new_state: freenet_stdlib::prelude::WrappedState,
+        related_contracts: freenet_stdlib::prelude::RelatedContracts<'static>,
+    },
 }
 
 impl Hash for RequestResource {
@@ -71,6 +81,29 @@ impl Hash for RequestResource {
                 hasher.finish().hash(state);
                 subscribe.hash(state);
             }
+            RequestResource::Subscribe { key } => {
+                // Hash discriminant for SUBSCRIBE variant
+                2u8.hash(state);
+                key.hash(state);
+            }
+            RequestResource::Update {
+                key,
+                new_state,
+                related_contracts,
+            } => {
+                // Hash discriminant for UPDATE variant
+                3u8.hash(state);
+                key.hash(state);
+                // For complex types, we'll serialize to bytes and hash that
+                // This ensures different states/related_contracts produce different hashes
+                let mut hasher = DefaultHasher::new();
+                key.hash(&mut hasher);
+                for (key, _) in related_contracts.states() {
+                    key.hash(&mut hasher);
+                }
+                new_state.hash(&mut hasher);
+                hasher.finish().hash(state);
+            }
         }
     }
 }
@@ -91,6 +124,18 @@ pub enum DeduplicatedRequest {
         related_contracts: freenet_stdlib::prelude::RelatedContracts<'static>,
         state: freenet_stdlib::prelude::WrappedState,
         subscribe: bool,
+        client_id: ClientId,
+        request_id: RequestId,
+    },
+    Subscribe {
+        key: ContractKey,
+        client_id: ClientId,
+        request_id: RequestId,
+    },
+    Update {
+        key: ContractKey,
+        new_state: freenet_stdlib::prelude::WrappedState,
+        related_contracts: freenet_stdlib::prelude::RelatedContracts<'static>,
         client_id: ClientId,
         request_id: RequestId,
     },
@@ -123,6 +168,17 @@ impl DeduplicatedRequest {
                 state: state.clone(),
                 subscribe: *subscribe,
             },
+            DeduplicatedRequest::Subscribe { key, .. } => RequestResource::Subscribe { key: *key },
+            DeduplicatedRequest::Update {
+                key,
+                new_state,
+                related_contracts,
+                ..
+            } => RequestResource::Update {
+                key: *key,
+                new_state: new_state.clone(),
+                related_contracts: related_contracts.clone(),
+            },
         }
     }
 
@@ -134,6 +190,16 @@ impl DeduplicatedRequest {
                 ..
             } => (*client_id, *request_id),
             DeduplicatedRequest::Put {
+                client_id,
+                request_id,
+                ..
+            } => (*client_id, *request_id),
+            DeduplicatedRequest::Subscribe {
+                client_id,
+                request_id,
+                ..
+            } => (*client_id, *request_id),
+            DeduplicatedRequest::Update {
                 client_id,
                 request_id,
                 ..
@@ -226,6 +292,8 @@ impl RequestRouter {
         match request {
             DeduplicatedRequest::Get { .. } => Transaction::new::<crate::operations::get::GetMsg>(),
             DeduplicatedRequest::Put { .. } => Transaction::new::<crate::operations::put::PutMsg>(),
+            DeduplicatedRequest::Subscribe { .. } => Transaction::new::<crate::operations::subscribe::SubscribeMsg>(),
+            DeduplicatedRequest::Update { .. } => Transaction::new::<crate::operations::update::UpdateMsg>(),
         }
     }
 }
@@ -494,5 +562,236 @@ mod tests {
         let (tx2, should_start_2) = router.route_request(request_2).await.unwrap();
         assert!(should_start_2); // Should start new operation
         assert_ne!(tx1, tx2); // Different transactions
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_request_deduplication() {
+        let router = RequestRouter::new();
+        let key = create_test_contract_key();
+        let client_id_1 = ClientId::next();
+        let client_id_2 = ClientId::next();
+        let request_id_1 = RequestId::new();
+        let request_id_2 = RequestId::new();
+
+        // First SUBSCRIBE request
+        let request_1 = DeduplicatedRequest::Subscribe {
+            key,
+            client_id: client_id_1,
+            request_id: request_id_1,
+        };
+
+        // Identical SUBSCRIBE request from different client (should be deduplicated)
+        let request_2 = DeduplicatedRequest::Subscribe {
+            key,
+            client_id: client_id_2,
+            request_id: request_id_2,
+        };
+
+        // First request should create new operation
+        let (tx1, should_start_1) = router.route_request(request_1).await.unwrap();
+        assert!(should_start_1);
+
+        // Second identical request should reuse existing operation
+        let (tx2, should_start_2) = router.route_request(request_2).await.unwrap();
+        assert!(!should_start_2);
+        assert_eq!(tx1, tx2);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_different_contract_no_deduplication() {
+        let router = RequestRouter::new();
+        let key1 = create_test_contract_key();
+        let key2 = ContractInstanceId::new([2u8; 32]).into(); // Different contract
+        let client_id = create_test_client_id();
+        let request_id_1 = RequestId::new();
+        let request_id_2 = RequestId::new();
+
+        // SUBSCRIBE request for first contract
+        let request_1 = DeduplicatedRequest::Subscribe {
+            key: key1,
+            client_id,
+            request_id: request_id_1,
+        };
+
+        // SUBSCRIBE request for different contract (should not be deduplicated)
+        let request_2 = DeduplicatedRequest::Subscribe {
+            key: key2,
+            client_id,
+            request_id: request_id_2,
+        };
+
+        let (tx1, should_start_1) = router.route_request(request_1).await.unwrap();
+        assert!(should_start_1);
+
+        let (tx2, should_start_2) = router.route_request(request_2).await.unwrap();
+        assert!(should_start_2); // Should start new operation
+        assert_ne!(tx1, tx2); // Different transactions
+    }
+
+    #[tokio::test]
+    async fn test_update_request_deduplication() {
+        let router = RequestRouter::new();
+        let key = create_test_contract_key();
+        let related_contracts = create_test_related_contracts();
+        let new_state = create_test_wrapped_state();
+        let client_id_1 = ClientId::next();
+        let client_id_2 = ClientId::next();
+        let request_id_1 = RequestId::new();
+        let request_id_2 = RequestId::new();
+
+        // First UPDATE request
+        let request_1 = DeduplicatedRequest::Update {
+            key,
+            new_state: new_state.clone(),
+            related_contracts: related_contracts.clone(),
+            client_id: client_id_1,
+            request_id: request_id_1,
+        };
+
+        // Identical UPDATE request from different client (should be deduplicated)
+        let request_2 = DeduplicatedRequest::Update {
+            key,
+            new_state: new_state.clone(),
+            related_contracts: related_contracts.clone(),
+            client_id: client_id_2,
+            request_id: request_id_2,
+        };
+
+        // First request should create new operation
+        let (tx1, should_start_1) = router.route_request(request_1).await.unwrap();
+        assert!(should_start_1);
+
+        // Second identical request should reuse existing operation
+        let (tx2, should_start_2) = router.route_request(request_2).await.unwrap();
+        assert!(!should_start_2);
+        assert_eq!(tx1, tx2);
+    }
+
+    #[tokio::test]
+    async fn test_update_request_different_state_no_deduplication() {
+        let router = RequestRouter::new();
+        let key = create_test_contract_key();
+        let related_contracts = create_test_related_contracts();
+        let state1 = create_test_wrapped_state();
+        let state2 = WrappedState::new(vec![15, 16, 17, 18]); // Different state
+        let client_id = create_test_client_id();
+        let request_id_1 = RequestId::new();
+        let request_id_2 = RequestId::new();
+
+        // UPDATE request with first state
+        let request_1 = DeduplicatedRequest::Update {
+            key,
+            new_state: state1,
+            related_contracts: related_contracts.clone(),
+            client_id,
+            request_id: request_id_1,
+        };
+
+        // UPDATE request with different state (should not be deduplicated)
+        let request_2 = DeduplicatedRequest::Update {
+            key,
+            new_state: state2,
+            related_contracts: related_contracts.clone(),
+            client_id,
+            request_id: request_id_2,
+        };
+
+        let (tx1, should_start_1) = router.route_request(request_1).await.unwrap();
+        assert!(should_start_1);
+
+        let (tx2, should_start_2) = router.route_request(request_2).await.unwrap();
+        assert!(should_start_2); // Should start new operation
+        assert_ne!(tx1, tx2); // Different transactions
+    }
+
+    #[tokio::test]
+    async fn test_update_request_different_contract_no_deduplication() {
+        let router = RequestRouter::new();
+        let key1 = create_test_contract_key();
+        let key2 = ContractInstanceId::new([3u8; 32]).into(); // Different contract
+        let related_contracts = create_test_related_contracts();
+        let new_state = create_test_wrapped_state();
+        let client_id = create_test_client_id();
+        let request_id_1 = RequestId::new();
+        let request_id_2 = RequestId::new();
+
+        // UPDATE request for first contract
+        let request_1 = DeduplicatedRequest::Update {
+            key: key1,
+            new_state: new_state.clone(),
+            related_contracts: related_contracts.clone(),
+            client_id,
+            request_id: request_id_1,
+        };
+
+        // UPDATE request for different contract (should not be deduplicated)
+        let request_2 = DeduplicatedRequest::Update {
+            key: key2,
+            new_state: new_state.clone(),
+            related_contracts: related_contracts.clone(),
+            client_id,
+            request_id: request_id_2,
+        };
+
+        let (tx1, should_start_1) = router.route_request(request_1).await.unwrap();
+        assert!(should_start_1);
+
+        let (tx2, should_start_2) = router.route_request(request_2).await.unwrap();
+        assert!(should_start_2); // Should start new operation
+        assert_ne!(tx1, tx2); // Different transactions
+    }
+
+    #[test]
+    fn test_all_operation_types_resource_hash_consistency() {
+        let key = create_test_contract_key();
+        let related_contracts = create_test_related_contracts();
+        let state = create_test_wrapped_state();
+
+        // Same operations should have same hashes
+        let get_1 = RequestResource::Get {
+            key,
+            return_contract_code: true,
+            subscribe: false,
+        };
+        let get_2 = RequestResource::Get {
+            key,
+            return_contract_code: true,
+            subscribe: false,
+        };
+        assert_eq!(get_1, get_2);
+
+        let subscribe_1 = RequestResource::Subscribe { key };
+        let subscribe_2 = RequestResource::Subscribe { key };
+        assert_eq!(subscribe_1, subscribe_2);
+
+        let update_1 = RequestResource::Update {
+            key,
+            new_state: state.clone(),
+            related_contracts: related_contracts.clone(),
+        };
+        let update_2 = RequestResource::Update {
+            key,
+            new_state: state.clone(),
+            related_contracts: related_contracts.clone(),
+        };
+        assert_eq!(update_1, update_2);
+
+        // Different operation types should have different hashes
+        assert_ne!(get_1, subscribe_1);
+        assert_ne!(get_1, update_1);
+        assert_ne!(subscribe_1, update_1);
+
+        // Same operation type with different parameters should have different hashes
+        let subscribe_different = RequestResource::Subscribe {
+            key: ContractInstanceId::new([4u8; 32]).into(),
+        };
+        assert_ne!(subscribe_1, subscribe_different);
+
+        let update_different = RequestResource::Update {
+            key,
+            new_state: WrappedState::new(vec![99, 100]),
+            related_contracts: related_contracts.clone(),
+        };
+        assert_ne!(update_1, update_different);
     }
 }
