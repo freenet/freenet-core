@@ -99,5 +99,136 @@ impl MessageProcessor {
     }
 }
 
-// TODO: Add comprehensive tests for MessageProcessor functionality
-// Tests temporarily removed to focus on core functionality compilation
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::{get, OpEnum};
+    use freenet_stdlib::prelude::ContractKey;
+    use tokio::sync::mpsc;
+
+    fn create_test_transaction() -> Transaction {
+        Transaction::new::<crate::operations::get::GetMsg>()
+    }
+
+    fn create_success_op_result() -> Result<Option<OpEnum>, crate::node::OpError> {
+        // Create a GetOp using the proper constructor
+        use freenet_stdlib::prelude::ContractInstanceId;
+        let key = ContractKey::from(ContractInstanceId::new([1u8; 32]));
+        let get_op = get::start_op(key, false, false);
+        Ok(Some(OpEnum::Get(get_op)))
+    }
+
+    fn create_none_op_result() -> Result<Option<OpEnum>, crate::node::OpError> {
+        Ok(None)
+    }
+
+    fn create_error_op_result() -> Result<Option<OpEnum>, crate::node::OpError> {
+        let tx = create_test_transaction();
+        Err(crate::node::OpError::InvalidStateTransition {
+            tx,
+            #[cfg(debug_assertions)]
+            state: Some(Box::new("test_state".to_string()) as Box<dyn std::fmt::Debug + Send + Sync>),
+            #[cfg(debug_assertions)]
+            trace: std::backtrace::Backtrace::capture(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_message_processor_creation() {
+        let (session_tx, _session_rx) = mpsc::channel(100);
+        let processor = MessageProcessor::new(session_tx);
+
+        // Verify the processor can be created
+        assert!(std::ptr::addr_of!(processor).is_aligned());
+    }
+
+    #[tokio::test]
+    async fn test_handle_network_result_success() {
+        let (session_tx, mut session_rx) = mpsc::channel(100);
+        let processor = MessageProcessor::new(session_tx);
+        let tx = create_test_transaction();
+
+        let result = processor
+            .handle_network_result(tx, create_success_op_result())
+            .await;
+
+        assert!(result.is_ok());
+
+        // Verify message was sent to SessionActor
+        let received_msg = session_rx.recv().await.expect("Should receive message");
+        match received_msg {
+            SessionMessage::DeliverHostResponse { tx: received_tx, response: _ } => {
+                assert_eq!(received_tx, tx);
+            }
+            _ => panic!("Expected DeliverHostResponse message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_network_result_none() {
+        let (session_tx, mut session_rx) = mpsc::channel(100);
+        let processor = MessageProcessor::new(session_tx);
+        let tx = create_test_transaction();
+
+        let result = processor
+            .handle_network_result(tx, create_none_op_result())
+            .await;
+
+        assert!(result.is_ok());
+
+        // Verify no message was sent for None result
+        tokio::select! {
+            _ = session_rx.recv() => {
+                panic!("Should not receive message for None result");
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
+                // Expected - no message sent
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_network_result_error() {
+        let (session_tx, mut session_rx) = mpsc::channel(100);
+        let processor = MessageProcessor::new(session_tx);
+        let tx = create_test_transaction();
+
+        let result = processor
+            .handle_network_result(tx, create_error_op_result())
+            .await;
+
+        assert!(result.is_ok());
+
+        // Verify error was converted to ClientError and sent
+        let received_msg = session_rx.recv().await.expect("Should receive message");
+        match received_msg {
+            SessionMessage::DeliverHostResponse { tx: received_tx, response } => {
+                assert_eq!(received_tx, tx);
+                // Response should be an error
+                assert!(response.is_err());
+            }
+            _ => panic!("Expected DeliverHostResponse message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_network_result_channel_closed() {
+        let (session_tx, session_rx) = mpsc::channel(100);
+        let processor = MessageProcessor::new(session_tx);
+        let tx = create_test_transaction();
+
+        // Close the receiver to simulate SessionActor being down
+        drop(session_rx);
+
+        let result = processor
+            .handle_network_result(tx, create_success_op_result())
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProcessingError::ActorCommunication(_) => {
+                // Expected error type
+            }
+        }
+    }
+}

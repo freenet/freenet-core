@@ -46,8 +46,13 @@ impl SessionActor {
             SessionMessage::DeliverHostResponse { tx, response } => {
                 self.handle_result_delivery(tx, response).await;
             }
-            SessionMessage::DeliverHostResponseWithRequestId { tx, response, request_id } => {
-                self.handle_result_delivery_with_request_id(tx, response, request_id).await;
+            SessionMessage::DeliverHostResponseWithRequestId {
+                tx,
+                response,
+                request_id,
+            } => {
+                self.handle_result_delivery_with_request_id(tx, response, request_id)
+                    .await;
             }
             SessionMessage::RegisterTransaction {
                 tx,
@@ -182,7 +187,10 @@ impl SessionActor {
             self.client_request_ids.remove(&(tx, client_id));
 
             // Deliver result to the specific client
-            if let Err(e) = self.client_responses.send((client_id, request_id, (*result).clone())) {
+            if let Err(e) = self
+                .client_responses
+                .send((client_id, request_id, (*result).clone()))
+            {
                 tracing::warn!(
                     "Failed to deliver result to client {} (request {}): {}",
                     client_id,

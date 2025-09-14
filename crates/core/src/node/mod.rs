@@ -71,9 +71,11 @@ mod message_processor;
 mod network_bridge;
 mod op_state_manager;
 mod p2p_impl;
+mod request_router;
 pub(crate) mod testing_impl;
 
 pub use message_processor::MessageProcessor;
+pub use request_router::{DeduplicatedRequest, RequestRouter};
 
 pub struct Node(NodeP2P);
 

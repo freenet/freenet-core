@@ -42,7 +42,10 @@ use crate::{
         NetworkEventListenerHalve, WaitingResolution,
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction},
-    node::{handle_aborted_op, process_message, process_message_decoupled, NetEventRegister, NodeConfig, OpManager},
+    node::{
+        handle_aborted_op, process_message, process_message_decoupled, NetEventRegister,
+        NodeConfig, OpManager,
+    },
     ring::PeerKeyLocation,
     tracing::NetEventLog,
 };

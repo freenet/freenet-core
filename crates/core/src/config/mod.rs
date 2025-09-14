@@ -458,6 +458,7 @@ pub struct Config {
     pub(crate) is_gateway: bool,
     pub(crate) location: Option<f64>,
     /// Enable actor-based client management system for improved scalability and monitoring
+    #[serde(default)]
     pub actor_clients: bool,
 }
 
