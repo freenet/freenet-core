@@ -584,25 +584,107 @@ async fn process_open_request(
                             ?new_state,
                             "Sending update op",
                         );
-                        let op = update::start_op(key, new_state, related_contracts);
 
-                        tracing::debug!(
-                            request_id = %request_id,
-                            transaction_id = %op.id,
-                            operation = "update",
-                            "Request-Transaction correlation"
-                        );
+                        // Use RequestRouter for deduplication if in actor mode, otherwise direct operation
+                        if let Some(router) = &request_router {
+                            tracing::debug!(
+                                peer_id = %peer_id,
+                                key = %key,
+                                "Routing UPDATE request through deduplication layer (actor mode)",
+                            );
 
-                        op_manager
-                            .ch_outbound
-                            .waiting_for_transaction_result(op.id, client_id, request_id)
-                            .await
-                            .inspect_err(|err| {
-                                tracing::error!("Error waiting for transaction result: {}", err);
-                            })?;
+                            let request = crate::node::DeduplicatedRequest::Update {
+                                key,
+                                new_state: new_state.clone(),
+                                related_contracts: related_contracts.clone(),
+                                client_id,
+                                request_id,
+                            };
 
-                        if let Err(err) = update::request_update(&op_manager, op).await {
-                            tracing::error!("request update error {}", err)
+                            let (transaction_id, should_start_operation) =
+                                router.route_request(request).await.map_err(|e| {
+                                    Error::Node(format!("Request routing failed: {}", e))
+                                })?;
+
+                            // Always register this client for the result
+                            op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(
+                                    transaction_id,
+                                    client_id,
+                                    request_id,
+                                )
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!(
+                                        "Error waiting for transaction result: {}",
+                                        err
+                                    );
+                                })?;
+
+                            // Only start new network operation if this is a new operation
+                            if should_start_operation {
+                                tracing::debug!(
+                                    peer_id = %peer_id,
+                                    key = %key,
+                                    "Starting new UPDATE network operation via RequestRouter",
+                                );
+
+                                let op = update::start_op_with_id(
+                                    key,
+                                    new_state,
+                                    related_contracts,
+                                    transaction_id,
+                                );
+
+                                tracing::debug!(
+                                    request_id = %request_id,
+                                    transaction_id = %op.id,
+                                    operation = "update",
+                                    "Request-Transaction correlation"
+                                );
+
+                                if let Err(err) = update::request_update(&op_manager, op).await {
+                                    tracing::error!("request update error {}", err)
+                                }
+                            } else {
+                                tracing::debug!(
+                                    peer_id = %peer_id,
+                                    key = %key,
+                                    "Reusing existing UPDATE operation via RequestRouter - client registered for result",
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                peer_id = %peer_id,
+                                key = %key,
+                                "Starting direct UPDATE operation (legacy mode)",
+                            );
+
+                            // Legacy mode: direct operation without deduplication
+                            let op = update::start_op(key, new_state, related_contracts);
+
+                            tracing::debug!(
+                                request_id = %request_id,
+                                transaction_id = %op.id,
+                                operation = "update",
+                                "Request-Transaction correlation"
+                            );
+
+                            op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(op.id, client_id, request_id)
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!(
+                                        "Error waiting for transaction result: {}",
+                                        err
+                                    );
+                                })?;
+
+                            if let Err(err) = update::request_update(&op_manager, op).await {
+                                tracing::error!("request update error {}", err)
+                            }
                         }
                     }
                     ContractRequest::Get {
@@ -791,25 +873,123 @@ async fn process_open_request(
                         }
                     }
                     ContractRequest::Subscribe { key, summary } => {
-                        let op_id =
-                            crate::node::subscribe(op_manager.clone(), key, Some(client_id))
+                        let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
+                        else {
+                            tracing::error!("Peer id not found at subscribe op, it should be set");
+                            return Err(Error::Disconnected);
+                        };
+
+                        tracing::debug!(
+                            this_peer = %peer_id,
+                            "Received subscribe from user event",
+                        );
+
+                        let Some(subscriber_listener) = subscription_listener else {
+                            tracing::error!(%client_id, "No subscriber listener");
+                            return Ok(None);
+                        };
+
+                        // Use RequestRouter for deduplication if in actor mode, otherwise direct operation
+                        if let Some(router) = &request_router {
+                            tracing::debug!(
+                                peer_id = %peer_id,
+                                key = %key,
+                                "Routing SUBSCRIBE request through deduplication layer (actor mode)",
+                            );
+
+                            let request = crate::node::DeduplicatedRequest::Subscribe {
+                                key,
+                                client_id,
+                                request_id,
+                            };
+
+                            let (transaction_id, should_start_operation) =
+                                router.route_request(request).await.map_err(|e| {
+                                    Error::Node(format!("Request routing failed: {}", e))
+                                })?;
+
+                            // Always register this client for the result
+                            op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(
+                                    transaction_id,
+                                    client_id,
+                                    request_id,
+                                )
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!(
+                                        "Error waiting for transaction result: {}",
+                                        err
+                                    );
+                                })?;
+
+                            // Only start new network operation if this is a new operation
+                            if should_start_operation {
+                                tracing::debug!(
+                                    peer_id = %peer_id,
+                                    key = %key,
+                                    "Starting new SUBSCRIBE network operation via RequestRouter",
+                                );
+
+                                let op_id = crate::node::subscribe(
+                                    op_manager.clone(),
+                                    key,
+                                    Some(client_id),
+                                )
                                 .await
                                 .inspect_err(|err| {
                                     tracing::error!("Subscribe error: {}", err);
                                 })?;
 
-                        tracing::debug!(
-                            request_id = %request_id,
-                            transaction_id = %op_id,
-                            operation = "subscribe",
-                            "Request-Transaction correlation"
-                        );
+                                tracing::debug!(
+                                    request_id = %request_id,
+                                    transaction_id = %op_id,
+                                    operation = "subscribe",
+                                    "Request-Transaction correlation"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    peer_id = %peer_id,
+                                    key = %key,
+                                    "Reusing existing SUBSCRIBE operation via RequestRouter - client registered for result",
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                peer_id = %peer_id,
+                                key = %key,
+                                "Starting direct SUBSCRIBE operation (legacy mode)",
+                            );
 
-                        let Some(subscriber_listener) = subscription_listener else {
-                            tracing::error!(%op_id, %client_id, "No subscriber listener");
-                            return Ok(None);
-                        };
+                            // Legacy mode: direct operation without deduplication
+                            let op_id =
+                                crate::node::subscribe(op_manager.clone(), key, Some(client_id))
+                                    .await
+                                    .inspect_err(|err| {
+                                        tracing::error!("Subscribe error: {}", err);
+                                    })?;
 
+                            tracing::debug!(
+                                request_id = %request_id,
+                                transaction_id = %op_id,
+                                operation = "subscribe",
+                                "Request-Transaction correlation"
+                            );
+
+                            op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(op_id, client_id, request_id)
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!(
+                                        "Error waiting for transaction result: {}",
+                                        err
+                                    );
+                                })?;
+                        }
+
+                        // Register subscription listener (same for both modes)
                         let register_listener = op_manager
                             .notify_contract_handler(
                                 ContractHandlerEvent::RegisterSubscriberListener {
@@ -822,33 +1002,25 @@ async fn process_open_request(
                             .await
                             .inspect_err(|err| {
                                 tracing::error!(
-                                    %op_id, %client_id,
+                                    %client_id, %key,
                                     "Register subscriber listener error: {}", err
                                 );
                             });
                         match register_listener {
                             Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
                                 tracing::debug!(
-                                    %op_id, %client_id,
+                                    %client_id, %key,
                                     "Subscriber listener registered successfully"
                                 );
                             }
                             _ => {
                                 tracing::error!(
-                                    %op_id, %client_id,
+                                    %client_id, %key,
                                     "Subscriber listener registration failed"
                                 );
                                 return Err(Error::Op(OpError::UnexpectedOpState));
                             }
                         }
-
-                        op_manager
-                            .ch_outbound
-                            .waiting_for_transaction_result(op_id, client_id, request_id)
-                            .await
-                            .inspect_err(|err| {
-                                tracing::error!("Error waiting for transaction result: {}", err);
-                            })?;
                     }
                     _ => {
                         tracing::error!("Op not supported");

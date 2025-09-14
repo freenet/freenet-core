@@ -108,7 +108,6 @@ impl Hash for RequestResource {
 
 /// A client request that can be deduplicated
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Subscribe and Update variants will be used when integrated
 pub enum DeduplicatedRequest {
     Get {
         key: ContractKey,
