@@ -29,7 +29,7 @@ use crate::node::network_bridge::handshake::{
     Event as HandshakeEvent, ForwardInfo, HandshakeError, HandshakeHandler, HanshakeHandlerMsg,
     OutboundMessage,
 };
-use crate::node::PeerId;
+use crate::node::{MessageProcessor, PeerId};
 use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
 use crate::transport::{
     create_connection_handler, PeerConnection, TransportError, TransportKeypair,
@@ -42,7 +42,7 @@ use crate::{
         NetworkEventListenerHalve, WaitingResolution,
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction},
-    node::{handle_aborted_op, process_message, NetEventRegister, NodeConfig, OpManager},
+    node::{handle_aborted_op, process_message, process_message_decoupled, NetEventRegister, NodeConfig, OpManager},
     ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
@@ -127,6 +127,8 @@ pub(in crate::node) struct P2pConnManager {
     check_version: bool,
     bandwidth_limit: Option<usize>,
     blocked_addresses: Option<HashSet<SocketAddr>>,
+    /// MessageProcessor for clean client handling separation
+    message_processor: Option<Arc<MessageProcessor>>,
 }
 
 impl P2pConnManager {
@@ -157,7 +159,14 @@ impl P2pConnManager {
             check_version: !config.config.network_api.ignore_protocol_version,
             bandwidth_limit: config.config.network_api.bandwidth_limit,
             blocked_addresses: config.blocked_addresses.clone(),
+            message_processor: None, // Will be set later based on configuration
         })
+    }
+
+    /// Set the MessageProcessor for Phase 4 network decoupling
+    pub fn with_message_processor(mut self, message_processor: Arc<MessageProcessor>) -> Self {
+        self.message_processor = Some(message_processor);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -717,19 +726,37 @@ impl P2pConnManager {
 
         let pending_op_result = state.pending_op_results.get(msg.id()).cloned();
 
-        GlobalExecutor::spawn(
-            process_message(
-                msg,
-                op_manager.clone(),
-                self.bridge.clone(),
-                self.event_listener.trait_clone(),
-                executor_callback,
-                client_req_handler_callback,
-                pending_client_req,
-                pending_op_result,
-            )
-            .instrument(span),
-        );
+        // Phase 4: Use MessageProcessor for clean client handling separation when available
+        if let Some(message_processor) = &self.message_processor {
+            tracing::debug!("Using PURE network processing - zero client types in network layer for transaction {}", msg.id());
+            GlobalExecutor::spawn(
+                process_message_decoupled(
+                    msg,
+                    op_manager.clone(),
+                    self.bridge.clone(),
+                    self.event_listener.trait_clone(),
+                    executor_callback,
+                    message_processor.clone(),
+                    pending_op_result,
+                )
+                .instrument(span),
+            );
+        } else {
+            // Legacy path - existing behavior
+            GlobalExecutor::spawn(
+                process_message(
+                    msg,
+                    op_manager.clone(),
+                    self.bridge.clone(),
+                    self.event_listener.trait_clone(),
+                    executor_callback,
+                    client_req_handler_callback,
+                    pending_client_req,
+                    pending_op_result,
+                )
+                .instrument(span),
+            );
+        }
     }
 
     async fn handle_connect_peer(

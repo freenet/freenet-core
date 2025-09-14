@@ -66,8 +66,7 @@ pub(crate) struct OpManager {
     pub ch_outbound: ContractHandlerChannel<SenderHalve>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
     pub result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
-    // TODO: Add circuit breaker state for router failures
-    // pub router_circuit_breaker: Arc<AtomicBool>,
+    pub actor_clients: bool,
 }
 
 impl OpManager {
@@ -113,6 +112,7 @@ impl OpManager {
             ch_outbound,
             new_transactions,
             result_router_tx,
+            actor_clients: config.config.actor_clients,
         })
     }
 

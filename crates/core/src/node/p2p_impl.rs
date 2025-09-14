@@ -225,7 +225,7 @@ impl NodeP2P {
 
         // Install session adapter in contract handler if migration enabled
         let result_router_tx =
-            if std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true" {
+            if config.config.actor_clients {
                 ch_outbound.with_session_adapter(session_tx.clone());
 
                 // Create result router channel for dual-path result delivery
@@ -242,7 +242,7 @@ impl NodeP2P {
 
                 // Spawn ResultRouter task
                 use crate::client_events::result_router::ResultRouter;
-                let router = ResultRouter::new(result_router_rx, session_tx);
+                let router = ResultRouter::new(result_router_rx, session_tx.clone());
                 GlobalExecutor::spawn(async move {
                     tracing::info!("Result router starting");
                     router.run().await;
@@ -272,8 +272,23 @@ impl NodeP2P {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let conn_manager =
+        let mut conn_manager =
             P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
+
+        // Phase 4: Configure MessageProcessor for clean client handling separation
+        let use_actor_clients = config.config.actor_clients;
+        if use_actor_clients {
+            // Clone session_tx before using it in MessageProcessor
+            let session_tx_for_processor = session_tx.clone();
+
+            // Create MessageProcessor for actor mode - direct to SessionActor
+            use crate::node::MessageProcessor;
+            let message_processor = Arc::new(MessageProcessor::new(session_tx_for_processor));
+            conn_manager = conn_manager.with_message_processor(message_processor);
+            tracing::info!("P2P layer configured with MessageProcessor in ACTOR mode - network processing will be decoupled from client handling");
+        } else {
+            tracing::info!("P2P layer using legacy client handling - MessageProcessor not configured");
+        }
 
         let parent_span = tracing::Span::current();
         let contract_executor_task = GlobalExecutor::spawn({

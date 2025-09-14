@@ -3,7 +3,7 @@
 //! This module provides a simplified session actor that manages client sessions
 //! and handles efficient 1→N result delivery to multiple clients.
 
-use crate::client_events::{ClientId, RequestId};
+use crate::client_events::{ClientId, HostResult, RequestId};
 use crate::contract::{ClientResponsesSender, SessionMessage};
 use crate::message::Transaction;
 use std::collections::{HashMap, HashSet};
@@ -45,6 +45,9 @@ impl SessionActor {
         match msg {
             SessionMessage::DeliverHostResponse { tx, response } => {
                 self.handle_result_delivery(tx, response).await;
+            }
+            SessionMessage::DeliverHostResponseWithRequestId { tx, response, request_id } => {
+                self.handle_result_delivery_with_request_id(tx, response, request_id).await;
             }
             SessionMessage::RegisterTransaction {
                 tx,
@@ -143,6 +146,62 @@ impl SessionActor {
             }
         } else {
             tracing::debug!("No clients waiting for transaction result: {}", tx);
+        }
+    }
+
+    /// Handle result delivery with a specific RequestId (for actor mode)
+    async fn handle_result_delivery_with_request_id(
+        &mut self,
+        tx: Transaction,
+        result: std::sync::Arc<HostResult>,
+        request_id: RequestId,
+    ) {
+        // Find the specific client associated with this RequestId
+        let mut target_client = None;
+
+        // Search for the client that has this RequestId for this transaction
+        for ((tx_key, client_id), stored_request_id) in &self.client_request_ids {
+            if *tx_key == tx && *stored_request_id == request_id {
+                target_client = Some(*client_id);
+                break;
+            }
+        }
+
+        if let Some(client_id) = target_client {
+            // Remove the specific client from waiting
+            if let Some(waiting_clients) = self.client_transactions.get_mut(&tx) {
+                waiting_clients.remove(&client_id);
+
+                // Clean up if no more clients waiting
+                if waiting_clients.is_empty() {
+                    self.client_transactions.remove(&tx);
+                }
+            }
+
+            // Remove the RequestId correlation
+            self.client_request_ids.remove(&(tx, client_id));
+
+            // Deliver result to the specific client
+            if let Err(e) = self.client_responses.send((client_id, request_id, (*result).clone())) {
+                tracing::warn!(
+                    "Failed to deliver result to client {} (request {}): {}",
+                    client_id,
+                    request_id,
+                    e
+                );
+            } else {
+                tracing::debug!(
+                    "Delivered result for transaction {} to specific client {} with request correlation {}",
+                    tx, client_id, request_id
+                );
+            }
+        } else {
+            tracing::warn!(
+                "No client found for transaction {} with request ID {}, falling back to general delivery",
+                tx, request_id
+            );
+            // Fall back to general delivery mechanism
+            self.handle_result_delivery(tx, result).await;
         }
     }
 

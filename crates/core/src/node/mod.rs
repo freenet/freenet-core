@@ -67,10 +67,13 @@ use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
+mod message_processor;
 mod network_bridge;
 mod op_state_manager;
 mod p2p_impl;
 pub(crate) mod testing_impl;
+
+pub use message_processor::MessageProcessor;
 
 pub struct Node(NodeP2P);
 
@@ -427,10 +430,9 @@ async fn report_result(
                 });
             }
 
-            // EXISTING: Legacy client delivery (skip only in router_only mode)
-            let router_mode = std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default();
-            let skip_legacy_delivery = router_mode == "router_only";
-            if !skip_legacy_delivery {
+            // EXISTING: Legacy client delivery (only when actor_clients is disabled)
+            // When actor_clients is enabled, SessionActor handles all client communication
+            if !op_manager.actor_clients {
                 if let Some((client_ids, cb)) = client_req_handler_callback {
                     for client_id in client_ids {
                         // Enhanced logging for UPDATE operations
@@ -640,6 +642,70 @@ async fn process_message<CB>(
     }
 }
 
+/// NEW: Pure network message processing using MessageProcessor for client handling
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_message_decoupled<CB>(
+    msg: NetMessage,
+    op_manager: Arc<OpManager>,
+    conn_manager: CB,
+    event_listener: Box<dyn NetEventRegister>,
+    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    message_processor: std::sync::Arc<MessageProcessor>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+) where
+    CB: NetworkBridge,
+{
+    let tx = *msg.id();
+
+    // Pure network message processing - no client types involved
+    let op_result = handle_pure_network_message(
+        msg,
+        op_manager.clone(),
+        conn_manager,
+        event_listener,
+        executor_callback,
+        pending_op_result,
+    )
+    .await;
+
+    // Delegate to MessageProcessor - it handles all client concerns internally
+    if let Err(e) = message_processor.handle_network_result(tx, op_result).await {
+        tracing::error!(
+            "Failed to handle network result for transaction {}: {}",
+            tx,
+            e
+        );
+    }
+}
+
+/// Pure network message handling (no client concerns)
+#[allow(clippy::too_many_arguments)]
+async fn handle_pure_network_message<CB>(
+    msg: NetMessage,
+    op_manager: Arc<OpManager>,
+    conn_manager: CB,
+    event_listener: Box<dyn NetEventRegister>,
+    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
+where
+    CB: NetworkBridge,
+{
+    match msg {
+        NetMessage::V1(msg_v1) => {
+            handle_pure_network_message_v1(
+                msg_v1,
+                op_manager,
+                conn_manager,
+                event_listener,
+                executor_callback,
+                pending_op_result,
+            )
+            .await
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_message_v1<CB>(
     tx: Option<Transaction>,
@@ -797,6 +863,265 @@ async fn process_message_v1<CB>(
             _ => break, // Exit the loop if no applicable message type is found
         }
     }
+}
+
+/// Pure network message processing for V1 messages (no client concerns)
+#[allow(clippy::too_many_arguments)]
+async fn handle_pure_network_message_v1<CB>(
+    msg: NetMessageV1,
+    op_manager: Arc<OpManager>,
+    mut conn_manager: CB,
+    mut event_listener: Box<dyn NetEventRegister>,
+    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
+where
+    CB: NetworkBridge,
+{
+    // Register network events (pure network concern)
+    event_listener
+        .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
+        .await;
+
+    const MAX_RETRIES: usize = 10usize;
+    for i in 0..MAX_RETRIES {
+        let tx = Some(*msg.id());
+        tracing::debug!(?tx, "Processing pure network operation, iteration: {i}");
+
+        match msg {
+            NetMessageV1::Connect(ref op) => {
+                let parent_span = tracing::Span::current();
+                let span = tracing::info_span!(
+                    parent: parent_span,
+                    "handle_connect_op_request",
+                    transaction = %msg.id(),
+                    tx_type = %msg.id().transaction_type()
+                );
+                let op_result =
+                    handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
+                        .instrument(span)
+                        .await;
+
+                if let Err(OpError::OpNotAvailable(state)) = &op_result {
+                    match state {
+                        OpNotAvailable::Running => {
+                            tracing::debug!("Pure network: Operation still running");
+                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            continue;
+                        }
+                        OpNotAvailable::Completed => {
+                            tracing::debug!("Pure network: Operation already completed");
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                // Pure network result processing - no client handling
+                return handle_pure_network_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            NetMessageV1::Put(ref op) => {
+                let op_result =
+                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
+
+                // Handle pending operation results (network concern)
+                if is_operation_completed(&op_result) {
+                    if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
+                        let _ = op_execution_callback
+                            .send(NetMessage::V1(NetMessageV1::Put((*op).clone())))
+                            .await
+                            .inspect_err(|err| tracing::error!(%err, %tx_id, "Failed to send message to executor"));
+                    }
+                }
+
+                if let Err(OpError::OpNotAvailable(state)) = &op_result {
+                    match state {
+                        OpNotAvailable::Running => {
+                            tracing::debug!("Pure network: Operation still running");
+                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            continue;
+                        }
+                        OpNotAvailable::Completed => {
+                            tracing::debug!("Pure network: Operation already completed");
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                return handle_pure_network_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            NetMessageV1::Get(ref op) => {
+                let op_result =
+                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
+
+                // Handle pending operation results (network concern)
+                if is_operation_completed(&op_result) {
+                    if let Some(ref op_execution_callback) = pending_op_result {
+                        let tx_id = *op.id();
+                        let _ = op_execution_callback
+                            .send(NetMessage::V1(NetMessageV1::Get((*op).clone())))
+                            .await
+                            .inspect_err(|err| tracing::error!(%err, %tx_id, "Failed to send message to executor"));
+                    }
+                }
+
+                if let Err(OpError::OpNotAvailable(state)) = &op_result {
+                    match state {
+                        OpNotAvailable::Running => {
+                            tracing::debug!("Pure network: Operation still running");
+                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            continue;
+                        }
+                        OpNotAvailable::Completed => {
+                            tracing::debug!("Pure network: Operation already completed");
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                return handle_pure_network_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            NetMessageV1::Update(ref op) => {
+                let op_result =
+                    handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
+                        .await;
+
+                if let Err(OpError::OpNotAvailable(state)) = &op_result {
+                    match state {
+                        OpNotAvailable::Running => {
+                            tracing::debug!("Pure network: Operation still running");
+                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            continue;
+                        }
+                        OpNotAvailable::Completed => {
+                            tracing::debug!("Pure network: Operation already completed");
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                return handle_pure_network_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            NetMessageV1::Subscribe(ref op) => {
+                let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                )
+                .await;
+
+                if let Err(OpError::OpNotAvailable(state)) = &op_result {
+                    match state {
+                        OpNotAvailable::Running => {
+                            tracing::debug!("Pure network: Operation still running");
+                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            continue;
+                        }
+                        OpNotAvailable::Completed => {
+                            tracing::debug!("Pure network: Operation already completed");
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                return handle_pure_network_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            NetMessageV1::Unsubscribed { ref key, .. } => {
+                if let Err(error) = subscribe(op_manager, *key, None).await {
+                    tracing::error!(%error, "Failed to subscribe to contract");
+                }
+                break;
+            }
+            _ => break, // Exit the loop if no applicable message type is found
+        }
+    }
+
+    // If we reach here, no operation was processed
+    Ok(None)
+}
+
+/// Pure network result handling - no client notification logic
+async fn handle_pure_network_result(
+    tx: Option<Transaction>,
+    op_result: Result<Option<crate::operations::OpEnum>, OpError>,
+    _op_manager: &Arc<OpManager>,
+    _executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    _event_listener: &mut dyn NetEventRegister,
+) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError> {
+    tracing::debug!("Pure network result handling for transaction: {:?}", tx);
+
+    match &op_result {
+        Ok(Some(_op_res)) => {
+            // Log network operation completion
+            tracing::debug!(
+                "Network operation completed successfully for transaction: {:?}",
+                tx
+            );
+
+            // Register completion event (pure network concern)
+            if let Some(tx_id) = tx {
+                // TODO: Register completion event properly
+                tracing::debug!("Network operation completed for transaction: {}", tx_id);
+            }
+
+            // TODO: Handle executor callbacks (network concern)
+            // Executor callback functionality needs to be restored with proper types
+            if let Some(_callback) = _executor_callback {
+                tracing::debug!("Executor callback available for transaction {:?} but not implemented in pure network processing", tx);
+            }
+        }
+        Ok(None) => {
+            tracing::debug!("Network operation returned no result");
+        }
+        Err(e) => {
+            tracing::error!("Network operation failed: {}", e);
+            // TODO: Register error event properly
+            if let Some(tx_id) = tx {
+                tracing::debug!(
+                    "Network operation failed for transaction: {} with error: {}",
+                    tx_id,
+                    e
+                );
+            }
+        }
+    }
+
+    op_result
 }
 
 /// Attempts to subscribe to a contract
