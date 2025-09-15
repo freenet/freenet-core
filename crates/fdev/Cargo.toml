@@ -9,7 +9,7 @@ license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet"
 
 [dependencies]
-bytesize = "2.0"
+bytesize = "2.1"
 anyhow = "1"
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
 bincode = "1"
