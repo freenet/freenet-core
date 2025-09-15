@@ -8,20 +8,10 @@ on:
 
 jobs:
   test_all:
-    name: Test (${{ matrix.name }})
+    name: Test
 
     runs-on: freenet-default-runner
 
-    strategy:
-      max-parallel: 1
-      matrix:
-        include:
-          - args: "--no-default-features --features trace,websocket,redb"
-            name: "legacy-mode"
-            env_vars: ""
-          - args: "--no-default-features --features trace,websocket,redb"
-            name: "actor-mode"
-            env_vars: "FREENET_ACTOR_CLIENTS=true"
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -45,15 +35,17 @@ jobs:
           shared-key: "rust-cache"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-
       - name: Build
         run: |
           cargo build --locked
           export PATH="$PWD/target/debug:$PATH"
           make -C apps/freenet-ping -f run-ping.mk build
 
-      - name: Test - features
-        run: ${{ matrix.env_vars }} cargo test --workspace ${{ matrix.args }}
+      - name: Test - legacy mode
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb
+
+      - name: Test - actor mode
+        run: FREENET_ACTOR_CLIENTS=true cargo test --workspace --no-default-features --features trace,websocket,redb
 
   clippy_check:
     name: Clippy
