@@ -170,7 +170,7 @@ impl PeerConnection {
                 let elapsed_since_start = task_start.elapsed();
                 let elapsed_since_last_tick = tick_start.elapsed();
 
-                tracing::info!(
+                tracing::debug!(
                     target: "freenet_core::transport::keepalive_lifecycle",
                     remote = ?remote_addr,
                     tick_count,
@@ -195,7 +195,7 @@ impl PeerConnection {
                 };
 
                 // Send the keep-alive packet
-                tracing::info!(
+                tracing::debug!(
                     target: "freenet_core::transport::keepalive_lifecycle",
                     remote = ?remote_addr,
                     packet_id,
@@ -204,7 +204,7 @@ impl PeerConnection {
 
                 match outbound_packets.send((remote_addr, noop_packet)).await {
                     Ok(_) => {
-                        tracing::info!(
+                        tracing::debug!(
                             target: "freenet_core::transport::keepalive_lifecycle",
                             remote = ?remote_addr,
                             packet_id,
@@ -462,7 +462,7 @@ impl PeerConnection {
                     // Log keep-alive packets specifically
                     if matches!(payload, SymmetricMessagePayload::NoOp) {
                         if confirm_receipt.is_empty() {
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "freenet_core::transport::keepalive_received",
                                 remote = ?self.remote_conn.remote_addr,
                                 packet_id,
