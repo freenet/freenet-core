@@ -589,6 +589,30 @@ pub(crate) fn start_op(
     }
 }
 
+/// This will be called from the node when processing an open request with a specific transaction ID
+pub(crate) fn start_op_with_id(
+    key: ContractKey,
+    new_state: WrappedState,
+    related_contracts: RelatedContracts<'static>,
+    id: Transaction,
+) -> UpdateOp {
+    let contract_location = Location::from(&key);
+    tracing::debug!(%contract_location, %key, "Requesting update with transaction ID {}", id);
+    // let payload_size = contract.data().len();
+
+    let state = Some(UpdateState::PrepareRequest {
+        key,
+        related_contracts,
+        value: new_state,
+    });
+
+    UpdateOp {
+        id,
+        state,
+        stats: Some(UpdateStats { target: None }),
+    }
+}
+
 /// Entry point from node to operations logic
 pub(crate) async fn request_update(
     op_manager: &OpManager,

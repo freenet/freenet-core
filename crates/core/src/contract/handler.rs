@@ -206,6 +206,12 @@ pub enum SessionMessage {
         response: Arc<HostResult>,
     },
     #[allow(dead_code)]
+    DeliverHostResponseWithRequestId {
+        tx: Transaction,
+        response: Arc<HostResult>,
+        request_id: RequestId,
+    },
+    #[allow(dead_code)]
     ClientDisconnect {
         #[allow(dead_code)]
         client_id: ClientId,
@@ -320,19 +326,17 @@ impl ContractHandlerChannel<SenderHalve> {
             .await
             .map_err(|_| ContractError::NoEvHandlerResponse)?;
 
-        // Optionally route to session actor if migration enabled
-        if std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true" {
-            if let Some(session_tx) = &self.session_adapter_tx {
-                // Only mirror Transaction variants, handle Subscription separately later
-                if let WaitingTransaction::Transaction(tx) = waiting_tx {
-                    let msg = SessionMessage::RegisterTransaction {
-                        tx,
-                        client_id,
-                        request_id,
-                    };
-                    if let Err(e) = session_tx.try_send(msg) {
-                        tracing::warn!("Failed to notify session actor: {}", e);
-                    }
+        // Route to session actor if session adapter is installed
+        if let Some(session_tx) = &self.session_adapter_tx {
+            // Only mirror Transaction variants, handle Subscription separately later
+            if let WaitingTransaction::Transaction(tx) = waiting_tx {
+                let msg = SessionMessage::RegisterTransaction {
+                    tx,
+                    client_id,
+                    request_id,
+                };
+                if let Err(e) = session_tx.try_send(msg) {
+                    tracing::warn!("Failed to notify session actor: {}", e);
                 }
             }
         }
