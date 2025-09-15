@@ -8,14 +8,20 @@ on:
 
 jobs:
   test_all:
-    name: Test
+    name: Test (${{ matrix.name }})
 
     runs-on: freenet-default-runner
 
     strategy:
       max-parallel: 1
       matrix:
-        args: ["--no-default-features --features trace,websocket,redb"]
+        include:
+          - args: "--no-default-features --features trace,websocket,redb"
+            name: "legacy-mode"
+            env_vars: ""
+          - args: "--no-default-features --features trace,websocket,redb"
+            name: "actor-mode"
+            env_vars: "FREENET_ACTOR_CLIENTS=true"
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -47,7 +53,7 @@ jobs:
           make -C apps/freenet-ping -f run-ping.mk build
 
       - name: Test - features
-        run: cargo test --workspace ${{ matrix.args }}
+        run: ${{ matrix.env_vars }} cargo test --workspace ${{ matrix.args }}
 
   clippy_check:
     name: Clippy
