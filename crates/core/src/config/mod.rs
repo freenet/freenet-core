@@ -77,7 +77,8 @@ pub struct ConfigArgs {
     pub id: Option<String>,
 
     /// Enable actor-based client management system for improved scalability and monitoring.
-    #[arg(long, env = "FREENET_ACTOR_CLIENTS")]
+    /// This is now enabled by default. Set to false to use legacy client management.
+    #[arg(long, env = "FREENET_ACTOR_CLIENTS", default_value = "true", action = clap::ArgAction::Set)]
     pub actor_clients: bool,
 
     /// Show the version of the application.
@@ -110,7 +111,7 @@ impl Default for ConfigArgs {
             log_level: Some(tracing::log::LevelFilter::Info),
             config_paths: Default::default(),
             id: None,
-            actor_clients: false,
+            actor_clients: true,
             version: false,
         }
     }
