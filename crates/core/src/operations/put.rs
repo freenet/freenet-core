@@ -854,31 +854,7 @@ pub(crate) fn start_op(
     PutOp { id, state }
 }
 
-/// Create a PUT operation with a specific transaction ID (for operation deduplication)
-pub(crate) fn start_op_with_id(
-    contract: ContractContainer,
-    related_contracts: RelatedContracts<'static>,
-    value: WrappedState,
-    htl: usize,
-    subscribe: bool,
-    id: Transaction,
-) -> PutOp {
-    let key = contract.key();
-    let contract_location = Location::from(&key);
-    tracing::debug!(%contract_location, %key, tx = %id, "Requesting put with existing transaction ID");
-
-    // let payload_size = contract.data().len();
-    let state = Some(PutState::PrepareRequest {
-        contract,
-        related_contracts,
-        value,
-        htl,
-        subscribe,
-    });
-
-    PutOp { id, state }
-}
-
+#[derive(Debug)]
 pub enum PutState {
     ReceivedRequest,
     /// Preparing request for put op.
@@ -923,7 +899,10 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
             *htl,
             *subscribe,
         ),
-        _ => return Err(OpError::UnexpectedOpState),
+        _ => {
+            tracing::error!(tx = %put_op.id, op_state = ?put_op.state, "request_put called with unexpected state, expected PrepareRequest");
+            return Err(OpError::UnexpectedOpState);
+        }
     };
 
     let key = contract.key();
@@ -934,77 +913,101 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         .ring
         .closest_potentially_caching(&key, [&own_location.peer].as_slice());
 
-    // If no other peers available, handle locally without network operations
+    // No other peers found - handle locally
     if target.is_none() {
         tracing::debug!(tx = %id, %key, "No other peers available, handling put operation locally");
 
-        // Update the contract locally
+        // Store the contract locally
         let updated_value =
             put_contract(op_manager, key, value, related_contracts.clone(), &contract).await?;
 
-        tracing::debug!(tx = %id, %key, "Contract successfully updated locally");
-
-        // Broadcast changes to subscribers (same as BroadcastTo case)
-        let broadcast_to = op_manager.get_broadcast_targets(&key, &own_location.peer);
+        // Always seed the contract locally after a successful put
         tracing::debug!(
             tx = %id,
             %key,
-            location = ?own_location.location,
-            "Successfully updated contract value locally"
+            peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
+            "Adding contract to local seed list"
         );
+        op_manager.ring.seed_contract(key);
 
-        // Try to broadcast the changes to subscribers
-        let sender = own_location.clone();
-        match try_to_broadcast(
-            id,
-            false, // not last_hop since we're handling locally
-            op_manager,
-            put_op.state,
-            (broadcast_to, sender),
-            key,
-            (contract.clone(), updated_value),
-        )
-        .await
-        {
-            Ok((new_state, return_msg)) => {
-                // Update the operation state
-                put_op.state = new_state;
+        // Determine which peers need to be notified and broadcast the update
+        let broadcast_to = op_manager.get_broadcast_targets(&key, &own_location.peer);
 
-                // Send any return message if needed
-                if let Some(msg) = return_msg {
-                    op_manager
-                        .notify_op_change(NetMessage::from(msg), OpEnum::Put(put_op))
-                        .await?;
-                } else {
-                    // Complete the operation locally if no further messages needed
-                    put_op.state = Some(PutState::Finished { key });
-                }
+        if broadcast_to.is_empty() {
+            // No peers to broadcast to - operation complete
+            tracing::debug!(tx = %id, %key, "No broadcast targets, completing operation");
+
+            // Set up state for SuccessfulPut message handling
+            put_op.state = Some(PutState::AwaitingResponse {
+                key,
+                upstream: None,
+                contract: contract.clone(),
+                state: updated_value.clone(),
+                subscribe: false,
+            });
+
+            // Create a SuccessfulPut message to trigger the completion handling
+            let success_msg = PutMsg::SuccessfulPut {
+                id,
+                target: own_location.clone(),
+                key,
+                sender: own_location.clone(),
+            };
+
+            // Use notify_op_change to trigger the completion handling
+            op_manager
+                .notify_op_change(NetMessage::from(success_msg), OpEnum::Put(put_op))
+                .await?;
+
+            return Ok(());
+        } else {
+            // Broadcast to subscribers
+            let sender = own_location.clone();
+            let broadcast_state = Some(PutState::ReceivedRequest);
+
+            let (new_state, return_msg) = try_to_broadcast(
+                id,
+                false,
+                op_manager,
+                broadcast_state,
+                (broadcast_to, sender),
+                key,
+                (contract.clone(), updated_value),
+            )
+            .await?;
+
+            put_op.state = new_state;
+
+            if let Some(msg) = return_msg {
+                op_manager
+                    .notify_op_change(NetMessage::from(msg), OpEnum::Put(put_op))
+                    .await?;
+            } else {
+                // Complete the operation locally if no further messages needed
+                put_op.state = Some(PutState::Finished { key });
             }
-            Err(err) => return Err(err),
         }
 
         return Ok(());
     }
 
-    // Network path: proceed with normal network propagation
-    let modified_value = value.clone();
-
+    // At least one peer found - forward to network
     put_op.state = Some(PutState::AwaitingResponse {
         key,
-        upstream: None, // No upstream since we're initiating
+        upstream: None,
         contract: contract.clone(),
-        state: modified_value.clone(),
+        state: value.clone(),
         subscribe,
     });
 
-    // Create the initial RequestPut message to trigger the operation flow for network propagation
+    // Create RequestPut message and forward to target peer
     let msg = PutMsg::RequestPut {
         id,
         contract,
         related_contracts,
-        value: modified_value,
+        value,
         htl,
-        target: target.unwrap(), // Safe to unwrap since we checked is_none() above
+        target: target.unwrap(),
     };
 
     // Use notify_op_change to trigger the operation processing
