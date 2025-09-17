@@ -854,6 +854,31 @@ pub(crate) fn start_op(
     PutOp { id, state }
 }
 
+/// Create a PUT operation with a specific transaction ID (for operation deduplication)
+pub(crate) fn start_op_with_id(
+    contract: ContractContainer,
+    related_contracts: RelatedContracts<'static>,
+    value: WrappedState,
+    htl: usize,
+    subscribe: bool,
+    id: Transaction,
+) -> PutOp {
+    let key = contract.key();
+    let contract_location = Location::from(&key);
+    tracing::debug!(%contract_location, %key, tx = %id, "Requesting put with existing transaction ID");
+
+    // let payload_size = contract.data().len();
+    let state = Some(PutState::PrepareRequest {
+        contract,
+        related_contracts,
+        value,
+        htl,
+        subscribe,
+    });
+
+    PutOp { id, state }
+}
+
 #[derive(Debug)]
 pub enum PutState {
     ReceivedRequest,
