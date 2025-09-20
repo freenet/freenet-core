@@ -472,14 +472,6 @@ impl Display for NetMessage {
     }
 }
 
-/// The result of a connection attempt.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) enum ConnectionResult {
-    /// The target node for connection is valid
-    Accepted,
-    /// The target node for connection is not valid
-    Connection,
-}
 
 #[cfg(test)]
 mod tests {
