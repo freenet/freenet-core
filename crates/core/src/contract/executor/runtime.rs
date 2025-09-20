@@ -49,7 +49,25 @@ impl ContractExecutor for Executor<Runtime> {
             );
         }
         let params = if let Some(code) = &code {
-            code.params()
+            let params = code.params();
+            // BUGFIX: Check if params are in state_store, if not we need to ensure they're stored
+            // This handles the case where we receive a contract from the network
+            let params_exist = self
+                .state_store
+                .get_params(&key)
+                .await
+                .map_err(ExecutorError::other)?
+                .is_some();
+
+            if !params_exist {
+                tracing::debug!(
+                    contract = %key,
+                    "Contract parameters not found in state_store, will be stored with state"
+                );
+                // The params will be stored together with the state below in the is_new_contract branch
+                // or in the update flow
+            }
+            params
         } else {
             self.state_store
                 .get_params(&key)
