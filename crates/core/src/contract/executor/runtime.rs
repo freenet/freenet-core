@@ -49,31 +49,21 @@ impl ContractExecutor for Executor<Runtime> {
             );
         }
         let params = if let Some(code) = &code {
-            let params = code.params();
-            // BUGFIX: Check if params are in state_store, if not we need to ensure they're stored
-            // This handles the case where we receive a contract from the network
-            let params_exist = self
-                .state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
-                .is_some();
-
-            if !params_exist {
-                tracing::debug!(
-                    contract = %key,
-                    "Contract parameters not found in state_store, will be stored with state"
-                );
-                // The params will be stored together with the state below in the is_new_contract branch
-                // or in the update flow
-            }
-            params
+            code.params()
         } else {
+            // Contract not provided, need to get params from state_store
             self.state_store
                 .get_params(&key)
                 .await
                 .map_err(ExecutorError::other)?
                 .ok_or_else(|| {
+                    // This error occurs when an UPDATE arrives for a contract whose
+                    // parameters haven't been stored yet (race condition)
+                    tracing::warn!(
+                        contract = %key,
+                        is_delta = matches!(update, Either::Right(_)),
+                        "Contract parameters not found in state_store"
+                    );
                     ExecutorError::request(StdContractError::Put {
                         key,
                         cause: "missing contract parameters".into(),
@@ -90,26 +80,13 @@ impl ContractExecutor for Executor<Runtime> {
             let code = code.ok_or_else(|| {
                 ExecutorError::request(StdContractError::MissingContract { key: key.into() })
             })?;
-            // DEBUG: Log before and after store_contract
-            tracing::debug!(
-                "DEBUG PUT: Before store_contract - key={}, key.code_hash={:?}",
-                key,
-                key.code_hash()
-            );
+
+            tracing::debug!("Storing new contract - key={}", key);
 
             self.runtime
                 .contract_store
                 .store_contract(code.clone())
                 .map_err(ExecutorError::other)?;
-
-            // Immediately verify the contract was stored
-            let fetch_result = self.runtime.contract_store.fetch_contract(&key, &params);
-            tracing::debug!(
-                "DEBUG PUT: After store_contract - key={}, stored successfully={}, immediate fetch result={}",
-                key,
-                true,
-                fetch_result.is_some()
-            );
 
             true
         } else {
@@ -1140,8 +1117,16 @@ impl Executor<Runtime> {
             .await
             .map_err(ExecutorError::other)?
         else {
+            // Parameters not in state_store yet
+            // This can happen when a contract was just stored but state hasn't been stored yet
+            // In this case, we can't fetch the contract because fetch_contract requires params
+            tracing::debug!(
+                contract = %key,
+                "Contract parameters not in state_store, cannot fetch contract"
+            );
             return Ok(None);
         };
+
         let Some(contract) = self.runtime.contract_store.fetch_contract(key, &parameters) else {
             return Ok(None);
         };
