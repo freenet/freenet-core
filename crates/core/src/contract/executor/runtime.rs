@@ -71,29 +71,59 @@ impl ContractExecutor for Executor<Runtime> {
                 })?
         };
 
-        let remove_if_fail = if self
+        // Track if we stored a new contract
+        let (remove_if_fail, contract_was_provided) = if self
             .runtime
             .contract_store
             .fetch_contract(&key, &params)
             .is_none()
         {
-            let code = code.ok_or_else(|| {
-                ExecutorError::request(StdContractError::MissingContract { key: key.into() })
-            })?;
+            if let Some(ref contract_code) = code {
+                tracing::debug!("Storing new contract - key={}", key);
 
-            tracing::debug!("Storing new contract - key={}", key);
-
-            self.runtime
-                .contract_store
-                .store_contract(code.clone())
-                .map_err(ExecutorError::other)?;
-
-            true
+                self.runtime
+                    .contract_store
+                    .store_contract(contract_code.clone())
+                    .map_err(ExecutorError::other)?;
+                (true, true)
+            } else {
+                return Err(ExecutorError::request(StdContractError::MissingContract {
+                    key: key.into(),
+                }));
+            }
         } else {
-            false
+            (false, code.is_some())
         };
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
+
+        // CRITICAL FIX for #1838: When we just stored a new contract, immediately store
+        // its parameters with an empty state if no state exists yet. This prevents the
+        // race condition where UPDATE arrives before params are available.
+        if remove_if_fail && is_new_contract && contract_was_provided {
+            // We just stored a new contract and there's no state yet
+            // Store empty state with params immediately to make them available
+            tracing::debug!(
+                contract = %key,
+                "Storing parameters for newly received contract to prevent race condition"
+            );
+
+            // Store a minimal empty state just to ensure params are persisted
+            // This will be replaced with the actual state below
+            let empty_state = WrappedState::new(Vec::new());
+            if let Err(e) = self
+                .state_store
+                .store(key, empty_state, params.clone())
+                .await
+            {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to pre-store parameters for new contract"
+                );
+                // Don't fail here, continue with normal flow
+            }
+        }
 
         let mut updates = match update {
             Either::Left(incoming_state) => {
@@ -114,6 +144,7 @@ impl ContractExecutor for Executor<Runtime> {
                         if is_new_contract {
                             tracing::debug!("Contract is new, storing initial state");
                             let state_to_store = incoming_state.clone();
+                            // This will overwrite the empty state we stored above (if any)
                             self.state_store
                                 .store(key, state_to_store, params.clone())
                                 .await
