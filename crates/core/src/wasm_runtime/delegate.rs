@@ -512,11 +512,6 @@ mod test {
     const TEST_DELEGATE_1: &str = "test_delegate_1";
 
     #[derive(Debug, Serialize, Deserialize)]
-    struct SecretsContext {
-        private_key: Option<Vec<u8>>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
     enum InboundAppMessage {
         CreateInboxRequest,
         PleaseSignMessage(Vec<u8>),

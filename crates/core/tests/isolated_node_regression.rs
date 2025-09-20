@@ -10,7 +10,7 @@ use freenet::{
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{load_contract, make_get, make_put, verify_contract_exists},
+    test_utils::{load_contract, make_get, make_put},
 };
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
@@ -93,7 +93,7 @@ async fn test_isolated_node_put_get_workflow() -> anyhow::Result<()> {
     // Start a single isolated node (no peers)
     let ws_port = 50700;
     let network_port = 50701;
-    let (config, temp_dir) = create_test_node_config(true, ws_port, Some(network_port)).await?;
+    let (config, _temp_dir) = create_test_node_config(true, ws_port, Some(network_port)).await?;
 
     // Load test contract and state
     const TEST_CONTRACT: &str = "test-contract-integration";
