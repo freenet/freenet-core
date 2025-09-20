@@ -511,7 +511,6 @@ mod test {
 
     const TEST_DELEGATE_1: &str = "test_delegate_1";
 
-
     #[derive(Debug, Serialize, Deserialize)]
     enum InboundAppMessage {
         CreateInboxRequest,

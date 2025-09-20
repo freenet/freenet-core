@@ -472,7 +472,6 @@ impl Display for NetMessage {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
