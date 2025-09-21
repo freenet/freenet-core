@@ -549,7 +549,6 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// This executor will monitor the store directories and databases to detect state changes.
 /// Represents an operation that's waiting for a contract to finish initializing
 #[derive(Debug)]
-#[allow(dead_code)] // Fields will be used when we implement proper queue processing
 struct QueuedOperation {
     update: Either<WrappedState, StateDelta<'static>>,
     related_contracts: RelatedContracts<'static>,
@@ -588,47 +587,6 @@ pub struct Executor<R = Runtime> {
 }
 
 impl<R> Executor<R> {
-    /// Process any queued operations for a contract that has completed initialization.
-    /// Returns the number of operations that were processed.
-    #[allow(dead_code)] // Will be used when we implement proper queue processing
-    pub(crate) async fn process_queued_operations(&mut self, key: ContractKey) -> usize
-    where
-        R: ContractExecutor,
-    {
-        if let Some(ContractInitState::Initializing { queued_ops, .. }) =
-            self.contract_init_state.remove(&key)
-        {
-            let count = queued_ops.len();
-            tracing::info!(
-                contract = %key,
-                operations = count,
-                "Processing queued operations for initialized contract"
-            );
-
-            for op in queued_ops {
-                let queue_duration = op.queued_at.elapsed();
-                tracing::debug!(
-                    contract = %key,
-                    queued_for_ms = queue_duration.as_millis(),
-                    "Processing queued operation"
-                );
-
-                // Process the operation through the executor
-                // Note: We can't call upsert_contract_state directly due to async recursion
-                // This would need to be handled through the event loop
-                // For now, just log that it needs processing
-                tracing::warn!(
-                    contract = %key,
-                    "Queued operation needs to be retried by sender"
-                );
-            }
-
-            count
-        } else {
-            0
-        }
-    }
-
     pub async fn new(
         state_store: StateStore<Storage>,
         ctrl_handler: impl FnOnce() -> anyhow::Result<()>,

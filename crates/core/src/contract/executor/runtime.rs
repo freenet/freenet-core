@@ -195,14 +195,18 @@ impl ContractExecutor for Executor<Runtime> {
                                 Vec::new()
                             };
 
-                            // Process queued operations externally to avoid recursive async
+                            // Log details about queued operations
                             if !queued_ops.is_empty() {
-                                tracing::info!(
-                                    contract = %key,
-                                    count = queued_ops.len(),
-                                    "Contract initialized with {} queued operations - will be processed on retry",
-                                    queued_ops.len()
-                                );
+                                for op in &queued_ops {
+                                    let queue_time = op.queued_at.elapsed();
+                                    tracing::info!(
+                                        contract = %key,
+                                        queue_time_ms = queue_time.as_millis(),
+                                        is_delta = matches!(op.update, Either::Right(_)),
+                                        has_related = op.related_contracts.states().next().is_some(),
+                                        "Queued operation ready for retry after initialization"
+                                    );
+                                }
                                 // The queued operations will be handled when the sender retries them
                                 // Now that initialization is complete, they will succeed
                             }
