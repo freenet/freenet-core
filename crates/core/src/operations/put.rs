@@ -879,6 +879,7 @@ pub(crate) fn start_op_with_id(
     PutOp { id, state }
 }
 
+#[derive(Debug)]
 pub enum PutState {
     ReceivedRequest,
     /// Preparing request for put op.
@@ -908,60 +909,130 @@ pub enum PutState {
 /// Request to insert/update a value into a contract.
 pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Result<(), OpError> {
     // Process PrepareRequest state and transition to next state
-    let (id, contract, value, related_contracts, htl, subscribe, target) = match &put_op.state {
+    let (id, contract, value, related_contracts, htl, subscribe) = match &put_op.state {
         Some(PutState::PrepareRequest {
             contract,
             value,
             related_contracts,
             htl,
             subscribe,
-        }) => {
-            let key = contract.key();
-            let own_location = op_manager.ring.connection_manager.own_location();
-
-            // Find the optimal target for this contract
-            let target = op_manager
-                .ring
-                .closest_potentially_caching(&key, [&own_location.peer].as_slice())
-                .unwrap_or(own_location); // If no other peers, target ourselves
-
-            (
-                put_op.id,
-                contract.clone(),
-                value.clone(),
-                related_contracts.clone(),
-                *htl,
-                *subscribe,
-                target,
-            )
+        }) => (
+            put_op.id,
+            contract.clone(),
+            value.clone(),
+            related_contracts.clone(),
+            *htl,
+            *subscribe,
+        ),
+        _ => {
+            tracing::error!(tx = %put_op.id, op_state = ?put_op.state, "request_put called with unexpected state, expected PrepareRequest");
+            return Err(OpError::UnexpectedOpState);
         }
-        _ => return Err(OpError::UnexpectedOpState),
     };
 
-    // Transition to AwaitingResponse state (similar to GET operation)
     let key = contract.key();
+    let own_location = op_manager.ring.connection_manager.own_location();
 
-    // Don't cache locally here - it will be cached in process_message when handling RequestPut
-    // Caching here synchronously blocks the network protocol and causes timing issues
-    // The caching happens in process_message lines 165-217 which runs asynchronously
-    let modified_value = value.clone();
+    // Find the optimal target for this contract
+    let target = op_manager
+        .ring
+        .closest_potentially_caching(&key, [&own_location.peer].as_slice());
 
+    // No other peers found - handle locally
+    if target.is_none() {
+        tracing::debug!(tx = %id, %key, "No other peers available, handling put operation locally");
+
+        // Store the contract locally
+        let updated_value =
+            put_contract(op_manager, key, value, related_contracts.clone(), &contract).await?;
+
+        // Always seed the contract locally after a successful put
+        tracing::debug!(
+            tx = %id,
+            %key,
+            peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
+            "Adding contract to local seed list"
+        );
+        op_manager.ring.seed_contract(key);
+
+        // Determine which peers need to be notified and broadcast the update
+        let broadcast_to = op_manager.get_broadcast_targets(&key, &own_location.peer);
+
+        if broadcast_to.is_empty() {
+            // No peers to broadcast to - operation complete
+            tracing::debug!(tx = %id, %key, "No broadcast targets, completing operation");
+
+            // Set up state for SuccessfulPut message handling
+            put_op.state = Some(PutState::AwaitingResponse {
+                key,
+                upstream: None,
+                contract: contract.clone(),
+                state: updated_value.clone(),
+                subscribe: false,
+            });
+
+            // Create a SuccessfulPut message to trigger the completion handling
+            let success_msg = PutMsg::SuccessfulPut {
+                id,
+                target: own_location.clone(),
+                key,
+                sender: own_location.clone(),
+            };
+
+            // Use notify_op_change to trigger the completion handling
+            op_manager
+                .notify_op_change(NetMessage::from(success_msg), OpEnum::Put(put_op))
+                .await?;
+
+            return Ok(());
+        } else {
+            // Broadcast to subscribers
+            let sender = own_location.clone();
+            let broadcast_state = Some(PutState::ReceivedRequest);
+
+            let (new_state, return_msg) = try_to_broadcast(
+                id,
+                false,
+                op_manager,
+                broadcast_state,
+                (broadcast_to, sender),
+                key,
+                (contract.clone(), updated_value),
+            )
+            .await?;
+
+            put_op.state = new_state;
+
+            if let Some(msg) = return_msg {
+                op_manager
+                    .notify_op_change(NetMessage::from(msg), OpEnum::Put(put_op))
+                    .await?;
+            } else {
+                // Complete the operation locally if no further messages needed
+                put_op.state = Some(PutState::Finished { key });
+            }
+        }
+
+        return Ok(());
+    }
+
+    // At least one peer found - forward to network
     put_op.state = Some(PutState::AwaitingResponse {
         key,
-        upstream: None, // No upstream since we're initiating
+        upstream: None,
         contract: contract.clone(),
-        state: modified_value.clone(),
+        state: value.clone(),
         subscribe,
     });
 
-    // Create the initial RequestPut message to trigger the operation flow for network propagation
+    // Create RequestPut message and forward to target peer
     let msg = PutMsg::RequestPut {
         id,
         contract,
         related_contracts,
-        value: modified_value, // Use the modified value from put_contract
+        value,
         htl,
-        target,
+        target: target.unwrap(),
     };
 
     // Use notify_op_change to trigger the operation processing
