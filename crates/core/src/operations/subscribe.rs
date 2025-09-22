@@ -75,20 +75,11 @@ pub(crate) async fn request_subscribe(
                 tracing::debug!(%key, "No remote peers available for subscription, checking locally");
 
                 if super::has_contract(op_manager, *key).await? {
-                    // We have the contract locally, subscribe to ourselves
-                    let own_location = op_manager.ring.connection_manager.own_location();
-                    if op_manager
-                        .ring
-                        .add_subscriber(key, own_location.clone())
-                        .is_err()
-                    {
-                        tracing::debug!(%key, "Max number of subscribers reached for local contract");
-                        return Err(OpError::UnexpectedOpState);
-                    }
+                    // We have the contract locally, just complete the operation
+                    // Don't subscribe to self - let contract_handler handle local subscription
+                    tracing::info!(%key, "Contract available locally, completing operation");
 
-                    tracing::info!(%key, "Successfully subscribed to local contract");
-
-                    // Complete the operation immediately with a successful local subscription
+                    // Complete the operation immediately so client gets notified
                     let completed_op = SubscribeOp {
                         id: *id,
                         state: Some(SubscribeState::Completed { key: *key }),
