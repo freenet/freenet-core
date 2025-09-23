@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
-use crate::operations::{get, put, update, OpError};
+use crate::operations::{get, put, subscribe, update, OpError};
 use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 // pub(crate) mod admin_endpoints; // TODO: Add axum dependencies
@@ -932,19 +932,17 @@ async fn process_open_request(
                                     "Starting new SUBSCRIBE network operation via RequestRouter",
                                 );
 
-                                let op_id = crate::node::subscribe(
-                                    op_manager.clone(),
-                                    key,
-                                    Some(client_id),
-                                )
-                                .await
-                                .inspect_err(|err| {
-                                    tracing::error!("Subscribe error: {}", err);
-                                })?;
+                                // Phase 2 fix: Use the transaction_id from RequestRouter for consistency
+                                let op = subscribe::start_op_with_id(key, transaction_id);
+                                subscribe::request_subscribe(&op_manager, op)
+                                    .await
+                                    .inspect_err(|err| {
+                                        tracing::error!("Subscribe error: {}", err);
+                                    })?;
 
                                 tracing::debug!(
                                     request_id = %request_id,
-                                    transaction_id = %op_id,
+                                    transaction_id = %transaction_id,
                                     operation = "subscribe",
                                     "Request-Transaction correlation"
                                 );
