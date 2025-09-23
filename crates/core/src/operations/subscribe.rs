@@ -66,13 +66,18 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // Find a remote peer to handle the subscription
-        const EMPTY: &[PeerId] = &[];
-        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
+        // Phase 1 fix for issue #1848: Properly find next-best peer for subscription
+        // Exclude ourselves to ensure we find a remote peer, even if we're at optimal location
+        let own_location = op_manager.ring.connection_manager.own_location();
+        let skip_self = [own_location.peer.clone()];
+        let target = match op_manager
+            .ring
+            .closest_potentially_caching(key, &skip_self[..])
+        {
             Some(peer) => peer,
             None => {
-                // No remote peers available
-                tracing::debug!(%key, "No remote peers available for subscription");
+                // No remote peers available - this may happen when node is isolated
+                tracing::warn!(%key, "No remote peers available for subscription - node may be isolated");
                 return Err(RingError::NoCachingPeers(*key).into());
             }
         };
