@@ -530,11 +530,9 @@ impl OpManager {
             let neighbors_future = proximity_cache.neighbors_with_contract(key);
             // Since this is in a non-async context, we'll use a blocking wait
             // TODO: Consider making this method async in a future refactor
-            let neighbor_peers = match tokio::task::block_in_place(|| {
+            let neighbor_peers = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(neighbors_future)
-            }) {
-                neighbors => neighbors,
-            };
+            });
 
             // Convert PeerIds to PeerKeyLocation, filtering out the sender
             neighbor_peers
