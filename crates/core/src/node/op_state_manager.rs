@@ -67,6 +67,7 @@ pub(crate) struct OpManager {
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
     pub result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
     pub actor_clients: bool,
+    pub proximity_cache: Option<Arc<crate::node::proximity_cache::ProximityCacheManager>>,
 }
 
 impl OpManager {
@@ -77,6 +78,7 @@ impl OpManager {
         event_register: ER,
         connection_manager: ConnectionManager,
         result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
+        proximity_cache: Option<Arc<crate::node::proximity_cache::ProximityCacheManager>>,
     ) -> anyhow::Result<Self> {
         let ring = Ring::new(
             config,
@@ -113,6 +115,7 @@ impl OpManager {
             new_transactions,
             result_router_tx,
             actor_clients: config.config.actor_clients,
+            proximity_cache,
         })
     }
 

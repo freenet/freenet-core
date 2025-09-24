@@ -71,6 +71,7 @@ mod message_processor;
 mod network_bridge;
 mod op_state_manager;
 mod p2p_impl;
+pub(crate) mod proximity_cache;
 mod request_router;
 pub(crate) mod testing_impl;
 
@@ -862,6 +863,13 @@ async fn process_message_v1<CB>(
                 }
                 break;
             }
+            NetMessageV1::ProximityCache { from, message } => {
+                // Handle proximity cache messages
+                if let Some(proximity_cache) = &op_manager.proximity_cache {
+                    proximity_cache.handle_message(from, message).await;
+                }
+                break;
+            }
             _ => break, // Exit the loop if no applicable message type is found
         }
     }
@@ -1066,6 +1074,13 @@ where
             NetMessageV1::Unsubscribed { ref key, .. } => {
                 if let Err(error) = subscribe(op_manager, *key, None).await {
                     tracing::error!(%error, "Failed to subscribe to contract");
+                }
+                break;
+            }
+            NetMessageV1::ProximityCache { from, message } => {
+                // Handle proximity cache messages
+                if let Some(proximity_cache) = &op_manager.proximity_cache {
+                    proximity_cache.handle_message(from, message).await;
                 }
                 break;
             }

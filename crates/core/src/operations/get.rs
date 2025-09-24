@@ -947,6 +947,18 @@ impl Operation for GetOp {
                                 if !is_subscribed_contract {
                                     tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                     op_manager.ring.seed_contract(key);
+
+                                    // Track contract caching in proximity cache
+                                    if let Some(proximity_cache) = &op_manager.proximity_cache {
+                                        if let Some(_cache_msg) =
+                                            proximity_cache.on_contract_cached(&key).await
+                                        {
+                                            tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement");
+                                            // Note: Cache announcements will be sent periodically or when requested
+                                            // For now we just track the cache locally
+                                        }
+                                    }
+
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.insert(sender.peer.clone());
 
