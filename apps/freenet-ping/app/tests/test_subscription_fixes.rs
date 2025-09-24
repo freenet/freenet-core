@@ -3,7 +3,6 @@
 /// 1. Transaction ID correlation (waiting_for_transaction_result)
 /// 2. Optimal location subscriptions (removed early return)
 /// 3. Multiple peer candidates (k_closest_potentially_caching with k=3)
-
 mod common;
 
 use std::{net::TcpListener, time::Duration};
@@ -20,8 +19,8 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 use common::{
-    base_node_test_config, connect_ws_client, deploy_contract, subscribe_to_contract,
-    get_contract_state, APP_TAG,
+    base_node_test_config, connect_ws_client, deploy_contract, get_contract_state,
+    subscribe_to_contract, APP_TAG,
 };
 
 /// Test that subscription responses properly route back to the originating client
@@ -79,19 +78,28 @@ async fn test_subscription_response_reaches_client() -> TestResult {
     // Start gateway
     let gw_task = tokio::spawn(async move {
         let node_config = NodeConfig::from(gw_config);
-        serve_gateway(node_config).await
+        let node = freenet::dev_tool::NetworkPeer::from(node_config);
+        let clients = serve_gateway(node.config.ws_api.clone()).await;
+        let node = node.build(clients).await.unwrap();
+        node.run().await
     });
 
     // Start Node1
     let node1_task = tokio::spawn(async move {
         let node_config = NodeConfig::from(node1_config);
-        serve_gateway(node_config).await
+        let node = freenet::dev_tool::NetworkPeer::from(node_config);
+        let clients = serve_gateway(node.config.ws_api.clone()).await;
+        let node = node.build(clients).await.unwrap();
+        node.run().await
     });
 
     // Start Node2
     let node2_task = tokio::spawn(async move {
         let node_config = NodeConfig::from(node2_config);
-        serve_gateway(node_config).await
+        let node = freenet::dev_tool::NetworkPeer::from(node_config);
+        let clients = serve_gateway(node.config.ws_api.clone()).await;
+        let node = node.build(clients).await.unwrap();
+        node.run().await
     });
 
     // Wait for network to stabilize
@@ -157,7 +165,8 @@ async fn test_subscription_response_reaches_client() -> TestResult {
             return Err(anyhow!(
                 "TIMEOUT: Gateway did not receive subscription response within 10 seconds. \
                 This indicates the waiting_for_transaction_result fix may not be working."
-            ).into());
+            )
+            .into());
         }
     }
 
@@ -200,7 +209,10 @@ async fn test_optimal_location_can_subscribe() -> TestResult {
     // Start gateway
     let gw_task = tokio::spawn(async move {
         let node_config = NodeConfig::from(gw_config);
-        serve_gateway(node_config).await
+        let node = freenet::dev_tool::NetworkPeer::from(node_config);
+        let clients = serve_gateway(node.config.ws_api.clone()).await;
+        let node = node.build(clients).await.unwrap();
+        node.run().await
     });
 
     // Start regular nodes
@@ -218,8 +230,11 @@ async fn test_optimal_location_can_subscribe() -> TestResult {
         .await?;
 
         let task = tokio::spawn(async move {
-            let node_config = NodeConfig::from(node_config);
-            serve_gateway(node_config).await
+            let node_config_local = NodeConfig::from(node_config);
+            let node = freenet::dev_tool::NetworkPeer::from(node_config_local);
+            let clients = serve_gateway(node.config.ws_api.clone()).await;
+            let node = node.build(clients).await.unwrap();
+            node.run().await
         });
         node_tasks.push(task);
     }
@@ -242,7 +257,8 @@ async fn test_optimal_location_can_subscribe() -> TestResult {
     // Deploy contract from gateway
     let initial_state = Ping::new();
     let options = PingContractOptions { max_pings: 10 };
-    let contract_key = deploy_contract(&mut client_gw, initial_state.clone(), &options, false).await?;
+    let contract_key =
+        deploy_contract(&mut client_gw, initial_state.clone(), &options, false).await?;
     info!("Contract deployed: {}", contract_key);
 
     // Wait for contract to propagate and reach optimal location
@@ -406,13 +422,19 @@ async fn test_basic_subscription() -> TestResult {
 
     // Start nodes
     let gw_task = tokio::spawn(async move {
-        let node_config = NodeConfig::from(gw_config);
-        serve_gateway(node_config).await
+        let node_config_gw = NodeConfig::from(gw_config);
+        let node = freenet::dev_tool::NetworkPeer::from(node_config_gw);
+        let clients = serve_gateway(node.config.ws_api.clone()).await;
+        let node = node.build(clients).await.unwrap();
+        node.run().await
     });
 
     let node_task = tokio::spawn(async move {
-        let node_config = NodeConfig::from(node_config);
-        serve_gateway(node_config).await
+        let node_config_node = NodeConfig::from(node_config);
+        let node = freenet::dev_tool::NetworkPeer::from(node_config_node);
+        let clients = serve_gateway(node.config.ws_api.clone()).await;
+        let node = node.build(clients).await.unwrap();
+        node.run().await
     });
 
     tokio::time::sleep(Duration::from_secs(2)).await;
