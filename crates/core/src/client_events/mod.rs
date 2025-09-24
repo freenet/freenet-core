@@ -913,11 +913,14 @@ async fn process_open_request(
                                     Error::Node(format!("Request routing failed: {}", e))
                                 })?;
 
-                            // Always register this client for the result
+                            // Issue #1: Register this client for the subscription result with proper WaitingTransaction type
+                            use crate::contract::WaitingTransaction;
                             op_manager
                                 .ch_outbound
                                 .waiting_for_transaction_result(
-                                    transaction_id,
+                                    WaitingTransaction::Subscription {
+                                        contract_key: *key.id(),
+                                    },
                                     client_id,
                                     request_id,
                                 )
