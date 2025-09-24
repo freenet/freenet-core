@@ -1,6 +1,6 @@
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::contract::{ContractHandlerEvent, WaitingTransaction};
-use crate::message::{NetMessageV1, QueryResult};
+use crate::message::{NetMessage, NetMessageV1, QueryResult};
 use crate::node::subscribe::SubscribeMsg;
 use crate::ring::Location;
 use dashmap::DashSet;
@@ -1060,6 +1060,27 @@ impl P2pConnManager {
         self.connections.insert(peer_id.clone(), tx);
         let task = peer_connection_listener(rx, connection).boxed();
         state.peer_connections.push(task);
+
+        // Send cache state request to newly connected peer
+        if let Some(proximity_cache) = &self.bridge.op_manager.proximity_cache {
+            let cache_request = proximity_cache.request_cache_state_from_peer();
+            let cache_msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                from: self
+                    .bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .own_location()
+                    .peer,
+                message: cache_request,
+            });
+
+            tracing::debug!(peer = %peer_id, "Sending cache state request to newly connected peer");
+            if let Err(err) = self.bridge.send(&peer_id, cache_msg).await {
+                tracing::warn!("Failed to send cache state request to {}: {}", peer_id, err);
+            }
+        }
+
         Ok(())
     }
 

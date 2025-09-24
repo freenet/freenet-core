@@ -812,7 +812,22 @@ async fn process_message_v1<CB>(
             NetMessageV1::ProximityCache { from, message } => {
                 // Handle proximity cache messages
                 if let Some(proximity_cache) = &op_manager.proximity_cache {
-                    proximity_cache.handle_message(from, message).await;
+                    if let Some(response) =
+                        proximity_cache.handle_message(from.clone(), message).await
+                    {
+                        // Send response back to the peer
+                        let response_msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                            from: op_manager.ring.connection_manager.own_location().peer,
+                            message: response,
+                        });
+                        if let Err(err) = conn_manager.send(&from, response_msg).await {
+                            tracing::error!(
+                                "Failed to send proximity cache response to {}: {}",
+                                from,
+                                err
+                            );
+                        }
+                    }
                 }
                 break;
             }
@@ -1026,7 +1041,22 @@ where
             NetMessageV1::ProximityCache { from, message } => {
                 // Handle proximity cache messages
                 if let Some(proximity_cache) = &op_manager.proximity_cache {
-                    proximity_cache.handle_message(from, message).await;
+                    if let Some(response) =
+                        proximity_cache.handle_message(from.clone(), message).await
+                    {
+                        // Send response back to the peer
+                        let response_msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                            from: op_manager.ring.connection_manager.own_location().peer,
+                            message: response,
+                        });
+                        if let Err(err) = conn_manager.send(&from, response_msg).await {
+                            tracing::error!(
+                                "Failed to send proximity cache response to {}: {}",
+                                from,
+                                err
+                            );
+                        }
+                    }
                 }
                 break;
             }
