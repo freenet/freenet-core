@@ -212,14 +212,57 @@ impl Operation for PutOp {
                                 "Marked contract as seeding locally"
                             );
 
-                            // Track contract caching in proximity cache
+                            // Track contract caching in proximity cache and send announcements
                             if let Some(proximity_cache) = &op_manager.proximity_cache {
-                                if let Some(_cache_msg) =
+                                if let Some(cache_msg) =
                                     proximity_cache.on_contract_cached(&key).await
                                 {
-                                    tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement for PUT");
-                                    // Note: Cache announcements will be sent periodically or when requested
-                                    // For now we just track the cache locally
+                                    tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement for PUT, sending to neighbors");
+
+                                    // Send the cache announcement to all connected neighbors
+                                    let own_peer =
+                                        op_manager.ring.connection_manager.get_peer_key().unwrap();
+                                    let connected_peers: Vec<_> = op_manager
+                                        .ring
+                                        .connection_manager
+                                        .connected_peers()
+                                        .collect();
+
+                                    tracing::debug!(
+                                        tx = %id,
+                                        %key,
+                                        neighbor_count = connected_peers.len(),
+                                        "PROXIMITY_PROPAGATION: Sending cache announcements to {} neighbors",
+                                        connected_peers.len()
+                                    );
+
+                                    for peer_id in connected_peers {
+                                        let proximity_msg = crate::message::NetMessage::V1(
+                                            crate::message::NetMessageV1::ProximityCache {
+                                                from: own_peer.clone(),
+                                                message: cache_msg.clone(),
+                                            },
+                                        );
+
+                                        if let Err(err) =
+                                            conn_manager.send(&peer_id, proximity_msg).await
+                                        {
+                                            tracing::warn!(
+                                                tx = %id,
+                                                %key,
+                                                peer = %peer_id,
+                                                error = %err,
+                                                "PROXIMITY_PROPAGATION: Failed to send cache announcement to neighbor"
+                                            );
+                                        } else {
+                                            tracing::trace!(
+                                                tx = %id,
+                                                %key,
+                                                peer = %peer_id,
+                                                "PROXIMITY_PROPAGATION: Successfully sent cache announcement to neighbor"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -340,13 +383,56 @@ impl Operation for PutOp {
                         super::start_subscription_request(op_manager, key).await;
                         op_manager.ring.seed_contract(key);
 
-                        // Track contract caching in proximity cache
+                        // Track contract caching in proximity cache and send announcements
                         if let Some(proximity_cache) = &op_manager.proximity_cache {
-                            if let Some(_cache_msg) = proximity_cache.on_contract_cached(&key).await
+                            if let Some(cache_msg) = proximity_cache.on_contract_cached(&key).await
                             {
-                                tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement for PUT");
-                                // Note: Cache announcements will be sent periodically or when requested
-                                // For now we just track the cache locally
+                                tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement for PUT, sending to neighbors");
+
+                                // Send the cache announcement to all connected neighbors
+                                let own_peer =
+                                    op_manager.ring.connection_manager.get_peer_key().unwrap();
+                                let connected_peers: Vec<_> = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .connected_peers()
+                                    .collect();
+
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    neighbor_count = connected_peers.len(),
+                                    "PROXIMITY_PROPAGATION: Sending cache announcements to {} neighbors",
+                                    connected_peers.len()
+                                );
+
+                                for peer_id in connected_peers {
+                                    let proximity_msg = crate::message::NetMessage::V1(
+                                        crate::message::NetMessageV1::ProximityCache {
+                                            from: own_peer.clone(),
+                                            message: cache_msg.clone(),
+                                        },
+                                    );
+
+                                    if let Err(err) =
+                                        conn_manager.send(&peer_id, proximity_msg).await
+                                    {
+                                        tracing::warn!(
+                                            tx = %id,
+                                            %key,
+                                            peer = %peer_id,
+                                            error = %err,
+                                            "PROXIMITY_PROPAGATION: Failed to send cache announcement to neighbor"
+                                        );
+                                    } else {
+                                        tracing::trace!(
+                                            tx = %id,
+                                            %key,
+                                            peer = %peer_id,
+                                            "PROXIMITY_PROPAGATION: Successfully sent cache announcement to neighbor"
+                                        );
+                                    }
+                                }
                             }
                         }
 
@@ -538,14 +624,60 @@ impl Operation for PutOp {
                                 );
                                 op_manager.ring.seed_contract(key);
 
-                                // Track contract caching in proximity cache
+                                // Track contract caching in proximity cache and send announcements
                                 if let Some(proximity_cache) = &op_manager.proximity_cache {
-                                    if let Some(_cache_msg) =
+                                    if let Some(cache_msg) =
                                         proximity_cache.on_contract_cached(&key).await
                                     {
-                                        tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement for PUT");
-                                        // Note: Cache announcements will be sent periodically or when requested
-                                        // For now we just track the cache locally
+                                        tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement for PUT, sending to neighbors");
+
+                                        // Send the cache announcement to all connected neighbors
+                                        let own_peer = op_manager
+                                            .ring
+                                            .connection_manager
+                                            .get_peer_key()
+                                            .unwrap();
+                                        let connected_peers: Vec<_> = op_manager
+                                            .ring
+                                            .connection_manager
+                                            .connected_peers()
+                                            .collect();
+
+                                        tracing::debug!(
+                                            tx = %id,
+                                            %key,
+                                            neighbor_count = connected_peers.len(),
+                                            "PROXIMITY_PROPAGATION: Sending cache announcements to {} neighbors",
+                                            connected_peers.len()
+                                        );
+
+                                        for peer_id in connected_peers {
+                                            let proximity_msg = crate::message::NetMessage::V1(
+                                                crate::message::NetMessageV1::ProximityCache {
+                                                    from: own_peer.clone(),
+                                                    message: cache_msg.clone(),
+                                                },
+                                            );
+
+                                            if let Err(err) =
+                                                conn_manager.send(&peer_id, proximity_msg).await
+                                            {
+                                                tracing::warn!(
+                                                    tx = %id,
+                                                    %key,
+                                                    peer = %peer_id,
+                                                    error = %err,
+                                                    "PROXIMITY_PROPAGATION: Failed to send cache announcement to neighbor"
+                                                );
+                                            } else {
+                                                tracing::trace!(
+                                                    tx = %id,
+                                                    %key,
+                                                    peer = %peer_id,
+                                                    "PROXIMITY_PROPAGATION: Successfully sent cache announcement to neighbor"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             } else {
@@ -679,13 +811,56 @@ impl Operation for PutOp {
                             op_manager.ring.seed_contract(key)
                         };
 
-                        // Track contract caching in proximity cache
+                        // Track contract caching in proximity cache and send announcements
                         if let Some(proximity_cache) = &op_manager.proximity_cache {
-                            if let Some(_cache_msg) = proximity_cache.on_contract_cached(&key).await
+                            if let Some(cache_msg) = proximity_cache.on_contract_cached(&key).await
                             {
-                                tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement for PUT");
-                                // Note: Cache announcements will be sent periodically or when requested
-                                // For now we just track the cache locally
+                                tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement for PUT, sending to neighbors");
+
+                                // Send the cache announcement to all connected neighbors
+                                let own_peer =
+                                    op_manager.ring.connection_manager.get_peer_key().unwrap();
+                                let connected_peers: Vec<_> = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .connected_peers()
+                                    .collect();
+
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    neighbor_count = connected_peers.len(),
+                                    "PROXIMITY_PROPAGATION: Sending cache announcements to {} neighbors",
+                                    connected_peers.len()
+                                );
+
+                                for peer_id in connected_peers {
+                                    let proximity_msg = crate::message::NetMessage::V1(
+                                        crate::message::NetMessageV1::ProximityCache {
+                                            from: own_peer.clone(),
+                                            message: cache_msg.clone(),
+                                        },
+                                    );
+
+                                    if let Err(err) =
+                                        conn_manager.send(&peer_id, proximity_msg).await
+                                    {
+                                        tracing::warn!(
+                                            tx = %id,
+                                            %key,
+                                            peer = %peer_id,
+                                            error = %err,
+                                            "PROXIMITY_PROPAGATION: Failed to send cache announcement to neighbor"
+                                        );
+                                    } else {
+                                        tracing::trace!(
+                                            tx = %id,
+                                            %key,
+                                            peer = %peer_id,
+                                            "PROXIMITY_PROPAGATION: Successfully sent cache announcement to neighbor"
+                                        );
+                                    }
+                                }
                             }
                         }
 
@@ -1001,8 +1176,16 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         if let Some(proximity_cache) = &op_manager.proximity_cache {
             if let Some(_cache_msg) = proximity_cache.on_contract_cached(&key).await {
                 tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement for PUT");
-                // Note: Cache announcements will be sent periodically or when requested
-                // For now we just track the cache locally
+
+                // TODO: Send proximity cache announcement to neighbors
+                // Note: This function doesn't have access to NetworkBridge (conn_manager)
+                // The cache announcement should be sent when this operation reaches process_message
+                // or through a different mechanism that has access to network messaging.
+                tracing::debug!(
+                    tx = %id,
+                    %key,
+                    "PROXIMITY_PROPAGATION: Cache announcement generated but not sent (no NetworkBridge access in request_put)"
+                );
             }
         }
 

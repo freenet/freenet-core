@@ -2889,7 +2889,7 @@ async fn test_proximity_cache_query() -> TestResult {
     };
 
     // Configure gateway node
-    let (gw_config, preset_config_gw, gw_info) = {
+    let (gw_config, _preset_config_gw, gw_info) = {
         let (cfg, preset) = base_node_test_config(true, vec![], Some(gw_port), gw_ws_port).await?;
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
@@ -2897,7 +2897,7 @@ async fn test_proximity_cache_query() -> TestResult {
     };
 
     // Configure peer node
-    let (peer_config, preset_config_peer) = base_node_test_config(
+    let (peer_config, _preset_config_peer) = base_node_test_config(
         false,
         vec![serde_json::to_string(&gw_info)?],
         None,
