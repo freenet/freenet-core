@@ -2866,3 +2866,140 @@ async fn test_update_no_change_notification() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_proximity_cache_query() -> TestResult {
+    // Configure test logging
+    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+
+    tracing::info!("Starting proximity cache query test");
+
+    // Set up two nodes: a gateway and a peer
+    let gw_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let gw_ws_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let peer_ws_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    // Configure gateway node
+    let (gw_config, preset_config_gw, gw_info) = {
+        let (cfg, preset) = base_node_test_config(true, vec![], Some(gw_port), gw_ws_port).await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    // Configure peer node
+    let (peer_config, preset_config_peer) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&gw_info)?],
+        None,
+        peer_ws_port,
+    )
+    .await?;
+
+    // Start gateway node
+    let node_gw = async {
+        let config = gw_config.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start peer node
+    let node_peer = async move {
+        let config = peer_config.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let test = tokio::time::timeout(Duration::from_secs(60), async {
+        // Allow nodes to start and connect
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        // Connect to the peers WebSocket API
+        let url = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            peer_ws_port
+        );
+        let (ws_stream, _) = connect_async(url.clone()).await?;
+        let mut client_api = WebApi::start(ws_stream);
+
+        // Send proximity cache query
+        tracing::info!("Sending proximity cache query");
+        client_api
+            .send(ClientRequest::NodeQueries(
+                freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo,
+            ))
+            .await?;
+
+        // Wait for response
+        let resp = tokio::time::timeout(Duration::from_secs(10), client_api.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::QueryResponse(QueryResponse::ProximityCache(info)))) => {
+                tracing::info!("✅ Successfully received proximity cache info");
+                tracing::info!("  My cache entries: {}", info.my_cache.len());
+                tracing::info!("  Neighbor caches: {}", info.neighbor_caches.len());
+                tracing::info!(
+                    "  Cache announces sent: {}",
+                    info.stats.cache_announces_sent
+                );
+                tracing::info!(
+                    "  Cache announces received: {}",
+                    info.stats.cache_announces_received
+                );
+                tracing::info!(
+                    "  Updates via proximity: {}",
+                    info.stats.updates_via_proximity
+                );
+                tracing::info!(
+                    "  Updates via subscription: {}",
+                    info.stats.updates_via_subscription
+                );
+            }
+            Ok(Ok(other)) => {
+                bail!("Unexpected response: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Error receiving response: {}", e);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for proximity cache response");
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // Run test with nodes
+    select! {
+        gw = node_gw => {
+            let Err(e) = gw;
+            return Err(anyhow!("Gateway node failed: {}", e).into())
+        }
+        peer = node_peer => {
+            let Err(e) = peer;
+            return Err(anyhow!("Peer node failed: {}", e).into())
+        }
+        r = test => {
+            r??;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    Ok(())
+}

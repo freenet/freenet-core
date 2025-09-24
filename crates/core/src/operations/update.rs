@@ -511,6 +511,7 @@ impl OpManager {
         key: &ContractKey,
         sender: &PeerId,
     ) -> Vec<PeerKeyLocation> {
+        // Get subscription-based targets (existing logic)
         let subscribers = self
             .ring
             .subscribers_of(key)
@@ -523,18 +524,54 @@ impl OpManager {
             })
             .unwrap_or_default();
 
+        // Get proximity-based targets (new logic)
+        let proximity_targets = if let Some(proximity_cache) = &self.proximity_cache {
+            // Get neighbors who have cached this contract
+            let neighbors_future = proximity_cache.neighbors_with_contract(key);
+            // Since this is in a non-async context, we'll use a blocking wait
+            // TODO: Consider making this method async in a future refactor
+            let neighbor_peers = match tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(neighbors_future)
+            }) {
+                neighbors => neighbors,
+            };
+
+            // Convert PeerIds to PeerKeyLocation, filtering out the sender
+            neighbor_peers
+                .into_iter()
+                .filter(|peer| peer != sender)
+                .map(PeerKeyLocation::from)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        // Combine both subscription and proximity targets, avoiding duplicates
+        let subscription_count = subscribers.len();
+        let mut all_targets = subscribers;
+        for proximity_target in proximity_targets {
+            // Only add if not already in the list
+            if !all_targets.iter().any(|s| s.peer == proximity_target.peer) {
+                all_targets.push(proximity_target);
+            }
+        }
+
         // Trace update propagation for debugging
-        if !subscribers.is_empty() {
+        if !all_targets.is_empty() {
+            let proximity_count = all_targets.len() - subscription_count;
+
             tracing::info!(
-                "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={}",
+                "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={} (sub={} prox={})",
                 key,
                 sender,
-                subscribers
+                all_targets
                     .iter()
                     .map(|s| format!("{:.8}", s.peer))
                     .collect::<Vec<_>>()
                     .join(","),
-                subscribers.len()
+                all_targets.len(),
+                subscription_count,
+                proximity_count
             );
         } else {
             tracing::warn!(
@@ -544,7 +581,7 @@ impl OpManager {
             );
         }
 
-        subscribers
+        all_targets
     }
 }
 
