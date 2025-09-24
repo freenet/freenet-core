@@ -77,28 +77,37 @@ async fn test_subscription_response_reaches_client() -> TestResult {
 
     // Start gateway
     let gw_task = tokio::spawn(async move {
-        let node_config = NodeConfig::from(gw_config);
-        let node = freenet::dev_tool::NetworkPeer::from(node_config);
-        let clients = serve_gateway(node.config.ws_api.clone()).await;
-        let node = node.build(clients).await.unwrap();
+        let config = gw_config.build().await.unwrap();
+        let node = NodeConfig::new(config.clone())
+            .await
+            .unwrap()
+            .build(serve_gateway(config.ws_api).await)
+            .await
+            .unwrap();
         node.run().await
     });
 
     // Start Node1
     let node1_task = tokio::spawn(async move {
-        let node_config = NodeConfig::from(node1_config);
-        let node = freenet::dev_tool::NetworkPeer::from(node_config);
-        let clients = serve_gateway(node.config.ws_api.clone()).await;
-        let node = node.build(clients).await.unwrap();
+        let config = node1_config.build().await.unwrap();
+        let node = NodeConfig::new(config.clone())
+            .await
+            .unwrap()
+            .build(serve_gateway(config.ws_api).await)
+            .await
+            .unwrap();
         node.run().await
     });
 
     // Start Node2
     let node2_task = tokio::spawn(async move {
-        let node_config = NodeConfig::from(node2_config);
-        let node = freenet::dev_tool::NetworkPeer::from(node_config);
-        let clients = serve_gateway(node.config.ws_api.clone()).await;
-        let node = node.build(clients).await.unwrap();
+        let config = node2_config.build().await.unwrap();
+        let node = NodeConfig::new(config.clone())
+            .await
+            .unwrap()
+            .build(serve_gateway(config.ws_api).await)
+            .await
+            .unwrap();
         node.run().await
     });
 
@@ -208,10 +217,13 @@ async fn test_optimal_location_can_subscribe() -> TestResult {
 
     // Start gateway
     let gw_task = tokio::spawn(async move {
-        let node_config = NodeConfig::from(gw_config);
-        let node = freenet::dev_tool::NetworkPeer::from(node_config);
-        let clients = serve_gateway(node.config.ws_api.clone()).await;
-        let node = node.build(clients).await.unwrap();
+        let config = gw_config.build().await.unwrap();
+        let node = NodeConfig::new(config.clone())
+            .await
+            .unwrap()
+            .build(serve_gateway(config.ws_api).await)
+            .await
+            .unwrap();
         node.run().await
     });
 
@@ -230,10 +242,13 @@ async fn test_optimal_location_can_subscribe() -> TestResult {
         .await?;
 
         let task = tokio::spawn(async move {
-            let node_config_local = NodeConfig::from(node_config);
-            let node = freenet::dev_tool::NetworkPeer::from(node_config_local);
-            let clients = serve_gateway(node.config.ws_api.clone()).await;
-            let node = node.build(clients).await.unwrap();
+            let config = node_config.build().await.unwrap();
+            let node = NodeConfig::new(config.clone())
+                .await
+                .unwrap()
+                .build(serve_gateway(config.ws_api).await)
+                .await
+                .unwrap();
             node.run().await
         });
         node_tasks.push(task);
@@ -422,18 +437,24 @@ async fn test_basic_subscription() -> TestResult {
 
     // Start nodes
     let gw_task = tokio::spawn(async move {
-        let node_config_gw = NodeConfig::from(gw_config);
-        let node = freenet::dev_tool::NetworkPeer::from(node_config_gw);
-        let clients = serve_gateway(node.config.ws_api.clone()).await;
-        let node = node.build(clients).await.unwrap();
+        let config = gw_config.build().await.unwrap();
+        let node = NodeConfig::new(config.clone())
+            .await
+            .unwrap()
+            .build(serve_gateway(config.ws_api).await)
+            .await
+            .unwrap();
         node.run().await
     });
 
     let node_task = tokio::spawn(async move {
-        let node_config_node = NodeConfig::from(node_config);
-        let node = freenet::dev_tool::NetworkPeer::from(node_config_node);
-        let clients = serve_gateway(node.config.ws_api.clone()).await;
-        let node = node.build(clients).await.unwrap();
+        let config = node_config.build().await.unwrap();
+        let node = NodeConfig::new(config.clone())
+            .await
+            .unwrap()
+            .build(serve_gateway(config.ws_api).await)
+            .await
+            .unwrap();
         node.run().await
     });
 
