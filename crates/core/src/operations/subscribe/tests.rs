@@ -31,26 +31,6 @@ fn test_subscription_response_generates_host_result() {
     }
 }
 
-/// Test that k_closest_potentially_caching is used for finding peers
-/// This verifies the fix for nodes at optimal location not being able to subscribe
-#[test]
-fn test_uses_multiple_peer_candidates() {
-    // This test would require mocking the OpManager and ring structures
-    // For now, we verify the code structure uses k_closest_potentially_caching
-    // with k=3 in the actual implementation
-
-    // The actual implementation in request_subscribe should use:
-    // op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3)
-    // instead of closest_potentially_caching
-
-    // Similarly, in the message handler for ReturnSub with subscribed: false,
-    // it should use:
-    // op_manager.ring.k_closest_potentially_caching(key, &skip_list, 3)
-
-    // This is a compile-time verification that the method exists
-    // Actual runtime testing requires the full integration test
-}
-
 /// Test that subscription state transitions correctly
 #[test]
 fn test_subscription_state_transitions() {
