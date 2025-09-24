@@ -23,6 +23,7 @@ pub struct ProximityCacheManager {
     stats: Arc<RwLock<ProximityStats>>,
 
     /// Last time we sent a batch announcement
+    #[allow(dead_code)]
     last_batch_announce: Arc<RwLock<Instant>>,
 }
 
@@ -45,6 +46,7 @@ pub struct ProximityStats {
 
 /// Message types for proximity cache protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names)]
 pub enum ProximityCacheMessage {
     /// Announce contracts we're caching (immediate for additions, batched for removals)
     CacheAnnounce {
@@ -74,7 +76,7 @@ impl ProximityCacheManager {
         // Use first 4 bytes of the ContractInstanceId as hash
         let bytes = contract_id.as_bytes();
         u32::from_le_bytes([
-            bytes.get(0).copied().unwrap_or(0),
+            bytes.first().copied().unwrap_or(0),
             bytes.get(1).copied().unwrap_or(0),
             bytes.get(2).copied().unwrap_or(0),
             bytes.get(3).copied().unwrap_or(0),
@@ -112,6 +114,7 @@ impl ProximityCacheManager {
     }
 
     /// Called when we evict a contract from cache
+    #[allow(dead_code)]
     pub async fn on_contract_evicted(&self, contract_key: &ContractKey) {
         let hash = Self::hash_contract(contract_key.id());
 
@@ -218,6 +221,7 @@ impl ProximityCacheManager {
     }
 
     /// Generate a batch announcement for removed contracts (called periodically)
+    #[allow(dead_code)]
     pub async fn generate_batch_announcement(&self) -> Option<ProximityCacheMessage> {
         let mut last_announce = self.last_batch_announce.write().await;
 
@@ -254,18 +258,21 @@ impl ProximityCacheManager {
     }
 
     /// Record that an update was forwarded via proximity
+    #[allow(dead_code)]
     pub async fn record_proximity_forward(&self) {
         let mut stats = self.stats.write().await;
         stats.updates_via_proximity += 1;
     }
 
     /// Record that an update was forwarded via subscription
+    #[allow(dead_code)]
     pub async fn record_subscription_forward(&self) {
         let mut stats = self.stats.write().await;
         stats.updates_via_subscription += 1;
     }
 
     /// Record a false positive (forwarded to a peer that didn't actually have the contract)
+    #[allow(dead_code)]
     pub async fn record_false_positive(&self) {
         let mut stats = self.stats.write().await;
         stats.false_positive_forwards += 1;
