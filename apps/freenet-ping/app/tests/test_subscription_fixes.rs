@@ -11,7 +11,7 @@ use anyhow::anyhow;
 use freenet::{local_node::NodeConfig, server::serve_gateway};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use testresult::TestResult;
@@ -20,7 +20,6 @@ use tracing::{info, warn};
 
 use common::{
     base_node_test_config, connect_ws_client, deploy_contract, get_contract_state,
-    subscribe_to_contract, APP_TAG,
 };
 
 /// Test that subscription responses properly route back to the originating client
@@ -125,7 +124,12 @@ async fn test_subscription_response_reaches_client() -> TestResult {
 
     // Deploy contract on Node2
     let initial_state = Ping::new();
-    let options = PingContractOptions { max_pings: 10 };
+    let options = PingContractOptions {
+        ttl: std::time::Duration::from_secs(60),
+        frequency: std::time::Duration::from_secs(5),
+        tag: "test".to_string(),
+        code_key: "test_contract".to_string(),
+    };
     let contract_key = deploy_contract(&mut client_node2, initial_state, &options, false).await?;
     info!("Contract deployed on Node2: {}", contract_key);
 
@@ -271,7 +275,12 @@ async fn test_optimal_location_can_subscribe() -> TestResult {
 
     // Deploy contract from gateway
     let initial_state = Ping::new();
-    let options = PingContractOptions { max_pings: 10 };
+    let options = PingContractOptions {
+        ttl: std::time::Duration::from_secs(60),
+        frequency: std::time::Duration::from_secs(5),
+        tag: "test".to_string(),
+        code_key: "test_contract".to_string(),
+    };
     let contract_key =
         deploy_contract(&mut client_gw, initial_state.clone(), &options, false).await?;
     info!("Contract deployed: {}", contract_key);
@@ -297,13 +306,9 @@ async fn test_optimal_location_can_subscribe() -> TestResult {
                 match client.recv().await {
                     Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                         contract: _,
-                        state: Some(_),
+                        state,
                         ..
-                    })) => return true,
-                    Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        state: None,
-                        ..
-                    })) => return false,
+                    })) => return !state.is_empty(),
                     Ok(_) => continue,
                     Err(_) => return false,
                 }
@@ -466,7 +471,12 @@ async fn test_basic_subscription() -> TestResult {
 
     // Deploy and subscribe
     let initial_state = Ping::new();
-    let options = PingContractOptions { max_pings: 10 };
+    let options = PingContractOptions {
+        ttl: std::time::Duration::from_secs(60),
+        frequency: std::time::Duration::from_secs(5),
+        tag: "test".to_string(),
+        code_key: "test_contract".to_string(),
+    };
     let contract_key = deploy_contract(&mut client_node, initial_state, &options, true).await?;
 
     info!("Contract deployed with subscription: {}", contract_key);
