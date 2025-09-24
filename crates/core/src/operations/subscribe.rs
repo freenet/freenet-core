@@ -452,6 +452,9 @@ impl IsOperationCompleted for SubscribeOp {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 mod messages {
     use std::{borrow::Borrow, fmt::Display};
 
