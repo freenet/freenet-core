@@ -66,13 +66,16 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // Find a remote peer to handle the subscription
+        // Issue #2: Use k_closest_potentially_caching to try multiple candidates
+        // instead of short-circuiting on first failure
         const EMPTY: &[PeerId] = &[];
-        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
-            Some(peer) => peer,
+        let candidates = op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3); // Try up to 3 candidates
+
+        let target = match candidates.first() {
+            Some(peer) => peer.clone(),
             None => {
-                // No remote peers available
-                tracing::debug!(%key, "No remote peers available for subscription");
+                // No remote peers available - this may happen when node is isolated
+                tracing::warn!(%key, "No remote peers available for subscription - node may be isolated");
                 return Err(RingError::NoCachingPeers(*key).into());
             }
         };
@@ -233,12 +236,15 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        let Some(new_target) =
-                            op_manager.ring.closest_potentially_caching(key, skip_list)
-                        else {
+                        // Issue #2: Use k_closest_potentially_caching to try multiple candidates
+                        let candidates = op_manager
+                            .ring
+                            .k_closest_potentially_caching(key, skip_list, 3);
+                        let Some(new_target) = candidates.first() else {
                             tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
                             return Ok(return_not_subbed());
                         };
+                        let new_target = new_target.clone();
                         let new_htl = htl - 1;
 
                         if new_htl == 0 {
@@ -325,16 +331,18 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
-                                if let Some(target) =
-                                    op_manager.ring.closest_potentially_caching(key, &skip_list)
-                                {
+                                // Issue #2: Use k_closest_potentially_caching to try multiple candidates
+                                let candidates = op_manager
+                                    .ring
+                                    .k_closest_potentially_caching(key, &skip_list, 3);
+                                if let Some(target) = candidates.first() {
                                     let subscriber =
                                         op_manager.ring.connection_manager.own_location();
                                     return_msg = Some(SubscribeMsg::SeekNode {
                                         id: *id,
                                         key: *key,
                                         subscriber,
-                                        target,
+                                        target: target.clone(),
                                         skip_list: skip_list.clone(),
                                         htl: current_hop,
                                         retries: retries + 1,
