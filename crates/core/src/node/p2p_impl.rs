@@ -254,6 +254,8 @@ impl NodeP2P {
         let proximity_cache = Arc::new(ProximityCacheManager::new());
 
         let connection_manager = ConnectionManager::new(&config);
+        // Clone notification_tx before moving it to OpManager
+        let notification_tx_clone = notification_tx.clone();
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ch_outbound,
@@ -326,6 +328,11 @@ impl NodeP2P {
             Err(e) => anyhow::anyhow!(e),
         })
         .boxed();
+
+        // Spawn the periodic batch announcement task for proximity cache
+        proximity_cache
+            .clone()
+            .spawn_periodic_batch_announcements(notification_tx_clone, Arc::downgrade(&op_manager));
 
         Ok(NodeP2P {
             conn_manager,

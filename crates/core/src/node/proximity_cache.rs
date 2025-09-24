@@ -23,8 +23,10 @@ pub struct ProximityCacheManager {
     stats: Arc<RwLock<ProximityStats>>,
 
     /// Last time we sent a batch announcement
-    #[allow(dead_code)]
     last_batch_announce: Arc<RwLock<Instant>>,
+
+    /// Pending removals to be sent in the next batch announcement
+    pending_removals: Arc<RwLock<HashSet<u32>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,6 +70,7 @@ impl ProximityCacheManager {
             neighbor_caches: Arc::new(DashMap::new()),
             stats: Arc::new(RwLock::new(ProximityStats::default())),
             last_batch_announce: Arc::new(RwLock::new(Instant::now())),
+            pending_removals: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -114,7 +117,7 @@ impl ProximityCacheManager {
     }
 
     /// Called when we evict a contract from cache
-    #[allow(dead_code)]
+    #[allow(dead_code)] // TODO: This will be called when contract eviction is implemented
     pub async fn on_contract_evicted(&self, contract_key: &ContractKey) {
         let hash = Self::hash_contract(contract_key.id());
 
@@ -123,9 +126,11 @@ impl ProximityCacheManager {
             debug!(
                 contract = %contract_key,
                 hash = hash,
-                "PROXIMITY_PROPAGATION: Removed contract from cache"
+                "PROXIMITY_PROPAGATION: Removed contract from cache, adding to pending removals"
             );
-            // Removals are batched, not sent immediately
+            // Add to pending removals for batch processing
+            let mut pending = self.pending_removals.write().await;
+            pending.insert(hash);
         }
     }
 
@@ -241,8 +246,7 @@ impl ProximityCacheManager {
         neighbors
     }
 
-    /// Generate a batch announcement for removed contracts (called periodically)
-    #[allow(dead_code)]
+    /// Generate a batch announcement for pending removals (called periodically)
     pub async fn generate_batch_announcement(&self) -> Option<ProximityCacheMessage> {
         let mut last_announce = self.last_batch_announce.write().await;
 
@@ -253,9 +257,30 @@ impl ProximityCacheManager {
 
         *last_announce = Instant::now();
 
-        // For now, we don't track removals separately, so return None
-        // In a full implementation, we'd track pending removals here
-        None
+        // Get pending removals and clear the list
+        let mut pending = self.pending_removals.write().await;
+        if pending.is_empty() {
+            return None;
+        }
+
+        let removals: Vec<u32> = pending.iter().copied().collect();
+        pending.clear();
+        drop(pending); // Release lock early
+        drop(last_announce); // Release lock early
+
+        info!(
+            removal_count = removals.len(),
+            "PROXIMITY_PROPAGATION: Generated batch announcement for removals"
+        );
+
+        // Update statistics
+        let mut stats = self.stats.write().await;
+        stats.cache_announces_sent += 1;
+
+        Some(ProximityCacheMessage::CacheAnnounce {
+            added: vec![],
+            removed: removals,
+        })
     }
 
     /// Get current statistics
@@ -297,5 +322,204 @@ impl ProximityCacheManager {
     pub async fn record_false_positive(&self) {
         let mut stats = self.stats.write().await;
         stats.false_positive_forwards += 1;
+    }
+
+    /// Get list of all known neighbor peer IDs for sending batch announcements
+    pub fn get_neighbor_ids(&self) -> Vec<PeerId> {
+        self.neighbor_caches
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// Create a periodic task for batch announcements that sends through the event loop
+    /// This should be spawned as a background task when the node starts
+    pub fn spawn_periodic_batch_announcements(
+        self: Arc<Self>,
+        event_loop_notifier: crate::node::EventLoopNotificationsSender,
+        op_manager: std::sync::Weak<crate::node::OpManager>,
+    ) {
+        use crate::{
+            config::GlobalExecutor,
+            message::{NetMessage, NetMessageV1},
+        };
+
+        GlobalExecutor::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            info!("PROXIMITY_PROPAGATION: Periodic batch announcement task started");
+
+            loop {
+                interval.tick().await;
+
+                // Check if the op_manager is still alive
+                let op_manager = match op_manager.upgrade() {
+                    Some(manager) => manager,
+                    None => {
+                        info!("PROXIMITY_PROPAGATION: OpManager dropped, stopping batch announcement task");
+                        break;
+                    }
+                };
+
+                // Generate batch announcement if there are pending removals
+                if let Some(announcement) = self.generate_batch_announcement().await {
+                    let neighbor_ids = self.get_neighbor_ids();
+
+                    if neighbor_ids.is_empty() {
+                        debug!("PROXIMITY_PROPAGATION: No neighbors to send batch announcement to");
+                        continue;
+                    }
+
+                    // Get our own peer ID
+                    let own_peer_id = match op_manager.ring.connection_manager.get_peer_key() {
+                        Some(peer_id) => peer_id,
+                        None => {
+                            debug!("PROXIMITY_PROPAGATION: No peer key available, skipping batch announcement");
+                            continue;
+                        }
+                    };
+
+                    info!(
+                        neighbor_count = neighbor_ids.len(),
+                        removal_count = match &announcement {
+                            ProximityCacheMessage::CacheAnnounce { removed, .. } => removed.len(),
+                            _ => 0,
+                        },
+                        "PROXIMITY_PROPAGATION: Sending periodic batch announcement to neighbors"
+                    );
+
+                    // Send to all neighbors through the event loop notification system
+                    for peer_id in neighbor_ids {
+                        let message = NetMessage::V1(NetMessageV1::ProximityCache {
+                            from: own_peer_id.clone(),
+                            message: announcement.clone(),
+                        });
+
+                        // Send the message through the event loop notifications
+                        if event_loop_notifier
+                            .notifications_sender()
+                            .send(either::Either::Left(message))
+                            .await
+                            .is_err()
+                        {
+                            debug!(
+                                peer = %peer_id,
+                                "PROXIMITY_PROPAGATION: Failed to send batch announcement to event loop"
+                            );
+                        }
+                    }
+                }
+            }
+
+            info!("PROXIMITY_PROPAGATION: Periodic batch announcement task stopped");
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freenet_stdlib::prelude::ContractInstanceId;
+    use std::time::Duration;
+
+    fn create_test_contract_key() -> ContractKey {
+        let contract_id = ContractInstanceId::new([1u8; 32]);
+        ContractKey::from(contract_id)
+    }
+
+    #[tokio::test]
+    async fn test_contract_caching_and_eviction() {
+        let cache = ProximityCacheManager::new();
+        let contract_key = create_test_contract_key();
+
+        // Test caching a contract generates immediate announcement
+        let announcement = cache.on_contract_cached(&contract_key).await;
+        assert!(announcement.is_some());
+
+        if let Some(ProximityCacheMessage::CacheAnnounce { added, removed }) = announcement {
+            assert_eq!(added.len(), 1);
+            assert!(removed.is_empty());
+        } else {
+            panic!("Expected CacheAnnounce message");
+        }
+
+        // Test evicting a contract adds to pending removals but doesn't generate immediate announcement
+        cache.on_contract_evicted(&contract_key).await;
+
+        // Check that the contract is in pending removals
+        let pending = cache.pending_removals.read().await;
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_batch_announcement_generation() {
+        let cache = ProximityCacheManager::new();
+        let contract_key = create_test_contract_key();
+
+        // Add a contract to pending removals manually
+        let hash = ProximityCacheManager::hash_contract(contract_key.id());
+        {
+            let mut pending = cache.pending_removals.write().await;
+            pending.insert(hash);
+        }
+
+        // Force time to pass for batch announcement
+        {
+            let mut last_announce = cache.last_batch_announce.write().await;
+            *last_announce = Instant::now() - Duration::from_secs(31);
+        }
+
+        // Generate batch announcement
+        let announcement = cache.generate_batch_announcement().await;
+        assert!(announcement.is_some());
+
+        if let Some(ProximityCacheMessage::CacheAnnounce { added, removed }) = announcement {
+            assert!(added.is_empty());
+            assert_eq!(removed.len(), 1);
+            assert_eq!(removed[0], hash);
+        } else {
+            panic!("Expected CacheAnnounce message");
+        }
+
+        // Check that pending removals are cleared
+        let pending = cache.pending_removals.read().await;
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_no_batch_announcement_when_no_pending_removals() {
+        let cache = ProximityCacheManager::new();
+
+        // Force time to pass for batch announcement
+        {
+            let mut last_announce = cache.last_batch_announce.write().await;
+            *last_announce = Instant::now() - Duration::from_secs(31);
+        }
+
+        // Generate batch announcement - should be None since no pending removals
+        let announcement = cache.generate_batch_announcement().await;
+        assert!(announcement.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_batch_announcement_rate_limiting() {
+        let cache = ProximityCacheManager::new();
+        let contract_key = create_test_contract_key();
+
+        // Add a contract to pending removals
+        let hash = ProximityCacheManager::hash_contract(contract_key.id());
+        {
+            let mut pending = cache.pending_removals.write().await;
+            pending.insert(hash);
+        }
+
+        // Try to generate batch announcement too soon - should be rate limited
+        let announcement = cache.generate_batch_announcement().await;
+        assert!(announcement.is_none());
+
+        // Check that pending removals are still there
+        let pending = cache.pending_removals.read().await;
+        assert_eq!(pending.len(), 1);
     }
 }
