@@ -35,6 +35,7 @@ pub(crate) struct NodeP2P {
     pub(super) is_gateway: bool,
     /// used for testing with deterministic location
     pub(super) location: Option<Location>,
+    #[allow(dead_code)]
     pub(super) proximity_cache: Arc<ProximityCacheManager>,
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
