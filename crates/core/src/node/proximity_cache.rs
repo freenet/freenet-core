@@ -130,7 +130,12 @@ impl ProximityCacheManager {
     }
 
     /// Process a proximity cache message from a neighbor
-    pub async fn handle_message(&self, peer_id: PeerId, message: ProximityCacheMessage) {
+    /// Returns an optional response message that should be sent back to the peer
+    pub async fn handle_message(
+        &self,
+        peer_id: PeerId,
+        message: ProximityCacheMessage,
+    ) -> Option<ProximityCacheMessage> {
         match message {
             ProximityCacheMessage::CacheAnnounce { added, removed } => {
                 let mut stats = self.stats.write().await;
@@ -160,22 +165,30 @@ impl ProximityCacheManager {
                     removed = removed.len(),
                     "PROXIMITY_PROPAGATION: Updated neighbor cache knowledge"
                 );
+                None
             }
 
             ProximityCacheMessage::CacheStateRequest => {
                 // Send our full cache state
                 let cache = self.my_cache.read().await;
-                let _response = ProximityCacheMessage::CacheStateResponse {
+                let response = ProximityCacheMessage::CacheStateResponse {
                     contracts: cache.iter().copied().collect(),
                 };
                 drop(cache);
 
+                let cache_size =
+                    if let ProximityCacheMessage::CacheStateResponse { contracts } = &response {
+                        contracts.len()
+                    } else {
+                        0
+                    };
                 debug!(
                     peer = %peer_id,
+                    cache_size = cache_size,
                     "PROXIMITY_PROPAGATION: Sending cache state to neighbor"
                 );
 
-                // TODO: Send response to peer
+                Some(response)
             }
 
             ProximityCacheMessage::CacheStateResponse { contracts } => {
@@ -193,8 +206,16 @@ impl ProximityCacheManager {
                     contracts = self.neighbor_caches.get(&peer_id).map(|c| c.contracts.len()).unwrap_or(0),
                     "PROXIMITY_PROPAGATION: Received full cache state from neighbor"
                 );
+                None
             }
         }
+    }
+
+    /// Generate a cache state request for a new peer connection
+    /// This should be called when a new peer connection is established
+    pub fn request_cache_state_from_peer(&self) -> ProximityCacheMessage {
+        debug!("PROXIMITY_PROPAGATION: Generating cache state request for new peer");
+        ProximityCacheMessage::CacheStateRequest
     }
 
     /// Check if any neighbors might have this contract cached (for update forwarding)
