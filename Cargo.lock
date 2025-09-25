@@ -1409,7 +1409,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fdev"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "aes-gcm",
  "ahash",
