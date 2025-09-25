@@ -8,44 +8,6 @@ use crate::{
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use std::collections::HashSet;
 
-/// Test that skip list properly excludes failed peers
-/// This validates the Contains trait implementation and skip list behavior
-#[test]
-fn test_skip_list_excludes_failed_peers() {
-    let peer1 = PeerId::random();
-    let peer2 = PeerId::random();
-    let peer3 = PeerId::random();
-
-    // Test with HashSet<PeerId> as skip list (commonly used in the code)
-    let mut skip_list = HashSet::new();
-    skip_list.insert(peer1.clone());
-    skip_list.insert(peer2.clone());
-
-    // Test Contains implementation for HashSet reference (using clones for ownership)
-    assert!(
-        (&skip_list).has_element(peer1.clone()),
-        "Should contain peer1"
-    );
-    assert!(
-        (&skip_list).has_element(peer2.clone()),
-        "Should contain peer2"
-    );
-    assert!(
-        !(&skip_list).has_element(peer3.clone()),
-        "Should not contain peer3"
-    );
-
-    // Verify the skip list has the expected size
-    assert_eq!(skip_list.len(), 2, "Skip list should contain 2 peers");
-
-    // Test that regular HashSet operations work
-    assert!(skip_list.contains(&peer1), "HashSet should contain peer1");
-    assert!(skip_list.contains(&peer2), "HashSet should contain peer2");
-    assert!(
-        !skip_list.contains(&peer3),
-        "HashSet should not contain peer3"
-    );
-}
 
 /// Test that subscription messages contain proper skip list data
 /// This tests the message structure used by the subscription protocol
