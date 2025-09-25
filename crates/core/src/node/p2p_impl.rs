@@ -283,7 +283,7 @@ impl NodeP2P {
         let mut conn_manager =
             P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
 
-        // Phase 4: Configure MessageProcessor for clean client handling separation
+        // Configure MessageProcessor for clean client handling separation
         let use_actor_clients = config.config.actor_clients;
         if use_actor_clients {
             // Clone session_tx before using it in MessageProcessor

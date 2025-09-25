@@ -60,7 +60,7 @@ pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     SubscribeOp { id, state }
 }
 
-/// Phase 2 fix for issue #1848: Allow subscribe with specific transaction ID
+/// Allow subscribe with specific transaction ID for consistency
 pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp {
     let state = Some(SubscribeState::PrepareRequest { id, key });
     SubscribeOp { id, state }

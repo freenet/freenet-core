@@ -940,7 +940,7 @@ async fn process_open_request(
                                     "Starting new SUBSCRIBE network operation via RequestRouter",
                                 );
 
-                                // Phase 2 fix: Use the transaction_id from RequestRouter for consistency
+                                // Use the transaction_id from RequestRouter for consistency
                                 let op = subscribe::start_op_with_id(key, transaction_id);
                                 subscribe::request_subscribe(&op_manager, op)
                                     .await
@@ -1087,7 +1087,7 @@ async fn process_open_request(
                     query,
                     freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo
                 ) {
-                    // Phase 4: Return real proximity cache data
+                    // Return proximity cache data
                     let (my_cache_hashes, neighbor_cache_data) =
                         proximity_cache.get_introspection_data().await;
                     let stats = proximity_cache.get_stats().await;

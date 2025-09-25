@@ -166,7 +166,7 @@ impl P2pConnManager {
         })
     }
 
-    /// Set the MessageProcessor for Phase 4 network decoupling
+    /// Set the MessageProcessor for network decoupling
     pub fn with_message_processor(mut self, message_processor: Arc<MessageProcessor>) -> Self {
         self.message_processor = Some(message_processor);
         self
@@ -735,7 +735,7 @@ impl P2pConnManager {
 
         let pending_op_result = state.pending_op_results.get(msg.id()).cloned();
 
-        // Phase 4: Use MessageProcessor for clean client handling separation when available
+        // Use MessageProcessor for clean client handling separation when available
         if let Some(message_processor) = &self.message_processor {
             tracing::debug!("Using PURE network processing - zero client types in network layer for transaction {}", msg.id());
             GlobalExecutor::spawn(
