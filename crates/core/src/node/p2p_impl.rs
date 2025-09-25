@@ -334,6 +334,22 @@ impl NodeP2P {
             .clone()
             .spawn_periodic_batch_announcements(notification_tx_clone, Arc::downgrade(&op_manager));
 
+        // Spawn periodic cleanup task to remove stale neighbor entries
+        // This handles cases where disconnect events might be missed
+        let proximity_cache_cleanup = proximity_cache.clone();
+        crate::config::GlobalExecutor::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // Every 5 minutes
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+                // Remove neighbors that haven't been seen for 10 minutes
+                proximity_cache_cleanup
+                    .cleanup_stale_neighbors(std::time::Duration::from_secs(600))
+                    .await;
+            }
+        });
+
         Ok(NodeP2P {
             conn_manager,
             notification_channel,
