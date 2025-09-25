@@ -1249,7 +1249,7 @@ async fn process_open_request(
                     query,
                     freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo
                 ) {
-                    // Phase 4: Return real proximity cache data
+                    // Return proximity cache data
                     let (my_cache_hashes, neighbor_cache_data) =
                         proximity_cache.get_introspection_data().await;
                     let stats = proximity_cache.get_stats().await;

@@ -72,7 +72,7 @@ pub async fn query(base_cfg: BaseConfig) -> anyhow::Result<()> {
         println!("No application subscriptions");
     }
 
-    // Query for proximity cache info (Phase 3)
+    // Query for proximity cache info
     tracing::info!("Querying for proximity cache info");
     execute_command(
         freenet_stdlib::client_api::ClientRequest::NodeQueries(NodeQuery::ProximityCacheInfo),
@@ -87,7 +87,7 @@ pub async fn query(base_cfg: BaseConfig) -> anyhow::Result<()> {
     };
 
     // Display proximity cache information
-    println!("\n=== Proximity Cache Information (Phase 3) ===");
+    println!("\n=== Proximity Cache Information ===");
 
     if !proximity_info.my_cache.is_empty() {
         println!("\nContracts cached locally:");
