@@ -66,8 +66,7 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // Issue #2: Use k_closest_potentially_caching to try multiple candidates
-        // instead of short-circuiting on first failure
+        // Use k_closest_potentially_caching to try multiple candidates
         const EMPTY: &[PeerId] = &[];
         let candidates = op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3); // Try up to 3 candidates
 
@@ -236,7 +235,7 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        // Issue #2: Use k_closest_potentially_caching to try multiple candidates
+                        // Use k_closest_potentially_caching to try multiple candidates
                         let candidates = op_manager
                             .ring
                             .k_closest_potentially_caching(key, skip_list, 3);
@@ -331,7 +330,7 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
-                                // Issue #2: Use k_closest_potentially_caching to try multiple candidates
+                                // Use k_closest_potentially_caching to try multiple candidates
                                 let candidates = op_manager
                                     .ring
                                     .k_closest_potentially_caching(key, &skip_list, 3);
