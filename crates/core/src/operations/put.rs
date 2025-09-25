@@ -525,17 +525,19 @@ impl Operation for PutOp {
                                 );
                             }
 
-                            // Start subscription if the contract is already seeded and the user requested it
-                            if subscribe && is_seeding_contract {
+                            // Start subscription if requested - should work for both new and existing contracts
+                            if subscribe {
                                 tracing::debug!(
                                     tx = %id,
                                     %key,
                                     peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
-                                    "Starting subscription request"
+                                    was_already_seeding = %is_seeding_contract,
+                                    "Starting subscription for contract after successful PUT"
                                 );
-                                // TODO: Make put operation atomic by linking it to the completion of this subscription request.
-                                // Currently we can't link one transaction to another transaction's result, which would be needed
-                                // to make this fully atomic. This should be addressed in a future refactoring.
+
+                                // Start subscription request to register with peers
+                                // Note: start_subscription_request already handles adding self as subscriber internally
+                                // so we don't need to do it explicitly here
                                 super::start_subscription_request(op_manager, key).await;
                             }
 
