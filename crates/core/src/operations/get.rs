@@ -408,7 +408,7 @@ impl Operation for GetOp {
 
     fn process_message<'a, NB: NetworkBridge>(
         self,
-        _conn_manager: &'a mut NB,
+        conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
@@ -947,6 +947,64 @@ impl Operation for GetOp {
                                 if !is_subscribed_contract {
                                     tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                     op_manager.ring.seed_contract(key);
+
+                                    // Track contract caching in proximity cache and send announcements
+                                    if let Some(proximity_cache) = &op_manager.proximity_cache {
+                                        if let Some(cache_msg) =
+                                            proximity_cache.on_contract_cached(&key).await
+                                        {
+                                            tracing::debug!(tx = %id, %key, "PROXIMITY_PROPAGATION: Generated cache announcement, sending to neighbors");
+
+                                            // Send the cache announcement to all connected neighbors
+                                            let own_peer = op_manager
+                                                .ring
+                                                .connection_manager
+                                                .get_peer_key()
+                                                .unwrap();
+                                            let connected_peers: Vec<_> = op_manager
+                                                .ring
+                                                .connection_manager
+                                                .connected_peers()
+                                                .collect();
+
+                                            tracing::debug!(
+                                                tx = %id,
+                                                %key,
+                                                neighbor_count = connected_peers.len(),
+                                                "PROXIMITY_PROPAGATION: Sending cache announcements to {} neighbors",
+                                                connected_peers.len()
+                                            );
+
+                                            for peer_id in connected_peers {
+                                                let proximity_msg = crate::message::NetMessage::V1(
+                                                    crate::message::NetMessageV1::ProximityCache {
+                                                        from: own_peer.clone(),
+                                                        message: cache_msg.clone(),
+                                                    },
+                                                );
+
+                                                if let Err(err) =
+                                                    conn_manager.send(&peer_id, proximity_msg).await
+                                                {
+                                                    tracing::warn!(
+                                                        tx = %id,
+                                                        %key,
+                                                        peer = %peer_id,
+                                                        error = %err,
+                                                        "PROXIMITY_PROPAGATION: Failed to send cache announcement to neighbor"
+                                                    );
+                                                } else {
+                                                    tracing::trace!(
+                                                        tx = %id,
+                                                        %key,
+                                                        peer = %peer_id,
+                                                        "PROXIMITY_PROPAGATION: Successfully sent cache announcement to neighbor"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.insert(sender.peer.clone());
 

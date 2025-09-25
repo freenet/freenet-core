@@ -804,6 +804,7 @@ where
             config.user_events.take().expect("should be set"),
             client_responses,
             node_controller_tx,
+            Arc::new(crate::node::proximity_cache::ProximityCacheManager::new()),
         )
         .instrument(span),
     );

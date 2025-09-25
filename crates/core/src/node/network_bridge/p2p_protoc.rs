@@ -1,6 +1,6 @@
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::contract::{ContractHandlerEvent, WaitingTransaction};
-use crate::message::{NetMessageV1, QueryResult};
+use crate::message::{NetMessage, NetMessageV1, QueryResult};
 use crate::node::subscribe::SubscribeMsg;
 use crate::ring::Location;
 use dashmap::DashSet;
@@ -41,7 +41,7 @@ use crate::{
         ClientResponsesSender, ContractHandlerChannel, ExecutorToEventLoopChannel,
         NetworkEventListenerHalve, WaitingResolution,
     },
-    message::{MessageStats, NetMessage, NodeEvent, Transaction},
+    message::{MessageStats, NodeEvent, Transaction},
     node::{
         handle_aborted_op, process_message, process_message_decoupled, NetEventRegister,
         NodeConfig, OpManager,
@@ -166,7 +166,7 @@ impl P2pConnManager {
         })
     }
 
-    /// Set the MessageProcessor for Phase 4 network decoupling
+    /// Set the MessageProcessor for network decoupling
     pub fn with_message_processor(mut self, message_processor: Arc<MessageProcessor>) -> Self {
         self.message_processor = Some(message_processor);
         self
@@ -312,6 +312,12 @@ impl P2pConnManager {
                             NodeEvent::DropConnection(peer) => {
                                 tracing::debug!(%peer, "Dropping connection");
                                 if let Some(conn) = self.connections.remove(&peer) {
+                                    // Clean up proximity cache for disconnected peer
+                                    if let Some(proximity_cache) =
+                                        &self.bridge.op_manager.proximity_cache
+                                    {
+                                        proximity_cache.on_peer_disconnected(&peer);
+                                    }
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     timeout(
                                         Duration::from_secs(1),
@@ -729,7 +735,7 @@ impl P2pConnManager {
 
         let pending_op_result = state.pending_op_results.get(msg.id()).cloned();
 
-        // Phase 4: Use MessageProcessor for clean client handling separation when available
+        // Use MessageProcessor for clean client handling separation when available
         if let Some(message_processor) = &self.message_processor {
             tracing::debug!("Using PURE network processing - zero client types in network layer for transaction {}", msg.id());
             GlobalExecutor::spawn(
@@ -994,6 +1000,27 @@ impl P2pConnManager {
         self.connections.insert(peer_id.clone(), tx);
         let task = peer_connection_listener(rx, connection).boxed();
         state.peer_connections.push(task);
+
+        // Send cache state request to newly connected peer
+        if let Some(proximity_cache) = &self.bridge.op_manager.proximity_cache {
+            let cache_request = proximity_cache.request_cache_state_from_peer();
+            let cache_msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                from: self
+                    .bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .own_location()
+                    .peer,
+                message: cache_request,
+            });
+
+            tracing::debug!(peer = %peer_id, "Sending cache state request to newly connected peer");
+            if let Err(err) = self.bridge.send(&peer_id, cache_msg).await {
+                tracing::warn!("Failed to send cache state request to {}: {}", peer_id, err);
+            }
+        }
+
         Ok(())
     }
 
@@ -1056,6 +1083,12 @@ impl P2pConnManager {
                             .ring
                             .prune_connection(peer.clone())
                             .await;
+
+                        // Clean up proximity cache for disconnected peer
+                        if let Some(proximity_cache) = &self.bridge.op_manager.proximity_cache {
+                            proximity_cache.on_peer_disconnected(&peer);
+                        }
+
                         self.connections.remove(&peer);
                         handshake_handler_msg.drop_connection(peer).await?;
                     }

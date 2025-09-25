@@ -41,6 +41,7 @@ impl<ER> Builder<ER> {
             self.event_register.clone(),
             connection_manager.clone(),
             None, // No result router for testing
+            None, // No proximity cache for testing
         )?);
         std::mem::drop(_guard);
         let (executor_listener, executor_sender) = executor_channel(op_manager.clone());

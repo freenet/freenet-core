@@ -60,6 +60,12 @@ pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     SubscribeOp { id, state }
 }
 
+/// Allow subscribe with specific transaction ID for consistency
+pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp {
+    let state = Some(SubscribeState::PrepareRequest { id, key });
+    SubscribeOp { id, state }
+}
+
 /// Request to subscribe to value changes from a contract.
 pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
