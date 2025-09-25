@@ -903,16 +903,19 @@ async fn process_open_request(
                                 request_id,
                             };
 
-                            let (transaction_id, should_start_operation) =
+                            let (_transaction_id, should_start_operation) =
                                 router.route_request(request).await.map_err(|e| {
                                     Error::Node(format!("Request routing failed: {}", e))
                                 })?;
 
-                            // Always register this client for the result
+                            // Register this client for the subscription result with proper WaitingTransaction type
+                            use crate::contract::WaitingTransaction;
                             op_manager
                                 .ch_outbound
                                 .waiting_for_transaction_result(
-                                    transaction_id,
+                                    WaitingTransaction::Subscription {
+                                        contract_key: *key.id(),
+                                    },
                                     client_id,
                                     request_id,
                                 )
