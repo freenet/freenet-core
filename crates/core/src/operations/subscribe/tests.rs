@@ -8,9 +8,6 @@ use crate::{
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use std::collections::HashSet;
 
-
-
-
 /// TestRing implements only the methods used by subscription routing
 #[allow(clippy::type_complexity)]
 struct TestRing {
