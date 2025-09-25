@@ -308,23 +308,9 @@ impl<T> From<SendError<T>> for OpError {
 
 /// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
 async fn start_subscription_request(op_manager: &OpManager, key: ContractKey) {
-    // Phase 1 fix for issue #1848: Allow nodes at optimal location to subscribe to next-best peers
-    // This prevents isolation when a node is at the optimal network position
-    let own_location = op_manager.ring.connection_manager.own_location();
-    let closest = op_manager
-        .ring
-        .closest_potentially_caching(&key, [&own_location.peer].as_slice());
-
-    if closest.is_none() {
-        // No other peers available for caching
-        tracing::warn!(
-            %key,
-            "No remote peers available for subscription - node may become isolated"
-        );
-        // Still attempt subscription in case new peers join later
-        // The subscribe operation will handle the no-peers case appropriately
-    }
-
+    // Always try to subscribe, even if we're at optimal location
+    // The k_closest_potentially_caching logic in subscribe::request_subscribe
+    // will find alternative peers if needed
     let sub_op = subscribe::start_op(key);
     if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
         tracing::warn!(%error, "Error subscribing to contract");
