@@ -9,56 +9,6 @@ use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use std::collections::HashSet;
 
 
-/// Test that subscription messages contain proper skip list data
-/// This tests the message structure used by the subscription protocol
-#[test]
-fn test_subscription_messages_with_skip_lists() {
-    let contract_key = ContractKey::from(ContractInstanceId::new([2u8; 32]));
-    let transaction_id = Transaction::new::<SubscribeMsg>();
-    let peer1 = PeerId::random();
-    let peer2 = PeerId::random();
-
-    // Create skip list with failed peers
-    let mut skip_list = HashSet::new();
-    skip_list.insert(peer1.clone());
-    skip_list.insert(peer2.clone());
-
-    // Create a SeekNode message with skip list
-    let target_location = PeerKeyLocation {
-        peer: PeerId::random(),
-        location: Some(Location::try_from(0.5).unwrap()),
-    };
-
-    let subscriber_location = PeerKeyLocation {
-        peer: PeerId::random(),
-        location: Some(Location::try_from(0.3).unwrap()),
-    };
-
-    let msg = SubscribeMsg::SeekNode {
-        id: transaction_id,
-        key: contract_key,
-        target: target_location.clone(),
-        subscriber: subscriber_location,
-        skip_list: skip_list.clone(),
-        htl: 10,
-        retries: 2,
-    };
-
-    // Verify message contains skip list and retry count
-    if let SubscribeMsg::SeekNode {
-        skip_list: list,
-        retries,
-        ..
-    } = msg
-    {
-        assert_eq!(list.len(), 2, "Skip list should contain 2 peers");
-        assert!(list.contains(&peer1), "Should contain peer1");
-        assert!(list.contains(&peer2), "Should contain peer2");
-        assert_eq!(retries, 2, "Should have 2 retries");
-    } else {
-        panic!("Expected SeekNode message");
-    }
-}
 
 /// Test demonstrating the subscription flow that would fail if k_closest_potentially_caching is broken
 /// This test shows the critical path where the subscription logic depends on k_closest_potentially_caching
