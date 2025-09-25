@@ -367,6 +367,12 @@ impl P2pConnManager {
                             NodeEvent::DropConnection(peer) => {
                                 tracing::debug!(%peer, "Dropping connection");
                                 if let Some(conn) = self.connections.remove(&peer) {
+                                    // Clean up proximity cache for disconnected peer
+                                    if let Some(proximity_cache) =
+                                        &self.bridge.op_manager.proximity_cache
+                                    {
+                                        proximity_cache.on_peer_disconnected(&peer);
+                                    }
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     timeout(
                                         Duration::from_secs(1),
@@ -1143,6 +1149,12 @@ impl P2pConnManager {
                             .ring
                             .prune_connection(peer.clone())
                             .await;
+
+                        // Clean up proximity cache for disconnected peer
+                        if let Some(proximity_cache) = &self.bridge.op_manager.proximity_cache {
+                            proximity_cache.on_peer_disconnected(&peer);
+                        }
+
                         self.connections.remove(&peer);
                         handshake_handler_msg.drop_connection(peer).await?;
                     }

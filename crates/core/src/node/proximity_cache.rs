@@ -415,6 +415,61 @@ impl ProximityCacheManager {
             info!("PROXIMITY_PROPAGATION: Periodic batch announcement task stopped");
         });
     }
+
+    /// Handle peer disconnection by removing them from the neighbor cache
+    /// This prevents stale data from accumulating and avoids forwarding updates to disconnected peers
+    pub fn on_peer_disconnected(&self, peer_id: &PeerId) {
+        if let Some((_, removed_cache)) = self.neighbor_caches.remove(peer_id) {
+            debug!(
+                peer = %peer_id,
+                cached_contracts = removed_cache.contracts.len(),
+                "PROXIMITY_CACHE: Removed disconnected peer from neighbor cache"
+            );
+        }
+    }
+
+    /// Cleanup stale neighbor entries based on last_update timestamp
+    /// This provides an alternative to explicit disconnect notifications
+    pub async fn cleanup_stale_neighbors(&self, max_age: Duration) {
+        let now = Instant::now();
+        let mut removed_count = 0;
+
+        // Collect stale peer IDs to avoid holding references while removing
+        let stale_peers: Vec<PeerId> = self
+            .neighbor_caches
+            .iter()
+            .filter_map(|entry| {
+                let peer_id = entry.key().clone();
+                let cache = entry.value();
+                if now.duration_since(cache.last_update) > max_age {
+                    Some(peer_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Remove stale entries
+        for peer_id in stale_peers {
+            if let Some((_, removed_cache)) = self.neighbor_caches.remove(&peer_id) {
+                removed_count += 1;
+                debug!(
+                    peer = %peer_id,
+                    cached_contracts = removed_cache.contracts.len(),
+                    age = ?now.duration_since(removed_cache.last_update),
+                    "PROXIMITY_CACHE: Removed stale neighbor cache entry"
+                );
+            }
+        }
+
+        if removed_count > 0 {
+            info!(
+                removed_peers = removed_count,
+                max_age = ?max_age,
+                "PROXIMITY_CACHE: Cleaned up stale neighbor cache entries"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

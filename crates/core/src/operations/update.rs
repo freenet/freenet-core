@@ -195,7 +195,9 @@ impl Operation for UpdateOp {
                         "Updating contract at target peer",
                     );
 
-                    let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
+                    let broadcast_to = op_manager
+                        .get_broadcast_targets_update(key, &sender.peer)
+                        .await;
 
                     if should_handle_update {
                         tracing::debug!(
@@ -255,7 +257,9 @@ impl Operation for UpdateOp {
                     .await?;
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
-                    let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
+                    let broadcast_to = op_manager
+                        .get_broadcast_targets_update(key, &sender.peer)
+                        .await;
 
                     tracing::debug!(
                         "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
@@ -506,7 +510,7 @@ async fn try_to_broadcast(
 }
 
 impl OpManager {
-    pub(crate) fn get_broadcast_targets_update(
+    pub(crate) async fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
         sender: &PeerId,
@@ -526,13 +530,8 @@ impl OpManager {
 
         // Get proximity-based targets (new logic)
         let proximity_targets = if let Some(proximity_cache) = &self.proximity_cache {
-            // Get neighbors who have cached this contract
-            let neighbors_future = proximity_cache.neighbors_with_contract(key);
-            // Since this is in a non-async context, we'll use a blocking wait
-            // TODO: Consider making this method async in a future refactor
-            let neighbor_peers = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(neighbors_future)
-            });
+            // Get neighbors who have cached this contract - now using proper async
+            let neighbor_peers = proximity_cache.neighbors_with_contract(key).await;
 
             // Convert PeerIds to PeerKeyLocation, filtering out the sender
             neighbor_peers
