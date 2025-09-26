@@ -158,6 +158,8 @@ impl Router {
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
     ) -> Vec<&'a PeerKeyLocation> {
+        use rand::seq::SliceRandom;
+
         let mut peer_distances: Vec<_> = peers
             .into_iter()
             .filter_map(|peer| {
@@ -166,8 +168,8 @@ impl Router {
             })
             .collect();
 
-        use rand::prelude::SliceRandom;
-        peer_distances.shuffle(&mut rand::rng());
+        let rng = &mut rand::rng();
+        peer_distances.shuffle(rng);
         peer_distances.sort_by_key(|&(_, distance)| distance);
         peer_distances.truncate(self.consider_n_closest_peers);
         peer_distances.into_iter().map(|(peer, _)| peer).collect()
@@ -196,6 +198,8 @@ impl Router {
         }
 
         if !self.has_sufficient_historical_data() {
+            use rand::seq::SliceRandom;
+
             let mut peer_distances: Vec<_> = peers
                 .into_iter()
                 .filter_map(|peer| {
@@ -204,8 +208,8 @@ impl Router {
                 })
                 .collect();
 
-            use rand::prelude::SliceRandom;
-            peer_distances.shuffle(&mut rand::rng());
+            let rng = &mut rand::rng();
+            peer_distances.shuffle(rng);
             peer_distances.sort_by_key(|&(_, distance)| distance);
             peer_distances.truncate(k);
             peer_distances.into_iter().map(|(peer, _)| peer).collect()
