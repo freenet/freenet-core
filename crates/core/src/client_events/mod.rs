@@ -1097,6 +1097,11 @@ async fn process_open_request(
                             callback: tx,
                         }
                     }
+                    freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo => {
+                        // TODO: Implement proximity cache info query
+                        tracing::warn!("ProximityCacheInfo query not yet implemented");
+                        return Ok(None);
+                    }
                 };
 
                 if let Err(err) = op_manager.notify_node_event(node_event).await {

@@ -1655,9 +1655,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.15"
+version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34eceef281df7747dc9f813a632d2d25eaa37a80732bbe2d729775ffe842dea8"
+checksum = "4296dc285be76c89549a0c47d068c8360c26ddb75f091a1402e11aa11f61a690"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -2264,7 +2264,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "system-configuration",
  "tokio",
  "tower-service",
