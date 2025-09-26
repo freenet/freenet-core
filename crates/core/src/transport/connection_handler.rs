@@ -1864,12 +1864,15 @@ mod test {
             let data = vec![0u8; MAX_DATA_SIZE + 1];
             let data =
                 tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap()).await?;
+            // This should panic or return an error since data is too large
             conn.outbound_short_message(data).await?;
             Ok::<_, anyhow::Error>(())
         });
 
         let (a, b) = tokio::join!(peer_a, peer_b);
+        // peer_a should get an error (timeout waiting for message)
         assert!(a?.is_err());
+        // peer_b task should panic when trying to send oversized message
         assert!(b.is_err());
         Ok(())
     }
