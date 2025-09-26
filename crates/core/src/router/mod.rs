@@ -158,26 +158,19 @@ impl Router {
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
     ) -> Vec<&'a PeerKeyLocation> {
-        let mut heap =
-            std::collections::BinaryHeap::with_capacity(self.consider_n_closest_peers + 1);
-
-        for peer_location in peers {
-            if let Some(location) = peer_location.location.as_ref() {
-                let distance = target_location.distance(location);
-                heap.push((distance, peer_location));
-
-                // Ensure we keep the heap size to specified capacity
-                if heap.len() > self.consider_n_closest_peers {
-                    heap.pop();
-                }
-            }
-        }
-
-        // Convert the heap to a sorted vector
-        heap.into_sorted_vec()
+        let mut peer_distances: Vec<_> = peers
             .into_iter()
-            .map(|(_, peer_location)| peer_location)
-            .collect()
+            .filter_map(|peer| {
+                peer.location
+                    .map(|loc| (peer, target_location.distance(loc)))
+            })
+            .collect();
+
+        use rand::prelude::SliceRandom;
+        peer_distances.shuffle(&mut rand::rng());
+        peer_distances.sort_by_key(|&(_, distance)| distance);
+        peer_distances.truncate(self.consider_n_closest_peers);
+        peer_distances.into_iter().map(|(peer, _)| peer).collect()
     }
 
     pub fn select_peer<'a>(
@@ -203,7 +196,6 @@ impl Router {
         }
 
         if !self.has_sufficient_historical_data() {
-            // Sort peers by distance to the contract location
             let mut peer_distances: Vec<_> = peers
                 .into_iter()
                 .filter_map(|peer| {
@@ -212,6 +204,8 @@ impl Router {
                 })
                 .collect();
 
+            use rand::prelude::SliceRandom;
+            peer_distances.shuffle(&mut rand::rng());
             peer_distances.sort_by_key(|&(_, distance)| distance);
             peer_distances.truncate(k);
             peer_distances.into_iter().map(|(peer, _)| peer).collect()
