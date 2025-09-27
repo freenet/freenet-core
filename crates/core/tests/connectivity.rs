@@ -612,13 +612,7 @@ async fn test_peer_mesh_formation() -> TestResult {
         let (stream1, _) = connect_async(&uri1).await?;
         let mut client1 = WebApi::start(stream1);
 
-        make_put(
-            &mut client1,
-            wrapped_state.clone(),
-            contract.clone(),
-            false,
-        )
-        .await?;
+        make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
 
         let resp1 = tokio::time::timeout(Duration::from_secs(60), client1.recv()).await;
         match resp1 {
