@@ -169,7 +169,12 @@ impl SymmetricMessage {
     ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
         let mut packet = [0u8; MAX_DATA_SIZE];
         let size = bincode::serialized_size(self)?;
-        debug_assert!(size <= MAX_DATA_SIZE as u64);
+        if size > MAX_DATA_SIZE as u64 {
+            return Err(Box::new(bincode::ErrorKind::Custom(format!(
+                "Message size {} exceeds MAX_DATA_SIZE {}",
+                size, MAX_DATA_SIZE
+            ))));
+        }
         bincode::serialize_into(packet.as_mut_slice(), self)?;
         let bytes = &packet[..size as usize];
         let packet = PacketData::from_buf_plain(bytes);

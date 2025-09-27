@@ -1872,8 +1872,9 @@ mod test {
         let (a, b) = tokio::join!(peer_a, peer_b);
         // peer_a should get an error (timeout waiting for message)
         assert!(a?.is_err());
-        // peer_b task should panic when trying to send oversized message
-        assert!(b.is_err());
+        // peer_b task should error when trying to send oversized message
+        let b_result = b?;
+        assert!(b_result.is_err(), "Expected error from peer_b, got Ok");
         Ok(())
     }
 
