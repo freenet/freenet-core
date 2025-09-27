@@ -1025,15 +1025,6 @@ where
         return Ok(None);
     }
 
-    if connection_manager.num_connections() == 0 {
-        tracing::warn!(
-            tx = %id,
-            joiner = %joiner.peer,
-            "Couldn't forward connect petition, not enough connections",
-        );
-        return Ok(None);
-    }
-
     let target_peer = {
         let router = router.read();
         select_forward_target(
