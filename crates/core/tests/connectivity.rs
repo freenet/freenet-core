@@ -420,3 +420,272 @@ async fn test_basic_gateway_connectivity() -> TestResult {
         Err(_) => Err(anyhow!("Test timed out after 30 seconds").into()),
     }
 }
+
+/// Test for issue #1863: Verify that peers can form a mesh network through a gateway
+/// with zero initial connections. This test validates that the fix for the race condition
+/// allows the gateway to attempt forwarding even when num_connections() == 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_peer_mesh_formation() -> TestResult {
+    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+
+    // Load test contract for performing operations
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    // Create network sockets
+    let gateway_network_socket = TcpListener::bind("127.0.0.1:0")?;
+    let gateway_ws_socket = TcpListener::bind("127.0.0.1:0")?;
+    let peer1_ws_socket = TcpListener::bind("127.0.0.1:0")?;
+    let peer2_ws_socket = TcpListener::bind("127.0.0.1:0")?;
+
+    // Gateway configuration
+    let temp_dir_gw = tempfile::tempdir()?;
+    let gateway_key = TransportKeypair::new();
+    let gateway_transport_keypair = temp_dir_gw.path().join("private.pem");
+    gateway_key.save(&gateway_transport_keypair)?;
+    gateway_key
+        .public()
+        .save(temp_dir_gw.path().join("public.pem"))?;
+
+    let gateway_port = gateway_network_socket.local_addr()?.port();
+    let gateway_ws_port = gateway_ws_socket.local_addr()?.port();
+    let peer1_ws_port = peer1_ws_socket.local_addr()?.port();
+    let peer2_ws_port = peer2_ws_socket.local_addr()?.port();
+
+    let gateway_config = ConfigArgs {
+        ws_api: WebsocketApiArgs {
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            ws_api_port: Some(gateway_ws_port),
+        },
+        network_api: NetworkArgs {
+            public_address: Some(Ipv4Addr::LOCALHOST.into()),
+            public_port: Some(gateway_port),
+            is_gateway: true,
+            skip_load_from_network: true,
+            gateways: Some(vec![]),
+            location: Some(RNG.lock().unwrap().random()),
+            ignore_protocol_checking: true,
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_port: Some(gateway_port),
+            bandwidth_limit: None,
+            blocked_addresses: None,
+        },
+        config_paths: freenet::config::ConfigPathsArgs {
+            config_dir: Some(temp_dir_gw.path().to_path_buf()),
+            data_dir: Some(temp_dir_gw.path().to_path_buf()),
+        },
+        secrets: SecretArgs {
+            transport_keypair: Some(gateway_transport_keypair),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let gateway_info = InlineGwConfig {
+        address: (Ipv4Addr::LOCALHOST, gateway_port).into(),
+        location: Some(RNG.lock().unwrap().random()),
+        public_key_path: temp_dir_gw.path().join("public.pem"),
+    };
+
+    // Peer 1 configuration
+    let temp_dir_peer1 = tempfile::tempdir()?;
+    let peer1_key = TransportKeypair::new();
+    let peer1_transport_keypair = temp_dir_peer1.path().join("private.pem");
+    peer1_key.save(&peer1_transport_keypair)?;
+
+    let peer1_config = ConfigArgs {
+        ws_api: WebsocketApiArgs {
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            ws_api_port: Some(peer1_ws_port),
+        },
+        network_api: NetworkArgs {
+            public_address: Some(Ipv4Addr::LOCALHOST.into()),
+            public_port: None,
+            is_gateway: false,
+            skip_load_from_network: true,
+            gateways: Some(vec![serde_json::to_string(&gateway_info)?]),
+            location: Some(RNG.lock().unwrap().random()),
+            ignore_protocol_checking: true,
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_port: None,
+            bandwidth_limit: None,
+            blocked_addresses: None,
+        },
+        config_paths: freenet::config::ConfigPathsArgs {
+            config_dir: Some(temp_dir_peer1.path().to_path_buf()),
+            data_dir: Some(temp_dir_peer1.path().to_path_buf()),
+        },
+        secrets: SecretArgs {
+            transport_keypair: Some(peer1_transport_keypair),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // Peer 2 configuration
+    let temp_dir_peer2 = tempfile::tempdir()?;
+    let peer2_key = TransportKeypair::new();
+    let peer2_transport_keypair = temp_dir_peer2.path().join("private.pem");
+    peer2_key.save(&peer2_transport_keypair)?;
+
+    let peer2_config = ConfigArgs {
+        ws_api: WebsocketApiArgs {
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            ws_api_port: Some(peer2_ws_port),
+        },
+        network_api: NetworkArgs {
+            public_address: Some(Ipv4Addr::LOCALHOST.into()),
+            public_port: None,
+            is_gateway: false,
+            skip_load_from_network: true,
+            gateways: Some(vec![serde_json::to_string(&gateway_info)?]),
+            location: Some(RNG.lock().unwrap().random()),
+            ignore_protocol_checking: true,
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_port: None,
+            bandwidth_limit: None,
+            blocked_addresses: None,
+        },
+        config_paths: freenet::config::ConfigPathsArgs {
+            config_dir: Some(temp_dir_peer2.path().to_path_buf()),
+            data_dir: Some(temp_dir_peer2.path().to_path_buf()),
+        },
+        secrets: SecretArgs {
+            transport_keypair: Some(peer2_transport_keypair),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // Free the sockets before starting nodes
+    std::mem::drop(gateway_network_socket);
+    std::mem::drop(gateway_ws_socket);
+    std::mem::drop(peer1_ws_socket);
+    std::mem::drop(peer2_ws_socket);
+
+    // Start gateway node
+    let gateway = async {
+        let config = gateway_config.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start peer1 node
+    let peer1 = async move {
+        let config = peer1_config.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start peer2 node
+    let peer2 = async move {
+        let config = peer2_config.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Main test logic
+    let test = tokio::time::timeout(Duration::from_secs(180), async move {
+        // Wait for nodes to start and form network
+        tracing::info!("Waiting for network to initialize...");
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        // Connect to peer1's websocket API and perform a PUT
+        tracing::info!("Testing peer1 connectivity");
+        let uri1 =
+            format!("ws://127.0.0.1:{peer1_ws_port}/v1/contract/command?encodingProtocol=native");
+        let (stream1, _) = connect_async(&uri1).await?;
+        let mut client1 = WebApi::start(stream1);
+
+        make_put(
+            &mut client1,
+            wrapped_state.clone(),
+            contract.clone(),
+            false,
+        )
+        .await?;
+
+        let resp1 = tokio::time::timeout(Duration::from_secs(60), client1.recv()).await;
+        match resp1 {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Peer1 PUT successful");
+            }
+            _ => bail!("Peer1 PUT failed"),
+        }
+
+        // Wait a bit for network to stabilize after first peer joins
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Connect to peer2's websocket API and perform a GET
+        tracing::info!("Testing peer2 connectivity and data propagation");
+        let uri2 =
+            format!("ws://127.0.0.1:{peer2_ws_port}/v1/contract/command?encodingProtocol=native");
+        let (stream2, _) = connect_async(&uri2).await?;
+        let mut client2 = WebApi::start(stream2);
+
+        make_get(&mut client2, contract_key, true, false).await?;
+        let resp2 = tokio::time::timeout(Duration::from_secs(60), client2.recv()).await;
+        match resp2 {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                contract: recv_contract,
+                state: recv_state,
+                ..
+            }))) => {
+                assert_eq!(
+                    recv_contract.as_ref().expect("Contract should exist").key(),
+                    contract_key
+                );
+                assert_eq!(recv_state, wrapped_state);
+                tracing::info!("Peer2 GET successful - mesh network formed correctly");
+            }
+            _ => bail!("Peer2 GET failed"),
+        }
+
+        // Clean disconnect
+        client1
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        client2
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        Ok::<_, anyhow::Error>(())
+    });
+
+    select! {
+        g = gateway => {
+            g.map_err(|e| anyhow!("Gateway error: {}", e))?;
+            Ok(())
+        }
+        p1 = peer1 => {
+            p1.map_err(|e| anyhow!("Peer1 error: {}", e))?;
+            Ok(())
+        }
+        p2 = peer2 => {
+            p2.map_err(|e| anyhow!("Peer2 error: {}", e))?;
+            Ok(())
+        }
+        r = test => {
+            r??;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(())
+        }
+    }
+}
