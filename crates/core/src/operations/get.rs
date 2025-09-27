@@ -719,35 +719,71 @@ impl Operation for GetOp {
                                         alternatives: new_candidates,
                                         attempts_at_hop: 1,
                                     });
-                                } else if let Some(requester_peer) = requester.clone() {
-                                    // No more peers to try, return failure to requester
-                                    tracing::warn!(
-                                        tx = %id,
-                                        %key,
-                                        %this_peer,
-                                        target = %requester_peer,
-                                        "No other peers found while trying to get the contract, returning response to requester"
-                                    );
-                                    return_msg = Some(GetMsg::ReturnGet {
-                                        id: *id,
-                                        key: *key,
-                                        value: StoreResponse {
-                                            state: None,
-                                            contract: None,
-                                        },
-                                        sender: this_peer.clone(),
-                                        target: requester_peer,
-                                        skip_list: new_skip_list.clone(),
-                                    });
                                 } else {
-                                    // Original requester, operation failed
-                                    tracing::error!(
-                                        tx = %id,
-                                        "Failed getting a value for contract {}, reached max retries",
-                                        key
-                                    );
-                                    return_msg = None;
-                                    new_state = None;
+                                    // No peers available right now
+                                    // Check if we should retry with exponential backoff
+                                    const MAX_RETRIES: usize = 10;
+
+                                    if retries < MAX_RETRIES {
+                                        // We have retries left, increment counter and wait
+                                        // This gives time for new peers to potentially become available
+                                        tracing::info!(
+                                            tx = %id,
+                                            %key,
+                                            current_retry = retries,
+                                            max_retries = MAX_RETRIES,
+                                            "No peers available for GET, incrementing retry count (will check again)"
+                                        );
+
+                                        // Keep the operation alive with incremented retry count
+                                        // The operation will be retried when peers become available
+                                        // or when the operation manager reschedules it
+                                        new_state = Some(GetState::AwaitingResponse {
+                                            retries: retries + 1,
+                                            fetch_contract,
+                                            requester: requester.clone(),
+                                            current_hop,
+                                            subscribe,
+                                            tried_peers: HashSet::new(), // Reset tried peers for fresh retry
+                                            alternatives: Vec::new(),
+                                            attempts_at_hop: 0, // Reset attempts
+                                        });
+
+                                        // Don't send any message yet, keep operation alive for retry
+                                        return_msg = None;
+                                    } else if let Some(requester_peer) = requester.clone() {
+                                        // Exhausted retry budget, return failure to requester
+                                        tracing::warn!(
+                                            tx = %id,
+                                            %key,
+                                            %this_peer,
+                                            target = %requester_peer,
+                                            retries,
+                                            "Exhausted {} retries for GET operation, returning failure",
+                                            MAX_RETRIES
+                                        );
+                                        return_msg = Some(GetMsg::ReturnGet {
+                                            id: *id,
+                                            key: *key,
+                                            value: StoreResponse {
+                                                state: None,
+                                                contract: None,
+                                            },
+                                            sender: this_peer.clone(),
+                                            target: requester_peer,
+                                            skip_list: new_skip_list.clone(),
+                                        });
+                                    } else {
+                                        // Original requester, operation failed after all retries
+                                        tracing::error!(
+                                            tx = %id,
+                                            retries,
+                                            "Failed getting value for contract {} after {} retries",
+                                            key,
+                                            retries
+                                        );
+                                        return_msg = None;
+                                    }
                                     result = Some(GetResult {
                                         key: *key,
                                         state: WrappedState::new(vec![]),
