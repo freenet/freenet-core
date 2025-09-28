@@ -66,10 +66,12 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // Find a remote peer to handle the subscription
+        // Use k_closest_potentially_caching to try multiple candidates
         const EMPTY: &[PeerId] = &[];
-        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
-            Some(peer) => peer,
+        let candidates = op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3);
+
+        let target = match candidates.first() {
+            Some(peer) => peer.clone(),
             None => {
                 // No remote peers available - check if we have the contract locally
                 tracing::debug!(%key, "No remote peers available for subscription, checking locally");
@@ -254,12 +256,15 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        let Some(new_target) =
-                            op_manager.ring.closest_potentially_caching(key, skip_list)
-                        else {
+                        // Use k_closest_potentially_caching to try multiple candidates
+                        let candidates = op_manager
+                            .ring
+                            .k_closest_potentially_caching(key, skip_list, 3);
+                        let Some(new_target) = candidates.first() else {
                             tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
                             return Ok(return_not_subbed());
                         };
+                        let new_target = new_target.clone();
                         let new_htl = htl - 1;
 
                         if new_htl == 0 {
@@ -346,16 +351,18 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
-                                if let Some(target) =
-                                    op_manager.ring.closest_potentially_caching(key, &skip_list)
-                                {
+                                // Use k_closest_potentially_caching to try multiple candidates
+                                let candidates = op_manager
+                                    .ring
+                                    .k_closest_potentially_caching(key, &skip_list, 3);
+                                if let Some(target) = candidates.first() {
                                     let subscriber =
                                         op_manager.ring.connection_manager.own_location();
                                     return_msg = Some(SubscribeMsg::SeekNode {
                                         id: *id,
                                         key: *key,
                                         subscriber,
-                                        target,
+                                        target: target.clone(),
                                         skip_list: skip_list.clone(),
                                         htl: current_hop,
                                         retries: retries + 1,
@@ -424,15 +431,11 @@ impl Operation for SubscribeOp {
                                 subscribed: true,
                             });
                         } else {
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %id,
                                 %key,
-                                "Subscribe operation completed at originating node, should notify client"
+                                "No upstream subscriber, subscription completed"
                             );
-                            // No upstream subscriber, this is the originating node
-                            // The operation should complete and be reported to the client
-                            // This will create OperationResult { return_msg: None, state: Some(Completed) }
-                            // which should trigger the finalized pattern in handle_op_result
                             return_msg = None;
                         }
                     }
@@ -443,18 +446,7 @@ impl Operation for SubscribeOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            let result = build_op_result(self.id, new_state, return_msg);
-            if let Ok(ref op_result) = result {
-                if let Some(ref state) = op_result.state {
-                    if state.finalized() {
-                        tracing::debug!(
-                            tx = %self.id,
-                            "Subscribe operation completing with finalized state, should be reported to client"
-                        );
-                    }
-                }
-            }
-            result
+            build_op_result(self.id, new_state, return_msg)
         })
     }
 }
@@ -479,6 +471,9 @@ impl IsOperationCompleted for SubscribeOp {
         matches!(self.state, Some(SubscribeState::Completed { .. }))
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 mod messages {
     use std::{borrow::Borrow, fmt::Display};
