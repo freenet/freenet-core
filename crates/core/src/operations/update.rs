@@ -175,6 +175,16 @@ impl Operation for UpdateOp {
                     let has_subscribers = op_manager.ring.subscribers_of(key).is_some();
                     let should_handle_update = is_seeding || has_subscribers;
 
+                    tracing::info!(
+                        "UPDATE_RECEIVED: tx={} contract={:.8} from={} at={} seeding={} subscribers={}",
+                        id,
+                        key,
+                        sender.peer,
+                        target.peer,
+                        is_seeding,
+                        has_subscribers
+                    );
+
                     tracing::debug!(
                         tx = %id,
                         %key,
@@ -512,6 +522,27 @@ impl OpManager {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+
+        // Trace update propagation for debugging
+        if !subscribers.is_empty() {
+            tracing::info!(
+                "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={}",
+                key,
+                sender,
+                subscribers
+                    .iter()
+                    .map(|s| format!("{:.8}", s.peer))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                subscribers.len()
+            );
+        } else {
+            tracing::warn!(
+                "UPDATE_PROPAGATION: contract={:.8} from={} NO_TARGETS - update will not propagate",
+                key,
+                sender
+            );
+        }
 
         subscribers
     }

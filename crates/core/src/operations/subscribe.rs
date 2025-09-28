@@ -68,7 +68,7 @@ pub(crate) async fn request_subscribe(
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
         // Use k_closest_potentially_caching to try multiple candidates
         const EMPTY: &[PeerId] = &[];
-        let candidates = op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3);
+        let candidates = op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3); // Try up to 3 candidates
 
         let target = match candidates.first() {
             Some(peer) => peer.clone(),
