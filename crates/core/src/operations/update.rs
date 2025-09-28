@@ -1,4 +1,6 @@
 // TODO: complete update logic in the network
+use std::collections::HashSet;
+
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
@@ -545,10 +547,16 @@ impl OpManager {
 
         // Combine both subscription and proximity targets, avoiding duplicates
         let subscription_count = subscribers.len();
-        let mut all_targets = subscribers;
+        let mut seen_peers = HashSet::new();
+        let mut all_targets = Vec::new();
+
+        for subscriber in subscribers {
+            seen_peers.insert(subscriber.peer.clone());
+            all_targets.push(subscriber);
+        }
+
         for proximity_target in proximity_targets {
-            // Only add if not already in the list
-            if !all_targets.iter().any(|s| s.peer == proximity_target.peer) {
+            if seen_peers.insert(proximity_target.peer.clone()) {
                 all_targets.push(proximity_target);
             }
         }
