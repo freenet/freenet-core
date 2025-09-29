@@ -203,6 +203,7 @@ impl P2pConnManager {
                 self.bridge.op_manager.ring.connection_manager.clone(),
                 self.bridge.op_manager.ring.router.clone(),
                 self.this_location,
+                self.is_gateway,
             );
 
         loop {

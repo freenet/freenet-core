@@ -352,6 +352,7 @@ impl Operation for ConnectOp {
                                 skip_forwards: skip_forwards.clone(),
                                 req_peer: sender.clone(),
                                 joiner: joiner.clone(),
+                                is_gateway: op_manager.ring.is_gateway(),
                             },
                         )
                         .await?
@@ -995,6 +996,8 @@ pub(crate) struct ForwardParams {
     pub skip_forwards: HashSet<PeerId>,
     pub req_peer: PeerKeyLocation,
     pub joiner: PeerKeyLocation,
+    /// Whether this node is a gateway
+    pub is_gateway: bool,
 }
 
 pub(crate) async fn forward_conn<NB>(
@@ -1015,6 +1018,7 @@ where
         mut skip_forwards,
         req_peer,
         joiner,
+        is_gateway,
     } = params;
     if left_htl == 0 {
         tracing::debug!(
@@ -1029,9 +1033,7 @@ where
         // Check if this node is a gateway that needs to bootstrap
         // Gateways should accept their first connection to bootstrap the network
         // Non-gateways maintain the strict requirement for existing connections
-        // Note: We can't access is_gateway here directly, so we check if accepted is true
-        // which indicates the gateway is willing to accept this as its first connection
-        if accepted {
+        if is_gateway && accepted {
             tracing::info!(
                 tx = %id,
                 joiner = %joiner.peer,
@@ -1048,6 +1050,8 @@ where
             tracing::warn!(
                 tx = %id,
                 joiner = %joiner.peer,
+                is_gateway,
+                accepted,
                 "Couldn't forward connect petition, not enough connections",
             );
             return Ok(None);
