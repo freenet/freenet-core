@@ -1471,6 +1471,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flatbuffers"
+version = "25.9.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09b6620799e7340ebd9968d2e0708eb82cf1971e9a16821e2091b6d6e475eed5"
+dependencies = [
+ "bitflags 2.9.4",
+ "rustc_version",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1551,7 +1561,7 @@ dependencies = [
  "delegate",
  "directories",
  "either",
- "flatbuffers",
+ "flatbuffers 25.9.23",
  "freenet-stdlib",
  "futures 0.3.31",
  "headers",
@@ -1665,7 +1675,7 @@ dependencies = [
  "bs58",
  "byteorder",
  "chrono",
- "flatbuffers",
+ "flatbuffers 24.12.23",
  "freenet-macros",
  "futures 0.3.31",
  "js-sys",
