@@ -218,6 +218,9 @@ pub(super) struct HandshakeHandler {
     /// This is used for testing deterministically with given location. In production this should always be none
     /// and locations should be derived from IP addresses.
     this_location: Option<Location>,
+
+    /// Whether this node is a gateway
+    is_gateway: bool,
 }
 
 impl HandshakeHandler {
@@ -227,6 +230,7 @@ impl HandshakeHandler {
         connection_manager: ConnectionManager,
         router: Arc<RwLock<Router>>,
         this_location: Option<Location>,
+        is_gateway: bool,
     ) -> (Self, HanshakeHandlerMsg, OutboundMessage) {
         let (pending_msg_tx, pending_msg_rx) = tokio::sync::mpsc::channel(100);
         let (establish_connection_tx, establish_connection_rx) = tokio::sync::mpsc::channel(100);
@@ -243,6 +247,7 @@ impl HandshakeHandler {
             connection_manager,
             router,
             this_location,
+            is_gateway,
         };
         (
             connector,
@@ -426,6 +431,7 @@ impl HandshakeHandler {
                                         skip_forwards,
                                         req_peer: my_peer_id.clone(),
                                         joiner: joiner_pk_loc.clone(),
+                                        is_gateway: self.is_gateway,
                                     };
 
                                     let f = forward_conn(
@@ -592,6 +598,7 @@ impl HandshakeHandler {
             skip_forwards: transaction.skip_forwards.clone(),
             req_peer: my_peer_id.clone(),
             joiner: joiner_pk_loc.clone(),
+            is_gateway: self.is_gateway,
         };
 
         match forward_conn(
@@ -1408,6 +1415,7 @@ mod tests {
             mngr,
             Arc::new(RwLock::new(router)),
             None,
+            false, // Not a gateway in test
         );
         (
             handler,
