@@ -32,7 +32,7 @@ dashmap = { workspace = true }
 delegate = "0.13"
 directories = "6"
 either = { features = ["serde"], workspace = true }
-flatbuffers = "24.3"
+flatbuffers = "25.9"
 futures = "0.3"
 semver = { version = "1",  features = ["serde"] }
 headers = "0.4"
