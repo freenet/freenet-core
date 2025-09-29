@@ -29,7 +29,7 @@ semver = { workspace = true }
 tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "parking_lot", "process"] }
-tokio-tungstenite = "0.27.0"
+tokio-tungstenite = "0.28.0"
 toml = { version = "0.9", features = ["default", "preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
