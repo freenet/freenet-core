@@ -1026,12 +1026,32 @@ where
     }
 
     if connection_manager.num_connections() == 0 {
-        tracing::warn!(
-            tx = %id,
-            joiner = %joiner.peer,
-            "Couldn't forward connect petition, not enough connections",
-        );
-        return Ok(None);
+        // Check if this node is a gateway that needs to bootstrap
+        // Gateways should accept their first connection to bootstrap the network
+        // Non-gateways maintain the strict requirement for existing connections
+        // Note: We can't access is_gateway here directly, so we check if accepted is true
+        // which indicates the gateway is willing to accept this as its first connection
+        if accepted {
+            tracing::info!(
+                tx = %id,
+                joiner = %joiner.peer,
+                "Gateway bootstrap: accepting first connection to bootstrap network",
+            );
+            // Return a state that will lead to accepting this connection
+            // Create ConnectivityInfo for gateway bootstrap
+            let connectivity_info = ConnectivityInfo::new(
+                req_peer.clone(),
+                1, // Single check for bootstrap connection
+            );
+            return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
+        } else {
+            tracing::warn!(
+                tx = %id,
+                joiner = %joiner.peer,
+                "Couldn't forward connect petition, not enough connections",
+            );
+            return Ok(None);
+        }
     }
 
     let target_peer = {
