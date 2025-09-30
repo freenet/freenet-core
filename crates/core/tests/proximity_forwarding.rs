@@ -246,72 +246,54 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     };
 
     // Start all nodes
-    tracing::info!("TEST_DEBUG: Setting up gateway node future");
     std::mem::drop(gateway_network_socket);
     std::mem::drop(gateway_ws_socket);
     let gateway = async move {
-        tracing::info!("TEST_DEBUG: Gateway future started");
         let config = gateway_config.build().await?;
-        tracing::info!("TEST_DEBUG: Gateway config built");
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
-        tracing::info!("TEST_DEBUG: Gateway node built, starting run");
         node.run().await
     }
     .boxed_local();
 
-    tracing::info!("TEST_DEBUG: Setting up peer A node future");
     std::mem::drop(peer_a_ws_socket);
     let peer_a = async move {
-        tracing::info!("TEST_DEBUG: Peer A future started");
         let config = peer_a_config.build().await?;
-        tracing::info!("TEST_DEBUG: Peer A config built");
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
-        tracing::info!("TEST_DEBUG: Peer A node built, starting run");
         node.run().await
     }
     .boxed_local();
 
-    tracing::info!("TEST_DEBUG: Setting up peer B node future");
     std::mem::drop(peer_b_ws_socket);
     let peer_b = async move {
-        tracing::info!("TEST_DEBUG: Peer B future started");
         let config = peer_b_config.build().await?;
-        tracing::info!("TEST_DEBUG: Peer B config built");
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
-        tracing::info!("TEST_DEBUG: Peer B node built, starting run");
         node.run().await
     }
     .boxed_local();
 
-    tracing::info!("TEST_DEBUG: Setting up peer C node future");
     std::mem::drop(peer_c_ws_socket);
     let peer_c = async move {
-        tracing::info!("TEST_DEBUG: Peer C future started");
         let config = peer_c_config.build().await?;
-        tracing::info!("TEST_DEBUG: Peer C config built");
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
-        tracing::info!("TEST_DEBUG: Peer C node built, starting run");
         node.run().await
     }
     .boxed_local();
 
-    tracing::info!("TEST_DEBUG: Setting up test future");
     let test = tokio::time::timeout(Duration::from_secs(300), async move {
         // Wait for nodes to start up and connect
         // CI environment needs more time for nodes to discover each other and establish connections
-        tracing::info!("TEST_DEBUG: Test future started - waiting for network to stabilize...");
         tracing::info!("Waiting for network to stabilize...");
         tokio::time::sleep(Duration::from_secs(30)).await;
 
@@ -472,30 +454,24 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
         Ok(())
     });
 
-    tracing::info!("TEST_DEBUG: Entering select! to run all futures");
     select! {
         g = gateway => {
-            tracing::info!("TEST_DEBUG: Gateway future completed");
             let Err(e) = g;
             return Err(anyhow!("Gateway error: {}", e).into());
         }
         a = peer_a => {
-            tracing::info!("TEST_DEBUG: Peer A future completed");
             let Err(e) = a;
             return Err(anyhow!("Peer A error: {}", e).into());
         }
         b = peer_b => {
-            tracing::info!("TEST_DEBUG: Peer B future completed");
             let Err(e) = b;
             return Err(anyhow!("Peer B error: {}", e).into());
         }
         c = peer_c => {
-            tracing::info!("TEST_DEBUG: Peer C future completed");
             let Err(e) = c;
             return Err(anyhow!("Peer C error: {}", e).into());
         }
         r = test => {
-            tracing::info!("TEST_DEBUG: Test future completed");
             r??;
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
