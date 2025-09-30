@@ -62,7 +62,7 @@ impl ConnectOp {
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
-        // this should't ever be called since clients can't request explicit connects
+        // this shouldn't ever be called since clients can't request explicit connects
         Ok(HostResponse::Ok)
     }
 }
@@ -352,7 +352,6 @@ impl Operation for ConnectOp {
                                 skip_forwards: skip_forwards.clone(),
                                 req_peer: sender.clone(),
                                 joiner: joiner.clone(),
-                                is_gateway: op_manager.ring.is_gateway(),
                             },
                         )
                         .await?
@@ -403,14 +402,14 @@ impl Operation for ConnectOp {
                     match self.state.as_mut() {
                         Some(ConnectState::ConnectingToNode(info)) => {
                             assert!(info.remaining_connections > 0);
-                            let remaining_connetions = info.remaining_connections.saturating_sub(1);
+                            let remaining_connections = info.remaining_connections.saturating_sub(1);
 
                             if *accepted {
                                 tracing::debug!(
                                     tx = %id,
                                     at = %this_peer_id,
                                     from = %sender.peer,
-                                    connectect_to = %acceptor.peer,
+                                    connected_to = %acceptor.peer,
                                     "Open connection acknowledged at requesting joiner peer",
                                 );
                                 info.accepted_by.insert(acceptor.clone());
@@ -445,7 +444,7 @@ impl Operation for ConnectOp {
                                 .connection_manager
                                 .update_location(target.location);
 
-                            if remaining_connetions == 0 {
+                            if remaining_connections == 0 {
                                 tracing::debug!(
                                     tx = %id,
                                     at = %this_peer_id,
@@ -674,8 +673,6 @@ impl ConnectState {
 /// - gateways: Inmutable list of known gateways. Passed when starting up the node.
 ///   After the initial connections through the gateways are established all other connections
 ///   (to gateways or regular peers) will be treated as regular connections.
-///
-/// - is_gateway: Whether this peer is a gateway or not.
 pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
     gateways: &[PeerKeyLocation],
@@ -992,7 +989,7 @@ pub(crate) struct ForwardParams {
     pub accepted: bool,
     /// Avoid connecting to these peers.
     pub skip_connections: HashSet<PeerId>,
-    /// Avoif forwarding to these peers.
+    /// Avoid forwarding to these peers.
     pub skip_forwards: HashSet<PeerId>,
     pub req_peer: PeerKeyLocation,
     pub joiner: PeerKeyLocation,
