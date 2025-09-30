@@ -1029,10 +1029,23 @@ where
     }
 
     let num_connections = connection_manager.num_connections();
+    let num_reserved = connection_manager.get_reserved_connections();
 
-    // Special case: Gateway bootstrap when starting with zero connections
+    tracing::debug!(
+        tx = %id,
+        joiner = %joiner.peer,
+        num_connections = %num_connections,
+        num_reserved = %num_reserved,
+        is_gateway = %is_gateway,
+        accepted = %accepted,
+        "forward_conn: checking connection forwarding",
+    );
+
+    // Special case: Gateway bootstrap when starting with zero connections AND zero reserved
+    // This ensures only the very first connection is accepted directly, avoiding race conditions
+    // where multiple concurrent join attempts would all be accepted directly
     if num_connections == 0 {
-        if is_gateway && accepted {
+        if num_reserved == 0 && is_gateway && accepted {
             tracing::info!(
                 tx = %id,
                 joiner = %joiner.peer,
@@ -1048,7 +1061,8 @@ where
                 tx = %id,
                 joiner = %joiner.peer,
                 is_gateway = %is_gateway,
-                "Cannot forward or accept: no existing connections",
+                num_reserved = %num_reserved,
+                "Cannot forward or accept: no existing connections, or reserved connections pending",
             );
             return Ok(None);
         }

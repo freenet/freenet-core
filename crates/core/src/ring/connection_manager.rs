@@ -323,6 +323,11 @@ impl ConnectionManager {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn get_reserved_connections(&self) -> usize {
+        self.reserved_connections
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
         self.connections_by_location.read().clone()
     }
