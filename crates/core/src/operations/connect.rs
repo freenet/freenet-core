@@ -402,7 +402,8 @@ impl Operation for ConnectOp {
                     match self.state.as_mut() {
                         Some(ConnectState::ConnectingToNode(info)) => {
                             assert!(info.remaining_connections > 0);
-                            let remaining_connections = info.remaining_connections.saturating_sub(1);
+                            let remaining_connections =
+                                info.remaining_connections.saturating_sub(1);
 
                             if *accepted {
                                 tracing::debug!(

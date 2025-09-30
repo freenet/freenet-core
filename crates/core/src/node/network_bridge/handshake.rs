@@ -99,6 +99,7 @@ pub(super) enum Event {
 #[allow(clippy::large_enum_variant)]
 enum ForwardResult {
     Forward(PeerId, NetMessage, ConnectivityInfo),
+    DirectlyAccepted(ConnectivityInfo),
     Rejected,
 }
 
@@ -523,6 +524,15 @@ impl HandshakeHandler {
                                             msg: Box::new(msg),
                                         });
                                     }
+                                    Ok(ForwardResult::DirectlyAccepted(_info)) => {
+                                        // Connection was accepted directly (not forwarded)
+                                        // For now, treat this as a rejection since we shouldn't hit this case in transient connections
+                                        // Clean up the reserved connection slot
+                                        self.connection_manager.prune_in_transit_connection(&joiner);
+                                        self.outbound_messages.remove(&remote);
+                                        self.connecting.remove(&remote);
+                                        return Ok(Event::InboundConnectionRejected { peer_id: joiner });
+                                    }
                                     Ok(ForwardResult::Rejected) => {
                                         // Clean up the reserved connection slot
                                         self.connection_manager.prune_in_transit_connection(&joiner);
@@ -626,14 +636,16 @@ impl HandshakeHandler {
         .await
         {
             Ok(Some(conn_state)) => {
-                let (forward_target, msg) = nw_bridge
-                    .msg
-                    .into_inner()
-                    .expect("target was successfully set");
                 let ConnectState::AwaitingConnectivity(info) = conn_state else {
                     unreachable!("forward_conn should return AwaitingConnectivity if successful")
                 };
-                Ok(ForwardResult::Forward(forward_target, msg, info))
+                // Check if we have a forward message (forwarding) or not (direct acceptance)
+                if let Some((forward_target, msg)) = nw_bridge.msg.into_inner() {
+                    Ok(ForwardResult::Forward(forward_target, msg, info))
+                } else {
+                    // Accepting the connection directly without forwarding
+                    Ok(ForwardResult::DirectlyAccepted(info))
+                }
             }
             Ok(None) => {
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), "Rejecting connection, no peers found to forward");
