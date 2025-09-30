@@ -355,7 +355,7 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
         match subscribe_result {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
-                summary,
+                subscribed,
             }))) => {
                 assert_eq!(key, contract_key);
                 println!(
@@ -363,10 +363,10 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
                     subscribe_elapsed
                 );
 
-                // Verify we got the summary (contract exists locally)
+                // Verify we got the subscribed confirmation (contract exists locally)
                 assert!(
-                    summary.is_some(),
-                    "Should receive summary when subscribing to local contract"
+                    subscribed,
+                    "Should receive subscribed=true when subscribing to local contract"
                 );
             }
             Ok(Ok(other)) => {
@@ -393,11 +393,11 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
         match subscribe2_result {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
-                summary,
+                subscribed,
             }))) => {
                 assert_eq!(key, contract_key);
                 println!("Client 2: SUBSCRIBE operation successful");
-                assert!(summary.is_some());
+                assert!(subscribed);
             }
             _ => {
                 panic!("Client 2: SUBSCRIBE operation failed or timed out");
@@ -415,7 +415,7 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
         match update_result {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
                 key,
-                summary: _,
+                subscribed: _,
             }))) => {
                 assert_eq!(key, contract_key);
                 println!("UPDATE operation successful");
