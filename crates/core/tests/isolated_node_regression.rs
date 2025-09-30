@@ -11,7 +11,7 @@ use freenet::{
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{load_contract, make_get, make_put, make_subscribe, make_update},
+    test_utils::{load_contract, make_get, make_put, make_subscribe, make_update, Task, TodoList},
 };
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
