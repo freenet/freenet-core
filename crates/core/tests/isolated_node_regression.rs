@@ -18,6 +18,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::FutureExt;
+use serde_json;
 use std::{
     net::Ipv4Addr,
     sync::{LazyLock, Mutex},
@@ -259,7 +260,7 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
 
     // Create updated state for testing updates
     let updated_state = {
-        use freenet::test_utils::{TodoList, Task};
+        use freenet::test_utils::{Task, TodoList};
         let todo_list = TodoList {
             tasks: vec![
                 Task {
@@ -267,12 +268,14 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
                     title: "Test subscription".to_string(),
                     completed: false,
                     description: "".to_string(),
+                    priority: 1,
                 },
                 Task {
                     id: 2,
                     title: "Verify updates".to_string(),
                     completed: false,
                     description: "".to_string(),
+                    priority: 1,
                 },
             ],
             version: 1,
@@ -352,7 +355,7 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
         match subscribe_result {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
-                summary
+                summary,
             }))) => {
                 assert_eq!(key, contract_key);
                 println!(
@@ -390,7 +393,7 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
         match subscribe2_result {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
-                summary
+                summary,
             }))) => {
                 assert_eq!(key, contract_key);
                 println!("Client 2: SUBSCRIBE operation successful");
@@ -404,10 +407,7 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
         println!("Step 4: Testing UPDATE delivery to subscribed clients");
 
         // Update the contract - both subscribed clients should receive updates
-        let delta = updated_state
-            .delta(&initial_state)
-            .expect("Failed to create delta");
-        make_update(&mut client1, contract_key, delta.clone()).await?;
+        make_update(&mut client1, contract_key, wrapped_updated_state.clone()).await?;
 
         // Wait for UPDATE response from client that sent the update
         let update_result = timeout(Duration::from_secs(10), client1.recv()).await;
