@@ -632,13 +632,16 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
         let mut client1 = WebApi::start(stream1);
 
         // Connect to peer2's websocket
-        let uri2 = format!("ws://127.0.0.1:{peer2_ws_port}/v1/contract/command?encodingProtocol=native");
+        let uri2 =
+            format!("ws://127.0.0.1:{peer2_ws_port}/v1/contract/command?encodingProtocol=native");
         let (stream2, _) = connect_async(&uri2).await?;
         let mut client2 = WebApi::start(stream2);
 
         // Query gateway for its connections
         tracing::info!("Querying gateway for connected peers...");
-        client_gw.send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers)).await?;
+        client_gw
+            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+            .await?;
         let gw_resp = tokio::time::timeout(Duration::from_secs(10), client_gw.recv()).await?;
         let gw_peers = match gw_resp {
             Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
@@ -651,7 +654,9 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
 
         // Query peer1 for its connections
         tracing::info!("Querying peer1 for connected peers...");
-        client1.send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers)).await?;
+        client1
+            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+            .await?;
         let peer1_resp = tokio::time::timeout(Duration::from_secs(10), client1.recv()).await?;
         let peer1_peers = match peer1_resp {
             Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
@@ -664,7 +669,9 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
 
         // Query peer2 for its connections
         tracing::info!("Querying peer2 for connected peers...");
-        client2.send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers)).await?;
+        client2
+            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+            .await?;
         let peer2_resp = tokio::time::timeout(Duration::from_secs(10), client2.recv()).await?;
         let peer2_peers = match peer2_resp {
             Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
@@ -696,13 +703,7 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
 
         // Peer1 performs PUT
         tracing::info!("Peer1 performing PUT operation");
-        make_put(
-            &mut client1,
-            wrapped_state.clone(),
-            contract.clone(),
-            false,
-        )
-        .await?;
+        make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
 
         let resp = tokio::time::timeout(Duration::from_secs(60), client1.recv()).await;
         match resp {
