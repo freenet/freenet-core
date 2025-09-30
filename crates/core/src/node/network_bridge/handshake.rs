@@ -371,7 +371,12 @@ impl HandshakeHandler {
                                 Location::from_address(&req.conn.remote_addr())
                             };
                             let should_accept = self.connection_manager.should_accept(location, &req.joiner);
-                            if should_accept {
+                            // Check if this is a valid acceptance scenario
+                            // Non-gateways with 0 connections should not accept (they need existing connections to forward through)
+                            let can_accept = should_accept &&
+                                (self.is_gateway || self.connection_manager.num_connections() > 0);
+
+                            if can_accept {
                                 let accepted_msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
                                     id: req.id,
                                     sender: self.connection_manager.own_location(),
@@ -472,6 +477,16 @@ impl HandshakeHandler {
                                 })
 
                             } else {
+                                // If should_accept was true but we can't actually accept (non-gateway with 0 connections),
+                                // we need to clean up the reserved connection
+                                if should_accept && !can_accept {
+                                    self.connection_manager.prune_in_transit_connection(&req.joiner);
+                                    tracing::debug!(
+                                        "Non-gateway with 0 connections cannot accept connection from {:?}",
+                                        req.joiner
+                                    );
+                                }
+
                                 let InboundGwJoinRequest {
                                     mut conn,
                                     id,

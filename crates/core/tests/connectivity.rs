@@ -618,7 +618,8 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
 
         // Test 1: Verify peer1 can connect and perform operations (gateway accepts first connection)
         tracing::info!("Test 1: Verifying peer1 connected to gateway successfully");
-        let uri1 = format!("ws://127.0.0.1:{peer1_ws_port}/v1/contract/command?encodingProtocol=native");
+        let uri1 =
+            format!("ws://127.0.0.1:{peer1_ws_port}/v1/contract/command?encodingProtocol=native");
         let (stream1, _) = connect_async(&uri1).await?;
         let mut client1 = WebApi::start(stream1);
 
