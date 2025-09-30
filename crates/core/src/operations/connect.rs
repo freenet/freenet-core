@@ -352,6 +352,7 @@ impl Operation for ConnectOp {
                                 skip_forwards: skip_forwards.clone(),
                                 req_peer: sender.clone(),
                                 joiner: joiner.clone(),
+                                is_gateway: op_manager.ring.is_gateway,
                             },
                         )
                         .await?
@@ -994,6 +995,8 @@ pub(crate) struct ForwardParams {
     pub skip_forwards: HashSet<PeerId>,
     pub req_peer: PeerKeyLocation,
     pub joiner: PeerKeyLocation,
+    /// Whether this node is a gateway
+    pub is_gateway: bool,
 }
 
 pub(crate) async fn forward_conn<NB>(
@@ -1014,6 +1017,7 @@ where
         mut skip_forwards,
         req_peer,
         joiner,
+        is_gateway,
     } = params;
     if left_htl == 0 {
         tracing::debug!(
@@ -1021,12 +1025,36 @@ where
             joiner = %joiner.peer,
             "Couldn't forward connect petition, no hops left",
         );
-        return handle_unforwardable_connection(id, &req_peer, accepted);
+        return Ok(None);
     }
 
     let num_connections = connection_manager.num_connections();
 
-    // Try to forward the connection request if we have existing connections
+    // Special case: Gateway bootstrap when starting with zero connections
+    if num_connections == 0 {
+        if is_gateway && accepted {
+            tracing::info!(
+                tx = %id,
+                joiner = %joiner.peer,
+                "Gateway bootstrap: accepting first connection directly",
+            );
+            let connectivity_info = ConnectivityInfo::new(
+                joiner.clone(),
+                1, // Single check for direct connection
+            );
+            return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
+        } else {
+            tracing::debug!(
+                tx = %id,
+                joiner = %joiner.peer,
+                is_gateway = %is_gateway,
+                "Cannot forward or accept: no existing connections",
+            );
+            return Ok(None);
+        }
+    }
+
+    // Try to forward the connection request to an existing peer
     if num_connections > 0 {
         let target_peer = {
             let router = router.read();
@@ -1074,19 +1102,13 @@ where
                     "No suitable peer found for forwarding despite having {} connections",
                     num_connections
                 );
+                return Ok(None);
             }
         }
-    } else {
-        tracing::debug!(
-            tx = %id,
-            joiner = %joiner.peer,
-            "No existing connections to forward through",
-        );
     }
 
-    // If we reach here, forwarding failed or wasn't possible
-    // Accept the connection directly if it was previously accepted
-    handle_unforwardable_connection(id, &req_peer, accepted)
+    // Should be unreachable - we either forwarded or returned None
+    unreachable!("forward_conn should have returned by now")
 }
 
 fn select_forward_target(
@@ -1154,29 +1176,6 @@ fn update_state_with_forward_info(
     let connecivity_info = ConnectivityInfo::new(requester.clone(), left_htl);
     let new_state = ConnectState::AwaitingConnectivity(connecivity_info);
     Ok(Some(new_state))
-}
-
-fn handle_unforwardable_connection(
-    id: Transaction,
-    req_peer: &PeerKeyLocation,
-    accepted: bool,
-) -> Result<Option<ConnectState>, OpError> {
-    if accepted {
-        tracing::info!(
-            tx = %id,
-            peer = %req_peer.peer,
-            "Unable to forward, accepting connection directly",
-        );
-        // Accept the connection directly since it was approved by should_accept()
-        let connectivity_info = ConnectivityInfo::new(
-            req_peer.clone(),
-            1, // Single check for direct connection
-        );
-        Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)))
-    } else {
-        tracing::debug!(tx = %id, "Unable to forward or accept connection");
-        Ok(None)
-    }
 }
 
 mod messages {

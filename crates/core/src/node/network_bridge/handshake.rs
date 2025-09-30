@@ -437,6 +437,7 @@ impl HandshakeHandler {
                                         skip_forwards,
                                         req_peer: my_peer_id.clone(),
                                         joiner: joiner_pk_loc.clone(),
+                                        is_gateway: self.is_gateway,
                                     };
 
                                     let f = forward_conn(
@@ -624,6 +625,7 @@ impl HandshakeHandler {
             skip_forwards: transaction.skip_forwards.clone(),
             req_peer: my_peer_id.clone(),
             joiner: joiner_pk_loc.clone(),
+            is_gateway: self.is_gateway,
         };
 
         match forward_conn(

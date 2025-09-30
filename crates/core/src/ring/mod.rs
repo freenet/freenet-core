@@ -70,8 +70,7 @@ pub(crate) struct Ring {
     event_register: Box<dyn NetEventRegister>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
-    #[allow(unused)]
-    is_gateway: bool,
+    pub(crate) is_gateway: bool,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
