@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "available_tools": [
+    "grep_search",
+    "list_files",
+    "update_plan",
+    "run_terminal_cmd",
+    "curl",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "simple_search",
+    "bash",
+    "apply_patch",
+    "srgn"
+  ],
+  "policies": {
+    "run_terminal_cmd": "allow",
+    "bash": "allow",
+    "grep_search": "prompt",
+    "list_files": "prompt",
+    "update_plan": "prompt",
+    "curl": "prompt",
+    "read_file": "prompt",
+    "write_file": "prompt",
+    "edit_file": "prompt",
+    "simple_search": "prompt",
+    "apply_patch": "prompt",
+    "srgn": "prompt"
+  },
+  "constraints": {
+    "curl": {
+      "allowed_modes": null,
+      "max_results_per_call": null,
+      "max_items_per_call": null,
+      "default_response_format": null,
+      "max_bytes_per_read": null,
+      "max_response_bytes": 65536,
+      "allowed_url_schemes": [
+        "https"
+      ],
+      "denied_url_hosts": [
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        ".localhost",
+        ".local",
+        ".internal",
+        ".lan"
+      ]
+    }
+  }
+}
