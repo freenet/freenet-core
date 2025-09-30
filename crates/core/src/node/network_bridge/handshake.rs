@@ -2103,4 +2103,146 @@ mod tests {
         futures::try_join!(test_controller, peer_inbound)?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_gateway_bootstrap_zero_connections() -> anyhow::Result<()> {
+        // Create a gateway handler with is_gateway = true
+        let gateway_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
+        let (outbound_sender, outbound_recv) = mpsc::channel(100);
+        let outbound_conn_handler = OutboundConnectionHandler::new(outbound_sender);
+        let (inbound_sender, inbound_recv) = mpsc::channel(100);
+        let inbound_conn_handler = InboundConnectionHandler::new(inbound_recv);
+
+        let keypair = TransportKeypair::new();
+        let mngr = ConnectionManager::default_with_key(keypair.public().clone());
+        mngr.try_set_peer_key(gateway_addr);
+        let router = Router::new(&[]);
+
+        // Create handler with is_gateway = true (this is the key difference for gateway bootstrap)
+        let (mut handler, establish_conn, _outbound_msg) = HandshakeHandler::new(
+            inbound_conn_handler,
+            outbound_conn_handler,
+            mngr,
+            Arc::new(RwLock::new(router)),
+            None,
+            true, // Gateway node
+        );
+
+        let mut test = TestVerifier {
+            transport: TransportMock {
+                inbound_sender,
+                outbound_recv,
+                packet_senders: HashMap::new(),
+                packet_receivers: Vec::new(),
+                in_key: Aes128Gcm::new_from_slice(&[0; 16]).unwrap(),
+                packet_id: 0,
+                my_addr: gateway_addr,
+            },
+            node: NodeMock {
+                establish_conn,
+                _outbound_msg,
+            },
+        };
+
+        // Simulate a peer trying to connect to the gateway when it has 0 connections
+        let peer_addr = ([127, 0, 0, 1], 10001).into();
+        let peer_key = TransportKeypair::new();
+        let peer_pub_key = peer_key.public().clone();
+
+        let test_controller = async {
+            test.transport.new_conn(peer_addr).await;
+            test.transport
+                .establish_inbound_conn(peer_addr, peer_pub_key.clone(), None)
+                .await;
+
+            // Gateway should accept the first connection even with 0 connections
+            let msg = test.transport.recv_outbound_msg().await?;
+            tracing::debug!("Gateway response: {:?}", msg);
+
+            // Verify that gateway accepted the connection (bootstrap case)
+            assert!(
+                matches!(msg, NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                    msg: ConnectResponse::AcceptedBy { accepted, .. },
+                    ..
+                })) if accepted),
+                "Gateway should accept first connection for bootstrap"
+            );
+
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let gateway_handler = async {
+            let event =
+                tokio::time::timeout(Duration::from_secs(15), handler.wait_for_events()).await??;
+            match event {
+                Event::InboundConnection { conn, joiner, .. } => {
+                    assert_eq!(conn.remote_addr(), peer_addr);
+                    assert_eq!(joiner.pub_key, peer_pub_key);
+                    tracing::info!("Gateway accepted bootstrap connection from {:?}", peer_addr);
+                    Ok(())
+                }
+                other => bail!("Unexpected event: {:?}", other),
+            }
+        };
+
+        futures::try_join!(test_controller, gateway_handler)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_non_gateway_rejects_zero_connections() -> anyhow::Result<()> {
+        // Create a non-gateway handler with is_gateway = false
+        let node_addr: SocketAddr = ([127, 0, 0, 1], 10000).into();
+        let (mut handler, mut test) = config_handler(node_addr, None);
+
+        // Ensure handler is not a gateway (already set to false in config_handler)
+        assert!(!handler.is_gateway);
+
+        // Ensure the node has 0 connections
+        assert_eq!(handler.connection_manager.num_connections(), 0);
+
+        let peer_addr = ([127, 0, 0, 1], 10001).into();
+        let peer_key = TransportKeypair::new();
+        let peer_pub_key = peer_key.public().clone();
+
+        let test_controller = async {
+            test.transport.new_conn(peer_addr).await;
+            // Set hops_to_live to 0 to avoid forwarding attempts
+            test.transport
+                .establish_inbound_conn(peer_addr, peer_pub_key.clone(), Some(0))
+                .await;
+
+            // Non-gateway should reject when it has 0 connections
+            let msg = test.transport.recv_outbound_msg().await?;
+            tracing::debug!("Non-gateway response: {:?}", msg);
+
+            // Verify that non-gateway rejected the connection
+            assert!(
+                matches!(msg, NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                    msg: ConnectResponse::AcceptedBy { accepted, .. },
+                    ..
+                })) if !accepted),
+                "Non-gateway should reject connections when it has 0 connections"
+            );
+
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let node_handler = async {
+            let event =
+                tokio::time::timeout(Duration::from_secs(15), handler.wait_for_events()).await??;
+            match event {
+                Event::InboundConnectionRejected { peer_id } => {
+                    assert_eq!(peer_id.addr, peer_addr);
+                    assert_eq!(peer_id.pub_key, peer_pub_key);
+                    tracing::info!("Non-gateway correctly rejected connection with 0 connections");
+                    Ok(())
+                }
+                other => bail!("Unexpected event: {:?}", other),
+            }
+        };
+
+        futures::try_join!(test_controller, node_handler)?;
+        Ok(())
+    }
 }
