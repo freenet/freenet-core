@@ -7,7 +7,7 @@ use freenet::{
     test_utils::{self, make_get, make_put},
 };
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractResponse, HostResponse, NodeQuery, QueryResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
@@ -616,12 +616,83 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
         tracing::info!("Waiting for nodes to start and establish connections...");
         tokio::time::sleep(Duration::from_secs(20)).await;
 
-        // Test 1: Verify peer1 can connect and perform operations (gateway accepts first connection)
-        tracing::info!("Test 1: Verifying peer1 connected to gateway successfully");
+        // Test connectivity by querying each peer for their connections via websocket
+        tracing::info!("Test 1: Verifying connectivity by querying connections on each peer");
+
+        // Connect to gateway's websocket
+        let uri_gw =
+            format!("ws://127.0.0.1:{gateway_ws_port}/v1/contract/command?encodingProtocol=native");
+        let (stream_gw, _) = connect_async(&uri_gw).await?;
+        let mut client_gw = WebApi::start(stream_gw);
+
+        // Connect to peer1's websocket
         let uri1 =
             format!("ws://127.0.0.1:{peer1_ws_port}/v1/contract/command?encodingProtocol=native");
         let (stream1, _) = connect_async(&uri1).await?;
         let mut client1 = WebApi::start(stream1);
+
+        // Connect to peer2's websocket
+        let uri2 = format!("ws://127.0.0.1:{peer2_ws_port}/v1/contract/command?encodingProtocol=native");
+        let (stream2, _) = connect_async(&uri2).await?;
+        let mut client2 = WebApi::start(stream2);
+
+        // Query gateway for its connections
+        tracing::info!("Querying gateway for connected peers...");
+        client_gw.send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers)).await?;
+        let gw_resp = tokio::time::timeout(Duration::from_secs(10), client_gw.recv()).await?;
+        let gw_peers = match gw_resp {
+            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
+                tracing::info!("Gateway has {} connected peers", peers.len());
+                peers
+            }
+            Ok(other) => bail!("Unexpected response from gateway query: {:?}", other),
+            Err(e) => bail!("Error receiving gateway query response: {}", e),
+        };
+
+        // Query peer1 for its connections
+        tracing::info!("Querying peer1 for connected peers...");
+        client1.send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers)).await?;
+        let peer1_resp = tokio::time::timeout(Duration::from_secs(10), client1.recv()).await?;
+        let peer1_peers = match peer1_resp {
+            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
+                tracing::info!("Peer1 has {} connected peers", peers.len());
+                peers
+            }
+            Ok(other) => bail!("Unexpected response from peer1 query: {:?}", other),
+            Err(e) => bail!("Error receiving peer1 query response: {}", e),
+        };
+
+        // Query peer2 for its connections
+        tracing::info!("Querying peer2 for connected peers...");
+        client2.send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers)).await?;
+        let peer2_resp = tokio::time::timeout(Duration::from_secs(10), client2.recv()).await?;
+        let peer2_peers = match peer2_resp {
+            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
+                tracing::info!("Peer2 has {} connected peers", peers.len());
+                peers
+            }
+            Ok(other) => bail!("Unexpected response from peer2 query: {:?}", other),
+            Err(e) => bail!("Error receiving peer2 query response: {}", e),
+        };
+
+        // Verify connectivity
+        if gw_peers.is_empty() {
+            bail!("Gateway should have at least one connection but has none");
+        }
+        if peer1_peers.is_empty() {
+            bail!("Peer1 should have at least one connection but has none");
+        }
+        if peer2_peers.is_empty() {
+            bail!("Peer2 should have at least one connection but has none");
+        }
+
+        tracing::info!("Test 1 PASSED: All nodes have established connections");
+        tracing::info!("  - Gateway has {} connections", gw_peers.len());
+        tracing::info!("  - Peer1 has {} connections", peer1_peers.len());
+        tracing::info!("  - Peer2 has {} connections", peer2_peers.len());
+
+        // Test 2: Verify functionality by having peer1 PUT and peer2 GET
+        tracing::info!("Test 2: Verifying network functionality with PUT/GET operations");
 
         // Peer1 performs PUT
         tracing::info!("Peer1 performing PUT operation");
@@ -637,7 +708,7 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key);
-                tracing::info!("Test 1 PASSED: Peer1 successfully connected and performed PUT");
+                tracing::info!("Peer1 successfully performed PUT");
             }
             Ok(Ok(other)) => {
                 bail!("Unexpected response from peer1 PUT: {:?}", other);
@@ -649,12 +720,6 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
                 bail!("Timeout waiting for peer1 put response");
             }
         }
-
-        // Test 2: Verify peer2 can connect and retrieve data (network is functional)
-        tracing::info!("Test 2: Verifying peer2 can connect and interact with network");
-        let uri2 = format!("ws://127.0.0.1:{peer2_ws_port}/v1/contract/command?encodingProtocol=native");
-        let (stream2, _) = connect_async(&uri2).await?;
-        let mut client2 = WebApi::start(stream2);
 
         // Peer2 performs GET to retrieve data put by peer1
         tracing::info!("Peer2 performing GET operation to retrieve peer1's data");
@@ -672,7 +737,7 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
                     contract_key
                 );
                 assert_eq!(recv_state, wrapped_state);
-                tracing::info!("Test 2 PASSED: Peer2 successfully connected and retrieved data");
+                tracing::info!("Test 2 PASSED: Peer2 successfully retrieved data from network");
             }
             Ok(Ok(other)) => {
                 bail!("Unexpected response from peer2 GET: {:?}", other);
@@ -688,6 +753,9 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
         tracing::info!("All tests PASSED: Gateway bootstrap successful, network fully operational");
 
         // Clean disconnect
+        client_gw
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
         client1
             .send(ClientRequest::Disconnect { cause: None })
             .await?;
