@@ -310,9 +310,10 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     tracing::info!("TEST_DEBUG: Setting up test future");
     let test = tokio::time::timeout(Duration::from_secs(300), async move {
         // Wait for nodes to start up and connect
+        // CI environment needs more time for nodes to discover each other and establish connections
         tracing::info!("TEST_DEBUG: Test future started - waiting for network to stabilize...");
         tracing::info!("Waiting for network to stabilize...");
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
 
         // Connect to all peers
         let uri_a =
