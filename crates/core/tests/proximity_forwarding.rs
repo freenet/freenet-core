@@ -277,8 +277,8 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(300), async move {
-        // CI environment: 30s for network discovery and connections
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        // CI environment: 45s for network discovery and full connection establishment
+        tokio::time::sleep(Duration::from_secs(45)).await;
 
         // Connect to all peers
         let uri_a =
