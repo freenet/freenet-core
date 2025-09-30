@@ -1021,71 +1021,74 @@ where
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
-            "Couldn't forward connect petition, no hops left or enough connections",
+            "Couldn't forward connect petition, no hops left",
         );
-        return Ok(None);
-    }
-
-    // If the connection was accepted, establish it even if we can't forward
-    // This prevents dropping valid connections and allows connection_maintenance to use them later
-    if accepted {
-        tracing::debug!(
-            tx = %id,
-            joiner = %joiner.peer,
-            "Connection accepted, establishing even if unable to forward",
-        );
-        // Return a state that will lead to accepting this connection
-        let connectivity_info = ConnectivityInfo::new(
-            req_peer.clone(),
-            1, // Single check for direct connection
-        );
-        return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
+        return handle_unforwardable_connection(id, &req_peer, accepted);
     }
 
     let num_connections = connection_manager.num_connections();
 
-    // Can't forward without existing connections
-    if num_connections == 0 {
+    // Try to forward the connection request if we have existing connections
+    if num_connections > 0 {
+        let target_peer = {
+            let router = router.read();
+            select_forward_target(
+                id,
+                connection_manager,
+                &router,
+                &req_peer,
+                &joiner,
+                left_htl,
+                &skip_forwards,
+            )
+        };
+
+        skip_connections.insert(req_peer.peer.clone());
+        skip_forwards.insert(req_peer.peer.clone());
+
+        match target_peer {
+            Some(target_peer) => {
+                // Successfully found a peer to forward to
+                let forward_msg = create_forward_message(
+                    id,
+                    &req_peer,
+                    &joiner,
+                    &target_peer,
+                    left_htl,
+                    max_htl,
+                    skip_connections,
+                    skip_forwards,
+                );
+                tracing::debug!(
+                    target: "network",
+                    tx = %id,
+                    "Forwarding connection request to {:?}",
+                    target_peer
+                );
+                network_bridge.send(&target_peer.peer, forward_msg).await?;
+                return update_state_with_forward_info(&req_peer, left_htl);
+            }
+            None => {
+                // Couldn't find suitable peer to forward to
+                tracing::debug!(
+                    tx = %id,
+                    joiner = %joiner.peer,
+                    "No suitable peer found for forwarding despite having {} connections",
+                    num_connections
+                );
+            }
+        }
+    } else {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
-            "Couldn't forward connect petition, not enough connections",
+            "No existing connections to forward through",
         );
-        return Ok(None);
     }
 
-    let target_peer = {
-        let router = router.read();
-        select_forward_target(
-            id,
-            connection_manager,
-            &router,
-            &req_peer,
-            &joiner,
-            left_htl,
-            &skip_forwards,
-        )
-    };
-    skip_connections.insert(req_peer.peer.clone());
-    skip_forwards.insert(req_peer.peer.clone());
-    match target_peer {
-        Some(target_peer) => {
-            let forward_msg = create_forward_message(
-                id,
-                &req_peer,
-                &joiner,
-                &target_peer,
-                left_htl,
-                max_htl,
-                skip_connections,
-                skip_forwards,
-            );
-            tracing::debug!(target: "network", "Forwarding connection request to {:?}", target_peer);
-            network_bridge.send(&target_peer.peer, forward_msg).await?;
-            update_state_with_forward_info(&req_peer, left_htl)
-        }
-        None => handle_unforwardable_connection(id, accepted),
-    }
+    // If we reach here, forwarding failed or wasn't possible
+    // Accept the connection directly if it was previously accepted
+    handle_unforwardable_connection(id, &req_peer, accepted)
 }
 
 fn select_forward_target(
@@ -1157,17 +1160,25 @@ fn update_state_with_forward_info(
 
 fn handle_unforwardable_connection(
     id: Transaction,
+    req_peer: &PeerKeyLocation,
     accepted: bool,
 ) -> Result<Option<ConnectState>, OpError> {
     if accepted {
-        tracing::warn!(
+        tracing::info!(
             tx = %id,
-            "Unable to forward, will only be connecting to one peer",
+            peer = %req_peer.peer,
+            "Unable to forward, accepting connection directly",
         );
+        // Accept the connection directly since it was approved by should_accept()
+        let connectivity_info = ConnectivityInfo::new(
+            req_peer.clone(),
+            1, // Single check for direct connection
+        );
+        Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)))
     } else {
-        tracing::warn!(tx = %id, "Unable to forward or accept any connections");
+        tracing::debug!(tx = %id, "Unable to forward or accept connection");
+        Ok(None)
     }
-    Ok(None)
 }
 
 mod messages {
