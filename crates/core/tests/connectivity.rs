@@ -421,12 +421,12 @@ async fn test_basic_gateway_connectivity() -> TestResult {
     }
 }
 
-/// Test three-node network with gateway bootstrap:
-/// 1. Start a gateway (which will bootstrap from 0 connections)
+/// Test three-node network connectivity:
+/// 1. Start a gateway
 /// 2. Connect a first peer to the gateway
 /// 3. Connect a second peer and verify connectivity between all nodes
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_gateway_bootstrap_three_node_network() -> TestResult {
+async fn test_three_node_network_connectivity() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
     // Load test contract
@@ -575,7 +575,7 @@ async fn test_gateway_bootstrap_three_node_network() -> TestResult {
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
-        tracing::info!("Gateway starting with 0 connections - testing bootstrap");
+        tracing::info!("Gateway starting");
         node.run().await
     }
     .boxed_local();

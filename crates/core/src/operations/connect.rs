@@ -996,8 +996,6 @@ pub(crate) struct ForwardParams {
     pub skip_forwards: HashSet<PeerId>,
     pub req_peer: PeerKeyLocation,
     pub joiner: PeerKeyLocation,
-    /// Whether this node is a gateway
-    pub is_gateway: bool,
 }
 
 pub(crate) async fn forward_conn<NB>(
@@ -1018,7 +1016,6 @@ where
         mut skip_forwards,
         req_peer,
         joiner,
-        is_gateway,
     } = params;
     if left_htl == 0 {
         tracing::debug!(
@@ -1029,28 +1026,14 @@ where
         return Ok(None);
     }
 
-    let num_connections = connection_manager.num_connections();
-
-    // Check if gateway needs to accept connections directly
-    // Gateways can accept connections when:
-    // 1. They have 0 connections (bootstrap mode)
-    // 2. They are below their minimum connection threshold
-    if is_gateway && accepted && num_connections < connection_manager.min_connections {
-        if num_connections == 0 {
-            tracing::info!(
-                tx = %id,
-                joiner = %joiner.peer,
-                "Gateway bootstrap: accepting first connection to bootstrap network",
-            );
-        } else {
-            tracing::info!(
-                tx = %id,
-                joiner = %joiner.peer,
-                current_connections = num_connections,
-                min_connections = connection_manager.min_connections,
-                "Gateway accepting connection directly (below minimum threshold)",
-            );
-        }
+    // If the connection was accepted, establish it even if we can't forward
+    // This prevents dropping valid connections and allows connection_maintenance to use them later
+    if accepted {
+        tracing::debug!(
+            tx = %id,
+            joiner = %joiner.peer,
+            "Connection accepted, establishing even if unable to forward",
+        );
         // Return a state that will lead to accepting this connection
         let connectivity_info = ConnectivityInfo::new(
             req_peer.clone(),
@@ -1059,13 +1042,13 @@ where
         return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
     }
 
-    // Non-gateways and gateways at/above minimum connections need existing connections to forward
+    let num_connections = connection_manager.num_connections();
+
+    // Can't forward without existing connections
     if num_connections == 0 {
-        tracing::warn!(
+        tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
-            is_gateway,
-            accepted,
             "Couldn't forward connect petition, not enough connections",
         );
         return Ok(None);

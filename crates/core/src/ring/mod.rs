@@ -580,16 +580,6 @@ impl Ring {
                     is_gateway
                 );
 
-                // BOOTSTRAP FIX: Gateways can accept connections directly when below minimum threshold
-                // This includes bootstrap mode (0 connections) and building up to minimum connections
-                if is_gateway && current_connections < self.connection_manager.min_connections {
-                    tracing::info!(
-                        current = current_connections,
-                        min = self.connection_manager.min_connections,
-                        "Gateway will accept connections directly (below minimum threshold)"
-                    );
-                }
-
                 return Ok(None);
             }
         };
