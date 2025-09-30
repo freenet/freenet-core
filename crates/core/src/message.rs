@@ -339,6 +339,11 @@ pub(crate) enum NodeEvent {
         key: ContractKey,
         subscribed: bool,
     },
+    /// Broadcast a ProximityCache message to all connected peers
+    BroadcastProximityCache {
+        from: PeerId,
+        message: crate::node::proximity_cache::ProximityCacheMessage,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +420,9 @@ impl Display for NodeEvent {
                     f,
                     "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
                 )
+            }
+            NodeEvent::BroadcastProximityCache { from, .. } => {
+                write!(f, "BroadcastProximityCache (from {from})")
             }
         }
     }

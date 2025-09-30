@@ -918,6 +918,17 @@ where
                     tracing::info!(peer = %peer_key, "Shutting down node");
                     return Ok(());
                 }
+                NodeEvent::BroadcastProximityCache {
+                    from: _,
+                    message: _,
+                } => {
+                    tracing::debug!(
+                        "PROXIMITY_PROPAGATION: Broadcasting cache announcement in test mode"
+                    );
+                    // In test mode, we need to send to all connected peers through the network
+                    // For now, we just log this - the actual broadcast happens through the network
+                    continue;
+                }
                 NodeEvent::QueryConnections { .. } => {
                     unimplemented!()
                 }

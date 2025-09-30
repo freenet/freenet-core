@@ -339,10 +339,7 @@ impl ProximityCacheManager {
         event_loop_notifier: crate::node::EventLoopNotificationsSender,
         op_manager: std::sync::Weak<crate::node::OpManager>,
     ) {
-        use crate::{
-            config::GlobalExecutor,
-            message::{NetMessage, NetMessageV1},
-        };
+        use crate::config::GlobalExecutor;
 
         GlobalExecutor::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -389,25 +386,23 @@ impl ProximityCacheManager {
                         "PROXIMITY_PROPAGATION: Sending periodic batch announcement to neighbors"
                     );
 
-                    // Send to all neighbors through the event loop notification system
-                    for peer_id in neighbor_ids {
-                        let message = NetMessage::V1(NetMessageV1::ProximityCache {
-                            from: own_peer_id.clone(),
-                            message: announcement.clone(),
-                        });
-
-                        // Send the message through the event loop notifications
-                        if event_loop_notifier
-                            .notifications_sender()
-                            .send(either::Either::Left(message))
-                            .await
-                            .is_err()
-                        {
-                            debug!(
-                                peer = %peer_id,
-                                "PROXIMITY_PROPAGATION: Failed to send batch announcement to event loop"
-                            );
-                        }
+                    // Send broadcast request to event loop
+                    // The event loop will iterate through connected peers and send to each one
+                    // This avoids the issue where ProximityCache messages don't have a target field
+                    if let Err(err) = event_loop_notifier
+                        .notifications_sender()
+                        .send(either::Either::Right(
+                            crate::message::NodeEvent::BroadcastProximityCache {
+                                from: own_peer_id,
+                                message: announcement,
+                            },
+                        ))
+                        .await
+                    {
+                        debug!(
+                            error = ?err,
+                            "PROXIMITY_PROPAGATION: Failed to send broadcast request to event loop"
+                        );
                     }
                 }
             }
