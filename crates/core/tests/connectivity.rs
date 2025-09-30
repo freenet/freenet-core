@@ -13,6 +13,7 @@ use freenet_stdlib::{
 use futures::FutureExt;
 use rand::{Rng, SeedableRng};
 use std::{
+    collections::HashSet,
     net::{Ipv4Addr, TcpListener},
     sync::{LazyLock, Mutex},
     time::Duration,
@@ -637,66 +638,96 @@ async fn test_three_node_network_connectivity() -> TestResult {
         let (stream2, _) = connect_async(&uri2).await?;
         let mut client2 = WebApi::start(stream2);
 
-        // Query gateway for its connections
-        tracing::info!("Querying gateway for connected peers...");
-        client_gw
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await?;
-        let gw_resp = tokio::time::timeout(Duration::from_secs(10), client_gw.recv()).await?;
-        let gw_peers = match gw_resp {
-            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
-                tracing::info!("Gateway has {} connected peers", peers.len());
-                peers
+        // Retry loop to wait for all nodes to fully connect to each other
+        const MAX_RETRIES: usize = 30;  // 30 retries * 2 seconds = 60 seconds max
+        const RETRY_DELAY: Duration = Duration::from_secs(2);
+        let mut retry_count = 0;
+
+        loop {
+            retry_count += 1;
+            if retry_count > MAX_RETRIES {
+                bail!("Failed to establish full connectivity after {} seconds", MAX_RETRIES * 2);
             }
-            Ok(other) => bail!("Unexpected response from gateway query: {:?}", other),
-            Err(e) => bail!("Error receiving gateway query response: {}", e),
-        };
 
-        // Query peer1 for its connections
-        tracing::info!("Querying peer1 for connected peers...");
-        client1
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await?;
-        let peer1_resp = tokio::time::timeout(Duration::from_secs(10), client1.recv()).await?;
-        let peer1_peers = match peer1_resp {
-            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
-                tracing::info!("Peer1 has {} connected peers", peers.len());
-                peers
+            // Query gateway for its connections
+            tracing::info!("Attempt {}/{}: Querying all nodes for connected peers...", retry_count, MAX_RETRIES);
+            client_gw
+                .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+                .await?;
+            let gw_resp = tokio::time::timeout(Duration::from_secs(10), client_gw.recv()).await?;
+            let gw_peers = match gw_resp {
+                Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
+                Ok(other) => bail!("Unexpected response from gateway query: {:?}", other),
+                Err(e) => bail!("Error receiving gateway query response: {}", e),
+            };
+
+            // Query peer1 for its connections
+            client1
+                .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+                .await?;
+            let peer1_resp = tokio::time::timeout(Duration::from_secs(10), client1.recv()).await?;
+            let peer1_peers = match peer1_resp {
+                Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
+                Ok(other) => bail!("Unexpected response from peer1 query: {:?}", other),
+                Err(e) => bail!("Error receiving peer1 query response: {}", e),
+            };
+
+            // Query peer2 for its connections
+            client2
+                .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+                .await?;
+            let peer2_resp = tokio::time::timeout(Duration::from_secs(10), client2.recv()).await?;
+            let peer2_peers = match peer2_resp {
+                Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
+                Ok(other) => bail!("Unexpected response from peer2 query: {:?}", other),
+                Err(e) => bail!("Error receiving peer2 query response: {}", e),
+            };
+
+            // Log current connection state
+            tracing::info!("  - Gateway has {} connections", gw_peers.len());
+            tracing::info!("  - Peer1 has {} connections", peer1_peers.len());
+            tracing::info!("  - Peer2 has {} connections", peer2_peers.len());
+
+            // Check if all nodes have at least 2 connections (full mesh in 3-node network)
+            // Each node should be connected to the other two nodes
+            if gw_peers.len() >= 2 && peer1_peers.len() >= 2 && peer2_peers.len() >= 2 {
+                // Verify that each node actually has the correct peers connected
+                // In a 3-node network, each node should have exactly 2 connections
+
+                // Since we control the network ports, we can identify nodes by their ports
+                // Extract peer addresses/ports from each node's perspective
+                let gw_peer_addrs: HashSet<_> = gw_peers.iter().map(|p| p.addr).collect();
+                let peer1_peer_addrs: HashSet<_> = peer1_peers.iter().map(|p| p.addr).collect();
+                let peer2_peer_addrs: HashSet<_> = peer2_peers.iter().map(|p| p.addr).collect();
+
+                // Each node should see 2 connections to distinct peers
+                // And the connection graph should be fully connected
+                let fully_connected =
+                    gw_peer_addrs.len() == 2 &&
+                    peer1_peer_addrs.len() == 2 &&
+                    peer2_peer_addrs.len() == 2;
+
+                if fully_connected {
+                    tracing::info!("Test 1 PASSED: All nodes have established full connectivity");
+                    tracing::info!("  - Gateway connected to {} peers: {:?}", gw_peers.len(), gw_peer_addrs);
+                    tracing::info!("  - Peer1 connected to {} peers: {:?}", peer1_peers.len(), peer1_peer_addrs);
+                    tracing::info!("  - Peer2 connected to {} peers: {:?}", peer2_peers.len(), peer2_peer_addrs);
+
+                    // Additional validation: collect all unique addresses to verify we have a 3-node network
+                    let mut all_addresses = HashSet::new();
+                    all_addresses.extend(gw_peer_addrs);
+                    all_addresses.extend(peer1_peer_addrs);
+                    all_addresses.extend(peer2_peer_addrs);
+                    tracing::info!("  - Total unique peer addresses seen: {} ({:?})", all_addresses.len(), all_addresses);
+
+                    break;
+                }
             }
-            Ok(other) => bail!("Unexpected response from peer1 query: {:?}", other),
-            Err(e) => bail!("Error receiving peer1 query response: {}", e),
-        };
 
-        // Query peer2 for its connections
-        tracing::info!("Querying peer2 for connected peers...");
-        client2
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await?;
-        let peer2_resp = tokio::time::timeout(Duration::from_secs(10), client2.recv()).await?;
-        let peer2_peers = match peer2_resp {
-            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
-                tracing::info!("Peer2 has {} connected peers", peers.len());
-                peers
-            }
-            Ok(other) => bail!("Unexpected response from peer2 query: {:?}", other),
-            Err(e) => bail!("Error receiving peer2 query response: {}", e),
-        };
-
-        // Verify connectivity
-        if gw_peers.is_empty() {
-            bail!("Gateway should have at least one connection but has none");
+            // Not fully connected yet, wait and retry
+            tracing::info!("Network not fully connected yet, waiting {} seconds before retry...", RETRY_DELAY.as_secs());
+            tokio::time::sleep(RETRY_DELAY).await;
         }
-        if peer1_peers.is_empty() {
-            bail!("Peer1 should have at least one connection but has none");
-        }
-        if peer2_peers.is_empty() {
-            bail!("Peer2 should have at least one connection but has none");
-        }
-
-        tracing::info!("Test 1 PASSED: All nodes have established connections");
-        tracing::info!("  - Gateway has {} connections", gw_peers.len());
-        tracing::info!("  - Peer1 has {} connections", peer1_peers.len());
-        tracing::info!("  - Peer2 has {} connections", peer2_peers.len());
 
         // Test 2: Verify functionality by having peer1 PUT and peer2 GET
         tracing::info!("Test 2: Verifying network functionality with PUT/GET operations");
