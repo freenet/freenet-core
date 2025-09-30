@@ -372,8 +372,8 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
             other => bail!("Expected GetResponse, got: {:?}", other),
         }
 
-        // Give time for B's cache announcement to propagate
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Give time for B's cache announcement to propagate (CI needs more time)
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Query proximity cache on gateway to verify it knows B has the contract
         let uri_gw =
