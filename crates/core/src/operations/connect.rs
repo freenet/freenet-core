@@ -1029,33 +1029,46 @@ where
         return Ok(None);
     }
 
-    if connection_manager.num_connections() == 0 {
-        // Check if this node is a gateway that needs to bootstrap
-        // Gateways should accept their first connection to bootstrap the network
-        // Non-gateways maintain the strict requirement for existing connections
-        if is_gateway && accepted {
+    let num_connections = connection_manager.num_connections();
+
+    // Check if gateway needs to accept connections directly
+    // Gateways can accept connections when:
+    // 1. They have 0 connections (bootstrap mode)
+    // 2. They are below their minimum connection threshold
+    if is_gateway && accepted && num_connections < connection_manager.min_connections {
+        if num_connections == 0 {
             tracing::info!(
                 tx = %id,
                 joiner = %joiner.peer,
                 "Gateway bootstrap: accepting first connection to bootstrap network",
             );
-            // Return a state that will lead to accepting this connection
-            // Create ConnectivityInfo for gateway bootstrap
-            let connectivity_info = ConnectivityInfo::new(
-                req_peer.clone(),
-                1, // Single check for bootstrap connection
-            );
-            return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
         } else {
-            tracing::warn!(
+            tracing::info!(
                 tx = %id,
                 joiner = %joiner.peer,
-                is_gateway,
-                accepted,
-                "Couldn't forward connect petition, not enough connections",
+                current_connections = num_connections,
+                min_connections = connection_manager.min_connections,
+                "Gateway accepting connection directly (below minimum threshold)",
             );
-            return Ok(None);
         }
+        // Return a state that will lead to accepting this connection
+        let connectivity_info = ConnectivityInfo::new(
+            req_peer.clone(),
+            1, // Single check for direct connection
+        );
+        return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
+    }
+
+    // Non-gateways and gateways at/above minimum connections need existing connections to forward
+    if num_connections == 0 {
+        tracing::warn!(
+            tx = %id,
+            joiner = %joiner.peer,
+            is_gateway,
+            accepted,
+            "Couldn't forward connect petition, not enough connections",
+        );
+        return Ok(None);
     }
 
     let target_peer = {
