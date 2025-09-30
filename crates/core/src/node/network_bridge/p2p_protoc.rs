@@ -232,12 +232,26 @@ impl P2pConnManager {
                             )
                             .await?;
                         }
-                        ConnEvent::OutboundMessage(NetMessage::V1(NetMessageV1::Aborted(tx))) => {
+                        ConnEvent::OutboundMessage {
+                            msg: NetMessage::V1(NetMessageV1::Aborted(tx)),
+                            ..
+                        } => {
                             // TODO: handle aborted transaction as internal message
                             tracing::error!(%tx, "Aborted transaction");
                         }
-                        ConnEvent::OutboundMessage(msg) => {
-                            let Some(target_peer) = msg.target() else {
+                        ConnEvent::OutboundMessage {
+                            msg,
+                            explicit_target,
+                        } => {
+                            // Try to get target from message first, fall back to explicit_target
+                            let target_peer = msg.target().or_else(|| {
+                                explicit_target.as_ref().map(|peer_id| PeerKeyLocation {
+                                    peer: peer_id.clone(),
+                                    location: None,
+                                })
+                            });
+
+                            let Some(target_peer) = target_peer else {
                                 let id = *msg.id();
                                 tracing::error!(%id, %msg, "Target peer not set, must be set for connection outbound message");
                                 self.bridge.op_manager.completed(id);
@@ -668,6 +682,33 @@ impl P2pConnManager {
                                         state.tx_to_client.remove(&tx);
                                     }
                                     Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
+                                }
+                            }
+                            NodeEvent::BroadcastProximityCache { from, message } => {
+                                tracing::debug!(
+                                    neighbor_count = self.connections.len(),
+                                    "PROXIMITY_PROPAGATION: Broadcasting cache announcement to all connected peers"
+                                );
+
+                                // Send the message to all connected peers
+                                for peer_id in self.connections.keys() {
+                                    let net_msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                                        from: from.clone(),
+                                        message: message.clone(),
+                                    });
+
+                                    if let Err(err) = self.bridge.send(peer_id, net_msg).await {
+                                        tracing::warn!(
+                                            peer = %peer_id,
+                                            error = ?err,
+                                            "PROXIMITY_PROPAGATION: Failed to send broadcast announcement to peer"
+                                        );
+                                    } else {
+                                        tracing::trace!(
+                                            peer = %peer_id,
+                                            "PROXIMITY_PROPAGATION: Successfully sent broadcast announcement to peer"
+                                        );
+                                    }
                                 }
                             }
                             NodeEvent::Disconnect { cause } => {
@@ -1192,7 +1233,13 @@ impl P2pConnManager {
 
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg).into()),
+            Some(Left((target, msg))) => EventResult::Event(
+                ConnEvent::OutboundMessage {
+                    msg: *msg,
+                    explicit_target: Some(target),
+                }
+                .into(),
+            ),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
             None => {
                 tracing::error!("🔴 BRIDGE CHANNEL CLOSED - P2P bridge channel has closed");
@@ -1341,7 +1388,12 @@ enum EventResult {
 #[derive(Debug)]
 enum ConnEvent {
     InboundMessage(NetMessage),
-    OutboundMessage(NetMessage),
+    OutboundMessage {
+        msg: NetMessage,
+        /// Target peer for messages that don't have an embedded target (e.g., ProximityCache)
+        /// For messages with embedded targets, this is used as fallback
+        explicit_target: Option<PeerId>,
+    },
     NodeAction(NodeEvent),
     ClosedChannel(ChannelCloseReason),
 }
