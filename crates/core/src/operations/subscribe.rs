@@ -60,6 +60,12 @@ pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     SubscribeOp { id, state }
 }
 
+/// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
+pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp {
+    let state = Some(SubscribeState::PrepareRequest { id, key });
+    SubscribeOp { id, state }
+}
+
 /// Request to subscribe to value changes from a contract.
 pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
@@ -68,14 +74,44 @@ pub(crate) async fn request_subscribe(
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
         // Use k_closest_potentially_caching to try multiple candidates
         const EMPTY: &[PeerId] = &[];
-        let candidates = op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3); // Try up to 3 candidates
+        // Try up to 3 candidates
+        let candidates = op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3);
 
         let target = match candidates.first() {
             Some(peer) => peer.clone(),
             None => {
-                // No remote peers available - this may happen when node is isolated
-                tracing::warn!(%key, "No remote peers available for subscription - node may be isolated");
-                return Err(RingError::NoCachingPeers(*key).into());
+                // No remote peers available - check if we have the contract locally
+                tracing::debug!(%key, "No remote peers available for subscription, checking locally");
+
+                if super::has_contract(op_manager, *key).await? {
+                    // We have the contract locally - complete operation immediately
+                    // Following Nacho's suggestion: use notify_node_event to tap into
+                    // result router directly without state transitions
+                    tracing::info!(%key, tx = %id, "Contract available locally, completing subscription via result router");
+
+                    // Use notify_node_event to deliver SubscribeResponse directly to client
+                    // This avoids the problem with notify_op_change overwriting the operation
+                    match op_manager
+                        .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
+                            tx: *id,
+                            key: *key,
+                            subscribed: true,
+                        })
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(%key, tx = %id, "Successfully sent LocalSubscribeComplete event")
+                        }
+                        Err(e) => {
+                            tracing::error!(%key, tx = %id, error = %e, "Failed to send LocalSubscribeComplete event")
+                        }
+                    }
+
+                    return Ok(());
+                } else {
+                    tracing::debug!(%key, "Contract not available locally and no remote peers");
+                    return Err(RingError::NoCachingPeers(*key).into());
+                }
             }
         };
 

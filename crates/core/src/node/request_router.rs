@@ -125,6 +125,9 @@ pub enum DeduplicatedRequest {
         client_id: ClientId,
         request_id: RequestId,
     },
+    /// Note: Currently unused - Subscribe operations bypass deduplication to avoid
+    /// race conditions with instant-completion. Kept for potential future use.
+    #[allow(dead_code)]
     Subscribe {
         key: ContractKey,
         client_id: ClientId,

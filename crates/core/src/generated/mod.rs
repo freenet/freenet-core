@@ -523,8 +523,8 @@ impl<'a> TryFromFbs<'a> for PeerChange<'a> {
             topology::PeerChangeType::AddedConnection => {
                 let req = req.change_as_added_connection().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "PeerChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("PeerChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -533,8 +533,8 @@ impl<'a> TryFromFbs<'a> for PeerChange<'a> {
             topology::PeerChangeType::RemovedConnection => {
                 let req = req.change_as_removed_connection().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "PeerChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("PeerChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -543,8 +543,8 @@ impl<'a> TryFromFbs<'a> for PeerChange<'a> {
             topology::PeerChangeType::Error => {
                 let req = req.change_as_error().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "PeerChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("PeerChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -590,8 +590,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::PutRequest => {
                 let req = req.change_as_put_request().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -600,8 +600,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::PutSuccess => {
                 let req = req.change_as_put_success().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -610,8 +610,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::PutFailure => {
                 let req = req.change_as_put_failure().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -620,8 +620,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::BroadcastEmitted => {
                 let req = req.change_as_broadcast_emitted().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -630,8 +630,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::BroadcastReceived => {
                 let req = req.change_as_broadcast_received().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -640,8 +640,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::GetContract => {
                 let req = req.change_as_get_contract().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -650,8 +650,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::SubscribedToContract => {
                 let req = req.change_as_subscribed_to_contract().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -660,8 +660,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::UpdateRequest => {
                 let req = req.change_as_update_request().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -670,8 +670,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::UpdateSuccess => {
                 let req = req.change_as_update_success().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
@@ -681,8 +681,8 @@ impl<'a> TryFromFbs<'a> for ContractChange<'a> {
             topology::ContractChangeType::UpdateFailure => {
                 let req = req.change_as_update_failure().ok_or_else(|| {
                     flatbuffers::InvalidFlatbuffer::InconsistentUnion {
-                        field: "change_type",
-                        field_type: "ContractChangeType",
+                        field: std::borrow::Cow::Borrowed("change_type"),
+                        field_type: std::borrow::Cow::Borrowed("ContractChangeType"),
                         error_trace: Default::default(),
                     }
                 })?;
