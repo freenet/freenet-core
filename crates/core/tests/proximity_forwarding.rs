@@ -233,6 +233,13 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     // Start all nodes
     std::mem::drop(gateway_network_socket);
     std::mem::drop(gateway_ws_socket);
+    std::mem::drop(peer_a_ws_socket);
+    std::mem::drop(peer_b_ws_socket);
+    std::mem::drop(peer_c_ws_socket);
+
+    // Give OS time to release ports (prevents "Address already in use" and connection errors)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
     let gateway = async move {
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -243,7 +250,6 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     }
     .boxed_local();
 
-    std::mem::drop(peer_a_ws_socket);
     let peer_a = async move {
         let config = peer_a_config.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -254,7 +260,6 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     }
     .boxed_local();
 
-    std::mem::drop(peer_b_ws_socket);
     let peer_b = async move {
         let config = peer_b_config.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -265,7 +270,6 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     }
     .boxed_local();
 
-    std::mem::drop(peer_c_ws_socket);
     let peer_c = async move {
         let config = peer_c_config.build().await?;
         let node = NodeConfig::new(config.clone())
