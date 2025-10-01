@@ -439,6 +439,28 @@ async fn process_open_request(
                             // Since there are no remote peers, this will complete locally
                             if let Err(err) = put::request_put(&op_manager, op).await {
                                 tracing::error!("Local PUT request error: {}", err);
+
+                                // Notify client of error via result router (actor mode)
+                                if let Some(router_tx) = &op_manager.result_router_tx {
+                                    let error_response = Err(ErrorKind::OperationError {
+                                        cause: format!("PUT operation failed: {}", err).into(),
+                                    }
+                                    .into());
+
+                                    let router_tx_clone = router_tx.clone();
+                                    let op_id_clone = op_id;
+                                    tokio::spawn(async move {
+                                        if let Err(e) = router_tx_clone
+                                            .send((op_id_clone, error_response))
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send PUT error to result router: {}. Transaction: {}",
+                                                e, op_id_clone
+                                            );
+                                        }
+                                    });
+                                }
                             }
 
                             // Note: We bypass the router for local-only PUTs to avoid the race
@@ -504,6 +526,27 @@ async fn process_open_request(
 
                                     if let Err(err) = put::request_put(&op_manager, op).await {
                                         tracing::error!("Put request error: {}", err);
+
+                                        // Notify client of error via result router (actor mode)
+                                        if let Some(router_tx) = &op_manager.result_router_tx {
+                                            let error_response = Err(ErrorKind::OperationError {
+                                                cause: format!("PUT operation failed: {}", err).into(),
+                                            }
+                                            .into());
+
+                                            let router_tx_clone = router_tx.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = router_tx_clone
+                                                    .send((transaction_id, error_response))
+                                                    .await
+                                                {
+                                                    tracing::error!(
+                                                        "Failed to send PUT error to result router: {}. Transaction: {}",
+                                                        e, transaction_id
+                                                    );
+                                                }
+                                            });
+                                        }
                                     }
                                 } else {
                                     tracing::debug!(
@@ -542,6 +585,28 @@ async fn process_open_request(
 
                                 if let Err(err) = put::request_put(&op_manager, op).await {
                                     tracing::error!("Put request error: {}", err);
+
+                                    // Notify client of error via result router (actor mode)
+                                    if let Some(router_tx) = &op_manager.result_router_tx {
+                                        let error_response = Err(ErrorKind::OperationError {
+                                            cause: format!("PUT operation failed: {}", err).into(),
+                                        }
+                                        .into());
+
+                                        let router_tx_clone = router_tx.clone();
+                                        let op_id_clone = op_id;
+                                        tokio::spawn(async move {
+                                            if let Err(e) = router_tx_clone
+                                                .send((op_id_clone, error_response))
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    "Failed to send PUT error to result router: {}. Transaction: {}",
+                                                    e, op_id_clone
+                                                );
+                                            }
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -697,7 +762,29 @@ async fn process_open_request(
                                 );
 
                                 if let Err(err) = update::request_update(&op_manager, op).await {
-                                    tracing::error!("request update error {}", err)
+                                    tracing::error!("request update error {}", err);
+
+                                    // Notify client of error via result router (actor mode)
+                                    if let Some(router_tx) = &op_manager.result_router_tx {
+                                        let error_response = Err(ErrorKind::OperationError {
+                                            cause: format!("UPDATE operation failed: {}", err)
+                                                .into(),
+                                        }
+                                        .into());
+
+                                        let router_tx_clone = router_tx.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = router_tx_clone
+                                                .send((transaction_id, error_response))
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    "Failed to send UPDATE error to result router: {}. Transaction: {}",
+                                                    e, transaction_id
+                                                );
+                                            }
+                                        });
+                                    }
                                 }
                             } else {
                                 tracing::debug!(
@@ -715,17 +802,18 @@ async fn process_open_request(
 
                             // Legacy mode: direct operation without deduplication
                             let op = update::start_op(key, new_state, related_contracts);
+                            let op_id = op.id;
 
                             tracing::debug!(
                                 request_id = %request_id,
-                                transaction_id = %op.id,
+                                transaction_id = %op_id,
                                 operation = "update",
                                 "Request-Transaction correlation"
                             );
 
                             op_manager
                                 .ch_outbound
-                                .waiting_for_transaction_result(op.id, client_id, request_id)
+                                .waiting_for_transaction_result(op_id, client_id, request_id)
                                 .await
                                 .inspect_err(|err| {
                                     tracing::error!(
@@ -735,7 +823,29 @@ async fn process_open_request(
                                 })?;
 
                             if let Err(err) = update::request_update(&op_manager, op).await {
-                                tracing::error!("request update error {}", err)
+                                tracing::error!("request update error {}", err);
+
+                                // Notify client of error via result router (actor mode)
+                                if let Some(router_tx) = &op_manager.result_router_tx {
+                                    let error_response = Err(ErrorKind::OperationError {
+                                        cause: format!("UPDATE operation failed: {}", err).into(),
+                                    }
+                                    .into());
+
+                                    let router_tx_clone = router_tx.clone();
+                                    let op_id_clone = op_id;
+                                    tokio::spawn(async move {
+                                        if let Err(e) = router_tx_clone
+                                            .send((op_id_clone, error_response))
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send UPDATE error to result router: {}. Transaction: {}",
+                                                e, op_id_clone
+                                            );
+                                        }
+                                    });
+                                }
                             }
                         }
                     }
@@ -887,6 +997,28 @@ async fn process_open_request(
                                         get::request_get(&op_manager, op, HashSet::new()).await
                                     {
                                         tracing::error!("get::request_get error: {}", err);
+
+                                        // Notify client of error via result router (actor mode)
+                                        if let Some(router_tx) = &op_manager.result_router_tx {
+                                            let error_response = Err(ErrorKind::OperationError {
+                                                cause: format!("GET operation failed: {}", err)
+                                                    .into(),
+                                            }
+                                            .into());
+
+                                            let router_tx_clone = router_tx.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = router_tx_clone
+                                                    .send((transaction_id, error_response))
+                                                    .await
+                                                {
+                                                    tracing::error!(
+                                                        "Failed to send GET error to result router: {}. Transaction: {}",
+                                                        e, transaction_id
+                                                    );
+                                                }
+                                            });
+                                        }
                                     }
                                 } else {
                                     tracing::debug!(
@@ -920,6 +1052,28 @@ async fn process_open_request(
                                     get::request_get(&op_manager, op, HashSet::new()).await
                                 {
                                     tracing::error!("Get request error: {}", err);
+
+                                    // Notify client of error via result router (actor mode)
+                                    if let Some(router_tx) = &op_manager.result_router_tx {
+                                        let error_response = Err(ErrorKind::OperationError {
+                                            cause: format!("GET operation failed: {}", err).into(),
+                                        }
+                                        .into());
+
+                                        let router_tx_clone = router_tx.clone();
+                                        let op_id_clone = op_id;
+                                        tokio::spawn(async move {
+                                            if let Err(e) = router_tx_clone
+                                                .send((op_id_clone, error_response))
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    "Failed to send GET error to result router: {}. Transaction: {}",
+                                                    e, op_id_clone
+                                                );
+                                            }
+                                        });
+                                    }
                                 }
                             }
                         }
