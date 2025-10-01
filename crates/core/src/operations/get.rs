@@ -48,6 +48,34 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, subscribe: bool) 
     }
 }
 
+/// Create a GET operation with a specific transaction ID (for operation deduplication)
+pub(crate) fn start_op_with_id(
+    key: ContractKey,
+    fetch_contract: bool,
+    subscribe: bool,
+    id: Transaction,
+) -> GetOp {
+    let contract_location = Location::from(&key);
+    tracing::debug!(tx = %id, "Requesting get contract {key} @ loc({contract_location}) with existing transaction ID");
+    let state = Some(GetState::PrepareRequest {
+        key,
+        id,
+        fetch_contract,
+        subscribe,
+    });
+    GetOp {
+        id,
+        state,
+        result: None,
+        stats: Some(Box::new(GetStats {
+            contract_location,
+            next_peer: None,
+            transfer_time: None,
+            first_response_time: None,
+        })),
+    }
+}
+
 /// Request to get the current value from a contract.
 pub(crate) async fn request_get(
     op_manager: &OpManager,

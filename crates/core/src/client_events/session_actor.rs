@@ -1,15 +1,16 @@
 //! Session actor for client connection refactor
 //!
-//! This module provides a full session actor that manages client sessions
+//! This module provides a simplified session actor that manages client sessions
 //! and handles efficient 1→N result delivery to multiple clients.
 
-use crate::client_events::{ClientId, RequestId};
+use crate::client_events::{ClientId, HostResult, RequestId};
 use crate::contract::{ClientResponsesSender, SessionMessage};
 use crate::message::Transaction;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
+use tracing::debug;
 
-/// Session actor for client connection refactor - Phase 2 implementation
+/// Simple session actor for client connection refactor
 pub struct SessionActor {
     message_rx: mpsc::Receiver<SessionMessage>,
     client_transactions: HashMap<Transaction, HashSet<ClientId>>,
@@ -34,61 +35,65 @@ impl SessionActor {
 
     /// Main message processing loop
     pub async fn run(mut self) {
-        tracing::info!("Session actor starting");
-
         while let Some(msg) = self.message_rx.recv().await {
-            match msg {
-                SessionMessage::DeliverHostResponse { tx, response } => {
-                    self.handle_result_delivery(tx, response).await;
-                }
-                SessionMessage::RegisterTransaction {
+            self.process_message(msg).await;
+        }
+    }
+
+    /// Process a single message
+    async fn process_message(&mut self, msg: SessionMessage) {
+        match msg {
+            SessionMessage::DeliverHostResponse { tx, response } => {
+                self.handle_result_delivery(tx, response).await;
+            }
+            SessionMessage::DeliverHostResponseWithRequestId {
+                tx,
+                response,
+                request_id,
+            } => {
+                self.handle_result_delivery_with_request_id(tx, response, request_id)
+                    .await;
+            }
+            SessionMessage::RegisterTransaction {
+                tx,
+                client_id,
+                request_id,
+            } => {
+                self.client_transactions
+                    .entry(tx)
+                    .or_default()
+                    .insert(client_id);
+
+                // Track RequestId correlation
+                self.client_request_ids.insert((tx, client_id), request_id);
+
+                tracing::info!(
+                    "Registered transaction {} for client {} (request {}), total clients: {}",
                     tx,
                     client_id,
                     request_id,
-                } => {
-                    self.client_transactions
-                        .entry(tx)
-                        .or_default()
-                        .insert(client_id);
-
-                    // Track RequestId correlation
-                    self.client_request_ids.insert((tx, client_id), request_id);
-
-                    tracing::debug!(
-                        "Registered transaction {} for client {} (request {}), total clients: {}",
-                        tx,
-                        client_id,
-                        request_id,
-                        self.client_transactions.get(&tx).map_or(0, |s| s.len())
-                    );
-                }
-                SessionMessage::ClientDisconnect { client_id } => {
-                    self.cleanup_client_transactions(client_id);
-                    tracing::debug!(
-                        "Cleaned up transactions for disconnected client {}",
-                        client_id
-                    );
-                }
-                SessionMessage::RegisterClient { client_id, .. } => {
-                    tracing::debug!("Registered client session: {}", client_id);
-                    // Note: Client registration handled by existing transport layer
-                }
-                SessionMessage::DeliverResult { tx, result: _ } => {
-                    tracing::debug!(
-                        "Session actor received legacy DeliverResult for transaction {}",
-                        tx
-                    );
-                    // Legacy variant - preserved for compatibility
-                }
+                    self.client_transactions.get(&tx).map_or(0, |s| s.len())
+                );
+            }
+            SessionMessage::ClientDisconnect { client_id } => {
+                self.cleanup_client_transactions(client_id);
+                debug!(
+                    "Cleaned up transactions for disconnected client {}",
+                    client_id
+                );
+            }
+            SessionMessage::RegisterClient { client_id, .. } => {
+                debug!("Registered client session: {}", client_id);
+                // Note: Client registration handled by existing transport layer
+            }
+            SessionMessage::DeliverResult { tx, result: _ } => {
+                debug!(
+                    "Session actor received legacy DeliverResult for transaction {}",
+                    tx
+                );
+                // Legacy variant - preserved for compatibility
             }
         }
-
-        tracing::error!(
-            "CRITICAL: Session actor channel closed. \
-             Result router or network layer has disconnected. \
-             Actor-based client delivery is broken."
-        );
-        tracing::info!("Session actor stopped");
     }
 
     /// CORE: 1→N Result Delivery with RequestId correlation
@@ -98,9 +103,10 @@ impl SessionActor {
         tx: Transaction,
         result: std::sync::Arc<crate::client_events::HostResult>,
     ) {
+        tracing::info!("Session actor attempting to deliver result for transaction {}, registered transactions: {}", tx, self.client_transactions.len());
         if let Some(waiting_clients) = self.client_transactions.remove(&tx) {
             let client_count = waiting_clients.len();
-            tracing::debug!(
+            tracing::info!(
                 "Delivering result for transaction {} to {} clients",
                 tx,
                 client_count
@@ -146,6 +152,65 @@ impl SessionActor {
             }
         } else {
             tracing::debug!("No clients waiting for transaction result: {}", tx);
+        }
+    }
+
+    /// Handle result delivery with a specific RequestId (for actor mode)
+    async fn handle_result_delivery_with_request_id(
+        &mut self,
+        tx: Transaction,
+        result: std::sync::Arc<HostResult>,
+        request_id: RequestId,
+    ) {
+        // Find the specific client associated with this RequestId
+        let mut target_client = None;
+
+        // Search for the client that has this RequestId for this transaction
+        for ((tx_key, client_id), stored_request_id) in &self.client_request_ids {
+            if *tx_key == tx && *stored_request_id == request_id {
+                target_client = Some(*client_id);
+                break;
+            }
+        }
+
+        if let Some(client_id) = target_client {
+            // Remove the specific client from waiting
+            if let Some(waiting_clients) = self.client_transactions.get_mut(&tx) {
+                waiting_clients.remove(&client_id);
+
+                // Clean up if no more clients waiting
+                if waiting_clients.is_empty() {
+                    self.client_transactions.remove(&tx);
+                }
+            }
+
+            // Remove the RequestId correlation
+            self.client_request_ids.remove(&(tx, client_id));
+
+            // Deliver result to the specific client
+            if let Err(e) = self
+                .client_responses
+                .send((client_id, request_id, (*result).clone()))
+            {
+                tracing::warn!(
+                    "Failed to deliver result to client {} (request {}): {}",
+                    client_id,
+                    request_id,
+                    e
+                );
+            } else {
+                tracing::debug!(
+                    "Delivered result for transaction {} to specific client {} with request correlation {}",
+                    tx, client_id, request_id
+                );
+            }
+        } else {
+            tracing::warn!(
+                "No client found for transaction {} with request ID {}, falling back to general delivery",
+                tx, request_id
+            );
+            // Fall back to general delivery mechanism
+            self.handle_result_delivery(tx, result).await;
         }
     }
 

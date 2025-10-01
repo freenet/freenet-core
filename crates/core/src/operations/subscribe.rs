@@ -60,20 +60,58 @@ pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     SubscribeOp { id, state }
 }
 
+/// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
+pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp {
+    let state = Some(SubscribeState::PrepareRequest { id, key });
+    SubscribeOp { id, state }
+}
+
 /// Request to subscribe to value changes from a contract.
 pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
-        // Find a remote peer to handle the subscription
+        // Use k_closest_potentially_caching to try multiple candidates
         const EMPTY: &[PeerId] = &[];
-        let target = match op_manager.ring.closest_potentially_caching(key, EMPTY) {
-            Some(peer) => peer,
+        // Try up to 3 candidates
+        let candidates = op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3);
+
+        let target = match candidates.first() {
+            Some(peer) => peer.clone(),
             None => {
-                // No remote peers available
-                tracing::debug!(%key, "No remote peers available for subscription");
-                return Err(RingError::NoCachingPeers(*key).into());
+                // No remote peers available - check if we have the contract locally
+                tracing::debug!(%key, "No remote peers available for subscription, checking locally");
+
+                if super::has_contract(op_manager, *key).await? {
+                    // We have the contract locally - complete operation immediately
+                    // Following Nacho's suggestion: use notify_node_event to tap into
+                    // result router directly without state transitions
+                    tracing::info!(%key, tx = %id, "Contract available locally, completing subscription via result router");
+
+                    // Use notify_node_event to deliver SubscribeResponse directly to client
+                    // This avoids the problem with notify_op_change overwriting the operation
+                    match op_manager
+                        .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
+                            tx: *id,
+                            key: *key,
+                            subscribed: true,
+                        })
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(%key, tx = %id, "Successfully sent LocalSubscribeComplete event")
+                        }
+                        Err(e) => {
+                            tracing::error!(%key, tx = %id, error = %e, "Failed to send LocalSubscribeComplete event")
+                        }
+                    }
+
+                    return Ok(());
+                } else {
+                    tracing::debug!(%key, "Contract not available locally and no remote peers");
+                    return Err(RingError::NoCachingPeers(*key).into());
+                }
             }
         };
 
@@ -233,12 +271,15 @@ impl Operation for SubscribeOp {
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
 
-                        let Some(new_target) =
-                            op_manager.ring.closest_potentially_caching(key, skip_list)
-                        else {
+                        // Use k_closest_potentially_caching to try multiple candidates
+                        let candidates = op_manager
+                            .ring
+                            .k_closest_potentially_caching(key, skip_list, 3);
+                        let Some(new_target) = candidates.first() else {
                             tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
                             return Ok(return_not_subbed());
                         };
+                        let new_target = new_target.clone();
                         let new_htl = htl - 1;
 
                         if new_htl == 0 {
@@ -325,16 +366,18 @@ impl Operation for SubscribeOp {
                         }) => {
                             if retries < MAX_RETRIES {
                                 skip_list.insert(sender.peer.clone());
-                                if let Some(target) =
-                                    op_manager.ring.closest_potentially_caching(key, &skip_list)
-                                {
+                                // Use k_closest_potentially_caching to try multiple candidates
+                                let candidates = op_manager
+                                    .ring
+                                    .k_closest_potentially_caching(key, &skip_list, 3);
+                                if let Some(target) = candidates.first() {
                                     let subscriber =
                                         op_manager.ring.connection_manager.own_location();
                                     return_msg = Some(SubscribeMsg::SeekNode {
                                         id: *id,
                                         key: *key,
                                         subscriber,
-                                        target,
+                                        target: target.clone(),
                                         skip_list: skip_list.clone(),
                                         htl: current_hop,
                                         retries: retries + 1,
@@ -443,6 +486,9 @@ impl IsOperationCompleted for SubscribeOp {
         matches!(self.state, Some(SubscribeState::Completed { .. }))
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 mod messages {
     use std::{borrow::Borrow, fmt::Display};

@@ -12,10 +12,6 @@ jobs:
 
     runs-on: freenet-default-runner
 
-    strategy:
-      max-parallel: 1
-      matrix:
-        args: ["--no-default-features --features trace,websocket,redb"]
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -39,15 +35,17 @@ jobs:
           shared-key: "rust-cache"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-
       - name: Build
         run: |
           cargo build --locked
           export PATH="$PWD/target/debug:$PATH"
           make -C apps/freenet-ping -f run-ping.mk build
 
-      - name: Test - features
-        run: cargo test --workspace ${{ matrix.args }}
+      - name: Test - legacy mode
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb
+
+      - name: Test - actor mode
+        run: FREENET_ACTOR_CLIENTS=true cargo test --workspace --no-default-features --features trace,websocket,redb
 
   clippy_check:
     name: Clippy
@@ -98,6 +96,82 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          components: rustfmt
 
       - name: Check code formatting
         run: cargo fmt -- --check
+
+  claude-ci-analysis:
+    name: Claude CI Analysis
+
+    runs-on: ubuntu-latest
+    needs: [test_all, clippy_check, fmt_check]
+    if: failure() && contains(github.event.pull_request.labels.*.name, 'claude-debug')
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 10
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Check Claude fix attempt count
+        id: check-attempts
+        run: |
+          # Count how many times Claude has already tried to fix this
+          ATTEMPT_COUNT=$(git log -10 --pretty=%B | grep -c "🤖 Claude CI fix attempt" || echo "0")
+          echo "Current attempt count: $ATTEMPT_COUNT"
+
+          if [ "$ATTEMPT_COUNT" -ge 2 ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "❌ Claude has already made 2 fix attempts. Stopping to prevent infinite loop."
+          else
+            NEXT_ATTEMPT=$((ATTEMPT_COUNT + 1))
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "attempt_number=$NEXT_ATTEMPT" >> $GITHUB_OUTPUT
+            echo "✅ Proceeding with fix attempt $NEXT_ATTEMPT/2"
+          fi
+
+      - name: Run Claude CI Fix
+        if: steps.check-attempts.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR BRANCH: ${{ github.event.pull_request.head.ref }}
+            FIX ATTEMPT: ${{ steps.check-attempts.outputs.attempt_number }}/2
+
+            The CI workflow has failed. Your task is to:
+            1. Analyze the CI failure logs to identify the root cause
+            2. Fix the code to resolve the issue
+            3. Commit and push your fixes to the PR branch
+
+            IMPORTANT COMMIT MESSAGE FORMAT:
+            Your commit message MUST include:
+            - Clear description of what you fixed
+            - The marker: "🤖 Claude CI fix attempt ${{ steps.check-attempts.outputs.attempt_number }}/2"
+            - This prevents infinite loops and tracks attempt count
+
+            Example commit message:
+            "Fix: [description of fix]
+
+            🤖 Claude CI fix attempt ${{ steps.check-attempts.outputs.attempt_number }}/2
+
+            Co-authored-by: Claude <noreply@anthropic.com>"
+
+            GUIDELINES:
+            - Make focused, minimal changes to fix the specific CI failure
+            - Do not make unrelated improvements
+            - Use git commands to commit and push your changes
+            - After pushing, CI will run automatically
+
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh api:*),Bash(gh run view:*),Bash(git status:*),Bash(git diff:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git log:*)"'

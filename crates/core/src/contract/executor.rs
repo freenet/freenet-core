@@ -547,6 +547,27 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// A WASM executor which will run any contracts, delegates, etc. registered.
 ///
 /// This executor will monitor the store directories and databases to detect state changes.
+/// Represents an operation that's waiting for a contract to finish initializing
+#[derive(Debug)]
+struct QueuedOperation {
+    update: Either<WrappedState, StateDelta<'static>>,
+    related_contracts: RelatedContracts<'static>,
+    /// When this operation was queued
+    queued_at: std::time::Instant,
+}
+
+/// Tracks the initialization state of a contract
+#[derive(Debug)]
+enum ContractInitState {
+    /// Contract is currently being initialized (validation in progress)
+    Initializing {
+        /// Operations waiting for initialization to complete
+        queued_ops: Vec<QueuedOperation>,
+        /// When initialization started
+        started_at: std::time::Instant,
+    },
+}
+
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
 pub struct Executor<R = Runtime> {
@@ -559,6 +580,8 @@ pub struct Executor<R = Runtime> {
     subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
     /// Attested contract instances for a given delegate.
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
+    /// Tracks contracts that are being initialized and operations queued for them
+    contract_init_state: HashMap<ContractKey, ContractInitState>,
 
     event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
 }
@@ -580,6 +603,7 @@ impl<R> Executor<R> {
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
             delegate_attested_ids: HashMap::default(),
+            contract_init_state: HashMap::default(),
             event_loop_channel,
         })
     }

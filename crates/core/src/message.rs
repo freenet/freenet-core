@@ -326,6 +326,12 @@ pub(crate) enum NodeEvent {
         callback: tokio::sync::mpsc::Sender<QueryResult>,
     },
     TransactionTimedOut(Transaction),
+    /// Local subscription completed - deliver SubscribeResponse to client via result router
+    LocalSubscribeComplete {
+        tx: Transaction,
+        key: ContractKey,
+        subscribed: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +394,16 @@ impl Display for NodeEvent {
             }
             NodeEvent::TransactionTimedOut(transaction) => {
                 write!(f, "Transaction timed out ({transaction})")
+            }
+            NodeEvent::LocalSubscribeComplete {
+                tx,
+                key,
+                subscribed,
+            } => {
+                write!(
+                    f,
+                    "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
+                )
             }
         }
     }
@@ -470,15 +486,6 @@ impl Display for NetMessage {
         };
         write!(f, "}}")
     }
-}
-
-/// The result of a connection attempt.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) enum ConnectionResult {
-    /// The target node for connection is valid
-    Accepted,
-    /// The target node for connection is not valid
-    Connection,
 }
 
 #[cfg(test)]

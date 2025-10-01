@@ -175,6 +175,16 @@ impl Operation for UpdateOp {
                     let has_subscribers = op_manager.ring.subscribers_of(key).is_some();
                     let should_handle_update = is_seeding || has_subscribers;
 
+                    tracing::info!(
+                        "UPDATE_RECEIVED: tx={} contract={:.8} from={} at={} seeding={} subscribers={}",
+                        id,
+                        key,
+                        sender.peer,
+                        target.peer,
+                        is_seeding,
+                        has_subscribers
+                    );
+
                     tracing::debug!(
                         tx = %id,
                         %key,
@@ -513,6 +523,27 @@ impl OpManager {
             })
             .unwrap_or_default();
 
+        // Trace update propagation for debugging
+        if !subscribers.is_empty() {
+            tracing::info!(
+                "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={}",
+                key,
+                sender,
+                subscribers
+                    .iter()
+                    .map(|s| format!("{:.8}", s.peer))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                subscribers.len()
+            );
+        } else {
+            tracing::warn!(
+                "UPDATE_PROPAGATION: contract={:.8} from={} NO_TARGETS - update will not propagate",
+                key,
+                sender
+            );
+        }
+
         subscribers
     }
 }
@@ -574,6 +605,30 @@ pub(crate) fn start_op(
     let contract_location = Location::from(&key);
     tracing::debug!(%contract_location, %key, "Requesting update");
     let id = Transaction::new::<UpdateMsg>();
+    // let payload_size = contract.data().len();
+
+    let state = Some(UpdateState::PrepareRequest {
+        key,
+        related_contracts,
+        value: new_state,
+    });
+
+    UpdateOp {
+        id,
+        state,
+        stats: Some(UpdateStats { target: None }),
+    }
+}
+
+/// This will be called from the node when processing an open request with a specific transaction ID
+pub(crate) fn start_op_with_id(
+    key: ContractKey,
+    new_state: WrappedState,
+    related_contracts: RelatedContracts<'static>,
+    id: Transaction,
+) -> UpdateOp {
+    let contract_location = Location::from(&key);
+    tracing::debug!(%contract_location, %key, "Requesting update with transaction ID {}", id);
     // let payload_size = contract.data().len();
 
     let state = Some(UpdateState::PrepareRequest {

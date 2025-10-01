@@ -863,7 +863,19 @@ where
                         contract::WaitingTransaction::Transaction(transaction) => {
                             tx_to_client.insert(transaction, client_id);
                         }
-                        contract::WaitingTransaction::Subscription { .. } => todo!(),
+                        contract::WaitingTransaction::Subscription { contract_key } => {
+                            // For subscriptions, we track the client waiting for responses
+                            // related to this contract key. The actual subscription response
+                            // will be handled through the contract notification system.
+                            tracing::debug!(
+                                "Client {} waiting for subscription to contract {}",
+                                client_id,
+                                contract_key
+                            );
+                            // Note: Unlike regular transactions, subscriptions don't have a
+                            // transaction ID to track. The subscription system handles routing
+                            // updates to subscribed clients through the contract key.
+                        }
                     }
                 }
                 continue;
@@ -910,6 +922,9 @@ where
                     unimplemented!()
                 }
                 NodeEvent::TransactionTimedOut(_) => {
+                    unimplemented!()
+                }
+                NodeEvent::LocalSubscribeComplete { .. } => {
                     unimplemented!()
                 }
                 NodeEvent::QuerySubscriptions { .. } => {
