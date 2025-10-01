@@ -1569,7 +1569,7 @@ dependencies = [
  "httptest",
  "itertools 0.14.0",
  "notify",
- "opentelemetry 0.29.1",
+ "opentelemetry 0.31.0",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.31.0",
