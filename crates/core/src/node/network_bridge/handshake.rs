@@ -64,6 +64,9 @@ pub(super) enum Event {
         joiner: PeerId,
         op: Option<Box<ConnectOp>>,
         forward_info: Option<Box<ForwardInfo>>,
+        /// If true, this is a gateway bootstrap acceptance that should be registered immediately.
+        /// See forward_conn() in connect.rs for full explanation.
+        is_bootstrap: bool,
     },
     /// An outbound connection to a peer was successfully established.
     OutboundConnectionSuccessful {
@@ -100,6 +103,9 @@ pub(super) enum Event {
 enum ForwardResult {
     Forward(PeerId, NetMessage, ConnectivityInfo),
     DirectlyAccepted(ConnectivityInfo),
+    /// Gateway bootstrap acceptance - connection should be registered immediately.
+    /// See forward_conn() in connect.rs and PR #1871 for context.
+    BootstrapAccepted(ConnectivityInfo),
     Rejected,
 }
 
@@ -411,7 +417,8 @@ impl HandshakeHandler {
                                     ..
                                 } = req;
 
-                                let (ok, forward_info) = {
+                                // Forward the connection or accept it directly
+                                let forward_result = {
                                     // TODO: refactor this so it happens in the background out of the main handler loop
                                     let mut nw_bridge = ForwardPeerMessage {
                                         msg: parking_lot::Mutex::new(None),
@@ -453,29 +460,70 @@ impl HandshakeHandler {
                                             tracing::error!(%err, "Error forwarding connection");
                                             continue;
                                         }
-                                        Ok(ok) => {
-                                            if let Some(ok_value) = ok {
-                                                let forward_info = nw_bridge.msg.lock().take().map(|(forward_target, msg)| {
-                                                    ForwardInfo {
-                                                        target: forward_target,
-                                                        msg,
-                                                    }
-                                                });
-                                                (Some(ok_value), forward_info)
+                                        Ok(Some(conn_state)) => {
+                                            let ConnectState::AwaitingConnectivity(info) = conn_state else {
+                                                unreachable!("forward_conn should return AwaitingConnectivity if successful")
+                                            };
+
+                                            // Check if we have a forward message (forwarding) or not (direct acceptance)
+                                            if let Some((forward_target, msg)) = nw_bridge.msg.into_inner() {
+                                                (Some(ForwardResult::Forward(forward_target.clone(), msg, info)), Some(forward_target))
+                                            } else if info.is_bootstrap_acceptance {
+                                                // Gateway bootstrap case: connection should be registered immediately
+                                                // This bypasses the normal CheckConnectivity flow. See forward_conn()
+                                                // bootstrap logic in connect.rs for full explanation.
+                                                (Some(ForwardResult::BootstrapAccepted(info)), None)
                                             } else {
-                                                (None, None)
+                                                // Normal direct acceptance - will wait for CheckConnectivity
+                                                (Some(ForwardResult::DirectlyAccepted(info)), None)
                                             }
                                         }
+                                        Ok(None) => (None, None),
                                     }
                                 };
 
-                                return Ok(Event::InboundConnection {
-                                    id,
-                                    conn,
-                                    joiner,
-                                    op: ok.map(|ok_value| Box::new(ConnectOp::new(id, Some(ok_value), None, None))),
-                                    forward_info: forward_info.map(Box::new),
-                                })
+                                match forward_result {
+                                    (Some(ForwardResult::Forward(forward_target, msg, info)), _) => {
+                                        return Ok(Event::InboundConnection {
+                                            id,
+                                            conn,
+                                            joiner,
+                                            op: Some(Box::new(ConnectOp::new(id, Some(ConnectState::AwaitingConnectivity(info)), None, None))),
+                                            forward_info: Some(Box::new(ForwardInfo { target: forward_target, msg })),
+                                            is_bootstrap: false,
+                                        });
+                                    }
+                                    (Some(ForwardResult::BootstrapAccepted(info)), _) => {
+                                        return Ok(Event::InboundConnection {
+                                            id,
+                                            conn,
+                                            joiner,
+                                            op: Some(Box::new(ConnectOp::new(id, Some(ConnectState::AwaitingConnectivity(info)), None, None))),
+                                            forward_info: None,
+                                            is_bootstrap: true,
+                                        });
+                                    }
+                                    (Some(ForwardResult::DirectlyAccepted(info)), _) => {
+                                        return Ok(Event::InboundConnection {
+                                            id,
+                                            conn,
+                                            joiner,
+                                            op: Some(Box::new(ConnectOp::new(id, Some(ConnectState::AwaitingConnectivity(info)), None, None))),
+                                            forward_info: None,
+                                            is_bootstrap: false,
+                                        });
+                                    }
+                                    (Some(ForwardResult::Rejected), _) | (None, _) => {
+                                        return Ok(Event::InboundConnection {
+                                            id,
+                                            conn,
+                                            joiner,
+                                            op: None,
+                                            forward_info: None,
+                                            is_bootstrap: false,
+                                        });
+                                    }
+                                }
 
                             } else {
                                 // If should_accept was true but we can't actually accept (non-gateway with 0 connections),
@@ -523,6 +571,19 @@ impl HandshakeHandler {
                                             tx: id,
                                             forward_to: forward_target,
                                             msg: Box::new(msg),
+                                        });
+                                    }
+                                    Ok(ForwardResult::BootstrapAccepted(info)) => {
+                                        // Gateway bootstrap: First connection should be registered immediately.
+                                        // This bypasses the normal transient connection flow.
+                                        // See forward_conn() in connect.rs for full explanation.
+                                        return Ok(Event::InboundConnection {
+                                            id,
+                                            conn,
+                                            joiner,
+                                            op: Some(Box::new(ConnectOp::new(id, Some(ConnectState::AwaitingConnectivity(info)), None, None))),
+                                            forward_info: None,
+                                            is_bootstrap: true,
                                         });
                                     }
                                     Ok(ForwardResult::DirectlyAccepted(_info)) => {
@@ -641,11 +702,17 @@ impl HandshakeHandler {
                 let ConnectState::AwaitingConnectivity(info) = conn_state else {
                     unreachable!("forward_conn should return AwaitingConnectivity if successful")
                 };
+
                 // Check if we have a forward message (forwarding) or not (direct acceptance)
                 if let Some((forward_target, msg)) = nw_bridge.msg.into_inner() {
                     Ok(ForwardResult::Forward(forward_target, msg, info))
+                } else if info.is_bootstrap_acceptance {
+                    // Gateway bootstrap case: connection should be registered immediately
+                    // This bypasses the normal CheckConnectivity flow. See forward_conn()
+                    // bootstrap logic in connect.rs for full explanation.
+                    Ok(ForwardResult::BootstrapAccepted(info))
                 } else {
-                    // Accepting the connection directly without forwarding
+                    // Normal direct acceptance - will wait for CheckConnectivity
                     Ok(ForwardResult::DirectlyAccepted(info))
                 }
             }

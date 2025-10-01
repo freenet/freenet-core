@@ -466,6 +466,7 @@ impl Operation for ConnectOp {
                         Some(ConnectState::AwaitingConnectivity(ConnectivityInfo {
                             remaining_checks,
                             requester,
+                            ..
                         })) => {
                             assert!(*remaining_checks > 0);
                             let remaining_checks = remaining_checks.saturating_sub(1);
@@ -488,11 +489,9 @@ impl Operation for ConnectOp {
                                 );
                                 new_state = None;
                             } else {
-                                new_state =
-                                    Some(ConnectState::AwaitingConnectivity(ConnectivityInfo {
-                                        remaining_checks,
-                                        requester: requester.clone(),
-                                    }));
+                                new_state = Some(ConnectState::AwaitingConnectivity(
+                                    ConnectivityInfo::new(requester.clone(), remaining_checks),
+                                ));
                             }
                             let response = ConnectResponse::AcceptedBy {
                                 accepted: *accepted,
@@ -631,6 +630,9 @@ pub enum ConnectState {
 pub(crate) struct ConnectivityInfo {
     remaining_checks: usize,
     requester: Requester,
+    /// Indicates this is a gateway bootstrap acceptance that should be registered immediately.
+    /// See forward_conn() bootstrap logic and handshake handler for details.
+    pub(crate) is_bootstrap_acceptance: bool,
 }
 
 impl ConnectivityInfo {
@@ -638,6 +640,15 @@ impl ConnectivityInfo {
         Self {
             requester,
             remaining_checks,
+            is_bootstrap_acceptance: false,
+        }
+    }
+
+    pub fn new_bootstrap(requester: Requester, remaining_checks: usize) -> Self {
+        Self {
+            requester,
+            remaining_checks,
+            is_bootstrap_acceptance: true,
         }
     }
 
@@ -1041,17 +1052,28 @@ where
         "forward_conn: checking connection forwarding",
     );
 
-    // Special case: Gateway bootstrap when starting with zero connections AND zero reserved
-    // This ensures only the very first connection is accepted directly, avoiding race conditions
-    // where multiple concurrent join attempts would all be accepted directly
+    // Special case: Gateway bootstrap when starting with zero connections AND only one reserved
+    // Note: num_reserved will be 1 (not 0) because should_accept() already reserved a slot
+    // for this connection. This ensures only the very first connection is accepted directly,
+    // avoiding race conditions where multiple concurrent join attempts would all be accepted directly.
+    //
+    // IMPORTANT: Bootstrap acceptances are marked with is_bootstrap_acceptance=true so that
+    // the handshake handler (see handshake.rs forward_or_accept_join) can immediately register
+    // the connection in the ring. This bypasses the normal CheckConnectivity flow which doesn't
+    // apply to bootstrap since:
+    // 1. There are no other peers to forward to
+    // 2. The "already connected" bug doesn't apply (this is the first connection)
+    // 3. We need the connection registered so the gateway can respond to FindOptimalPeer requests
+    //
+    // See PR #1871 discussion with @iduartgomez for context.
     if num_connections == 0 {
-        if num_reserved == 0 && is_gateway && accepted {
+        if num_reserved == 1 && is_gateway && accepted {
             tracing::info!(
                 tx = %id,
                 joiner = %joiner.peer,
-                "Gateway bootstrap: accepting first connection directly",
+                "Gateway bootstrap: accepting first connection directly (will register immediately)",
             );
-            let connectivity_info = ConnectivityInfo::new(
+            let connectivity_info = ConnectivityInfo::new_bootstrap(
                 joiner.clone(),
                 1, // Single check for direct connection
             );
