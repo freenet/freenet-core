@@ -67,7 +67,7 @@ impl SessionActor {
                 // Track RequestId correlation
                 self.client_request_ids.insert((tx, client_id), request_id);
 
-                debug!(
+                tracing::info!(
                     "Registered transaction {} for client {} (request {}), total clients: {}",
                     tx,
                     client_id,
@@ -103,9 +103,10 @@ impl SessionActor {
         tx: Transaction,
         result: std::sync::Arc<crate::client_events::HostResult>,
     ) {
+        tracing::info!("Session actor attempting to deliver result for transaction {}, registered transactions: {}", tx, self.client_transactions.len());
         if let Some(waiting_clients) = self.client_transactions.remove(&tx) {
             let client_count = waiting_clients.len();
-            tracing::debug!(
+            tracing::info!(
                 "Delivering result for transaction {} to {} clients",
                 tx,
                 client_count

@@ -11,14 +11,13 @@ use freenet::{
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{load_contract, make_get, make_put, make_subscribe, make_update, Task, TodoList},
+    test_utils::{load_contract, make_get, make_put, make_subscribe, make_update},
 };
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
-use serde_json;
 use std::{
     net::Ipv4Addr,
     sync::{LazyLock, Mutex},
@@ -415,7 +414,7 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
         match update_result {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
                 key,
-                subscribed: _,
+                summary: _,
             }))) => {
                 assert_eq!(key, contract_key);
                 println!("UPDATE operation successful");

@@ -60,6 +60,12 @@ pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     SubscribeOp { id, state }
 }
 
+/// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
+pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp {
+    let state = Some(SubscribeState::PrepareRequest { id, key });
+    SubscribeOp { id, state }
+}
+
 /// Request to subscribe to value changes from a contract.
 pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
@@ -78,20 +84,28 @@ pub(crate) async fn request_subscribe(
                 tracing::debug!(%key, "No remote peers available for subscription, checking locally");
 
                 if super::has_contract(op_manager, *key).await? {
-                    // We have the contract locally, just complete the operation
-                    // Don't subscribe to self - let contract_handler handle local subscription
-                    tracing::info!(%key, "Contract available locally, completing operation");
+                    // We have the contract locally - complete operation immediately
+                    // Following Nacho's suggestion: use notify_node_event to tap into
+                    // result router directly without state transitions
+                    tracing::info!(%key, tx = %id, "Contract available locally, completing subscription via result router");
 
-                    // Complete the operation immediately so client gets notified
-                    let completed_op = SubscribeOp {
-                        id: *id,
-                        state: Some(SubscribeState::Completed { key: *key }),
-                    };
-
-                    // Push the completed operation back to the manager so it gets reported
-                    op_manager
-                        .push(*id, OpEnum::Subscribe(completed_op))
-                        .await?;
+                    // Use notify_node_event to deliver SubscribeResponse directly to client
+                    // This avoids the problem with notify_op_change overwriting the operation
+                    match op_manager
+                        .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
+                            tx: *id,
+                            key: *key,
+                            subscribed: true,
+                        })
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(%key, tx = %id, "Successfully sent LocalSubscribeComplete event")
+                        }
+                        Err(e) => {
+                            tracing::error!(%key, tx = %id, error = %e, "Failed to send LocalSubscribeComplete event")
+                        }
+                    }
 
                     return Ok(());
                 } else {
