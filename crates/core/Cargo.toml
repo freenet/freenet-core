@@ -32,7 +32,7 @@ dashmap = { workspace = true }
 delegate = "0.13"
 directories = "6"
 either = { features = ["serde"], workspace = true }
-flatbuffers = "24.3"
+flatbuffers = "25.9"
 futures = "0.3"
 semver = { version = "1",  features = ["serde"] }
 headers = "0.4"
@@ -64,13 +64,13 @@ rsa = { version = "0.9", features = ["serde", "pem"] }
 pkcs8 = { version = "0.10", features = ["std", "pem"] }
 
 # Tracing deps
-opentelemetry = "0.29"
+opentelemetry = "0.31"
 opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.22" }
 tracing = { version = "0.1" }
 tracing-opentelemetry = { optional = true, version = "0.30.0" }
 tracing-subscriber = { optional = true, version = "0.3" }
-opentelemetry-otlp = { optional = true, version = "0.27.0" }
-opentelemetry_sdk = { optional = true, version = "0.29", features = ["rt-tokio"] }
+opentelemetry-otlp = { optional = true, version = "0.31.0" }
+opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"] }
 
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
