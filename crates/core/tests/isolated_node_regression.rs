@@ -233,3 +233,188 @@ async fn test_isolated_node_put_get_workflow() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Test concurrent GET operations to reproduce deduplication race condition (issue #1886)
+///
+/// This test attempts to reproduce the race condition where:
+/// 1. Client 1 sends GET request → Router creates operation with TX
+/// 2. Operation completes instantly (contract cached locally)  
+/// 3. Result delivered to Client 1, TX removed from tracking
+/// 4. Client 2 sends identical GET request → Router tries to reuse removed TX
+/// 5. Bug: Client 2 never receives response
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_get_deduplication_race() -> anyhow::Result<()> {
+    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
+
+    // Start a single isolated node (no peers) - ensures instant completion
+    let ws_port = 50900;
+    let network_port = 50901;
+    let (config, _temp_dir) = create_test_node_config(true, ws_port, Some(network_port)).await?;
+
+    // Load a small test contract
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+    let initial_state = freenet::test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    // Start the node
+    let node_handle = {
+        let config = config.clone();
+        async move {
+            let built_config = config.build().await?;
+            let node = NodeConfig::new(built_config.clone())
+                .await?
+                .build(serve_gateway(built_config.ws_api).await)
+                .await?;
+            node.run().await
+        }
+        .boxed_local()
+    };
+
+    // Run the test with timeout
+    let test_result = timeout(Duration::from_secs(60), async {
+        // Give node time to start
+        println!("Waiting for node to start up...");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        println!("Node should be ready, proceeding with test...");
+
+        let url = format!(
+            "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
+            ws_port
+        );
+
+        // Connect multiple clients
+        let (ws_stream1, _) = connect_async(&url).await?;
+        let mut client1 = WebApi::start(ws_stream1);
+
+        let (ws_stream2, _) = connect_async(&url).await?;
+        let mut client2 = WebApi::start(ws_stream2);
+
+        let (ws_stream3, _) = connect_async(&url).await?;
+        let mut client3 = WebApi::start(ws_stream3);
+
+        println!("Step 1: PUT contract to cache it locally");
+
+        // Cache the contract locally using client1
+        make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
+        let put_result = timeout(Duration::from_secs(30), client1.recv()).await;
+
+        match put_result {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+                println!("Contract cached successfully");
+            }
+            other => {
+                panic!("PUT failed: {:?}", other);
+            }
+        }
+
+        println!("Step 2: Concurrent GET requests from multiple clients");
+        println!("This tests the deduplication race condition from issue #1886");
+
+        // Send GET requests concurrently from all clients
+        // The contract is cached, so these will complete instantly
+        // This creates the race condition: TX may be removed before all clients register
+        let get1 = async {
+            make_get(&mut client1, contract_key, true, false).await?;
+            let result = timeout(Duration::from_secs(5), client1.recv()).await;
+            Ok::<_, anyhow::Error>((1, result))
+        };
+
+        let get2 = async {
+            make_get(&mut client2, contract_key, true, false).await?;
+            let result = timeout(Duration::from_secs(5), client2.recv()).await;
+            Ok::<_, anyhow::Error>((2, result))
+        };
+
+        let get3 = async {
+            make_get(&mut client3, contract_key, true, false).await?;
+            let result = timeout(Duration::from_secs(5), client3.recv()).await;
+            Ok::<_, anyhow::Error>((3, result))
+        };
+
+        // Execute all GETs concurrently
+        let (result1, result2, result3) = tokio::join!(get1, get2, get3);
+
+        // Verify all clients received responses
+        let check_result =
+            |client_num: i32, result: anyhow::Result<(i32, Result<Result<HostResponse, _>, _>)>| {
+                match result {
+                    Ok((
+                        _,
+                        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            key,
+                            state,
+                            ..
+                        }))),
+                    )) => {
+                        assert_eq!(key, contract_key);
+                        assert_eq!(state, wrapped_state);
+                        println!("Client {}: ✅ Received GET response", client_num);
+                        true
+                    }
+                    Ok((_, Ok(Ok(other)))) => {
+                        println!("Client {}: ❌ Unexpected response: {:?}", client_num, other);
+                        false
+                    }
+                    Ok((_, Ok(Err(e)))) => {
+                        println!("Client {}: ❌ Error: {}", client_num, e);
+                        false
+                    }
+                    Ok((_, Err(_))) => {
+                        println!(
+                            "Client {}: ❌ TIMEOUT - This is the bug from issue #1886!",
+                            client_num
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        println!("Client {}: ❌ Failed to send request: {}", client_num, e);
+                        false
+                    }
+                }
+            };
+
+        let success1 = check_result(1, result1);
+        let success2 = check_result(2, result2);
+        let success3 = check_result(3, result3);
+
+        // REGRESSION TEST: All clients should receive responses
+        // If any client times out, it indicates the deduplication race condition
+        assert!(
+            success1 && success2 && success3,
+            "All clients should receive GET responses. Failures indicate issue #1886 race condition."
+        );
+
+        println!("✅ All clients received responses - no race condition detected");
+
+        // Cleanup
+        client1
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        client2
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        client3
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // Run node and test concurrently
+    select! {
+        _ = node_handle => {
+            error!("Node exited unexpectedly");
+            panic!("Node should not exit during test");
+        }
+        result = test_result => {
+            result??;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    Ok(())
+}
