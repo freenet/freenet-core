@@ -307,10 +307,11 @@ impl TopologyManager {
             let mut locations = Vec::new();
             let below_threshold = self.limits.min_connections - neighbor_locations.len();
             if below_threshold > 0 {
-                for _i in 0..below_threshold {
+                // If we have no connections at all, bootstrap by targeting own location
+                if neighbor_locations.is_empty() {
                     match my_location {
                         Some(location) => {
-                            // The first few connect messages should target the peer's own
+                            // The first connect message should target the peer's own
                             // location (if known), to reduce the danger of a peer failing to
                             // cluster
                             locations.push(*location);
@@ -319,25 +320,62 @@ impl TopologyManager {
                             locations.push(Location::random());
                         }
                     }
+                    #[cfg(debug_assertions)]
+                    {
+                        thread_local! {
+                            static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
+                        }
+                        if LAST_LOG.with(|last_log| {
+                            last_log.borrow().elapsed() > std::time::Duration::from_secs(10)
+                        }) {
+                            LAST_LOG.with(|last_log| {
+                                tracing::trace!(
+                                    minimum_num_peers_hard_limit = self.limits.min_connections,
+                                    num_peers = neighbor_locations.len(),
+                                    to_add = below_threshold,
+                                    "Bootstrap: adding first connection at own location"
+                                );
+                                *last_log.borrow_mut() = Instant::now();
+                            });
+                        }
+                    }
                 }
-                #[cfg(debug_assertions)]
-                {
-                    thread_local! {
-                        static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
+                // If we have 1-4 connections, use random locations for diversity
+                else if neighbor_locations.len() < 5 {
+                    for _i in 0..below_threshold {
+                        locations.push(Location::random());
                     }
-                    if LAST_LOG.with(|last_log| {
-                        last_log.borrow().elapsed() > std::time::Duration::from_secs(10)
-                    }) {
-                        LAST_LOG.with(|last_log| {
-                            tracing::trace!(
-                                minimum_num_peers_hard_limit = self.limits.min_connections,
-                                num_peers = neighbor_locations.len(),
-                                to_add = below_threshold,
-                                "Adding peers at random locations to reach minimum number of peers"
-                            );
-                            *last_log.borrow_mut() = Instant::now();
+                    #[cfg(debug_assertions)]
+                    {
+                        thread_local! {
+                            static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
+                        }
+                        if LAST_LOG.with(|last_log| {
+                            last_log.borrow().elapsed() > std::time::Duration::from_secs(10)
+                        }) {
+                            LAST_LOG.with(|last_log| {
+                                tracing::trace!(
+                                    minimum_num_peers_hard_limit = self.limits.min_connections,
+                                    num_peers = neighbor_locations.len(),
+                                    to_add = below_threshold,
+                                    "Early stage: adding connections at random locations for diversity"
+                                );
+                                *last_log.borrow_mut() = Instant::now();
+                            });
+                        }
+                    }
+                }
+                // If we have 5+ connections, use density-based selection
+                else {
+                    return self.select_connections_to_add(neighbor_locations)
+                        .unwrap_or_else(|e| {
+                            debug!("Density-based selection failed: {:?}, falling back to random locations", e);
+                            let mut fallback_locations = Vec::new();
+                            for _i in 0..below_threshold {
+                                fallback_locations.push(Location::random());
+                            }
+                            TopologyAdjustment::AddConnections(fallback_locations)
                         });
-                    }
                 }
             }
             return TopologyAdjustment::AddConnections(locations);
@@ -930,6 +968,52 @@ mod tests {
             topology_manager.limits.max_downstream_bandwidth,
             Rate::new_per_second(2000.0)
         );
+    }
+
+    // Test that with 1 connection and min_connections=25, we get diverse random locations
+    // instead of 24 duplicates of the same location
+    #[test]
+    fn test_no_duplicate_connections_with_few_peers() {
+        with_tracing(|| {
+            let limits = Limits {
+                max_upstream_bandwidth: Rate::new_per_second(1000.0),
+                max_downstream_bandwidth: Rate::new_per_second(1000.0),
+                max_connections: 200,
+                min_connections: 25,
+            };
+            let mut topology_manager = TopologyManager::new(limits);
+
+            // Simulate having 1 existing connection
+            let mut neighbor_locations = BTreeMap::new();
+            let peer = PeerKeyLocation::random();
+            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+
+            let adjustment = topology_manager.adjust_topology(
+                &neighbor_locations,
+                &Some(Location::new(0.5)),
+                Instant::now(),
+            );
+
+            match adjustment {
+                TopologyAdjustment::AddConnections(locations) => {
+                    // Should request 24 more connections to reach min of 25
+                    assert_eq!(locations.len(), 24);
+
+                    // With random locations, we should NOT get all duplicates
+                    // Check that we have at least some diversity (not all identical)
+                    let unique_locations: std::collections::HashSet<_> = locations.iter().collect();
+
+                    // Should have more than 1 unique location (proving no duplicates)
+                    assert!(
+                        unique_locations.len() > 1,
+                        "Expected diverse locations but got {} unique locations out of {}",
+                        unique_locations.len(),
+                        locations.len()
+                    );
+                }
+                _ => panic!("Expected AddConnections, got {adjustment:?}"),
+            }
+        });
     }
 }
 
