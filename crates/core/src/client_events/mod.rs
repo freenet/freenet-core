@@ -889,33 +889,29 @@ async fn process_open_request(
                             return Ok(None);
                         };
 
-                        // Use RequestRouter for deduplication if in actor mode, otherwise direct operation
-                        if let Some(router) = &request_router {
+                        // SUBSCRIBE: Skip router deduplication due to instant-completion race conditions
+                        // When contracts are local, Subscribe completes instantly which breaks deduplication:
+                        // - Client 1 subscribes → operation completes → result delivered → TX removed
+                        // - Client 2 subscribes → tries to reuse TX → but TX already gone
+                        // Solution: Each client gets their own Subscribe operation (they're lightweight)
+                        if let Some(_router) = &request_router {
                             tracing::debug!(
                                 peer_id = %peer_id,
                                 key = %key,
-                                "Routing SUBSCRIBE request through deduplication layer (actor mode)",
+                                "Processing SUBSCRIBE without deduplication (actor mode - instant-completion safe)",
                             );
 
-                            let request = crate::node::DeduplicatedRequest::Subscribe {
-                                key,
-                                client_id,
-                                request_id,
-                            };
+                            // Create operation with new transaction ID
+                            let tx = crate::message::Transaction::new::<
+                                crate::operations::subscribe::SubscribeMsg,
+                            >();
 
-                            let (_transaction_id, should_start_operation) =
-                                router.route_request(request).await.map_err(|e| {
-                                    Error::Node(format!("Request routing failed: {}", e))
-                                })?;
-
-                            // Register this client for the subscription result with proper WaitingTransaction type
+                            // CRITICAL: Register BEFORE starting operation to avoid race with instant-completion
                             use crate::contract::WaitingTransaction;
                             op_manager
                                 .ch_outbound
                                 .waiting_for_transaction_result(
-                                    WaitingTransaction::Subscription {
-                                        contract_key: *key.id(),
-                                    },
+                                    WaitingTransaction::Transaction(tx),
                                     client_id,
                                     request_id,
                                 )
@@ -927,37 +923,24 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            // Only start new network operation if this is a new operation
-                            if should_start_operation {
-                                tracing::debug!(
-                                    peer_id = %peer_id,
-                                    key = %key,
-                                    "Starting new SUBSCRIBE network operation via RequestRouter",
-                                );
+                            // Start dedicated operation for this client AFTER registration
+                            let _result_tx = crate::node::subscribe_with_id(
+                                op_manager.clone(),
+                                key,
+                                None, // No legacy registration
+                                Some(tx),
+                            )
+                            .await
+                            .inspect_err(|err| {
+                                tracing::error!("Subscribe error: {}", err);
+                            })?;
 
-                                let op_id = crate::node::subscribe(
-                                    op_manager.clone(),
-                                    key,
-                                    Some(client_id),
-                                )
-                                .await
-                                .inspect_err(|err| {
-                                    tracing::error!("Subscribe error: {}", err);
-                                })?;
-
-                                tracing::debug!(
-                                    request_id = %request_id,
-                                    transaction_id = %op_id,
-                                    operation = "subscribe",
-                                    "Request-Transaction correlation"
-                                );
-                            } else {
-                                tracing::debug!(
-                                    peer_id = %peer_id,
-                                    key = %key,
-                                    "Reusing existing SUBSCRIBE operation via RequestRouter - client registered for result",
-                                );
-                            }
+                            tracing::debug!(
+                                request_id = %request_id,
+                                transaction_id = %tx,
+                                operation = "subscribe",
+                                "SUBSCRIBE operation started with dedicated transaction for this client"
+                            );
                         } else {
                             tracing::debug!(
                                 peer_id = %peer_id,

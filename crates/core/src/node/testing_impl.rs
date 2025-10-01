@@ -924,6 +924,9 @@ where
                 NodeEvent::TransactionTimedOut(_) => {
                     unimplemented!()
                 }
+                NodeEvent::LocalSubscribeComplete { .. } => {
+                    unimplemented!()
+                }
                 NodeEvent::QuerySubscriptions { .. } => {
                     unimplemented!()
                 }
