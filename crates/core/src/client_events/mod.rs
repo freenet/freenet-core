@@ -204,6 +204,25 @@ pub trait ClientEventsProxy {
 }
 
 /// Process client events.
+///
+/// # Architecture: Dual-Mode Client Handling
+///
+/// This function operates in one of two modes based on `op_manager.actor_clients`:
+///
+/// **Actor Mode** (default, `actor_clients=true`):
+/// - Uses ResultRouter → SessionActor for centralized client communication
+/// - Uses RequestRouter for operation deduplication (multiple clients share one operation)
+/// - More scalable and efficient for concurrent clients
+///
+/// **Legacy Mode** (`actor_clients=false`):
+/// - Uses direct client callbacks without centralized routing
+/// - Each client request creates a separate operation (no deduplication)
+/// - Simpler but less efficient - exists as fallback safety mechanism
+///
+/// For PUT/GET/UPDATE operations, actor mode uses 3 paths:
+/// 1. Local-only (no peers): Bypasses RequestRouter to avoid instant-completion race
+/// 2. Router-based (has peers): Uses RequestRouter for deduplication
+/// 3. Legacy: Direct operation when `actor_clients=false`
 pub async fn client_event_handling<ClientEv>(
     op_manager: Arc<OpManager>,
     mut client_events: ClientEv,
@@ -530,7 +549,8 @@ async fn process_open_request(
                                         // Notify client of error via result router (actor mode)
                                         if let Some(router_tx) = &op_manager.result_router_tx {
                                             let error_response = Err(ErrorKind::OperationError {
-                                                cause: format!("PUT operation failed: {}", err).into(),
+                                                cause: format!("PUT operation failed: {}", err)
+                                                    .into(),
                                             }
                                             .into());
 
