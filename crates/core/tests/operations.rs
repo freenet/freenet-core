@@ -2757,6 +2757,9 @@ async fn test_subscription_introspection() -> TestResult {
     std::mem::drop(ws_api_port_socket_gw);
     std::mem::drop(ws_api_port_socket_node);
 
+    // Give OS time to release ports
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
     // Start nodes
     let node_gw = async {
         let config = config_gw.build().await?;
