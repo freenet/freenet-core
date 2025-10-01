@@ -133,13 +133,11 @@ mod tests {
             .expect("Failed to send result");
 
         // Verify the result is delivered to session actor
-        let received = tokio::time::timeout(
-            tokio::time::Duration::from_millis(100),
-            session_rx.recv(),
-        )
-        .await
-        .expect("Timeout waiting for session message")
-        .expect("Channel closed unexpectedly");
+        let received =
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), session_rx.recv())
+                .await
+                .expect("Timeout waiting for session message")
+                .expect("Channel closed unexpectedly");
 
         match received {
             SessionMessage::DeliverHostResponse {
@@ -177,13 +175,11 @@ mod tests {
 
         // Verify all 3 results are delivered in order
         for expected_tx in [tx1, tx2, tx3] {
-            let received = tokio::time::timeout(
-                tokio::time::Duration::from_millis(100),
-                session_rx.recv(),
-            )
-            .await
-            .expect("Timeout waiting for session message")
-            .expect("Channel closed unexpectedly");
+            let received =
+                tokio::time::timeout(tokio::time::Duration::from_millis(100), session_rx.recv())
+                    .await
+                    .expect("Timeout waiting for session message")
+                    .expect("Channel closed unexpectedly");
 
             match received {
                 SessionMessage::DeliverHostResponse {
@@ -254,13 +250,11 @@ mod tests {
 
         // Verify all 10 results are delivered
         for _ in 0..10 {
-            let received = tokio::time::timeout(
-                tokio::time::Duration::from_millis(100),
-                session_rx.recv(),
-            )
-            .await
-            .expect("Timeout waiting for session message")
-            .expect("Channel closed unexpectedly");
+            let received =
+                tokio::time::timeout(tokio::time::Duration::from_millis(100), session_rx.recv())
+                    .await
+                    .expect("Timeout waiting for session message")
+                    .expect("Channel closed unexpectedly");
 
             assert!(
                 matches!(received, SessionMessage::DeliverHostResponse { .. }),
@@ -270,7 +264,10 @@ mod tests {
 
         // Ensure no extra messages
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        assert!(session_rx.try_recv().is_err(), "No extra messages should be present");
+        assert!(
+            session_rx.try_recv().is_err(),
+            "No extra messages should be present"
+        );
     }
 
     #[tokio::test]
@@ -291,13 +288,11 @@ mod tests {
         drop(network_tx);
 
         // Verify result is delivered
-        let received = tokio::time::timeout(
-            tokio::time::Duration::from_millis(100),
-            session_rx.recv(),
-        )
-        .await
-        .expect("Timeout waiting for session message")
-        .expect("Channel closed unexpectedly");
+        let received =
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), session_rx.recv())
+                .await
+                .expect("Timeout waiting for session message")
+                .expect("Channel closed unexpectedly");
 
         match received {
             SessionMessage::DeliverHostResponse {
