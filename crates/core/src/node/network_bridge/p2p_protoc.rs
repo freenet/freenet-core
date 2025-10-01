@@ -576,6 +576,14 @@ impl P2pConnManager {
                                 })??;
                             }
                             NodeEvent::TransactionTimedOut(tx) => {
+                                if op_manager.resolve_auto_subscription_failure(
+                                    &tx,
+                                    "subscription timed out on event loop",
+                                ) {
+                                    tracing::warn!(
+                                        "Auto-subscription for transaction {tx} timed out before completion"
+                                    );
+                                }
                                 let Some(clients) = state.tx_to_client.remove(&tx) else {
                                     continue;
                                 };
@@ -595,6 +603,10 @@ impl P2pConnManager {
                                 subscribed,
                             } => {
                                 tracing::info!("Received LocalSubscribeComplete event for transaction: {tx}, contract: {key}");
+
+                                if op_manager.resolve_auto_subscription_success(&tx) {
+                                    tracing::debug!("Resolved auto-subscription via LocalSubscribeComplete event for {tx}");
+                                }
 
                                 // Deliver SubscribeResponse directly to result router (actor mode)
                                 // Following Nacho's suggestion to tap into result router without state transitions

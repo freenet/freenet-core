@@ -11,7 +11,7 @@ use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
 use dashmap::{DashMap, DashSet};
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::{
@@ -22,7 +22,7 @@ use crate::{
     node::PeerId,
     operations::{
         connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
-        OpEnum, OpError,
+        AutoSubscribeResult, OpEnum, OpError,
     },
     ring::{ConnectionManager, LiveTransactionTracker, Ring},
 };
@@ -57,6 +57,13 @@ struct Ops {
     under_progress: DashSet<Transaction>,
 }
 
+#[derive(Debug)]
+struct AutoSubscribeContext {
+    parent_tx: Transaction,
+    key: ContractKey,
+    notify: oneshot::Sender<AutoSubscribeResult>,
+}
+
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
 pub(crate) struct OpManager {
@@ -67,6 +74,7 @@ pub(crate) struct OpManager {
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
     pub result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
     pub actor_clients: bool,
+    auto_subscribe_links: DashMap<Transaction, AutoSubscribeContext>,
 }
 
 impl OpManager {
@@ -113,6 +121,7 @@ impl OpManager {
             new_transactions,
             result_router_tx,
             actor_clients: config.config.actor_clients,
+            auto_subscribe_links: DashMap::new(),
         })
     }
 
@@ -261,6 +270,67 @@ impl OpManager {
     pub fn completed(&self, id: Transaction) {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.completed.insert(id);
+    }
+
+    pub fn register_auto_subscription(
+        &self,
+        parent_tx: Transaction,
+        subscribe_tx: Transaction,
+        key: ContractKey,
+    ) -> oneshot::Receiver<AutoSubscribeResult> {
+        let (notify, receiver) = oneshot::channel();
+        if let Some(previous) = self.auto_subscribe_links.insert(
+            subscribe_tx,
+            AutoSubscribeContext {
+                parent_tx,
+                key,
+                notify,
+            },
+        ) {
+            tracing::warn!(
+                subscribe_tx = %subscribe_tx,
+                parent_tx = %previous.parent_tx,
+                key = %previous.key,
+                "Replacing existing auto-subscription context"
+            );
+        }
+        receiver
+    }
+
+    pub fn resolve_auto_subscription_success(&self, subscribe_tx: &Transaction) -> bool {
+        if let Some((_, ctx)) = self.auto_subscribe_links.remove(subscribe_tx) {
+            tracing::debug!(
+                subscribe_tx = %subscribe_tx,
+                parent_tx = %ctx.parent_tx,
+                key = %ctx.key,
+                "Auto-subscription completed successfully",
+            );
+            let _ = ctx.notify.send(AutoSubscribeResult::Success);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn resolve_auto_subscription_failure(
+        &self,
+        subscribe_tx: &Transaction,
+        reason: impl Into<String>,
+    ) -> bool {
+        if let Some((_, ctx)) = self.auto_subscribe_links.remove(subscribe_tx) {
+            let reason = reason.into();
+            tracing::debug!(
+                subscribe_tx = %subscribe_tx,
+                parent_tx = %ctx.parent_tx,
+                key = %ctx.key,
+                %reason,
+                "Auto-subscription failed",
+            );
+            let _ = ctx.notify.send(AutoSubscribeResult::Failure { reason });
+            true
+        } else {
+            false
+        }
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.

@@ -1830,6 +1830,201 @@ async fn test_put_with_subscribe_flag() -> TestResult {
     Ok(())
 }
 
+/// Regression test for issue #1893.
+/// Ensures that PUT operations with `subscribe: true` block until the auto-subscribe completes,
+/// allowing the initiating client to issue an UPDATE immediately and receive its own notification
+/// without adding artificial sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_put_auto_subscribe_allows_immediate_update() -> TestResult {
+    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    let initial_state = WrappedState::from(test_utils::create_empty_todo_list());
+
+    // Allocate ports
+    let network_socket = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_socket_client = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_socket_gateway = TcpListener::bind("127.0.0.1:0")?;
+
+    // Configure gateway node (B)
+    let (config_gateway, _preset_gateway, gateway_info) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![],
+            Some(network_socket.local_addr()?.port()),
+            ws_api_socket_gateway.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    // Configure client node (A)
+    let (config_client, _preset_client) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&gateway_info)?],
+        None,
+        ws_api_socket_client.local_addr()?.port(),
+    )
+    .await?;
+    let ws_api_port = config_client.ws_api.ws_api_port.unwrap();
+
+    // Release sockets prior to node bootstrap
+    std::mem::drop(network_socket);
+    std::mem::drop(ws_api_socket_client);
+    std::mem::drop(ws_api_socket_gateway);
+
+    // Launch nodes
+    let node_gateway = async move {
+        let cfg = config_gateway.build().await?;
+        let node = NodeConfig::new(cfg.clone())
+            .await?
+            .build(serve_gateway(cfg.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let node_client = async move {
+        let cfg = config_client.build().await?;
+        let node = NodeConfig::new(cfg.clone())
+            .await?
+            .build(serve_gateway(cfg.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let test = tokio::time::timeout(Duration::from_secs(120), async move {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        // Connect to client node API
+        let uri =
+            format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
+        let (stream, _) = connect_async(&uri).await?;
+        let mut client_api = WebApi::start(stream);
+
+        // PUT with subscribe=true
+        make_put(
+            &mut client_api,
+            initial_state.clone(),
+            contract.clone(),
+            true,
+        )
+        .await?;
+
+        // Expect PUT response (auto-subscribe completion is now part of the operation)
+        match tokio::time::timeout(Duration::from_secs(30), client_api.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+            }
+            Ok(Ok(other)) => bail!("Unexpected response while waiting for PUT: {:?}", other),
+            Ok(Err(e)) => bail!("Error receiving PUT response: {}", e),
+            Err(_) => bail!("Timeout waiting for PUT response"),
+        }
+
+        // Immediately issue an UPDATE with new todo item
+        let mut todo = test_utils::TodoList {
+            tasks: Vec::new(),
+            version: 0,
+        };
+        todo.tasks.push(test_utils::Task {
+            id: 42,
+            title: "atomic put subscribe".into(),
+            description: "verify immediate update".into(),
+            completed: false,
+            priority: 1,
+        });
+        let updated_state = WrappedState::from(serde_json::to_vec(&todo)?);
+
+        make_update(&mut client_api, contract_key, updated_state.clone()).await?;
+
+        // Expect an UpdateNotification without additional sleeps (auto-subscribe completes as
+        // part of the PUT operation)
+        let mut saw_notification = false;
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(20);
+
+        while std::time::Instant::now() < wait_deadline && !saw_notification {
+            let resp = tokio::time::timeout(Duration::from_secs(5), client_api.recv()).await;
+            match resp {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                    key,
+                    summary: _,
+                }))) => assert_eq!(key, contract_key),
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                    key,
+                    update,
+                }))) => {
+                    assert_eq!(key, contract_key);
+                    if let UpdateData::State(state) = update {
+                        let retrieved: test_utils::TodoList =
+                            serde_json::from_slice(state.as_ref())?;
+                        assert_eq!(retrieved.tasks.len(), 1);
+                        assert_eq!(retrieved.tasks[0].id, 42);
+                    }
+                    saw_notification = true;
+                }
+                Ok(Ok(other)) => {
+                    tracing::debug!("Ignoring unrelated response: {:?}", other);
+                }
+                Ok(Err(e)) => bail!("Error while waiting for UPDATE result: {}", e),
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            saw_notification,
+            "Client did not receive UpdateNotification; auto-subscribe may have failed"
+        );
+
+        // Final GET to confirm state persisted
+        make_get(&mut client_api, contract_key, true, false).await?;
+        match tokio::time::timeout(Duration::from_secs(20), client_api.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key,
+                state,
+                contract: _,
+            }))) => {
+                assert_eq!(key, contract_key);
+                let retrieved: test_utils::TodoList = serde_json::from_slice(state.as_ref())?;
+                assert_eq!(retrieved.tasks.len(), 1);
+                assert_eq!(retrieved.tasks[0].id, 42);
+            }
+            other => bail!(
+                "Unexpected response while verifying updated state: {:?}",
+                other
+            ),
+        }
+
+        client_api
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+
+        Ok::<_, anyhow::Error>(())
+    });
+
+    select! {
+        gw = node_gateway => {
+            let Err(e) = gw;
+            return Err(anyhow!("Gateway node failed: {}", e).into());
+        }
+        client = node_client => {
+            let Err(e) = client;
+            return Err(anyhow!("Client node failed: {}", e).into());
+        }
+        result = test => {
+            result??;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_delegate_request() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);

@@ -5,6 +5,7 @@ use std::{pin::Pin, time::Duration};
 use freenet_stdlib::prelude::ContractKey;
 use futures::Future;
 use tokio::sync::mpsc::error::SendError;
+use tokio::time::timeout;
 
 use crate::{
     client_events::HostResult,
@@ -19,6 +20,12 @@ pub(crate) mod get;
 pub(crate) mod put;
 pub(crate) mod subscribe;
 pub(crate) mod update;
+
+#[derive(Debug)]
+pub(crate) enum AutoSubscribeResult {
+    Success,
+    Failure { reason: String },
+}
 
 pub(crate) trait Operation
 where
@@ -95,6 +102,9 @@ where
             return Ok(None);
         }
         Err(err) => {
+            if tx_id.transaction_type() == TransactionType::Subscribe {
+                op_manager.resolve_auto_subscription_failure(&tx_id, err.to_string());
+            }
             if let Some(sender) = sender {
                 network_bridge
                     .send(&sender, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
@@ -108,6 +118,9 @@ where
         }) if final_state.finalized() => {
             // operation finished_completely with result
             tracing::debug!(%tx_id, "operation finished_completely with result");
+            if tx_id.transaction_type() == TransactionType::Subscribe {
+                op_manager.resolve_auto_subscription_success(&tx_id);
+            }
             op_manager.completed(tx_id);
             return Ok(Some(final_state));
         }
@@ -137,6 +150,9 @@ where
             return_msg: Some(msg),
             state: None,
         }) => {
+            if tx_id.transaction_type() == TransactionType::Subscribe {
+                op_manager.resolve_auto_subscription_success(&tx_id);
+            }
             op_manager.completed(tx_id);
             // finished the operation at this node, informing back
 
@@ -150,6 +166,9 @@ where
             state: None,
         }) => {
             // operation finished_completely
+            if tx_id.transaction_type() == TransactionType::Subscribe {
+                op_manager.resolve_auto_subscription_success(&tx_id);
+            }
             op_manager.completed(tx_id);
         }
     }
@@ -263,6 +282,8 @@ pub(crate) enum OpError {
     MaxRetriesExceeded(Transaction, TransactionType),
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
+    #[error("auto-subscribe failed for contract {key}: {reason}")]
+    AutoSubscribeFailed { key: ContractKey, reason: String },
 
     // used for control flow
     /// This is used as an early interrumpt of an op update when an op
@@ -307,13 +328,52 @@ impl<T> From<SendError<T>> for OpError {
 }
 
 /// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
-async fn start_subscription_request(op_manager: &OpManager, key: ContractKey) {
-    // Always try to subscribe, even if we're at optimal location
-    // The k_closest_potentially_caching logic in subscribe::request_subscribe
-    // will find alternative peers if needed
+const AUTO_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn start_subscription_request(
+    op_manager: &OpManager,
+    key: ContractKey,
+    await_tx: Option<Transaction>,
+) -> Result<(), OpError> {
     let sub_op = subscribe::start_op(key);
-    if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
-        tracing::warn!(%error, "Error subscribing to contract");
+    let subscribe_tx = sub_op.id;
+
+    match await_tx {
+        Some(parent_tx) => {
+            let receiver = op_manager.register_auto_subscription(parent_tx, subscribe_tx, key);
+
+            if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
+                op_manager.resolve_auto_subscription_failure(&subscribe_tx, error.to_string());
+                return Err(error);
+            }
+
+            match timeout(AUTO_SUBSCRIBE_TIMEOUT, receiver).await {
+                Ok(Ok(AutoSubscribeResult::Success)) => Ok(()),
+                Ok(Ok(AutoSubscribeResult::Failure { reason })) => {
+                    Err(OpError::AutoSubscribeFailed { key, reason })
+                }
+                Ok(Err(_)) => Err(OpError::AutoSubscribeFailed {
+                    key,
+                    reason: "subscription completion channel dropped".into(),
+                }),
+                Err(_) => {
+                    op_manager.resolve_auto_subscription_failure(
+                        &subscribe_tx,
+                        "subscription did not complete before timeout".to_string(),
+                    );
+                    Err(OpError::AutoSubscribeFailed {
+                        key,
+                        reason: "subscription did not complete before timeout".into(),
+                    })
+                }
+            }
+        }
+        None => {
+            if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
+                tracing::warn!(%error, "Error subscribing to contract");
+            }
+            Ok(())
+        }
     }
 }
 
