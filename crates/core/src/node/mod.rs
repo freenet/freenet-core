@@ -1132,7 +1132,20 @@ pub async fn subscribe(
     key: ContractKey,
     client_id: Option<ClientId>,
 ) -> Result<Transaction, OpError> {
-    let op = subscribe::start_op(key);
+    subscribe_with_id(op_manager, key, client_id, None).await
+}
+
+/// Attempts to subscribe to a contract with a specific transaction ID (for deduplication)
+pub async fn subscribe_with_id(
+    op_manager: Arc<OpManager>,
+    key: ContractKey,
+    client_id: Option<ClientId>,
+    transaction_id: Option<Transaction>,
+) -> Result<Transaction, OpError> {
+    let op = match transaction_id {
+        Some(id) => subscribe::start_op_with_id(key, id),
+        None => subscribe::start_op(key),
+    };
     let id = op.id;
     if let Some(client_id) = client_id {
         use crate::client_events::RequestId;

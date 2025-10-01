@@ -589,6 +589,32 @@ impl P2pConnManager {
                                     ))?;
                                 }
                             }
+                            NodeEvent::LocalSubscribeComplete {
+                                tx,
+                                key,
+                                subscribed,
+                            } => {
+                                tracing::info!("Received LocalSubscribeComplete event for transaction: {tx}, contract: {key}");
+
+                                // Deliver SubscribeResponse directly to result router (actor mode)
+                                // Following Nacho's suggestion to tap into result router without state transitions
+                                if let Some(result_router) = &op_manager.result_router_tx {
+                                    tracing::info!("Sending SubscribeResponse to result router for transaction: {tx}");
+                                    use freenet_stdlib::client_api::{
+                                        ContractResponse, HostResponse,
+                                    };
+                                    let response = Ok(HostResponse::ContractResponse(
+                                        ContractResponse::SubscribeResponse { key, subscribed },
+                                    ));
+
+                                    match result_router.send((tx, response)).await {
+                                        Ok(()) => tracing::info!("Successfully sent SubscribeResponse to result router for transaction: {tx}"),
+                                        Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
+                                    }
+                                } else {
+                                    tracing::warn!("No result router available for local subscribe completion (legacy mode)");
+                                }
+                            }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
                                     "Disconnecting from network{}",

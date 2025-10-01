@@ -28,10 +28,15 @@ impl ResultRouter {
     /// Main routing loop
     pub async fn run(mut self) {
         while let Some((tx, host_result)) = self.network_results.recv().await {
+            tracing::info!("ResultRouter received result for transaction: {}", tx);
             let msg = SessionMessage::DeliverHostResponse {
                 tx,
                 response: std::sync::Arc::new(host_result),
             };
+            tracing::info!(
+                "ResultRouter sending result to SessionActor for transaction: {}",
+                tx
+            );
             if let Err(e) = self.session_actor_tx.send(msg).await {
                 // TODO: Add metric for router send failures
                 // metrics::ROUTER_SEND_FAILURES.increment();
