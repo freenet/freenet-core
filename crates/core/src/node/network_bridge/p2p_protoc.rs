@@ -721,27 +721,6 @@ impl P2pConnManager {
             .remove(msg.id())
             .then(|| executor_listener.callback());
 
-        // Clean up client waiting state even though we don't use it anymore
-        // (MessageProcessor handles all client concerns)
-        let _pending_client_req = state
-            .tx_to_client
-            .get(msg.id())
-            .cloned()
-            .map(|clients| clients.into_iter().collect::<Vec<_>>())
-            .or(state
-                .client_waiting_transaction
-                .iter_mut()
-                .find_map(|(tx, clients)| match (&msg, &tx) {
-                    (
-                        NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
-                            key,
-                            ..
-                        })),
-                        WaitingTransaction::Subscription { contract_key },
-                    ) if contract_key == key.id() => Some(clients.drain().collect::<Vec<_>>()),
-                    _ => None,
-                }));
-
         let span = tracing::info_span!(
             "process_network_message",
             transaction = %msg.id(),

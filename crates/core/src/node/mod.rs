@@ -38,8 +38,8 @@ use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::{Address, GatewayConfig, WebsocketApiConfig},
     contract::{
-        Callback, ClientResponsesSender, ExecutorError, ExecutorToEventLoopChannel,
-        NetworkContractHandler, WaitingTransaction,
+        Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler,
+        WaitingTransaction,
     },
     local_node::Executor,
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
@@ -563,15 +563,12 @@ macro_rules! handle_op_not_available {
 
 /// Legacy process_message - only kept for testing_impl
 /// Production code uses process_message_decoupled instead
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn process_message<CB>(
     msg: NetMessage,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
-    client_req_handler_callback: Option<ClientResponsesSender>,
-    client_ids: Option<Vec<ClientId>>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,
@@ -586,8 +583,6 @@ pub(super) async fn process_message<CB>(
                 conn_manager,
                 event_listener,
                 executor_callback,
-                client_req_handler_callback,
-                client_ids,
                 pending_op_result,
             )
             .await
@@ -659,7 +654,6 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn process_message_v1<CB>(
     tx: Option<Transaction>,
     msg: NetMessageV1,
@@ -667,8 +661,6 @@ async fn process_message_v1<CB>(
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
-    _client_req_handler_callback: Option<ClientResponsesSender>,
-    _client_id: Option<Vec<ClientId>>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,

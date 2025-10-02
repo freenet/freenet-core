@@ -818,7 +818,7 @@ where
 
 /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
 async fn run_event_listener<NB, UsrEv>(
-    cli_response_sender: contract::ClientResponsesSender,
+    _cli_response_sender: contract::ClientResponsesSender,
     mut node_controller_rx: tokio::sync::mpsc::Receiver<NodeEvent>,
     RunnerConfig {
         peer_key,
@@ -973,12 +973,6 @@ where
         let executor_callback = pending_from_executor
             .remove(msg.id())
             .then(|| executor_listener.callback());
-        let pending_client_req = tx_to_client.get(msg.id()).copied().map(|c| vec![c]);
-        let client_req_handler_callback = if pending_client_req.is_some() {
-            Some(cli_response_sender.clone())
-        } else {
-            None
-        };
 
         let msg = super::process_message(
             msg,
@@ -986,8 +980,6 @@ where
             conn_manager.clone(),
             event_listener,
             executor_callback,
-            client_req_handler_callback,
-            pending_client_req,
             None,
         )
         .instrument(span);
