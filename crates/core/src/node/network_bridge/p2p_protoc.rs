@@ -196,6 +196,14 @@ impl P2pConnManager {
         )
         .await?;
 
+        // For non-gateway peers, pass the peer_ready flag so it can be set after first handshake
+        // For gateways, pass None (they're always ready)
+        let peer_ready = if !self.is_gateway {
+            Some(self.bridge.op_manager.peer_ready.clone())
+        } else {
+            None
+        };
+
         let (mut handshake_handler, handshake_handler_msg, outbound_message) =
             HandshakeHandler::new(
                 inbound_conn_handler,
@@ -204,6 +212,7 @@ impl P2pConnManager {
                 self.bridge.op_manager.ring.router.clone(),
                 self.this_location,
                 self.is_gateway,
+                peer_ready,
             );
 
         loop {

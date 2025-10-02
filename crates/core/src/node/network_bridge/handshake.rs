@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
 };
 use tokio::time::{timeout, Duration};
 use tracing::{instrument, Instrument};
@@ -228,6 +228,10 @@ pub(super) struct HandshakeHandler {
 
     /// Whether this node is a gateway
     is_gateway: bool,
+
+    /// Indicates when peer is ready to process client operations (peer_id has been set).
+    /// Only used for non-gateway peers - set to Some(flag) for regular peers, None for gateways
+    peer_ready: Option<Arc<AtomicBool>>,
 }
 
 impl HandshakeHandler {
@@ -238,6 +242,7 @@ impl HandshakeHandler {
         router: Arc<RwLock<Router>>,
         this_location: Option<Location>,
         is_gateway: bool,
+        peer_ready: Option<Arc<AtomicBool>>,
     ) -> (Self, HanshakeHandlerMsg, OutboundMessage) {
         let (pending_msg_tx, pending_msg_rx) = tokio::sync::mpsc::channel(100);
         let (establish_connection_tx, establish_connection_rx) = tokio::sync::mpsc::channel(100);
@@ -255,6 +260,7 @@ impl HandshakeHandler {
             router,
             this_location,
             is_gateway,
+            peer_ready,
         };
         (
             connector,
@@ -294,6 +300,13 @@ impl HandshakeHandler {
                             if let Some(addr) = connection.my_address() {
                                 tracing::debug!(%addr, "Attempting setting own peer key");
                                 self.connection_manager.try_set_peer_key(addr);
+
+                                // For non-gateway peers: mark as ready to accept client operations
+                                if let Some(ref peer_ready) = self.peer_ready {
+                                    peer_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    tracing::info!("Peer initialization complete: peer_ready set to true, client operations now enabled");
+                                }
+
                                 if self.this_location.is_none() {
                                     // in the case trust locations is set to true, this peer already had its location set
                                     self.connection_manager.update_location(Some(Location::from_address(&addr)));
@@ -1513,6 +1526,7 @@ mod tests {
             Arc::new(RwLock::new(router)),
             None,
             is_gateway,
+            None, // test code doesn't need peer_ready
         );
         (
             handler,
