@@ -204,6 +204,25 @@ pub trait ClientEventsProxy {
 }
 
 /// Process client events.
+///
+/// # Architecture: Dual-Mode Client Handling
+///
+/// This function operates in one of two modes based on `op_manager.actor_clients`:
+///
+/// **Actor Mode** (default, `actor_clients=true`):
+/// - Uses ResultRouter → SessionActor for centralized client communication
+/// - Uses RequestRouter for operation deduplication (multiple clients share one operation)
+/// - More scalable and efficient for concurrent clients
+///
+/// **Legacy Mode** (`actor_clients=false`):
+/// - Uses direct client callbacks without centralized routing
+/// - Each client request creates a separate operation (no deduplication)
+/// - Simpler but less efficient - exists as fallback safety mechanism
+///
+/// For PUT/GET/UPDATE operations, actor mode uses 3 paths:
+/// 1. Local-only (no peers): Bypasses RequestRouter to avoid instant-completion race
+/// 2. Router-based (has peers): Uses RequestRouter for deduplication
+/// 3. Legacy: Direct operation when `actor_clients=false`
 pub async fn client_event_handling<ClientEv>(
     op_manager: Arc<OpManager>,
     mut client_events: ClientEv,
@@ -439,6 +458,21 @@ async fn process_open_request(
                             // Since there are no remote peers, this will complete locally
                             if let Err(err) = put::request_put(&op_manager, op).await {
                                 tracing::error!("Local PUT request error: {}", err);
+
+                                // Notify client of error via result router (actor mode)
+                                if let Some(router_tx) = &op_manager.result_router_tx {
+                                    let error_response = Err(ErrorKind::OperationError {
+                                        cause: format!("PUT operation failed: {}", err).into(),
+                                    }
+                                    .into());
+
+                                    if let Err(e) = router_tx.send((op_id, error_response)).await {
+                                        tracing::error!(
+                                            "Failed to send PUT error to result router: {}. Transaction: {}",
+                                            e, op_id
+                                        );
+                                    }
+                                }
                             }
 
                             // Note: We bypass the router for local-only PUTs to avoid the race
@@ -504,6 +538,25 @@ async fn process_open_request(
 
                                     if let Err(err) = put::request_put(&op_manager, op).await {
                                         tracing::error!("Put request error: {}", err);
+
+                                        // Notify client of error via result router (actor mode)
+                                        if let Some(router_tx) = &op_manager.result_router_tx {
+                                            let error_response = Err(ErrorKind::OperationError {
+                                                cause: format!("PUT operation failed: {}", err)
+                                                    .into(),
+                                            }
+                                            .into());
+
+                                            if let Err(e) = router_tx
+                                                .send((transaction_id, error_response))
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    "Failed to send PUT error to result router: {}. Transaction: {}",
+                                                    e, transaction_id
+                                                );
+                                            }
+                                        }
                                     }
                                 } else {
                                     tracing::debug!(
@@ -542,6 +595,23 @@ async fn process_open_request(
 
                                 if let Err(err) = put::request_put(&op_manager, op).await {
                                     tracing::error!("Put request error: {}", err);
+
+                                    // Notify client of error via result router (actor mode)
+                                    if let Some(router_tx) = &op_manager.result_router_tx {
+                                        let error_response = Err(ErrorKind::OperationError {
+                                            cause: format!("PUT operation failed: {}", err).into(),
+                                        }
+                                        .into());
+
+                                        if let Err(e) =
+                                            router_tx.send((op_id, error_response)).await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send PUT error to result router: {}. Transaction: {}",
+                                                e, op_id
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -697,7 +767,25 @@ async fn process_open_request(
                                 );
 
                                 if let Err(err) = update::request_update(&op_manager, op).await {
-                                    tracing::error!("request update error {}", err)
+                                    tracing::error!("request update error {}", err);
+
+                                    // Notify client of error via result router (actor mode)
+                                    if let Some(router_tx) = &op_manager.result_router_tx {
+                                        let error_response = Err(ErrorKind::OperationError {
+                                            cause: format!("UPDATE operation failed: {}", err)
+                                                .into(),
+                                        }
+                                        .into());
+
+                                        if let Err(e) =
+                                            router_tx.send((transaction_id, error_response)).await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send UPDATE error to result router: {}. Transaction: {}",
+                                                e, transaction_id
+                                            );
+                                        }
+                                    }
                                 }
                             } else {
                                 tracing::debug!(
@@ -715,17 +803,18 @@ async fn process_open_request(
 
                             // Legacy mode: direct operation without deduplication
                             let op = update::start_op(key, new_state, related_contracts);
+                            let op_id = op.id;
 
                             tracing::debug!(
                                 request_id = %request_id,
-                                transaction_id = %op.id,
+                                transaction_id = %op_id,
                                 operation = "update",
                                 "Request-Transaction correlation"
                             );
 
                             op_manager
                                 .ch_outbound
-                                .waiting_for_transaction_result(op.id, client_id, request_id)
+                                .waiting_for_transaction_result(op_id, client_id, request_id)
                                 .await
                                 .inspect_err(|err| {
                                     tracing::error!(
@@ -735,7 +824,22 @@ async fn process_open_request(
                                 })?;
 
                             if let Err(err) = update::request_update(&op_manager, op).await {
-                                tracing::error!("request update error {}", err)
+                                tracing::error!("request update error {}", err);
+
+                                // Notify client of error via result router (actor mode)
+                                if let Some(router_tx) = &op_manager.result_router_tx {
+                                    let error_response = Err(ErrorKind::OperationError {
+                                        cause: format!("UPDATE operation failed: {}", err).into(),
+                                    }
+                                    .into());
+
+                                    if let Err(e) = router_tx.send((op_id, error_response)).await {
+                                        tracing::error!(
+                                            "Failed to send UPDATE error to result router: {}. Transaction: {}",
+                                            e, op_id
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -887,6 +991,25 @@ async fn process_open_request(
                                         get::request_get(&op_manager, op, HashSet::new()).await
                                     {
                                         tracing::error!("get::request_get error: {}", err);
+
+                                        // Notify client of error via result router (actor mode)
+                                        if let Some(router_tx) = &op_manager.result_router_tx {
+                                            let error_response = Err(ErrorKind::OperationError {
+                                                cause: format!("GET operation failed: {}", err)
+                                                    .into(),
+                                            }
+                                            .into());
+
+                                            if let Err(e) = router_tx
+                                                .send((transaction_id, error_response))
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    "Failed to send GET error to result router: {}. Transaction: {}",
+                                                    e, transaction_id
+                                                );
+                                            }
+                                        }
                                     }
                                 } else {
                                     tracing::debug!(
@@ -920,6 +1043,23 @@ async fn process_open_request(
                                     get::request_get(&op_manager, op, HashSet::new()).await
                                 {
                                     tracing::error!("Get request error: {}", err);
+
+                                    // Notify client of error via result router (actor mode)
+                                    if let Some(router_tx) = &op_manager.result_router_tx {
+                                        let error_response = Err(ErrorKind::OperationError {
+                                            cause: format!("GET operation failed: {}", err).into(),
+                                        }
+                                        .into());
+
+                                        if let Err(e) =
+                                            router_tx.send((op_id, error_response)).await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send GET error to result router: {}. Transaction: {}",
+                                                e, op_id
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
