@@ -27,8 +27,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      # Disable submodules due to broken .gitmodules in main branch
+      # (wiki submodule reference issue)
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
