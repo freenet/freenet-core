@@ -400,6 +400,24 @@ pub fn create_empty_todo_list() -> Vec<u8> {
     serde_json::to_vec(&todo_list).unwrap_or_default()
 }
 
+/// Creates a todo list with a single task for testing
+pub fn create_todo_list_with_item(title: &str) -> Vec<u8> {
+    let task = Task {
+        id: 1,
+        title: title.to_string(),
+        description: String::new(),
+        completed: false,
+        priority: 3,
+    };
+
+    let todo_list = TodoList {
+        tasks: vec![task],
+        version: 1,
+    };
+
+    serde_json::to_vec(&todo_list).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
