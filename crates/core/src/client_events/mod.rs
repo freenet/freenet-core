@@ -404,6 +404,20 @@ async fn process_open_request(
                         related_contracts,
                         subscribe,
                     } => {
+                        // For non-gateway peers: check if peer is ready (peer_id has been set via handshake)
+                        // For gateways: always ready (peer_id set from config)
+                        if !op_manager.is_gateway
+                            && !op_manager
+                                .peer_ready
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            tracing::warn!(
+                                "Client attempted PUT operation before peer initialization complete. \
+                                Peer must complete initial network handshake before processing client operations."
+                            );
+                            return Err(Error::Disconnected);
+                        }
+
                         let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
                         else {
                             tracing::error!("peer id not found at put op, it should be set");

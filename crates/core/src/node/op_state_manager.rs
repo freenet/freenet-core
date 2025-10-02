@@ -6,7 +6,12 @@
 //!
 //! See [`../../architecture.md`](../../architecture.md) for details on its role and interaction with other components.
 
-use std::{cmp::Reverse, collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    cmp::Reverse,
+    collections::BTreeSet,
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
 use dashmap::{DashMap, DashSet};
 use either::Either;
@@ -67,6 +72,12 @@ pub(crate) struct OpManager {
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
     pub result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
     pub actor_clients: bool,
+    /// Indicates whether the peer is ready to process client operations.
+    /// For gateways: always true (peer_id is set from config)
+    /// For regular peers: true only after first successful network handshake sets peer_id
+    pub peer_ready: Arc<AtomicBool>,
+    /// Whether this node is a gateway
+    pub is_gateway: bool,
 }
 
 impl OpManager {
@@ -105,6 +116,17 @@ impl OpManager {
             .instrument(garbage_span),
         );
 
+        // Gateways are ready immediately (peer_id set from config)
+        // Regular peers become ready after first handshake
+        let is_gateway = config.is_gateway;
+        let peer_ready = Arc::new(AtomicBool::new(is_gateway));
+
+        if is_gateway {
+            tracing::debug!("Gateway node: peer_ready set to true immediately");
+        } else {
+            tracing::debug!("Regular peer node: peer_ready will be set after first handshake");
+        }
+
         Ok(Self {
             ring,
             ops,
@@ -113,6 +135,8 @@ impl OpManager {
             new_transactions,
             result_router_tx,
             actor_clients: config.config.actor_clients,
+            peer_ready,
+            is_gateway,
         })
     }
 
