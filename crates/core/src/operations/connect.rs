@@ -193,7 +193,7 @@ impl Operation for ConnectOp {
                         );
                         if let Some(desirable_peer) = op_manager.ring.closest_to_location(
                             *ideal_location,
-                            HashSet::from([joiner.peer.clone()]),
+                            skip_connections.iter().cloned().collect(),
                         ) {
                             tracing::info!(
                                 tx = %id,
