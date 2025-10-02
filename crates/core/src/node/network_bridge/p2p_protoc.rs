@@ -5,7 +5,6 @@ use crate::node::subscribe::SubscribeMsg;
 use crate::ring::Location;
 use dashmap::DashSet;
 use either::{Either, Left, Right};
-use freenet_stdlib::client_api::ErrorKind;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -38,8 +37,8 @@ use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
     contract::{
-        ClientResponsesSender, ContractHandlerChannel, ExecutorToEventLoopChannel,
-        NetworkEventListenerHalve, WaitingResolution,
+        ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+        WaitingResolution,
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction},
     node::{handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager},
@@ -172,7 +171,6 @@ impl P2pConnManager {
         mut client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
         mut notification_channel: EventLoopNotificationsReceiver,
         mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-        cli_response_sender: ClientResponsesSender,
         mut node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
         tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Opening network listener");
@@ -231,7 +229,6 @@ impl P2pConnManager {
                                 &op_manager,
                                 &mut state,
                                 &executor_listener,
-                                &cli_response_sender,
                             )
                             .await?;
                         }
@@ -578,18 +575,15 @@ impl P2pConnManager {
                                 })??;
                             }
                             NodeEvent::TransactionTimedOut(tx) => {
-                                let Some(clients) = state.tx_to_client.remove(&tx) else {
-                                    continue;
-                                };
-                                for client in clients {
-                                    // Legacy delivery needs a RequestId - generate one for error cases
-                                    use crate::client_events::RequestId;
-                                    cli_response_sender.send((
-                                        client,
-                                        RequestId::new(),
-                                        Err(ErrorKind::FailedOperation.into()),
-                                    ))?;
+                                // Clean up client subscription to prevent memory leak
+                                // Clients are not notified - transactions simply expire silently
+                                if let Some(clients) = state.tx_to_client.remove(&tx) {
+                                    tracing::debug!("Cleaned up {} client subscriptions for timed out transaction: {}", clients.len(), tx);
                                 }
+                            }
+                            NodeEvent::TransactionCompleted(tx) => {
+                                // Clean up client subscription after successful completion
+                                state.tx_to_client.remove(&tx);
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -606,7 +600,11 @@ impl P2pConnManager {
                                 ));
 
                                 match op_manager.result_router_tx.send((tx, response)).await {
-                                    Ok(()) => tracing::info!("Successfully sent SubscribeResponse to result router for transaction: {tx}"),
+                                    Ok(()) => {
+                                        tracing::info!("Successfully sent SubscribeResponse to result router for transaction: {tx}");
+                                        // Clean up client subscription after successful delivery
+                                        state.tx_to_client.remove(&tx);
+                                    }
                                     Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
                                 }
                             }
@@ -683,7 +681,6 @@ impl P2pConnManager {
         op_manager: &Arc<OpManager>,
         state: &mut EventListenerState,
         executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-        cli_response_sender: &ClientResponsesSender,
     ) -> anyhow::Result<()> {
         match msg {
             NetMessage::V1(NetMessageV1::Aborted(tx)) => {
@@ -694,14 +691,8 @@ impl P2pConnManager {
                     // Forward message to transient joiner
                     outbound_message.send_to(*addr, msg).await?;
                 } else {
-                    self.process_message(
-                        msg,
-                        op_manager,
-                        executor_listener,
-                        cli_response_sender,
-                        state,
-                    )
-                    .await;
+                    self.process_message(msg, op_manager, executor_listener, state)
+                        .await;
                 }
             }
         }
@@ -713,7 +704,6 @@ impl P2pConnManager {
         msg: NetMessage,
         op_manager: &Arc<OpManager>,
         executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-        _cli_response_sender: &ClientResponsesSender,
         state: &mut EventListenerState,
     ) {
         let executor_callback = state

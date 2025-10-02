@@ -781,7 +781,7 @@ where
     UsrEv: ClientEventsProxy + Send + 'static,
 {
     connect::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
-    let (client_responses, cli_response_sender) = contract::client_responses_channel();
+    let (client_responses, _cli_response_sender) = contract::client_responses_channel();
     let span = {
         config
             .parent_span
@@ -811,14 +811,13 @@ where
         .parent_span
         .clone()
         .unwrap_or_else(|| tracing::info_span!("event_listener", peer = %config.peer_key));
-    run_event_listener(cli_response_sender, node_controller_rx, config)
+    run_event_listener(node_controller_rx, config)
         .instrument(parent_span)
         .await
 }
 
 /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
 async fn run_event_listener<NB, UsrEv>(
-    _cli_response_sender: contract::ClientResponsesSender,
     mut node_controller_rx: tokio::sync::mpsc::Receiver<NodeEvent>,
     RunnerConfig {
         peer_key,
@@ -922,6 +921,9 @@ where
                     unimplemented!()
                 }
                 NodeEvent::TransactionTimedOut(_) => {
+                    unimplemented!()
+                }
+                NodeEvent::TransactionCompleted(_) => {
                     unimplemented!()
                 }
                 NodeEvent::LocalSubscribeComplete { .. } => {

@@ -19,15 +19,13 @@ pub enum ProcessingError {
 
 /// MessageProcessor for pure network-to-actor routing
 ///
-/// This processor only handles actor mode - legacy mode bypasses this entirely
-/// and uses the original direct client notification path.
+/// Routes network operation results to the session actor for client notification
 pub struct MessageProcessor {
     result_tx: mpsc::Sender<SessionMessage>,
 }
 
 impl MessageProcessor {
-    /// Create a new MessageProcessor for actor mode
-    /// Legacy mode doesn't use MessageProcessor at all
+    /// Create a new MessageProcessor
     pub fn new(result_tx: mpsc::Sender<SessionMessage>) -> Self {
         Self { result_tx }
     }

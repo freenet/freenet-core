@@ -326,6 +326,8 @@ pub(crate) enum NodeEvent {
         callback: tokio::sync::mpsc::Sender<QueryResult>,
     },
     TransactionTimedOut(Transaction),
+    /// Transaction completed successfully - cleanup client subscription
+    TransactionCompleted(Transaction),
     /// Local subscription completed - deliver SubscribeResponse to client via result router
     LocalSubscribeComplete {
         tx: Transaction,
@@ -394,6 +396,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::TransactionTimedOut(transaction) => {
                 write!(f, "Transaction timed out ({transaction})")
+            }
+            NodeEvent::TransactionCompleted(transaction) => {
+                write!(f, "Transaction completed ({transaction})")
             }
             NodeEvent::LocalSubscribeComplete {
                 tx,

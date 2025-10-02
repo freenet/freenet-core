@@ -413,6 +413,7 @@ async fn report_result(
             if let Some(transaction) = tx {
                 let host_result = op_res.to_host_result();
                 let router_tx_clone = op_manager.result_router_tx.clone();
+                let event_notifier = op_manager.to_event_listener.clone();
 
                 // Spawn fire-and-forget task to avoid blocking report_result()
                 // while still guaranteeing message delivery
@@ -426,6 +427,14 @@ async fn report_result(
                             e
                         );
                         // TODO: Consider implementing circuit breaker or automatic recovery
+                    } else {
+                        // Transaction completed successfully, notify to clean up subscriptions
+                        use crate::message::NodeEvent;
+                        use either::Either;
+                        let _ = event_notifier
+                            .notifications_sender
+                            .send(Either::Right(NodeEvent::TransactionCompleted(transaction)))
+                            .await;
                     }
                 });
             }

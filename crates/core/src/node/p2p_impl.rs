@@ -17,8 +17,8 @@ use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::GlobalExecutor,
     contract::{
-        self, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
-        ExecutorToEventLoopChannel, NetworkEventListenerHalve, WaitingResolution,
+        self, ContractHandler, ContractHandlerChannel, ExecutorToEventLoopChannel,
+        NetworkEventListenerHalve, WaitingResolution,
     },
     message::{NetMessage, NodeEvent, Transaction},
     node::NodeConfig,
@@ -37,7 +37,6 @@ pub(crate) struct NodeP2P {
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
     executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-    cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     should_try_connect: bool,
     client_events_task: BoxFuture<'static, anyhow::Error>,
@@ -188,7 +187,6 @@ impl NodeP2P {
             self.client_wait_for_transaction,
             self.notification_channel,
             self.executor_listener,
-            self.cli_response_sender,
             self.node_controller,
         );
 
@@ -325,7 +323,6 @@ impl NodeP2P {
             client_wait_for_transaction: wait_for_event,
             op_manager,
             executor_listener,
-            cli_response_sender,
             node_controller: node_controller_rx,
             should_try_connect: config.should_connect,
             peer_id: config.peer_id,

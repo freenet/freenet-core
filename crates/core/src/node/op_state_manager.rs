@@ -67,7 +67,7 @@ struct Ops {
 pub(crate) struct OpManager {
     pub ring: Arc<Ring>,
     ops: Arc<Ops>,
-    to_event_listener: EventLoopNotificationsSender,
+    pub(crate) to_event_listener: EventLoopNotificationsSender,
     pub ch_outbound: ContractHandlerChannel<SenderHalve>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
     pub result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
