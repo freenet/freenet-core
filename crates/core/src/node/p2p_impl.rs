@@ -17,8 +17,8 @@ use crate::{
     client_events::{combinator::ClientEventsCombinator, BoxedClient},
     config::GlobalExecutor,
     contract::{
-        self, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
-        ExecutorToEventLoopChannel, NetworkEventListenerHalve, WaitingResolution,
+        self, ContractHandler, ContractHandlerChannel, ExecutorToEventLoopChannel,
+        NetworkEventListenerHalve, WaitingResolution,
     },
     message::{NetMessage, NodeEvent, Transaction},
     node::NodeConfig,
@@ -37,7 +37,6 @@ pub(crate) struct NodeP2P {
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
     executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-    cli_response_sender: ClientResponsesSender,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     should_try_connect: bool,
     client_events_task: BoxFuture<'static, anyhow::Error>,
@@ -188,7 +187,6 @@ impl NodeP2P {
             self.client_wait_for_transaction,
             self.notification_channel,
             self.executor_listener,
-            self.cli_response_sender,
             self.node_controller,
         );
 
@@ -223,39 +221,31 @@ impl NodeP2P {
         // Prepare session adapter channel for actor-based client management
         let (session_tx, session_rx) = tokio::sync::mpsc::channel(1000);
 
-        // Install session adapter in contract handler if migration enabled
-        let result_router_tx = if config.config.actor_clients {
-            ch_outbound.with_session_adapter(session_tx.clone());
+        // Install session adapter in contract handler
+        ch_outbound.with_session_adapter(session_tx.clone());
 
-            // Create result router channel for dual-path result delivery
-            let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(1000);
+        // Create result router channel for dual-path result delivery
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(1000);
 
-            // Spawn Session Actor
-            use crate::client_events::session_actor::SessionActor;
-            let session_actor = SessionActor::new(session_rx, cli_response_sender.clone());
-            GlobalExecutor::spawn(async move {
-                tracing::info!("Session actor starting");
-                session_actor.run().await;
-                tracing::warn!("Session actor stopped");
-            });
+        // Spawn Session Actor
+        use crate::client_events::session_actor::SessionActor;
+        let session_actor = SessionActor::new(session_rx, cli_response_sender.clone());
+        GlobalExecutor::spawn(async move {
+            tracing::info!("Session actor starting");
+            session_actor.run().await;
+            tracing::warn!("Session actor stopped");
+        });
 
-            // Spawn ResultRouter task
-            use crate::client_events::result_router::ResultRouter;
-            let router = ResultRouter::new(result_router_rx, session_tx.clone());
-            GlobalExecutor::spawn(async move {
-                tracing::info!("Result router starting");
-                router.run().await;
-                tracing::warn!("Result router stopped");
-            });
+        // Spawn ResultRouter task
+        use crate::client_events::result_router::ResultRouter;
+        let router = ResultRouter::new(result_router_rx, session_tx.clone());
+        GlobalExecutor::spawn(async move {
+            tracing::info!("Result router starting");
+            router.run().await;
+            tracing::warn!("Result router stopped");
+        });
 
-            tracing::info!(
-                "Actor-based client management infrastructure installed with result router"
-            );
-            Some(result_router_tx)
-        } else {
-            tracing::debug!("Actor-based client management disabled");
-            None
-        };
+        tracing::info!("Actor-based client management infrastructure installed with result router");
 
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
@@ -271,25 +261,18 @@ impl NodeP2P {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let mut conn_manager =
-            P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
+        // Create MessageProcessor - direct to SessionActor
+        use crate::node::MessageProcessor;
+        let message_processor = Arc::new(MessageProcessor::new(session_tx.clone()));
 
-        // Phase 4: Configure MessageProcessor for clean client handling separation
-        let use_actor_clients = config.config.actor_clients;
-        if use_actor_clients {
-            // Clone session_tx before using it in MessageProcessor
-            let session_tx_for_processor = session_tx.clone();
-
-            // Create MessageProcessor for actor mode - direct to SessionActor
-            use crate::node::MessageProcessor;
-            let message_processor = Arc::new(MessageProcessor::new(session_tx_for_processor));
-            conn_manager = conn_manager.with_message_processor(message_processor);
-            tracing::info!("P2P layer configured with MessageProcessor in ACTOR mode - network processing will be decoupled from client handling");
-        } else {
-            tracing::info!(
-                "P2P layer using legacy client handling - MessageProcessor not configured"
-            );
-        }
+        let conn_manager = P2pConnManager::build(
+            &config,
+            op_manager.clone(),
+            event_register,
+            message_processor,
+        )
+        .await?;
+        tracing::info!("P2P layer configured with MessageProcessor - network processing decoupled from client handling");
 
         let parent_span = tracing::Span::current();
         let contract_executor_task = GlobalExecutor::spawn({
@@ -340,7 +323,6 @@ impl NodeP2P {
             client_wait_for_transaction: wait_for_event,
             op_manager,
             executor_listener,
-            cli_response_sender,
             node_controller: node_controller_rx,
             should_try_connect: config.should_connect,
             peer_id: config.peer_id,

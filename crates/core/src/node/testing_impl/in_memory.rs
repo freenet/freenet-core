@@ -34,13 +34,17 @@ impl<ER> Builder<ER> {
 
         let _guard = parent_span.enter();
         let connection_manager = ConnectionManager::new(&self.config);
+
+        // Create a dummy result router channel for testing
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ops_ch_channel,
             &self.config,
             self.event_register.clone(),
             connection_manager.clone(),
-            None, // No result router for testing
+            result_router_tx,
         )?);
         std::mem::drop(_guard);
         let (executor_listener, executor_sender) = executor_channel(op_manager.clone());

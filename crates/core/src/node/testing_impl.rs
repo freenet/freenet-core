@@ -781,7 +781,7 @@ where
     UsrEv: ClientEventsProxy + Send + 'static,
 {
     connect::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
-    let (client_responses, cli_response_sender) = contract::client_responses_channel();
+    let (client_responses, _cli_response_sender) = contract::client_responses_channel();
     let span = {
         config
             .parent_span
@@ -811,14 +811,13 @@ where
         .parent_span
         .clone()
         .unwrap_or_else(|| tracing::info_span!("event_listener", peer = %config.peer_key));
-    run_event_listener(cli_response_sender, node_controller_rx, config)
+    run_event_listener(node_controller_rx, config)
         .instrument(parent_span)
         .await
 }
 
 /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
 async fn run_event_listener<NB, UsrEv>(
-    cli_response_sender: contract::ClientResponsesSender,
     mut node_controller_rx: tokio::sync::mpsc::Receiver<NodeEvent>,
     RunnerConfig {
         peer_key,
@@ -924,6 +923,9 @@ where
                 NodeEvent::TransactionTimedOut(_) => {
                     unimplemented!()
                 }
+                NodeEvent::TransactionCompleted(_) => {
+                    unimplemented!()
+                }
                 NodeEvent::LocalSubscribeComplete { .. } => {
                     unimplemented!()
                 }
@@ -939,7 +941,6 @@ where
                     None,
                     Err(err.into()),
                     &op_manager,
-                    None,
                     None,
                     &mut *event_register as &mut _,
                 )
@@ -974,12 +975,6 @@ where
         let executor_callback = pending_from_executor
             .remove(msg.id())
             .then(|| executor_listener.callback());
-        let pending_client_req = tx_to_client.get(msg.id()).copied().map(|c| vec![c]);
-        let client_req_handler_callback = if pending_client_req.is_some() {
-            Some(cli_response_sender.clone())
-        } else {
-            None
-        };
 
         let msg = super::process_message(
             msg,
@@ -987,8 +982,6 @@ where
             conn_manager.clone(),
             event_listener,
             executor_callback,
-            client_req_handler_callback,
-            pending_client_req,
             None,
         )
         .instrument(span);

@@ -38,8 +38,8 @@ use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::{Address, GatewayConfig, WebsocketApiConfig},
     contract::{
-        Callback, ClientResponsesSender, ExecutorError, ExecutorToEventLoopChannel,
-        NetworkContractHandler, WaitingTransaction,
+        Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler,
+        WaitingTransaction,
     },
     local_node::Executor,
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
@@ -389,7 +389,6 @@ async fn report_result(
     op_result: Result<Option<OpEnum>, OpError>,
     op_manager: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
-    client_req_handler_callback: Option<(Vec<ClientId>, ClientResponsesSender)>,
     event_listener: &mut dyn NetEventRegister,
 ) {
     // Add UPDATE-specific debug logging at the start
@@ -410,11 +409,11 @@ async fn report_result(
                 );
             }
 
-            // NEW: Send to result router if feature flag is enabled and transaction exists
-            // (independent of legacy callback presence)
-            if let (Some(transaction), Some(router_tx)) = (tx, &op_manager.result_router_tx) {
+            // Send to result router
+            if let Some(transaction) = tx {
                 let host_result = op_res.to_host_result();
-                let router_tx_clone = router_tx.clone();
+                let router_tx_clone = op_manager.result_router_tx.clone();
+                let event_notifier = op_manager.to_event_listener.clone();
 
                 // Spawn fire-and-forget task to avoid blocking report_result()
                 // while still guaranteeing message delivery
@@ -423,63 +422,22 @@ async fn report_result(
                         tracing::error!(
                             "CRITICAL: Result router channel closed - dual-path delivery broken. \
                              Router or session actor has crashed. Transaction: {}. Error: {}. \
-                             Consider restarting node or disabling FREENET_ACTOR_CLIENTS flag.",
+                             Consider restarting node.",
                             transaction,
                             e
                         );
                         // TODO: Consider implementing circuit breaker or automatic recovery
+                    } else {
+                        // Transaction completed successfully, notify to clean up subscriptions
+                        use crate::message::NodeEvent;
+                        use either::Either;
+                        let _ = event_notifier
+                            .notifications_sender
+                            .send(Either::Right(NodeEvent::TransactionCompleted(transaction)))
+                            .await;
                     }
                 });
             }
-
-            // EXISTING: Legacy client delivery (only when actor_clients is disabled)
-            // When actor_clients is enabled, SessionActor handles all client communication
-            if !op_manager.actor_clients {
-                if let Some((client_ids, cb)) = client_req_handler_callback {
-                    for client_id in client_ids {
-                        // Enhanced logging for UPDATE operations
-                        if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                            tracing::debug!(
-                                "Sending UPDATE response to client {} for transaction {}",
-                                client_id,
-                                update_op.id
-                            );
-
-                            // Log the result being sent
-                            let host_result = op_res.to_host_result();
-                            match &host_result {
-                                Ok(response) => {
-                                    tracing::debug!(
-                                    "Client {} callback found, sending successful UPDATE response: {:?}",
-                                    client_id,
-                                    response
-                                );
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        "Client {} callback found, sending UPDATE error: {:?}",
-                                        client_id,
-                                        error
-                                    );
-                                }
-                            }
-                        } else {
-                            tracing::debug!(?tx, %client_id,  "Sending response to client");
-                        }
-                        // Legacy delivery needs a RequestId - generate one for backward compatibility
-                        use crate::client_events::RequestId;
-                        let _ = cb.send((client_id, RequestId::new(), op_res.to_host_result()));
-                    }
-                } else {
-                    // Log when no client callback is found for UPDATE operations
-                    if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                        tracing::debug!(
-                        "No client callback found for UPDATE transaction {} - this may indicate a missing client subscription",
-                        update_op.id
-                    );
-                    }
-                }
-            } // End skip_legacy_delivery check
 
             // check operations.rs:handle_op_result to see what's the meaning of each state
             // in case more cases want to be handled when feeding information to the OpManager
@@ -612,15 +570,14 @@ macro_rules! handle_op_not_available {
     };
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn process_message<CB>(
+/// Legacy process_message - only kept for testing_impl
+/// Production code uses process_message_decoupled instead
+pub(super) async fn process_message<CB>(
     msg: NetMessage,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
-    client_req_handler_callback: Option<ClientResponsesSender>,
-    client_ids: Option<Vec<ClientId>>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,
@@ -635,8 +592,6 @@ async fn process_message<CB>(
                 conn_manager,
                 event_listener,
                 executor_callback,
-                client_req_handler_callback,
-                client_ids,
                 pending_op_result,
             )
             .await
@@ -708,7 +663,6 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn process_message_v1<CB>(
     tx: Option<Transaction>,
     msg: NetMessageV1,
@@ -716,13 +670,10 @@ async fn process_message_v1<CB>(
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
-    client_req_handler_callback: Option<ClientResponsesSender>,
-    client_id: Option<Vec<ClientId>>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,
 {
-    let cli_req = client_id.zip(client_req_handler_callback);
     event_listener
         .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
         .await;
@@ -750,7 +701,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;
@@ -777,7 +727,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;
@@ -800,7 +749,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;
@@ -827,7 +775,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;
@@ -851,7 +798,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;

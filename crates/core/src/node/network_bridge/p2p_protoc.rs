@@ -5,7 +5,6 @@ use crate::node::subscribe::SubscribeMsg;
 use crate::ring::Location;
 use dashmap::DashSet;
 use either::{Either, Left, Right};
-use freenet_stdlib::client_api::ErrorKind;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -38,14 +37,11 @@ use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
     contract::{
-        ClientResponsesSender, ContractHandlerChannel, ExecutorToEventLoopChannel,
-        NetworkEventListenerHalve, WaitingResolution,
+        ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
+        WaitingResolution,
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction},
-    node::{
-        handle_aborted_op, process_message, process_message_decoupled, NetEventRegister,
-        NodeConfig, OpManager,
-    },
+    node::{handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager},
     ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
@@ -131,7 +127,7 @@ pub(in crate::node) struct P2pConnManager {
     bandwidth_limit: Option<usize>,
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// MessageProcessor for clean client handling separation
-    message_processor: Option<Arc<MessageProcessor>>,
+    message_processor: Arc<MessageProcessor>,
 }
 
 impl P2pConnManager {
@@ -139,6 +135,7 @@ impl P2pConnManager {
         config: &NodeConfig,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
+        message_processor: Arc<MessageProcessor>,
     ) -> anyhow::Result<Self> {
         let listen_port = config.network_listener_port;
         let listener_ip = config.network_listener_ip;
@@ -162,14 +159,8 @@ impl P2pConnManager {
             check_version: !config.config.network_api.ignore_protocol_version,
             bandwidth_limit: config.config.network_api.bandwidth_limit,
             blocked_addresses: config.blocked_addresses.clone(),
-            message_processor: None, // Will be set later based on configuration
+            message_processor,
         })
-    }
-
-    /// Set the MessageProcessor for Phase 4 network decoupling
-    pub fn with_message_processor(mut self, message_processor: Arc<MessageProcessor>) -> Self {
-        self.message_processor = Some(message_processor);
-        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -180,7 +171,6 @@ impl P2pConnManager {
         mut client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
         mut notification_channel: EventLoopNotificationsReceiver,
         mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-        cli_response_sender: ClientResponsesSender,
         mut node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
         tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Opening network listener");
@@ -239,7 +229,6 @@ impl P2pConnManager {
                                 &op_manager,
                                 &mut state,
                                 &executor_listener,
-                                &cli_response_sender,
                             )
                             .await?;
                         }
@@ -586,18 +575,15 @@ impl P2pConnManager {
                                 })??;
                             }
                             NodeEvent::TransactionTimedOut(tx) => {
-                                let Some(clients) = state.tx_to_client.remove(&tx) else {
-                                    continue;
-                                };
-                                for client in clients {
-                                    // Legacy delivery needs a RequestId - generate one for error cases
-                                    use crate::client_events::RequestId;
-                                    cli_response_sender.send((
-                                        client,
-                                        RequestId::new(),
-                                        Err(ErrorKind::FailedOperation.into()),
-                                    ))?;
+                                // Clean up client subscription to prevent memory leak
+                                // Clients are not notified - transactions simply expire silently
+                                if let Some(clients) = state.tx_to_client.remove(&tx) {
+                                    tracing::debug!("Cleaned up {} client subscriptions for timed out transaction: {}", clients.len(), tx);
                                 }
+                            }
+                            NodeEvent::TransactionCompleted(tx) => {
+                                // Clean up client subscription after successful completion
+                                state.tx_to_client.remove(&tx);
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -606,23 +592,20 @@ impl P2pConnManager {
                             } => {
                                 tracing::info!("Received LocalSubscribeComplete event for transaction: {tx}, contract: {key}");
 
-                                // Deliver SubscribeResponse directly to result router (actor mode)
-                                // Following Nacho's suggestion to tap into result router without state transitions
-                                if let Some(result_router) = &op_manager.result_router_tx {
-                                    tracing::info!("Sending SubscribeResponse to result router for transaction: {tx}");
-                                    use freenet_stdlib::client_api::{
-                                        ContractResponse, HostResponse,
-                                    };
-                                    let response = Ok(HostResponse::ContractResponse(
-                                        ContractResponse::SubscribeResponse { key, subscribed },
-                                    ));
+                                // Deliver SubscribeResponse directly to result router
+                                tracing::info!("Sending SubscribeResponse to result router for transaction: {tx}");
+                                use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+                                let response = Ok(HostResponse::ContractResponse(
+                                    ContractResponse::SubscribeResponse { key, subscribed },
+                                ));
 
-                                    match result_router.send((tx, response)).await {
-                                        Ok(()) => tracing::info!("Successfully sent SubscribeResponse to result router for transaction: {tx}"),
-                                        Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
+                                match op_manager.result_router_tx.send((tx, response)).await {
+                                    Ok(()) => {
+                                        tracing::info!("Successfully sent SubscribeResponse to result router for transaction: {tx}");
+                                        // Clean up client subscription after successful delivery
+                                        state.tx_to_client.remove(&tx);
                                     }
-                                } else {
-                                    tracing::warn!("No result router available for local subscribe completion (legacy mode)");
+                                    Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
                                 }
                             }
                             NodeEvent::Disconnect { cause } => {
@@ -698,7 +681,6 @@ impl P2pConnManager {
         op_manager: &Arc<OpManager>,
         state: &mut EventListenerState,
         executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-        cli_response_sender: &ClientResponsesSender,
     ) -> anyhow::Result<()> {
         match msg {
             NetMessage::V1(NetMessageV1::Aborted(tx)) => {
@@ -709,14 +691,8 @@ impl P2pConnManager {
                     // Forward message to transient joiner
                     outbound_message.send_to(*addr, msg).await?;
                 } else {
-                    self.process_message(
-                        msg,
-                        op_manager,
-                        executor_listener,
-                        cli_response_sender,
-                        state,
-                    )
-                    .await;
+                    self.process_message(msg, op_manager, executor_listener, state)
+                        .await;
                 }
             }
         }
@@ -728,34 +704,12 @@ impl P2pConnManager {
         msg: NetMessage,
         op_manager: &Arc<OpManager>,
         executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-        cli_response_sender: &ClientResponsesSender,
         state: &mut EventListenerState,
     ) {
         let executor_callback = state
             .pending_from_executor
             .remove(msg.id())
             .then(|| executor_listener.callback());
-        let pending_client_req = state
-            .tx_to_client
-            .get(msg.id())
-            .cloned()
-            .map(|clients| clients.into_iter().collect::<Vec<_>>())
-            .or(state
-                .client_waiting_transaction
-                .iter_mut()
-                .find_map(|(tx, clients)| match (&msg, &tx) {
-                    (
-                        NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
-                            key,
-                            ..
-                        })),
-                        WaitingTransaction::Subscription { contract_key },
-                    ) if contract_key == key.id() => Some(clients.drain().collect::<Vec<_>>()),
-                    _ => None,
-                }));
-        let client_req_handler_callback = pending_client_req
-            .is_some()
-            .then(|| cli_response_sender.clone());
 
         let span = tracing::info_span!(
             "process_network_message",
@@ -765,37 +719,23 @@ impl P2pConnManager {
 
         let pending_op_result = state.pending_op_results.get(msg.id()).cloned();
 
-        // Phase 4: Use MessageProcessor for clean client handling separation when available
-        if let Some(message_processor) = &self.message_processor {
-            tracing::debug!("Using PURE network processing - zero client types in network layer for transaction {}", msg.id());
-            GlobalExecutor::spawn(
-                process_message_decoupled(
-                    msg,
-                    op_manager.clone(),
-                    self.bridge.clone(),
-                    self.event_listener.trait_clone(),
-                    executor_callback,
-                    message_processor.clone(),
-                    pending_op_result,
-                )
-                .instrument(span),
-            );
-        } else {
-            // Legacy path - existing behavior
-            GlobalExecutor::spawn(
-                process_message(
-                    msg,
-                    op_manager.clone(),
-                    self.bridge.clone(),
-                    self.event_listener.trait_clone(),
-                    executor_callback,
-                    client_req_handler_callback,
-                    pending_client_req,
-                    pending_op_result,
-                )
-                .instrument(span),
-            );
-        }
+        // Use MessageProcessor for clean client handling separation
+        tracing::debug!(
+            "Using PURE network processing - zero client types in network layer for transaction {}",
+            msg.id()
+        );
+        GlobalExecutor::spawn(
+            process_message_decoupled(
+                msg,
+                op_manager.clone(),
+                self.bridge.clone(),
+                self.event_listener.trait_clone(),
+                executor_callback,
+                self.message_processor.clone(),
+                pending_op_result,
+            )
+            .instrument(span),
+        );
     }
 
     async fn handle_connect_peer(

@@ -67,11 +67,10 @@ struct Ops {
 pub(crate) struct OpManager {
     pub ring: Arc<Ring>,
     ops: Arc<Ops>,
-    to_event_listener: EventLoopNotificationsSender,
+    pub(crate) to_event_listener: EventLoopNotificationsSender,
     pub ch_outbound: ContractHandlerChannel<SenderHalve>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
-    pub result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
-    pub actor_clients: bool,
+    pub result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     /// Indicates whether the peer is ready to process client operations.
     /// For gateways: always true (peer_id is set from config)
     /// For regular peers: true only after first successful network handshake sets peer_id
@@ -87,7 +86,7 @@ impl OpManager {
         config: &NodeConfig,
         event_register: ER,
         connection_manager: ConnectionManager,
-        result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
+        result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     ) -> anyhow::Result<Self> {
         let ring = Ring::new(
             config,
@@ -134,7 +133,6 @@ impl OpManager {
             ch_outbound,
             new_transactions,
             result_router_tx,
-            actor_clients: config.config.actor_clients,
             peer_ready,
             is_gateway,
         })
