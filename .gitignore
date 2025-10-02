@@ -55,3 +55,9 @@ crates/core/tmp_work/
 .claude-flow/
 .swarm/
 test-results/
+
+# Development artifacts
+.vtcode/
+.worktrees/
+worktrees/
+logs/
