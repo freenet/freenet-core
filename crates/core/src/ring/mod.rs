@@ -70,8 +70,7 @@ pub(crate) struct Ring {
     event_register: Box<dyn NetEventRegister>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
-    #[allow(unused)]
-    is_gateway: bool,
+    pub(crate) is_gateway: bool,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -360,7 +359,9 @@ impl Ring {
         live_tx_tracker: LiveTransactionTracker,
         mut missing_candidates: mpsc::Receiver<PeerId>,
     ) -> anyhow::Result<()> {
-        tracing::debug!("Initializing connection maintenance task");
+        tracing::info!("Initializing connection maintenance task");
+        let is_gateway = self.is_gateway;
+        tracing::info!(is_gateway, "Connection maintenance task starting");
         #[cfg(not(test))]
         const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(60 * 5);
         #[cfg(test)]
@@ -388,6 +389,7 @@ impl Ring {
         // if the peer is just starting wait a bit before
         // we even attempt acquiring more connections
         tokio::time::sleep(Duration::from_secs(2)).await;
+        tracing::info!("Connection maintenance task: initial sleep completed");
 
         let mut live_tx = None;
         let mut pending_conn_adds = BTreeSet::new();
@@ -434,20 +436,42 @@ impl Ring {
 
             if let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if live_tx.is_none() {
+                    tracing::info!(
+                        "Attempting to acquire new connection for location: {:?}",
+                        ideal_location
+                    );
                     live_tx = self
                         .acquire_new(ideal_location, &skip_list, &notifier, &live_tx_tracker)
                         .await
                         .map_err(|error| {
-                            tracing::debug!(?error, "Shutting down connection maintenance task");
+                            tracing::error!(
+                                ?error,
+                                "FATAL: Connection maintenance task failed - shutting down"
+                            );
                             error
                         })?;
+
+                    if live_tx.is_none() {
+                        let conns = self.connection_manager.get_open_connections();
+                        tracing::warn!(
+                            "acquire_new returned None - likely no peers to query through (connections: {})",
+                            conns
+                        );
+                    } else {
+                        tracing::info!("Successfully initiated connection acquisition");
+                    }
                 } else {
                     pending_conn_adds.insert(ideal_location);
                 }
             }
 
+            let current_connections = self.connection_manager.get_open_connections();
             let neighbor_locations = {
                 let peers = self.connection_manager.get_connections_by_location();
+                tracing::debug!(
+                    "Maintenance task: current connections = {}, checking topology",
+                    current_connections
+                );
                 peers
                     .iter()
                     .map(|(loc, conns)| {
@@ -474,8 +498,22 @@ impl Ring {
                     &self.connection_manager.own_location().location,
                     Instant::now(),
                 );
+
+            tracing::info!(
+                ?adjustment,
+                current_connections,
+                is_gateway,
+                pending_adds = pending_conn_adds.len(),
+                "Topology adjustment result"
+            );
+
             match adjustment {
                 TopologyAdjustment::AddConnections(target_locs) => {
+                    tracing::info!(
+                        "Adding {} locations to pending connections (total pending: {})",
+                        target_locs.len(),
+                        pending_conn_adds.len() + target_locs.len()
+                    );
                     pending_conn_adds.extend(target_locs);
                 }
                 TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
@@ -515,6 +553,15 @@ impl Ring {
         notifier: &EventLoopNotificationsSender,
         live_tx_tracker: &LiveTransactionTracker,
     ) -> anyhow::Result<Option<Transaction>> {
+        let current_connections = self.connection_manager.get_open_connections();
+        let is_gateway = self.is_gateway;
+
+        tracing::info!(
+            current_connections,
+            is_gateway,
+            "acquire_new: attempting to find peer to query"
+        );
+
         // First find a query target using just the input skip list
         let query_target = {
             let router = self.router.read();
@@ -526,6 +573,12 @@ impl Ring {
             ) {
                 t
             } else {
+                tracing::warn!(
+                    "acquire_new: routing() returned None - cannot find peer to query (connections: {}, is_gateway: {})",
+                    current_connections,
+                    is_gateway
+                );
+
                 return Ok(None);
             }
         };
