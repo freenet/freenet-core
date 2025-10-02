@@ -707,7 +707,11 @@ pub(crate) async fn request_update(
                 return Err(OpError::RingError(RingError::NoCachingPeers(key)));
             }
 
-            // Update the contract locally
+            // Update the contract locally. This path is reached when:
+            // 1. No remote peers are available (isolated node OR no suitable caching peers)
+            // 2. Either seeding the contract OR has subscribers (verified above)
+            // Note: This handles both truly isolated nodes and nodes where subscribers exist
+            // but no suitable remote caching peer was found.
             let updated_value = update_contract(op_manager, key, value, related_contracts).await?;
 
             tracing::debug!(
