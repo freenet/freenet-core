@@ -466,19 +466,12 @@ async fn process_open_request(
                                     }
                                     .into());
 
-                                    let router_tx_clone = router_tx.clone();
-                                    let op_id_clone = op_id;
-                                    tokio::spawn(async move {
-                                        if let Err(e) = router_tx_clone
-                                            .send((op_id_clone, error_response))
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                "Failed to send PUT error to result router: {}. Transaction: {}",
-                                                e, op_id_clone
-                                            );
-                                        }
-                                    });
+                                    if let Err(e) = router_tx.send((op_id, error_response)).await {
+                                        tracing::error!(
+                                            "Failed to send PUT error to result router: {}. Transaction: {}",
+                                            e, op_id
+                                        );
+                                    }
                                 }
                             }
 
@@ -554,18 +547,15 @@ async fn process_open_request(
                                             }
                                             .into());
 
-                                            let router_tx_clone = router_tx.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(e) = router_tx_clone
-                                                    .send((transaction_id, error_response))
-                                                    .await
-                                                {
-                                                    tracing::error!(
-                                                        "Failed to send PUT error to result router: {}. Transaction: {}",
-                                                        e, transaction_id
-                                                    );
-                                                }
-                                            });
+                                            if let Err(e) = router_tx
+                                                .send((transaction_id, error_response))
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    "Failed to send PUT error to result router: {}. Transaction: {}",
+                                                    e, transaction_id
+                                                );
+                                            }
                                         }
                                     }
                                 } else {
@@ -613,19 +603,14 @@ async fn process_open_request(
                                         }
                                         .into());
 
-                                        let router_tx_clone = router_tx.clone();
-                                        let op_id_clone = op_id;
-                                        tokio::spawn(async move {
-                                            if let Err(e) = router_tx_clone
-                                                .send((op_id_clone, error_response))
-                                                .await
-                                            {
-                                                tracing::error!(
-                                                    "Failed to send PUT error to result router: {}. Transaction: {}",
-                                                    e, op_id_clone
-                                                );
-                                            }
-                                        });
+                                        if let Err(e) =
+                                            router_tx.send((op_id, error_response)).await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send PUT error to result router: {}. Transaction: {}",
+                                                e, op_id
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -792,18 +777,14 @@ async fn process_open_request(
                                         }
                                         .into());
 
-                                        let router_tx_clone = router_tx.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(e) = router_tx_clone
-                                                .send((transaction_id, error_response))
-                                                .await
-                                            {
-                                                tracing::error!(
-                                                    "Failed to send UPDATE error to result router: {}. Transaction: {}",
-                                                    e, transaction_id
-                                                );
-                                            }
-                                        });
+                                        if let Err(e) =
+                                            router_tx.send((transaction_id, error_response)).await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send UPDATE error to result router: {}. Transaction: {}",
+                                                e, transaction_id
+                                            );
+                                        }
                                     }
                                 }
                             } else {
@@ -852,19 +833,12 @@ async fn process_open_request(
                                     }
                                     .into());
 
-                                    let router_tx_clone = router_tx.clone();
-                                    let op_id_clone = op_id;
-                                    tokio::spawn(async move {
-                                        if let Err(e) = router_tx_clone
-                                            .send((op_id_clone, error_response))
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                "Failed to send UPDATE error to result router: {}. Transaction: {}",
-                                                e, op_id_clone
-                                            );
-                                        }
-                                    });
+                                    if let Err(e) = router_tx.send((op_id, error_response)).await {
+                                        tracing::error!(
+                                            "Failed to send UPDATE error to result router: {}. Transaction: {}",
+                                            e, op_id
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1026,18 +1000,15 @@ async fn process_open_request(
                                             }
                                             .into());
 
-                                            let router_tx_clone = router_tx.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(e) = router_tx_clone
-                                                    .send((transaction_id, error_response))
-                                                    .await
-                                                {
-                                                    tracing::error!(
-                                                        "Failed to send GET error to result router: {}. Transaction: {}",
-                                                        e, transaction_id
-                                                    );
-                                                }
-                                            });
+                                            if let Err(e) = router_tx
+                                                .send((transaction_id, error_response))
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    "Failed to send GET error to result router: {}. Transaction: {}",
+                                                    e, transaction_id
+                                                );
+                                            }
                                         }
                                     }
                                 } else {
@@ -1080,19 +1051,14 @@ async fn process_open_request(
                                         }
                                         .into());
 
-                                        let router_tx_clone = router_tx.clone();
-                                        let op_id_clone = op_id;
-                                        tokio::spawn(async move {
-                                            if let Err(e) = router_tx_clone
-                                                .send((op_id_clone, error_response))
-                                                .await
-                                            {
-                                                tracing::error!(
-                                                    "Failed to send GET error to result router: {}. Transaction: {}",
-                                                    e, op_id_clone
-                                                );
-                                            }
-                                        });
+                                        if let Err(e) =
+                                            router_tx.send((op_id, error_response)).await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send GET error to result router: {}. Transaction: {}",
+                                                e, op_id
+                                            );
+                                        }
                                     }
                                 }
                             }
