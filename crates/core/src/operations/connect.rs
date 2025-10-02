@@ -184,24 +184,23 @@ impl Operation for ConnectOp {
                     skip_forwards.extend([this_peer.clone(), query_target.peer.clone()]);
                     if this_peer == &query_target.peer {
                         // this peer should be the original target queries
-                        tracing::debug!(
+                        tracing::info!(
                             tx = %id,
                             query_target = %query_target.peer,
                             joiner = %joiner.peer,
-                            skip_connections = ?skip_connections,
-                            skip_forwards = ?skip_forwards,
-                            "Got queried for new connections from joiner",
+                            skip_connections_count = skip_connections.len(),
+                            "Gateway received FindOptimalPeer request from joiner",
                         );
                         if let Some(desirable_peer) = op_manager.ring.closest_to_location(
                             *ideal_location,
                             HashSet::from([joiner.peer.clone()]),
                         ) {
-                            tracing::debug!(
+                            tracing::info!(
                                 tx = %id,
                                 query_target = %query_target.peer,
                                 joiner = %joiner.peer,
                                 desirable_peer = %desirable_peer.peer,
-                                "Found a desirable peer to connect to",
+                                "Gateway found desirable peer, forwarding to joiner",
                             );
                             let msg = create_forward_message(
                                 *id,
@@ -217,11 +216,11 @@ impl Operation for ConnectOp {
                             return_msg = None;
                             new_state = Some(ConnectState::AwaitingConnectionAcquisition {});
                         } else {
-                            tracing::debug!(
+                            tracing::warn!(
                                 tx = %id,
                                 query_target = %query_target.peer,
                                 joiner = %joiner.peer,
-                                "No desirable peer found to connect to",
+                                "Gateway has no desirable peer to offer to joiner",
                             );
                             return_msg = None;
                             new_state = None;
@@ -296,7 +295,7 @@ impl Operation for ConnectOp {
                         .connection_manager
                         .should_accept(joiner_loc, &joiner.peer)
                     {
-                        tracing::debug!(tx = %id, %joiner, "Accepting connection from");
+                        tracing::info!(tx = %id, %joiner, "CheckConnectivity: Accepting connection from, will trigger ConnectPeer");
                         let (callback, mut result) = tokio::sync::mpsc::channel(10);
                         // Attempt to connect to the joiner
                         op_manager
