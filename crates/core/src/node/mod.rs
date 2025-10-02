@@ -389,7 +389,6 @@ async fn report_result(
     op_result: Result<Option<OpEnum>, OpError>,
     op_manager: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
-    _client_req_handler_callback: Option<(Vec<ClientId>, ClientResponsesSender)>,
     event_listener: &mut dyn NetEventRegister,
 ) {
     // Add UPDATE-specific debug logging at the start
@@ -410,11 +409,10 @@ async fn report_result(
                 );
             }
 
-            // NEW: Send to result router if feature flag is enabled and transaction exists
-            // (independent of legacy callback presence)
-            if let (Some(transaction), Some(router_tx)) = (tx, &op_manager.result_router_tx) {
+            // Send to result router
+            if let Some(transaction) = tx {
                 let host_result = op_res.to_host_result();
-                let router_tx_clone = router_tx.clone();
+                let router_tx_clone = op_manager.result_router_tx.clone();
 
                 // Spawn fire-and-forget task to avoid blocking report_result()
                 // while still guaranteeing message delivery
@@ -563,8 +561,10 @@ macro_rules! handle_op_not_available {
     };
 }
 
+/// Legacy process_message - only kept for testing_impl
+/// Production code uses process_message_decoupled instead
 #[allow(clippy::too_many_arguments)]
-async fn process_message<CB>(
+pub(super) async fn process_message<CB>(
     msg: NetMessage,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
@@ -667,13 +667,12 @@ async fn process_message_v1<CB>(
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
-    client_req_handler_callback: Option<ClientResponsesSender>,
-    client_id: Option<Vec<ClientId>>,
+    _client_req_handler_callback: Option<ClientResponsesSender>,
+    _client_id: Option<Vec<ClientId>>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge,
 {
-    let cli_req = client_id.zip(client_req_handler_callback);
     event_listener
         .register_events(NetEventLog::from_inbound_msg_v1(&msg, &op_manager))
         .await;
@@ -701,7 +700,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;
@@ -728,7 +726,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;
@@ -751,7 +748,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;
@@ -778,7 +774,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;
@@ -802,7 +797,6 @@ async fn process_message_v1<CB>(
                     op_result,
                     &op_manager,
                     executor_callback,
-                    cli_req,
                     &mut *event_listener,
                 )
                 .await;

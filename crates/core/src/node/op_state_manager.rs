@@ -70,7 +70,7 @@ pub(crate) struct OpManager {
     to_event_listener: EventLoopNotificationsSender,
     pub ch_outbound: ContractHandlerChannel<SenderHalve>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
-    pub result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
+    pub result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     /// Indicates whether the peer is ready to process client operations.
     /// For gateways: always true (peer_id is set from config)
     /// For regular peers: true only after first successful network handshake sets peer_id
@@ -86,7 +86,7 @@ impl OpManager {
         config: &NodeConfig,
         event_register: ER,
         connection_manager: ConnectionManager,
-        result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
+        result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     ) -> anyhow::Result<Self> {
         let ring = Ring::new(
             config,

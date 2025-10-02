@@ -940,7 +940,6 @@ where
                     Err(err.into()),
                     &op_manager,
                     None,
-                    None,
                     &mut *event_register as &mut _,
                 )
                 .await;

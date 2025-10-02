@@ -42,10 +42,7 @@ use crate::{
         NetworkEventListenerHalve, WaitingResolution,
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction},
-    node::{
-        handle_aborted_op, process_message, process_message_decoupled, NetEventRegister,
-        NodeConfig, OpManager,
-    },
+    node::{handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager},
     ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
@@ -131,7 +128,7 @@ pub(in crate::node) struct P2pConnManager {
     bandwidth_limit: Option<usize>,
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// MessageProcessor for clean client handling separation
-    message_processor: Option<Arc<MessageProcessor>>,
+    message_processor: Arc<MessageProcessor>,
 }
 
 impl P2pConnManager {
@@ -139,6 +136,7 @@ impl P2pConnManager {
         config: &NodeConfig,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
+        message_processor: Arc<MessageProcessor>,
     ) -> anyhow::Result<Self> {
         let listen_port = config.network_listener_port;
         let listener_ip = config.network_listener_ip;
@@ -162,14 +160,8 @@ impl P2pConnManager {
             check_version: !config.config.network_api.ignore_protocol_version,
             bandwidth_limit: config.config.network_api.bandwidth_limit,
             blocked_addresses: config.blocked_addresses.clone(),
-            message_processor: None, // Will be set later based on configuration
+            message_processor,
         })
-    }
-
-    /// Set the MessageProcessor for Phase 4 network decoupling
-    pub fn with_message_processor(mut self, message_processor: Arc<MessageProcessor>) -> Self {
-        self.message_processor = Some(message_processor);
-        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -606,23 +598,16 @@ impl P2pConnManager {
                             } => {
                                 tracing::info!("Received LocalSubscribeComplete event for transaction: {tx}, contract: {key}");
 
-                                // Deliver SubscribeResponse directly to result router (actor mode)
-                                // Following Nacho's suggestion to tap into result router without state transitions
-                                if let Some(result_router) = &op_manager.result_router_tx {
-                                    tracing::info!("Sending SubscribeResponse to result router for transaction: {tx}");
-                                    use freenet_stdlib::client_api::{
-                                        ContractResponse, HostResponse,
-                                    };
-                                    let response = Ok(HostResponse::ContractResponse(
-                                        ContractResponse::SubscribeResponse { key, subscribed },
-                                    ));
+                                // Deliver SubscribeResponse directly to result router
+                                tracing::info!("Sending SubscribeResponse to result router for transaction: {tx}");
+                                use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+                                let response = Ok(HostResponse::ContractResponse(
+                                    ContractResponse::SubscribeResponse { key, subscribed },
+                                ));
 
-                                    match result_router.send((tx, response)).await {
-                                        Ok(()) => tracing::info!("Successfully sent SubscribeResponse to result router for transaction: {tx}"),
-                                        Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
-                                    }
-                                } else {
-                                    tracing::warn!("No result router available for local subscribe completion (legacy mode)");
+                                match op_manager.result_router_tx.send((tx, response)).await {
+                                    Ok(()) => tracing::info!("Successfully sent SubscribeResponse to result router for transaction: {tx}"),
+                                    Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
                                 }
                             }
                             NodeEvent::Disconnect { cause } => {
@@ -728,14 +713,17 @@ impl P2pConnManager {
         msg: NetMessage,
         op_manager: &Arc<OpManager>,
         executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-        cli_response_sender: &ClientResponsesSender,
+        _cli_response_sender: &ClientResponsesSender,
         state: &mut EventListenerState,
     ) {
         let executor_callback = state
             .pending_from_executor
             .remove(msg.id())
             .then(|| executor_listener.callback());
-        let pending_client_req = state
+
+        // Clean up client waiting state even though we don't use it anymore
+        // (MessageProcessor handles all client concerns)
+        let _pending_client_req = state
             .tx_to_client
             .get(msg.id())
             .cloned()
@@ -753,9 +741,6 @@ impl P2pConnManager {
                     ) if contract_key == key.id() => Some(clients.drain().collect::<Vec<_>>()),
                     _ => None,
                 }));
-        let client_req_handler_callback = pending_client_req
-            .is_some()
-            .then(|| cli_response_sender.clone());
 
         let span = tracing::info_span!(
             "process_network_message",
@@ -765,37 +750,23 @@ impl P2pConnManager {
 
         let pending_op_result = state.pending_op_results.get(msg.id()).cloned();
 
-        // Phase 4: Use MessageProcessor for clean client handling separation when available
-        if let Some(message_processor) = &self.message_processor {
-            tracing::debug!("Using PURE network processing - zero client types in network layer for transaction {}", msg.id());
-            GlobalExecutor::spawn(
-                process_message_decoupled(
-                    msg,
-                    op_manager.clone(),
-                    self.bridge.clone(),
-                    self.event_listener.trait_clone(),
-                    executor_callback,
-                    message_processor.clone(),
-                    pending_op_result,
-                )
-                .instrument(span),
-            );
-        } else {
-            // Legacy path - existing behavior
-            GlobalExecutor::spawn(
-                process_message(
-                    msg,
-                    op_manager.clone(),
-                    self.bridge.clone(),
-                    self.event_listener.trait_clone(),
-                    executor_callback,
-                    client_req_handler_callback,
-                    pending_client_req,
-                    pending_op_result,
-                )
-                .instrument(span),
-            );
-        }
+        // Use MessageProcessor for clean client handling separation
+        tracing::debug!(
+            "Using PURE network processing - zero client types in network layer for transaction {}",
+            msg.id()
+        );
+        GlobalExecutor::spawn(
+            process_message_decoupled(
+                msg,
+                op_manager.clone(),
+                self.bridge.clone(),
+                self.event_listener.trait_clone(),
+                executor_callback,
+                self.message_processor.clone(),
+                pending_op_result,
+            )
+            .instrument(span),
+        );
     }
 
     async fn handle_connect_peer(
