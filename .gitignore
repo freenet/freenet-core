@@ -56,9 +56,8 @@ crates/core/tmp_work/
 .swarm/
 test-results/
 
-# Git worktrees
-worktrees/
+# Development artifacts
+.vtcode/
 .worktrees/
-
-# Development logs
-logs/*
+worktrees/
+logs/

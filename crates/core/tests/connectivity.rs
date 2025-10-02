@@ -422,12 +422,7 @@ async fn test_basic_gateway_connectivity() -> TestResult {
 }
 
 // test_three_node_network_connectivity has been removed - see issue #1889
-// This test revealed that the topology manager was requesting duplicate connections,
-// which has been fixed. However, the test also reveals a separate pre-existing issue
-// with gateway connection forwarding that prevents full mesh formation in small networks.
-// The test will be re-added once that separate issue is resolved.
-//
-// The topology fix itself is validated by the unit test:
-// topology::tests::test_no_duplicate_connections_with_few_peers
-//
+// This test revealed a pre-existing bug in the topology manager where adjust_topology()
+// requests duplicate connections to the same peer instead of diversifying connections.
+// The test will be re-added once issue #1889 is resolved.
 // Issue: https://github.com/freenet/freenet-core/issues/1889

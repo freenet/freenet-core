@@ -649,8 +649,14 @@ pub(crate) async fn request_update(
     op_manager: &OpManager,
     mut update_op: UpdateOp,
 ) -> Result<(), OpError> {
-    let key = if let Some(UpdateState::PrepareRequest { key, .. }) = &update_op.state {
-        key
+    // Extract the key and check if we need to handle this locally
+    let (key, value, related_contracts) = if let Some(UpdateState::PrepareRequest {
+        key,
+        value,
+        related_contracts,
+    }) = update_op.state.take()
+    {
+        (key, value, related_contracts)
     } else {
         return Err(OpError::UnexpectedOpState);
     };
@@ -660,7 +666,7 @@ pub(crate) async fn request_update(
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to update
-    let target = if let Some(location) = op_manager.ring.subscribers_of(key) {
+    let target = if let Some(location) = op_manager.ring.subscribers_of(&key) {
         location
             .clone()
             .pop()
@@ -669,14 +675,14 @@ pub(crate) async fn request_update(
         // Find the best peer to send the update to
         let remote_target = op_manager
             .ring
-            .closest_potentially_caching(key, [sender.peer.clone()].as_slice());
+            .closest_potentially_caching(&key, [sender.peer.clone()].as_slice());
 
         if let Some(target) = remote_target {
             // Subscribe to the contract
             op_manager
                 .ring
-                .add_subscriber(key, sender)
-                .map_err(|_| RingError::NoCachingPeers(*key))?;
+                .add_subscriber(&key, sender)
+                .map_err(|_| RingError::NoCachingPeers(key))?;
 
             target
         } else {
@@ -686,46 +692,138 @@ pub(crate) async fn request_update(
                 key
             );
 
-            // Target ourselves for the update
-            sender.clone()
+            let id = update_op.id;
+
+            // Check if we're seeding or subscribed to this contract
+            let is_seeding = op_manager.ring.is_seeding_contract(&key);
+            let has_subscribers = op_manager.ring.subscribers_of(&key).is_some();
+            let should_handle_update = is_seeding || has_subscribers;
+
+            if !should_handle_update {
+                tracing::error!(
+                    "UPDATE: Cannot update contract {} on isolated node - contract not seeded and no subscribers",
+                    key
+                );
+                return Err(OpError::RingError(RingError::NoCachingPeers(key)));
+            }
+
+            // Update the contract locally. This path is reached when:
+            // 1. No remote peers are available (isolated node OR no suitable caching peers)
+            // 2. Either seeding the contract OR has subscribers (verified above)
+            // Note: This handles both truly isolated nodes and nodes where subscribers exist
+            // but no suitable remote caching peer was found.
+            let updated_value = update_contract(op_manager, key, value, related_contracts).await?;
+
+            tracing::debug!(
+                tx = %id,
+                %key,
+                "Successfully updated contract locally on isolated node"
+            );
+
+            // Check if there are any subscribers to broadcast to
+            let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
+
+            if broadcast_to.is_empty() {
+                // No subscribers - operation complete
+                tracing::debug!(
+                    tx = %id,
+                    %key,
+                    "No broadcast targets, completing UPDATE operation locally"
+                );
+
+                // Set up state for SuccessfulUpdate message handling
+                update_op.state = Some(UpdateState::AwaitingResponse {
+                    key,
+                    upstream: None,
+                });
+
+                // Create a StateSummary from the updated value
+                let raw_state = State::from(updated_value);
+                let summary = StateSummary::from(raw_state.into_bytes());
+
+                // Create a SuccessfulUpdate message to trigger the completion handling
+                let success_msg = UpdateMsg::SuccessfulUpdate {
+                    id,
+                    target: sender.clone(),
+                    summary,
+                    sender: sender.clone(),
+                    key,
+                };
+
+                // Use notify_op_change to trigger the completion handling
+                op_manager
+                    .notify_op_change(NetMessage::from(success_msg), OpEnum::Update(update_op))
+                    .await?;
+
+                return Ok(());
+            } else {
+                // There are subscribers - broadcast the update
+                tracing::debug!(
+                    tx = %id,
+                    %key,
+                    subscribers = broadcast_to.len(),
+                    "Broadcasting UPDATE to subscribers on isolated node"
+                );
+
+                let broadcast_state = Some(UpdateState::ReceivedRequest);
+
+                let (new_state, return_msg) = try_to_broadcast(
+                    id,
+                    false,
+                    op_manager,
+                    broadcast_state,
+                    (broadcast_to, sender.clone()),
+                    key,
+                    updated_value,
+                    false,
+                )
+                .await?;
+
+                update_op.state = new_state;
+
+                if let Some(msg) = return_msg {
+                    op_manager
+                        .notify_op_change(NetMessage::from(msg), OpEnum::Update(update_op))
+                        .await?;
+                } else {
+                    // Complete the operation locally if no further messages needed
+                    let raw_state = State::from(WrappedState::new(vec![]));
+                    let summary = StateSummary::from(raw_state.into_bytes());
+                    update_op.state = Some(UpdateState::Finished { key, summary });
+                }
+
+                return Ok(());
+            }
         }
     };
 
+    // Normal case: we found a remote target
     let id = update_op.id;
     if let Some(stats) = &mut update_op.stats {
         stats.target = Some(target.clone());
     }
 
-    match update_op.state {
-        Some(UpdateState::PrepareRequest {
-            key,
-            value,
-            related_contracts,
-        }) => {
-            let new_state = Some(UpdateState::AwaitingResponse {
-                key,
-                upstream: None,
-            });
-            let msg = UpdateMsg::RequestUpdate {
-                id,
-                key,
-                related_contracts,
-                target,
-                value,
-            };
-
-            let op = UpdateOp {
-                state: new_state,
-                id,
-                stats: update_op.stats,
-            };
-
-            op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Update(op))
-                .await?;
-        }
-        _ => return Err(OpError::invalid_transition(update_op.id)),
+    let new_state = Some(UpdateState::AwaitingResponse {
+        key,
+        upstream: None,
+    });
+    let msg = UpdateMsg::RequestUpdate {
+        id,
+        key,
+        related_contracts,
+        target,
+        value,
     };
+
+    let op = UpdateOp {
+        state: new_state,
+        id,
+        stats: update_op.stats,
+    };
+
+    op_manager
+        .notify_op_change(NetMessage::from(msg), OpEnum::Update(op))
+        .await?;
 
     Ok(())
 }

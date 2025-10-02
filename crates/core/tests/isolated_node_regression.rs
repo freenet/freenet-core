@@ -5,13 +5,14 @@
 //! 2. GET operations retrieve from local cache without self-routing attempts
 //! 3. Complete PUT→GET workflow functions properly on isolated nodes
 //! 4. SUBSCRIBE operations complete successfully for local contracts
+//! 5. UPDATE operations complete successfully for local contracts
 
 use freenet::{
     config::{ConfigArgs, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{load_contract, make_get, make_put, make_subscribe},
+    test_utils::{load_contract, make_get, make_put, make_subscribe, make_update},
 };
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
@@ -574,6 +575,210 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
             .send(ClientRequest::Disconnect { cause: None })
             .await?;
         client2
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // Run node and test concurrently
+    select! {
+        _ = node_handle => {
+            error!("Node exited unexpectedly");
+            panic!("Node should not exit during test");
+        }
+        result = test_result => {
+            result??;
+            // Give time for cleanup
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Test UPDATE operation on isolated node
+///
+/// This regression test verifies UPDATE operations on isolated nodes:
+/// - PUT operation caches contract locally
+/// - UPDATE operation updates the contract state
+/// - UPDATE returns UpdateResponse without timeout (issue #1884)
+/// - GET operation retrieves updated state
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_isolated_node_update_operation() -> anyhow::Result<()> {
+    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
+
+    // Start a single isolated node (no peers)
+    let ws_port = 50702;
+    let network_port = 50703;
+    let (config, _temp_dir) = create_test_node_config(true, ws_port, Some(network_port)).await?;
+
+    // Load test contract and state
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+    let initial_state = freenet::test_utils::create_empty_todo_list();
+    let wrapped_initial_state = WrappedState::from(initial_state);
+
+    // Start the node
+    let node_handle = {
+        let config = config.clone();
+        async move {
+            let built_config = config.build().await?;
+            let node = NodeConfig::new(built_config.clone())
+                .await?
+                .build(serve_gateway(built_config.ws_api).await)
+                .await?;
+            node.run().await
+        }
+        .boxed_local()
+    };
+
+    // Run the test with timeout
+    let test_result = timeout(Duration::from_secs(60), async {
+        // Give node time to start - critical for proper initialization
+        println!("Waiting for node to start up...");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        println!("Node should be ready, proceeding with test...");
+
+        // Connect to the node
+        let url = format!(
+            "ws://localhost:{}/v1/contract/command?encodingProtocol=native",
+            ws_port
+        );
+        let (ws_stream, _) = connect_async(&url).await?;
+        let mut client = WebApi::start(ws_stream);
+
+        println!("Step 1: Performing PUT operation to cache contract locally");
+
+        // Perform PUT operation - this caches the contract locally
+        let put_start = std::time::Instant::now();
+        make_put(
+            &mut client,
+            wrapped_initial_state.clone(),
+            contract.clone(),
+            false,
+        )
+        .await?;
+
+        // Wait for PUT response
+        let put_result = timeout(Duration::from_secs(30), client.recv()).await;
+        let put_elapsed = put_start.elapsed();
+
+        match put_result {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+                println!("PUT operation successful in {:?}", put_elapsed);
+            }
+            Ok(Ok(other)) => {
+                panic!("Unexpected PUT response: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                panic!("PUT operation failed: {}", e);
+            }
+            Err(_) => {
+                panic!("PUT operation timed out");
+            }
+        }
+
+        println!("Step 2: Performing UPDATE operation with new state");
+
+        // Create updated state (add a todo item)
+        let updated_state = freenet::test_utils::create_todo_list_with_item("Test task");
+        let wrapped_updated_state = WrappedState::from(updated_state);
+
+        // Perform UPDATE operation
+        let update_start = std::time::Instant::now();
+        make_update(&mut client, contract_key, wrapped_updated_state.clone()).await?;
+
+        // Wait for UPDATE response
+        let update_result = timeout(Duration::from_secs(15), client.recv()).await;
+        let update_elapsed = update_start.elapsed();
+
+        // REGRESSION TEST: Verify UPDATE completed quickly without timeout (issue #1884)
+        // The bug causes UPDATE to timeout after 10 seconds, so we check it completes in < 10 seconds
+        assert!(
+            update_elapsed < Duration::from_secs(10),
+            "UPDATE should complete quickly on isolated node, not timeout. Elapsed: {:?}",
+            update_elapsed
+        );
+
+        // Verify UPDATE succeeded
+        match update_result {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key,
+                ..
+            }))) => {
+                assert_eq!(key, contract_key);
+                println!("UPDATE operation successful in {:?}", update_elapsed);
+            }
+            Ok(Ok(other)) => {
+                panic!("Unexpected UPDATE response: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                panic!("UPDATE operation failed: {}", e);
+            }
+            Err(_) => {
+                panic!("UPDATE operation timed out (this is the bug in issue #1884)");
+            }
+        }
+
+        println!("Step 3: Performing GET operation to verify updated state");
+
+        // Verify the state was updated by performing a GET
+        let get_start = std::time::Instant::now();
+        make_get(&mut client, contract_key, true, false).await?;
+
+        let get_result = timeout(Duration::from_secs(10), client.recv()).await;
+        let get_elapsed = get_start.elapsed();
+
+        match get_result {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                state: recv_state,
+                ..
+            }))) => {
+                // Parse both states to verify the tasks were updated correctly
+                // Note: UPDATE operations may modify the version number, so we check the tasks array
+                let recv_str = String::from_utf8_lossy(recv_state.as_ref());
+                println!("Received state after UPDATE: {}", recv_str);
+
+                // Verify the state contains the expected task
+                assert!(
+                    recv_str.contains("\"title\":\"Test task\""),
+                    "State should contain the updated task 'Test task'"
+                );
+                assert!(
+                    recv_str.contains("\"tasks\":["),
+                    "State should have tasks array"
+                );
+
+                // Verify it's not the empty state
+                assert!(
+                    !recv_str.contains("\"tasks\":[]"),
+                    "Tasks array should not be empty after update"
+                );
+
+                println!(
+                    "GET operation successful, state correctly updated in {:?}",
+                    get_elapsed
+                );
+            }
+            Ok(Ok(other)) => {
+                panic!("Unexpected GET response: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                panic!("GET operation failed: {}", e);
+            }
+            Err(_) => {
+                panic!("GET operation timed out");
+            }
+        }
+
+        println!("PUT-UPDATE-GET workflow completed successfully on isolated node");
+
+        // Properly close the client
+        client
             .send(ClientRequest::Disconnect { cause: None })
             .await?;
         tokio::time::sleep(Duration::from_millis(100)).await;

@@ -62,7 +62,7 @@ impl ConnectOp {
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
-        // this should't ever be called since clients can't request explicit connects
+        // this shouldn't ever be called since clients can't request explicit connects
         Ok(HostResponse::Ok)
     }
 }
@@ -352,6 +352,7 @@ impl Operation for ConnectOp {
                                 skip_forwards: skip_forwards.clone(),
                                 req_peer: sender.clone(),
                                 joiner: joiner.clone(),
+                                is_gateway: op_manager.ring.is_gateway,
                             },
                         )
                         .await?
@@ -402,14 +403,15 @@ impl Operation for ConnectOp {
                     match self.state.as_mut() {
                         Some(ConnectState::ConnectingToNode(info)) => {
                             assert!(info.remaining_connections > 0);
-                            let remaining_connetions = info.remaining_connections.saturating_sub(1);
+                            let remaining_connections =
+                                info.remaining_connections.saturating_sub(1);
 
                             if *accepted {
                                 tracing::debug!(
                                     tx = %id,
                                     at = %this_peer_id,
                                     from = %sender.peer,
-                                    connectect_to = %acceptor.peer,
+                                    connected_to = %acceptor.peer,
                                     "Open connection acknowledged at requesting joiner peer",
                                 );
                                 info.accepted_by.insert(acceptor.clone());
@@ -444,7 +446,7 @@ impl Operation for ConnectOp {
                                 .connection_manager
                                 .update_location(target.location);
 
-                            if remaining_connetions == 0 {
+                            if remaining_connections == 0 {
                                 tracing::debug!(
                                     tx = %id,
                                     at = %this_peer_id,
@@ -464,6 +466,7 @@ impl Operation for ConnectOp {
                         Some(ConnectState::AwaitingConnectivity(ConnectivityInfo {
                             remaining_checks,
                             requester,
+                            ..
                         })) => {
                             assert!(*remaining_checks > 0);
                             let remaining_checks = remaining_checks.saturating_sub(1);
@@ -486,11 +489,9 @@ impl Operation for ConnectOp {
                                 );
                                 new_state = None;
                             } else {
-                                new_state =
-                                    Some(ConnectState::AwaitingConnectivity(ConnectivityInfo {
-                                        remaining_checks,
-                                        requester: requester.clone(),
-                                    }));
+                                new_state = Some(ConnectState::AwaitingConnectivity(
+                                    ConnectivityInfo::new(requester.clone(), remaining_checks),
+                                ));
                             }
                             let response = ConnectResponse::AcceptedBy {
                                 accepted: *accepted,
@@ -629,6 +630,9 @@ pub enum ConnectState {
 pub(crate) struct ConnectivityInfo {
     remaining_checks: usize,
     requester: Requester,
+    /// Indicates this is a gateway bootstrap acceptance that should be registered immediately.
+    /// See forward_conn() bootstrap logic and handshake handler for details.
+    pub(crate) is_bootstrap_acceptance: bool,
 }
 
 impl ConnectivityInfo {
@@ -636,6 +640,15 @@ impl ConnectivityInfo {
         Self {
             requester,
             remaining_checks,
+            is_bootstrap_acceptance: false,
+        }
+    }
+
+    pub fn new_bootstrap(requester: Requester, remaining_checks: usize) -> Self {
+        Self {
+            requester,
+            remaining_checks,
+            is_bootstrap_acceptance: true,
         }
     }
 
@@ -673,8 +686,6 @@ impl ConnectState {
 /// - gateways: Inmutable list of known gateways. Passed when starting up the node.
 ///   After the initial connections through the gateways are established all other connections
 ///   (to gateways or regular peers) will be treated as regular connections.
-///
-/// - is_gateway: Whether this peer is a gateway or not.
 pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
     gateways: &[PeerKeyLocation],
@@ -991,10 +1002,12 @@ pub(crate) struct ForwardParams {
     pub accepted: bool,
     /// Avoid connecting to these peers.
     pub skip_connections: HashSet<PeerId>,
-    /// Avoif forwarding to these peers.
+    /// Avoid forwarding to these peers.
     pub skip_forwards: HashSet<PeerId>,
     pub req_peer: PeerKeyLocation,
     pub joiner: PeerKeyLocation,
+    /// Whether this node is a gateway
+    pub is_gateway: bool,
 }
 
 pub(crate) async fn forward_conn<NB>(
@@ -1015,57 +1028,123 @@ where
         mut skip_forwards,
         req_peer,
         joiner,
+        is_gateway,
     } = params;
     if left_htl == 0 {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
-            "Couldn't forward connect petition, no hops left or enough connections",
+            "Couldn't forward connect petition, no hops left",
         );
         return Ok(None);
     }
 
-    if connection_manager.num_connections() == 0 {
-        tracing::warn!(
-            tx = %id,
-            joiner = %joiner.peer,
-            "Couldn't forward connect petition, not enough connections",
-        );
-        return Ok(None);
+    let num_connections = connection_manager.num_connections();
+    let num_reserved = connection_manager.get_reserved_connections();
+
+    tracing::debug!(
+        tx = %id,
+        joiner = %joiner.peer,
+        num_connections = %num_connections,
+        num_reserved = %num_reserved,
+        is_gateway = %is_gateway,
+        accepted = %accepted,
+        "forward_conn: checking connection forwarding",
+    );
+
+    // Special case: Gateway bootstrap when starting with zero connections AND only one reserved
+    // Note: num_reserved will be 1 (not 0) because should_accept() already reserved a slot
+    // for this connection. This ensures only the very first connection is accepted directly,
+    // avoiding race conditions where multiple concurrent join attempts would all be accepted directly.
+    //
+    // IMPORTANT: Bootstrap acceptances are marked with is_bootstrap_acceptance=true so that
+    // the handshake handler (see handshake.rs forward_or_accept_join) can immediately register
+    // the connection in the ring. This bypasses the normal CheckConnectivity flow which doesn't
+    // apply to bootstrap since:
+    // 1. There are no other peers to forward to
+    // 2. The "already connected" bug doesn't apply (this is the first connection)
+    // 3. We need the connection registered so the gateway can respond to FindOptimalPeer requests
+    //
+    // See PR #1871 discussion with @iduartgomez for context.
+    if num_connections == 0 {
+        if num_reserved == 1 && is_gateway && accepted {
+            tracing::info!(
+                tx = %id,
+                joiner = %joiner.peer,
+                "Gateway bootstrap: accepting first connection directly (will register immediately)",
+            );
+            let connectivity_info = ConnectivityInfo::new_bootstrap(
+                joiner.clone(),
+                1, // Single check for direct connection
+            );
+            return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
+        } else {
+            tracing::debug!(
+                tx = %id,
+                joiner = %joiner.peer,
+                is_gateway = %is_gateway,
+                num_reserved = %num_reserved,
+                "Cannot forward or accept: no existing connections, or reserved connections pending",
+            );
+            return Ok(None);
+        }
     }
 
-    let target_peer = {
-        let router = router.read();
-        select_forward_target(
-            id,
-            connection_manager,
-            &router,
-            &req_peer,
-            &joiner,
-            left_htl,
-            &skip_forwards,
-        )
-    };
-    skip_connections.insert(req_peer.peer.clone());
-    skip_forwards.insert(req_peer.peer.clone());
-    match target_peer {
-        Some(target_peer) => {
-            let forward_msg = create_forward_message(
+    // Try to forward the connection request to an existing peer
+    if num_connections > 0 {
+        let target_peer = {
+            let router = router.read();
+            select_forward_target(
                 id,
+                connection_manager,
+                &router,
                 &req_peer,
                 &joiner,
-                &target_peer,
                 left_htl,
-                max_htl,
-                skip_connections,
-                skip_forwards,
-            );
-            tracing::debug!(target: "network", "Forwarding connection request to {:?}", target_peer);
-            network_bridge.send(&target_peer.peer, forward_msg).await?;
-            update_state_with_forward_info(&req_peer, left_htl)
+                &skip_forwards,
+            )
+        };
+
+        skip_connections.insert(req_peer.peer.clone());
+        skip_forwards.insert(req_peer.peer.clone());
+
+        match target_peer {
+            Some(target_peer) => {
+                // Successfully found a peer to forward to
+                let forward_msg = create_forward_message(
+                    id,
+                    &req_peer,
+                    &joiner,
+                    &target_peer,
+                    left_htl,
+                    max_htl,
+                    skip_connections,
+                    skip_forwards,
+                );
+                tracing::debug!(
+                    target: "network",
+                    tx = %id,
+                    "Forwarding connection request to {:?}",
+                    target_peer
+                );
+                network_bridge.send(&target_peer.peer, forward_msg).await?;
+                return update_state_with_forward_info(&req_peer, left_htl);
+            }
+            None => {
+                // Couldn't find suitable peer to forward to
+                tracing::debug!(
+                    tx = %id,
+                    joiner = %joiner.peer,
+                    "No suitable peer found for forwarding despite having {} connections",
+                    num_connections
+                );
+                return Ok(None);
+            }
         }
-        None => handle_unforwardable_connection(id, accepted),
     }
+
+    // Should be unreachable - we either forwarded or returned None
+    unreachable!("forward_conn should have returned by now")
 }
 
 fn select_forward_target(
@@ -1133,21 +1212,6 @@ fn update_state_with_forward_info(
     let connecivity_info = ConnectivityInfo::new(requester.clone(), left_htl);
     let new_state = ConnectState::AwaitingConnectivity(connecivity_info);
     Ok(Some(new_state))
-}
-
-fn handle_unforwardable_connection(
-    id: Transaction,
-    accepted: bool,
-) -> Result<Option<ConnectState>, OpError> {
-    if accepted {
-        tracing::warn!(
-            tx = %id,
-            "Unable to forward, will only be connecting to one peer",
-        );
-    } else {
-        tracing::warn!(tx = %id, "Unable to forward or accept any connections");
-    }
-    Ok(None)
 }
 
 mod messages {

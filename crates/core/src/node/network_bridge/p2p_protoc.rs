@@ -203,6 +203,7 @@ impl P2pConnManager {
                 self.bridge.op_manager.ring.connection_manager.clone(),
                 self.bridge.op_manager.ring.router.clone(),
                 self.this_location,
+                self.is_gateway,
             );
 
         loop {
@@ -849,6 +850,7 @@ impl P2pConnManager {
                 joiner,
                 op,
                 forward_info,
+                is_bootstrap,
             } => {
                 if let Some(blocked_addrs) = &self.blocked_addresses {
                     if blocked_addrs.contains(&joiner.addr) {
@@ -861,13 +863,32 @@ impl P2pConnManager {
                 }
                 let (tx, rx) = mpsc::channel(1);
                 self.connections.insert(joiner.clone(), tx);
-                // IMPORTANT: Do NOT add connection to ring here!
+
+                // IMPORTANT: Normally we do NOT add connection to ring here!
                 // Connection should only be added after StartJoinReq is accepted
                 // via CheckConnectivity. This prevents the "already connected" bug
                 // where gateways reject valid join requests.
                 //
-                // The connection will be properly added in the CheckConnectivity
-                // handler when should_accept() returns true.
+                // EXCEPTION: Gateway bootstrap (is_bootstrap=true)
+                // When a gateway accepts its very first connection (bootstrap case),
+                // we must register it immediately so the gateway can respond to
+                // FindOptimalPeer requests from subsequent joiners. Bootstrap connections
+                // bypass the normal CheckConnectivity flow. See forward_conn() in
+                // connect.rs and PR #1871 for full explanation.
+                if is_bootstrap {
+                    let location = Location::from_address(&joiner.addr);
+                    tracing::info!(
+                        %id,
+                        %joiner,
+                        %location,
+                        "Bootstrap connection: immediately registering in ring"
+                    );
+                    self.bridge
+                        .op_manager
+                        .ring
+                        .add_connection(location, joiner.clone(), true)
+                        .await;
+                }
 
                 if let Some(op) = op {
                     self.bridge
