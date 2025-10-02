@@ -223,39 +223,31 @@ impl NodeP2P {
         // Prepare session adapter channel for actor-based client management
         let (session_tx, session_rx) = tokio::sync::mpsc::channel(1000);
 
-        // Install session adapter in contract handler if migration enabled
-        let result_router_tx = if config.config.actor_clients {
-            ch_outbound.with_session_adapter(session_tx.clone());
+        // Install session adapter in contract handler
+        ch_outbound.with_session_adapter(session_tx.clone());
 
-            // Create result router channel for dual-path result delivery
-            let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(1000);
+        // Create result router channel for dual-path result delivery
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(1000);
 
-            // Spawn Session Actor
-            use crate::client_events::session_actor::SessionActor;
-            let session_actor = SessionActor::new(session_rx, cli_response_sender.clone());
-            GlobalExecutor::spawn(async move {
-                tracing::info!("Session actor starting");
-                session_actor.run().await;
-                tracing::warn!("Session actor stopped");
-            });
+        // Spawn Session Actor
+        use crate::client_events::session_actor::SessionActor;
+        let session_actor = SessionActor::new(session_rx, cli_response_sender.clone());
+        GlobalExecutor::spawn(async move {
+            tracing::info!("Session actor starting");
+            session_actor.run().await;
+            tracing::warn!("Session actor stopped");
+        });
 
-            // Spawn ResultRouter task
-            use crate::client_events::result_router::ResultRouter;
-            let router = ResultRouter::new(result_router_rx, session_tx.clone());
-            GlobalExecutor::spawn(async move {
-                tracing::info!("Result router starting");
-                router.run().await;
-                tracing::warn!("Result router stopped");
-            });
+        // Spawn ResultRouter task
+        use crate::client_events::result_router::ResultRouter;
+        let router = ResultRouter::new(result_router_rx, session_tx.clone());
+        GlobalExecutor::spawn(async move {
+            tracing::info!("Result router starting");
+            router.run().await;
+            tracing::warn!("Result router stopped");
+        });
 
-            tracing::info!(
-                "Actor-based client management infrastructure installed with result router"
-            );
-            Some(result_router_tx)
-        } else {
-            tracing::debug!("Actor-based client management disabled");
-            None
-        };
+        tracing::info!("Actor-based client management infrastructure installed with result router");
 
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
@@ -264,7 +256,7 @@ impl NodeP2P {
             &config,
             event_register.clone(),
             connection_manager,
-            result_router_tx,
+            Some(result_router_tx),
         )?);
         let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
@@ -274,22 +266,14 @@ impl NodeP2P {
         let mut conn_manager =
             P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
 
-        // Phase 4: Configure MessageProcessor for clean client handling separation
-        let use_actor_clients = config.config.actor_clients;
-        if use_actor_clients {
-            // Clone session_tx before using it in MessageProcessor
-            let session_tx_for_processor = session_tx.clone();
+        // Configure MessageProcessor for client handling separation
+        let session_tx_for_processor = session_tx.clone();
 
-            // Create MessageProcessor for actor mode - direct to SessionActor
-            use crate::node::MessageProcessor;
-            let message_processor = Arc::new(MessageProcessor::new(session_tx_for_processor));
-            conn_manager = conn_manager.with_message_processor(message_processor);
-            tracing::info!("P2P layer configured with MessageProcessor in ACTOR mode - network processing will be decoupled from client handling");
-        } else {
-            tracing::info!(
-                "P2P layer using legacy client handling - MessageProcessor not configured"
-            );
-        }
+        // Create MessageProcessor - direct to SessionActor
+        use crate::node::MessageProcessor;
+        let message_processor = Arc::new(MessageProcessor::new(session_tx_for_processor));
+        conn_manager = conn_manager.with_message_processor(message_processor);
+        tracing::info!("P2P layer configured with MessageProcessor - network processing decoupled from client handling");
 
         let parent_span = tracing::Span::current();
         let contract_executor_task = GlobalExecutor::spawn({

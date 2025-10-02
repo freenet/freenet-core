@@ -76,11 +76,6 @@ pub struct ConfigArgs {
     #[arg(long, hide = true)]
     pub id: Option<String>,
 
-    /// Enable actor-based client management system for improved scalability and monitoring.
-    /// This is now enabled by default. Set to false to use legacy client management.
-    #[arg(long, env = "FREENET_ACTOR_CLIENTS", default_value = "true", action = clap::ArgAction::Set)]
-    pub actor_clients: bool,
-
     /// Show the version of the application.
     #[arg(long, short)]
     pub version: bool,
@@ -111,7 +106,6 @@ impl Default for ConfigArgs {
             log_level: Some(tracing::log::LevelFilter::Info),
             config_paths: Default::default(),
             id: None,
-            actor_clients: true,
             version: false,
         }
     }
@@ -374,7 +368,6 @@ impl ConfigArgs {
             gateways: gateways.gateways.clone(),
             is_gateway: self.network_api.is_gateway,
             location: self.network_api.location,
-            actor_clients: self.actor_clients,
         };
 
         fs::create_dir_all(this.config_dir())?;
@@ -458,9 +451,6 @@ pub struct Config {
     pub(crate) gateways: Vec<GatewayConfig>,
     pub(crate) is_gateway: bool,
     pub(crate) location: Option<f64>,
-    /// Enable actor-based client management system for improved scalability and monitoring
-    #[serde(default)]
-    pub actor_clients: bool,
 }
 
 impl Config {

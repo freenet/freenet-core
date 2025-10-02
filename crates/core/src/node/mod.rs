@@ -389,7 +389,7 @@ async fn report_result(
     op_result: Result<Option<OpEnum>, OpError>,
     op_manager: &OpManager,
     executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
-    client_req_handler_callback: Option<(Vec<ClientId>, ClientResponsesSender)>,
+    _client_req_handler_callback: Option<(Vec<ClientId>, ClientResponsesSender)>,
     event_listener: &mut dyn NetEventRegister,
 ) {
     // Add UPDATE-specific debug logging at the start
@@ -423,7 +423,7 @@ async fn report_result(
                         tracing::error!(
                             "CRITICAL: Result router channel closed - dual-path delivery broken. \
                              Router or session actor has crashed. Transaction: {}. Error: {}. \
-                             Consider restarting node or disabling FREENET_ACTOR_CLIENTS flag.",
+                             Consider restarting node.",
                             transaction,
                             e
                         );
@@ -431,55 +431,6 @@ async fn report_result(
                     }
                 });
             }
-
-            // EXISTING: Legacy client delivery (only when actor_clients is disabled)
-            // When actor_clients is enabled, SessionActor handles all client communication
-            if !op_manager.actor_clients {
-                if let Some((client_ids, cb)) = client_req_handler_callback {
-                    for client_id in client_ids {
-                        // Enhanced logging for UPDATE operations
-                        if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                            tracing::debug!(
-                                "Sending UPDATE response to client {} for transaction {}",
-                                client_id,
-                                update_op.id
-                            );
-
-                            // Log the result being sent
-                            let host_result = op_res.to_host_result();
-                            match &host_result {
-                                Ok(response) => {
-                                    tracing::debug!(
-                                    "Client {} callback found, sending successful UPDATE response: {:?}",
-                                    client_id,
-                                    response
-                                );
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        "Client {} callback found, sending UPDATE error: {:?}",
-                                        client_id,
-                                        error
-                                    );
-                                }
-                            }
-                        } else {
-                            tracing::debug!(?tx, %client_id,  "Sending response to client");
-                        }
-                        // Legacy delivery needs a RequestId - generate one for backward compatibility
-                        use crate::client_events::RequestId;
-                        let _ = cb.send((client_id, RequestId::new(), op_res.to_host_result()));
-                    }
-                } else {
-                    // Log when no client callback is found for UPDATE operations
-                    if let crate::operations::OpEnum::Update(ref update_op) = op_res {
-                        tracing::debug!(
-                        "No client callback found for UPDATE transaction {} - this may indicate a missing client subscription",
-                        update_op.id
-                    );
-                    }
-                }
-            } // End skip_legacy_delivery check
 
             // check operations.rs:handle_op_result to see what's the meaning of each state
             // in case more cases want to be handled when feeding information to the OpManager

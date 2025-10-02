@@ -71,7 +71,6 @@ pub(crate) struct OpManager {
     pub ch_outbound: ContractHandlerChannel<SenderHalve>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
     pub result_router_tx: Option<mpsc::Sender<(Transaction, HostResult)>>,
-    pub actor_clients: bool,
     /// Indicates whether the peer is ready to process client operations.
     /// For gateways: always true (peer_id is set from config)
     /// For regular peers: true only after first successful network handshake sets peer_id
@@ -134,7 +133,6 @@ impl OpManager {
             ch_outbound,
             new_transactions,
             result_router_tx,
-            actor_clients: config.config.actor_clients,
             peer_ready,
             is_gateway,
         })

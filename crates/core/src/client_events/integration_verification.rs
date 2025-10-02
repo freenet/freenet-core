@@ -118,34 +118,6 @@ async fn test_result_router_receives_host_responses() {
 }
 
 #[tokio::test]
-async fn test_flag_disabled_no_router() {
-    // Test that router is not spawned when flag is false
-
-    // Save original state
-    let original = std::env::var("FREENET_ACTOR_CLIENTS").ok();
-
-    // Disable flag
-    std::env::remove_var("FREENET_ACTOR_CLIENTS");
-
-    // Verify flag is disabled
-    let enabled = std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true";
-    assert!(!enabled, "Flag should be disabled");
-
-    // When flag is disabled, router should not be active
-    // This is tested by the NodeP2P::build() logic - when flag is false,
-    // result_router_tx is None, so no router is spawned
-
-    // In a real scenario, we would test NodeP2P::build() directly,
-    // but for this unit test, we verify the flag behavior
-
-    // Restore original state
-    match original {
-        Some(val) => std::env::set_var("FREENET_ACTOR_CLIENTS", val),
-        None => std::env::remove_var("FREENET_ACTOR_CLIENTS"),
-    }
-}
-
-#[tokio::test]
 async fn test_dual_path_identical_results() {
     // Test that dual-path delivery sends identical results to both legacy and router paths
     // This test simulates what happens in report_result when both paths are active
@@ -244,40 +216,6 @@ async fn test_router_receives_results_without_legacy_callback() {
     let router_result = router_rx.recv().await.unwrap();
     assert_eq!(router_result.0, tx);
     assert!(router_result.1.is_ok());
-}
-
-#[test]
-fn test_actor_infrastructure_flag_behavior() {
-    // Test environment flag behavior in different scenarios
-
-    // Save original state
-    let original = std::env::var("FREENET_ACTOR_CLIENTS").ok();
-
-    // Test default (disabled) behavior
-    std::env::remove_var("FREENET_ACTOR_CLIENTS");
-    let disabled = std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true";
-    assert!(!disabled, "Should be disabled by default");
-
-    // Test enabled behavior
-    std::env::set_var("FREENET_ACTOR_CLIENTS", "true");
-    let enabled = std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true";
-    assert!(enabled, "Should be enabled when set to 'true'");
-
-    // Test case sensitivity
-    std::env::set_var("FREENET_ACTOR_CLIENTS", "TRUE");
-    let case_sensitive = std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true";
-    assert!(!case_sensitive, "Should be case-sensitive (TRUE != true)");
-
-    // Test other values
-    std::env::set_var("FREENET_ACTOR_CLIENTS", "1");
-    let numeric = std::env::var("FREENET_ACTOR_CLIENTS").unwrap_or_default() == "true";
-    assert!(!numeric, "Should only accept 'true', not '1'");
-
-    // Restore original state
-    match original {
-        Some(val) => std::env::set_var("FREENET_ACTOR_CLIENTS", val),
-        None => std::env::remove_var("FREENET_ACTOR_CLIENTS"),
-    }
 }
 
 #[tokio::test]
