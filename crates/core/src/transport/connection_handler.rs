@@ -531,13 +531,15 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                     // Also check if a connection attempt is already in progress
                     if ongoing_connections.contains_key(&remote_addr) {
-                        tracing::debug!(%remote_addr, "connection attempt already in progress, rejecting duplicate");
+                        // Duplicate connection attempt - just reject this one
+                        // The first attempt is still in progress and will complete
+                        tracing::info!(%remote_addr, "connection attempt already in progress, rejecting duplicate");
                         let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
                             cause: "connection attempt already in progress".into(),
                         }));
                         continue;
                     }
-                    tracing::debug!(%remote_addr, "attempting to establish connection");
+                    tracing::info!(%remote_addr, "attempting to establish connection");
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,  remote_public_key,
                     );

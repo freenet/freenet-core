@@ -334,19 +334,31 @@ impl Ring {
         location: Location,
         skip_list: HashSet<PeerId>,
     ) -> Option<PeerKeyLocation> {
-        self.connection_manager
-            .get_connections_by_location()
+        let connections = self.connection_manager.get_connections_by_location();
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let total_peers: usize = connections.values().map(|v| v.len()).sum();
+            tracing::debug!(
+                unique_locations = connections.len(),
+                total_peers = total_peers,
+                skip_list_size = skip_list.len(),
+                target_location = %location,
+                "Looking for closest peer to location"
+            );
+            for (loc, peers) in &connections {
+                tracing::debug!(location = %loc, peer_count = peers.len(), "Location has peers");
+            }
+        }
+        connections
             .iter()
             .sorted_by(|(loc_a, _), (loc_b, _)| {
                 loc_a.distance(location).cmp(&loc_b.distance(location))
             })
             .find_map(|(_, conns)| {
-                for _ in 0..conns.len() {
-                    let conn = conns.choose(&mut rand::rng()).unwrap();
-                    let selected =
-                        (!skip_list.contains(&conn.location.peer)).then_some(conn.location.clone());
-                    if selected.is_some() {
-                        return selected;
+                // Try all peers at this location, not just random sampling
+                for conn in conns {
+                    if !skip_list.contains(&conn.location.peer) {
+                        tracing::debug!(selected_peer = %conn.location.peer, "Found closest peer");
+                        return Some(conn.location.clone());
                     }
                 }
                 None
@@ -461,6 +473,10 @@ impl Ring {
                         tracing::info!("Successfully initiated connection acquisition");
                     }
                 } else {
+                    tracing::debug!(
+                        "Skipping connection attempt - live transaction still active, re-queuing location {}",
+                        ideal_location
+                    );
                     pending_conn_adds.insert(ideal_location);
                 }
             }
@@ -562,15 +578,45 @@ impl Ring {
             "acquire_new: attempting to find peer to query"
         );
 
-        // First find a query target using just the input skip list
+        // CRITICAL: Use separate skip lists for routing vs. connection requests
+        //
+        // The routing skip list determines who we can ASK for peer recommendations.
+        // The connection skip list determines who we DON'T want to connect to.
+        //
+        // For peers with few connections (e.g., only gateway), we MUST be able to
+        // route through existing connections to discover new peers. If we filter out
+        // existing connections from routing, peers get stuck unable to find anyone to ask.
+        //
+        // Example scenario:
+        // - Peer has 1 connection (gateway)
+        // - Topology manager suggests random location for diversity
+        // - Old code: adds gateway to routing skip list → routing() returns None → no request sent
+        // - New code: routes through gateway → gateway helps discover other peers → mesh forms
+        //
+        // The skip list for routing should only exclude:
+        // - This peer itself
+        // - Peers we've already tried and failed with (missing candidates)
+        //
+        // The skip list for the FindOptimalPeer request should also exclude:
+        // - Already connected peers (to avoid reconnecting)
+
+        // Find a peer to query (allow routing through existing connections)
         let query_target = {
             let router = self.router.read();
+            let num_connections = self.connection_manager.num_connections();
+            tracing::debug!(
+                %ideal_location,
+                num_connections,
+                skip_list_size = skip_list.len(),
+                "Looking for peer to route through"
+            );
             if let Some(t) = self.connection_manager.routing(
                 ideal_location,
                 None,
-                skip_list, // Use just the input skip list for finding who to query
+                skip_list, // Use just the input skip list (missing candidates + self)
                 &router,
             ) {
+                tracing::debug!(query_target = %t, "Found routing target");
                 t
             } else {
                 tracing::warn!(
@@ -583,8 +629,8 @@ impl Ring {
             }
         };
 
-        // Now create the complete skip list for the connect request
-        let new_skip_list = skip_list
+        // Create skip list for the FindOptimalPeer request (includes already connected peers)
+        let connection_skip_list: HashSet<PeerId> = skip_list
             .iter()
             .copied()
             .cloned()
@@ -592,12 +638,12 @@ impl Ring {
             .collect();
 
         let joiner = self.connection_manager.own_location();
-        tracing::debug!(
+        tracing::info!(
             this_peer = %joiner,
-            %query_target,
+            query_target_peer = %query_target.peer,
             %ideal_location,
-            skip_list = ?new_skip_list,
-            "Adding new connections"
+            skip_connections_count = connection_skip_list.len(),
+            "Sending FindOptimalPeer request via connection_maintenance"
         );
         let missing_connections = self.connection_manager.max_connections - self.open_connections();
         let id = Transaction::new::<connect::ConnectMsg>();
@@ -610,7 +656,7 @@ impl Ring {
                 ideal_location,
                 joiner,
                 max_hops_to_live: missing_connections,
-                skip_connections: new_skip_list,
+                skip_connections: connection_skip_list,
                 skip_forwards: HashSet::new(),
             },
         };
@@ -618,6 +664,7 @@ impl Ring {
             .notifications_sender
             .send(Either::Left(msg.into()))
             .await?;
+        tracing::info!(tx = %id, "FindOptimalPeer request sent");
         Ok(Some(id))
     }
 }
