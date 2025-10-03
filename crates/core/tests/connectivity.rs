@@ -24,7 +24,7 @@ use tracing::level_filters::LevelFilter;
 
 static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
     Mutex::new(rand::rngs::StdRng::from_seed(
-        *b"0102030405060708090a0b0c0d0e0f10",
+        *b"connectivity_test_seed0123456789",
     ))
 });
 
