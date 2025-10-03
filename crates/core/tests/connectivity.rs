@@ -576,8 +576,12 @@ async fn test_three_node_network_connectivity() -> TestResult {
     // Start gateway node
     let gateway = async {
         let config = gateway_config.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
+        let mut node_config = NodeConfig::new(config.clone()).await?;
+        // Configure realistic connection limits for 3-node network
+        // Default is 25 min connections, but max possible here is 2
+        node_config.min_number_of_connections(2);
+        node_config.max_number_of_connections(2);
+        let node = node_config
             .build(serve_gateway(config.ws_api).await)
             .await?;
         tracing::info!("Gateway starting");
@@ -586,11 +590,14 @@ async fn test_three_node_network_connectivity() -> TestResult {
     .boxed_local();
 
     // Start first peer node
+    // Wait 12s to ensure gateway completes aggressive_initial_connections() (10s)
     let peer1 = async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
         let config = peer1_config.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
+        let mut node_config = NodeConfig::new(config.clone()).await?;
+        node_config.min_number_of_connections(2);
+        node_config.max_number_of_connections(2);
+        let node = node_config
             .build(serve_gateway(config.ws_api).await)
             .await?;
         tracing::info!("Peer 1 starting");
@@ -599,11 +606,14 @@ async fn test_three_node_network_connectivity() -> TestResult {
     .boxed_local();
 
     // Start second peer node
+    // Wait 17s (12s gateway + 5s peer1 aggressive phase buffer)
     let peer2 = async move {
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(17)).await;
         let config = peer2_config.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
+        let mut node_config = NodeConfig::new(config.clone()).await?;
+        node_config.min_number_of_connections(2);
+        node_config.max_number_of_connections(2);
+        let node = node_config
             .build(serve_gateway(config.ws_api).await)
             .await?;
         tracing::info!("Peer 2 starting");
@@ -613,9 +623,11 @@ async fn test_three_node_network_connectivity() -> TestResult {
 
     // Main test logic
     let test = tokio::time::timeout(Duration::from_secs(180), async move {
-        // Wait for all nodes to start and connect
+        // Wait for all nodes to start and complete aggressive_initial_connections()
+        // Gateway: 0-10s, Peer1: 12-22s, Peer2: 17-27s
+        // Wait 30s to ensure all aggressive phases complete + buffer
         tracing::info!("Waiting for nodes to start and establish connections...");
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
 
         // Connect to websockets
         let uri_gw =
