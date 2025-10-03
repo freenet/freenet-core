@@ -192,9 +192,11 @@ impl Operation for ConnectOp {
                             skip_forwards = ?skip_forwards,
                             "Got queried for new connections from joiner",
                         );
+                        // Use the full skip_connections set to avoid recommending peers
+                        // that the joiner is already connected to (including the gateway itself)
                         if let Some(desirable_peer) = op_manager.ring.closest_to_location(
                             *ideal_location,
-                            HashSet::from([joiner.peer.clone()]),
+                            skip_connections.iter().cloned().collect(),
                         ) {
                             tracing::debug!(
                                 tx = %id,
