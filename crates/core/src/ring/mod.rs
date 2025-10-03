@@ -335,16 +335,18 @@ impl Ring {
         skip_list: HashSet<PeerId>,
     ) -> Option<PeerKeyLocation> {
         let connections = self.connection_manager.get_connections_by_location();
-        let total_peers: usize = connections.values().map(|v| v.len()).sum();
-        tracing::info!(
-            unique_locations = connections.len(),
-            total_peers = total_peers,
-            skip_list_size = skip_list.len(),
-            target_location = %location,
-            "Looking for closest peer to location"
-        );
-        for (loc, peers) in &connections {
-            tracing::info!(location = %loc, peer_count = peers.len(), "Location has peers");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let total_peers: usize = connections.values().map(|v| v.len()).sum();
+            tracing::debug!(
+                unique_locations = connections.len(),
+                total_peers = total_peers,
+                skip_list_size = skip_list.len(),
+                target_location = %location,
+                "Looking for closest peer to location"
+            );
+            for (loc, peers) in &connections {
+                tracing::debug!(location = %loc, peer_count = peers.len(), "Location has peers");
+            }
         }
         connections
             .iter()
@@ -355,7 +357,7 @@ impl Ring {
                 // Try all peers at this location, not just random sampling
                 for conn in conns {
                     if !skip_list.contains(&conn.location.peer) {
-                        tracing::info!(selected_peer = %conn.location.peer, "Found closest peer");
+                        tracing::debug!(selected_peer = %conn.location.peer, "Found closest peer");
                         return Some(conn.location.clone());
                     }
                 }
