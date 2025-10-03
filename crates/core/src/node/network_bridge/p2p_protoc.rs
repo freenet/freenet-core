@@ -636,15 +636,22 @@ impl P2pConnManager {
         client_wait_for_transaction: &mut ContractHandlerChannel<WaitingResolution>,
         executor_listener: &mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     ) -> anyhow::Result<EventResult> {
+        // IMPORTANT: notification_channel MUST come first to prevent starvation
+        // in busy networks where peer_connections is constantly ready.
+        // We use `biased;` to force sequential polling in source order, ensuring
+        // notification_channel is ALWAYS checked first before peer_connections.
         select! {
-            msg = state.peer_connections.next(), if !state.peer_connections.is_empty() => {
-                self.handle_peer_connection_msg(msg, state, handshake_handler_msg).await
-            }
+            biased;
+            // Process internal notifications FIRST - these drive operation state machines
             msg = notification_channel.notifications_receiver.recv() => {
                 Ok(self.handle_notification_msg(msg))
             }
             msg = notification_channel.op_execution_receiver.recv() => {
                 Ok(self.handle_op_execution(msg, state))
+            }
+            // Network messages come after internal notifications
+            msg = state.peer_connections.next(), if !state.peer_connections.is_empty() => {
+                self.handle_peer_connection_msg(msg, state, handshake_handler_msg).await
             }
             msg = self.conn_bridge_rx.recv() => {
                 Ok(self.handle_bridge_msg(msg))
