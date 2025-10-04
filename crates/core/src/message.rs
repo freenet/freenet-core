@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     client_events::{ClientId, HostResult},
-    node::PeerId,
+    node::{proximity_cache::ProximityCacheMessage, PeerId},
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
@@ -255,6 +255,10 @@ pub(crate) enum NetMessageV1 {
     },
     Update(UpdateMsg),
     Aborted(Transaction),
+    ProximityCache {
+        from: PeerId,
+        message: ProximityCacheMessage,
+    },
 }
 
 trait Versioned {
@@ -279,6 +283,7 @@ impl Versioned for NetMessageV1 {
             NetMessageV1::Unsubscribed { .. } => semver::Version::new(1, 0, 0),
             NetMessageV1::Update(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Aborted(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::ProximityCache { .. } => semver::Version::new(1, 0, 0),
         }
     }
 }
@@ -334,6 +339,11 @@ pub(crate) enum NodeEvent {
         key: ContractKey,
         subscribed: bool,
     },
+    /// Broadcast a ProximityCache message to all connected peers
+    BroadcastProximityCache {
+        from: PeerId,
+        message: crate::node::proximity_cache::ProximityCacheMessage,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +378,7 @@ pub(crate) enum QueryResult {
     },
     NetworkDebug(NetworkDebugInfo),
     NodeDiagnostics(freenet_stdlib::client_api::NodeDiagnosticsResponse),
+    ProximityCache(freenet_stdlib::client_api::ProximityCacheInfo),
 }
 
 impl Display for NodeEvent {
@@ -410,6 +421,9 @@ impl Display for NodeEvent {
                     "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
                 )
             }
+            NodeEvent::BroadcastProximityCache { from, .. } => {
+                write!(f, "BroadcastProximityCache (from {from})")
+            }
         }
     }
 }
@@ -444,6 +458,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Update(op) => op.id(),
             NetMessageV1::Aborted(tx) => tx,
             NetMessageV1::Unsubscribed { transaction, .. } => transaction,
+            NetMessageV1::ProximityCache { .. } => Transaction::NULL,
         }
     }
 
@@ -456,6 +471,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Update(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Aborted(_) => None,
             NetMessageV1::Unsubscribed { .. } => None,
+            NetMessageV1::ProximityCache { .. } => None,
         }
     }
 
@@ -468,6 +484,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Update(op) => op.requested_location(),
             NetMessageV1::Aborted(_) => None,
             NetMessageV1::Unsubscribed { .. } => None,
+            NetMessageV1::ProximityCache { .. } => None,
         }
     }
 }
@@ -486,6 +503,12 @@ impl Display for NetMessage {
                 Aborted(msg) => msg.fmt(f)?,
                 Unsubscribed { key, from, .. } => {
                     write!(f, "Unsubscribed {{  key: {key}, from: {from} }}")?;
+                }
+                ProximityCache { from, message } => {
+                    write!(
+                        f,
+                        "ProximityCache {{  from: {from}, message: {message:?} }}"
+                    )?;
                 }
             },
         };
