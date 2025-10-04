@@ -763,7 +763,9 @@ pub(crate) async fn request_update(
             );
 
             // Check if there are any subscribers to broadcast to
-            let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
+            let broadcast_to = op_manager
+                .get_broadcast_targets_update(&key, &sender.peer)
+                .await;
 
             if broadcast_to.is_empty() {
                 // No subscribers - operation complete

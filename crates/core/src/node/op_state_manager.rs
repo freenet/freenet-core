@@ -77,6 +77,7 @@ pub(crate) struct OpManager {
     pub peer_ready: Arc<AtomicBool>,
     /// Whether this node is a gateway
     pub is_gateway: bool,
+    pub proximity_cache: Option<Arc<crate::node::proximity_cache::ProximityCacheManager>>,
 }
 
 impl OpManager {
@@ -87,6 +88,7 @@ impl OpManager {
         event_register: ER,
         connection_manager: ConnectionManager,
         result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
+        proximity_cache: Option<Arc<crate::node::proximity_cache::ProximityCacheManager>>,
     ) -> anyhow::Result<Self> {
         let ring = Ring::new(
             config,
@@ -135,6 +137,7 @@ impl OpManager {
             result_router_tx,
             peer_ready,
             is_gateway,
+            proximity_cache,
         })
     }
 
