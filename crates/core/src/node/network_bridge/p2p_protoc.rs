@@ -323,7 +323,7 @@ impl P2pConnManager {
                                     let peers_to_cleanup: Vec<_> =
                                         self.connections.keys().cloned().collect();
                                     for peer in peers_to_cleanup {
-                                        tracing::debug!(%peer, "Cleaning up connection due to critical channel closure");
+                                        tracing::debug!(%peer, "Cleaning up active connection due to critical channel closure");
 
                                         // Clean up ring state
                                         self.bridge
