@@ -345,37 +345,255 @@ async fn test_app_ubertest() -> anyhow::Result<()> {
 
         // Step 6: Create room via riverctl on peer 0
         info!("\n--- Step 6: Creating Chat Room (via peer 0) ---");
-        let peer0_ws = format!("ws://127.0.0.1:{}", peer_infos[0].ws_port);
+        let peer0_ws = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            peer_infos[0].ws_port
+        );
+        let peer0_config_dir = peer_infos[0].temp_dir.path().join("river-user0");
+        std::fs::create_dir_all(&peer0_config_dir)?;
 
-        // TODO: Implement riverctl room creation
-        // Command would be something like:
-        // riverctl --ws-url $peer0_ws room create "Test Room"
+        let output = Command::new(&riverctl_path)
+            .env("RIVER_CONFIG_DIR", &peer0_config_dir)
+            .args([
+                "--node-url",
+                &peer0_ws,
+                "--format",
+                "json",
+                "room",
+                "create",
+                "--name",
+                "ubertest-room",
+                "--nickname",
+                "Alice",
+            ])
+            .output()
+            .context("Failed to execute riverctl room create")?;
+
+        if !output.status.success() {
+            bail!(
+                "Room creation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let room_output = String::from_utf8_lossy(&output.stdout);
+        info!("Room creation output: {}", room_output);
+
+        // Parse room ID from JSON output
+        let room_id = if let Some(line) = room_output.lines().find(|l| l.trim().starts_with('{')) {
+            let json: serde_json::Value = serde_json::from_str(line)?;
+            json.get("owner_key")
+                .and_then(|v| v.as_str())
+                .context("Failed to extract room owner_key from response")?
+                .to_string()
+        } else {
+            bail!("No JSON output found in room creation response");
+        };
+
+        info!("Room created with ID: {}", room_id);
+
+        // Step 7: Create invitation
+        info!("\n--- Step 7: Creating Invitation ---");
+        let output = Command::new(&riverctl_path)
+            .env("RIVER_CONFIG_DIR", &peer0_config_dir)
+            .args([
+                "--node-url",
+                &peer0_ws,
+                "--format",
+                "json",
+                "invite",
+                "create",
+                &room_id,
+            ])
+            .output()
+            .context("Failed to execute riverctl invite create")?;
+
+        if !output.status.success() {
+            bail!(
+                "Invitation creation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let invite_output = String::from_utf8_lossy(&output.stdout);
+        info!("Invitation creation output: {}", invite_output);
+
+        // Parse invitation code from JSON output
+        let invitation =
+            if let Some(line) = invite_output.lines().find(|l| l.trim().starts_with('{')) {
+                let json: serde_json::Value = serde_json::from_str(line)?;
+                json.get("invitation_code")
+                    .or_else(|| json.get("invitation"))
+                    .and_then(|v| v.as_str())
+                    .context("Failed to extract invitation from response")?
+                    .to_string()
+            } else {
+                bail!("No JSON output found in invitation response");
+            };
+
         info!(
-            "TODO: Create room via: {} --ws-url {} room create",
-            riverctl_path.display(),
-            peer0_ws
+            "Invitation created: {}...",
+            &invitation[..50.min(invitation.len())]
         );
 
-        // Step 7: Join room via riverctl on peer 1
-        info!("\n--- Step 7: Joining Room (via peer 1) ---");
-        let peer1_ws = format!("ws://127.0.0.1:{}", peer_infos[1].ws_port);
-        info!(
-            "TODO: Join room via: {} --ws-url {} room join",
-            riverctl_path.display(),
-            peer1_ws
+        // Step 8: Accept invitation on peer 1
+        info!("\n--- Step 8: Accepting Invitation (via peer 1) ---");
+        let peer1_ws = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            peer_infos[1].ws_port
         );
+        let peer1_config_dir = peer_infos[1].temp_dir.path().join("river-user1");
+        std::fs::create_dir_all(&peer1_config_dir)?;
 
-        // Step 8: Send message from user 2 -> user 1
-        info!("\n--- Step 8: Sending Message (peer 1 -> peer 0) ---");
-        info!("TODO: Send message via riverctl");
+        let output = Command::new(&riverctl_path)
+            .env("RIVER_CONFIG_DIR", &peer1_config_dir)
+            .args([
+                "--node-url",
+                &peer1_ws,
+                "--format",
+                "json",
+                "invite",
+                "accept",
+                &invitation,
+                "--nickname",
+                "Bob",
+            ])
+            .output()
+            .context("Failed to execute riverctl invite accept")?;
 
-        // Step 9: Send message from user 1 -> user 2
-        info!("\n--- Step 9: Sending Message (peer 0 -> peer 1) ---");
-        info!("TODO: Send message via riverctl");
+        if !output.status.success() {
+            bail!(
+                "Invitation acceptance failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
 
-        // Step 10: Verify messages received
-        info!("\n--- Step 10: Verifying Messages ---");
-        info!("TODO: Verify message receipt via riverctl");
+        info!("Invitation accepted by peer 1");
+
+        // Wait for synchronization
+        info!("Waiting 5s for state synchronization...");
+        sleep(Duration::from_secs(5)).await;
+
+        // Step 9: Send message from peer 0 -> peer 1
+        info!("\n--- Step 9: Sending Message (Alice -> Bob) ---");
+        let msg1 = "Hello from Alice!";
+        let output = Command::new(&riverctl_path)
+            .env("RIVER_CONFIG_DIR", &peer0_config_dir)
+            .args([
+                "--node-url",
+                &peer0_ws,
+                "--format",
+                "json",
+                "message",
+                "send",
+                &room_id,
+                msg1,
+            ])
+            .output()
+            .context("Failed to execute riverctl message send (Alice)")?;
+
+        if !output.status.success() {
+            bail!(
+                "Message send (Alice) failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        info!("Message sent from Alice");
+
+        // Step 10: Send message from peer 1 -> peer 0
+        info!("\n--- Step 10: Sending Message (Bob -> Alice) ---");
+        let msg2 = "Hello from Bob!";
+        let output = Command::new(&riverctl_path)
+            .env("RIVER_CONFIG_DIR", &peer1_config_dir)
+            .args([
+                "--node-url",
+                &peer1_ws,
+                "--format",
+                "json",
+                "message",
+                "send",
+                &room_id,
+                msg2,
+            ])
+            .output()
+            .context("Failed to execute riverctl message send (Bob)")?;
+
+        if !output.status.success() {
+            bail!(
+                "Message send (Bob) failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        info!("Message sent from Bob");
+
+        // Wait for message propagation
+        info!("Waiting 5s for message propagation...");
+        sleep(Duration::from_secs(5)).await;
+
+        // Step 11: Verify messages received by both users
+        info!("\n--- Step 11: Verifying Messages ---");
+
+        // Alice checks messages
+        info!("Alice listing messages...");
+        let output = Command::new(&riverctl_path)
+            .env("RIVER_CONFIG_DIR", &peer0_config_dir)
+            .args([
+                "--node-url",
+                &peer0_ws,
+                "--format",
+                "json",
+                "message",
+                "list",
+                &room_id,
+            ])
+            .output()
+            .context("Failed to execute riverctl message list (Alice)")?;
+
+        if !output.status.success() {
+            bail!(
+                "Message list (Alice) failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let alice_messages = String::from_utf8_lossy(&output.stdout);
+        info!("Alice's messages: {}", alice_messages);
+
+        // Bob checks messages
+        info!("Bob listing messages...");
+        let output = Command::new(&riverctl_path)
+            .env("RIVER_CONFIG_DIR", &peer1_config_dir)
+            .args([
+                "--node-url",
+                &peer1_ws,
+                "--format",
+                "json",
+                "message",
+                "list",
+                &room_id,
+            ])
+            .output()
+            .context("Failed to execute riverctl message list (Bob)")?;
+
+        if !output.status.success() {
+            bail!(
+                "Message list (Bob) failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let bob_messages = String::from_utf8_lossy(&output.stdout);
+        info!("Bob's messages: {}", bob_messages);
+
+        // Verify both messages are visible to both users
+        if !alice_messages.contains(msg1) || !alice_messages.contains(msg2) {
+            bail!("Alice didn't receive all messages");
+        }
+        if !bob_messages.contains(msg1) || !bob_messages.contains(msg2) {
+            bail!("Bob didn't receive all messages");
+        }
 
         info!("\n✓ Ubertest completed successfully!");
         Ok::<(), anyhow::Error>(())

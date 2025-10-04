@@ -1068,19 +1068,28 @@ where
     // 3. We need the connection registered so the gateway can respond to FindOptimalPeer requests
     //
     // See PR #1871 discussion with @iduartgomez for context.
-    if num_connections == 0 {
+    //
+    // IMPORTANT (issue #1908): Extended to cover early network formation (first few peers)
+    // During early network formation, the gateway should accept connections directly to ensure
+    // bidirectional connections are established. Without this, peers 2+ only get unidirectional
+    // connections (peer → gateway) but not the reverse (gateway → peer).
+    const EARLY_NETWORK_THRESHOLD: usize = 4;
+
+    if num_connections == 0 || (is_gateway && accepted && num_connections < EARLY_NETWORK_THRESHOLD)
+    {
         if num_reserved == 1 && is_gateway && accepted {
             tracing::info!(
                 tx = %id,
                 joiner = %joiner.peer,
-                "Gateway bootstrap: accepting first connection directly (will register immediately)",
+                connections = num_connections,
+                "Gateway early network: accepting connection directly (will register immediately)",
             );
             let connectivity_info = ConnectivityInfo::new_bootstrap(
                 joiner.clone(),
                 1, // Single check for direct connection
             );
             return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
-        } else {
+        } else if num_connections == 0 {
             tracing::debug!(
                 tx = %id,
                 joiner = %joiner.peer,

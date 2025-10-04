@@ -304,8 +304,11 @@ impl P2pConnManager {
                             }
                         }
                         ConnEvent::ClosedChannel => {
-                            tracing::info!("Notification channel closed");
-                            break;
+                            // IMPORTANT (issue #1908): Don't shut down the gateway/node on channel close
+                            // Connection failures should be transient errors that the system can recover from.
+                            // Only shut down on explicit Disconnect events or non-recoverable errors.
+                            tracing::warn!("Notification channel closed - continuing operation (not shutting down)");
+                            // Don't break - keep processing events
                         }
                         ConnEvent::NodeAction(action) => match action {
                             NodeEvent::DropConnection(peer) => {
