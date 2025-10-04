@@ -40,7 +40,7 @@ use crate::{
         ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
         WaitingResolution,
     },
-    message::{MessageStats, NetMessage, NodeEvent, Transaction},
+    message::{MessageStats, NodeEvent, Transaction},
     node::{handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager},
     ring::PeerKeyLocation,
     tracing::NetEventLog,
