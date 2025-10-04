@@ -321,7 +321,7 @@ impl P2pConnManager {
                                     let peers_to_cleanup: Vec<_> =
                                         self.connections.keys().cloned().collect();
                                     for peer in peers_to_cleanup {
-                                        tracing::debug!(%peer, "Cleaning up connection due to critical channel closure");
+                                        tracing::debug!(%peer, "Cleaning up active connection due to critical channel closure");
 
                                         // Clean up ring state
                                         self.bridge
@@ -340,6 +340,23 @@ impl P2pConnManager {
                                         {
                                             tracing::warn!(%peer, error = ?e, "Failed to drop connection during cleanup");
                                         }
+                                    }
+
+                                    // Clean up reservations for in-progress connections
+                                    // These are connections that started handshake but haven't completed yet
+                                    // Notifying the callbacks will trigger the calling code to clean up reservations
+                                    tracing::debug!(
+                                        awaiting_count = state.awaiting_connection.len(),
+                                        "Cleaning up in-progress connection reservations"
+                                    );
+
+                                    for (addr, mut callback) in state.awaiting_connection.drain() {
+                                        tracing::debug!(%addr, "Notifying awaiting connection of shutdown");
+                                        // Best effort notification - ignore errors since we're shutting down anyway
+                                        // The callback sender will handle cleanup on their side
+                                        let _ = callback
+                                            .send_result(Err(HandshakeError::ChannelClosed))
+                                            .await;
                                     }
 
                                     tracing::info!("Cleanup complete, exiting event loop");
