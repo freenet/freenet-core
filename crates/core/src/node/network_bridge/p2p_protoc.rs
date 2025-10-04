@@ -303,12 +303,49 @@ impl P2pConnManager {
                                 }
                             }
                         }
-                        ConnEvent::ClosedChannel => {
-                            // IMPORTANT (issue #1908): Don't shut down the gateway/node on channel close
-                            // Connection failures should be transient errors that the system can recover from.
-                            // Only shut down on explicit Disconnect events or non-recoverable errors.
-                            tracing::warn!("Notification channel closed - continuing operation (not shutting down)");
-                            // Don't break - keep processing events
+                        ConnEvent::ClosedChannel(reason) => {
+                            match reason {
+                                ChannelCloseReason::Handshake => {
+                                    // Handshake channel closure is potentially transient - log and continue
+                                    tracing::warn!("Handshake channel closed - continuing operation (may be transient)");
+                                    // Don't break - keep processing events
+                                }
+                                ChannelCloseReason::Bridge | ChannelCloseReason::Controller => {
+                                    // Critical internal channels closed - perform cleanup and shutdown gracefully
+                                    tracing::error!(
+                                        ?reason,
+                                        "Critical channel closed - performing cleanup and shutting down"
+                                    );
+
+                                    // Clean up all active connections
+                                    let peers_to_cleanup: Vec<_> =
+                                        self.connections.keys().cloned().collect();
+                                    for peer in peers_to_cleanup {
+                                        tracing::debug!(%peer, "Cleaning up connection due to critical channel closure");
+
+                                        // Clean up ring state
+                                        self.bridge
+                                            .op_manager
+                                            .ring
+                                            .prune_connection(peer.clone())
+                                            .await;
+
+                                        // Remove from connection map
+                                        self.connections.remove(&peer);
+
+                                        // Notify handshake handler to clean up
+                                        if let Err(e) = handshake_handler_msg
+                                            .drop_connection(peer.clone())
+                                            .await
+                                        {
+                                            tracing::warn!(%peer, error = ?e, "Failed to drop connection during cleanup");
+                                        }
+                                    }
+
+                                    tracing::info!("Cleanup complete, exiting event loop");
+                                    break;
+                                }
+                            }
                         }
                         ConnEvent::NodeAction(action) => match action {
                             NodeEvent::DropConnection(peer) => {
@@ -665,7 +702,9 @@ impl P2pConnManager {
                         self.handle_handshake_action(event, state, handshake_handler_msg).await?;
                         Ok(EventResult::Continue)
                     }
-                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(ConnEvent::ClosedChannel.into())),
+                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(
+                        ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
+                    )),
                     Err(e) => {
                         tracing::warn!("Handshake error: {:?}", e);
                         Ok(EventResult::Continue)
@@ -1101,14 +1140,16 @@ impl P2pConnManager {
         match msg {
             Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg).into()),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
-            None => EventResult::Event(ConnEvent::ClosedChannel.into()),
+            None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
         }
     }
 
     fn handle_node_controller_msg(&self, msg: Option<NodeEvent>) -> EventResult {
         match msg {
             Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg).into()),
-            None => EventResult::Event(ConnEvent::ClosedChannel.into()),
+            None => {
+                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Controller).into())
+            }
         }
     }
 
@@ -1242,7 +1283,17 @@ enum ConnEvent {
     InboundMessage(NetMessage),
     OutboundMessage(NetMessage),
     NodeAction(NodeEvent),
-    ClosedChannel,
+    ClosedChannel(ChannelCloseReason),
+}
+
+#[derive(Debug)]
+enum ChannelCloseReason {
+    /// Handshake channel closed - potentially transient, continue operation
+    Handshake,
+    /// Internal bridge channel closed - critical, must shutdown gracefully
+    Bridge,
+    /// Node controller channel closed - critical, must shutdown gracefully
+    Controller,
 }
 
 #[allow(dead_code)]
@@ -1278,7 +1329,8 @@ async fn peer_connection_listener(
                     Right(action) => {
                         tracing::debug!(to=%conn.remote_addr(), "Received action from channel");
                         match action {
-                            ConnEvent::NodeAction(NodeEvent::DropConnection(_)) | ConnEvent::ClosedChannel => {
+                            ConnEvent::NodeAction(NodeEvent::DropConnection(_))
+                            | ConnEvent::ClosedChannel(_) => {
                                 break Err(TransportError::ConnectionClosed(conn.remote_addr()));
                             }
                             other => {
