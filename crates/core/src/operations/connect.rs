@@ -1043,6 +1043,7 @@ where
 
     let num_connections = connection_manager.num_connections();
     let num_reserved = connection_manager.get_reserved_connections();
+    let max_connections = connection_manager.max_connections;
 
     tracing::debug!(
         tx = %id,
@@ -1073,15 +1074,19 @@ where
     // During early network formation, the gateway should accept connections directly to ensure
     // bidirectional connections are established. Without this, peers 2+ only get unidirectional
     // connections (peer → gateway) but not the reverse (gateway → peer).
+    //
+    // However, we still respect max_connections - this only applies when there's capacity.
     const EARLY_NETWORK_THRESHOLD: usize = 4;
+    let has_capacity = num_connections + num_reserved < max_connections;
+    let is_early_network = is_gateway && accepted && num_connections < EARLY_NETWORK_THRESHOLD;
 
-    if num_connections == 0 || (is_gateway && accepted && num_connections < EARLY_NETWORK_THRESHOLD)
-    {
+    if num_connections == 0 || (is_early_network && has_capacity) {
         if num_reserved == 1 && is_gateway && accepted {
             tracing::info!(
                 tx = %id,
                 joiner = %joiner.peer,
                 connections = num_connections,
+                has_capacity = %has_capacity,
                 "Gateway early network: accepting connection directly (will register immediately)",
             );
             let connectivity_info = ConnectivityInfo::new_bootstrap(
