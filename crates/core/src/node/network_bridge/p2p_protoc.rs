@@ -305,22 +305,25 @@ impl P2pConnManager {
                         }
                         ConnEvent::ClosedChannel(reason) => {
                             match reason {
-                                ChannelCloseReason::Handshake
-                                | ChannelCloseReason::Bridge
-                                | ChannelCloseReason::Controller => {
+                                ChannelCloseReason::Handshake => {
+                                    // Handshake channel closure is potentially transient - log and continue
+                                    tracing::warn!("Handshake channel closed - continuing operation (may be transient)");
+                                    // Don't break - keep processing events
+                                }
+                                ChannelCloseReason::Bridge | ChannelCloseReason::Controller => {
                                     // Critical internal channels closed - perform cleanup and shutdown gracefully
                                     tracing::error!(
                                         ?reason,
                                         is_gateway = self.bridge.op_manager.ring.is_gateway(),
                                         num_connections = self.connections.len(),
-                                        "🔴 CRITICAL CHANNEL CLOSED - performing cleanup and shutting down"
+                                        "Critical channel closed - performing cleanup and shutting down"
                                     );
 
                                     // Clean up all active connections
                                     let peers_to_cleanup: Vec<_> =
                                         self.connections.keys().cloned().collect();
                                     for peer in peers_to_cleanup {
-                                        tracing::debug!(%peer, "Cleaning up active connection due to critical channel closure");
+                                        tracing::debug!(%peer, "Cleaning up connection due to critical channel closure");
 
                                         // Clean up ring state
                                         self.bridge
@@ -718,14 +721,9 @@ impl P2pConnManager {
                         self.handle_handshake_action(event, state, handshake_handler_msg).await?;
                         Ok(EventResult::Continue)
                     }
-                    Err(HandshakeError::ChannelClosed) => {
-                        tracing::error!(
-                            "🔴 HANDSHAKE CHANNEL CLOSED - handshake handler's channel has closed"
-                        );
-                        Ok(EventResult::Event(
-                            ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
-                        ))
-                    }
+                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(
+                        ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
+                    )),
                     Err(e) => {
                         tracing::warn!("Handshake error: {:?}", e);
                         Ok(EventResult::Continue)
@@ -1161,22 +1159,14 @@ impl P2pConnManager {
         match msg {
             Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg).into()),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
-            None => {
-                tracing::error!("🔴 BRIDGE CHANNEL CLOSED - P2P bridge channel has closed");
-                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into())
-            }
+            None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
         }
     }
 
     fn handle_node_controller_msg(&self, msg: Option<NodeEvent>) -> EventResult {
         match msg {
             Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg).into()),
-            None => {
-                tracing::error!(
-                    "🔴 CONTROLLER CHANNEL CLOSED - node controller channel has closed"
-                );
-                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Controller).into())
-            }
+            None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Controller).into()),
         }
     }
 
