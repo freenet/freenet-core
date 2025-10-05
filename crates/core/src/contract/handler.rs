@@ -329,7 +329,6 @@ impl ContractHandlerChannel<SenderHalve> {
         // Route to session actor if session adapter is installed
         if let Some(session_tx) = &self.session_adapter_tx {
             // Register all Transaction variants with the session actor
-            // Note: Subscription variant is legacy and should not be used in actor mode
             if let WaitingTransaction::Transaction(tx) = waiting_tx {
                 let msg = SessionMessage::RegisterTransaction {
                     tx,

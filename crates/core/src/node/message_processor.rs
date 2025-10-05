@@ -50,21 +50,15 @@ impl MessageProcessor {
         // Convert operation result to host result
         let host_result = match op_result {
             Ok(Some(op_res)) => {
-                debug!(
-                    "Actor mode: converting network result for transaction {}",
-                    tx
-                );
+                debug!("Converting network result for transaction {}", tx);
                 Arc::new(op_res.to_host_result())
             }
             Ok(None) => {
-                debug!("Actor mode: no result to forward for transaction {}", tx);
+                debug!("No result to forward for transaction {}", tx);
                 return Ok(()); // No result to forward
             }
             Err(e) => {
-                error!(
-                    "Actor mode: network operation error for transaction {}: {}",
-                    tx, e
-                );
+                error!("Network operation error for transaction {}: {}", tx, e);
                 // Create a generic client error for operation failures
                 use freenet_stdlib::client_api::{ClientError, ErrorKind};
                 Arc::new(Err(ClientError::from(ErrorKind::OperationError {

@@ -209,20 +209,9 @@ pub trait ClientEventsProxy {
 ///
 /// This function operates in one of two modes based on `op_manager.actor_clients`:
 ///
-/// **Actor Mode** (default, `actor_clients=true`):
 /// - Uses ResultRouter → SessionActor for centralized client communication
 /// - Uses RequestRouter for operation deduplication (multiple clients share one operation)
 /// - More scalable and efficient for concurrent clients
-///
-/// **Legacy Mode** (`actor_clients=false`):
-/// - Uses direct client callbacks without centralized routing
-/// - Each client request creates a separate operation (no deduplication)
-/// - Simpler but less efficient - exists as fallback safety mechanism
-///
-/// For PUT/GET/UPDATE operations, actor mode uses 3 paths:
-/// 1. Local-only (no peers): Bypasses RequestRouter to avoid instant-completion race
-/// 2. Router-based (has peers): Uses RequestRouter for deduplication
-/// 3. Legacy: Direct operation when `actor_clients=false`
 pub async fn client_event_handling<ClientEv>(
     op_manager: Arc<OpManager>,
     mut client_events: ClientEv,
@@ -492,12 +481,11 @@ async fn process_open_request(
                             // before other clients can join. The operation will complete locally
                             // and deliver results through the normal transaction mechanism.
                         } else {
-                            // Has remote peers - use RequestRouter for deduplication if in actor mode, otherwise direct operation
                             if let Some(router) = &request_router {
                                 tracing::debug!(
                                     peer_id = %peer_id,
                                     key = %contract_key,
-                                    "Routing PUT request through deduplication layer (actor mode)",
+                                    "Routing PUT request through deduplication layer",
                                 );
 
                                 let request = crate::node::DeduplicatedRequest::Put {
@@ -717,12 +705,11 @@ async fn process_open_request(
                             "Sending update op",
                         );
 
-                        // Use RequestRouter for deduplication if in actor mode, otherwise direct operation
                         if let Some(router) = &request_router {
                             tracing::debug!(
                                 peer_id = %peer_id,
                                 key = %key,
-                                "Routing UPDATE request through deduplication layer (actor mode)",
+                                "Routing UPDATE request through deduplication layer",
                             );
 
                             let request = crate::node::DeduplicatedRequest::Update {
@@ -947,11 +934,10 @@ async fn process_open_request(
                                 })));
                             }
                         } else {
-                            // Use RequestRouter for deduplication if in actor mode, otherwise direct operation
                             if let Some(router) = &request_router {
                                 tracing::debug!(
                                     this_peer = %peer_id,
-                                    "Contract not found, routing GET request through deduplication layer (actor mode)",
+                                    "Contract not found, routing GET request through deduplication layer",
                                 );
 
                                 let request = crate::node::DeduplicatedRequest::Get {
@@ -1099,7 +1085,7 @@ async fn process_open_request(
                             tracing::debug!(
                                 peer_id = %peer_id,
                                 key = %key,
-                                "Processing SUBSCRIBE without deduplication (actor mode - instant-completion safe)",
+                                "Processing SUBSCRIBE without deduplication",
                             );
 
                             // Create operation with new transaction ID
