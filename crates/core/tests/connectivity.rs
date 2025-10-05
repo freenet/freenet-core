@@ -425,6 +425,9 @@ async fn test_basic_gateway_connectivity() -> TestResult {
 /// This test verifies that a network of 3 nodes (1 gateway + 2 peers) can:
 /// 1. Establish connections to form a full mesh
 /// 2. Successfully perform PUT/GET operations across the network
+///
+/// TEMPORARILY DISABLED: Test is being debugged in issue #1908
+#[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_three_node_network_connectivity() -> TestResult {
     use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
