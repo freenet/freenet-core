@@ -480,116 +480,60 @@ async fn process_open_request(
                             // condition where the transaction completes instantly and is removed
                             // before other clients can join. The operation will complete locally
                             // and deliver results through the normal transaction mechanism.
-                        } else {
-                            if let Some(router) = &request_router {
-                                tracing::debug!(
-                                    peer_id = %peer_id,
-                                    key = %contract_key,
-                                    "Routing PUT request through deduplication layer",
-                                );
+                        } else if let Some(router) = &request_router {
+                            tracing::debug!(
+                                peer_id = %peer_id,
+                                key = %contract_key,
+                                "Routing PUT request through deduplication layer",
+                            );
 
-                                let request = crate::node::DeduplicatedRequest::Put {
-                                    key: contract_key,
-                                    contract: contract.clone(),
-                                    related_contracts: related_contracts.clone(),
-                                    state: state.clone(),
-                                    subscribe,
+                            let request = crate::node::DeduplicatedRequest::Put {
+                                key: contract_key,
+                                contract: contract.clone(),
+                                related_contracts: related_contracts.clone(),
+                                state: state.clone(),
+                                subscribe,
+                                client_id,
+                                request_id,
+                            };
+
+                            let (transaction_id, should_start_operation) =
+                                router.route_request(request).await.map_err(|e| {
+                                    Error::Node(format!("Request routing failed: {}", e))
+                                })?;
+
+                            // Always register this client for the result
+                            op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(
+                                    transaction_id,
                                     client_id,
                                     request_id,
-                                };
-
-                                let (transaction_id, should_start_operation) =
-                                    router.route_request(request).await.map_err(|e| {
-                                        Error::Node(format!("Request routing failed: {}", e))
-                                    })?;
-
-                                // Always register this client for the result
-                                op_manager
-                                    .ch_outbound
-                                    .waiting_for_transaction_result(
-                                        transaction_id,
-                                        client_id,
-                                        request_id,
-                                    )
-                                    .await
-                                    .inspect_err(|err| {
-                                        tracing::error!(
-                                            "Error waiting for transaction result: {}",
-                                            err
-                                        );
-                                    })?;
-
-                                // Only start new network operation if this is a new operation
-                                if should_start_operation {
-                                    tracing::debug!(
-                                        peer_id = %peer_id,
-                                        key = %contract_key,
-                                        "Starting new PUT network operation via RequestRouter",
+                                )
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!(
+                                        "Error waiting for transaction result: {}",
+                                        err
                                     );
+                                })?;
 
-                                    let op = put::start_op_with_id(
-                                        contract.clone(),
-                                        related_contracts.clone(),
-                                        state.clone(),
-                                        op_manager.ring.max_hops_to_live,
-                                        subscribe,
-                                        transaction_id,
-                                    );
-
-                                    if let Err(err) = put::request_put(&op_manager, op).await {
-                                        tracing::error!("Put request error: {}", err);
-
-                                        // Notify client of error via result router
-                                        let error_response = Err(ErrorKind::OperationError {
-                                            cause: format!("PUT operation failed: {}", err).into(),
-                                        }
-                                        .into());
-
-                                        if let Err(e) = op_manager
-                                            .result_router_tx
-                                            .send((transaction_id, error_response))
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                "Failed to send PUT error to result router: {}. Transaction: {}",
-                                                e, transaction_id
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    tracing::debug!(
-                                        peer_id = %peer_id,
-                                        key = %contract_key,
-                                        "Reusing existing PUT operation via RequestRouter - client registered for result",
-                                    );
-                                }
-                            } else {
+                            // Only start new network operation if this is a new operation
+                            if should_start_operation {
                                 tracing::debug!(
                                     peer_id = %peer_id,
                                     key = %contract_key,
-                                    "Starting direct PUT operation (legacy mode)",
+                                    "Starting new PUT network operation via RequestRouter",
                                 );
 
-                                // Legacy mode: direct operation without deduplication
-                                let op = put::start_op(
+                                let op = put::start_op_with_id(
                                     contract.clone(),
                                     related_contracts.clone(),
                                     state.clone(),
                                     op_manager.ring.max_hops_to_live,
                                     subscribe,
+                                    transaction_id,
                                 );
-                                let op_id = op.id;
-
-                                op_manager
-                                    .ch_outbound
-                                    .waiting_for_transaction_result(op_id, client_id, request_id)
-                                    .await
-                                    .inspect_err(|err| {
-                                        tracing::error!(
-                                            "Error waiting for transaction result: {}",
-                                            err
-                                        )
-                                    })?;
 
                                 if let Err(err) = put::request_put(&op_manager, op).await {
                                     tracing::error!("Put request error: {}", err);
@@ -602,14 +546,65 @@ async fn process_open_request(
 
                                     if let Err(e) = op_manager
                                         .result_router_tx
-                                        .send((op_id, error_response))
+                                        .send((transaction_id, error_response))
                                         .await
                                     {
                                         tracing::error!(
                                             "Failed to send PUT error to result router: {}. Transaction: {}",
-                                            e, op_id
+                                            e, transaction_id
                                         );
                                     }
+                                }
+                            } else {
+                                tracing::debug!(
+                                    peer_id = %peer_id,
+                                    key = %contract_key,
+                                    "Reusing existing PUT operation via RequestRouter - client registered for result",
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                peer_id = %peer_id,
+                                key = %contract_key,
+                                "Starting direct PUT operation (legacy mode)",
+                            );
+
+                            // Legacy mode: direct operation without deduplication
+                            let op = put::start_op(
+                                contract.clone(),
+                                related_contracts.clone(),
+                                state.clone(),
+                                op_manager.ring.max_hops_to_live,
+                                subscribe,
+                            );
+                            let op_id = op.id;
+
+                            op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(op_id, client_id, request_id)
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!("Error waiting for transaction result: {}", err)
+                                })?;
+
+                            if let Err(err) = put::request_put(&op_manager, op).await {
+                                tracing::error!("Put request error: {}", err);
+
+                                // Notify client of error via result router
+                                let error_response = Err(ErrorKind::OperationError {
+                                    cause: format!("PUT operation failed: {}", err).into(),
+                                }
+                                .into());
+
+                                if let Err(e) = op_manager
+                                    .result_router_tx
+                                    .send((op_id, error_response))
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "Failed to send PUT error to result router: {}. Transaction: {}",
+                                        e, op_id
+                                    );
                                 }
                             }
                         }
@@ -933,111 +928,60 @@ async fn process_open_request(
                                     contract,
                                 })));
                             }
-                        } else {
-                            if let Some(router) = &request_router {
+                        } else if let Some(router) = &request_router {
+                            tracing::debug!(
+                                this_peer = %peer_id,
+                                "Contract not found, routing GET request through deduplication layer",
+                            );
+
+                            let request = crate::node::DeduplicatedRequest::Get {
+                                key,
+                                return_contract_code,
+                                subscribe,
+                                client_id,
+                                request_id,
+                            };
+
+                            let (transaction_id, should_start_operation) =
+                                router.route_request(request).await.map_err(|e| {
+                                    Error::Node(format!("Request routing failed: {}", e))
+                                })?;
+
+                            // Always register this client for the result
+                            op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(
+                                    transaction_id,
+                                    client_id,
+                                    request_id,
+                                )
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!(
+                                        "Error waiting for transaction result (get): {}",
+                                        err
+                                    );
+                                })?;
+
+                            // Only start new network operation if this is a new operation
+                            if should_start_operation {
                                 tracing::debug!(
                                     this_peer = %peer_id,
-                                    "Contract not found, routing GET request through deduplication layer",
+                                    key = %key,
+                                    "Starting new GET network operation via RequestRouter",
                                 );
 
-                                let request = crate::node::DeduplicatedRequest::Get {
+                                let op = get::start_op_with_id(
                                     key,
                                     return_contract_code,
                                     subscribe,
-                                    client_id,
-                                    request_id,
-                                };
-
-                                let (transaction_id, should_start_operation) =
-                                    router.route_request(request).await.map_err(|e| {
-                                        Error::Node(format!("Request routing failed: {}", e))
-                                    })?;
-
-                                // Always register this client for the result
-                                op_manager
-                                    .ch_outbound
-                                    .waiting_for_transaction_result(
-                                        transaction_id,
-                                        client_id,
-                                        request_id,
-                                    )
-                                    .await
-                                    .inspect_err(|err| {
-                                        tracing::error!(
-                                            "Error waiting for transaction result (get): {}",
-                                            err
-                                        );
-                                    })?;
-
-                                // Only start new network operation if this is a new operation
-                                if should_start_operation {
-                                    tracing::debug!(
-                                        this_peer = %peer_id,
-                                        key = %key,
-                                        "Starting new GET network operation via RequestRouter",
-                                    );
-
-                                    let op = get::start_op_with_id(
-                                        key,
-                                        return_contract_code,
-                                        subscribe,
-                                        transaction_id,
-                                    );
-
-                                    if let Err(err) =
-                                        get::request_get(&op_manager, op, HashSet::new()).await
-                                    {
-                                        tracing::error!("get::request_get error: {}", err);
-
-                                        // Notify client of error via result router
-                                        let error_response = Err(ErrorKind::OperationError {
-                                            cause: format!("GET operation failed: {}", err).into(),
-                                        }
-                                        .into());
-
-                                        if let Err(e) = op_manager
-                                            .result_router_tx
-                                            .send((transaction_id, error_response))
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                "Failed to send GET error to result router: {}. Transaction: {}",
-                                                e, transaction_id
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    tracing::debug!(
-                                        this_peer = %peer_id,
-                                        key = %key,
-                                        "Reusing existing GET operation via RequestRouter - client registered for result",
-                                    );
-                                }
-                            } else {
-                                tracing::debug!(
-                                    this_peer = %peer_id,
-                                    "Contract not found, starting direct GET operation (legacy mode)",
+                                    transaction_id,
                                 );
-
-                                // Legacy mode: direct operation without deduplication
-                                let op = get::start_op(key, return_contract_code, subscribe);
-                                let op_id = op.id;
-
-                                op_manager
-                                    .ch_outbound
-                                    .waiting_for_transaction_result(op_id, client_id, request_id)
-                                    .await
-                                    .inspect_err(|err| {
-                                        tracing::error!(
-                                            "Error waiting for transaction result: {}",
-                                            err
-                                        )
-                                    })?;
 
                                 if let Err(err) =
                                     get::request_get(&op_manager, op, HashSet::new()).await
                                 {
-                                    tracing::error!("Get request error: {}", err);
+                                    tracing::error!("get::request_get error: {}", err);
 
                                     // Notify client of error via result router
                                     let error_response = Err(ErrorKind::OperationError {
@@ -1047,14 +991,60 @@ async fn process_open_request(
 
                                     if let Err(e) = op_manager
                                         .result_router_tx
-                                        .send((op_id, error_response))
+                                        .send((transaction_id, error_response))
                                         .await
                                     {
                                         tracing::error!(
                                             "Failed to send GET error to result router: {}. Transaction: {}",
-                                            e, op_id
+                                            e, transaction_id
                                         );
                                     }
+                                }
+                            } else {
+                                tracing::debug!(
+                                    this_peer = %peer_id,
+                                    key = %key,
+                                    "Reusing existing GET operation via RequestRouter - client registered for result",
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                this_peer = %peer_id,
+                                "Contract not found, starting direct GET operation (legacy mode)",
+                            );
+
+                            // Legacy mode: direct operation without deduplication
+                            let op = get::start_op(key, return_contract_code, subscribe);
+                            let op_id = op.id;
+
+                            op_manager
+                                .ch_outbound
+                                .waiting_for_transaction_result(op_id, client_id, request_id)
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!("Error waiting for transaction result: {}", err)
+                                })?;
+
+                            if let Err(err) =
+                                get::request_get(&op_manager, op, HashSet::new()).await
+                            {
+                                tracing::error!("Get request error: {}", err);
+
+                                // Notify client of error via result router
+                                let error_response = Err(ErrorKind::OperationError {
+                                    cause: format!("GET operation failed: {}", err).into(),
+                                }
+                                .into());
+
+                                if let Err(e) = op_manager
+                                    .result_router_tx
+                                    .send((op_id, error_response))
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "Failed to send GET error to result router: {}. Transaction: {}",
+                                        e, op_id
+                                    );
                                 }
                             }
                         }
