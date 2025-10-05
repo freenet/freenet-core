@@ -197,9 +197,7 @@ impl Operation for UpdateOp {
                         "Updating contract at target peer",
                     );
 
-                    let broadcast_to = op_manager
-                        .get_broadcast_targets_update(key, &sender.peer)
-                        .await;
+                    let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
 
                     if should_handle_update {
                         tracing::debug!(
@@ -259,9 +257,7 @@ impl Operation for UpdateOp {
                     .await?;
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
-                    let broadcast_to = op_manager
-                        .get_broadcast_targets_update(key, &sender.peer)
-                        .await;
+                    let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
 
                     tracing::debug!(
                         "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
@@ -512,7 +508,7 @@ async fn try_to_broadcast(
 }
 
 impl OpManager {
-    pub(crate) async fn get_broadcast_targets_update(
+    pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
         sender: &PeerId,
@@ -532,8 +528,8 @@ impl OpManager {
 
         // Get proximity-based targets (new logic)
         let proximity_targets = if let Some(proximity_cache) = &self.proximity_cache {
-            // Get neighbors who have cached this contract - now using proper async
-            let neighbor_peers = proximity_cache.neighbors_with_contract(key).await;
+            // Get neighbors who have cached this contract
+            let neighbor_peers = proximity_cache.neighbors_with_contract(key);
 
             // Convert PeerIds to PeerKeyLocation, filtering out the sender
             neighbor_peers
@@ -763,9 +759,7 @@ pub(crate) async fn request_update(
             );
 
             // Check if there are any subscribers to broadcast to
-            let broadcast_to = op_manager
-                .get_broadcast_targets_update(&key, &sender.peer)
-                .await;
+            let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
 
             if broadcast_to.is_empty() {
                 // No subscribers - operation complete

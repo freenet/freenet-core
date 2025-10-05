@@ -224,7 +224,7 @@ impl ProximityCacheManager {
     }
 
     /// Check if any neighbors might have this contract cached (for update forwarding)
-    pub async fn neighbors_with_contract(&self, contract_key: &ContractKey) -> Vec<PeerId> {
+    pub fn neighbors_with_contract(&self, contract_key: &ContractKey) -> Vec<PeerId> {
         let hash = Self::hash_contract(contract_key.id());
 
         let mut neighbors = Vec::new();
