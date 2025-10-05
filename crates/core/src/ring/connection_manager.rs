@@ -384,7 +384,14 @@ impl ConnectionManager {
     }
 
     pub fn num_connections(&self) -> usize {
-        self.connections_by_location.read().len()
+        let connections = self.connections_by_location.read();
+        let total: usize = connections.values().map(|v| v.len()).sum();
+        tracing::debug!(
+            unique_locations = connections.len(),
+            total_connections = total,
+            "num_connections called"
+        );
+        total
     }
 
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {

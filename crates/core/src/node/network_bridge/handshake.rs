@@ -495,6 +495,7 @@ impl HandshakeHandler {
                                     }
                                 };
 
+                                tracing::info!(%id, %joiner, "Creating InboundConnection event");
                                 match forward_result {
                                     (Some(ForwardResult::Forward(forward_target, msg, info)), _) => {
                                         return Ok(Event::InboundConnection {
