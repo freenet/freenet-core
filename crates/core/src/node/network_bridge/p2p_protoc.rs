@@ -1162,9 +1162,7 @@ impl P2pConnManager {
             Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg).into()),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
             None => {
-                tracing::error!(
-                    "🔴 BRIDGE CHANNEL CLOSED - P2P bridge channel has closed"
-                );
+                tracing::error!("🔴 BRIDGE CHANNEL CLOSED - P2P bridge channel has closed");
                 EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into())
             }
         }

@@ -155,7 +155,7 @@ impl SessionActor {
         }
     }
 
-    /// Handle result delivery with a specific RequestId 
+    /// Handle result delivery with a specific RequestId
     async fn handle_result_delivery_with_request_id(
         &mut self,
         tx: Transaction,
