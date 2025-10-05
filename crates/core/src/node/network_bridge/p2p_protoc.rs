@@ -303,9 +303,65 @@ impl P2pConnManager {
                                 }
                             }
                         }
-                        ConnEvent::ClosedChannel => {
-                            tracing::info!("Notification channel closed");
-                            break;
+                        ConnEvent::ClosedChannel(reason) => {
+                            match reason {
+                                ChannelCloseReason::Handshake
+                                | ChannelCloseReason::Bridge
+                                | ChannelCloseReason::Controller => {
+                                    // Critical internal channels closed - perform cleanup and shutdown gracefully
+                                    tracing::error!(
+                                        ?reason,
+                                        is_gateway = self.bridge.op_manager.ring.is_gateway(),
+                                        num_connections = self.connections.len(),
+                                        "🔴 CRITICAL CHANNEL CLOSED - performing cleanup and shutting down"
+                                    );
+
+                                    // Clean up all active connections
+                                    let peers_to_cleanup: Vec<_> =
+                                        self.connections.keys().cloned().collect();
+                                    for peer in peers_to_cleanup {
+                                        tracing::debug!(%peer, "Cleaning up active connection due to critical channel closure");
+
+                                        // Clean up ring state
+                                        self.bridge
+                                            .op_manager
+                                            .ring
+                                            .prune_connection(peer.clone())
+                                            .await;
+
+                                        // Remove from connection map
+                                        self.connections.remove(&peer);
+
+                                        // Notify handshake handler to clean up
+                                        if let Err(e) = handshake_handler_msg
+                                            .drop_connection(peer.clone())
+                                            .await
+                                        {
+                                            tracing::warn!(%peer, error = ?e, "Failed to drop connection during cleanup");
+                                        }
+                                    }
+
+                                    // Clean up reservations for in-progress connections
+                                    // These are connections that started handshake but haven't completed yet
+                                    // Notifying the callbacks will trigger the calling code to clean up reservations
+                                    tracing::debug!(
+                                        awaiting_count = state.awaiting_connection.len(),
+                                        "Cleaning up in-progress connection reservations"
+                                    );
+
+                                    for (addr, mut callback) in state.awaiting_connection.drain() {
+                                        tracing::debug!(%addr, "Notifying awaiting connection of shutdown");
+                                        // Best effort notification - ignore errors since we're shutting down anyway
+                                        // The callback sender will handle cleanup on their side
+                                        let _ = callback
+                                            .send_result(Err(HandshakeError::ChannelClosed))
+                                            .await;
+                                    }
+
+                                    tracing::info!("Cleanup complete, exiting event loop");
+                                    break;
+                                }
+                            }
                         }
                         ConnEvent::NodeAction(action) => match action {
                             NodeEvent::DropConnection(peer) => {
@@ -662,7 +718,14 @@ impl P2pConnManager {
                         self.handle_handshake_action(event, state, handshake_handler_msg).await?;
                         Ok(EventResult::Continue)
                     }
-                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(ConnEvent::ClosedChannel.into())),
+                    Err(HandshakeError::ChannelClosed) => {
+                        tracing::error!(
+                            "🔴 HANDSHAKE CHANNEL CLOSED - handshake handler's channel has closed"
+                        );
+                        Ok(EventResult::Event(
+                            ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
+                        ))
+                    }
                     Err(e) => {
                         tracing::warn!("Handshake error: {:?}", e);
                         Ok(EventResult::Continue)
@@ -1098,14 +1161,22 @@ impl P2pConnManager {
         match msg {
             Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg).into()),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
-            None => EventResult::Event(ConnEvent::ClosedChannel.into()),
+            None => {
+                tracing::error!("🔴 BRIDGE CHANNEL CLOSED - P2P bridge channel has closed");
+                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into())
+            }
         }
     }
 
     fn handle_node_controller_msg(&self, msg: Option<NodeEvent>) -> EventResult {
         match msg {
             Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg).into()),
-            None => EventResult::Event(ConnEvent::ClosedChannel.into()),
+            None => {
+                tracing::error!(
+                    "🔴 CONTROLLER CHANNEL CLOSED - node controller channel has closed"
+                );
+                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Controller).into())
+            }
         }
     }
 
@@ -1239,7 +1310,17 @@ enum ConnEvent {
     InboundMessage(NetMessage),
     OutboundMessage(NetMessage),
     NodeAction(NodeEvent),
-    ClosedChannel,
+    ClosedChannel(ChannelCloseReason),
+}
+
+#[derive(Debug)]
+enum ChannelCloseReason {
+    /// Handshake channel closed - potentially transient, continue operation
+    Handshake,
+    /// Internal bridge channel closed - critical, must shutdown gracefully
+    Bridge,
+    /// Node controller channel closed - critical, must shutdown gracefully
+    Controller,
 }
 
 #[allow(dead_code)]
@@ -1275,7 +1356,8 @@ async fn peer_connection_listener(
                     Right(action) => {
                         tracing::debug!(to=%conn.remote_addr(), "Received action from channel");
                         match action {
-                            ConnEvent::NodeAction(NodeEvent::DropConnection(_)) | ConnEvent::ClosedChannel => {
+                            ConnEvent::NodeAction(NodeEvent::DropConnection(_))
+                            | ConnEvent::ClosedChannel(_) => {
                                 break Err(TransportError::ConnectionClosed(conn.remote_addr()));
                             }
                             other => {

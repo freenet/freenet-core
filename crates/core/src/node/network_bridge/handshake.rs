@@ -1125,7 +1125,18 @@ async fn gw_peer_connection_listener(
                 }) else {
                      break Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
                 };
-                let net_message = decode_msg(&msg).unwrap();
+                let net_message = match decode_msg(&msg) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        tracing::error!(
+                            at=?conn.my_address(),
+                            from=%conn.remote_addr(),
+                            error=%e,
+                            "Failed to decode message - closing connection"
+                        );
+                        break Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
+                    }
+                };
                 tracing::debug!(at=?conn.my_address(), from=%conn.remote_addr(), %net_message, "Received message from peer");
                 match net_message {
                     NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
@@ -1188,7 +1199,18 @@ async fn gw_transient_peer_conn(
             incoming_result = timeout(TIMEOUT, conn.recv()) => {
                 match incoming_result {
                     Ok(Ok(msg)) => {
-                        let net_msg = decode_msg(&msg).unwrap();
+                        let net_msg = match decode_msg(&msg) {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                tracing::error!(
+                                    at=?conn.my_address(),
+                                    from=%conn.remote_addr(),
+                                    error=%e,
+                                    "Failed to decode message from transient peer - closing connection"
+                                );
+                                break Err(HandshakeError::ConnectionClosed(conn.remote_addr()));
+                            }
+                        };
                         if transaction.is_drop_connection_message(&net_msg) {
                             tracing::debug!("Received drop connection message");
                             break Ok((InternalEvent::DropInboundConnection(conn.remote_addr()), outbound));
