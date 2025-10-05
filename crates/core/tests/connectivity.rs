@@ -426,8 +426,39 @@ async fn test_basic_gateway_connectivity() -> TestResult {
 /// 1. Establish connections to form a full mesh
 /// 2. Successfully perform PUT/GET operations across the network
 ///
-/// TEMPORARILY DISABLED: Test is being debugged in issue #1908
-#[ignore]
+/// # Port Configuration for P2P Mesh
+///
+/// For peers to participate in P2P mesh connectivity, they must have BOTH
+/// `public_address` AND `public_port` configured. This ensures the peer's
+/// PeerId is set from config (see config/mod.rs:242-251).
+///
+/// ## Port Types
+///
+/// - **network_port**: The local port the peer binds to for listening
+/// - **public_port**: The external port peers should connect to
+///   - In localhost tests (no NAT): public_port = network_port
+///   - In production with NAT: public_port = router's external port
+///
+/// ## How It Works
+///
+/// ### Localhost Tests (this test)
+/// 1. Peer binds UDP socket to network_port (e.g., 53425)
+/// 2. When sending to gateway, UDP uses bound port as source (53425)
+/// 3. Gateway sees source port 53425 in handshake
+/// 4. Gateway sends back "your external address is 127.0.0.1:53425"
+/// 5. Peer's PeerId is already set from config with public_port=53425
+/// 6. Other peers connect directly to 127.0.0.1:53425 ✅
+///
+/// ### Real P2P Network (with NAT)
+/// 1. Peer behind NAT binds to network_port (e.g., 8080)
+/// 2. Peer sets public_port to router's external port (e.g., 54321)
+/// 3. Router forwards external port 54321 → internal port 8080
+/// 4. When peer sends to gateway, NAT translates:
+///    - Source: 192.168.1.100:8080 → PublicIP:54321
+/// 5. Gateway sees source as PublicIP:54321
+/// 6. Peer's PeerId is set from config: PublicIP:54321
+/// 7. Other peers connect to PublicIP:54321
+/// 8. Router forwards to peer's internal 192.168.1.100:8080 ✅
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_three_node_network_connectivity() -> TestResult {
     use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
@@ -504,6 +535,12 @@ async fn test_three_node_network_connectivity() -> TestResult {
     let peer1_transport_keypair = temp_dir_peer1.path().join("private.pem");
     peer1_key.save(&peer1_transport_keypair)?;
 
+    // Allocate network port for peer1 to enable P2P mesh connectivity
+    // In localhost tests, peers must bind to a specific port so the gateway
+    // can see their listening address and facilitate P2P connections
+    let peer1_network_socket = TcpListener::bind("127.0.0.1:0")?;
+    let peer1_port = peer1_network_socket.local_addr()?.port();
+
     let peer1_config = ConfigArgs {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -511,14 +548,14 @@ async fn test_three_node_network_connectivity() -> TestResult {
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
-            public_port: None,
+            public_port: Some(peer1_port),
             is_gateway: false,
             skip_load_from_network: true,
             gateways: Some(vec![serde_json::to_string(&gateway_info)?]),
             location: Some(RNG.lock().unwrap().random()),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
-            network_port: None,
+            network_port: Some(peer1_port),
             bandwidth_limit: None,
             blocked_addresses: None,
         },
@@ -539,6 +576,10 @@ async fn test_three_node_network_connectivity() -> TestResult {
     let peer2_transport_keypair = temp_dir_peer2.path().join("private.pem");
     peer2_key.save(&peer2_transport_keypair)?;
 
+    // Allocate network port for peer2 to enable P2P mesh connectivity
+    let peer2_network_socket = TcpListener::bind("127.0.0.1:0")?;
+    let peer2_port = peer2_network_socket.local_addr()?.port();
+
     let peer2_config = ConfigArgs {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -546,14 +587,14 @@ async fn test_three_node_network_connectivity() -> TestResult {
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
-            public_port: None,
+            public_port: Some(peer2_port),
             is_gateway: false,
             skip_load_from_network: true,
             gateways: Some(vec![serde_json::to_string(&gateway_info)?]),
             location: Some(RNG.lock().unwrap().random()),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
-            network_port: None,
+            network_port: Some(peer2_port),
             bandwidth_limit: None,
             blocked_addresses: None,
         },
@@ -571,7 +612,9 @@ async fn test_three_node_network_connectivity() -> TestResult {
     // Free the sockets before starting nodes
     std::mem::drop(gateway_network_socket);
     std::mem::drop(gateway_ws_socket);
+    std::mem::drop(peer1_network_socket);
     std::mem::drop(peer1_ws_socket);
+    std::mem::drop(peer2_network_socket);
     std::mem::drop(peer2_ws_socket);
 
     // Start gateway node
