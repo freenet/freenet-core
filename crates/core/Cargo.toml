@@ -92,7 +92,7 @@ testresult.workspace = true
 tokio-tungstenite = "0.27.0"
 # console-subscriber = { version = "0.4" }
 ureq = { version = "2.10", features = ["json"] }
-which = "7.0"
+which = "8.0"
 
 [features]
 default = ["redb", "trace", "websocket"]
