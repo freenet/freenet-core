@@ -612,9 +612,13 @@ async fn test_three_node_network_connectivity() -> TestResult {
     // Free the sockets before starting nodes
     std::mem::drop(gateway_network_socket);
     std::mem::drop(gateway_ws_socket);
+<<<<<<< HEAD
     std::mem::drop(peer1_network_socket);
     std::mem::drop(peer1_ws_socket);
     std::mem::drop(peer2_network_socket);
+=======
+    std::mem::drop(peer1_ws_socket);
+>>>>>>> 5a899604 (test: Fix ubertest connectivity with randomized loopback IPs and public_port)
     std::mem::drop(peer2_ws_socket);
 
     // Start gateway node
