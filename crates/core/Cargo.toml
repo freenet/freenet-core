@@ -77,7 +77,7 @@ freenet-stdlib = { features = ["net"], workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["sysinfoapi"] }
-wmi = "0.17.2"
+wmi = "0.17.3"
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
