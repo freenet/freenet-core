@@ -33,6 +33,8 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 /// 2. Perform operations to verify connectivity
 /// 3. Force disconnect
 /// 4. Verify that the peer can reconnect and operate normally
+///
+/// Test gateway reconnection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_gateway_reconnection() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);

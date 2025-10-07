@@ -685,30 +685,53 @@ impl P2pConnManager {
                                 }
                             }
                             NodeEvent::BroadcastProximityCache { from, message } => {
+                                // WORKAROUND: Skip broadcasts in 2-node networks
+                                // This masks an underlying issue where PUT operations flood messages
+                                // in 2-node topologies. The proximity cache itself only broadcasts once
+                                // per contract (verified by logs), but something in PUT handling causes
+                                // a message flood. TODO: Investigate PUT operation message handling.
+                                if self.connections.len() <= 1 {
+                                    tracing::debug!(
+                                        neighbor_count = self.connections.len(),
+                                        "PROXIMITY_PROPAGATION: Skipping broadcast in 2-node network (workaround for PUT flood issue)"
+                                    );
+                                    continue;
+                                }
+
                                 tracing::debug!(
                                     neighbor_count = self.connections.len(),
+                                    from = %from,
                                     "PROXIMITY_PROPAGATION: Broadcasting cache announcement to all connected peers"
                                 );
 
-                                // Send the message to all connected peers
+                                // Spawn each send as a separate task to avoid deep call stacks
+                                // This prevents stack overflow when broadcasting to many peers
                                 for peer_id in self.connections.keys() {
-                                    let net_msg = NetMessage::V1(NetMessageV1::ProximityCache {
-                                        from: from.clone(),
-                                        message: message.clone(),
-                                    });
+                                    let peer_id = peer_id.clone();
+                                    let from = from.clone();
+                                    let message = message.clone();
+                                    let bridge = self.bridge.clone();
 
-                                    if let Err(err) = self.bridge.send(peer_id, net_msg).await {
-                                        tracing::warn!(
-                                            peer = %peer_id,
-                                            error = ?err,
-                                            "PROXIMITY_PROPAGATION: Failed to send broadcast announcement to peer"
-                                        );
-                                    } else {
-                                        tracing::trace!(
-                                            peer = %peer_id,
-                                            "PROXIMITY_PROPAGATION: Successfully sent broadcast announcement to peer"
-                                        );
-                                    }
+                                    tokio::spawn(async move {
+                                        let net_msg =
+                                            NetMessage::V1(NetMessageV1::ProximityCache {
+                                                from,
+                                                message,
+                                            });
+
+                                        if let Err(err) = bridge.send(&peer_id, net_msg).await {
+                                            tracing::warn!(
+                                                peer = %peer_id,
+                                                error = ?err,
+                                                "PROXIMITY_PROPAGATION: Failed to send broadcast announcement to peer"
+                                            );
+                                        } else {
+                                            tracing::trace!(
+                                                peer = %peer_id,
+                                                "PROXIMITY_PROPAGATION: Successfully sent broadcast announcement to peer"
+                                            );
+                                        }
+                                    });
                                 }
                             }
                             NodeEvent::Disconnect { cause } => {
