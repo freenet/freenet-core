@@ -180,7 +180,11 @@ impl Operation for ConnectOp {
                     };
                     let mut skip_connections = skip_connections.clone();
                     let mut skip_forwards = skip_forwards.clone();
-                    skip_connections.extend([this_peer.clone(), query_target.peer.clone()]);
+                    skip_connections.extend([
+                        this_peer.clone(),
+                        query_target.peer.clone(),
+                        joiner.peer.clone(),
+                    ]);
                     skip_forwards.extend([this_peer.clone(), query_target.peer.clone()]);
                     if this_peer == &query_target.peer {
                         // this peer should be the original target queries
@@ -281,17 +285,27 @@ impl Operation for ConnectOp {
                         },
                     ..
                 } => {
+                    let this_peer = op_manager.ring.connection_manager.own_location();
                     if sender.peer == joiner.peer {
                         tracing::error!(
                             tx = %id,
                             sender = %sender.peer,
                             joiner = %joiner.peer,
-                            at = %op_manager.ring.connection_manager.own_location().peer,
+                            at = %this_peer.peer,
                             "Connectivity check from self, aborting"
                         );
                         std::process::exit(1);
                     }
-                    let this_peer = op_manager.ring.connection_manager.own_location();
+                    if this_peer.peer == joiner.peer {
+                        tracing::error!(
+                            tx = %id,
+                            this_peer = %this_peer.peer,
+                            joiner = %joiner.peer,
+                            sender = %sender.peer,
+                            "Received CheckConnectivity where this peer is the joiner (self-connection attempt), aborting"
+                        );
+                        std::process::exit(1);
+                    }
                     let joiner_loc = joiner
                         .location
                         .expect("should be already set at the p2p bridge level");
@@ -1186,13 +1200,17 @@ fn select_forward_target(
     left_htl: usize,
     skip_forwards: &HashSet<PeerId>,
 ) -> Option<PeerKeyLocation> {
+    // Create an extended skip list that includes the joiner to prevent forwarding to the joiner
+    let mut extended_skip = skip_forwards.clone();
+    extended_skip.insert(joiner.peer.clone());
+
     if left_htl >= connection_manager.rnd_if_htl_above {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
             "Randomly selecting peer to forward connect request",
         );
-        connection_manager.random_peer(|p| !skip_forwards.contains(p))
+        connection_manager.random_peer(|p| !extended_skip.contains(p))
     } else {
         tracing::debug!(
             tx = %id,
@@ -1203,7 +1221,7 @@ fn select_forward_target(
             .routing(
                 joiner.location.unwrap(),
                 Some(&request_peer.peer),
-                skip_forwards,
+                &extended_skip,
                 router,
             )
             .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
