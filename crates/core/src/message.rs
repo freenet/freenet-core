@@ -334,6 +334,11 @@ pub(crate) enum NodeEvent {
         key: ContractKey,
         subscribed: bool,
     },
+    /// Send a message to a peer over the network
+    SendMessage {
+        target: PeerId,
+        msg: Box<NetMessage>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +414,9 @@ impl Display for NodeEvent {
                     f,
                     "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
                 )
+            }
+            NodeEvent::SendMessage { target, msg } => {
+                write!(f, "SendMessage (to {target}, tx: {})", msg.id())
             }
         }
     }

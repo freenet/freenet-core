@@ -978,16 +978,19 @@ async fn connect_request(
                 None,
             );
 
-            // Push the new operation and send the message
+            // Push the new operation
             op_manager
                 .push(new_tx_id, OpEnum::Connect(Box::new(new_op)))
                 .await?;
 
+            // Send the FindOptimalPeer message to the gateway over the network
+            // We use notify_node_event with a SendMessage event to ensure it goes through
+            // the proper network channel, not just local processing
             op_manager
-                .notify_op_change(
-                    NetMessage::from(msg),
-                    OpEnum::Connect(Box::new(ConnectOp::new(new_tx_id, None, None, None))),
-                )
+                .notify_node_event(NodeEvent::SendMessage {
+                    target: gateway.peer.clone(),
+                    msg: Box::new(NetMessage::from(msg)),
+                })
                 .await?;
             Ok(())
         }
