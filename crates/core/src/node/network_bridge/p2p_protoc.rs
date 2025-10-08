@@ -305,13 +305,11 @@ impl P2pConnManager {
                         }
                         ConnEvent::ClosedChannel(reason) => {
                             match reason {
-                                ChannelCloseReason::Handshake => {
-                                    // Handshake channel closure is potentially transient - log and continue
-                                    tracing::warn!("Handshake channel closed - continuing operation (may be transient)");
-                                    // Don't break - keep processing events
-                                }
-                                ChannelCloseReason::Bridge | ChannelCloseReason::Controller => {
-                                    // Critical internal channels closed - perform cleanup and shutdown gracefully
+                                ChannelCloseReason::Handshake
+                                | ChannelCloseReason::Bridge
+                                | ChannelCloseReason::Controller => {
+                                    // All ClosedChannel events are critical - the transport is unable to establish
+                                    // more connections, rendering this peer useless. Perform cleanup and shutdown.
                                     tracing::error!(
                                         ?reason,
                                         is_gateway = self.bridge.op_manager.ring.is_gateway(),
