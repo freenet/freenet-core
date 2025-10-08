@@ -1066,14 +1066,6 @@ async fn process_open_request(
                             return Ok(None);
                         };
 
-                        // CRITICAL FIX: Register notification listener BEFORE starting subscription operation
-                        // This prevents race condition where:
-                        // 1. Subscribe completes (especially for local contracts - instant completion)
-                        // 2. UPDATE happens and broadcasts to subscribers
-                        // 3. Listener registration completes (but misses the UPDATE notification)
-                        //
-                        // By registering first, we ensure the notification channel is ready to receive
-                        // updates as soon as the subscription becomes active on the network.
                         let register_listener = op_manager
                             .notify_contract_handler(
                                 ContractHandlerEvent::RegisterSubscriberListener {
