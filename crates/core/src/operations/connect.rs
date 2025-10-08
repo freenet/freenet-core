@@ -224,7 +224,19 @@ impl Operation for ConnectOp {
                                 joiner = %joiner.peer,
                                 "Gateway found no suitable peers to forward CheckConnectivity request",
                             );
-                            return_msg = None;
+                            // Send a negative response back to the joiner to inform them
+                            // that no suitable peers are currently available
+                            let response = ConnectResponse::AcceptedBy {
+                                accepted: false,
+                                acceptor: own_loc.clone(),
+                                joiner: joiner.peer.clone(),
+                            };
+                            return_msg = Some(ConnectMsg::Response {
+                                id: *id,
+                                sender: own_loc.clone(),
+                                target: joiner.clone(),
+                                msg: response,
+                            });
                             new_state = None;
                         }
                     } else {
