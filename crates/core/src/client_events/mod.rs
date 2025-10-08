@@ -1129,6 +1129,39 @@ async fn process_open_request(
                             return Ok(None);
                         };
 
+                        let register_listener = op_manager
+                            .notify_contract_handler(
+                                ContractHandlerEvent::RegisterSubscriberListener {
+                                    key,
+                                    client_id,
+                                    summary,
+                                    subscriber_listener,
+                                },
+                            )
+                            .await
+                            .inspect_err(|err| {
+                                tracing::error!(
+                                    %client_id, %key,
+                                    "Register subscriber listener error: {}", err
+                                );
+                            });
+                        match register_listener {
+                            Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
+                                tracing::debug!(
+                                    %client_id, %key,
+                                    "Subscriber listener registered successfully (before subscribe op)"
+                                );
+                            }
+                            _ => {
+                                tracing::error!(
+                                    %client_id, %key,
+                                    "Subscriber listener registration failed"
+                                );
+                                return Err(Error::Op(OpError::UnexpectedOpState));
+                            }
+                        }
+
+                        // Now start the network subscription operation
                         // SUBSCRIBE: Skip router deduplication due to instant-completion race conditions
                         // When contracts are local, Subscribe completes instantly which breaks deduplication:
                         // - Client 1 subscribes → operation completes → result delivered → TX removed
@@ -1213,39 +1246,6 @@ async fn process_open_request(
                                         err
                                     );
                                 })?;
-                        }
-
-                        // Register subscription listener (same for both modes)
-                        let register_listener = op_manager
-                            .notify_contract_handler(
-                                ContractHandlerEvent::RegisterSubscriberListener {
-                                    key,
-                                    client_id,
-                                    summary,
-                                    subscriber_listener,
-                                },
-                            )
-                            .await
-                            .inspect_err(|err| {
-                                tracing::error!(
-                                    %client_id, %key,
-                                    "Register subscriber listener error: {}", err
-                                );
-                            });
-                        match register_listener {
-                            Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
-                                tracing::debug!(
-                                    %client_id, %key,
-                                    "Subscriber listener registered successfully"
-                                );
-                            }
-                            _ => {
-                                tracing::error!(
-                                    %client_id, %key,
-                                    "Subscriber listener registration failed"
-                                );
-                                return Err(Error::Op(OpError::UnexpectedOpState));
-                            }
                         }
                     }
                     _ => {
