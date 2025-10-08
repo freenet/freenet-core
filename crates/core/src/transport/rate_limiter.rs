@@ -39,7 +39,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         bandwidth_limit: Option<usize>,
         socket: Arc<S>,
     ) {
-        tracing::info!("Rate limiter task started");
+        tracing::trace!("Rate limiter task started");
         while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
             // tracing::trace!(%socket_addr, packet_len = %packet.len(), "Sending outbound packet");
             if let Some(bandwidth_limit) = bandwidth_limit {
@@ -49,7 +49,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 let _ = socket.send_to(&packet, socket_addr).await;
             }
         }
-        tracing::debug!("Rate limiter task ended unexpectedly");
+        tracing::trace!("Rate limiter task ended unexpectedly");
     }
 
     #[inline(always)]
@@ -62,9 +62,9 @@ impl<T: TimeSource> PacketRateLimiter<T> {
     ) {
         if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
             tokio::time::sleep(wait_time).await;
-            tracing::debug!(%socket_addr, "Sending outbound packet after waiting {:?}", wait_time);
+            tracing::trace!(%socket_addr, "Sending outbound packet after waiting {:?}", wait_time);
 
-            tracing::info!(
+            tracing::trace!(
                 target: "freenet_core::transport::send_debug",
                 dest_addr = %socket_addr,
                 packet_len = packet.len(),
@@ -74,7 +74,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
 
             match socket.send_to(&packet, socket_addr).await {
                 Ok(bytes_sent) => {
-                    tracing::info!(
+                    tracing::trace!(
                         target: "freenet_core::transport::send_debug",
                         dest_addr = %socket_addr,
                         bytes_sent,
@@ -82,7 +82,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                     );
                 }
                 Err(error) => {
-                    tracing::error!(
+                    tracing::trace!(
                         target: "freenet_core::transport::send_debug",
                         dest_addr = %socket_addr,
                         error = %error,
@@ -91,7 +91,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 }
             }
         } else {
-            tracing::info!(
+            tracing::trace!(
                 target: "freenet_core::transport::send_debug",
                 dest_addr = %socket_addr,
                 packet_len = packet.len(),
@@ -101,7 +101,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
 
             match socket.send_to(&packet, socket_addr).await {
                 Ok(bytes_sent) => {
-                    tracing::info!(
+                    tracing::trace!(
                         target: "freenet_core::transport::send_debug",
                         dest_addr = %socket_addr,
                         bytes_sent,
@@ -110,7 +110,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                     );
                 }
                 Err(error) => {
-                    tracing::error!(
+                    tracing::trace!(
                         target: "freenet_core::transport::send_debug",
                         dest_addr = %socket_addr,
                         error = %error,

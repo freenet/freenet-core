@@ -152,8 +152,6 @@ impl OutboundConnectionHandler {
             new_connection_notifier: new_connection_sender,
             outbound_packets: outbound_sender,
             this_addr: socket_addr,
-            dropped_packets: HashMap::new(),
-            last_drop_warning: Instant::now(),
             bandwidth_limit,
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
@@ -234,8 +232,6 @@ struct UdpPacketsListener<S = UdpSocket> {
     new_connection_notifier: mpsc::Sender<PeerConnection>,
     outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     this_addr: SocketAddr,
-    dropped_packets: HashMap<SocketAddr, u64>,
-    last_drop_warning: Instant,
     bandwidth_limit: Option<usize>,
 }
 
@@ -320,73 +316,32 @@ impl<S: Socket> UdpPacketsListener<S> {
                             );
 
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
-                                match remote_conn.inbound_packet_sender.try_send(packet_data) {
-                                    Ok(_) => {
-                                        self.remote_connections.insert(remote_addr, remote_conn);
-                                        continue;
+                                // Spawn a task to send the packet with backpressure instead of dropping
+                                // This prevents retransmission amplification from dropped ACK packets
+                                let sender = remote_conn.inbound_packet_sender.clone();
+                                let addr = remote_addr;
+                                tokio::spawn(async move {
+                                    if let Err(e) = sender.send(packet_data).await {
+                                        // Channel closed - connection is being torn down, which is fine
+                                        tracing::trace!(%addr, error = ?e, "Failed to send packet (connection closing)");
                                     }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        // Channel full, reinsert connection
-                                        self.remote_connections.insert(remote_addr, remote_conn);
+                                });
 
-                                        // Track dropped packets and log warnings periodically
-                                        let dropped_count = self.dropped_packets.entry(remote_addr).or_insert(0);
-                                        *dropped_count += 1;
-
-                                        // Log warning every 10 seconds if packets are being dropped
-                                        let now = Instant::now();
-                                        if now.duration_since(self.last_drop_warning) > Duration::from_secs(10) {
-                                            let total_dropped: u64 = self.dropped_packets.values().sum();
-                                            tracing::warn!(
-                                                "Channel overflow: dropped {} packets in last 10s (bandwidth limit may be too high or receiver too slow)",
-                                                total_dropped
-                                            );
-                                            for (addr, count) in &self.dropped_packets {
-                                                if *count > 100 {
-                                                    tracing::warn!("  {} dropped from {}", count, addr);
-                                                }
-                                            }
-                                            self.dropped_packets.clear();
-                                            self.last_drop_warning = now;
-                                        }
-
-                                        // Drop the packet instead of falling through - prevents symmetric packets
-                                        // from being sent to RSA decryption handlers
-                                        continue;
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        // Channel closed, connection is dead
-                                        tracing::warn!(
-                                            %remote_addr,
-                                            "connection closed, removing from active connections"
-                                        );
-                                        // Don't reinsert - connection is truly dead
-                                        continue;
-                                    }
-                                }
+                                // Reinsert connection immediately so we don't block the UDP receive loop
+                                self.remote_connections.insert(remote_addr, remote_conn);
+                                continue;
                             }
 
                             if let Some(inbound_packet_sender) = ongoing_gw_connections.get(&remote_addr) {
-                                match inbound_packet_sender.try_send(packet_data) {
-                                    Ok(_) => continue,
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        // Channel full, drop packet to prevent misrouting
-                                        tracing::debug!(
-                                            %remote_addr,
-                                            "ongoing gateway connection channel full, dropping packet"
-                                        );
-                                        continue;
+                                // Spawn task for ongoing gateway connections too - same backpressure benefits
+                                let sender = inbound_packet_sender.clone();
+                                let addr = remote_addr;
+                                tokio::spawn(async move {
+                                    if let Err(e) = sender.send(packet_data).await {
+                                        tracing::trace!(%addr, error = ?e, "Failed to send to ongoing gateway connection (closing)");
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        // Channel closed, remove the connection
-                                        ongoing_gw_connections.remove(&remote_addr);
-                                        tracing::debug!(
-                                            %remote_addr,
-                                            "ongoing gateway connection channel closed, removing"
-                                        );
-                                        continue;
-                                    }
-                                }
+                                });
+                                continue;
                             }
 
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
@@ -533,13 +488,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                     if ongoing_connections.contains_key(&remote_addr) {
                         // Duplicate connection attempt - just reject this one
                         // The first attempt is still in progress and will complete
-                        tracing::info!(%remote_addr, "connection attempt already in progress, rejecting duplicate");
+                        tracing::trace!(%remote_addr, "connection attempt already in progress, rejecting duplicate");
                         let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
                             cause: "connection attempt already in progress".into(),
                         }));
                         continue;
                     }
-                    tracing::info!(%remote_addr, "attempting to establish connection");
+                    tracing::trace!(%remote_addr, "attempting to establish connection");
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,  remote_public_key,
                     );

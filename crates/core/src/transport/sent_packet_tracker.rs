@@ -58,6 +58,9 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
 
     resend_queue: VecDeque<ResendQueueEntry>,
 
+    /// Track retry count per packet for exponential backoff
+    retry_counts: HashMap<PacketId, u32>,
+
     packet_loss_proportion: f64,
 
     pub(super) time_source: T,
@@ -68,6 +71,7 @@ impl SentPacketTracker<InstantTimeSrc> {
         SentPacketTracker {
             pending_receipts: HashMap::new(),
             resend_queue: VecDeque::new(),
+            retry_counts: HashMap::new(),
             packet_loss_proportion: 0.0,
             time_source: InstantTimeSrc::new(),
         }
@@ -77,8 +81,19 @@ impl SentPacketTracker<InstantTimeSrc> {
 impl<T: TimeSource> SentPacketTracker<T> {
     pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Arc<[u8]>) {
         self.pending_receipts.insert(packet_id, payload);
+
+        // Get retry count for this packet and increment it
+        let retry_count = self.retry_counts.entry(packet_id).or_insert(0);
+        let current_retry = *retry_count;
+        *retry_count += 1;
+
+        // Calculate exponential backoff: base_timeout * 2^retry_count
+        // Cap at 8 seconds (2^4 * 500ms = 8000ms) to prevent excessive delays
+        let backoff_multiplier = 2u32.pow(current_retry.min(4));
+        let timeout = MESSAGE_CONFIRMATION_TIMEOUT * backoff_multiplier;
+
         self.resend_queue.push_back(ResendQueueEntry {
-            timeout_at: self.time_source.now() + MESSAGE_CONFIRMATION_TIMEOUT,
+            timeout_at: self.time_source.now() + timeout,
             packet_id,
         });
     }
@@ -90,6 +105,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 * (1.0 - PACKET_LOSS_DECAY_FACTOR)
                 + (PACKET_LOSS_DECAY_FACTOR * 0.0);
             self.pending_receipts.remove(packet_id);
+            // Clean up retry count when packet is acknowledged
+            self.retry_counts.remove(packet_id);
         }
     }
 
@@ -148,6 +165,7 @@ pub(in crate::transport) mod tests {
         SentPacketTracker {
             pending_receipts: HashMap::new(),
             resend_queue: VecDeque::new(),
+            retry_counts: HashMap::new(),
             packet_loss_proportion: 0.0,
             time_source,
         }
