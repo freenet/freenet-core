@@ -222,7 +222,7 @@ impl Operation for ConnectOp {
                                 tx = %id,
                                 query_target = %query_target.peer,
                                 joiner = %joiner.peer,
-                                "Gateway has no desirable peer to offer to joiner",
+                                "Gateway found no suitable peers to forward CheckConnectivity request",
                             );
                             return_msg = None;
                             new_state = None;
