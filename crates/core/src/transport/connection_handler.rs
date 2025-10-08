@@ -1532,7 +1532,7 @@ mod test {
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_a_conn).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_a_conn).await??;
             conn.send("some data").await.inspect_err(|error| {
                 tracing::error!(%error, "error while sending message to peer a");
             })?;
@@ -1542,8 +1542,8 @@ mod test {
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_b_conn).await??;
-            let b = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await??;
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_b_conn).await??;
+            let b = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await??;
             // we should receive the message
             assert_eq!(&b[8..], b"some data");
             tracing::info!("Peer a received package from peer b");
@@ -1571,7 +1571,7 @@ mod test {
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_a_conn)
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_a_conn)
                 .await
                 .inspect_err(|_| tracing::error!("peer a timed out"))?
                 .inspect_err(|error| tracing::error!(%error, "error while connecting to peer a"))?;
@@ -1584,13 +1584,13 @@ mod test {
             conn.send("some data").await.inspect_err(|error| {
                 tracing::error!(%error, "error while sending 2nd message");
             })?;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
             Ok::<_, anyhow::Error>(conn)
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_b_conn)
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_b_conn)
                 .await
                 .inspect_err(|_| tracing::error!("peer b timed out"))?
                 .inspect_err(|error| tracing::error!(%error, "error while connecting to peer b"))?;

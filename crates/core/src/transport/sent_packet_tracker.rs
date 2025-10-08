@@ -88,8 +88,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
         *retry_count += 1;
 
         // Calculate exponential backoff: base_timeout * 2^retry_count
-        // Cap at 8 seconds (2^4 * 500ms = 8000ms) to prevent excessive delays
-        let backoff_multiplier = 2u32.pow(current_retry.min(4));
+        // Cap at 2 seconds (2^2 * 600ms = 2400ms) for faster recovery while preventing flooding
+        let backoff_multiplier = 2u32.pow(current_retry.min(2));
         let timeout = MESSAGE_CONFIRMATION_TIMEOUT * backoff_multiplier;
 
         self.resend_queue.push_back(ResendQueueEntry {
