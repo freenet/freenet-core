@@ -1175,7 +1175,9 @@ impl P2pConnManager {
     fn handle_node_controller_msg(&self, msg: Option<NodeEvent>) -> EventResult {
         match msg {
             Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg).into()),
-            None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Controller).into()),
+            None => {
+                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Controller).into())
+            }
         }
     }
 
