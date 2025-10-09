@@ -282,8 +282,9 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
 
     // Increased from 300s to accommodate exponential backoff across multiple operations
     let test = tokio::time::timeout(Duration::from_secs(500), async move {
-        // CI environment: 45s for network discovery and full connection establishment
-        tokio::time::sleep(Duration::from_secs(45)).await;
+        // CI environment: 120s for network discovery and full connection establishment
+        // Nodes need time to: start, connect to gateway, exchange peer info, establish mesh
+        tokio::time::sleep(Duration::from_secs(120)).await;
 
         // Connect to all peers
         let uri_a =
