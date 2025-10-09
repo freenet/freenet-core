@@ -32,7 +32,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: success() || steps.test.conclusion == 'failure'
         with:
-          shared-key: "rust-cache"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
@@ -69,7 +68,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "rust-cache"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
