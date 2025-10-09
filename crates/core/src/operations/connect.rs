@@ -292,11 +292,9 @@ impl Operation for ConnectOp {
                             sender = %sender.peer,
                             joiner = %joiner.peer,
                             at = %this_peer.peer,
-                            "Connectivity check from self, rejecting operation"
+                            "Connectivity check from self (sender == joiner), rejecting operation"
                         );
-                        return Err(OpError::InvalidRoute(
-                            "Self-connection attempt: sender == joiner".to_string(),
-                        ));
+                        return Err(OpError::UnexpectedOpState);
                     }
                     if this_peer.peer == joiner.peer {
                         tracing::error!(
@@ -306,9 +304,7 @@ impl Operation for ConnectOp {
                             sender = %sender.peer,
                             "Received CheckConnectivity where this peer is the joiner (self-connection attempt), rejecting operation"
                         );
-                        return Err(OpError::InvalidRoute(
-                            "Self-connection attempt: this_peer == joiner".to_string(),
-                        ));
+                        return Err(OpError::UnexpectedOpState);
                     }
                     let joiner_loc = joiner
                         .location
