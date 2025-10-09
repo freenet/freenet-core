@@ -280,11 +280,9 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     }
     .boxed_local();
 
-    // Increased from 300s to accommodate exponential backoff across multiple operations
-    let test = tokio::time::timeout(Duration::from_secs(500), async move {
-        // CI environment: 120s for network discovery and full connection establishment
-        // Nodes need time to: start, connect to gateway, exchange peer info, establish mesh
-        tokio::time::sleep(Duration::from_secs(120)).await;
+    let test = tokio::time::timeout(Duration::from_secs(300), async move {
+        // CI environment: Give nodes time to start, connect to gateway, exchange peer info, establish mesh
+        tokio::time::sleep(Duration::from_secs(60)).await;
 
         // Connect to all peers
         let uri_a =
@@ -311,8 +309,7 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
         )
         .await?;
 
-        // Increased timeout to accommodate exponential backoff in retransmissions
-        let resp = tokio::time::timeout(Duration::from_secs(120), client_a.recv()).await??;
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_a.recv()).await??;
         match resp {
             HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
                 assert_eq!(key, contract_key);
@@ -323,8 +320,7 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         make_get(&mut client_b, contract_key, true, false).await?;
-        // Increased timeout to accommodate exponential backoff in retransmissions
-        let resp = tokio::time::timeout(Duration::from_secs(120), client_b.recv()).await??;
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_b.recv()).await??;
         match resp {
             HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }) => {
                 assert_eq!(key, contract_key);
@@ -339,8 +335,7 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         make_update(&mut client_a, contract_key, updated_state.clone()).await?;
-        // Increased timeout to accommodate exponential backoff in retransmissions
-        let resp = tokio::time::timeout(Duration::from_secs(120), client_a.recv()).await??;
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_a.recv()).await??;
         match resp {
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
                 assert_eq!(key, contract_key);

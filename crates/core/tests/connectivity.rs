@@ -661,8 +661,7 @@ async fn test_three_node_network_connectivity() -> TestResult {
     .boxed_local();
 
     // Main test logic
-    // Increased timeout to accommodate exponential backoff in retransmissions
-    let test = tokio::time::timeout(Duration::from_secs(300), async move {
+    let test = tokio::time::timeout(Duration::from_secs(200), async move {
         // Wait for all nodes to start and connect
         tracing::info!("Waiting for nodes to start and establish connections...");
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -762,8 +761,7 @@ async fn test_three_node_network_connectivity() -> TestResult {
         tracing::info!("Verifying network functionality with PUT/GET operations");
 
         make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
-        // Increased timeout to accommodate exponential backoff in retransmissions
-        let resp = tokio::time::timeout(Duration::from_secs(120), client1.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(60), client1.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key);
@@ -775,8 +773,7 @@ async fn test_three_node_network_connectivity() -> TestResult {
         }
 
         make_get(&mut client2, contract_key, true, false).await?;
-        // Increased timeout to accommodate exponential backoff in retransmissions
-        let get_response = tokio::time::timeout(Duration::from_secs(120), client2.recv()).await;
+        let get_response = tokio::time::timeout(Duration::from_secs(60), client2.recv()).await;
         match get_response {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 contract: recv_contract,
