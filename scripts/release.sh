@@ -88,6 +88,55 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 
+# Get the most recently published version from crates.io (most authoritative source)
+echo -n "Checking latest published version on crates.io... "
+PUBLISHED_VERSION=$(cargo search freenet --limit 1 2>/dev/null | grep "^freenet =" | head -1 | cut -d'"' -f2)
+if [[ -z "$PUBLISHED_VERSION" ]]; then
+    echo "⚠️  Could not query crates.io"
+    echo "Warning: Unable to verify against published version"
+    PUBLISHED_VERSION="0.0.0"  # Fallback to allow any version
+else
+    echo "v$PUBLISHED_VERSION"
+fi
+
+# Version comparison function
+version_compare() {
+    local v1="$1"
+    local v2="$2"
+
+    local v1_major=$(echo "$v1" | cut -d. -f1)
+    local v1_minor=$(echo "$v1" | cut -d. -f2)
+    local v1_patch=$(echo "$v1" | cut -d. -f3)
+
+    local v2_major=$(echo "$v2" | cut -d. -f1)
+    local v2_minor=$(echo "$v2" | cut -d. -f2)
+    local v2_patch=$(echo "$v2" | cut -d. -f3)
+
+    if [[ $v1_major -gt $v2_major ]]; then echo "1"; return; fi
+    if [[ $v1_major -lt $v2_major ]]; then echo "-1"; return; fi
+    if [[ $v1_minor -gt $v2_minor ]]; then echo "1"; return; fi
+    if [[ $v1_minor -lt $v2_minor ]]; then echo "-1"; return; fi
+    if [[ $v1_patch -gt $v2_patch ]]; then echo "1"; return; fi
+    if [[ $v1_patch -lt $v2_patch ]]; then echo "-1"; return; fi
+    echo "0"
+}
+
+# Validate requested version against published version
+VERSION_CMP=$(version_compare "$VERSION" "$PUBLISHED_VERSION")
+
+if [[ "$VERSION_CMP" == "-1" ]]; then
+    echo "Error: Cannot release v$VERSION - published version is v$PUBLISHED_VERSION (would be a downgrade)"
+    echo "  Published version on crates.io: v$PUBLISHED_VERSION"
+    echo "  Requested version:              v$VERSION"
+    exit 1
+elif [[ "$VERSION_CMP" == "0" ]]; then
+    echo "Note: Requested version v$VERSION matches published version on crates.io"
+    echo "  This appears to be a re-run of a previous release attempt"
+    echo "  The script will skip already-completed steps (e.g., crates.io publish)"
+elif [[ "$VERSION_CMP" == "1" ]]; then
+    echo "Releasing new version: v$PUBLISHED_VERSION → v$VERSION"
+fi
+
 # Get current fdev version and increment patch version
 CURRENT_FDEV_VERSION=$(grep "^version" "$PROJECT_ROOT/crates/fdev/Cargo.toml" 2>/dev/null | cut -d'"' -f2)
 if [[ -n "$CURRENT_FDEV_VERSION" ]]; then
