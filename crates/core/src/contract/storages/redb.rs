@@ -58,10 +58,9 @@ impl ReDb {
     }
 
     fn is_version_mismatch(error: &DatabaseError) -> bool {
-        let msg = error.to_string();
-        msg.contains("Manual upgrade required")
-            || msg.contains("file format version")
-            || msg.contains("Expected file format version")
+        // Match on the specific UpgradeRequired error variant in redb 3.x
+        // This is more robust than string matching on error messages
+        matches!(error, DatabaseError::UpgradeRequired(..))
     }
 
     fn backup_and_remove_database(db_path: &Path) -> Result<(), redb::Error> {
