@@ -94,12 +94,13 @@ fn verify_riverctl() -> anyhow::Result<PathBuf> {
 
     // Get latest version from crates.io
     let crates_io_url = "https://crates.io/api/v1/crates/riverctl";
-    let response = ureq::get(crates_io_url)
+    let mut response = ureq::get(crates_io_url)
         .call()
         .context("Failed to fetch riverctl info from crates.io")?;
 
     let json: serde_json::Value = response
-        .into_json()
+        .body_mut()
+        .read_json()
         .context("Failed to parse crates.io response")?;
 
     let latest_version = json["crate"]["newest_version"]
