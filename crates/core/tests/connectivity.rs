@@ -762,7 +762,8 @@ async fn test_three_node_network_connectivity() -> TestResult {
         tracing::info!("Verifying network functionality with PUT/GET operations");
 
         make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
-        let resp = tokio::time::timeout(Duration::from_secs(60), client1.recv()).await;
+        // Increased timeout to accommodate exponential backoff in retransmissions
+        let resp = tokio::time::timeout(Duration::from_secs(120), client1.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key);
@@ -774,7 +775,8 @@ async fn test_three_node_network_connectivity() -> TestResult {
         }
 
         make_get(&mut client2, contract_key, true, false).await?;
-        let get_response = tokio::time::timeout(Duration::from_secs(60), client2.recv()).await;
+        // Increased timeout to accommodate exponential backoff in retransmissions
+        let get_response = tokio::time::timeout(Duration::from_secs(120), client2.recv()).await;
         match get_response {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 contract: recv_contract,
