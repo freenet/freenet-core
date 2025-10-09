@@ -495,6 +495,9 @@ async fn test_three_node_network_connectivity() -> TestResult {
     let peer1_ws_port = peer1_ws_socket.local_addr()?.port();
     let peer2_ws_port = peer2_ws_socket.local_addr()?.port();
 
+    // Generate a single consistent location for the gateway
+    let gateway_location = RNG.lock().unwrap().random();
+
     let gateway_config = ConfigArgs {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -506,7 +509,7 @@ async fn test_three_node_network_connectivity() -> TestResult {
             is_gateway: true,
             skip_load_from_network: true,
             gateways: Some(vec![]),
-            location: Some(RNG.lock().unwrap().random()),
+            location: Some(gateway_location),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: Some(gateway_port),
@@ -524,10 +527,10 @@ async fn test_three_node_network_connectivity() -> TestResult {
         ..Default::default()
     };
 
-    // Gateway info for peers
+    // Gateway info for peers - use the SAME location as gateway config
     let gateway_info = InlineGwConfig {
         address: (Ipv4Addr::LOCALHOST, gateway_port).into(),
-        location: Some(RNG.lock().unwrap().random()),
+        location: Some(gateway_location),
         public_key_path: temp_dir_gw.path().join("public.pem"),
     };
 

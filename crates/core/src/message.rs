@@ -344,6 +344,11 @@ pub(crate) enum NodeEvent {
         from: PeerId,
         message: crate::node::proximity_cache::ProximityCacheMessage,
     },
+    /// Send a message to a peer over the network
+    SendMessage {
+        target: PeerId,
+        msg: Box<NetMessage>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -423,6 +428,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::BroadcastProximityCache { from, .. } => {
                 write!(f, "BroadcastProximityCache (from {from})")
+            }
+            NodeEvent::SendMessage { target, msg } => {
+                write!(f, "SendMessage (to {target}, tx: {})", msg.id())
             }
         }
     }

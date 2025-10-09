@@ -322,12 +322,13 @@ impl P2pConnManager {
                                 ChannelCloseReason::Handshake
                                 | ChannelCloseReason::Bridge
                                 | ChannelCloseReason::Controller => {
-                                    // Critical internal channels closed - perform cleanup and shutdown gracefully
+                                    // All ClosedChannel events are critical - the transport is unable to establish
+                                    // more connections, rendering this peer useless. Perform cleanup and shutdown.
                                     tracing::error!(
                                         ?reason,
                                         is_gateway = self.bridge.op_manager.ring.is_gateway(),
                                         num_connections = self.connections.len(),
-                                        "🔴 CRITICAL CHANNEL CLOSED - performing cleanup and shutting down"
+                                        "Critical channel closed - performing cleanup and shutting down"
                                     );
 
                                     // Clean up all active connections
@@ -420,6 +421,15 @@ impl P2pConnManager {
                                     is_gw,
                                 )
                                 .await?;
+                            }
+                            NodeEvent::SendMessage { target, msg } => {
+                                // Send the message to the target peer over the network
+                                tracing::debug!(
+                                    tx = %msg.id(),
+                                    %target,
+                                    "SendMessage event: sending message to peer via network bridge"
+                                );
+                                self.bridge.send(&target, *msg).await?;
                             }
                             NodeEvent::QueryConnections { callback } => {
                                 let connections = self.connections.keys().cloned().collect();
@@ -788,14 +798,9 @@ impl P2pConnManager {
                         self.handle_handshake_action(event, state, handshake_handler_msg).await?;
                         Ok(EventResult::Continue)
                     }
-                    Err(HandshakeError::ChannelClosed) => {
-                        tracing::error!(
-                            "🔴 HANDSHAKE CHANNEL CLOSED - handshake handler's channel has closed"
-                        );
-                        Ok(EventResult::Event(
-                            ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
-                        ))
-                    }
+                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(
+                        ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
+                    )),
                     Err(e) => {
                         tracing::warn!("Handshake error: {:?}", e);
                         Ok(EventResult::Continue)
@@ -1264,10 +1269,7 @@ impl P2pConnManager {
                 .into(),
             ),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
-            None => {
-                tracing::error!("🔴 BRIDGE CHANNEL CLOSED - P2P bridge channel has closed");
-                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into())
-            }
+            None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
         }
     }
 
@@ -1275,9 +1277,6 @@ impl P2pConnManager {
         match msg {
             Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg).into()),
             None => {
-                tracing::error!(
-                    "🔴 CONTROLLER CHANNEL CLOSED - node controller channel has closed"
-                );
                 EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Controller).into())
             }
         }
