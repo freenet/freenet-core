@@ -180,7 +180,11 @@ impl Operation for ConnectOp {
                     };
                     let mut skip_connections = skip_connections.clone();
                     let mut skip_forwards = skip_forwards.clone();
-                    skip_connections.extend([this_peer.clone(), query_target.peer.clone()]);
+                    skip_connections.extend([
+                        this_peer.clone(),
+                        query_target.peer.clone(),
+                        joiner.peer.clone(),
+                    ]);
                     skip_forwards.extend([this_peer.clone(), query_target.peer.clone()]);
                     if this_peer == &query_target.peer {
                         // this peer should be the original target queries
@@ -222,9 +226,21 @@ impl Operation for ConnectOp {
                                 tx = %id,
                                 query_target = %query_target.peer,
                                 joiner = %joiner.peer,
-                                "Gateway has no desirable peer to offer to joiner",
+                                "Gateway found no suitable peers to forward CheckConnectivity request",
                             );
-                            return_msg = None;
+                            // Send a negative response back to the joiner to inform them
+                            // that no suitable peers are currently available
+                            let response = ConnectResponse::AcceptedBy {
+                                accepted: false,
+                                acceptor: own_loc.clone(),
+                                joiner: joiner.peer.clone(),
+                            };
+                            return_msg = Some(ConnectMsg::Response {
+                                id: *id,
+                                sender: own_loc.clone(),
+                                target: joiner.clone(),
+                                msg: response,
+                            });
                             new_state = None;
                         }
                     } else {
@@ -269,17 +285,27 @@ impl Operation for ConnectOp {
                         },
                     ..
                 } => {
+                    let this_peer = op_manager.ring.connection_manager.own_location();
                     if sender.peer == joiner.peer {
                         tracing::error!(
                             tx = %id,
                             sender = %sender.peer,
                             joiner = %joiner.peer,
-                            at = %op_manager.ring.connection_manager.own_location().peer,
-                            "Connectivity check from self, aborting"
+                            at = %this_peer.peer,
+                            "Connectivity check from self (sender == joiner), rejecting operation"
                         );
-                        std::process::exit(1);
+                        return Err(OpError::UnexpectedOpState);
                     }
-                    let this_peer = op_manager.ring.connection_manager.own_location();
+                    if this_peer.peer == joiner.peer {
+                        tracing::error!(
+                            tx = %id,
+                            this_peer = %this_peer.peer,
+                            joiner = %joiner.peer,
+                            sender = %sender.peer,
+                            "Received CheckConnectivity where this peer is the joiner (self-connection attempt), rejecting operation"
+                        );
+                        return Err(OpError::UnexpectedOpState);
+                    }
                     let joiner_loc = joiner
                         .location
                         .expect("should be already set at the p2p bridge level");
@@ -978,16 +1004,19 @@ async fn connect_request(
                 None,
             );
 
-            // Push the new operation and send the message
+            // Push the new operation
             op_manager
                 .push(new_tx_id, OpEnum::Connect(Box::new(new_op)))
                 .await?;
 
+            // Send the FindOptimalPeer message to the gateway over the network
+            // We use notify_node_event with a SendMessage event to ensure it goes through
+            // the proper network channel, not just local processing
             op_manager
-                .notify_op_change(
-                    NetMessage::from(msg),
-                    OpEnum::Connect(Box::new(ConnectOp::new(new_tx_id, None, None, None))),
-                )
+                .notify_node_event(NodeEvent::SendMessage {
+                    target: gateway.peer.clone(),
+                    msg: Box::new(NetMessage::from(msg)),
+                })
                 .await?;
             Ok(())
         }
@@ -1171,13 +1200,17 @@ fn select_forward_target(
     left_htl: usize,
     skip_forwards: &HashSet<PeerId>,
 ) -> Option<PeerKeyLocation> {
+    // Create an extended skip list that includes the joiner to prevent forwarding to the joiner
+    let mut extended_skip = skip_forwards.clone();
+    extended_skip.insert(joiner.peer.clone());
+
     if left_htl >= connection_manager.rnd_if_htl_above {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
             "Randomly selecting peer to forward connect request",
         );
-        connection_manager.random_peer(|p| !skip_forwards.contains(p))
+        connection_manager.random_peer(|p| !extended_skip.contains(p))
     } else {
         tracing::debug!(
             tx = %id,
@@ -1188,7 +1221,7 @@ fn select_forward_target(
             .routing(
                 joiner.location.unwrap(),
                 Some(&request_peer.peer),
-                skip_forwards,
+                &extended_skip,
                 router,
             )
             .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))

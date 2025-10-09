@@ -133,6 +133,7 @@ async fn create_peer_config(
     name: String,
     is_gateway: bool,
     gateway_info: Option<InlineGwConfig>,
+    _peer_index: usize,
 ) -> anyhow::Result<(ConfigArgs, PeerInfo)> {
     let temp_dir = tempfile::tempdir()?;
     let key = TransportKeypair::new();
@@ -140,10 +141,26 @@ async fn create_peer_config(
     key.save(&transport_keypair)?;
     key.public().save(temp_dir.path().join("public.pem"))?;
 
-    // Bind to random ports
-    let network_socket = TcpListener::bind("127.0.0.1:0")?;
-    let ws_socket = TcpListener::bind("127.0.0.1:0")?;
+    // Use different loopback IPs to ensure unique ring locations for P2P network
+    // 127.0.0.1 is gateway, 127.1-255.x.1 for peers
+    let peer_ip = if is_gateway {
+        Ipv4Addr::new(127, 0, 0, 1)
+    } else {
+        // Randomize 2nd and 3rd bytes to minimize location collisions
+        let mut rng = RNG.lock().unwrap();
+        let byte2 = rng.random_range(1..=255);
+        let byte3 = rng.random_range(0..=255);
+        Ipv4Addr::new(127, byte2, byte3, 1)
+    };
+
+    // Bind network socket to peer-specific IP for P2P communication
+    let network_bind_addr = format!("{}:0", peer_ip);
+    let network_socket = TcpListener::bind(&network_bind_addr)?;
     let network_port = network_socket.local_addr()?.port();
+
+    // Bind WebSocket API to 127.0.0.1 so local clients (riverctl) can connect
+    let ws_bind_addr = "127.0.0.1:0";
+    let ws_socket = TcpListener::bind(ws_bind_addr)?;
     let ws_port = ws_socket.local_addr()?.port();
 
     // Drop sockets so they can be reused
@@ -158,18 +175,18 @@ async fn create_peer_config(
 
     let config = ConfigArgs {
         ws_api: WebsocketApiArgs {
-            address: Some(Ipv4Addr::LOCALHOST.into()),
+            address: Some(Ipv4Addr::new(127, 0, 0, 1).into()), // Always use 127.0.0.1 for WebSocket API
             ws_api_port: Some(ws_port),
         },
         network_api: NetworkArgs {
-            public_address: Some(Ipv4Addr::LOCALHOST.into()),
-            public_port: if is_gateway { Some(network_port) } else { None },
+            public_address: Some(peer_ip.into()), // Use randomized IP for P2P network
+            public_port: Some(network_port), // Always set for localhost (required for local networks)
             is_gateway,
             skip_load_from_network: true,
             gateways: Some(gateways),
-            location: Some(RNG.lock().unwrap().random()),
+            location: None, // Let location be derived from IP address
             ignore_protocol_checking: true,
-            address: Some(Ipv4Addr::LOCALHOST.into()),
+            address: Some(peer_ip.into()),
             network_port: Some(network_port),
             bandwidth_limit: None,
             blocked_addresses: None,
@@ -241,7 +258,7 @@ async fn verify_network_topology(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "Requires riverctl to be installed - run manually with: cargo test --test ubertest -- --ignored"]
 async fn test_app_ubertest() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
+    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
 
     info!("=== Freenet Application Ubertest ===");
     info!("Testing River as reference application");
@@ -255,7 +272,7 @@ async fn test_app_ubertest() -> anyhow::Result<()> {
 
     // Step 2: Create and start gateway
     info!("\n--- Step 2: Creating Gateway ---");
-    let (gw_config, gw_info) = create_peer_config("gateway".to_string(), true, None).await?;
+    let (gw_config, gw_info) = create_peer_config("gateway".to_string(), true, None, 0).await?;
 
     let gateway_inline_config = InlineGwConfig {
         address: (Ipv4Addr::LOCALHOST, gw_info.network_port).into(),
@@ -290,6 +307,7 @@ async fn test_app_ubertest() -> anyhow::Result<()> {
             format!("peer{}", i),
             false,
             Some(gateway_inline_config.clone()),
+            i + 1, // peer_index: gateway is 0, peers are 1, 2, 3...
         )
         .await?;
 
@@ -333,6 +351,11 @@ async fn test_app_ubertest() -> anyhow::Result<()> {
         let peer_startup_time = config.peer_count * 10 + 30; // Extra 30s buffer
         sleep(Duration::from_secs(peer_startup_time as u64)).await;
         info!("All peers should be started now");
+
+        // Wait additional time for mesh formation (connection maintenance cycles)
+        info!("Waiting for peer mesh formation...");
+        sleep(Duration::from_secs(75)).await;
+        info!("Mesh formation period complete");
 
         // Step 5: Verify network topology
         info!("\n--- Step 5: Verifying Network Topology ---");
@@ -610,12 +633,7 @@ async fn test_app_ubertest() -> anyhow::Result<()> {
             result?;
             bail!("Gateway node exited unexpectedly");
         }
-        result = async {
-            for node in peer_nodes {
-                node.await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        } => {
+        result = futures::future::try_join_all(peer_nodes) => {
             result?;
             bail!("A peer node exited unexpectedly");
         }

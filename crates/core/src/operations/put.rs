@@ -938,6 +938,14 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         .ring
         .closest_potentially_caching(&key, [&own_location.peer].as_slice());
 
+    tracing::debug!(
+        tx = %id,
+        %key,
+        target_found = target.is_some(),
+        target_peer = ?target.as_ref().map(|t| t.peer.to_string()),
+        "Determined PUT routing target"
+    );
+
     // No other peers found - handle locally
     if target.is_none() {
         tracing::debug!(tx = %id, %key, "No other peers available, handling put operation locally");
@@ -1017,6 +1025,16 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
     }
 
     // At least one peer found - forward to network
+    let target_peer = target.unwrap();
+
+    tracing::debug!(
+        tx = %id,
+        %key,
+        target_peer = %target_peer.peer,
+        target_location = ?target_peer.location,
+        "Forwarding PUT to target peer"
+    );
+
     put_op.state = Some(PutState::AwaitingResponse {
         key,
         upstream: None,
@@ -1032,8 +1050,14 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         related_contracts,
         value,
         htl,
-        target: target.unwrap(),
+        target: target_peer,
     };
+
+    tracing::debug!(
+        tx = %id,
+        %key,
+        "Calling notify_op_change to send PUT message to network"
+    );
 
     // Use notify_op_change to trigger the operation processing
     // This will cause the operation to be processed through process_message for network propagation
