@@ -256,7 +256,6 @@ async fn verify_network_topology(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "Requires riverctl to be installed - run manually with: cargo test --test ubertest -- --ignored"]
 async fn test_app_ubertest() -> anyhow::Result<()> {
     freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
 
