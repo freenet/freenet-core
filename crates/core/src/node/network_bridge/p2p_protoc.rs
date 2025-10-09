@@ -911,23 +911,55 @@ impl P2pConnManager {
             tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
         }
         state.awaiting_connection.insert(peer.addr, callback);
+        // Increased timeout from 10s to 60s for CI environments where connection
+        // establishment can be slow. The 10s timeout was causing callbacks to be
+        // orphaned in awaiting_connection, leading to "channel closed" errors.
         let res = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             handshake_handler_msg.establish_conn(peer.clone(), tx, is_gw),
         )
-        .await
-        .inspect_err(|error| {
-            tracing::error!(tx = %tx, "Failed to establish connection: {:?}", error);
-        })?;
+        .await;
+
         match res {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 tracing::debug!(tx = %tx,
                     "Successfully initiated connection process for peer: {:?}",
                     peer
                 );
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::msg(e)),
+            Ok(Err(e)) => {
+                // Connection establishment failed - remove orphaned callback
+                if let Some(mut cb) = state.awaiting_connection.remove(&peer.addr) {
+                    // Notify callback of failure
+                    let _ = cb
+                        .send_result(Err(HandshakeError::ConnectionError(
+                            crate::node::network_bridge::ConnectionError::TransportError(
+                                e.to_string(),
+                            ),
+                        )))
+                        .await;
+                }
+                Err(anyhow::Error::msg(e))
+            }
+            Err(_timeout_err) => {
+                // Timeout - remove orphaned callback to prevent "channel closed" errors
+                tracing::error!(tx = %tx, %peer, "Timeout establishing connection after 60s");
+                if let Some(mut cb) = state.awaiting_connection.remove(&peer.addr) {
+                    // Notify callback of timeout
+                    let _ = cb
+                        .send_result(Err(HandshakeError::ConnectionError(
+                            crate::node::network_bridge::ConnectionError::TransportError(
+                                "connection timeout".to_string(),
+                            ),
+                        )))
+                        .await;
+                }
+                Err(anyhow::anyhow!(
+                    "Timeout establishing connection to {}",
+                    peer
+                ))
+            }
         }
     }
 
