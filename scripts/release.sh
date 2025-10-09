@@ -291,25 +291,80 @@ update_versions() {
 
 create_release_pr() {
     echo "Creating release PR:"
-    
+
     local branch_name="release/v$VERSION"
-    
+
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "  [DRY RUN] Would create branch $branch_name"
         echo "  [DRY RUN] Would create auto-merge PR"
         echo "  [DRY RUN] Would wait for GitHub CI"
         return 0
     fi
-    
-    run_cmd "Creating release branch" git checkout -b "$branch_name"
-    run_cmd "Adding changes" git add -A
+
+    # Check if a release PR for this version already exists or was merged
+    echo -n "  Checking for existing release PR... "
+    local existing_pr=$(gh pr list --search "Release $VERSION OR 🚀 Release $VERSION" --state all --limit 1 --json number,state,title --jq '.[] | "\(.number)|\(.state)|\(.title)"' 2>/dev/null || echo "")
+
+    if [[ -n "$existing_pr" ]]; then
+        local pr_number=$(echo "$existing_pr" | cut -d'|' -f1)
+        local pr_state=$(echo "$existing_pr" | cut -d'|' -f2)
+        local pr_title=$(echo "$existing_pr" | cut -d'|' -f3)
+        echo "found #$pr_number ($pr_state)"
+
+        if [[ "$pr_state" == "MERGED" ]]; then
+            echo "  ✓ Release PR #$pr_number already merged, skipping PR creation"
+
+            # Make sure we're on main with the merged changes
+            if [[ $(git branch --show-current) != "main" ]]; then
+                run_cmd "Switching to main branch" git checkout main
+            fi
+            run_cmd "Pulling latest changes" git pull origin main
+
+            # Clean up release branch if it exists
+            if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+                git branch -d "$branch_name" 2>/dev/null || true
+            fi
+
+            return 0
+        elif [[ "$pr_state" == "OPEN" ]]; then
+            echo "  ℹ️  Release PR #$pr_number already exists and is open"
+            echo "     Monitoring existing PR instead of creating a new one..."
+            # Continue with the existing PR monitoring logic below
+        else
+            echo "  ⚠️  Release PR #$pr_number exists but is $pr_state"
+        fi
+    else
+        echo "not found"
+    fi
+
+    # Check if there are any changes to commit
+    git add -A
+    if git diff --cached --quiet; then
+        echo "  ✓ No version changes needed (already at $VERSION)"
+
+        # Check if we're already on main
+        if [[ $(git branch --show-current) != "main" ]]; then
+            run_cmd "Switching to main branch" git checkout main
+        fi
+
+        return 0
+    fi
+
+    # Create release branch if it doesn't exist
+    if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+        echo "  ℹ️  Branch $branch_name already exists, using it"
+        git checkout "$branch_name"
+    else
+        run_cmd "Creating release branch" git checkout -b "$branch_name"
+    fi
+
     run_cmd "Committing version bump" git commit -m "chore: bump versions to $VERSION
 
 - freenet: → $VERSION
 - fdev: → $FDEV_VERSION
 
 🤖 Automated release commit"
-    
+
     run_cmd "Pushing branch" git push origin "$branch_name"
     
     echo -n "  Creating auto-merge PR... "
@@ -510,15 +565,30 @@ publish_crates() {
         return 0
     fi
 
-    # Publish freenet first (fdev depends on it)
-    run_cmd "Publishing freenet $VERSION" cargo publish -p freenet
+    # Check if freenet is already published
+    echo -n "  Checking if freenet $VERSION is already published... "
+    if cargo search freenet --limit 1 2>/dev/null | grep -q "freenet = \"$VERSION\""; then
+        echo "yes"
+        echo "  ✓ freenet $VERSION already published to crates.io"
+    else
+        echo "no"
+        run_cmd "Publishing freenet $VERSION" cargo publish -p freenet
 
-    # Wait a bit for crates.io to propagate
-    echo -n "  Waiting for crates.io propagation... "
-    sleep 30
-    echo "✓"
+        # Wait a bit for crates.io to propagate
+        echo -n "  Waiting for crates.io propagation... "
+        sleep 30
+        echo "✓"
+    fi
 
-    run_cmd "Publishing fdev $FDEV_VERSION" cargo publish -p fdev
+    # Check if fdev is already published
+    echo -n "  Checking if fdev $FDEV_VERSION is already published... "
+    if cargo search fdev --limit 1 2>/dev/null | grep -q "fdev = \"$FDEV_VERSION\""; then
+        echo "yes"
+        echo "  ✓ fdev $FDEV_VERSION already published to crates.io"
+    else
+        echo "no"
+        run_cmd "Publishing fdev $FDEV_VERSION" cargo publish -p fdev
+    fi
 }
 
 create_github_release() {
@@ -530,8 +600,31 @@ create_github_release() {
         return 0
     fi
 
-    run_cmd "Creating and pushing tag" git tag -a "v$VERSION" -m "Release v$VERSION"
-    run_cmd "Pushing tag" git push origin "v$VERSION"
+    # Check if release already exists
+    echo -n "  Checking if release v$VERSION already exists... "
+    if gh release view "v$VERSION" &>/dev/null; then
+        echo "yes"
+        echo "  ✓ GitHub release v$VERSION already exists"
+        release_url=$(gh release view "v$VERSION" --json url --jq '.url')
+        echo "  Release URL: $release_url"
+        return 0
+    else
+        echo "no"
+    fi
+
+    # Check if tag already exists
+    if git tag | grep -q "^v$VERSION$"; then
+        echo "  ℹ️  Tag v$VERSION already exists locally"
+    else
+        run_cmd "Creating tag v$VERSION" git tag -a "v$VERSION" -m "Release v$VERSION"
+    fi
+
+    # Check if tag exists on remote
+    if git ls-remote --tags origin | grep -q "refs/tags/v$VERSION$"; then
+        echo "  ℹ️  Tag v$VERSION already exists on remote"
+    else
+        run_cmd "Pushing tag" git push origin "v$VERSION"
+    fi
 
     echo -n "  Generating release notes... "
     local release_notes=$(generate_release_notes "$VERSION")
