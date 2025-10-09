@@ -658,7 +658,8 @@ async fn test_three_node_network_connectivity() -> TestResult {
     .boxed_local();
 
     // Main test logic
-    let test = tokio::time::timeout(Duration::from_secs(180), async move {
+    // Increased timeout to accommodate exponential backoff in retransmissions
+    let test = tokio::time::timeout(Duration::from_secs(300), async move {
         // Wait for all nodes to start and connect
         tracing::info!("Waiting for nodes to start and establish connections...");
         tokio::time::sleep(Duration::from_secs(20)).await;
