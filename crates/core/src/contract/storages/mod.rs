@@ -11,7 +11,7 @@ pub type Storage = SqlitePool;
 #[cfg(feature = "redb")]
 pub mod redb;
 #[cfg(feature = "redb")]
-use self::redb::ReDb;
+pub use self::redb::ReDb;
 
 #[cfg(feature = "redb")]
 pub type Storage = ReDb;
