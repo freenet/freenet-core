@@ -52,6 +52,24 @@ async fn query_proximity_cache(
 /// 4. Proximity cache stats are correctly tracked
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_proximity_based_update_forwarding() -> TestResult {
+    // Increase stack size to prevent overflow (need 16MB for deep async call stacks)
+    const STACK_SIZE: usize = 16 * 1024 * 1024; // 16MB
+    let builder = std::thread::Builder::new().stack_size(STACK_SIZE);
+    let handler = builder
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { run_test().await })
+        })
+        .unwrap();
+    handler.join().unwrap()
+}
+
+async fn run_test() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
     // Load test contract
@@ -292,9 +310,9 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(300), async move {
-        // Wait for nodes to start up and connect
+        // CI environment: Give nodes time to start, connect to gateway, exchange peer info, establish mesh
         tracing::info!("Waiting for network to stabilize...");
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
 
         // Connect to all peers
         let uri_a =
