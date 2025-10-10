@@ -166,3 +166,88 @@ impl StateStorage for ReDb {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    // Note: Direct unit testing of is_version_mismatch is difficult because
+    // DatabaseError::UpgradeRequired is created internally by redb and cannot
+    // be easily constructed in tests. The real validation happens via:
+    // 1. The backup tests below (verify backup logic works)
+    // 2. Integration tests with actual v2 databases (verify migration works)
+    // 3. Manual testing with actual version mismatches
+
+    #[tokio::test]
+    async fn test_backup_nonexistent_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("nonexistent_db");
+
+        // Should succeed even if database doesn't exist
+        let result = ReDb::backup_and_remove_database(&db_path);
+        assert!(
+            result.is_ok(),
+            "Should handle nonexistent database gracefully"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backup_creates_timestamped_backup() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+
+        // Create a dummy database file (use "db" like the real code does)
+        let mut file = std::fs::File::create(&db_path).unwrap();
+        file.write_all(b"dummy database content").unwrap();
+        drop(file);
+
+        // Backup the database
+        ReDb::backup_and_remove_database(&db_path).unwrap();
+
+        // Original should be gone
+        assert!(!db_path.exists(), "Original database should be removed");
+
+        // Backup should exist with timestamp format like "db.backup.{timestamp}"
+        let backups: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("db.backup.") || name.starts_with("db.db.backup.")
+            })
+            .collect();
+
+        assert!(
+            !backups.is_empty(),
+            "Should create at least one backup. Found files: {:?}",
+            std::fs::read_dir(temp_dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
+
+        // Verify backup has the same content
+        let backup_path = backups[0].path();
+        let backup_content = std::fs::read_to_string(&backup_path).unwrap();
+        assert_eq!(
+            backup_content, "dummy database content",
+            "Backup should preserve original content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migration_with_fresh_database() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // This should succeed and create a new database
+        let result = ReDb::new(temp_dir.path()).await;
+        assert!(result.is_ok(), "Should successfully create fresh database");
+
+        // Verify database file was created
+        let db_path = temp_dir.path().join("db");
+        assert!(db_path.exists(), "Database file should exist");
+    }
+}
