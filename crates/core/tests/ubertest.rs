@@ -338,9 +338,6 @@ async fn test_app_ubertest() -> anyhow::Result<()> {
         .boxed_local();
 
         peer_nodes.push(peer_node);
-
-        info!("Peer {} started, waiting 5s to start next...", i);
-        sleep(Duration::from_secs(5)).await;
     }
 
     // The actual test logic
