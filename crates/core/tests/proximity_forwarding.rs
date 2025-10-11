@@ -396,9 +396,26 @@ async fn run_test() -> TestResult {
 
         make_subscribe(&mut client_c, contract_key).await?;
 
-        // Wait for subscription confirmation
+        // Wait for and consume subscription confirmation
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_c.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            }) => {
+                tracing::info!(
+                    "✓ Peer C subscribed to contract: {} (subscribed: {})",
+                    key,
+                    subscribed
+                );
+                assert_eq!(key, contract_key);
+                assert!(subscribed);
+            }
+            other => bail!("Expected SubscribeResponse, got: {:?}", other),
+        }
+
+        // Give time for subscription to stabilize
         tokio::time::sleep(Duration::from_secs(5)).await;
-        tracing::info!("✓ Peer C subscribed to contract");
 
         tracing::info!("========================================");
         tracing::info!("STEP 4: Peer A UPDATEs the contract");
