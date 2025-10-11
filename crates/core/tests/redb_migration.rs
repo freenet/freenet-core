@@ -75,7 +75,7 @@ async fn test_automatic_migration_from_v2_to_v3() -> Result<(), Box<dyn std::err
     );
 
     // Verify the new database exists and can be used
-    let db = result.unwrap();
+    let _db = result.unwrap();
 
     // Note: We can't verify the old data was preserved because the migration
     // creates a fresh database. This is expected behavior - the backup is for
@@ -98,7 +98,10 @@ async fn test_normal_operation_without_migration() -> Result<(), Box<dyn std::er
 
     // Create a fresh database - no migration should occur
     let result = ReDb::new(temp_dir.path()).await;
-    assert!(result.is_ok(), "Should create fresh database without issues");
+    assert!(
+        result.is_ok(),
+        "Should create fresh database without issues"
+    );
 
     // Verify no backup files were created
     let backups: Vec<_> = std::fs::read_dir(temp_dir.path())?

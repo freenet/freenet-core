@@ -8,7 +8,7 @@ pub mod config;
 mod contract;
 
 // Re-export for integration tests (tests/ directory needs pub access)
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "testing", feature = "redb"))]
 pub use contract::storages;
 
 /// Generated messages from the flatbuffers schema for the network monitor.
