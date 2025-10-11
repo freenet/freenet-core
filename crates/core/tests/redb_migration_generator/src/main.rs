@@ -46,13 +46,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let write_txn = db.begin_write()?;
     {
         let mut state_table = write_txn.open_table(STATE_TABLE)?;
-        state_table.insert(b"test_key_1", b"test_value_1")?;
-        state_table.insert(b"test_key_2", b"test_value_2")?;
-        state_table.insert(b"contract_abc", b"state_data_abc")?;
+        state_table.insert(&b"test_key_1"[..], &b"test_value_1"[..])?;
+        state_table.insert(&b"test_key_2"[..], &b"test_value_2"[..])?;
+        state_table.insert(&b"contract_abc"[..], &b"state_data_abc"[..])?;
 
         let mut params_table = write_txn.open_table(CONTRACT_PARAMS_TABLE)?;
-        params_table.insert(b"param_key_1", b"param_value_1")?;
-        params_table.insert(b"config_key", b"config_value")?;
+        params_table.insert(&b"param_key_1"[..], &b"param_value_1"[..])?;
+        params_table.insert(&b"config_key"[..], &b"config_value"[..])?;
     }
     write_txn.commit()?;
 
@@ -65,8 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state_table = read_txn.open_table(STATE_TABLE)?;
         let mut iter = state_table.iter()?;
         println!("  STATE_TABLE entries:");
-        while let Some((key, value)) = iter.next() {
-            let (k, v) = (key?, value?);
+        while let Some(result) = iter.next() {
+            let (k, v) = result?;
             println!(
                 "    {} = {}",
                 String::from_utf8_lossy(k.value()),
@@ -77,8 +77,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let params_table = read_txn.open_table(CONTRACT_PARAMS_TABLE)?;
         let mut iter = params_table.iter()?;
         println!("  CONTRACT_PARAMS_TABLE entries:");
-        while let Some((key, value)) = iter.next() {
-            let (k, v) = (key?, value?);
+        while let Some(result) = iter.next() {
+            let (k, v) = result?;
             println!(
                 "    {} = {}",
                 String::from_utf8_lossy(k.value()),

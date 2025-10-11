@@ -17,7 +17,6 @@ use tempfile::TempDir;
 ///    - The migration completes without errors
 #[tokio::test]
 #[cfg_attr(not(feature = "redb"), ignore)]
-#[ignore] // Requires a pre-built v2 database file - run manually after generation
 async fn test_automatic_migration_from_v2_to_v3() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "redb")]
     use freenet::storages::redb::ReDb;
@@ -28,15 +27,11 @@ async fn test_automatic_migration_from_v2_to_v3() -> Result<(), Box<dyn std::err
         .join("data")
         .join("redb_v2_test.db");
 
-    if !v2_db_path.exists() {
-        eprintln!("WARNING: v2 test database not found at {:?}", v2_db_path);
-        eprintln!("To generate it:");
-        eprintln!("1. Edit Cargo.toml to temporarily use redb = \"2\"");
-        eprintln!("2. Run: cargo run --bin create_v2_db");
-        eprintln!("3. Revert Cargo.toml to redb = \"3\"");
-        eprintln!("4. Run this test again");
-        return Ok(());
-    }
+    assert!(
+        v2_db_path.exists(),
+        "v2 test database not found at {:?}. Generate it with: cargo run --manifest-path crates/core/tests/redb_migration_generator/Cargo.toml",
+        v2_db_path
+    );
 
     // Create temp directory and copy v2 database
     let temp_dir = TempDir::new()?;
