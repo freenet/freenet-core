@@ -947,6 +947,37 @@ impl Operation for GetOp {
                                 if !is_subscribed_contract {
                                     tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                     op_manager.ring.seed_contract(key);
+
+                                    // Track contract caching in proximity cache and send announcements
+                                    if let Some(proximity_cache) = &op_manager.proximity_cache {
+                                        if let Some(cache_msg) =
+                                            proximity_cache.on_contract_cached(&key).await
+                                        {
+                                            if let Some(own_peer) =
+                                                op_manager.ring.connection_manager.get_peer_key()
+                                            {
+                                                tracing::debug!(
+                                                    tx = %id,
+                                                    %key,
+                                                    "PROXIMITY_PROPAGATION: Generated cache announcement, broadcasting to neighbors via event loop"
+                                                );
+
+                                                // Send broadcast event to event loop to avoid blocking
+                                                // Event loop will spawn tasks for each peer send to prevent stack overflow
+                                                let _ = op_manager
+                                                    .to_event_listener
+                                                    .notifications_sender()
+                                                    .send(either::Either::Right(
+                                                        crate::message::NodeEvent::BroadcastProximityCache {
+                                                            from: own_peer,
+                                                            message: cache_msg,
+                                                        },
+                                                    ))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.insert(sender.peer.clone());
 

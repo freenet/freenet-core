@@ -7,6 +7,7 @@ use super::{
     network_bridge::{
         event_loop_notification_channel, p2p_protoc::P2pConnManager, EventLoopNotificationsReceiver,
     },
+    proximity_cache::ProximityCacheManager,
     NetEventRegister, PeerId,
 };
 use crate::{
@@ -34,6 +35,8 @@ pub(crate) struct NodeP2P {
     pub(super) is_gateway: bool,
     /// used for testing with deterministic location
     pub(super) location: Option<Location>,
+    #[allow(dead_code)]
+    pub(super) proximity_cache: Arc<ProximityCacheManager>,
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
     executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
@@ -247,7 +250,12 @@ impl NodeP2P {
 
         tracing::info!("Actor-based client management infrastructure installed with result router");
 
+        // Create proximity cache instance that will be shared
+        let proximity_cache = Arc::new(ProximityCacheManager::new());
+
         let connection_manager = ConnectionManager::new(&config);
+        // Clone notification_tx before moving it to OpManager
+        let notification_tx_clone = notification_tx.clone();
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
             ch_outbound,
@@ -255,6 +263,7 @@ impl NodeP2P {
             event_register.clone(),
             connection_manager,
             result_router_tx,
+            Some(proximity_cache.clone()),
         )?);
         let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
@@ -295,8 +304,10 @@ impl NodeP2P {
         .boxed();
         let clients = ClientEventsCombinator::new(clients);
         let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
+
         let client_events_task = GlobalExecutor::spawn({
             let op_manager_clone = op_manager.clone();
+            let proximity_cache_clone = proximity_cache.clone();
             let task = async move {
                 tracing::info!("Client events task starting");
                 let result = client_event_handling(
@@ -304,6 +315,7 @@ impl NodeP2P {
                     clients,
                     client_responses,
                     node_controller_tx,
+                    proximity_cache_clone,
                 )
                 .await;
                 tracing::warn!("Client events task exiting (unexpected)");
@@ -317,11 +329,33 @@ impl NodeP2P {
         })
         .boxed();
 
+        // Spawn the periodic batch announcement task for proximity cache
+        proximity_cache
+            .clone()
+            .spawn_periodic_batch_announcements(notification_tx_clone, Arc::downgrade(&op_manager));
+
+        // Spawn periodic cleanup task to remove stale neighbor entries
+        // This handles cases where disconnect events might be missed
+        let proximity_cache_cleanup = proximity_cache.clone();
+        crate::config::GlobalExecutor::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // Every 5 minutes
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+                // Remove neighbors that haven't been seen for 10 minutes
+                proximity_cache_cleanup
+                    .cleanup_stale_neighbors(std::time::Duration::from_secs(600))
+                    .await;
+            }
+        });
+
         Ok(NodeP2P {
             conn_manager,
             notification_channel,
             client_wait_for_transaction: wait_for_event,
             op_manager,
+            proximity_cache,
             executor_listener,
             node_controller: node_controller_rx,
             should_try_connect: config.should_connect,
