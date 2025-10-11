@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile.yml
     image: freenet-node:latest
     environment:
-      - WS_API_PORT=50509
+      - WS_API_PORT=7509
     network_mode: host
     volumes:
       - freenet-data:/root/.cache/freenet

@@ -9,4 +9,4 @@ NODE_DIR="${BASE_DIR}/node"
 freenet network \
   --config-dir "$BASE_DIR" \
   --data-dir "$NODE_DIR" \
-  --ws-api-port "${WS_API_PORT:-50509}"
+  --ws-api-port "${WS_API_PORT:-7509}"

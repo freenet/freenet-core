@@ -65,7 +65,7 @@ pub struct ExecutorConfig {
     #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub(crate) address: IpAddr,
     /// The port of the running local freenet node.
-    #[arg(short, long, default_value = "50509")]
+    #[arg(short, long, default_value = "7509")]
     pub(crate) port: u16,
     /// Node operation mode.
     #[clap(value_enum, default_value_t = OperationMode::Local, env = "MODE")]

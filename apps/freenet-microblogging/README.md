@@ -68,7 +68,7 @@ that, run the following command:
    ```
 2. Browse to the following URL to load the microblogging web, note that the hash may be different:
    ```
-   http://127.0.0.1:50509/contract/web/9zaPEBmmMAF3eKy7NnuPUit2j1annxtVY226DWGLzEFN/
+   http://127.0.0.1:7509/contract/web/9zaPEBmmMAF3eKy7NnuPUit2j1annxtVY226DWGLzEFN/
    ```
 
 The hash may be different and you can get it when you run the build command.

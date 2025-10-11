@@ -170,7 +170,7 @@ After building the app, what remains is to run the local node and the web app. T
 During the development process, changes inside the web app will be automatically reloaded if it is running.
 
 If you, instead, want to access the published app via the `build` command, go to your browser and write an URL like (with the node running):
-`http://localhost:50509/contract/web/5zrr81Nbvk6PjkrXjXXFpDfrNZZvhx2JCc7BZTBHUKDo/`
+`http://localhost:7509/contract/web/5zrr81Nbvk6PjkrXjXXFpDfrNZZvhx2JCc7BZTBHUKDo/`
 
 The hash may be different and you can get it when you run the build command.
 

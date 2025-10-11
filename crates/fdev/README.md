@@ -175,7 +175,7 @@ To push a state delta to an existing contract (identified by its Base58 key):
 fdev execute update <BASE58_CONTRACT_KEY> \
     --delta path/to/delta \
     [--address 127.0.0.1 \
-     --port 50509 \
+     --port 7509 \
      --release]
 ```
 
@@ -539,7 +539,7 @@ To push a state delta to an existing contract (identified by its Base58 key):
 fdev execute update <BASE58_CONTRACT_KEY> \
     --delta path/to/delta.json \
     [--address 127.0.0.1 \
-     --port 50509 \
+     --port 7509 \
      --release]
 ```
 

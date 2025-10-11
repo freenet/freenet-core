@@ -59,7 +59,7 @@ The `freenet-setup.sh` script supports two modes:
 ```
 
 - **<name>**: Unique name for your node or gateway.
-- **[ws-api-port]**: Optional WebSocket API port (default: 50509).
+- **[ws-api-port]**: Optional WebSocket API port (default: 7509).
 
 ### Examples
 
