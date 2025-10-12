@@ -190,7 +190,7 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: [validate, wait_for_pr]
-    if: ${{ !inputs.dry_run }}
+    if: always() && (needs.wait_for_pr.result == 'success' || inputs.dry_run)
 
     steps:
       - name: Checkout code
@@ -208,11 +208,18 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          echo "📦 Publishing freenet ${{ needs.validate.outputs.version }} to crates.io..."
-          cargo publish -p freenet
-          echo "✅ freenet published successfully"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "📦 [DRY RUN] Verifying freenet ${{ needs.validate.outputs.version }} can be published to crates.io..."
+            cargo publish -p freenet --dry-run
+            echo "✅ freenet dry-run successful (would publish)"
+          else
+            echo "📦 Publishing freenet ${{ needs.validate.outputs.version }} to crates.io..."
+            cargo publish -p freenet
+            echo "✅ freenet published successfully"
+          fi
 
       - name: Wait for crates.io propagation
+        if: ${{ !inputs.dry_run }}
         run: |
           echo "⏳ Waiting 30s for crates.io to propagate..."
           sleep 30
@@ -221,9 +228,15 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          echo "📦 Publishing fdev ${{ needs.validate.outputs.fdev_version }} to crates.io..."
-          cargo publish -p fdev
-          echo "✅ fdev published successfully"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "📦 [DRY RUN] Verifying fdev ${{ needs.validate.outputs.fdev_version }} can be published to crates.io..."
+            cargo publish -p fdev --dry-run
+            echo "✅ fdev dry-run successful (would publish)"
+          else
+            echo "📦 Publishing fdev ${{ needs.validate.outputs.fdev_version }} to crates.io..."
+            cargo publish -p fdev
+            echo "✅ fdev published successfully"
+          fi
 
   create_release:
     name: Create GitHub release
