@@ -15,24 +15,62 @@ show_help() {
     echo -e "${YELLOW}Usage:${NC}"
     echo -e "  $0 [options]\n"
     echo -e "${YELLOW}Options:${NC}"
-    echo -e "  -h, --help    Show this help message\n"
+    echo -e "  --servers SERVER_LIST    Comma-separated list of servers (format: host:arch[:port])"
+    echo -e "  --servers-file FILE      Path to file with one server per line"
+    echo -e "  -h, --help               Show this help message\n"
     echo -e "${YELLOW}Environment Variables:${NC}"
-    echo -e "  ARTIFACTS_DIR   Directory containing the binary artifacts (default: current directory)"
-    echo -e "  BINARIES_PATH   Temporary path for unpacked binaries (default: $TMPDIR or /tmp)\n"
+    echo -e "  ARTIFACTS_DIR    Directory containing the binary artifacts (default: current directory)"
+    echo -e "  BINARIES_PATH    Temporary path for unpacked binaries (default: \$TMPDIR or /tmp)"
+    echo -e "  SERVERS          Comma-separated list of servers (same as --servers option)\n"
+    echo -e "${YELLOW}Server Format:${NC}"
+    echo -e "  hostname:architecture[:port]"
+    echo -e "  - hostname: Server address (e.g., vega.locut.us)"
+    echo -e "  - architecture: x86_64 or aarch64 (must match release artifacts)"
+    echo -e "  - port: SSH port (optional, defaults to 22)\n"
+    echo -e "${YELLOW}Examples:${NC}"
+    echo -e "  # Using command-line option"
+    echo -e "  $0 --servers vega.locut.us:x86_64,ziggy.locut.us:aarch64:23"
+    echo -e ""
+    echo -e "  # Using environment variable"
+    echo -e "  SERVERS=\"vega.locut.us:x86_64\" $0"
+    echo -e ""
+    echo -e "  # Using a servers file"
+    echo -e "  $0 --servers-file ./servers.conf"
+    echo -e ""
+    echo -e "  # servers.conf format (one per line):"
+    echo -e "  vega.locut.us:x86_64"
+    echo -e "  ziggy.locut.us:aarch64:23\n"
     echo -e "${YELLOW}Expected Artifacts:${NC}"
     echo -e "  The script expects zip files in the format: binaries-<arch>-<binary>.zip"
     echo -e "  These artifacts are produced by the cross-compile.yml GitHub Actions workflow"
-    echo -e "  Example: binaries-x86_64-freenet.zip, binaries-arm64-fdev.zip\n"
-    echo -e "${YELLOW}Target Servers:${NC}"
-    echo -e "  The script deploys to servers defined in the SERVERS array with their architectures"
-    echo -e "  Each server will receive the appropriate architecture binaries"
+    echo -e "  Example: binaries-x86_64-freenet.zip, binaries-aarch64-fdev.zip"
 }
 
-# Check for help flags
-if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-    show_help
-    exit 0
-fi
+# Parse command-line arguments
+SERVERS_ARG=""
+SERVERS_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --servers)
+            SERVERS_ARG="$2"
+            shift 2
+            ;;
+        --servers-file)
+            SERVERS_FILE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            show_help
+            exit 1
+            ;;
+    esac
+done
 
 # Configuration
 REMOTE_DIR="/usr/local/bin"  # Remote directory where binaries will be copied
@@ -49,12 +87,68 @@ echo -e "${YELLOW}Using artifacts from: $ARTIFACTS_DIR${NC}"
 echo -e "${YELLOW}Available artifact files:${NC}"
 ls -la "$ARTIFACTS_DIR"/binaries-*.zip 2>/dev/null || echo -e "${RED}No binary zip files found in $ARTIFACTS_DIR${NC}"
 
-# Server list with architecture mapping
-SERVERS=(
-    "vega.locut.us:x86_64"
-    "ziggy.locut.us:arm64"
-)
+# Load servers from various sources (priority: --servers > --servers-file > SERVERS env > default)
+SERVERS=()
+
+if [[ -n "$SERVERS_ARG" ]]; then
+    # From command-line argument: comma-separated list
+    echo -e "${BLUE}Loading servers from --servers argument${NC}"
+    IFS=',' read -ra SERVERS <<< "$SERVERS_ARG"
+elif [[ -n "$SERVERS_FILE" ]]; then
+    # From file: one server per line
+    if [[ ! -f "$SERVERS_FILE" ]]; then
+        echo -e "${RED}Error: Servers file not found: $SERVERS_FILE${NC}"
+        exit 1
+    fi
+    echo -e "${BLUE}Loading servers from file: $SERVERS_FILE${NC}"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        SERVERS+=("$line")
+    done < "$SERVERS_FILE"
+elif [[ -n "${SERVERS:-}" ]]; then
+    # From environment variable: comma-separated list
+    echo -e "${BLUE}Loading servers from SERVERS environment variable${NC}"
+    IFS=',' read -ra SERVERS <<< "$SERVERS"
+else
+    # Default servers (for backward compatibility)
+    echo -e "${BLUE}Using default server list${NC}"
+    SERVERS=(
+        "vega.locut.us:x86_64"
+        "ziggy.locut.us:aarch64:23"
+    )
+fi
+
+# Validate we have at least one server
+if [[ ${#SERVERS[@]} -eq 0 ]]; then
+    echo -e "${RED}Error: No servers configured${NC}"
+    echo -e "${YELLOW}Specify servers using:${NC}"
+    echo -e "  --servers 'host:arch[:port],host2:arch2[:port]'"
+    echo -e "  --servers-file /path/to/servers.conf"
+    echo -e "  SERVERS='host:arch[:port]' $0"
+    exit 1
+fi
+
+echo -e "${GREEN}Configured servers:${NC}"
+for server in "${SERVERS[@]}"; do
+    echo -e "  - $server"
+done
+echo
+
 BINARIES_PATH="${BINARIES_PATH:-${TMPDIR:-/tmp}}"
+
+# Parse server info to extract hostname, arch, and optional port
+parse_server_info() {
+    local server_info="$1"
+    local server arch port
+
+    IFS=':' read -r server arch port <<< "$server_info"
+
+    # Set default port if not specified
+    port="${port:-22}"
+
+    echo "$server:$arch:$port"
+}
 
 # Function to check if artifact exists for given architecture and binary
 check_artifact_exists() {
@@ -240,14 +334,15 @@ echo -e "${YELLOW}Starting deployment process...${NC}"
 
 # For each server in the list
 for server_info in "${SERVERS[@]}"; do
-    # Split server_info into server and architecture
-    IFS=':' read -r server arch <<< "$server_info"
-    
-    echo -e "${YELLOW}Deploying to $server (architecture: $arch)...${NC}"
-    
-    # SSH options
-    if [ "$server" = "ziggy.locut.us" ]; then
-        SSH_OPTS="-p 23"
+    # Parse server information
+    parsed=$(parse_server_info "$server_info")
+    IFS=':' read -r server arch port <<< "$parsed"
+
+    echo -e "${YELLOW}Deploying to $server (architecture: $arch, port: $port)...${NC}"
+
+    # SSH options with port
+    if [ "$port" != "22" ]; then
+        SSH_OPTS="-p $port"
     else
         SSH_OPTS=""
     fi
@@ -273,13 +368,9 @@ for server_info in "${SERVERS[@]}"; do
                 
                 # Copy the binary to the server with timeout
                 echo -e "${YELLOW}Copying $binary to $server (this may take a moment)...${NC}"
-                
-                # Use our custom scp_with_timeout function
-                if [ "$server" = "ziggy.locut.us" ]; then
-                    scp_with_timeout "${CURRENT_BINARY_PATH}" "freenet@$server:${binary}.new" "23"
-                else
-                    scp_with_timeout "${CURRENT_BINARY_PATH}" "freenet@$server:${binary}.new" ""
-                fi
+
+                # Use our custom scp_with_timeout function with the parsed port
+                scp_with_timeout "${CURRENT_BINARY_PATH}" "freenet@$server:${binary}.new" "$port"
                 
                 SCP_RESULT=$?
                 if [ $SCP_RESULT -eq 124 ]; then
