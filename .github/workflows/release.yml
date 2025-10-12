@@ -120,10 +120,10 @@ jobs:
           git add -A
           git commit -m "chore: bump versions to ${{ needs.validate.outputs.version }}
 
-- freenet: → ${{ needs.validate.outputs.version }}
-- fdev: → ${{ needs.validate.outputs.fdev_version }}
+          - freenet: → ${{ needs.validate.outputs.version }}
+          - fdev: → ${{ needs.validate.outputs.fdev_version }}
 
-🤖 Automated release commit"
+          🤖 Automated release commit"
           git push origin "$BRANCH"
           echo "RELEASE_BRANCH=$BRANCH" >> $GITHUB_ENV
 
