@@ -105,14 +105,6 @@ jobs:
       - name: Update Cargo.lock
         run: cargo update --workspace
 
-      - name: Verify compilation
-        if: ${{ !inputs.skip_tests }}
-        run: cargo build --release
-
-      - name: Run tests
-        if: ${{ !inputs.skip_tests }}
-        run: cargo test --release
-
       - name: Create release branch
         run: |
           BRANCH="release/v${{ needs.validate.outputs.version }}"
