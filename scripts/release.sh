@@ -5,24 +5,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TESTING_TOOLS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Find the main freenet-core repository
-if [[ -d "$TESTING_TOOLS_ROOT/../freenet-core/main" ]]; then
-    PROJECT_ROOT="$(cd "$TESTING_TOOLS_ROOT/../freenet-core/main" && pwd)"
-elif [[ -d "$HOME/code/freenet/freenet-core/main" ]]; then
-    PROJECT_ROOT="$HOME/code/freenet/freenet-core/main"
-else
-    echo "Error: Could not find freenet-core/main repository"
-    echo "Expected at: $HOME/code/freenet/freenet-core/main"
+# Find the git repository root (works from any directory in the repo)
+if ! PROJECT_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "Error: Not in a git repository"
     exit 1
 fi
 
 # Parse arguments
 VERSION=""
-SKIP_DEPLOY=false
 DRY_RUN=false
 SKIP_TESTS=false
+DEPLOY_LOCAL=false
+DEPLOY_REMOTE=false
 
 show_help() {
     echo "Freenet Release Script"
@@ -30,17 +25,22 @@ show_help() {
     echo "Usage: $0 --version X.Y.Z [options]"
     echo
     echo "This script automates the complete release process:"
-    echo "• Version bumping → Release PR → GitHub CI → Auto-merge"  
-    echo "• Publishing to crates.io → GitHub release → Cross-compilation → Gateway deployment"
+    echo "• Version bumping → Release PR → GitHub CI → Auto-merge"
+    echo "• Publishing to crates.io → GitHub release → Automatic cross-compilation"
     echo
     echo "Options:"
     echo "  --version X.Y.Z     Target version (required)"
-    echo "  --skip-deploy       Skip gateway deployment"
+    echo "  --deploy-local      Deploy to local gateway after release (optional)"
+    echo "  --deploy-remote     Deploy to remote gateways after release (optional)"
     echo "  --skip-tests        Skip pre-release tests"
     echo "  --dry-run           Show what would be done without executing"
     echo "  --help              Show this help"
     echo
-    echo "Note: Relies on GitHub CI for testing (more reliable than local tests)"
+    echo "Notes:"
+    echo "  • Relies on GitHub CI for testing (more reliable than local tests)"
+    echo "  • Cross-compilation triggered automatically when version tag is pushed"
+    echo "  • Can deploy to local gateway (--deploy-local) or remote (--deploy-remote)"
+    echo "  • Manual deployment: scripts/deploy-local-gateway.sh or scripts/update-remote-gws.sh"
     echo
     echo "Example: $0 --version 0.1.18"
 }
@@ -52,8 +52,12 @@ while [[ $# -gt 0 ]]; do
             VERSION="$2"
             shift 2
             ;;
-        --skip-deploy)
-            SKIP_DEPLOY=true
+        --deploy-local)
+            DEPLOY_LOCAL=true
+            shift
+            ;;
+        --deploy-remote)
+            DEPLOY_REMOTE=true
             shift
             ;;
         --skip-tests)
@@ -237,29 +241,12 @@ check_prerequisites() {
         fi
     done
     echo "  ✓ Required tools available"
-    
-    # Run pre-release testing checklist
+
+    # Note: Pre-release testing is handled by GitHub CI
+    # The release PR will run all tests before merging
     if [[ "$SKIP_TESTS" == "false" ]]; then
         echo ""
-        echo "Running pre-release tests:"
-        PRE_RELEASE_SCRIPT="$TESTING_TOOLS_ROOT/gateway-testing/pre_release_checklist.sh"
-        if [[ -f "$PRE_RELEASE_SCRIPT" ]]; then
-            echo "  Running pre-release checklist..."
-            if ! "$PRE_RELEASE_SCRIPT"; then
-                echo "  ✗ Pre-release tests failed"
-                echo "    Please fix all issues before releasing"
-                exit 1
-            fi
-        else
-            echo "  ⚠️  Warning: Pre-release checklist not found at $PRE_RELEASE_SCRIPT"
-            echo "    Continuing without pre-release tests (not recommended)"
-            echo -n "    Continue anyway? (y/n) "
-            read -r response
-            if [[ "$response" != "y" ]]; then
-                echo "    Release cancelled"
-                exit 1
-            fi
-        fi
+        echo "ℹ️  Pre-release tests will be run by GitHub CI during the release PR"
     else
         echo ""
         echo "⚠️  Skipping pre-release tests (--skip-tests specified)"
@@ -280,15 +267,22 @@ update_versions() {
         return 0
     fi
 
+    # Portable sed function (works on both GNU and BSD sed)
+    sed_inplace() {
+        local pattern="$1"
+        local file="$2"
+        sed "$pattern" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+    }
+
     # Update freenet version
     echo -n "  Updating freenet to $VERSION... "
-    sed -i "s/^version = \".*\"/version = \"$VERSION\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
+    sed_inplace "s/^version = \".*\"/version = \"$VERSION\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
     echo "✓"
 
     # Update fdev version and its freenet dependency
     echo -n "  Updating fdev to $FDEV_VERSION... "
-    sed -i "s/^version = \".*\"/version = \"$FDEV_VERSION\"/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
-    sed -i "s/freenet = { path = \"..\/core\", version = \".*\" }/freenet = { path = \"..\/core\", version = \"$VERSION\" }/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
+    sed_inplace "s/^version = \".*\"/version = \"$FDEV_VERSION\"/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
+    sed_inplace "s/freenet = { path = \"..\/core\", version = \".*\" }/freenet = { path = \"..\/core\", version = \"$VERSION\" }/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
     echo "✓"
 
     # Update Cargo.lock to match new versions
@@ -686,108 +680,64 @@ create_github_release() {
     echo "  Release created: $release_url"
 }
 
-trigger_cross_compile() {
-    echo "Triggering cross-compilation:"
-    
-    if [[ "$DRY_RUN" == "true" ]]; then
-        echo "  [DRY RUN] Would trigger Build and Cross-Compile workflow"
-        return 0
-    fi
-    
-    run_cmd "Triggering workflow" gh workflow run "Build and Cross-Compile" --ref main
-    
-    echo -n "  Waiting for workflow to complete... "
-    sleep 10  # Give workflow time to start
-    
-    local run_id=""
-    while [[ -z "$run_id" ]]; do
-        run_id=$(gh run list --workflow="Build and Cross-Compile" --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
-        sleep 5
-    done
-    
-    # Use gh run watch for better experience
-    echo
-    echo "  Monitoring workflow run $run_id..."
-    if gh run watch "$run_id"; then
-        echo "  ✓ Cross-compilation completed!"
-    else
-        echo "  ✗ Cross-compilation failed"
-        exit 1
-    fi
-}
+# Note: Cross-compilation is now triggered automatically when a version tag is pushed
+# See .github/workflows/cross-compile.yml - it has `tags: ['v*']` trigger
+# trigger_cross_compile function is no longer needed
 
 deploy_gateways() {
-    if [[ "$SKIP_DEPLOY" == "true" ]]; then
-        echo "Skipping gateway deployment (--skip-deploy specified)"
+    # Skip if no deployment requested
+    if [[ "$DEPLOY_LOCAL" == "false" ]] && [[ "$DEPLOY_REMOTE" == "false" ]]; then
+        echo "Skipping gateway deployment (use --deploy-local or --deploy-remote to enable)"
         return 0
     fi
 
-    echo "Deploying to remote gateways:"
-    echo "  ℹ️  Remote gateways (vega, ziggy) are no longer active"
-    echo "  ℹ️  Only local gateway (nova) will be updated"
-}
+    echo "Gateway Deployment:"
 
-update_local_gateway() {
-    if [[ "$SKIP_DEPLOY" == "true" ]]; then
-        echo "Skipping local gateway update (--skip-deploy specified)"
-        return 0
-    fi
+    # Deploy to local gateway
+    if [[ "$DEPLOY_LOCAL" == "true" ]]; then
+        echo
+        echo "Deploying to local gateway:"
 
-    echo "Updating local gateway:"
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        echo "  [DRY RUN] Would update local gateway service"
-        return 0
-    fi
-
-    # Check if local gateway service exists
-    if ! systemctl status freenet-gateway.service &> /dev/null; then
-        echo "  ⚠️  Local gateway service not found, skipping"
-        return 0
-    fi
-
-    # Build the release binary if it doesn't exist
-    local binary_path="$PROJECT_ROOT/target/release/freenet"
-    if [[ ! -f "$binary_path" ]]; then
-        echo -n "  Building release binary... "
-        if cargo build --release -p freenet --quiet 2>/dev/null; then
-            echo "✓"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "  [DRY RUN] Would run: $SCRIPT_DIR/deploy-local-gateway.sh"
         else
-            echo "✗"
-            echo "  ⚠️  Failed to build release binary, skipping local gateway update"
-            return 1
+            local deploy_script="$SCRIPT_DIR/deploy-local-gateway.sh"
+            if [[ ! -f "$deploy_script" ]]; then
+                echo "  ⚠️  Deployment script not found: $deploy_script"
+                echo "     Skipping local deployment"
+            else
+                if "$deploy_script" --binary "$PROJECT_ROOT/target/release/freenet"; then
+                    echo "  ✓ Local gateway deployed successfully"
+                else
+                    echo "  ⚠️  Local gateway deployment failed (non-fatal)"
+                    echo "     You can deploy manually with: $deploy_script"
+                fi
+            fi
         fi
     fi
 
-    run_cmd "Stopping local gateway service" sudo systemctl stop freenet-gateway.service
-    run_cmd "Installing new binary" sudo cp "$binary_path" /usr/local/bin/freenet
-    run_cmd "Setting permissions" sudo chown root:root /usr/local/bin/freenet
-    run_cmd "Setting executable" sudo chmod 755 /usr/local/bin/freenet
+    # Deploy to remote gateways
+    if [[ "$DEPLOY_REMOTE" == "true" ]]; then
+        echo
+        echo "Deploying to remote gateways:"
 
-    # Clear old logs for cleaner verification
-    echo -n "  Clearing old logs... "
-    sudo journalctl --vacuum-time=1s -u freenet-gateway.service &>/dev/null || true
-    echo "✓"
-
-    run_cmd "Starting local gateway service" sudo systemctl start freenet-gateway.service
-
-    # Wait for service to start
-    echo -n "  Waiting for service startup... "
-    sleep 3
-    echo "✓"
-
-    # Verify the service is running
-    echo -n "  Verifying deployment... "
-    if systemctl is-active --quiet freenet-gateway.service; then
-        local version=$(/usr/local/bin/freenet --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' || echo "unknown")
-        echo "✓"
-        echo "  ✓ Version: $version"
-        echo "  ✓ Service: Running"
-    else
-        echo "✗"
-        echo "  ⚠️  Service failed to start, check logs:"
-        echo "      sudo journalctl -u freenet-gateway.service -n 50"
-        return 1
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "  [DRY RUN] Would run: $SCRIPT_DIR/update-remote-gws.sh"
+        else
+            local deploy_script="$SCRIPT_DIR/update-remote-gws.sh"
+            if [[ ! -f "$deploy_script" ]]; then
+                echo "  ⚠️  Deployment script not found: $deploy_script"
+                echo "     Skipping remote deployment"
+            else
+                echo "  Running remote deployment script..."
+                if "$deploy_script"; then
+                    echo "  ✓ Remote gateways deployed successfully"
+                else
+                    echo "  ⚠️  Remote gateway deployment failed (non-fatal)"
+                    echo "     You can deploy manually with: $deploy_script"
+                fi
+            fi
+        fi
     fi
 }
 
@@ -849,9 +799,7 @@ update_versions
 create_release_pr
 publish_crates
 create_github_release
-trigger_cross_compile
 deploy_gateways
-update_local_gateway
 announce_to_matrix
 
 echo
@@ -861,11 +809,30 @@ echo "Summary:"
 echo "- freenet $VERSION published to crates.io"
 echo "- fdev $FDEV_VERSION published to crates.io"
 echo "- GitHub release created: https://github.com/freenet/freenet-core/releases/tag/v$VERSION"
-if [[ "$SKIP_DEPLOY" == "false" ]]; then
-    echo "- Local gateway (nova) updated to v$VERSION"
-fi
 echo "- Announcement sent to Matrix (#freenet-locutus)"
+echo "- Cross-compilation workflow triggered automatically by tag push"
+echo "- Binaries will be attached to release when workflow completes"
+
+# Show deployment status
+if [[ "$DEPLOY_LOCAL" == "true" ]]; then
+    echo "- Local gateway deployed to $(hostname)"
+fi
+if [[ "$DEPLOY_REMOTE" == "true" ]]; then
+    echo "- Remote gateways deployment initiated"
+fi
+
 echo
 echo "Next steps:"
-echo "- Monitor gateway logs: sudo journalctl -u freenet-gateway.service -f"
+echo "- Monitor cross-compile workflow: https://github.com/freenet/freenet-core/actions/workflows/cross-compile.yml"
+
+# Suggest deployment options if not used
+if [[ "$DEPLOY_LOCAL" == "false" ]] && [[ "$DEPLOY_REMOTE" == "false" ]]; then
+    echo "- Deploy locally: scripts/deploy-local-gateway.sh"
+    echo "- Deploy to remote gateways: scripts/update-remote-gws.sh"
+elif [[ "$DEPLOY_LOCAL" == "false" ]]; then
+    echo "- Deploy locally: scripts/deploy-local-gateway.sh"
+elif [[ "$DEPLOY_REMOTE" == "false" ]]; then
+    echo "- Deploy to remote gateways: scripts/update-remote-gws.sh"
+fi
+
 echo "- Update any dependent projects to use the new version"
