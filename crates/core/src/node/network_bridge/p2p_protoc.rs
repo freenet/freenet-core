@@ -702,6 +702,8 @@ impl P2pConnManager {
         client_wait_for_transaction: &mut ContractHandlerChannel<WaitingResolution>,
         executor_listener: &mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     ) -> anyhow::Result<EventResult> {
+        let peer_id = &self.bridge.op_manager.ring.connection_manager.pub_key;
+        tracing::trace!(peer = %peer_id, "wait_for_event: Entering select! to poll all event sources");
         // IMPORTANT: notification_channel MUST come first to prevent starvation
         // in busy networks where peer_connections is constantly ready.
         // We use `biased;` to force sequential polling in source order, ensuring
@@ -710,19 +712,24 @@ impl P2pConnManager {
             biased;
             // Process internal notifications FIRST - these drive operation state machines
             msg = notification_channel.notifications_receiver.recv() => {
+                tracing::trace!(peer = %peer_id, "wait_for_event: notifications_receiver branch selected");
                 Ok(self.handle_notification_msg(msg))
             }
             msg = notification_channel.op_execution_receiver.recv() => {
+                tracing::trace!(peer = %peer_id, "wait_for_event: op_execution_receiver branch selected");
                 Ok(self.handle_op_execution(msg, state))
             }
             // Network messages come after internal notifications
             msg = state.peer_connections.next(), if !state.peer_connections.is_empty() => {
+                tracing::trace!(peer = %peer_id, "wait_for_event: peer_connections branch selected");
                 self.handle_peer_connection_msg(msg, state, handshake_handler_msg).await
             }
             msg = self.conn_bridge_rx.recv() => {
+                tracing::trace!(peer = %peer_id, "wait_for_event: conn_bridge_rx branch selected");
                 Ok(self.handle_bridge_msg(msg))
             }
             handshake_event_res = handshake_handler.wait_for_events() => {
+                tracing::trace!(peer = %peer_id, "wait_for_event: handshake_handler branch selected");
                 match handshake_event_res {
                     Ok(event) => {
                         self.handle_handshake_action(event, state, handshake_handler_msg).await?;
@@ -738,12 +745,15 @@ impl P2pConnManager {
                 }
             }
             msg = node_controller.recv() => {
+                tracing::trace!(peer = %peer_id, "wait_for_event: node_controller branch selected");
                 Ok(self.handle_node_controller_msg(msg))
             }
             event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
+                tracing::trace!(peer = %peer_id, "wait_for_event: client_wait_for_transaction branch selected");
                 Ok(self.handle_client_transaction_subscription(event_id, state))
             }
             id = executor_listener.transaction_from_executor() => {
+                tracing::trace!(peer = %peer_id, "wait_for_event: executor_listener branch selected");
                 Ok(self.handle_executor_transaction(id, state))
             }
         }

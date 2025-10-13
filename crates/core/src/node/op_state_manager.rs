@@ -145,9 +145,11 @@ impl OpManager {
     /// with other nodes, like intermediate states before returning.
     pub async fn notify_op_change(&self, msg: NetMessage, op: OpEnum) -> Result<(), OpError> {
         let tx = *msg.id();
+        let peer_id = &self.ring.connection_manager.pub_key;
         tracing::debug!(
             tx = %tx,
             msg_type = %msg,
+            peer = %peer_id,
             "notify_op_change: Pushing operation and sending notification"
         );
 
@@ -156,6 +158,7 @@ impl OpManager {
 
         tracing::debug!(
             tx = %tx,
+            peer = %peer_id,
             "notify_op_change: Operation pushed, sending to event listener"
         );
 
@@ -166,6 +169,7 @@ impl OpManager {
 
         tracing::debug!(
             tx = %tx,
+            peer = %peer_id,
             "notify_op_change: Notification sent successfully"
         );
 
