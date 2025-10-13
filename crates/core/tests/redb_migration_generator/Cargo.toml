@@ -1,0 +1,15 @@
+[package]
+name = "redb-migration-generator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Exclude from workspace to avoid version conflicts with main project's redb dependency
+[workspace]
+
+[dependencies]
+redb = "=2.1.3"  # Exact v2 version with format version 2
+
+[[bin]]
+name = "generate_v2_db"
+path = "src/main.rs"
