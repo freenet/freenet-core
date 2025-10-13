@@ -1142,8 +1142,20 @@ impl P2pConnManager {
 
     fn handle_notification_msg(&self, msg: Option<Either<NetMessage, NodeEvent>>) -> EventResult {
         match msg {
-            Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg).into()),
-            Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
+            Some(Left(msg)) => {
+                tracing::debug!(
+                    tx = %msg.id(),
+                    msg_type = %msg,
+                    "handle_notification_msg: Received NetMessage notification, converting to InboundMessage"
+                );
+                EventResult::Event(ConnEvent::InboundMessage(msg).into())
+            }
+            Some(Right(action)) => {
+                tracing::debug!(
+                    "handle_notification_msg: Received NodeEvent notification"
+                );
+                EventResult::Event(ConnEvent::NodeAction(action).into())
+            }
             None => EventResult::Continue,
         }
     }
