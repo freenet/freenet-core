@@ -34,19 +34,26 @@ PUT operations timeout after 10 seconds because RequestPut notifications never r
 1. `.recv()` in production event loop never fires for PUT notifications
 2. PUT notification disappears between send and receive
 
-## The Mystery
+## The Mystery - SOLVED! 🎯
 
-We have an impossible situation:
-- Same channel pair
-- Send completes
-- Event loop running
-- But receive never happens
+### Root Cause: Event Loop Deadlock in select!
 
-This suggests either:
-1. A tokio mpsc edge case/bug
-2. Select! biased polling not working as expected in production
-3. Some state corruption in the channel
-4. A race condition we haven't identified
+**Timeline of Discovery:**
+1. Added detailed DEBUG logging to `wait_for_event` showing entry/exit of select!
+2. Ran test and found:
+   - **22:44:35.563735Z** - Event loop enters wait_for_event (last call)
+   - **22:44:44.720347Z** - PUT notification sent (9 seconds later)
+   - **NO MORE wait_for_event calls** - Event loop NEVER returns from select!
+
+**Critical Finding:** The event loop **DEADLOCKS** inside the select! macro at line 724. It enters the select! and never comes back out. None of the select! branches ever become ready, causing the entire event loop to freeze.
+
+**Why This Explains Everything:**
+- ✅ Send completes successfully (happens outside event loop)
+- ✅ Channel IDs match (correct channel)
+- ✅ Event loop task is "running" (but stuck in select!)
+- ❌ Receive never happens (event loop frozen, can't poll notification channel)
+
+The event loop is not crashed or exited - it's **DEADLOCKED** waiting for one of the futures in select! to complete, but none of them ever do.
 
 ## Code Changes Made
 
