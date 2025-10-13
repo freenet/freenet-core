@@ -173,7 +173,15 @@ impl P2pConnManager {
         mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         mut node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
-        tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Opening network listener");
+        let channel_id = notification_channel.channel_id;
+        tracing::info!(
+            %self.listening_port,
+            %self.listening_ip,
+            %self.is_gateway,
+            key = %self.key_pair.public(),
+            channel_id = channel_id,
+            "Opening network listener - will receive from channel"
+        );
 
         let mut state = EventListenerState::new();
 
