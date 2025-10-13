@@ -759,22 +759,41 @@ impl P2pConnManager {
                 );
                 Ok(self.handle_bridge_msg(msg))
             }
-            handshake_event_res = handshake_handler.wait_for_events() => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    "wait_for_event: handshake_handler branch SELECTED"
-                );
+            // IMPORTANT: Handshake handler has nested select! that can block indefinitely
+            // Use timeout to prevent deadlocking the main event loop
+            handshake_event_res = timeout(Duration::from_millis(100), handshake_handler.wait_for_events()) => {
                 match handshake_event_res {
-                    Ok(event) => {
+                    Ok(Ok(event)) => {
+                        tracing::debug!(
+                            peer = %peer_id,
+                            channel_id = channel_id,
+                            "wait_for_event: handshake_handler branch SELECTED with event"
+                        );
                         self.handle_handshake_action(event, state, handshake_handler_msg).await?;
                         Ok(EventResult::Continue)
                     }
-                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(
-                        ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
-                    )),
-                    Err(e) => {
-                        tracing::warn!("Handshake error: {:?}", e);
+                    Ok(Err(HandshakeError::ChannelClosed)) => {
+                        tracing::debug!(
+                            peer = %peer_id,
+                            channel_id = channel_id,
+                            "wait_for_event: handshake_handler channel closed"
+                        );
+                        Ok(EventResult::Event(
+                            ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
+                        ))
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(peer = %peer_id, "Handshake error: {:?}", e);
+                        Ok(EventResult::Continue)
+                    }
+                    Err(_timeout) => {
+                        // Timeout - handshake handler has no ready events
+                        // Continue to next iteration, allowing other branches to be polled
+                        tracing::trace!(
+                            peer = %peer_id,
+                            channel_id = channel_id,
+                            "wait_for_event: handshake_handler timeout - no pending events"
+                        );
                         Ok(EventResult::Continue)
                     }
                 }
