@@ -252,6 +252,134 @@ async fn verify_network_topology(
     Ok(true)
 }
 
+/// Simplified test with just gateway + 1 peer to verify basic PUT operations work
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_basic_room_creation() -> anyhow::Result<()> {
+    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
+
+    info!("=== Basic Room Creation Test ===");
+    info!("Testing minimal setup: 1 gateway + 1 peer");
+
+    // Find riverctl without version check
+    let riverctl_path = which::which("riverctl").context("riverctl not found in PATH")?;
+    info!("Using riverctl at: {}", riverctl_path.display());
+
+    // Create gateway
+    let (gw_config, gw_info) = create_peer_config("gateway".to_string(), true, None, 0).await?;
+    let gateway_inline_config = InlineGwConfig {
+        address: (Ipv4Addr::LOCALHOST, gw_info.network_port).into(),
+        location: Some(gw_info.location),
+        public_key_path: gw_info.temp_dir.path().join("public.pem"),
+    };
+
+    info!(
+        "Gateway - network: {}, ws: {}",
+        gw_info.network_port, gw_info.ws_port
+    );
+
+    // Create peer
+    let (peer_config, peer_info) = create_peer_config(
+        "peer0".to_string(),
+        false,
+        Some(gateway_inline_config.clone()),
+        1,
+    )
+    .await?;
+
+    info!(
+        "Peer - network: {}, ws: {}",
+        peer_info.network_port, peer_info.ws_port
+    );
+
+    // Start gateway
+    let gw_node = async {
+        let config = gw_config.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start peer (with delay for gateway to be ready)
+    let peer_node = async {
+        sleep(Duration::from_secs(5)).await;
+        let config = peer_config.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    let peer_ws_port = peer_info.ws_port;
+    let peer_temp_dir = peer_info.temp_dir.path().to_path_buf();
+
+    // Test logic
+    let test_logic = timeout(Duration::from_secs(120), async move {
+        info!("Waiting for nodes to bootstrap...");
+        sleep(Duration::from_secs(25)).await;
+
+        let peer_ws = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            peer_ws_port
+        );
+        let river_config_dir = peer_temp_dir.join("river-user0");
+        std::fs::create_dir_all(&river_config_dir)?;
+
+        info!("Creating room via riverctl...");
+        let output = Command::new(&riverctl_path)
+            .env("RIVER_CONFIG_DIR", &river_config_dir)
+            .args([
+                "--node-url",
+                &peer_ws,
+                "--format",
+                "json",
+                "room",
+                "create",
+                "--name",
+                "test-room",
+                "--nickname",
+                "Alice",
+            ])
+            .output()
+            .context("Failed to execute riverctl room create")?;
+
+        if !output.status.success() {
+            bail!(
+                "Room creation failed: {}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+
+        info!("✓ Room created successfully");
+        info!("Output: {}", String::from_utf8_lossy(&output.stdout));
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // Run everything
+    select! {
+        result = test_logic => {
+            result??;
+            info!("Test completed successfully");
+        }
+        result = gw_node => {
+            result?;
+            bail!("Gateway node exited unexpectedly");
+        }
+        result = peer_node => {
+            result?;
+            bail!("Peer node exited unexpectedly");
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "Requires riverctl to be installed - run manually with: cargo test --test ubertest -- --ignored"]
 async fn test_app_ubertest() -> anyhow::Result<()> {
