@@ -139,8 +139,6 @@ impl EventLoopNotificationsSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{NetMessage, Transaction};
-    use crate::operations::put::{PutMsg, PutOp};
     use either::Either;
     use freenet_stdlib::prelude::*;
     use tokio::time::{timeout, Duration};
@@ -162,7 +160,8 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             tracing::info!("Sending notification");
-            sender.notifications_sender()
+            sender
+                .notifications_sender()
                 .send(Either::Right(test_event))
                 .await
                 .expect("Failed to send notification");
@@ -170,13 +169,13 @@ mod tests {
         });
 
         // Simulate event loop with biased select
-        let (dummy_tx, mut dummy_rx) = tokio::sync::mpsc::channel::<String>(10);
+        let (_dummy_tx, mut dummy_rx) = tokio::sync::mpsc::channel::<String>(10);
         let mut received = false;
 
         tracing::info!("Starting event loop simulation");
         for i in 0..50 {
             tracing::debug!("Loop iteration {}", i);
-            
+
             let result = timeout(Duration::from_millis(100), async {
                 tokio::select! {
                     biased;
@@ -189,7 +188,8 @@ mod tests {
                         None
                     }
                 }
-            }).await;
+            })
+            .await;
 
             match result {
                 Ok(Some(Some(_msg))) => {
@@ -224,7 +224,8 @@ mod tests {
         for _i in 0..3 {
             let test_event = crate::message::NodeEvent::Disconnect { cause: None };
 
-            notification_tx.notifications_sender()
+            notification_tx
+                .notifications_sender()
                 .send(Either::Right(test_event))
                 .await
                 .expect("Failed to send notification");
@@ -254,7 +255,8 @@ mod tests {
         // Try to send - should fail
         let test_event = crate::message::NodeEvent::Disconnect { cause: None };
 
-        let result = notification_tx.notifications_sender()
+        let result = notification_tx
+            .notifications_sender()
             .send(Either::Right(test_event))
             .await;
 
