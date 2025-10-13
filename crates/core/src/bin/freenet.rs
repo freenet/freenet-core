@@ -57,8 +57,8 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .unwrap();
+    let config = ConfigArgs::parse();
     rt.block_on(async move {
-        let config = ConfigArgs::parse();
         if config.version {
             println!("Freenet version: {}", config.current_version());
             return Ok(());
