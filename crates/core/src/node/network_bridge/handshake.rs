@@ -6,7 +6,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 use tokio::time::{timeout, Duration};
-use tracing::Instrument;
+use tracing::{instrument, Instrument};
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt, TryFutureExt};
 use tokio::sync::mpsc::{self};
@@ -179,31 +179,30 @@ type EstablishConnectionReceiver = mpsc::Receiver<ExternConnection>;
 /// the transition from unconfirmed to confirmed connections.
 pub(super) struct HandshakeHandler {
     /// Tracks ongoing connection attempts by their remote socket address
-    pub(crate) connecting: HashMap<SocketAddr, Transaction>,
+    connecting: HashMap<SocketAddr, Transaction>,
 
     /// Set of socket addresses for established connections
-    pub(crate) connected: HashSet<SocketAddr>,
+    connected: HashSet<SocketAddr>,
 
     /// Handles incoming connections from the network
-    pub(crate) inbound_conn_handler: InboundConnectionHandler,
+    inbound_conn_handler: InboundConnectionHandler,
 
     /// Initiates outgoing connections to remote peers
-    pub(crate) outbound_conn_handler: OutboundConnectionHandler,
+    outbound_conn_handler: OutboundConnectionHandler,
 
     /// Queue of ongoing outbound connection attempts
     /// Used for non-gateway peers initiating connections
-    pub(crate) ongoing_outbound_connections:
-        FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
+    ongoing_outbound_connections: FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
 
     /// Queue of inbound connections not yet confirmed at the logical level
     /// Used primarily by gateways for handling new peer join requests
-    pub(crate) unconfirmed_inbound_connections: FuturesUnordered<
+    unconfirmed_inbound_connections: FuturesUnordered<
         BoxFuture<'static, Result<(InternalEvent, PeerOutboundMessage), HandshakeError>>,
     >,
 
     /// Mapping of socket addresses to channels for sending messages to peers
     /// Used for both confirmed and unconfirmed connections
-    pub(crate) outbound_messages: HashMap<SocketAddr, OutboundMessageSender>,
+    outbound_messages: HashMap<SocketAddr, OutboundMessageSender>,
 
     /// Receiver for messages to be sent to peers not yet confirmed
     /// Part of the OutboundMessage public API
@@ -214,10 +213,10 @@ pub(super) struct HandshakeHandler {
     establish_connection_rx: EstablishConnectionReceiver,
 
     /// Manages the node's connections and topology
-    pub(crate) connection_manager: ConnectionManager,
+    connection_manager: ConnectionManager,
 
     /// Handles routing decisions within the network
-    pub(crate) router: Arc<RwLock<Router>>,
+    router: Arc<RwLock<Router>>,
 
     /// If set, will sent the location over network messages.
     ///
@@ -225,14 +224,14 @@ pub(super) struct HandshakeHandler {
     ///
     /// This is used for testing deterministically with given location. In production this should always be none
     /// and locations should be derived from IP addresses.
-    pub(crate) this_location: Option<Location>,
+    this_location: Option<Location>,
 
     /// Whether this node is a gateway
-    pub(crate) is_gateway: bool,
+    is_gateway: bool,
 
     /// Indicates when peer is ready to process client operations (peer_id has been set).
     /// Only used for non-gateway peers - set to Some(flag) for regular peers, None for gateways
-    pub(crate) peer_ready: Option<Arc<AtomicBool>>,
+    peer_ready: Option<Arc<AtomicBool>>,
 }
 
 impl HandshakeHandler {
@@ -270,6 +269,8 @@ impl HandshakeHandler {
         )
     }
 
+    /// Processes events related to connection establishment and management.
+    #[instrument(skip(self))]
     pub async fn wait_for_events(&mut self) -> Result<Event, HandshakeError> {
         loop {
             tracing::trace!(
@@ -750,7 +751,7 @@ impl HandshakeHandler {
     }
 
     /// Tracks a new inbound connection and sets up message handling for it.
-    pub(crate) fn track_inbound_connection(&mut self, conn: PeerConnection) {
+    fn track_inbound_connection(&mut self, conn: PeerConnection) {
         let (outbound_msg_sender, outbound_msg_recv) = mpsc::channel(100);
         let remote = conn.remote_addr();
         tracing::debug!(%remote, "Tracking inbound connection - spawning gw_peer_connection_listener");
@@ -860,7 +861,7 @@ impl HandshakeHandler {
     }
 
     /// Waits for confirmation from a gateway after establishing a connection.
-    pub(crate) async fn wait_for_gw_confirmation(
+    async fn wait_for_gw_confirmation(
         &mut self,
         gw_peer_id: PeerId,
         conn: PeerConnection,
@@ -923,19 +924,19 @@ impl NetworkBridge for ForwardPeerMessage {
 }
 
 #[derive(Debug)]
-pub(super) struct InboundGwJoinRequest {
-    pub conn: PeerConnection,
-    pub id: Transaction,
-    pub joiner: PeerId,
-    pub location: Option<Location>,
-    pub hops_to_live: usize,
-    pub max_hops_to_live: usize,
-    pub skip_connections: HashSet<PeerId>,
-    pub skip_forwards: HashSet<PeerId>,
+struct InboundGwJoinRequest {
+    conn: PeerConnection,
+    id: Transaction,
+    joiner: PeerId,
+    location: Option<Location>,
+    hops_to_live: usize,
+    max_hops_to_live: usize,
+    skip_connections: HashSet<PeerId>,
+    skip_forwards: HashSet<PeerId>,
 }
 
 #[derive(Debug)]
-pub(super) enum InternalEvent {
+enum InternalEvent {
     InboundGwJoinRequest(InboundGwJoinRequest),
     /// Regular connection established
     OutboundConnEstablished(PeerId, PeerConnection),
@@ -951,21 +952,21 @@ pub(super) enum InternalEvent {
 }
 
 #[repr(transparent)]
-pub(crate) struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
+struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
 
 #[derive(Debug)]
-pub(crate) struct AcceptedTracker {
-    pub(crate) gw_peer: PeerKeyLocation,
-    pub(crate) gw_conn: PeerConnection,
-    pub(crate) gw_accepted_processed: bool,
-    pub(crate) gw_accepted: bool,
+struct AcceptedTracker {
+    gw_peer: PeerKeyLocation,
+    gw_conn: PeerConnection,
+    gw_accepted_processed: bool,
+    gw_accepted: bool,
     /// Remaining checks to be made, at max total_checks
-    pub(crate) remaining_checks: usize,
+    remaining_checks: usize,
     /// At max this will be total_checks
-    pub(crate) accepted: usize,
+    accepted: usize,
     /// Equivalent to max_hops_to_live
-    pub(crate) total_checks: usize,
-    pub(crate) tx: Transaction,
+    total_checks: usize,
+    tx: Transaction,
 }
 
 /// Waits for confirmation from a gateway after initiating a connection.
