@@ -6,7 +6,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 use tokio::time::{timeout, Duration};
-use tracing::{instrument, Instrument};
+use tracing::Instrument;
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt, TryFutureExt};
 use tokio::sync::mpsc::{self};
@@ -192,7 +192,8 @@ pub(super) struct HandshakeHandler {
 
     /// Queue of ongoing outbound connection attempts
     /// Used for non-gateway peers initiating connections
-    pub(crate) ongoing_outbound_connections: FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
+    pub(crate) ongoing_outbound_connections:
+        FuturesUnordered<BoxFuture<'static, OutboundConnResult>>,
 
     /// Queue of inbound connections not yet confirmed at the logical level
     /// Used primarily by gateways for handling new peer join requests
@@ -267,17 +268,6 @@ impl HandshakeHandler {
             HanshakeHandlerMsg(establish_connection_tx),
             OutboundMessage(pending_msg_tx),
         )
-    }
-
-    /// Processes events related to connection establishment and management.
-    /// This is the main event loop for the HandshakeHandler.
-    #[instrument(skip(self))]
-    /// Check if there are any pending handshake operations that need processing
-    pub fn has_pending_operations(&self) -> bool {
-        !self.ongoing_outbound_connections.is_empty()
-            || !self.unconfirmed_inbound_connections.is_empty()
-            // inbound_conn_handler is always potentially ready for new connections
-            // so we always need to poll it
     }
 
     pub async fn wait_for_events(&mut self) -> Result<Event, HandshakeError> {
@@ -933,7 +923,7 @@ impl NetworkBridge for ForwardPeerMessage {
 }
 
 #[derive(Debug)]
-struct InboundGwJoinRequest {
+pub(super) struct InboundGwJoinRequest {
     pub conn: PeerConnection,
     pub id: Transaction,
     pub joiner: PeerId,
@@ -945,7 +935,7 @@ struct InboundGwJoinRequest {
 }
 
 #[derive(Debug)]
-pub(crate) enum InternalEvent {
+pub(super) enum InternalEvent {
     InboundGwJoinRequest(InboundGwJoinRequest),
     /// Regular connection established
     OutboundConnEstablished(PeerId, PeerConnection),

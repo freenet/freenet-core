@@ -12,7 +12,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -26,28 +26,25 @@ use tracing::Instrument;
 
 /// Custom select combinator that takes references to futures for explicit waker control.
 /// This avoids waker registration issues that can occur with nested tokio::select! macros.
-#[allow(dead_code)]  // Work in progress - will be enabled once fully implemented
 mod priority_select {
     use super::*;
-    use tokio::sync::mpsc::Receiver;
-    use futures::stream::{SelectAll, StreamExt, Stream};
-    use std::task::{Context, Poll};
-    use std::pin::Pin;
+    use futures::stream::Stream;
     use futures::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::sync::mpsc::Receiver;
 
     // Import types not in parent scope
-    use crate::node::OpManager;
-    use crate::operations::OpEnum;
-    use crate::transport::connection_handler::ConnectionEvent;
-    use crate::transport::{TransportPublicKey, PeerConnection, TransportError};
+    use super::PeerConnectionInbound;
     use crate::dev_tool::{PeerId, Transaction};
-    use crate::node::network_bridge::handshake::{HandshakeError, InternalEvent, PeerOutboundMessage};
     use crate::message::{NetMessage, NodeEvent};
-    use super::PeerConnectionInbound;  // Import from parent module
+    use crate::node::network_bridge::handshake::{InternalEvent, PeerOutboundMessage};
+    use crate::transport::{PeerConnection, TransportError}; // Import from parent module
 
     // P2pBridgeEvent is defined in parent as: Either<(PeerId, Box<NetMessage>), NodeEvent>
     type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
 
+    #[allow(clippy::large_enum_variant)]
     pub enum SelectResult {
         Notification(Option<Either<NetMessage, NodeEvent>>),
         OpExecution(Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>),
@@ -57,7 +54,15 @@ mod priority_select {
         HandshakeOutbound(Option<Result<InternalEvent, (PeerId, HandshakeError)>>),
         HandshakeUnconfirmed(Option<Result<(InternalEvent, PeerOutboundMessage), HandshakeError>>),
         NodeController(Option<NodeEvent>),
-        ClientTransaction(Result<(crate::client_events::ClientId, crate::contract::WaitingTransaction), anyhow::Error>),
+        ClientTransaction(
+            Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            >,
+        ),
         ExecutorTransaction(Result<Transaction, anyhow::Error>),
     }
 
@@ -65,7 +70,9 @@ mod priority_select {
     pub struct PrioritySelectFuture<'a> {
         notification_rx: &'a mut Receiver<Either<NetMessage, NodeEvent>>,
         op_execution_rx: &'a mut Receiver<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
-        peer_connections: &'a mut FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
+        peer_connections: &'a mut FuturesUnordered<
+            BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
+        >,
         conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
         handshake_handler: &'a mut HandshakeHandler,
         node_controller: &'a mut Receiver<NodeEvent>,
@@ -77,10 +84,13 @@ mod priority_select {
     }
 
     impl<'a> PrioritySelectFuture<'a> {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             notification_rx: &'a mut Receiver<Either<NetMessage, NodeEvent>>,
             op_execution_rx: &'a mut Receiver<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
-            peer_connections: &'a mut FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
+            peer_connections: &'a mut FuturesUnordered<
+                BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
+            >,
             conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
             handshake_handler: &'a mut HandshakeHandler,
             node_controller: &'a mut Receiver<NodeEvent>,
@@ -88,8 +98,10 @@ mod priority_select {
             executor_listener: &'a mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         ) -> Self {
             let peer_connections_empty = peer_connections.is_empty();
-            let handshake_outbound_empty = handshake_handler.ongoing_outbound_connections.is_empty();
-            let handshake_unconfirmed_empty = handshake_handler.unconfirmed_inbound_connections.is_empty();
+            let handshake_outbound_empty =
+                handshake_handler.ongoing_outbound_connections.is_empty();
+            let handshake_unconfirmed_empty =
+                handshake_handler.unconfirmed_inbound_connections.is_empty();
 
             Self {
                 notification_rx,
@@ -166,7 +178,11 @@ mod priority_select {
 
             // Handshake: inbound connections (always poll - this is the listener)
             {
-                let mut inbound_fut = Box::pin(self.handshake_handler.inbound_conn_handler.next_connection());
+                let mut inbound_fut = Box::pin(
+                    self.handshake_handler
+                        .inbound_conn_handler
+                        .next_connection(),
+                );
                 match inbound_fut.as_mut().poll(cx) {
                     Poll::Ready(conn) => {
                         tracing::trace!("PrioritySelect: handshake inbound ready");
@@ -178,7 +194,10 @@ mod priority_select {
 
             // Handshake: outbound connections (only if not empty)
             if !self.handshake_outbound_empty {
-                match Stream::poll_next(Pin::new(&mut self.handshake_handler.ongoing_outbound_connections), cx) {
+                match Stream::poll_next(
+                    Pin::new(&mut self.handshake_handler.ongoing_outbound_connections),
+                    cx,
+                ) {
                     Poll::Ready(event) => {
                         tracing::trace!("PrioritySelect: handshake outbound ready");
                         return Poll::Ready(SelectResult::HandshakeOutbound(event));
@@ -189,7 +208,10 @@ mod priority_select {
 
             // Handshake: unconfirmed inbound (only if not empty)
             if !self.handshake_unconfirmed_empty {
-                match Stream::poll_next(Pin::new(&mut self.handshake_handler.unconfirmed_inbound_connections), cx) {
+                match Stream::poll_next(
+                    Pin::new(&mut self.handshake_handler.unconfirmed_inbound_connections),
+                    cx,
+                ) {
                     Poll::Ready(event) => {
                         tracing::trace!("PrioritySelect: handshake unconfirmed ready");
                         return Poll::Ready(SelectResult::HandshakeUnconfirmed(event));
@@ -212,7 +234,10 @@ mod priority_select {
 
             // Priority 9: Client transaction waiting
             {
-                let mut client_fut = Box::pin(self.client_wait_for_transaction.relay_transaction_result_to_client());
+                let mut client_fut = Box::pin(
+                    self.client_wait_for_transaction
+                        .relay_transaction_result_to_client(),
+                );
                 match client_fut.as_mut().poll(cx) {
                     Poll::Ready(event_id) => {
                         tracing::trace!("PrioritySelect: client_wait_for_transaction ready");
@@ -242,10 +267,13 @@ mod priority_select {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn select_priority<'a>(
         notification_rx: &'a mut Receiver<Either<NetMessage, NodeEvent>>,
         op_execution_rx: &'a mut Receiver<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
-        peer_connections: &'a mut FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
+        peer_connections: &'a mut FuturesUnordered<
+            BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
+        >,
         conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
         handshake_handler: &'a mut HandshakeHandler,
         node_controller: &'a mut Receiver<NodeEvent>,
@@ -261,54 +289,9 @@ mod priority_select {
             node_controller,
             client_wait_for_transaction,
             executor_listener,
-        ).await
+        )
+        .await
     }
-}
-
-/// Instrumented select! macro that tracks timing and detects blocking
-///
-/// This wraps tokio::select! with detailed instrumentation to help diagnose
-/// event loop issues. It logs:
-/// - How long the select! took to complete
-/// - Warnings if it takes longer than expected (possible blocking)
-/// - Which iteration this is (to detect spinning)
-macro_rules! instrumented_select {
-    (
-        iteration: $iteration:expr,
-        peer: $peer:expr,
-        $( $tokens:tt )*
-    ) => {{
-        let start = Instant::now();
-        let iteration = $iteration;
-
-        tracing::trace!(
-            peer = %$peer,
-            iteration = iteration,
-            "select! starting"
-        );
-
-        let result = tokio::select! { $( $tokens )* };
-
-        let elapsed = start.elapsed();
-
-        if elapsed > Duration::from_millis(200) {
-            tracing::warn!(
-                peer = %$peer,
-                iteration = iteration,
-                elapsed_ms = elapsed.as_millis(),
-                "select! took longer than expected - possible blocking future"
-            );
-        } else {
-            tracing::trace!(
-                peer = %$peer,
-                iteration = iteration,
-                elapsed_us = elapsed.as_micros(),
-                "select! completed"
-            );
-        }
-
-        result
-    }};
 }
 
 use crate::node::network_bridge::handshake::{
@@ -500,43 +483,11 @@ impl P2pConnManager {
                 peer_ready,
             );
 
-        // Check which event loop mode to use via environment variables
-        let use_manual_polling = std::env::var("FREENET_MANUAL_POLL")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-
-        let use_priority_select = std::env::var("FREENET_PRIORITY_SELECT")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);  // Default to FALSE while we finish implementation
-
-        if use_manual_polling {
-            tracing::info!("Event loop using MANUAL POLLING mode for enhanced observability");
-        } else if use_priority_select {
-            tracing::info!("Event loop using PRIORITY SELECT mode with explicit waker control");
-        } else {
-            tracing::info!("Event loop using LEGACY tokio::select! mode");
-        }
-
-        let mut iteration = 0u64;
         loop {
-            iteration += 1;
-
-            let event = if use_manual_polling {
-                // Use manual polling mode with detailed per-future instrumentation
-                self.wait_for_event_manual_poll(
-                    &mut state,
-                    &mut handshake_handler,
-                    &handshake_handler_msg,
-                    &mut notification_channel,
-                    &mut node_controller,
-                    &mut client_wait_for_transaction,
-                    &mut executor_listener,
-                    iteration,
-                )
-                .await?
-            } else if use_priority_select {
-                // Use custom priority select combinator with reference-based polling
-                self.wait_for_event_priority_select(
+            // Use custom priority select combinator for explicit waker control
+            // This fixes waker registration issues that occurred with nested tokio::select!
+            let event = self
+                .wait_for_event(
                     &mut state,
                     &mut handshake_handler,
                     &handshake_handler_msg,
@@ -545,20 +496,7 @@ impl P2pConnManager {
                     &mut client_wait_for_transaction,
                     &mut executor_listener,
                 )
-                .await?
-            } else {
-                // Use legacy tokio::select! mode
-                self.wait_for_event(
-                    &mut state,
-                    &mut handshake_handler,
-                    &handshake_handler_msg,
-                    &mut notification_channel,
-                    &mut node_controller,
-                    &mut client_wait_for_transaction,
-                    &mut executor_listener,
-                )
-                .await?
-            };
+                .await?;
 
             match event {
                 EventResult::Continue => continue,
@@ -1033,160 +971,10 @@ impl P2pConnManager {
         ))
     }
 
-    /// Manual polling version of wait_for_event with full observability
-    ///
-    /// This polls each future manually and logs the state of each one, allowing us to see
-    /// exactly which futures are pending and which are ready. This helps diagnose waker issues.
+    /// Wait for next event using custom priority select combinator.
+    /// This implementation uses explicit waker control to fix waker registration issues.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]  // Keep for debugging
-    async fn wait_for_event_manual_poll(
-        &mut self,
-        state: &mut EventListenerState,
-        handshake_handler: &mut HandshakeHandler,
-        handshake_handler_msg: &HanshakeHandlerMsg,
-        notification_channel: &mut EventLoopNotificationsReceiver,
-        node_controller: &mut Receiver<NodeEvent>,
-        client_wait_for_transaction: &mut ContractHandlerChannel<WaitingResolution>,
-        executor_listener: &mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-        iteration: u64,
-    ) -> anyhow::Result<EventResult> {
-        use std::task::{Context, Poll};
-        use std::future::Future;
-        use futures::stream::Stream;
-
-        let peer_id = &self.bridge.op_manager.ring.connection_manager.pub_key;
-        let channel_id = notification_channel.channel_id;
-
-        tracing::debug!(
-            peer = %peer_id,
-            channel_id = channel_id,
-            iteration = iteration,
-            "wait_for_event: ENTERING manual poll mode"
-        );
-
-        // Create a noop waker for manual polling
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        // Poll notifications_receiver (need to pin the future)
-        let mut notif_fut = Box::pin(notification_channel.notifications_receiver.recv());
-        match notif_fut.as_mut().poll(&mut cx) {
-            Poll::Ready(msg) => {
-                tracing::info!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    iteration = iteration,
-                    msg_present = msg.is_some(),
-                    "POLL: notifications_receiver READY"
-                );
-                return Ok(self.handle_notification_msg(msg));
-            }
-            Poll::Pending => {
-                tracing::trace!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    iteration = iteration,
-                    "POLL: notifications_receiver PENDING"
-                );
-            }
-        }
-
-        // Poll op_execution_receiver
-        let mut op_exec_fut = Box::pin(notification_channel.op_execution_receiver.recv());
-        match op_exec_fut.as_mut().poll(&mut cx) {
-            Poll::Ready(msg) => {
-                tracing::info!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    iteration = iteration,
-                    "POLL: op_execution_receiver READY"
-                );
-                return Ok(self.handle_op_execution(msg, state));
-            }
-            Poll::Pending => {
-                tracing::trace!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    iteration = iteration,
-                    "POLL: op_execution_receiver PENDING"
-                );
-            }
-        }
-
-        // Poll peer_connections if not empty
-        if !state.peer_connections.is_empty() {
-            match Pin::new(&mut state.peer_connections).poll_next(&mut cx) {
-                Poll::Ready(Some(msg)) => {
-                    tracing::info!(
-                        peer = %peer_id,
-                        channel_id = channel_id,
-                        iteration = iteration,
-                        num_connections = state.peer_connections.len(),
-                        "POLL: peer_connections READY"
-                    );
-                    return self.handle_peer_connection_msg(Some(msg), state, handshake_handler_msg).await;
-                }
-                Poll::Ready(None) => {
-                    tracing::warn!(
-                        peer = %peer_id,
-                        "POLL: peer_connections stream ended"
-                    );
-                }
-                Poll::Pending => {
-                    tracing::trace!(
-                        peer = %peer_id,
-                        iteration = iteration,
-                        "POLL: peer_connections PENDING"
-                    );
-                }
-            }
-        }
-
-        // Poll conn_bridge_rx
-        let mut bridge_fut = Box::pin(self.conn_bridge_rx.recv());
-        let bridge_result = bridge_fut.as_mut().poll(&mut cx);
-        drop(bridge_fut);  // Drop before calling handler to avoid borrow issues
-
-        match bridge_result {
-            Poll::Ready(msg) => {
-                tracing::info!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    iteration = iteration,
-                    "POLL: conn_bridge_rx READY"
-                );
-                return Ok(self.handle_bridge_msg(msg));
-            }
-            Poll::Pending => {
-                tracing::trace!(
-                    peer = %peer_id,
-                    iteration = iteration,
-                    "POLL: conn_bridge_rx PENDING"
-                );
-            }
-        }
-
-        tracing::debug!(
-            peer = %peer_id,
-            channel_id = channel_id,
-            iteration = iteration,
-            "POLL: ALL futures PENDING - yielding and will retry"
-        );
-
-        // All futures pending - yield to allow wakers to fire
-        tokio::task::yield_now().await;
-
-        // Return Continue to retry
-        Ok(EventResult::Continue)
-    }
-
-    /// Wait for event using custom priority select combinator with explicit waker control
-    ///
-    /// This version uses our custom select implementation that takes references to futures
-    /// and flattens the handshake futures to avoid nested select! issues.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]  // Keep for A/B testing
-    async fn wait_for_event_priority_select(
+    async fn wait_for_event(
         &mut self,
         state: &mut EventListenerState,
         handshake_handler: &mut HandshakeHandler,
@@ -1202,7 +990,7 @@ impl P2pConnManager {
         tracing::debug!(
             peer = %peer_id,
             channel_id = channel_id,
-            "wait_for_event_priority_select: calling custom select combinator"
+            "wait_for_event: using custom priority select combinator"
         );
 
         let result = priority_select::select_priority(
@@ -1214,7 +1002,8 @@ impl P2pConnManager {
             node_controller,
             client_wait_for_transaction,
             executor_listener,
-        ).await;
+        )
+        .await;
 
         use priority_select::SelectResult;
         match result {
@@ -1242,7 +1031,8 @@ impl P2pConnManager {
                     num_connections = state.peer_connections.len(),
                     "PrioritySelect: peer_connections READY"
                 );
-                self.handle_peer_connection_msg(msg, state, handshake_handler_msg).await
+                self.handle_peer_connection_msg(msg, state, handshake_handler_msg)
+                    .await
             }
             SelectResult::ConnBridge(msg) => {
                 tracing::debug!(
@@ -1273,7 +1063,7 @@ impl P2pConnManager {
                     channel_id = channel_id,
                     "PrioritySelect: handshake outbound connection READY"
                 );
-                use crate::node::network_bridge::handshake::{HandshakeError, InternalEvent};
+                use crate::node::network_bridge::handshake::InternalEvent;
                 let event = match outbound_conn {
                     Some(Ok(InternalEvent::OutboundConnEstablished(peer_id, connection))) => {
                         tracing::info!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection successful");
@@ -1286,24 +1076,40 @@ impl P2pConnManager {
                             handshake_handler.connection_manager.try_set_peer_key(addr);
                             if let Some(ref peer_ready) = handshake_handler.peer_ready {
                                 peer_ready.store(true, std::sync::atomic::Ordering::SeqCst);
-                                tracing::info!("Peer initialization complete: peer_ready set to true");
+                                tracing::info!(
+                                    "Peer initialization complete: peer_ready set to true"
+                                );
                             }
                             if handshake_handler.this_location.is_none() {
-                                handshake_handler.connection_manager.update_location(Some(Location::from_address(&addr)));
+                                handshake_handler
+                                    .connection_manager
+                                    .update_location(Some(Location::from_address(&addr)));
                             }
                         }
                         // Continue with confirmation process
-                        handshake_handler.wait_for_gw_confirmation(id, connection, crate::ring::Ring::DEFAULT_MAX_HOPS_TO_LIVE).await?;
+                        handshake_handler
+                            .wait_for_gw_confirmation(
+                                id,
+                                connection,
+                                crate::ring::Ring::DEFAULT_MAX_HOPS_TO_LIVE,
+                            )
+                            .await?;
                         return Ok(EventResult::Continue);
                     }
                     Some(Ok(InternalEvent::FinishedOutboundConnProcess(tracker))) => {
-                        handshake_handler.connecting.remove(&tracker.gw_peer.peer.addr);
+                        handshake_handler
+                            .connecting
+                            .remove(&tracker.gw_peer.peer.addr);
                         tracing::debug!(at=?tracker.gw_conn.my_address(), gw=%tracker.gw_conn.remote_addr(), "Connection not accepted by gw");
                         crate::node::network_bridge::handshake::Event::OutboundGatewayConnectionRejected { peer_id: tracker.gw_peer.peer }
                     }
                     Some(Ok(InternalEvent::OutboundGwConnConfirmed(tracker))) => {
-                        handshake_handler.connected.insert(tracker.gw_conn.remote_addr());
-                        handshake_handler.connecting.remove(&tracker.gw_conn.remote_addr());
+                        handshake_handler
+                            .connected
+                            .insert(tracker.gw_conn.remote_addr());
+                        handshake_handler
+                            .connecting
+                            .remove(&tracker.gw_conn.remote_addr());
                         crate::node::network_bridge::handshake::Event::OutboundGatewayConnectionSuccessful {
                             peer_id: tracker.gw_peer.peer,
                             connection: tracker.gw_conn,
@@ -1313,12 +1119,18 @@ impl P2pConnManager {
                     Some(Err((peer_id, error))) => {
                         handshake_handler.connecting.remove(&peer_id.addr);
                         handshake_handler.outbound_messages.remove(&peer_id.addr);
-                        handshake_handler.connection_manager.prune_alive_connection(&peer_id);
-                        crate::node::network_bridge::handshake::Event::OutboundConnectionFailed { peer_id, error }
+                        handshake_handler
+                            .connection_manager
+                            .prune_alive_connection(&peer_id);
+                        crate::node::network_bridge::handshake::Event::OutboundConnectionFailed {
+                            peer_id,
+                            error,
+                        }
                     }
                     _ => return Ok(EventResult::Continue),
                 };
-                self.handle_handshake_action(event, state, handshake_handler_msg).await?;
+                self.handle_handshake_action(event, state, handshake_handler_msg)
+                    .await?;
                 Ok(EventResult::Continue)
             }
             SelectResult::HandshakeUnconfirmed(_event) => {
@@ -1357,132 +1169,6 @@ impl P2pConnManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn wait_for_event(
-        &mut self,
-        state: &mut EventListenerState,
-        handshake_handler: &mut HandshakeHandler,
-        handshake_handler_msg: &HanshakeHandlerMsg, // already passed here
-        notification_channel: &mut EventLoopNotificationsReceiver,
-        node_controller: &mut Receiver<NodeEvent>,
-        client_wait_for_transaction: &mut ContractHandlerChannel<WaitingResolution>,
-        executor_listener: &mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-    ) -> anyhow::Result<EventResult> {
-        let peer_id = &self.bridge.op_manager.ring.connection_manager.pub_key;
-        let channel_id = notification_channel.channel_id;
-        tracing::debug!(
-            peer = %peer_id,
-            channel_id = channel_id,
-            "wait_for_event: ENTERING select! - about to poll notification channel and other futures"
-        );
-        // EXPERIMENT: Temporarily removing biased to test if it fixes waker registration
-        // Original comment: notification_channel MUST come first to prevent starvation
-        // in busy networks where peer_connections is constantly ready.
-        // We use `biased;` to force sequential polling in source order, ensuring
-        // notification_channel is ALWAYS checked first before peer_connections.
-        select! {
-            // biased; // REMOVED FOR TESTING
-            // Process internal notifications FIRST - these drive operation state machines
-            msg = notification_channel.notifications_receiver.recv() => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    msg_present = msg.is_some(),
-                    "wait_for_event: notifications_receiver branch SELECTED and READY"
-                );
-                Ok(self.handle_notification_msg(msg))
-            }
-            msg = notification_channel.op_execution_receiver.recv() => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    "wait_for_event: op_execution_receiver branch SELECTED"
-                );
-                Ok(self.handle_op_execution(msg, state))
-            }
-            // Network messages come after internal notifications
-            msg = state.peer_connections.next(), if !state.peer_connections.is_empty() => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    num_connections = state.peer_connections.len(),
-                    "wait_for_event: peer_connections branch SELECTED"
-                );
-                self.handle_peer_connection_msg(msg, state, handshake_handler_msg).await
-            }
-            msg = self.conn_bridge_rx.recv() => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    "wait_for_event: conn_bridge_rx branch SELECTED"
-                );
-                Ok(self.handle_bridge_msg(msg))
-            }
-            // IMPORTANT: Handshake handler has nested select! that can block indefinitely
-            // Use timeout to prevent deadlocking the main event loop
-            handshake_event_res = timeout(Duration::from_millis(100), handshake_handler.wait_for_events()) => {
-                match handshake_event_res {
-                    Ok(Ok(event)) => {
-                        tracing::debug!(
-                            peer = %peer_id,
-                            channel_id = channel_id,
-                            "wait_for_event: handshake_handler branch SELECTED with event"
-                        );
-                        self.handle_handshake_action(event, state, handshake_handler_msg).await?;
-                        Ok(EventResult::Continue)
-                    }
-                    Ok(Err(HandshakeError::ChannelClosed)) => {
-                        tracing::debug!(
-                            peer = %peer_id,
-                            channel_id = channel_id,
-                            "wait_for_event: handshake_handler channel closed"
-                        );
-                        Ok(EventResult::Event(
-                            ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
-                        ))
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(peer = %peer_id, "Handshake error: {:?}", e);
-                        Ok(EventResult::Continue)
-                    }
-                    Err(_timeout) => {
-                        // Timeout - handshake handler has no ready events
-                        // Continue to next iteration, allowing other branches to be polled
-                        tracing::trace!(
-                            peer = %peer_id,
-                            channel_id = channel_id,
-                            "wait_for_event: handshake_handler timeout - no pending events"
-                        );
-                        Ok(EventResult::Continue)
-                    }
-                }
-            }
-            msg = node_controller.recv() => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    "wait_for_event: node_controller branch SELECTED"
-                );
-                Ok(self.handle_node_controller_msg(msg))
-            }
-            event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    "wait_for_event: client_wait_for_transaction branch SELECTED"
-                );
-                Ok(self.handle_client_transaction_subscription(event_id, state))
-            }
-            id = executor_listener.transaction_from_executor() => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    "wait_for_event: executor_listener branch SELECTED"
-                );
-                Ok(self.handle_executor_transaction(id, state))
-            }
-        }
-    }
 
     async fn handle_inbound_message(
         &self,
@@ -1886,9 +1572,7 @@ impl P2pConnManager {
                 EventResult::Event(ConnEvent::InboundMessage(msg).into())
             }
             Some(Right(action)) => {
-                tracing::debug!(
-                    "handle_notification_msg: Received NodeEvent notification"
-                );
+                tracing::debug!("handle_notification_msg: Received NodeEvent notification");
                 EventResult::Event(ConnEvent::NodeAction(action).into())
             }
             None => EventResult::Continue,
