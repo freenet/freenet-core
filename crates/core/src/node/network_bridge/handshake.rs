@@ -870,7 +870,7 @@ impl HandshakeHandler {
     }
 
     /// Waits for confirmation from a gateway after establishing a connection.
-    async fn wait_for_gw_confirmation(
+    pub(crate) async fn wait_for_gw_confirmation(
         &mut self,
         gw_peer_id: PeerId,
         conn: PeerConnection,
@@ -961,21 +961,21 @@ pub(crate) enum InternalEvent {
 }
 
 #[repr(transparent)]
-struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
+pub(crate) struct PeerOutboundMessage(mpsc::Receiver<NetMessage>);
 
 #[derive(Debug)]
-struct AcceptedTracker {
-    gw_peer: PeerKeyLocation,
-    gw_conn: PeerConnection,
-    gw_accepted_processed: bool,
-    gw_accepted: bool,
+pub(crate) struct AcceptedTracker {
+    pub(crate) gw_peer: PeerKeyLocation,
+    pub(crate) gw_conn: PeerConnection,
+    pub(crate) gw_accepted_processed: bool,
+    pub(crate) gw_accepted: bool,
     /// Remaining checks to be made, at max total_checks
-    remaining_checks: usize,
+    pub(crate) remaining_checks: usize,
     /// At max this will be total_checks
-    accepted: usize,
+    pub(crate) accepted: usize,
     /// Equivalent to max_hops_to_live
-    total_checks: usize,
-    tx: Transaction,
+    pub(crate) total_checks: usize,
+    pub(crate) tx: Transaction,
 }
 
 /// Waits for confirmation from a gateway after initiating a connection.

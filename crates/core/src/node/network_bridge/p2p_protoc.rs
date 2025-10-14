@@ -30,50 +30,42 @@ use tracing::Instrument;
 mod priority_select {
     use super::*;
     use tokio::sync::mpsc::Receiver;
-    use futures::stream::{SelectAll, StreamExt};
+    use futures::stream::{SelectAll, StreamExt, Stream};
     use std::task::{Context, Poll};
     use std::pin::Pin;
     use futures::Future;
-    // Import types from parent scope to avoid privacy issues
-    use super::super::super::transport::PeerConnection;
-    use super::OpManager;
-    use super::OpEnum;
-    use super::TransportPublicKey;
-    use super::PeerId;
-    use super::HandshakeHandler;
-    use super::handshake::{HandshakeError, InternalEvent};
-    use super::Transaction;
-    use super::NetMessage;
-    use super::NodeEvent;
-    use super::ContractHandlerChannel;
-    use super::WaitingResolution;
-    use super::ExecutorToEventLoopChannel;
-    use super::NetworkEventListenerHalve;
 
-    // ConnectionEvent is in parent scope but through a re-export
-    type ConnectionEvent = super::super::super::transport::connection_handler::ConnectionEvent;
+    // Import types not in parent scope
+    use crate::node::OpManager;
+    use crate::operations::OpEnum;
+    use crate::transport::connection_handler::ConnectionEvent;
+    use crate::transport::{TransportPublicKey, PeerConnection, TransportError};
+    use crate::dev_tool::{PeerId, Transaction};
+    use crate::node::network_bridge::handshake::{HandshakeError, InternalEvent, PeerOutboundMessage};
+    use crate::message::{NetMessage, NodeEvent};
+    use super::PeerConnectionInbound;  // Import from parent module
 
-    // P2pBridgeEvent is defined in the parent scope as: Either<(PeerId, Box<NetMessage>), NodeEvent>
+    // P2pBridgeEvent is defined in parent as: Either<(PeerId, Box<NetMessage>), NodeEvent>
     type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
 
     pub enum SelectResult {
-        Notification(Option<OpManager>),
-        OpExecution(Option<OpEnum>),
-        PeerConnection(Option<Result<ConnectionEvent, std::io::Error>>),
+        Notification(Option<Either<NetMessage, NodeEvent>>),
+        OpExecution(Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>),
+        PeerConnection(Option<Result<PeerConnectionInbound, TransportError>>),
         ConnBridge(Option<P2pBridgeEvent>),
-        HandshakeInbound(Option<TransportPublicKey>),
+        HandshakeInbound(Option<PeerConnection>),
         HandshakeOutbound(Option<Result<InternalEvent, (PeerId, HandshakeError)>>),
-        HandshakeUnconfirmed(Option<Result<(InternalEvent, tokio::sync::mpsc::Sender<Result<InternalEvent, HandshakeError>>), HandshakeError>>),
+        HandshakeUnconfirmed(Option<Result<(InternalEvent, PeerOutboundMessage), HandshakeError>>),
         NodeController(Option<NodeEvent>),
-        ClientTransaction(Transaction),
-        ExecutorTransaction(Transaction),
+        ClientTransaction(Result<(crate::client_events::ClientId, crate::contract::WaitingTransaction), anyhow::Error>),
+        ExecutorTransaction(Result<Transaction, anyhow::Error>),
     }
 
     /// A future that polls multiple futures with explicit priority order and waker control
     pub struct PrioritySelectFuture<'a> {
-        notification_rx: &'a mut Receiver<OpManager>,
-        op_execution_rx: &'a mut Receiver<OpEnum>,
-        peer_connections: &'a mut SelectAll<futures::stream::BoxStream<'static, Result<ConnectionEvent, std::io::Error>>>,
+        notification_rx: &'a mut Receiver<Either<NetMessage, NodeEvent>>,
+        op_execution_rx: &'a mut Receiver<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
+        peer_connections: &'a mut FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
         conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
         handshake_handler: &'a mut HandshakeHandler,
         node_controller: &'a mut Receiver<NodeEvent>,
@@ -86,9 +78,9 @@ mod priority_select {
 
     impl<'a> PrioritySelectFuture<'a> {
         pub fn new(
-            notification_rx: &'a mut Receiver<OpManager>,
-            op_execution_rx: &'a mut Receiver<OpEnum>,
-            peer_connections: &'a mut SelectAll<futures::stream::BoxStream<'static, Result<ConnectionEvent, std::io::Error>>>,
+            notification_rx: &'a mut Receiver<Either<NetMessage, NodeEvent>>,
+            op_execution_rx: &'a mut Receiver<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
+            peer_connections: &'a mut FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
             conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
             handshake_handler: &'a mut HandshakeHandler,
             node_controller: &'a mut Receiver<NodeEvent>,
@@ -122,28 +114,32 @@ mod priority_select {
             // Priority 1: Notification channel (highest priority)
             // This MUST be polled first to ensure operation state machine messages
             // are processed before network messages
-            let mut notif_fut = Box::pin(self.notification_rx.recv());
-            match notif_fut.as_mut().poll(cx) {
-                Poll::Ready(msg) => {
-                    tracing::trace!("PrioritySelect: notification_rx ready");
-                    return Poll::Ready(SelectResult::Notification(msg));
+            {
+                let mut notif_fut = Box::pin(self.notification_rx.recv());
+                match notif_fut.as_mut().poll(cx) {
+                    Poll::Ready(msg) => {
+                        tracing::trace!("PrioritySelect: notification_rx ready");
+                        return Poll::Ready(SelectResult::Notification(msg));
+                    }
+                    Poll::Pending => {}
                 }
-                Poll::Pending => {}
             }
 
             // Priority 2: Op execution channel
-            let mut op_exec_fut = Box::pin(self.op_execution_rx.recv());
-            match op_exec_fut.as_mut().poll(cx) {
-                Poll::Ready(msg) => {
-                    tracing::trace!("PrioritySelect: op_execution_rx ready");
-                    return Poll::Ready(SelectResult::OpExecution(msg));
+            {
+                let mut op_exec_fut = Box::pin(self.op_execution_rx.recv());
+                match op_exec_fut.as_mut().poll(cx) {
+                    Poll::Ready(msg) => {
+                        tracing::trace!("PrioritySelect: op_execution_rx ready");
+                        return Poll::Ready(SelectResult::OpExecution(msg));
+                    }
+                    Poll::Pending => {}
                 }
-                Poll::Pending => {}
             }
 
             // Priority 3: Peer connections (only if not empty)
             if !self.peer_connections_empty {
-                match Pin::new(&mut *self.peer_connections).poll_next(cx) {
+                match Stream::poll_next(Pin::new(&mut *self.peer_connections), cx) {
                     Poll::Ready(msg) => {
                         tracing::trace!("PrioritySelect: peer_connections ready");
                         return Poll::Ready(SelectResult::PeerConnection(msg));
@@ -153,13 +149,15 @@ mod priority_select {
             }
 
             // Priority 4: Connection bridge
-            let mut bridge_fut = Box::pin(self.conn_bridge_rx.recv());
-            match bridge_fut.as_mut().poll(cx) {
-                Poll::Ready(msg) => {
-                    tracing::trace!("PrioritySelect: conn_bridge_rx ready");
-                    return Poll::Ready(SelectResult::ConnBridge(msg));
+            {
+                let mut bridge_fut = Box::pin(self.conn_bridge_rx.recv());
+                match bridge_fut.as_mut().poll(cx) {
+                    Poll::Ready(msg) => {
+                        tracing::trace!("PrioritySelect: conn_bridge_rx ready");
+                        return Poll::Ready(SelectResult::ConnBridge(msg));
+                    }
+                    Poll::Pending => {}
                 }
-                Poll::Pending => {}
             }
 
             // Priority 5-7: Handshake futures (flattened from nested select!)
@@ -167,18 +165,20 @@ mod priority_select {
             // which has a nested select!, we directly poll the individual futures
 
             // Handshake: inbound connections (always poll - this is the listener)
-            let mut inbound_fut = Box::pin(self.handshake_handler.inbound_conn_handler.next_connection());
-            match inbound_fut.as_mut().poll(cx) {
-                Poll::Ready(conn) => {
-                    tracing::trace!("PrioritySelect: handshake inbound ready");
-                    return Poll::Ready(SelectResult::HandshakeInbound(conn));
+            {
+                let mut inbound_fut = Box::pin(self.handshake_handler.inbound_conn_handler.next_connection());
+                match inbound_fut.as_mut().poll(cx) {
+                    Poll::Ready(conn) => {
+                        tracing::trace!("PrioritySelect: handshake inbound ready");
+                        return Poll::Ready(SelectResult::HandshakeInbound(conn));
+                    }
+                    Poll::Pending => {}
                 }
-                Poll::Pending => {}
             }
 
             // Handshake: outbound connections (only if not empty)
             if !self.handshake_outbound_empty {
-                match Pin::new(&mut self.handshake_handler.ongoing_outbound_connections).poll_next(cx) {
+                match Stream::poll_next(Pin::new(&mut self.handshake_handler.ongoing_outbound_connections), cx) {
                     Poll::Ready(event) => {
                         tracing::trace!("PrioritySelect: handshake outbound ready");
                         return Poll::Ready(SelectResult::HandshakeOutbound(event));
@@ -189,7 +189,7 @@ mod priority_select {
 
             // Handshake: unconfirmed inbound (only if not empty)
             if !self.handshake_unconfirmed_empty {
-                match Pin::new(&mut self.handshake_handler.unconfirmed_inbound_connections).poll_next(cx) {
+                match Stream::poll_next(Pin::new(&mut self.handshake_handler.unconfirmed_inbound_connections), cx) {
                     Poll::Ready(event) => {
                         tracing::trace!("PrioritySelect: handshake unconfirmed ready");
                         return Poll::Ready(SelectResult::HandshakeUnconfirmed(event));
@@ -199,33 +199,39 @@ mod priority_select {
             }
 
             // Priority 8: Node controller
-            let mut controller_fut = Box::pin(self.node_controller.recv());
-            match controller_fut.as_mut().poll(cx) {
-                Poll::Ready(msg) => {
-                    tracing::trace!("PrioritySelect: node_controller ready");
-                    return Poll::Ready(SelectResult::NodeController(msg));
+            {
+                let mut controller_fut = Box::pin(self.node_controller.recv());
+                match controller_fut.as_mut().poll(cx) {
+                    Poll::Ready(msg) => {
+                        tracing::trace!("PrioritySelect: node_controller ready");
+                        return Poll::Ready(SelectResult::NodeController(msg));
+                    }
+                    Poll::Pending => {}
                 }
-                Poll::Pending => {}
             }
 
             // Priority 9: Client transaction waiting
-            let mut client_fut = Box::pin(self.client_wait_for_transaction.relay_transaction_result_to_client());
-            match client_fut.as_mut().poll(cx) {
-                Poll::Ready(event_id) => {
-                    tracing::trace!("PrioritySelect: client_wait_for_transaction ready");
-                    return Poll::Ready(SelectResult::ClientTransaction(event_id));
+            {
+                let mut client_fut = Box::pin(self.client_wait_for_transaction.relay_transaction_result_to_client());
+                match client_fut.as_mut().poll(cx) {
+                    Poll::Ready(event_id) => {
+                        tracing::trace!("PrioritySelect: client_wait_for_transaction ready");
+                        return Poll::Ready(SelectResult::ClientTransaction(event_id));
+                    }
+                    Poll::Pending => {}
                 }
-                Poll::Pending => {}
             }
 
             // Priority 10: Executor transaction
-            let mut executor_fut = Box::pin(self.executor_listener.transaction_from_executor());
-            match executor_fut.as_mut().poll(cx) {
-                Poll::Ready(id) => {
-                    tracing::trace!("PrioritySelect: executor_listener ready");
-                    return Poll::Ready(SelectResult::ExecutorTransaction(id));
+            {
+                let mut executor_fut = Box::pin(self.executor_listener.transaction_from_executor());
+                match executor_fut.as_mut().poll(cx) {
+                    Poll::Ready(id) => {
+                        tracing::trace!("PrioritySelect: executor_listener ready");
+                        return Poll::Ready(SelectResult::ExecutorTransaction(id));
+                    }
+                    Poll::Pending => {}
                 }
-                Poll::Pending => {}
             }
 
             // All futures returned Pending - wakers are now registered for all of them
@@ -237,9 +243,9 @@ mod priority_select {
     }
 
     pub async fn select_priority<'a>(
-        notification_rx: &'a mut Receiver<OpManager>,
-        op_execution_rx: &'a mut Receiver<OpEnum>,
-        peer_connections: &'a mut SelectAll<futures::stream::BoxStream<'static, Result<ConnectionEvent, std::io::Error>>>,
+        notification_rx: &'a mut Receiver<Either<NetMessage, NodeEvent>>,
+        op_execution_rx: &'a mut Receiver<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
+        peer_connections: &'a mut FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
         conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
         handshake_handler: &'a mut HandshakeHandler,
         node_controller: &'a mut Receiver<NodeEvent>,
