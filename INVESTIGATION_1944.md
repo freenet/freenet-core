@@ -209,14 +209,94 @@ Timeline from test:
 4. **Tokio bug**: Edge case in tokio::mpsc with biased select! and timeouts
 5. **Receiver consumed**: The receiver might be moved out of the struct between iterations
 
+## The REAL Root Cause: Waker Registration Failure 🎯🎯🎯
+
+### Critical Discovery - 2025-10-14
+
+After implementing detailed logging and manual polling experiments, we've identified the **true root cause**:
+
+**The notification channel receiver's waker is NOT being registered/triggered when the event loop is already blocked in select!**
+
+### Evidence from Latest Testing
+
+#### Test Run: Regular Mode with Detailed Logging
+Timeline:
+- `09:57:19.007109Z` - Last "ENTERING select!" log for peer v6MWKgqJE4HoFnZW
+- `09:57:19.058305Z` - PUT notification **sent successfully** (51ms later)
+- **ZERO "SELECTED" logs after this point** - notification never received
+
+**Key Finding**: The event loop entered select! BEFORE the PUT was sent (at 09:57:19.007), then 51ms later the PUT notification was sent. The notification channel tried to wake the task, but **the waker was never triggered**.
+
+All select! branches (including `notifications_receiver.recv()`) returned Poll::Pending and stayed that way forever, despite messages being successfully sent to the channel.
+
+#### Test Run: Manual Polling Mode
+Created a manual polling implementation that explicitly polls each future:
+- Used `Box::pin()` + noop waker to manually poll `notifications_receiver.recv()`
+- Result: **332,936 iterations** in 25 seconds
+- Only **1** notification ever became ready (iteration 1)
+- All subsequent polls returned Poll::Pending
+
+### The Waker Registration Problem
+
+When `tokio::select!` polls futures:
+
+1. Each future (including `notifications_receiver.recv()`) must register a waker
+2. When data arrives in the channel, the sender calls `waker.wake()` to notify the task
+3. The task gets scheduled, select! polls again, and the ready future is selected
+
+**What's Going Wrong**:
+- The notification receiver IS being polled
+- The waker IS being registered (initially)
+- But when the sender tries to wake the task, **the waker is not firing**
+- This could be due to:
+  - Waker being replaced by another future's waker
+  - Waker reference being dropped/invalidated
+  - Race condition in waker registration
+  - Tokio bug with nested select! + timeouts
+
+### Why the Timeout "Fix" Doesn't Work
+
+The timeout wrapper (PR #1950) prevents complete deadlock by forcing the loop to continue every 100ms. However:
+
+**The timeout doesn't fix the underlying waker issue** - it just masks it by creating a busy-wait loop. The notification channel's waker is still not being triggered, so the only way messages get processed is if they arrive EXACTLY when select! is polling (which is why we see a few SELECTED logs early on).
+
+### Hypothesis: Nested Select! + Timeout Breaks Waker Chain
+
+The combination of:
+1. Outer select! with `biased`
+2. Inner select! in `handshake_handler.wait_for_events()`
+3. `timeout()` wrapper around handshake branch
+
+...may be causing Tokio's waker registration to fail. The timeout creates its own future that wraps the handshake future, which contains another select!. This nesting might be confusing Tokio's waker bookkeeping.
+
+### Next Steps to Investigate
+
+1. **Test without timeout**: Remove the timeout wrapper and see if wakers work correctly when there ARE pending handshake events
+2. **Test without handshake**: Comment out the handshake branch entirely and see if notification channel works
+3. **Test with FuturesUnordered**: Replace nested select! with FuturesUnordered to avoid nesting
+4. **Check Tokio version**: Look for known bugs with nested select! or waker registration issues
+
+### Why Unit Tests Pass But Production Fails
+
+The unit tests work because they don't have:
+- Nested select! loops
+- Multiple competing futures
+- Timeout wrappers
+- Complex waker interaction patterns
+
+They test the channel in isolation, which works fine. The bug only manifests when the channel is used inside a complex select! with multiple nested async boundaries.
+
 ## Questions for Review
 
 1. Could there be multiple EventLoopNotificationsReceiver instances somehow?
 2. Is the notification_channel being moved/consumed elsewhere?
 3. Could tokio runtime configuration affect mpsc behavior?
 4. Any known issues with biased select! and mpsc channels?
+5. **NEW**: Does Tokio have known issues with waker registration in nested select! with timeouts?
+6. **NEW**: Can we simplify the select! structure to avoid nesting?
 
 ---
 Investigation by: Claude Code
-Branch: fix/put-operation-network-send  
+Branch: fix/put-operation-network-send
 Issue: #1944
+Last Updated: 2025-10-14
