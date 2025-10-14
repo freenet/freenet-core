@@ -1043,7 +1043,6 @@ impl P2pConnManager {
         }
     }
 
-
     async fn handle_inbound_message(
         &self,
         msg: NetMessage,

@@ -1270,7 +1270,9 @@ pub(crate) mod tracer {
         {
             if std::env::var("TOKIO_CONSOLE").is_ok() {
                 console_subscriber::init();
-                println!("Tokio console subscriber initialized. Connect with 'tokio-console' command.");
+                println!(
+                    "Tokio console subscriber initialized. Connect with 'tokio-console' command."
+                );
                 return Ok(());
             }
         }
