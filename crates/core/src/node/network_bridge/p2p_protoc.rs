@@ -7,7 +7,7 @@ use dashmap::DashSet;
 use either::{Either, Left, Right};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -37,8 +37,7 @@ mod priority_select {
     use super::PeerConnectionInbound;
     use crate::dev_tool::{PeerId, Transaction};
     use crate::message::{NetMessage, NodeEvent};
-    use crate::node::network_bridge::handshake::{InternalEvent, PeerOutboundMessage};
-    use crate::transport::{PeerConnection, TransportError}; // Import from parent module
+    use crate::transport::TransportError; // Import from parent module
 
     // P2pBridgeEvent is defined in parent as: Either<(PeerId, Box<NetMessage>), NodeEvent>
     type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
@@ -49,9 +48,7 @@ mod priority_select {
         OpExecution(Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>),
         PeerConnection(Option<Result<PeerConnectionInbound, TransportError>>),
         ConnBridge(Option<P2pBridgeEvent>),
-        HandshakeInbound(Option<PeerConnection>),
-        HandshakeOutbound(Option<Result<InternalEvent, (PeerId, HandshakeError)>>),
-        HandshakeUnconfirmed(Option<Result<(InternalEvent, PeerOutboundMessage), HandshakeError>>),
+        Handshake(Result<crate::node::network_bridge::handshake::Event, HandshakeError>),
         NodeController(Option<NodeEvent>),
         ClientTransaction(
             Result<
@@ -78,8 +75,6 @@ mod priority_select {
         client_wait_for_transaction: &'a mut ContractHandlerChannel<WaitingResolution>,
         executor_listener: &'a mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         peer_connections_empty: bool,
-        handshake_outbound_empty: bool,
-        handshake_unconfirmed_empty: bool,
     }
 
     impl<'a> PrioritySelectFuture<'a> {
@@ -97,10 +92,6 @@ mod priority_select {
             executor_listener: &'a mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         ) -> Self {
             let peer_connections_empty = peer_connections.is_empty();
-            let handshake_outbound_empty =
-                handshake_handler.ongoing_outbound_connections.is_empty();
-            let handshake_unconfirmed_empty =
-                handshake_handler.unconfirmed_inbound_connections.is_empty();
 
             Self {
                 notification_rx,
@@ -112,8 +103,6 @@ mod priority_select {
                 client_wait_for_transaction,
                 executor_listener,
                 peer_connections_empty,
-                handshake_outbound_empty,
-                handshake_unconfirmed_empty,
             }
         }
     }
@@ -171,49 +160,15 @@ mod priority_select {
                 }
             }
 
-            // Priority 5-7: Handshake futures (flattened from nested select!)
-            // This is the key change - instead of polling handshake_handler.wait_for_events()
-            // which has a nested select!, we directly poll the individual futures
-
-            // Handshake: inbound connections (always poll - this is the listener)
+            // Priority 5: Handshake handler (poll wait_for_events as a whole to preserve all logic)
+            // We poll this as a boxed future to avoid nested select! waker registration issues
+            // while still keeping all the handshake event handling logic intact
             {
-                let mut inbound_fut = Box::pin(
-                    self.handshake_handler
-                        .inbound_conn_handler
-                        .next_connection(),
-                );
-                match inbound_fut.as_mut().poll(cx) {
-                    Poll::Ready(conn) => {
-                        tracing::trace!("PrioritySelect: handshake inbound ready");
-                        return Poll::Ready(SelectResult::HandshakeInbound(conn));
-                    }
-                    Poll::Pending => {}
-                }
-            }
-
-            // Handshake: outbound connections (only if not empty)
-            if !self.handshake_outbound_empty {
-                match Stream::poll_next(
-                    Pin::new(&mut self.handshake_handler.ongoing_outbound_connections),
-                    cx,
-                ) {
-                    Poll::Ready(event) => {
-                        tracing::trace!("PrioritySelect: handshake outbound ready");
-                        return Poll::Ready(SelectResult::HandshakeOutbound(event));
-                    }
-                    Poll::Pending => {}
-                }
-            }
-
-            // Handshake: unconfirmed inbound (only if not empty)
-            if !self.handshake_unconfirmed_empty {
-                match Stream::poll_next(
-                    Pin::new(&mut self.handshake_handler.unconfirmed_inbound_connections),
-                    cx,
-                ) {
-                    Poll::Ready(event) => {
-                        tracing::trace!("PrioritySelect: handshake unconfirmed ready");
-                        return Poll::Ready(SelectResult::HandshakeUnconfirmed(event));
+                let mut handshake_fut = Box::pin(self.handshake_handler.wait_for_events());
+                match handshake_fut.as_mut().poll(cx) {
+                    Poll::Ready(result) => {
+                        tracing::trace!("PrioritySelect: handshake_handler ready");
+                        return Poll::Ready(SelectResult::Handshake(result));
                     }
                     Poll::Pending => {}
                 }
@@ -1041,105 +996,25 @@ impl P2pConnManager {
                 );
                 Ok(self.handle_bridge_msg(msg))
             }
-            SelectResult::HandshakeInbound(conn) => {
+            SelectResult::Handshake(result) => {
                 tracing::debug!(
                     peer = %peer_id,
                     channel_id = channel_id,
-                    "PrioritySelect: handshake inbound connection READY"
+                    "PrioritySelect: handshake event READY"
                 );
-                let Some(conn) = conn else {
-                    return Ok(EventResult::Event(
-                        ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
-                    ));
-                };
-                tracing::debug!(from=%conn.remote_addr(), "New inbound connection");
-                handshake_handler.track_inbound_connection(conn);
-                Ok(EventResult::Continue)
-            }
-            SelectResult::HandshakeOutbound(outbound_conn) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    "PrioritySelect: handshake outbound connection READY"
-                );
-                use crate::node::network_bridge::handshake::InternalEvent;
-                let event = match outbound_conn {
-                    Some(Ok(InternalEvent::OutboundConnEstablished(peer_id, connection))) => {
-                        tracing::info!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound connection successful");
-                        crate::node::network_bridge::handshake::Event::OutboundConnectionSuccessful { peer_id, connection }
-                    }
-                    Some(Ok(InternalEvent::OutboundGwConnEstablished(id, connection))) => {
-                        tracing::info!(at=?connection.my_address(), from=%connection.remote_addr(), "Outbound gateway connection successful");
-                        // Handle gateway connection setup inline
-                        if let Some(addr) = connection.my_address() {
-                            handshake_handler.connection_manager.try_set_peer_key(addr);
-                            if let Some(ref peer_ready) = handshake_handler.peer_ready {
-                                peer_ready.store(true, std::sync::atomic::Ordering::SeqCst);
-                                tracing::info!(
-                                    "Peer initialization complete: peer_ready set to true"
-                                );
-                            }
-                            if handshake_handler.this_location.is_none() {
-                                handshake_handler
-                                    .connection_manager
-                                    .update_location(Some(Location::from_address(&addr)));
-                            }
-                        }
-                        // Continue with confirmation process
-                        handshake_handler
-                            .wait_for_gw_confirmation(
-                                id,
-                                connection,
-                                crate::ring::Ring::DEFAULT_MAX_HOPS_TO_LIVE,
-                            )
+                match result {
+                    Ok(event) => {
+                        self.handle_handshake_action(event, state, handshake_handler_msg)
                             .await?;
-                        return Ok(EventResult::Continue);
+                        Ok(EventResult::Continue)
                     }
-                    Some(Ok(InternalEvent::FinishedOutboundConnProcess(tracker))) => {
-                        handshake_handler
-                            .connecting
-                            .remove(&tracker.gw_peer.peer.addr);
-                        tracing::debug!(at=?tracker.gw_conn.my_address(), gw=%tracker.gw_conn.remote_addr(), "Connection not accepted by gw");
-                        crate::node::network_bridge::handshake::Event::OutboundGatewayConnectionRejected { peer_id: tracker.gw_peer.peer }
+                    Err(handshake_error) => {
+                        tracing::error!(?handshake_error, "Handshake handler error");
+                        Ok(EventResult::Event(
+                            ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
+                        ))
                     }
-                    Some(Ok(InternalEvent::OutboundGwConnConfirmed(tracker))) => {
-                        handshake_handler
-                            .connected
-                            .insert(tracker.gw_conn.remote_addr());
-                        handshake_handler
-                            .connecting
-                            .remove(&tracker.gw_conn.remote_addr());
-                        crate::node::network_bridge::handshake::Event::OutboundGatewayConnectionSuccessful {
-                            peer_id: tracker.gw_peer.peer,
-                            connection: tracker.gw_conn,
-                            remaining_checks: tracker.remaining_checks,
-                        }
-                    }
-                    Some(Err((peer_id, error))) => {
-                        handshake_handler.connecting.remove(&peer_id.addr);
-                        handshake_handler.outbound_messages.remove(&peer_id.addr);
-                        handshake_handler
-                            .connection_manager
-                            .prune_alive_connection(&peer_id);
-                        crate::node::network_bridge::handshake::Event::OutboundConnectionFailed {
-                            peer_id,
-                            error,
-                        }
-                    }
-                    _ => return Ok(EventResult::Continue),
-                };
-                self.handle_handshake_action(event, state, handshake_handler_msg)
-                    .await?;
-                Ok(EventResult::Continue)
-            }
-            SelectResult::HandshakeUnconfirmed(_event) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    channel_id = channel_id,
-                    "PrioritySelect: handshake unconfirmed READY (not fully implemented yet)"
-                );
-                // TODO: Implement unconfirmed handling
-                Ok(EventResult::Continue)
+                }
             }
             SelectResult::NodeController(msg) => {
                 tracing::debug!(
