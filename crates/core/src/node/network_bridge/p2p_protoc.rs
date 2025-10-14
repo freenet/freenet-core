@@ -34,15 +34,24 @@ mod priority_select {
     use std::task::{Context, Poll};
     use std::pin::Pin;
     use futures::Future;
-    use crate::node::OpManager;
-    use crate::operations::OpEnum;
-    use crate::transport::connection_handler::ConnectionEvent;
-    use crate::transport::TransportPublicKey;
-    use crate::dev_tool::PeerId;
-    use crate::node::network_bridge::handshake::{HandshakeError, InternalEvent};
-    use crate::dev_tool::Transaction;
-    use crate::message::NetMessage;
-    use crate::node::p2p_impl::NodeEvent;
+    // Import types from parent scope to avoid privacy issues
+    use super::super::super::transport::PeerConnection;
+    use super::OpManager;
+    use super::OpEnum;
+    use super::TransportPublicKey;
+    use super::PeerId;
+    use super::HandshakeHandler;
+    use super::handshake::{HandshakeError, InternalEvent};
+    use super::Transaction;
+    use super::NetMessage;
+    use super::NodeEvent;
+    use super::ContractHandlerChannel;
+    use super::WaitingResolution;
+    use super::ExecutorToEventLoopChannel;
+    use super::NetworkEventListenerHalve;
+
+    // ConnectionEvent is in parent scope but through a re-export
+    type ConnectionEvent = super::super::super::transport::connection_handler::ConnectionEvent;
 
     // P2pBridgeEvent is defined in the parent scope as: Either<(PeerId, Box<NetMessage>), NodeEvent>
     type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
@@ -113,7 +122,8 @@ mod priority_select {
             // Priority 1: Notification channel (highest priority)
             // This MUST be polled first to ensure operation state machine messages
             // are processed before network messages
-            match Pin::new(&mut self.notification_rx.recv()).poll(cx) {
+            let mut notif_fut = Box::pin(self.notification_rx.recv());
+            match notif_fut.as_mut().poll(cx) {
                 Poll::Ready(msg) => {
                     tracing::trace!("PrioritySelect: notification_rx ready");
                     return Poll::Ready(SelectResult::Notification(msg));
@@ -122,7 +132,8 @@ mod priority_select {
             }
 
             // Priority 2: Op execution channel
-            match Pin::new(&mut self.op_execution_rx.recv()).poll(cx) {
+            let mut op_exec_fut = Box::pin(self.op_execution_rx.recv());
+            match op_exec_fut.as_mut().poll(cx) {
                 Poll::Ready(msg) => {
                     tracing::trace!("PrioritySelect: op_execution_rx ready");
                     return Poll::Ready(SelectResult::OpExecution(msg));
@@ -142,7 +153,8 @@ mod priority_select {
             }
 
             // Priority 4: Connection bridge
-            match Pin::new(&mut self.conn_bridge_rx.recv()).poll(cx) {
+            let mut bridge_fut = Box::pin(self.conn_bridge_rx.recv());
+            match bridge_fut.as_mut().poll(cx) {
                 Poll::Ready(msg) => {
                     tracing::trace!("PrioritySelect: conn_bridge_rx ready");
                     return Poll::Ready(SelectResult::ConnBridge(msg));
@@ -155,7 +167,8 @@ mod priority_select {
             // which has a nested select!, we directly poll the individual futures
 
             // Handshake: inbound connections (always poll - this is the listener)
-            match Pin::new(&mut self.handshake_handler.inbound_conn_handler.next_connection()).poll(cx) {
+            let mut inbound_fut = Box::pin(self.handshake_handler.inbound_conn_handler.next_connection());
+            match inbound_fut.as_mut().poll(cx) {
                 Poll::Ready(conn) => {
                     tracing::trace!("PrioritySelect: handshake inbound ready");
                     return Poll::Ready(SelectResult::HandshakeInbound(conn));
@@ -186,7 +199,8 @@ mod priority_select {
             }
 
             // Priority 8: Node controller
-            match Pin::new(&mut self.node_controller.recv()).poll(cx) {
+            let mut controller_fut = Box::pin(self.node_controller.recv());
+            match controller_fut.as_mut().poll(cx) {
                 Poll::Ready(msg) => {
                     tracing::trace!("PrioritySelect: node_controller ready");
                     return Poll::Ready(SelectResult::NodeController(msg));
@@ -195,7 +209,8 @@ mod priority_select {
             }
 
             // Priority 9: Client transaction waiting
-            match Pin::new(&mut self.client_wait_for_transaction.relay_transaction_result_to_client()).poll(cx) {
+            let mut client_fut = Box::pin(self.client_wait_for_transaction.relay_transaction_result_to_client());
+            match client_fut.as_mut().poll(cx) {
                 Poll::Ready(event_id) => {
                     tracing::trace!("PrioritySelect: client_wait_for_transaction ready");
                     return Poll::Ready(SelectResult::ClientTransaction(event_id));
@@ -204,7 +219,8 @@ mod priority_select {
             }
 
             // Priority 10: Executor transaction
-            match Pin::new(&mut self.executor_listener.transaction_from_executor()).poll(cx) {
+            let mut executor_fut = Box::pin(self.executor_listener.transaction_from_executor());
+            match executor_fut.as_mut().poll(cx) {
                 Poll::Ready(id) => {
                     tracing::trace!("PrioritySelect: executor_listener ready");
                     return Poll::Ready(SelectResult::ExecutorTransaction(id));
