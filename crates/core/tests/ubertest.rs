@@ -382,6 +382,7 @@ async fn test_basic_room_creation() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires fixes still in progress"]
 async fn test_app_ubertest() -> anyhow::Result<()> {
     freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
 

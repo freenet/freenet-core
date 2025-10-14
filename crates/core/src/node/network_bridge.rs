@@ -19,6 +19,7 @@ use crate::message::{NetMessage, NodeEvent};
 mod handshake;
 pub(crate) mod in_memory;
 pub(crate) mod p2p_protoc;
+pub(crate) mod priority_select;
 
 pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
@@ -92,12 +93,12 @@ pub(crate) fn event_loop_notification_channel(
     use std::sync::atomic::{AtomicU64, Ordering};
     static CHANNEL_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let channel_id = CHANNEL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let _channel_id = CHANNEL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
     let (notification_tx, notification_rx) = mpsc::channel(100);
     let (op_execution_tx, op_execution_rx) = mpsc::channel(100);
 
     tracing::info!(
-        channel_id = channel_id,
+        channel_id = _channel_id,
         "Created event loop notification channel pair"
     );
 
@@ -105,12 +106,10 @@ pub(crate) fn event_loop_notification_channel(
         EventLoopNotificationsReceiver {
             notifications_receiver: notification_rx,
             op_execution_receiver: op_execution_rx,
-            channel_id,
         },
         EventLoopNotificationsSender {
             notifications_sender: notification_tx,
             op_execution_sender: op_execution_tx,
-            channel_id,
         },
     )
 }
@@ -118,7 +117,6 @@ pub(crate) fn event_loop_notification_channel(
 pub(crate) struct EventLoopNotificationsReceiver {
     pub(crate) notifications_receiver: Receiver<Either<NetMessage, NodeEvent>>,
     pub(crate) op_execution_receiver: Receiver<(Sender<NetMessage>, NetMessage)>,
-    pub(crate) channel_id: u64,
 }
 
 #[allow(dead_code)] // FIXME: enable async sub-transactions
@@ -136,7 +134,6 @@ impl EventLoopNotificationsReceiver {
 pub(crate) struct EventLoopNotificationsSender {
     pub(crate) notifications_sender: Sender<Either<NetMessage, NodeEvent>>,
     pub(crate) op_execution_sender: Sender<(Sender<NetMessage>, NetMessage)>,
-    pub(crate) channel_id: u64,
 }
 
 impl EventLoopNotificationsSender {
