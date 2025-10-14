@@ -722,17 +722,25 @@ impl P2pConnManager {
             msg = self.conn_bridge_rx.recv() => {
                 Ok(self.handle_bridge_msg(msg))
             }
-            handshake_event_res = handshake_handler.wait_for_events() => {
+            // IMPORTANT: Handshake handler has nested select! that can block indefinitely
+            // Use timeout to prevent deadlocking the main event loop
+            // TODO: need to implement a better fix for this
+            handshake_event_res = timeout(Duration::from_millis(10), handshake_handler.wait_for_events()) => {
                 match handshake_event_res {
-                    Ok(event) => {
+                    Ok(Ok(event)) => {
                         self.handle_handshake_action(event, state, handshake_handler_msg).await?;
                         Ok(EventResult::Continue)
                     }
-                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(
+                    Ok(Err(HandshakeError::ChannelClosed)) => Ok(EventResult::Event(
                         ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
                     )),
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!("Handshake error: {:?}", e);
+                        Ok(EventResult::Continue)
+                    }
+                    Err(_timeout) => {
+                        // Timeout - handshake handler has no ready events
+                        // Continue to next iteration, allowing other branches to be polled
                         Ok(EventResult::Continue)
                     }
                 }
