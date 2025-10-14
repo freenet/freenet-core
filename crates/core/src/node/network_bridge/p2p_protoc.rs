@@ -36,18 +36,22 @@ mod priority_select {
     use futures::Future;
     use crate::node::OpManager;
     use crate::operations::OpEnum;
-    use crate::transport::ConnectionEvent;
+    use crate::transport::connection_handler::ConnectionEvent;
     use crate::transport::TransportPublicKey;
     use crate::dev_tool::PeerId;
     use crate::node::network_bridge::handshake::{HandshakeError, InternalEvent};
     use crate::dev_tool::Transaction;
-    use crate::node::NodeEvent;
+    use crate::message::NetMessage;
+    use crate::node::p2p_impl::NodeEvent;
+
+    // P2pBridgeEvent is defined in the parent scope as: Either<(PeerId, Box<NetMessage>), NodeEvent>
+    type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
 
     pub enum SelectResult {
         Notification(Option<OpManager>),
         OpExecution(Option<OpEnum>),
         PeerConnection(Option<Result<ConnectionEvent, std::io::Error>>),
-        ConnBridge(Option<ConnBridgeMsg>),
+        ConnBridge(Option<P2pBridgeEvent>),
         HandshakeInbound(Option<TransportPublicKey>),
         HandshakeOutbound(Option<Result<InternalEvent, (PeerId, HandshakeError)>>),
         HandshakeUnconfirmed(Option<Result<(InternalEvent, tokio::sync::mpsc::Sender<Result<InternalEvent, HandshakeError>>), HandshakeError>>),
@@ -61,7 +65,7 @@ mod priority_select {
         notification_rx: &'a mut Receiver<OpManager>,
         op_execution_rx: &'a mut Receiver<OpEnum>,
         peer_connections: &'a mut SelectAll<futures::stream::BoxStream<'static, Result<ConnectionEvent, std::io::Error>>>,
-        conn_bridge_rx: &'a mut Receiver<ConnBridgeMsg>,
+        conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
         handshake_handler: &'a mut HandshakeHandler,
         node_controller: &'a mut Receiver<NodeEvent>,
         client_wait_for_transaction: &'a mut ContractHandlerChannel<WaitingResolution>,
@@ -76,7 +80,7 @@ mod priority_select {
             notification_rx: &'a mut Receiver<OpManager>,
             op_execution_rx: &'a mut Receiver<OpEnum>,
             peer_connections: &'a mut SelectAll<futures::stream::BoxStream<'static, Result<ConnectionEvent, std::io::Error>>>,
-            conn_bridge_rx: &'a mut Receiver<ConnBridgeMsg>,
+            conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
             handshake_handler: &'a mut HandshakeHandler,
             node_controller: &'a mut Receiver<NodeEvent>,
             client_wait_for_transaction: &'a mut ContractHandlerChannel<WaitingResolution>,
@@ -220,7 +224,7 @@ mod priority_select {
         notification_rx: &'a mut Receiver<OpManager>,
         op_execution_rx: &'a mut Receiver<OpEnum>,
         peer_connections: &'a mut SelectAll<futures::stream::BoxStream<'static, Result<ConnectionEvent, std::io::Error>>>,
-        conn_bridge_rx: &'a mut Receiver<ConnBridgeMsg>,
+        conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
         handshake_handler: &'a mut HandshakeHandler,
         node_controller: &'a mut Receiver<NodeEvent>,
         client_wait_for_transaction: &'a mut ContractHandlerChannel<WaitingResolution>,
