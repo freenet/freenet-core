@@ -1649,6 +1649,7 @@ dependencies = [
  "opentelemetry_sdk 0.31.0",
  "parking_lot",
  "pav_regression",
+ "pin-project",
  "pkcs8",
  "rand 0.9.2",
  "redb",
