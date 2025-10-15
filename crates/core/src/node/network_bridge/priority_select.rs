@@ -44,62 +44,68 @@ pub(super) enum SelectResult {
 }
 
 /// A future that polls multiple futures with explicit priority order and waker control.
-/// Uses stack-allocated futures (generic types) to avoid heap allocations.
+/// Uses pinned BoxFutures that are created once and reused across polls to maintain
+/// waker registration and future state (including handshake state machine).
 #[pin_project]
-pub(super) struct PrioritySelectFuture<
-    'a,
-    NotifFut,
-    OpExecFut,
-    ConnBridgeFut,
-    HandshakeFut,
-    NodeCtrlFut,
-    ClientTxFut,
-    ExecTxFut,
-> {
+pub(super) struct PrioritySelectFuture<'a> {
     #[pin]
-    notification_fut: NotifFut,
+    notification_fut: BoxFuture<'a, Option<Either<NetMessage, NodeEvent>>>,
     #[pin]
-    op_execution_fut: OpExecFut,
+    op_execution_fut: BoxFuture<'a, Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>>,
     #[pin]
     peer_connections:
         &'a mut FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
     #[pin]
-    conn_bridge_fut: ConnBridgeFut,
+    conn_bridge_fut: BoxFuture<'a, Option<P2pBridgeEvent>>,
     #[pin]
-    handshake_fut: HandshakeFut,
+    handshake_fut:
+        BoxFuture<'a, Result<crate::node::network_bridge::handshake::Event, HandshakeError>>,
     #[pin]
-    node_controller_fut: NodeCtrlFut,
+    node_controller_fut: BoxFuture<'a, Option<NodeEvent>>,
     #[pin]
-    client_transaction_fut: ClientTxFut,
+    client_transaction_fut: BoxFuture<
+        'a,
+        Result<
+            (
+                crate::client_events::ClientId,
+                crate::contract::WaitingTransaction,
+            ),
+            anyhow::Error,
+        >,
+    >,
     #[pin]
-    executor_transaction_fut: ExecTxFut,
+    executor_transaction_fut: BoxFuture<'a, Result<Transaction, anyhow::Error>>,
     peer_connections_empty: bool,
 }
 
-impl<'a, NotifFut, OpExecFut, ConnBridgeFut, HandshakeFut, NodeCtrlFut, ClientTxFut, ExecTxFut>
-    PrioritySelectFuture<
-        'a,
-        NotifFut,
-        OpExecFut,
-        ConnBridgeFut,
-        HandshakeFut,
-        NodeCtrlFut,
-        ClientTxFut,
-        ExecTxFut,
-    >
-{
+impl<'a> PrioritySelectFuture<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        notification_fut: NotifFut,
-        op_execution_fut: OpExecFut,
+        notification_fut: BoxFuture<'a, Option<Either<NetMessage, NodeEvent>>>,
+        op_execution_fut: BoxFuture<
+            'a,
+            Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
+        >,
         peer_connections: &'a mut FuturesUnordered<
             BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
         >,
-        conn_bridge_fut: ConnBridgeFut,
-        handshake_fut: HandshakeFut,
-        node_controller_fut: NodeCtrlFut,
-        client_transaction_fut: ClientTxFut,
-        executor_transaction_fut: ExecTxFut,
+        conn_bridge_fut: BoxFuture<'a, Option<P2pBridgeEvent>>,
+        handshake_fut: BoxFuture<
+            'a,
+            Result<crate::node::network_bridge::handshake::Event, HandshakeError>,
+        >,
+        node_controller_fut: BoxFuture<'a, Option<NodeEvent>>,
+        client_transaction_fut: BoxFuture<
+            'a,
+            Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            >,
+        >,
+        executor_transaction_fut: BoxFuture<'a, Result<Transaction, anyhow::Error>>,
     ) -> Self {
         let peer_connections_empty = peer_connections.is_empty();
 
@@ -117,36 +123,7 @@ impl<'a, NotifFut, OpExecFut, ConnBridgeFut, HandshakeFut, NodeCtrlFut, ClientTx
     }
 }
 
-impl<'a, NotifFut, OpExecFut, ConnBridgeFut, HandshakeFut, NodeCtrlFut, ClientTxFut, ExecTxFut>
-    Future
-    for PrioritySelectFuture<
-        'a,
-        NotifFut,
-        OpExecFut,
-        ConnBridgeFut,
-        HandshakeFut,
-        NodeCtrlFut,
-        ClientTxFut,
-        ExecTxFut,
-    >
-where
-    NotifFut: Future<Output = Option<Either<NetMessage, NodeEvent>>>,
-    OpExecFut: Future<Output = Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>>,
-    ConnBridgeFut: Future<Output = Option<P2pBridgeEvent>>,
-    HandshakeFut:
-        Future<Output = Result<crate::node::network_bridge::handshake::Event, HandshakeError>>,
-    NodeCtrlFut: Future<Output = Option<NodeEvent>>,
-    ClientTxFut: Future<
-        Output = Result<
-            (
-                crate::client_events::ClientId,
-                crate::contract::WaitingTransaction,
-            ),
-            anyhow::Error,
-        >,
-    >,
-    ExecTxFut: Future<Output = Result<Transaction, anyhow::Error>>,
-{
+impl<'a> Future for PrioritySelectFuture<'a> {
     type Output = SelectResult;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -251,16 +228,19 @@ pub(super) async fn select_priority<'a>(
     client_wait_for_transaction: &'a mut ContractHandlerChannel<WaitingResolution>,
     executor_listener: &'a mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
 ) -> SelectResult {
-    // Create stack-allocated futures once - they will be reused across polls
+    // Create boxed futures ONCE - they will be pinned and reused across polls.
+    // This is critical: the futures must persist across multiple poll() calls to:
+    // 1. Maintain waker registration (so the runtime can wake the task)
+    // 2. Preserve internal state (especially the handshake state machine)
     PrioritySelectFuture::new(
-        notification_rx.recv(),
-        op_execution_rx.recv(),
+        Box::pin(notification_rx.recv()),
+        Box::pin(op_execution_rx.recv()),
         peer_connections,
-        conn_bridge_rx.recv(),
-        handshake_handler.wait_for_events(),
-        node_controller.recv(),
-        client_wait_for_transaction.relay_transaction_result_to_client(),
-        executor_listener.transaction_from_executor(),
+        Box::pin(conn_bridge_rx.recv()),
+        Box::pin(handshake_handler.wait_for_events()),
+        Box::pin(node_controller.recv()),
+        Box::pin(client_wait_for_transaction.relay_transaction_result_to_client()),
+        Box::pin(executor_listener.transaction_from_executor()),
     )
     .await
 }
