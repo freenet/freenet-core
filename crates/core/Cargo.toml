@@ -41,6 +41,7 @@ itertools = "0.14"
 notify = "8"
 pav_regression = "0.5.2"
 parking_lot = "0.12"
+pin-project = "1"
 rand = { features = ["small_rng"], workspace = true }
 redb = { optional = true, version = "3" }
 serde = { features = ["derive", "rc"], workspace = true }
@@ -51,7 +52,7 @@ sqlx = { features = ["runtime-tokio-rustls", "sqlite"], optional = true, version
 stretto = { features = ["async", "sync"], version = "0.8" }
 tar = { version = "0.4" }
 thiserror = "2"
-tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process"], version = "1" }
+tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process", "tracing"], version = "1" }
 tokio-tungstenite = "0.27.0"
 tower-http = { features = ["fs", "trace"], version = "0.6" }
 ulid = { features = ["serde"], version = "1.1" }
@@ -74,6 +75,7 @@ opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"]
 
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
+console-subscriber = { version = "0.4.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["sysinfoapi"] }
@@ -101,3 +103,4 @@ trace = ["tracing-subscriber"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]
 websocket = ["axum/ws"]
 testing = ["freenet-stdlib/testing"]
+console-subscriber = ["dep:console-subscriber"]

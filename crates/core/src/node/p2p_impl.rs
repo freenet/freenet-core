@@ -193,12 +193,15 @@ impl NodeP2P {
         tokio::select!(
             r = f => {
                let Err(e) = r;
+               tracing::error!("Network event listener exited: {}", e);
                Err(e)
             }
             e = self.client_events_task => {
+                tracing::error!("Client events task exited: {:?}", e);
                 Err(e)
             }
             e = self.contract_executor_task => {
+                tracing::error!("Contract executor task exited: {:?}", e);
                 Err(e)
             }
         )

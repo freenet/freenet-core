@@ -11,7 +11,7 @@ use std::{borrow::Cow, io, net::SocketAddr};
 use futures::Future;
 use tokio::net::UdpSocket;
 
-mod connection_handler;
+pub(crate) mod connection_handler;
 mod crypto;
 mod packet_data;
 mod peer_connection;
