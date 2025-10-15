@@ -391,15 +391,21 @@ async fn report_result(
     executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
     event_listener: &mut dyn NetEventRegister,
 ) {
-    // Add UPDATE-specific debug logging at the start
+    // Log all operation result reporting
     if let Some(tx_id) = tx {
-        if matches!(tx_id.transaction_type(), TransactionType::Update) {
-            tracing::debug!("report_result called for UPDATE transaction {}", tx_id);
-        }
+        tracing::info!(
+            tx = %tx_id,
+            tx_type = ?tx_id.transaction_type(),
+            "report_result called - processing operation result"
+        );
     }
 
     match op_result {
         Ok(Some(op_res)) => {
+            tracing::info!(
+                tx = ?tx,
+                "Operation result ready - will send to result router"
+            );
             // Log specifically for UPDATE operations
             if let crate::operations::OpEnum::Update(ref update_op) = op_res {
                 tracing::debug!(
@@ -412,12 +418,17 @@ async fn report_result(
             // Send to result router
             if let Some(transaction) = tx {
                 let host_result = op_res.to_host_result();
+                tracing::info!(
+                    tx = %transaction,
+                    "Sending operation result to result router for client delivery"
+                );
                 let router_tx_clone = op_manager.result_router_tx.clone();
                 let event_notifier = op_manager.to_event_listener.clone();
 
                 // Spawn fire-and-forget task to avoid blocking report_result()
                 // while still guaranteeing message delivery
                 tokio::spawn(async move {
+                    tracing::debug!(tx = %transaction, "Sending to result router channel");
                     if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
                         tracing::error!(
                             "CRITICAL: Result router channel closed - dual-path delivery broken. \

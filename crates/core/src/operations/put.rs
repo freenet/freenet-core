@@ -569,11 +569,17 @@ impl Operation for PutOp {
                                 tx = %id,
                                 %key,
                                 this_peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
-                                "Peer completed contract value put",
+                                "Peer completed contract value put - marking as Finished",
                             );
 
                             // Mark operation as finished
                             new_state = Some(PutState::Finished { key });
+
+                            tracing::info!(
+                                tx = %id,
+                                %key,
+                                "PUT operation marked as Finished - should trigger client response",
+                            );
 
                             // Forward success message upstream if needed
                             if let Some(upstream) = upstream {
