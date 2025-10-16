@@ -1229,6 +1229,22 @@ impl P2pConnManager {
     fn handle_notification_msg(&self, msg: Option<Either<NetMessage, NodeEvent>>) -> EventResult {
         match msg {
             Some(Left(msg)) => {
+                // Check if message has a target peer - if so, route as outbound, otherwise process locally
+                if let Some(target) = msg.target() {
+                    let self_peer = self.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap();
+                    if target.peer != self_peer {
+                        // Message targets another peer - send as outbound
+                        tracing::info!(
+                            tx = %msg.id(),
+                            msg_type = %msg,
+                            target_peer = %target,
+                            "handle_notification_msg: Message has target peer, routing as OutboundMessage"
+                        );
+                        return EventResult::Event(ConnEvent::OutboundMessage(msg).into());
+                    }
+                }
+
+                // Message targets self or has no target - process locally
                 tracing::debug!(
                     tx = %msg.id(),
                     msg_type = %msg,
