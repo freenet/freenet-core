@@ -231,6 +231,12 @@ impl P2pConnManager {
                 EventResult::Event(event) => {
                     match *event {
                         ConnEvent::InboundMessage(msg) => {
+                            tracing::info!(
+                                tx = %msg.id(),
+                                msg_type = %msg,
+                                peer = %self.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                                "Received inbound message from peer - processing"
+                            );
                             self.handle_inbound_message(
                                 msg,
                                 &outbound_message,
@@ -251,11 +257,25 @@ impl P2pConnManager {
                                 self.bridge.op_manager.completed(id);
                                 continue;
                             };
-                            tracing::debug!(%target_peer, %msg, "Sending message to peer");
+                            tracing::info!(
+                                tx = %msg.id(),
+                                msg_type = %msg,
+                                target_peer = %target_peer,
+                                "Sending outbound message to peer"
+                            );
                             match self.connections.get(&target_peer.peer) {
                                 Some(peer_connection) => {
-                                    if let Err(e) = peer_connection.send(Left(msg)).await {
-                                        tracing::error!("Failed to send message to peer: {}", e);
+                                    if let Err(e) = peer_connection.send(Left(msg.clone())).await {
+                                        tracing::error!(
+                                            tx = %msg.id(),
+                                            "Failed to send message to peer: {}", e
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            tx = %msg.id(),
+                                            target_peer = %target_peer,
+                                            "Message successfully sent to peer connection"
+                                        );
                                     }
                                 }
                                 None => {
@@ -839,6 +859,14 @@ impl P2pConnManager {
         executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         state: &mut EventListenerState,
     ) {
+        tracing::info!(
+            tx = %msg.id(),
+            tx_type = ?msg.id().transaction_type(),
+            msg_type = %msg,
+            peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
+            "process_message called - processing network message"
+        );
+
         let executor_callback = state
             .pending_from_executor
             .remove(msg.id())
