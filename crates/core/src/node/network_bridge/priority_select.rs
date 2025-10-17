@@ -1182,8 +1182,14 @@ mod tests {
             bridge_rx,
             MockHandshake,
             node_rx,
-            MockClient { rx: client_rx, closed: false },
-            MockExecutor { rx: executor_rx, closed: false },
+            MockClient {
+                rx: client_rx,
+                closed: false,
+            },
+            MockExecutor {
+                rx: executor_rx,
+                closed: false,
+            },
             peers,
         );
         tokio::pin!(stream);
@@ -1567,8 +1573,14 @@ mod tests {
             bridge_rx,
             MockHandshake,
             node_rx,
-            MockClient { rx: client_rx, closed: false },
-            MockExecutor { rx: executor_rx, closed: false },
+            MockClient {
+                rx: client_rx,
+                closed: false,
+            },
+            MockExecutor {
+                rx: executor_rx,
+                closed: false,
+            },
             peers,
         );
         tokio::pin!(stream);
@@ -2087,9 +2099,11 @@ mod tests {
         }
 
         assert_eq!(
-            received.len(), 3,
+            received.len(),
+            3,
             "Stream with NESTED select should receive all messages! Got {} messages: {:?}",
-            received.len(), received
+            received.len(),
+            received
         );
 
         let final_counter = *counter.lock().unwrap();
@@ -2198,7 +2212,11 @@ mod tests {
                     if !msg.contains("closed") {
                         received.push(msg);
                         if received.len() % 100 == 0 {
-                            tracing::info!("Received {} of {} messages", received.len(), MESSAGE_COUNT);
+                            tracing::info!(
+                                "Received {} of {} messages",
+                                received.len(),
+                                MESSAGE_COUNT
+                            );
                         }
                     }
                     if received.len() >= MESSAGE_COUNT {
@@ -2207,7 +2225,11 @@ mod tests {
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    tracing::info!("Timeout on iteration {} after receiving {} messages", iteration, received.len());
+                    tracing::info!(
+                        "Timeout on iteration {} after receiving {} messages",
+                        iteration,
+                        received.len()
+                    );
                     break;
                 }
             }
@@ -2222,7 +2244,8 @@ mod tests {
         );
 
         tracing::info!("✅ SUCCESS: All {} rapid messages received!", MESSAGE_COUNT);
-        tracing::info!("✅ Nested select with stream maintains waker registration under high concurrent load!");
+        tracing::info!(
+            "✅ Nested select with stream maintains waker registration under high concurrent load!"
+        );
     }
-
 }
