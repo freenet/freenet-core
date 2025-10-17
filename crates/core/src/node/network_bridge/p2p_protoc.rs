@@ -389,7 +389,9 @@ impl P2pConnManager {
                             match reason {
                                 ChannelCloseReason::Handshake
                                 | ChannelCloseReason::Bridge
-                                | ChannelCloseReason::Controller => {
+                                | ChannelCloseReason::Controller
+                                | ChannelCloseReason::Notification
+                                | ChannelCloseReason::OpExecution => {
                                     // All ClosedChannel events are critical - the transport is unable to establish
                                     // more connections, rendering this peer useless. Perform cleanup and shutdown.
                                     tracing::error!(
@@ -1300,7 +1302,9 @@ impl P2pConnManager {
                 tracing::debug!("handle_notification_msg: Received NodeEvent notification");
                 EventResult::Event(ConnEvent::NodeAction(action).into())
             }
-            None => EventResult::Continue,
+            None => {
+                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Notification).into())
+            }
         }
     }
 
@@ -1314,7 +1318,9 @@ impl P2pConnManager {
                 state.pending_op_results.insert(*msg.id(), callback);
                 EventResult::Event(ConnEvent::InboundMessage(msg).into())
             }
-            _ => EventResult::Continue,
+            None => {
+                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::OpExecution).into())
+            }
         }
     }
 
@@ -1474,6 +1480,10 @@ pub(super) enum ChannelCloseReason {
     Bridge,
     /// Node controller channel closed - critical, must shutdown gracefully
     Controller,
+    /// Notification channel closed - critical, must shutdown gracefully
+    Notification,
+    /// Op execution channel closed - critical, must shutdown gracefully
+    OpExecution,
 }
 
 #[allow(dead_code)]
