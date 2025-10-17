@@ -166,63 +166,118 @@ impl P2pConnManager {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.connection_manager.pub_key), skip_all)]
     pub async fn run_event_listener(
-        mut self,
+        self,
         op_manager: Arc<OpManager>,
-        mut client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
-        mut notification_channel: EventLoopNotificationsReceiver,
-        mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-        mut node_controller: Receiver<NodeEvent>,
+        client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
+        notification_channel: EventLoopNotificationsReceiver,
+        executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+        node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
+        // Destructure self to avoid partial move issues
+        let P2pConnManager {
+            gateways,
+            bridge,
+            conn_bridge_rx,
+            event_listener,
+            connections,
+            key_pair,
+            listening_ip,
+            listening_port,
+            is_gateway,
+            this_location,
+            check_version,
+            bandwidth_limit,
+            blocked_addresses,
+            message_processor,
+        } = self;
+
         tracing::info!(
-            %self.listening_port,
-            %self.listening_ip,
-            %self.is_gateway,
-            key = %self.key_pair.public(),
+            %listening_port,
+            %listening_ip,
+            %is_gateway,
+            key = %key_pair.public(),
             "Opening network listener - will receive from channel"
         );
 
         let mut state = EventListenerState::new();
 
+        // Separate peer_connections to allow independent borrowing by the stream
+        let peer_connections: FuturesUnordered<
+            BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
+        > = FuturesUnordered::new();
+
         let (outbound_conn_handler, inbound_conn_handler) = create_connection_handler::<UdpSocket>(
-            self.key_pair.clone(),
-            self.listening_ip,
-            self.listening_port,
-            self.is_gateway,
-            self.bandwidth_limit,
+            key_pair.clone(),
+            listening_ip,
+            listening_port,
+            is_gateway,
+            bandwidth_limit,
         )
         .await?;
 
         // For non-gateway peers, pass the peer_ready flag so it can be set after first handshake
         // For gateways, pass None (they're always ready)
-        let peer_ready = if !self.is_gateway {
-            Some(self.bridge.op_manager.peer_ready.clone())
+        let peer_ready = if !is_gateway {
+            Some(bridge.op_manager.peer_ready.clone())
         } else {
             None
         };
 
-        let (mut handshake_handler, handshake_handler_msg, outbound_message) =
-            HandshakeHandler::new(
-                inbound_conn_handler,
-                outbound_conn_handler.clone(),
-                self.bridge.op_manager.ring.connection_manager.clone(),
-                self.bridge.op_manager.ring.router.clone(),
-                self.this_location,
-                self.is_gateway,
-                peer_ready,
-            );
+        let (handshake_handler, handshake_handler_msg, outbound_message) = HandshakeHandler::new(
+            inbound_conn_handler,
+            outbound_conn_handler.clone(),
+            bridge.op_manager.ring.connection_manager.clone(),
+            bridge.op_manager.ring.router.clone(),
+            this_location,
+            is_gateway,
+            peer_ready,
+        );
 
-        loop {
-            // Use custom priority select combinator for explicit waker control
-            // This fixes waker registration issues that occurred with nested tokio::select!
-            let event = self
-                .wait_for_event(
+        // Create priority select stream ONCE by moving ownership - it stays alive across iterations.
+        // This fixes the lost wakeup race condition (issue #1932).
+        let select_stream = priority_select::ProductionPrioritySelectStream::new(
+            notification_channel.notifications_receiver,
+            notification_channel.op_execution_receiver,
+            conn_bridge_rx,
+            handshake_handler,
+            node_controller,
+            client_wait_for_transaction,
+            executor_listener,
+            peer_connections,
+        );
+
+        // Pin the stream on the stack
+        tokio::pin!(select_stream);
+
+        // Reconstruct a P2pConnManager-like structure for use in the loop
+        // We can't use the original self because we moved conn_bridge_rx
+        let mut ctx = P2pConnManager {
+            gateways,
+            bridge,
+            conn_bridge_rx: tokio::sync::mpsc::channel(1).1, // Dummy, won't be used
+            event_listener,
+            connections,
+            key_pair,
+            listening_ip,
+            listening_port,
+            is_gateway,
+            this_location,
+            check_version,
+            bandwidth_limit,
+            blocked_addresses,
+            message_processor,
+        };
+
+        use futures::StreamExt;
+
+        while let Some(result) = select_stream.as_mut().next().await {
+            // Process the result using the existing handler
+            let event = ctx
+                .process_select_result(
+                    result,
                     &mut state,
-                    &mut handshake_handler,
+                    &mut select_stream,
                     &handshake_handler_msg,
-                    &mut notification_channel,
-                    &mut node_controller,
-                    &mut client_wait_for_transaction,
-                    &mut executor_listener,
                 )
                 .await?;
 
@@ -234,15 +289,14 @@ impl P2pConnManager {
                             tracing::info!(
                                 tx = %msg.id(),
                                 msg_type = %msg,
-                                peer = %self.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                                peer = %ctx.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap(),
                                 "Received inbound message from peer - processing"
                             );
-                            self.handle_inbound_message(
+                            ctx.handle_inbound_message(
                                 msg,
                                 &outbound_message,
                                 &op_manager,
                                 &mut state,
-                                &executor_listener,
                             )
                             .await?;
                         }
@@ -254,7 +308,7 @@ impl P2pConnManager {
                             let Some(target_peer) = msg.target() else {
                                 let id = *msg.id();
                                 tracing::error!(%id, %msg, "Target peer not set, must be set for connection outbound message");
-                                self.bridge.op_manager.completed(id);
+                                ctx.bridge.op_manager.completed(id);
                                 continue;
                             };
                             tracing::info!(
@@ -263,7 +317,7 @@ impl P2pConnManager {
                                 target_peer = %target_peer,
                                 "Sending outbound message to peer"
                             );
-                            match self.connections.get(&target_peer.peer) {
+                            match ctx.connections.get(&target_peer.peer) {
                                 Some(peer_connection) => {
                                     if let Err(e) = peer_connection.send(Left(msg.clone())).await {
                                         tracing::error!(
@@ -290,7 +344,7 @@ impl P2pConnManager {
                                     let (callback, mut result) = tokio::sync::mpsc::channel(10);
 
                                     // Initiate connection to the peer
-                                    self.bridge
+                                    ctx.bridge
                                         .ev_listener_tx
                                         .send(Right(NodeEvent::ConnectPeer {
                                             peer: target_peer.peer.clone(),
@@ -305,7 +359,7 @@ impl P2pConnManager {
                                         Ok(Some(Ok(_))) => {
                                             // Connection established, try sending again
                                             if let Some(peer_connection) =
-                                                self.connections.get(&target_peer.peer)
+                                                ctx.connections.get(&target_peer.peer)
                                             {
                                                 if let Err(e) =
                                                     peer_connection.send(Left(msg)).await
@@ -340,26 +394,26 @@ impl P2pConnManager {
                                     // more connections, rendering this peer useless. Perform cleanup and shutdown.
                                     tracing::error!(
                                         ?reason,
-                                        is_gateway = self.bridge.op_manager.ring.is_gateway(),
-                                        num_connections = self.connections.len(),
+                                        is_gateway = ctx.bridge.op_manager.ring.is_gateway(),
+                                        num_connections = ctx.connections.len(),
                                         "Critical channel closed - performing cleanup and shutting down"
                                     );
 
                                     // Clean up all active connections
                                     let peers_to_cleanup: Vec<_> =
-                                        self.connections.keys().cloned().collect();
+                                        ctx.connections.keys().cloned().collect();
                                     for peer in peers_to_cleanup {
                                         tracing::debug!(%peer, "Cleaning up active connection due to critical channel closure");
 
                                         // Clean up ring state
-                                        self.bridge
+                                        ctx.bridge
                                             .op_manager
                                             .ring
                                             .prune_connection(peer.clone())
                                             .await;
 
                                         // Remove from connection map
-                                        self.connections.remove(&peer);
+                                        ctx.connections.remove(&peer);
 
                                         // Notify handshake handler to clean up
                                         if let Err(e) = handshake_handler_msg
@@ -395,7 +449,7 @@ impl P2pConnManager {
                         ConnEvent::NodeAction(action) => match action {
                             NodeEvent::DropConnection(peer) => {
                                 tracing::debug!(%peer, "Dropping connection");
-                                if let Some(conn) = self.connections.remove(&peer) {
+                                if let Some(conn) = ctx.connections.remove(&peer) {
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     timeout(
                                         Duration::from_secs(1),
@@ -420,7 +474,7 @@ impl P2pConnManager {
                                 callback,
                                 is_gw,
                             } => {
-                                self.handle_connect_peer(
+                                ctx.handle_connect_peer(
                                     peer,
                                     Box::new(callback),
                                     tx,
@@ -437,10 +491,10 @@ impl P2pConnManager {
                                     %target,
                                     "SendMessage event: sending message to peer via network bridge"
                                 );
-                                self.bridge.send(&target, *msg).await?;
+                                ctx.bridge.send(&target, *msg).await?;
                             }
                             NodeEvent::QueryConnections { callback } => {
-                                let connections = self.connections.keys().cloned().collect();
+                                let connections = ctx.connections.keys().cloned().collect();
                                 timeout(
                                     Duration::from_secs(1),
                                     callback.send(QueryResult::Connections(connections)),
@@ -487,7 +541,7 @@ impl P2pConnManager {
                                     }
                                 }
 
-                                let connections = self.connections.keys().cloned().collect();
+                                let connections = ctx.connections.keys().cloned().collect();
                                 let debug_info = crate::message::NetworkDebugInfo {
                                     application_subscriptions: app_subscriptions,
                                     network_subscriptions: network_subs,
@@ -536,7 +590,7 @@ impl P2pConnManager {
 
                                     // Always include basic node info, but only include address/location if available
                                     response.node_info = Some(NodeInfo {
-                                        peer_id: self.key_pair.public().to_string(),
+                                        peer_id: ctx.key_pair.public().to_string(),
                                         is_gateway: self.is_gateway,
                                         location: location.map(|loc| format!("{:.6}", loc.0)),
                                         listening_address: addr
@@ -547,7 +601,7 @@ impl P2pConnManager {
 
                                 // Collect network information
                                 if config.include_network_info {
-                                    let connected_peers: Vec<_> = self
+                                    let connected_peers: Vec<_> = ctx
                                         .connections
                                         .keys()
                                         .map(|p| (p.to_string(), p.addr.to_string()))
@@ -555,7 +609,7 @@ impl P2pConnManager {
 
                                     response.network_info = Some(NetworkInfo {
                                         connected_peers,
-                                        active_connections: self.connections.len(),
+                                        active_connections: ctx.connections.len(),
                                     });
                                 }
 
@@ -639,7 +693,7 @@ impl P2pConnManager {
                                     let seeding_contracts =
                                         op_manager.ring.all_network_subscriptions().len() as u32;
                                     response.system_metrics = Some(SystemMetrics {
-                                        active_connections: self.connections.len() as u32,
+                                        active_connections: ctx.connections.len() as u32,
                                         seeding_contracts,
                                     });
                                 }
@@ -648,7 +702,7 @@ impl P2pConnManager {
                                 if config.include_detailed_peer_info {
                                     use freenet_stdlib::client_api::ConnectedPeerInfo;
                                     // Populate detailed peer information from actual connections
-                                    for peer in self.connections.keys() {
+                                    for peer in ctx.connections.keys() {
                                         response.connected_peers_detailed.push(ConnectedPeerInfo {
                                             peer_id: peer.to_string(),
                                             address: peer.addr.to_string(),
@@ -714,42 +768,18 @@ impl P2pConnManager {
                 }
             }
         }
-        Err(anyhow::anyhow!(
-            "Network event listener exited unexpectedly"
-        ))
+        Err(anyhow::anyhow!("Network event stream ended unexpectedly"))
     }
 
-    /// Wait for next event using custom priority select combinator.
-    /// This implementation uses explicit waker control to fix waker registration issues.
-    #[allow(clippy::too_many_arguments)]
-    async fn wait_for_event(
+    /// Process a SelectResult from the priority select stream
+    async fn process_select_result(
         &mut self,
+        result: priority_select::SelectResult,
         state: &mut EventListenerState,
-        handshake_handler: &mut HandshakeHandler,
+        select_stream: &mut priority_select::ProductionPrioritySelectStream,
         handshake_handler_msg: &HanshakeHandlerMsg,
-        notification_channel: &mut EventLoopNotificationsReceiver,
-        node_controller: &mut Receiver<NodeEvent>,
-        client_wait_for_transaction: &mut ContractHandlerChannel<WaitingResolution>,
-        executor_listener: &mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     ) -> anyhow::Result<EventResult> {
         let peer_id = &self.bridge.op_manager.ring.connection_manager.pub_key;
-
-        tracing::debug!(
-            peer = %peer_id,
-            "wait_for_event: using custom priority select combinator"
-        );
-
-        let result = priority_select::select_priority(
-            &mut notification_channel.notifications_receiver,
-            &mut notification_channel.op_execution_receiver,
-            &mut state.peer_connections,
-            &mut self.conn_bridge_rx,
-            handshake_handler,
-            node_controller,
-            client_wait_for_transaction,
-            executor_listener,
-        )
-        .await;
 
         use priority_select::SelectResult;
         match result {
@@ -771,10 +801,9 @@ impl P2pConnManager {
             SelectResult::PeerConnection(msg) => {
                 tracing::debug!(
                     peer = %peer_id,
-                    num_connections = state.peer_connections.len(),
                     "PrioritySelect: peer_connections READY"
                 );
-                self.handle_peer_connection_msg(msg, state, handshake_handler_msg)
+                self.handle_peer_connection_msg(msg, state, select_stream, handshake_handler_msg)
                     .await
             }
             SelectResult::ConnBridge(msg) => {
@@ -791,8 +820,13 @@ impl P2pConnManager {
                 );
                 match result {
                     Ok(event) => {
-                        self.handle_handshake_action(event, state, handshake_handler_msg)
-                            .await?;
+                        self.handle_handshake_action(
+                            event,
+                            state,
+                            select_stream,
+                            handshake_handler_msg,
+                        )
+                        .await?;
                         Ok(EventResult::Continue)
                     }
                     Err(handshake_error) => {
@@ -833,7 +867,6 @@ impl P2pConnManager {
         outbound_message: &OutboundMessage,
         op_manager: &Arc<OpManager>,
         state: &mut EventListenerState,
-        executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     ) -> anyhow::Result<()> {
         match msg {
             NetMessage::V1(NetMessageV1::Aborted(tx)) => {
@@ -844,8 +877,7 @@ impl P2pConnManager {
                     // Forward message to transient joiner
                     outbound_message.send_to(*addr, msg).await?;
                 } else {
-                    self.process_message(msg, op_manager, executor_listener, state)
-                        .await;
+                    self.process_message(msg, op_manager, None, state).await;
                 }
             }
         }
@@ -856,7 +888,7 @@ impl P2pConnManager {
         &self,
         msg: NetMessage,
         op_manager: &Arc<OpManager>,
-        executor_listener: &ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+        executor_callback_opt: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
         state: &mut EventListenerState,
     ) {
         tracing::info!(
@@ -867,10 +899,12 @@ impl P2pConnManager {
             "process_message called - processing network message"
         );
 
-        let executor_callback = state
-            .pending_from_executor
-            .remove(msg.id())
-            .then(|| executor_listener.callback());
+        // Only use the callback if this message was initiated by the executor
+        let executor_callback_opt = if state.pending_from_executor.remove(msg.id()) {
+            executor_callback_opt
+        } else {
+            None
+        };
 
         let span = tracing::info_span!(
             "process_network_message",
@@ -891,7 +925,7 @@ impl P2pConnManager {
                 op_manager.clone(),
                 self.bridge.clone(),
                 self.event_listener.trait_clone(),
-                executor_callback,
+                executor_callback_opt,
                 self.message_processor.clone(),
                 pending_op_result,
             )
@@ -951,6 +985,7 @@ impl P2pConnManager {
         &mut self,
         event: HandshakeEvent,
         state: &mut EventListenerState,
+        select_stream: &mut priority_select::ProductionPrioritySelectStream,
         _handshake_handler_msg: &HanshakeHandlerMsg, // Parameter added
     ) -> anyhow::Result<()> {
         match event {
@@ -1007,7 +1042,7 @@ impl P2pConnManager {
                         .await?;
                 }
                 let task = peer_connection_listener(rx, conn).boxed();
-                state.peer_connections.push(task);
+                select_stream.push_peer_connection(task);
 
                 if let Some(ForwardInfo {
                     target: forward_to,
@@ -1040,7 +1075,7 @@ impl P2pConnManager {
                 peer_id,
                 connection,
             } => {
-                self.handle_successful_connection(peer_id, connection, state, None)
+                self.handle_successful_connection(peer_id, connection, state, select_stream, None)
                     .await?;
             }
             HandshakeEvent::OutboundGatewayConnectionSuccessful {
@@ -1052,6 +1087,7 @@ impl P2pConnManager {
                     peer_id,
                     connection,
                     state,
+                    select_stream,
                     Some(remaining_checks),
                 )
                 .await?;
@@ -1118,6 +1154,7 @@ impl P2pConnManager {
         peer_id: PeerId,
         connection: PeerConnection,
         state: &mut EventListenerState,
+        select_stream: &mut priority_select::ProductionPrioritySelectStream,
         remaining_checks: Option<usize>,
     ) -> anyhow::Result<()> {
         if let Some(mut cb) = state.awaiting_connection.remove(&peer_id.addr) {
@@ -1150,7 +1187,7 @@ impl P2pConnManager {
         let (tx, rx) = mpsc::channel(10);
         self.connections.insert(peer_id.clone(), tx);
         let task = peer_connection_listener(rx, connection).boxed();
-        state.peer_connections.push(task);
+        select_stream.push_peer_connection(task);
         Ok(())
     }
 
@@ -1158,6 +1195,7 @@ impl P2pConnManager {
         &mut self,
         msg: Option<Result<PeerConnectionInbound, TransportError>>,
         state: &mut EventListenerState,
+        select_stream: &mut priority_select::ProductionPrioritySelectStream,
         handshake_handler_msg: &HanshakeHandlerMsg,
     ) -> anyhow::Result<EventResult> {
         match msg {
@@ -1195,7 +1233,7 @@ impl P2pConnManager {
                 }
 
                 let task = peer_connection_listener(peer_conn.rx, peer_conn.conn).boxed();
-                state.peer_connections.push(task);
+                select_stream.push_peer_connection(task);
                 Ok(EventResult::Event(
                     ConnEvent::InboundMessage(peer_conn.msg).into(),
                 ))
@@ -1231,7 +1269,13 @@ impl P2pConnManager {
             Some(Left(msg)) => {
                 // Check if message has a target peer - if so, route as outbound, otherwise process locally
                 if let Some(target) = msg.target() {
-                    let self_peer = self.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap();
+                    let self_peer = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_key()
+                        .unwrap();
                     if target.peer != self_peer {
                         // Message targets another peer - send as outbound
                         tracing::info!(
@@ -1386,8 +1430,7 @@ impl ConnectResultSender for mpsc::Sender<Result<(PeerId, Option<usize>), ()>> {
 }
 
 struct EventListenerState {
-    peer_connections:
-        FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
+    // Note: peer_connections has been moved out to allow separate borrowing by the stream
     pending_from_executor: HashSet<Transaction>,
     // FIXME: we are potentially leaving trash here when transacrions are completed
     tx_to_client: HashMap<Transaction, HashSet<ClientId>>,
@@ -1400,7 +1443,6 @@ struct EventListenerState {
 impl EventListenerState {
     fn new() -> Self {
         Self {
-            peer_connections: FuturesUnordered::new(),
             pending_from_executor: HashSet::new(),
             tx_to_client: HashMap::new(),
             client_waiting_transaction: Vec::new(),
@@ -1442,6 +1484,7 @@ enum ProtocolStatus {
     Failed,
 }
 
+#[derive(Debug)]
 pub(super) struct PeerConnectionInbound {
     pub conn: PeerConnection,
     /// Receiver for inbound messages for the peer connection

@@ -2,9 +2,7 @@
 //! This avoids waker registration issues that can occur with nested tokio::select! macros.
 
 use either::Either;
-use futures::future::BoxFuture;
-use futures::stream::{FuturesUnordered, Stream};
-use pin_project::pin_project;
+use futures::{future::BoxFuture, stream::FuturesUnordered, Stream};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -24,6 +22,7 @@ use crate::transport::TransportError;
 pub type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub(super) enum SelectResult {
     Notification(Option<Either<NetMessage, NodeEvent>>),
     OpExecution(Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>),
@@ -43,231 +42,287 @@ pub(super) enum SelectResult {
     ExecutorTransaction(Result<Transaction, anyhow::Error>),
 }
 
-/// A future that polls multiple futures with explicit priority order and waker control.
-/// Uses pinned BoxFutures that are created once and reused across polls to maintain
-/// waker registration and future state (including handshake state machine).
-#[pin_project]
-pub(super) struct PrioritySelectFuture<'a> {
-    #[pin]
-    notification_fut: BoxFuture<'a, Option<Either<NetMessage, NodeEvent>>>,
-    #[pin]
-    op_execution_fut: BoxFuture<'a, Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>>,
-    #[pin]
-    peer_connections:
-        &'a mut FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
-    #[pin]
-    conn_bridge_fut: BoxFuture<'a, Option<P2pBridgeEvent>>,
-    #[pin]
-    handshake_fut:
-        BoxFuture<'a, Result<crate::node::network_bridge::handshake::Event, HandshakeError>>,
-    #[pin]
-    node_controller_fut: BoxFuture<'a, Option<NodeEvent>>,
-    #[pin]
-    client_transaction_fut: BoxFuture<
-        'a,
-        Result<
+/// Trait for types that can provide handshake events
+pub(super) trait HandshakeEventProvider: Send + Unpin {
+    fn wait_for_events(
+        &mut self,
+    ) -> impl Future<Output = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Send;
+}
+
+/// Trait for types that can relay client transaction results
+pub(super) trait ClientTransactionRelay: Send + Unpin {
+    fn relay_transaction_result_to_client(
+        &mut self,
+    ) -> impl Future<
+        Output = Result<
             (
                 crate::client_events::ClientId,
                 crate::contract::WaitingTransaction,
             ),
             anyhow::Error,
         >,
-    >,
-    #[pin]
-    executor_transaction_fut: BoxFuture<'a, Result<Transaction, anyhow::Error>>,
-    peer_connections_empty: bool,
+    > + Send;
 }
 
-impl<'a> PrioritySelectFuture<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        notification_fut: BoxFuture<'a, Option<Either<NetMessage, NodeEvent>>>,
-        op_execution_fut: BoxFuture<
-            'a,
-            Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
-        >,
-        peer_connections: &'a mut FuturesUnordered<
-            BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
-        >,
-        conn_bridge_fut: BoxFuture<'a, Option<P2pBridgeEvent>>,
-        handshake_fut: BoxFuture<
-            'a,
-            Result<crate::node::network_bridge::handshake::Event, HandshakeError>,
-        >,
-        node_controller_fut: BoxFuture<'a, Option<NodeEvent>>,
-        client_transaction_fut: BoxFuture<
-            'a,
-            Result<
-                (
-                    crate::client_events::ClientId,
-                    crate::contract::WaitingTransaction,
-                ),
-                anyhow::Error,
-            >,
-        >,
-        executor_transaction_fut: BoxFuture<'a, Result<Transaction, anyhow::Error>>,
-    ) -> Self {
-        let peer_connections_empty = peer_connections.is_empty();
+/// Trait for types that can receive transactions from executor
+pub(super) trait ExecutorTransactionReceiver: Send + Unpin {
+    fn transaction_from_executor(
+        &mut self,
+    ) -> impl Future<Output = anyhow::Result<Transaction>> + Send;
+}
 
-        Self {
-            notification_fut,
-            op_execution_fut,
-            peer_connections,
-            conn_bridge_fut,
-            handshake_fut,
-            node_controller_fut,
-            client_transaction_fut,
-            executor_transaction_fut,
-            peer_connections_empty,
-        }
+// Implementations for production types
+impl HandshakeEventProvider for HandshakeHandler {
+    fn wait_for_events(
+        &mut self,
+    ) -> impl Future<Output = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Send
+    {
+        self.wait_for_events()
     }
 }
 
-impl<'a> Future for PrioritySelectFuture<'a> {
-    type Output = SelectResult;
+impl ClientTransactionRelay for ContractHandlerChannel<WaitingResolution> {
+    fn relay_transaction_result_to_client(
+        &mut self,
+    ) -> impl Future<
+        Output = Result<
+            (
+                crate::client_events::ClientId,
+                crate::contract::WaitingTransaction,
+            ),
+            anyhow::Error,
+        >,
+    > + Send {
+        self.relay_transaction_result_to_client()
+    }
+}
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
+impl ExecutorTransactionReceiver for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
+    fn transaction_from_executor(
+        &mut self,
+    ) -> impl Future<Output = anyhow::Result<Transaction>> + Send {
+        self.transaction_from_executor()
+    }
+}
+
+/// Type alias for the production PrioritySelectStream with concrete types
+pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
+    HandshakeHandler,
+    ContractHandlerChannel<WaitingResolution>,
+    ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+>;
+
+/// Generic stream-based priority select that owns simple Receivers as streams
+/// and holds references to complex event sources.
+/// This fixes the lost wakeup race condition (issue #1932) by keeping the stream
+/// alive across loop iterations, maintaining waker registration.
+pub(super) struct PrioritySelectStream<H, C, E>
+where
+    H: HandshakeEventProvider,
+    C: ClientTransactionRelay,
+    E: ExecutorTransactionReceiver,
+{
+    // Streams created from owned receivers
+    notification: tokio_stream::wrappers::ReceiverStream<Either<NetMessage, NodeEvent>>,
+    op_execution:
+        tokio_stream::wrappers::ReceiverStream<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
+    conn_bridge: tokio_stream::wrappers::ReceiverStream<P2pBridgeEvent>,
+    node_controller: tokio_stream::wrappers::ReceiverStream<NodeEvent>,
+
+    // FuturesUnordered already implements Stream (owned)
+    peer_connections:
+        FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
+
+    // These three are owned and we create futures from them that poll their internal state
+    // Now generic to allow testing with mocks
+    handshake_handler: H,
+    client_wait_for_transaction: C,
+    executor_listener: E,
+}
+
+impl<H, C, E> PrioritySelectStream<H, C, E>
+where
+    H: HandshakeEventProvider,
+    C: ClientTransactionRelay,
+    E: ExecutorTransactionReceiver,
+{
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        notification_rx: Receiver<Either<NetMessage, NodeEvent>>,
+        op_execution_rx: Receiver<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
+        conn_bridge_rx: Receiver<P2pBridgeEvent>,
+        handshake_handler: H,
+        node_controller: Receiver<NodeEvent>,
+        client_wait_for_transaction: C,
+        executor_listener: E,
+        peer_connections: FuturesUnordered<
+            BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
+        >,
+    ) -> Self {
+        use tokio_stream::wrappers::ReceiverStream;
+
+        Self {
+            notification: ReceiverStream::new(notification_rx),
+            op_execution: ReceiverStream::new(op_execution_rx),
+            conn_bridge: ReceiverStream::new(conn_bridge_rx),
+            node_controller: ReceiverStream::new(node_controller),
+            peer_connections,
+            handshake_handler,
+            client_wait_for_transaction,
+            executor_listener,
+        }
+    }
+
+    /// Add a new peer connection task to the stream
+    pub fn push_peer_connection(
+        &mut self,
+        task: BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
+    ) {
+        self.peer_connections.push(task);
+    }
+}
+
+impl<H, C, E> Stream for PrioritySelectStream<H, C, E>
+where
+    H: HandshakeEventProvider,
+    C: ClientTransactionRelay,
+    E: ExecutorTransactionReceiver,
+{
+    type Item = SelectResult;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
 
         // Priority 1: Notification channel (highest priority)
-        // This MUST be polled first to ensure operation state machine messages
-        // are processed before network messages
-        tracing::trace!("PrioritySelect: polling notification_rx");
-        match this.notification_fut.as_mut().poll(cx) {
-            Poll::Ready(msg) => {
-                tracing::trace!(
-                    "PrioritySelect: notification_rx READY with message: {:?}",
-                    msg.is_some()
-                );
-                return Poll::Ready(SelectResult::Notification(msg));
+        match Pin::new(&mut this.notification).poll_next(cx) {
+            Poll::Ready(Some(msg)) => {
+                return Poll::Ready(Some(SelectResult::Notification(Some(msg))))
             }
-            Poll::Pending => {
-                tracing::trace!("PrioritySelect: notification_rx pending");
-            }
+            Poll::Ready(None) => {} // Channel closed
+            Poll::Pending => {}
         }
 
-        // Priority 2: Op execution channel
-        match this.op_execution_fut.as_mut().poll(cx) {
-            Poll::Ready(msg) => {
-                tracing::trace!("PrioritySelect: op_execution_rx ready");
-                return Poll::Ready(SelectResult::OpExecution(msg));
+        // Priority 2: Op execution
+        match Pin::new(&mut this.op_execution).poll_next(cx) {
+            Poll::Ready(Some(msg)) => {
+                return Poll::Ready(Some(SelectResult::OpExecution(Some(msg))))
             }
+            Poll::Ready(None) => {}
             Poll::Pending => {}
         }
 
         // Priority 3: Peer connections (only if not empty)
-        if !*this.peer_connections_empty {
-            match Stream::poll_next(this.peer_connections.as_mut(), cx) {
-                Poll::Ready(msg) => {
-                    tracing::trace!("PrioritySelect: peer_connections ready");
-                    return Poll::Ready(SelectResult::PeerConnection(msg));
-                }
+        if !this.peer_connections.is_empty() {
+            match Pin::new(&mut this.peer_connections).poll_next(cx) {
+                Poll::Ready(msg) => return Poll::Ready(Some(SelectResult::PeerConnection(msg))),
                 Poll::Pending => {}
             }
         }
 
         // Priority 4: Connection bridge
-        match this.conn_bridge_fut.as_mut().poll(cx) {
-            Poll::Ready(msg) => {
-                tracing::trace!("PrioritySelect: conn_bridge_rx ready");
-                return Poll::Ready(SelectResult::ConnBridge(msg));
+        match Pin::new(&mut this.conn_bridge).poll_next(cx) {
+            Poll::Ready(Some(msg)) => {
+                return Poll::Ready(Some(SelectResult::ConnBridge(Some(msg))))
             }
+            Poll::Ready(None) => {}
             Poll::Pending => {}
         }
 
-        // Priority 5: Handshake handler (poll wait_for_events as a whole to preserve all logic)
-        // The handshake future is pinned in the struct and reused across polls,
-        // preserving the internal state machine of wait_for_events()
-        match this.handshake_fut.as_mut().poll(cx) {
+        // Priority 5: Handshake handler
+        // Poll the wait_for_events future directly - create it inline
+        let handshake_fut = this.handshake_handler.wait_for_events();
+        tokio::pin!(handshake_fut);
+        match handshake_fut.poll(cx) {
+            Poll::Ready(result) => return Poll::Ready(Some(SelectResult::Handshake(result))),
+            Poll::Pending => {}
+        }
+
+        // Priority 6: Node controller
+        match Pin::new(&mut this.node_controller).poll_next(cx) {
+            Poll::Ready(Some(msg)) => {
+                return Poll::Ready(Some(SelectResult::NodeController(Some(msg))))
+            }
+            Poll::Ready(None) => {}
+            Poll::Pending => {}
+        }
+
+        // Priority 7: Client transaction
+        let client_fut = this
+            .client_wait_for_transaction
+            .relay_transaction_result_to_client();
+        tokio::pin!(client_fut);
+        match client_fut.poll(cx) {
             Poll::Ready(result) => {
-                tracing::trace!("PrioritySelect: handshake_handler ready");
-                return Poll::Ready(SelectResult::Handshake(result));
+                return Poll::Ready(Some(SelectResult::ClientTransaction(result)))
             }
             Poll::Pending => {}
         }
 
-        // Priority 8: Node controller
-        match this.node_controller_fut.as_mut().poll(cx) {
-            Poll::Ready(msg) => {
-                tracing::trace!("PrioritySelect: node_controller ready");
-                return Poll::Ready(SelectResult::NodeController(msg));
+        // Priority 8: Executor transaction
+        let executor_fut = this.executor_listener.transaction_from_executor();
+        tokio::pin!(executor_fut);
+        match executor_fut.poll(cx) {
+            Poll::Ready(result) => {
+                return Poll::Ready(Some(SelectResult::ExecutorTransaction(result)))
             }
             Poll::Pending => {}
         }
 
-        // Priority 9: Client transaction waiting
-        match this.client_transaction_fut.as_mut().poll(cx) {
-            Poll::Ready(event_id) => {
-                tracing::trace!("PrioritySelect: client_wait_for_transaction ready");
-                return Poll::Ready(SelectResult::ClientTransaction(event_id));
-            }
-            Poll::Pending => {}
-        }
-
-        // Priority 10: Executor transaction
-        match this.executor_transaction_fut.as_mut().poll(cx) {
-            Poll::Ready(id) => {
-                tracing::trace!("PrioritySelect: executor_listener ready");
-                return Poll::Ready(SelectResult::ExecutorTransaction(id));
-            }
-            Poll::Pending => {}
-        }
-
-        // All futures returned Pending - wakers are now registered for all of them
-        // The key difference from the broken implementation: these are the SAME futures
-        // being polled repeatedly, so their wakers persist and internal state is preserved
-        tracing::trace!("PrioritySelect: all pending");
+        // All pending
         Poll::Pending
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn select_priority<'a>(
-    notification_rx: &'a mut Receiver<Either<NetMessage, NodeEvent>>,
-    op_execution_rx: &'a mut Receiver<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
-    peer_connections: &'a mut FuturesUnordered<
-        BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
-    >,
-    conn_bridge_rx: &'a mut Receiver<P2pBridgeEvent>,
-    handshake_handler: &'a mut HandshakeHandler,
-    node_controller: &'a mut Receiver<NodeEvent>,
-    client_wait_for_transaction: &'a mut ContractHandlerChannel<WaitingResolution>,
-    executor_listener: &'a mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-) -> SelectResult {
-    // Create boxed futures ONCE - they will be pinned and reused across polls.
-    // This is critical: the futures must persist across multiple poll() calls to:
-    // 1. Maintain waker registration (so the runtime can wake the task)
-    // 2. Preserve internal state (especially the handshake state machine)
-    PrioritySelectFuture::new(
-        Box::pin(notification_rx.recv()),
-        Box::pin(op_execution_rx.recv()),
-        peer_connections,
-        Box::pin(conn_bridge_rx.recv()),
-        Box::pin(handshake_handler.wait_for_events()),
-        Box::pin(node_controller.recv()),
-        Box::pin(client_wait_for_transaction.relay_transaction_result_to_client()),
-        Box::pin(executor_listener.transaction_from_executor()),
-    )
-    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream::StreamExt;
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout, Duration};
 
-    /// Test PrioritySelectFuture with notification arriving after initial poll
+    /// Test PrioritySelectStream with notification arriving after initial poll
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_future_wakeup() {
-        let (notif_tx, mut notif_rx) = mpsc::channel(10);
-        let (_op_tx, mut op_rx) = mpsc::channel(10);
-        let mut peers = FuturesUnordered::new();
-        let (_bridge_tx, mut bridge_rx) = mpsc::channel(10);
-        let (_node_tx, mut node_rx) = mpsc::channel(10);
-        let (_client_tx, mut client_rx) = mpsc::channel(10);
-        let (_executor_tx, mut executor_rx) = mpsc::channel(10);
+        struct MockHandshake;
+        impl HandshakeEventProvider for MockHandshake {
+            async fn wait_for_events(
+                &mut self,
+            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(HandshakeError::ChannelClosed)
+            }
+        }
+
+        struct MockClient;
+        impl ClientTransactionRelay for MockClient {
+            async fn relay_transaction_result_to_client(
+                &mut self,
+            ) -> Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            > {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        struct MockExecutor;
+        impl ExecutorTransactionReceiver for MockExecutor {
+            async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        let (notif_tx, notif_rx) = mpsc::channel(10);
+        let (_op_tx, op_rx) = mpsc::channel(10);
+        let peers = FuturesUnordered::new();
+        let (_bridge_tx, bridge_rx) = mpsc::channel(10);
+        let (_node_tx, node_rx) = mpsc::channel(10);
 
         // Spawn task that sends notification after delay
         let notif_tx_clone = notif_tx.clone();
@@ -279,40 +334,28 @@ mod tests {
             notif_tx_clone.send(Either::Left(test_msg)).await.unwrap();
         });
 
-        // Create PrioritySelectFuture - should be pending initially, then wake up when message arrives
-        let select_fut = PrioritySelectFuture::new(
-            Box::pin(notif_rx.recv()),
-            Box::pin(op_rx.recv()),
-            &mut peers,
-            Box::pin(bridge_rx.recv()),
-            Box::pin(async {
-                sleep(Duration::from_secs(1000)).await; // Long-running handshake
-                Err(HandshakeError::ChannelClosed)
-            }),
-            Box::pin(node_rx.recv()),
-            Box::pin(async move {
-                client_rx
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("closed"))
-            }),
-            Box::pin(async move {
-                executor_rx
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("closed"))
-            }),
+        // Create stream - should be pending initially, then wake up when message arrives
+        let stream = PrioritySelectStream::new(
+            notif_rx,
+            op_rx,
+            bridge_rx,
+            MockHandshake,
+            node_rx,
+            MockClient,
+            MockExecutor,
+            peers,
         );
+        tokio::pin!(stream);
 
         // Should complete when message arrives (notification has priority over handshake)
-        let result = timeout(Duration::from_millis(200), select_fut).await;
+        let result = timeout(Duration::from_millis(200), stream.next()).await;
 
         assert!(
             result.is_ok(),
-            "Select future should wake up when notification arrives"
+            "Select stream should wake up when notification arrives"
         );
 
-        let select_result = result.unwrap();
+        let select_result = result.unwrap().expect("Stream should yield value");
         match select_result {
             SelectResult::Notification(Some(_)) => {}
             SelectResult::Notification(None) => panic!("Got Notification(None)"),
@@ -326,17 +369,49 @@ mod tests {
         }
     }
 
-    /// Test that notification has priority over other channels in PrioritySelectFuture
+    /// Test that notification has priority over other channels in PrioritySelectStream
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_future_priority_ordering() {
-        let (notif_tx, mut notif_rx) = mpsc::channel(10);
-        let (op_tx, mut op_rx) = mpsc::channel(10);
-        let mut peers = FuturesUnordered::new();
-        let (bridge_tx, mut bridge_rx) = mpsc::channel(10);
-        let (_, mut node_rx) = mpsc::channel(10);
-        let (_, mut client_rx) = mpsc::channel(10);
-        let (_, mut executor_rx) = mpsc::channel(10);
+        struct MockHandshake;
+        impl HandshakeEventProvider for MockHandshake {
+            async fn wait_for_events(
+                &mut self,
+            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
+                futures::future::pending::<()>().await;
+                Err(HandshakeError::ChannelClosed)
+            }
+        }
+
+        struct MockClient;
+        impl ClientTransactionRelay for MockClient {
+            async fn relay_transaction_result_to_client(
+                &mut self,
+            ) -> Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            > {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        struct MockExecutor;
+        impl ExecutorTransactionReceiver for MockExecutor {
+            async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        let (notif_tx, notif_rx) = mpsc::channel(10);
+        let (op_tx, op_rx) = mpsc::channel(10);
+        let peers = FuturesUnordered::new();
+        let (bridge_tx, bridge_rx) = mpsc::channel(10);
+        let (_, node_rx) = mpsc::channel(10);
 
         // Send to multiple channels - notification should be received first
         let (callback_tx, _) = mpsc::channel(1);
@@ -354,35 +429,23 @@ mod tests {
         ));
         notif_tx.send(Either::Left(test_msg)).await.unwrap();
 
-        // Create and poll the future
-        let select_fut = PrioritySelectFuture::new(
-            Box::pin(notif_rx.recv()),
-            Box::pin(op_rx.recv()),
-            &mut peers,
-            Box::pin(bridge_rx.recv()),
-            Box::pin(async {
-                futures::future::pending::<()>().await;
-                Err(HandshakeError::ChannelClosed)
-            }),
-            Box::pin(node_rx.recv()),
-            Box::pin(async move {
-                client_rx
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("closed"))
-            }),
-            Box::pin(async move {
-                executor_rx
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("closed"))
-            }),
+        // Create and poll the stream
+        let stream = PrioritySelectStream::new(
+            notif_rx,
+            op_rx,
+            bridge_rx,
+            MockHandshake,
+            node_rx,
+            MockClient,
+            MockExecutor,
+            peers,
         );
+        tokio::pin!(stream);
 
-        let result = timeout(Duration::from_millis(100), select_fut).await;
+        let result = timeout(Duration::from_millis(100), stream.next()).await;
         assert!(result.is_ok());
 
-        match result.unwrap() {
+        match result.unwrap().expect("Stream should yield value") {
             SelectResult::Notification(_) => {}
             _ => panic!("Notification should be received first due to priority"),
         }
@@ -392,8 +455,42 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_future_concurrent_messages() {
-        let (notif_tx, mut notif_rx) = mpsc::channel(100);
-        let mut peers = FuturesUnordered::new();
+        struct MockHandshake;
+        impl HandshakeEventProvider for MockHandshake {
+            async fn wait_for_events(
+                &mut self,
+            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(HandshakeError::ChannelClosed)
+            }
+        }
+
+        struct MockClient;
+        impl ClientTransactionRelay for MockClient {
+            async fn relay_transaction_result_to_client(
+                &mut self,
+            ) -> Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            > {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        struct MockExecutor;
+        impl ExecutorTransactionReceiver for MockExecutor {
+            async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        let (notif_tx, notif_rx) = mpsc::channel(100);
+        let peers = FuturesUnordered::new();
 
         // Send all 15 messages
         for _ in 0..15 {
@@ -404,39 +501,25 @@ mod tests {
         }
 
         // Receive first message
-        let (_, mut op_rx) = mpsc::channel(10);
-        let (_, mut bridge_rx) = mpsc::channel(10);
-        let (_, mut node_rx) = mpsc::channel(10);
-        let (_, mut client_rx) = mpsc::channel(10);
-        let (_, mut executor_rx) = mpsc::channel(10);
+        let (_, op_rx) = mpsc::channel(10);
+        let (_, bridge_rx) = mpsc::channel(10);
+        let (_, node_rx) = mpsc::channel(10);
 
-        let select_fut = PrioritySelectFuture::new(
-            Box::pin(notif_rx.recv()),
-            Box::pin(op_rx.recv()),
-            &mut peers,
-            Box::pin(bridge_rx.recv()),
-            Box::pin(async {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }),
-            Box::pin(node_rx.recv()),
-            Box::pin(async move {
-                client_rx
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("closed"))
-            }),
-            Box::pin(async move {
-                executor_rx
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("closed"))
-            }),
+        let stream = PrioritySelectStream::new(
+            notif_rx,
+            op_rx,
+            bridge_rx,
+            MockHandshake,
+            node_rx,
+            MockClient,
+            MockExecutor,
+            peers,
         );
+        tokio::pin!(stream);
 
-        let result = timeout(Duration::from_millis(100), select_fut).await;
+        let result = timeout(Duration::from_millis(100), stream.next()).await;
         assert!(result.is_ok(), "Should receive first message");
-        match result.unwrap() {
+        match result.unwrap().expect("Stream should yield value") {
             SelectResult::Notification(Some(_)) => {}
             _ => panic!("Expected notification"),
         }
@@ -446,64 +529,120 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_future_buffered_messages() {
-        let (notif_tx, mut notif_rx) = mpsc::channel(10);
-        let mut peers = FuturesUnordered::new();
+        struct MockHandshake;
+        impl HandshakeEventProvider for MockHandshake {
+            async fn wait_for_events(
+                &mut self,
+            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(HandshakeError::ChannelClosed)
+            }
+        }
 
-        // Send message BEFORE creating future
+        struct MockClient;
+        impl ClientTransactionRelay for MockClient {
+            async fn relay_transaction_result_to_client(
+                &mut self,
+            ) -> Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            > {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        struct MockExecutor;
+        impl ExecutorTransactionReceiver for MockExecutor {
+            async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        let (notif_tx, notif_rx) = mpsc::channel(10);
+        let peers = FuturesUnordered::new();
+
+        // Send message BEFORE creating stream
         let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
             crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
         ));
         notif_tx.send(Either::Left(test_msg)).await.unwrap();
 
-        // Create future - should receive the buffered message immediately
-        let (_, mut op_rx) = mpsc::channel(10);
-        let (_, mut bridge_rx) = mpsc::channel(10);
-        let (_, mut node_rx) = mpsc::channel(10);
-        let (_, mut client_rx) = mpsc::channel(10);
-        let (_, mut executor_rx) = mpsc::channel(10);
+        // Create stream - should receive the buffered message immediately
+        let (_, op_rx) = mpsc::channel(10);
+        let (_, bridge_rx) = mpsc::channel(10);
+        let (_, node_rx) = mpsc::channel(10);
 
-        let select_fut = PrioritySelectFuture::new(
-            Box::pin(notif_rx.recv()),
-            Box::pin(op_rx.recv()),
-            &mut peers,
-            Box::pin(bridge_rx.recv()),
-            Box::pin(async {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }),
-            Box::pin(node_rx.recv()),
-            Box::pin(async move {
-                client_rx
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("closed"))
-            }),
-            Box::pin(async move {
-                executor_rx
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("closed"))
-            }),
+        let stream = PrioritySelectStream::new(
+            notif_rx,
+            op_rx,
+            bridge_rx,
+            MockHandshake,
+            node_rx,
+            MockClient,
+            MockExecutor,
+            peers,
         );
+        tokio::pin!(stream);
 
-        let result = timeout(Duration::from_millis(100), select_fut).await;
+        let result = timeout(Duration::from_millis(100), stream.next()).await;
         assert!(
             result.is_ok(),
             "Should receive buffered message immediately"
         );
 
-        match result.unwrap() {
+        match result.unwrap().expect("Stream should yield value") {
             SelectResult::Notification(Some(_)) => {}
             _ => panic!("Expected notification"),
         }
     }
 
-    /// Test rapid creation and cancellation of PrioritySelectFuture instances
+    /// Test rapid polling of stream with short timeouts
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_future_rapid_cancellations() {
-        let (notif_tx, mut notif_rx) = mpsc::channel(100);
-        let mut peers = FuturesUnordered::new();
+        use futures::StreamExt;
+
+        struct MockHandshake;
+        impl HandshakeEventProvider for MockHandshake {
+            async fn wait_for_events(
+                &mut self,
+            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(HandshakeError::ChannelClosed)
+            }
+        }
+
+        struct MockClient;
+        impl ClientTransactionRelay for MockClient {
+            async fn relay_transaction_result_to_client(
+                &mut self,
+            ) -> Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            > {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        struct MockExecutor;
+        impl ExecutorTransactionReceiver for MockExecutor {
+            async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        let (notif_tx, notif_rx) = mpsc::channel(100);
+        let peers = FuturesUnordered::new();
 
         // Send 10 messages
         for _ in 0..10 {
@@ -513,41 +652,28 @@ mod tests {
             notif_tx.send(Either::Left(test_msg)).await.unwrap();
         }
 
-        // Rapidly create futures with short timeouts (simulating cancellations)
+        let (_, op_rx) = mpsc::channel(10);
+        let (_, bridge_rx) = mpsc::channel(10);
+        let (_, node_rx) = mpsc::channel(10);
+
+        // Create stream once - it maintains waker registration across polls
+        let stream = PrioritySelectStream::new(
+            notif_rx,
+            op_rx,
+            bridge_rx,
+            MockHandshake,
+            node_rx,
+            MockClient,
+            MockExecutor,
+            peers,
+        );
+        tokio::pin!(stream);
+
+        // Rapidly poll stream with short timeouts (simulating cancellations)
         let mut received = 0;
         for _ in 0..30 {
-            let (_, mut op_rx) = mpsc::channel(10);
-            let (_, mut bridge_rx) = mpsc::channel(10);
-            let (_, mut node_rx) = mpsc::channel(10);
-            let (_, mut client_rx) = mpsc::channel(10);
-            let (_, mut executor_rx) = mpsc::channel(10);
-
-            let select_fut = PrioritySelectFuture::new(
-                Box::pin(notif_rx.recv()),
-                Box::pin(op_rx.recv()),
-                &mut peers,
-                Box::pin(bridge_rx.recv()),
-                Box::pin(async {
-                    sleep(Duration::from_secs(1000)).await;
-                    Err(HandshakeError::ChannelClosed)
-                }),
-                Box::pin(node_rx.recv()),
-                Box::pin(async move {
-                    client_rx
-                        .recv()
-                        .await
-                        .ok_or_else(|| anyhow::anyhow!("closed"))
-                }),
-                Box::pin(async move {
-                    executor_rx
-                        .recv()
-                        .await
-                        .ok_or_else(|| anyhow::anyhow!("closed"))
-                }),
-            );
-
-            if let Ok(SelectResult::Notification(Some(_))) =
-                timeout(Duration::from_millis(5), select_fut).await
+            if let Ok(Some(SelectResult::Notification(Some(_)))) =
+                timeout(Duration::from_millis(5), stream.as_mut().next()).await
             {
                 received += 1;
             }
@@ -563,32 +689,57 @@ mod tests {
         );
     }
 
-    /// Test simulating wait_for_event loop behavior - reusing receivers across iterations
-    /// This test simulates how the event loop actually works: it creates channel receivers once
-    /// and then polls them repeatedly in a loop, creating a new PrioritySelectFuture each iteration.
+    /// Test simulating wait_for_event loop behavior - using stream that maintains waker registration
+    /// This test verifies that PrioritySelectStream properly maintains waker registration across
+    /// multiple .next().await calls, unlike the old approach that recreated futures each iteration.
     ///
     /// Enhanced version: sends MULTIPLE messages per channel to verify interleaving and priority.
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_event_loop_simulation() {
-        // Create channels once (like in wait_for_event)
-        let (notif_tx, mut notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
-        let (op_tx, mut op_rx) =
-            mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(10);
-        let mut peers = FuturesUnordered::new();
-        let (bridge_tx, mut bridge_rx) = mpsc::channel::<P2pBridgeEvent>(10);
-        let (node_tx, mut node_rx) = mpsc::channel::<NodeEvent>(10);
-        let (client_tx, mut client_rx) = mpsc::channel::<
-            Result<
+        use futures::StreamExt;
+
+        struct MockHandshake;
+        impl HandshakeEventProvider for MockHandshake {
+            async fn wait_for_events(
+                &mut self,
+            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(HandshakeError::ChannelClosed)
+            }
+        }
+
+        struct MockClient;
+        impl ClientTransactionRelay for MockClient {
+            async fn relay_transaction_result_to_client(
+                &mut self,
+            ) -> Result<
                 (
                     crate::client_events::ClientId,
                     crate::contract::WaitingTransaction,
                 ),
                 anyhow::Error,
-            >,
-        >(10);
-        let (executor_tx, mut executor_rx) =
-            mpsc::channel::<Result<Transaction, anyhow::Error>>(10);
+            > {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        struct MockExecutor;
+        impl ExecutorTransactionReceiver for MockExecutor {
+            async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        // Create channels once (like in wait_for_event)
+        let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
+        let (op_tx, op_rx) =
+            mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(10);
+        let peers = FuturesUnordered::new();
+        let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(10);
+        let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(10);
 
         // Spawn task that sends MULTIPLE messages to different channels
         let notif_tx_clone = notif_tx.clone();
@@ -634,43 +785,31 @@ mod tests {
                 .unwrap();
         });
 
+        // Create stream ONCE - maintains waker registration across iterations
+        let stream = PrioritySelectStream::new(
+            notif_rx,
+            op_rx,
+            bridge_rx,
+            MockHandshake,
+            node_rx,
+            MockClient,
+            MockExecutor,
+            peers,
+        );
+        tokio::pin!(stream);
+
         let mut received_events = Vec::new();
 
-        // Simulate event loop: poll until we've received all expected messages (3+2+2+1 = 8)
+        // Simulate event loop: poll stream until we've received all expected messages (3+2+2+1 = 8)
         let expected_count = 8;
         for iteration in 0..expected_count {
             tracing::info!("Event loop iteration {}", iteration);
 
-            // Create a new PrioritySelectFuture for this iteration (like wait_for_event does)
-            let select_fut = PrioritySelectFuture::new(
-                Box::pin(notif_rx.recv()),
-                Box::pin(op_rx.recv()),
-                &mut peers,
-                Box::pin(bridge_rx.recv()),
-                Box::pin(async {
-                    sleep(Duration::from_secs(1000)).await;
-                    Err(HandshakeError::ChannelClosed)
-                }),
-                Box::pin(node_rx.recv()),
-                Box::pin(async {
-                    client_rx
-                        .recv()
-                        .await
-                        .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
-                }),
-                Box::pin(async {
-                    executor_rx
-                        .recv()
-                        .await
-                        .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
-                }),
-            );
-
-            // Wait for an event
-            let result = timeout(Duration::from_millis(50), select_fut).await;
+            // Poll the SAME stream on each iteration - waker registration is maintained
+            let result = timeout(Duration::from_millis(50), stream.as_mut().next()).await;
             assert!(result.is_ok(), "Iteration {} should complete", iteration);
 
-            let event = result.unwrap();
+            let event = result.unwrap().expect("Stream should yield value");
             match &event {
                 SelectResult::Notification(_) => received_events.push("notification"),
                 SelectResult::OpExecution(_) => received_events.push("op_execution"),
@@ -774,8 +913,7 @@ mod tests {
         drop(op_tx);
         drop(bridge_tx);
         drop(node_tx);
-        drop(client_tx);
-        drop(executor_tx);
+        // client_tx and executor_tx were moved into MockClient and MockExecutor
     }
 
     /// Stress test: Multiple concurrent tasks sending messages with random delays
@@ -837,13 +975,13 @@ mod tests {
         let executor_delays = make_delays(EXECUTOR_COUNT, &mut rng);
 
         // Create channels once (like in wait_for_event)
-        let (notif_tx, mut notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(100);
-        let (op_tx, mut op_rx) =
+        let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(100);
+        let (op_tx, op_rx) =
             mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(100);
-        let mut peers = FuturesUnordered::new();
-        let (bridge_tx, mut bridge_rx) = mpsc::channel::<P2pBridgeEvent>(100);
-        let (node_tx, mut node_rx) = mpsc::channel::<NodeEvent>(100);
-        let (client_tx, mut client_rx) = mpsc::channel::<
+        let peers = FuturesUnordered::new();
+        let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(100);
+        let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(100);
+        let (client_tx, client_rx) = mpsc::channel::<
             Result<
                 (
                     crate::client_events::ClientId,
@@ -852,8 +990,7 @@ mod tests {
                 anyhow::Error,
             >,
         >(100);
-        let (executor_tx, mut executor_rx) =
-            mpsc::channel::<Result<Transaction, anyhow::Error>>(100);
+        let (executor_tx, executor_rx) = mpsc::channel::<Result<Transaction, anyhow::Error>>(100);
 
         tracing::info!(
             "Starting stress test with {} total messages from 6 concurrent tasks",
@@ -969,102 +1106,112 @@ mod tests {
         // Wait a bit for senders to start sending (shorter delay since we're using microseconds now)
         sleep(Duration::from_micros(100)).await;
 
+        // Mock implementations for the stream
+        struct MockHandshake;
+        impl HandshakeEventProvider for MockHandshake {
+            async fn wait_for_events(
+                &mut self,
+            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(HandshakeError::ChannelClosed)
+            }
+        }
+
+        struct MockClient {
+            rx: mpsc::Receiver<
+                Result<
+                    (
+                        crate::client_events::ClientId,
+                        crate::contract::WaitingTransaction,
+                    ),
+                    anyhow::Error,
+                >,
+            >,
+            closed: bool,
+        }
+        impl ClientTransactionRelay for MockClient {
+            async fn relay_transaction_result_to_client(
+                &mut self,
+            ) -> Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            > {
+                if self.closed {
+                    // Once closed, pend forever instead of returning error repeatedly
+                    futures::future::pending::<()>().await;
+                    unreachable!()
+                }
+                match self.rx.recv().await {
+                    Some(result) => result,
+                    None => {
+                        self.closed = true;
+                        Err(anyhow::anyhow!("closed"))
+                    }
+                }
+            }
+        }
+
+        struct MockExecutor {
+            rx: mpsc::Receiver<Result<Transaction, anyhow::Error>>,
+            closed: bool,
+        }
+        impl ExecutorTransactionReceiver for MockExecutor {
+            async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+                if self.closed {
+                    // Once closed, pend forever instead of returning error repeatedly
+                    futures::future::pending::<()>().await;
+                    unreachable!()
+                }
+                match self.rx.recv().await {
+                    Some(result) => result,
+                    None => {
+                        self.closed = true;
+                        Err(anyhow::anyhow!("closed"))
+                    }
+                }
+            }
+        }
+
+        // Create stream ONCE - it maintains waker registration and handles channel closures
+        let stream = PrioritySelectStream::new(
+            notif_rx,
+            op_rx,
+            bridge_rx,
+            MockHandshake,
+            node_rx,
+            MockClient { rx: client_rx, closed: false },
+            MockExecutor { rx: executor_rx, closed: false },
+            peers,
+        );
+        tokio::pin!(stream);
+
         // Collect all messages from the event loop (run concurrently with senders)
         let mut received_events = Vec::new();
         let mut iteration = 0;
 
-        // Track which channels have closed so we can replace them
-        let mut notif_active = true;
-        let mut op_active = true;
-        let mut bridge_active = true;
-        let mut node_active = true;
-        let mut client_active = true;
-        let mut executor_active = true;
-
         // Continue until we've received all expected messages
+        use futures::StreamExt;
         while received_events.len() < TOTAL_MESSAGES {
-            // Create a new PrioritySelectFuture for this iteration
-            // Use the real channel if still active, otherwise use a never-ready future with the correct type
-            let select_fut = PrioritySelectFuture::new(
-                if notif_active {
-                    Box::pin(notif_rx.recv())
-                } else {
-                    Box::pin(async {
-                        sleep(Duration::from_secs(10000)).await;
-                        None::<Either<NetMessage, NodeEvent>>
-                    })
-                },
-                if op_active {
-                    Box::pin(op_rx.recv())
-                } else {
-                    Box::pin(async {
-                        sleep(Duration::from_secs(10000)).await;
-                        None::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>
-                    })
-                },
-                &mut peers,
-                if bridge_active {
-                    Box::pin(bridge_rx.recv())
-                } else {
-                    Box::pin(async {
-                        sleep(Duration::from_secs(10000)).await;
-                        None::<P2pBridgeEvent>
-                    })
-                },
-                Box::pin(async {
-                    sleep(Duration::from_secs(1000)).await;
-                    Err(HandshakeError::ChannelClosed)
-                }),
-                if node_active {
-                    Box::pin(node_rx.recv())
-                } else {
-                    Box::pin(async {
-                        sleep(Duration::from_secs(10000)).await;
-                        None::<NodeEvent>
-                    })
-                },
-                if client_active {
-                    Box::pin(async {
-                        client_rx
-                            .recv()
-                            .await
-                            .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
-                    })
-                } else {
-                    Box::pin(async {
-                        sleep(Duration::from_secs(10000)).await;
-                        Err(anyhow::anyhow!("inactive"))
-                    })
-                },
-                if executor_active {
-                    Box::pin(async {
-                        executor_rx
-                            .recv()
-                            .await
-                            .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
-                    })
-                } else {
-                    Box::pin(async {
-                        sleep(Duration::from_secs(10000)).await;
-                        Err(anyhow::anyhow!("inactive"))
-                    })
-                },
-            );
-
-            // Wait for an event (with generous timeout for random delays, including outliers up to 5ms)
-            let result = timeout(Duration::from_millis(100), select_fut).await;
+            // Poll the SAME stream on each iteration - maintains waker registration
+            let result = timeout(Duration::from_millis(100), stream.as_mut().next()).await;
             assert!(result.is_ok(), "Iteration {} timed out", iteration);
 
-            let event = result.unwrap();
+            // Stream returns None when there are no more events
+            let Some(event) = result.unwrap() else {
+                tracing::debug!("Stream ended (all channels closed)");
+                break;
+            };
 
-            // Check if this is a real message or a channel close, and mark channels as inactive when closed
+            // Check if this is a real message or a channel close
             let (event_name, is_real_message) = match &event {
                 SelectResult::Notification(msg) => {
                     if msg.is_some() {
                         tracing::debug!("Received Notification message");
                         ("notification", true)
                     } else {
-                        notif_active = false;
                         tracing::debug!("Notification channel closed");
                         ("notification", false)
                     }
@@ -1074,7 +1221,6 @@ mod tests {
                         tracing::debug!("Received OpExecution message");
                         ("op_execution", true)
                     } else {
-                        op_active = false;
                         tracing::debug!("OpExecution channel closed");
                         ("op_execution", false)
                     }
@@ -1085,7 +1231,6 @@ mod tests {
                         tracing::debug!("Received ConnBridge message");
                         ("conn_bridge", true)
                     } else {
-                        bridge_active = false;
                         tracing::debug!("ConnBridge channel closed");
                         ("conn_bridge", false)
                     }
@@ -1098,7 +1243,6 @@ mod tests {
                         tracing::debug!("Received NodeController message");
                         ("node_controller", true)
                     } else {
-                        node_active = false;
                         tracing::debug!("NodeController channel closed");
                         ("node_controller", false)
                     }
@@ -1108,11 +1252,7 @@ mod tests {
                         tracing::debug!("Received ClientTransaction message");
                         ("client_transaction", true)
                     } else {
-                        // Check if this is initial close or just an error
-                        if client_active {
-                            client_active = false;
-                            tracing::debug!("ClientTransaction channel closed");
-                        }
+                        tracing::debug!("ClientTransaction channel closed or error");
                         ("client_transaction", false)
                     }
                 }
@@ -1121,11 +1261,7 @@ mod tests {
                         tracing::debug!("Received ExecutorTransaction message");
                         ("executor_transaction", true)
                     } else {
-                        // Check if this is initial close or just an error
-                        if executor_active {
-                            executor_active = false;
-                            tracing::debug!("ExecutorTransaction channel closed");
-                        }
+                        tracing::debug!("ExecutorTransaction channel closed or error");
                         ("executor_transaction", false)
                     }
                 }
@@ -1284,19 +1420,89 @@ mod tests {
     }
 
     /// Test that verifies waker registration across ALL channels when they're all Pending
-    /// This is the critical behavior: when a PrioritySelectFuture polls all 8 channels and they
+    /// This is the critical behavior: when a PrioritySelectStream polls all 8 channels and they
     /// all return Pending, it must register wakers for ALL of them, not just some.
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_all_pending_waker_registration() {
+        use futures::StreamExt;
+
+        struct MockHandshake;
+        impl HandshakeEventProvider for MockHandshake {
+            async fn wait_for_events(
+                &mut self,
+            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(HandshakeError::ChannelClosed)
+            }
+        }
+
+        struct MockClient {
+            rx: mpsc::Receiver<
+                Result<
+                    (
+                        crate::client_events::ClientId,
+                        crate::contract::WaitingTransaction,
+                    ),
+                    anyhow::Error,
+                >,
+            >,
+            closed: bool,
+        }
+        impl ClientTransactionRelay for MockClient {
+            async fn relay_transaction_result_to_client(
+                &mut self,
+            ) -> Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            > {
+                if self.closed {
+                    // Once closed, pend forever instead of returning error repeatedly
+                    futures::future::pending::<()>().await;
+                    unreachable!()
+                }
+                match self.rx.recv().await {
+                    Some(result) => result,
+                    None => {
+                        self.closed = true;
+                        Err(anyhow::anyhow!("closed"))
+                    }
+                }
+            }
+        }
+
+        struct MockExecutor {
+            rx: mpsc::Receiver<Result<Transaction, anyhow::Error>>,
+            closed: bool,
+        }
+        impl ExecutorTransactionReceiver for MockExecutor {
+            async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+                if self.closed {
+                    // Once closed, pend forever instead of returning error repeatedly
+                    futures::future::pending::<()>().await;
+                    unreachable!()
+                }
+                match self.rx.recv().await {
+                    Some(result) => result,
+                    None => {
+                        self.closed = true;
+                        Err(anyhow::anyhow!("closed"))
+                    }
+                }
+            }
+        }
+
         // Create all 8 channels
-        let (notif_tx, mut notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
-        let (op_tx, mut op_rx) =
+        let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
+        let (op_tx, op_rx) =
             mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(10);
-        let mut peers = FuturesUnordered::new();
-        let (bridge_tx, mut bridge_rx) = mpsc::channel::<P2pBridgeEvent>(10);
-        let (node_tx, mut node_rx) = mpsc::channel::<NodeEvent>(10);
-        let (client_tx, mut client_rx) = mpsc::channel::<
+        let peers = FuturesUnordered::new();
+        let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(10);
+        let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(10);
+        let (client_tx, client_rx) = mpsc::channel::<
             Result<
                 (
                     crate::client_events::ClientId,
@@ -1305,14 +1511,13 @@ mod tests {
                 anyhow::Error,
             >,
         >(10);
-        let (executor_tx, mut executor_rx) =
-            mpsc::channel::<Result<Transaction, anyhow::Error>>(10);
+        let (executor_tx, executor_rx) = mpsc::channel::<Result<Transaction, anyhow::Error>>(10);
 
         // Start with NO messages buffered - this will cause all channels to return Pending on first poll
-        tracing::info!("Creating PrioritySelectFuture with all channels empty");
+        tracing::info!("Creating PrioritySelectStream with all channels empty");
 
         // Spawn a task that will send messages after a delay
-        // This gives the select future time to poll all channels and register wakers
+        // This gives the stream time to poll all channels and register wakers
         tokio::spawn(async move {
             sleep(Duration::from_millis(10)).await;
             tracing::info!("All wakers should now be registered, sending messages");
@@ -1354,42 +1559,30 @@ mod tests {
             notif_tx.send(Either::Left(test_msg)).await.unwrap();
         });
 
-        // Create the select future - it will poll all channels, find them all Pending,
+        // Create the stream - it will poll all channels, find them all Pending,
         // and register wakers for all of them
-        let select_fut = PrioritySelectFuture::new(
-            Box::pin(notif_rx.recv()),
-            Box::pin(op_rx.recv()),
-            &mut peers,
-            Box::pin(bridge_rx.recv()),
-            Box::pin(async {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }),
-            Box::pin(node_rx.recv()),
-            Box::pin(async {
-                client_rx
-                    .recv()
-                    .await
-                    .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
-            }),
-            Box::pin(async {
-                executor_rx
-                    .recv()
-                    .await
-                    .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
-            }),
+        let stream = PrioritySelectStream::new(
+            notif_rx,
+            op_rx,
+            bridge_rx,
+            MockHandshake,
+            node_rx,
+            MockClient { rx: client_rx, closed: false },
+            MockExecutor { rx: executor_rx, closed: false },
+            peers,
         );
+        tokio::pin!(stream);
 
-        // Await the select future - it should wake up and return the NOTIFICATION (highest priority)
+        // Poll the stream - it should wake up and return the NOTIFICATION (highest priority)
         // despite all other channels also having messages
-        tracing::info!("PrioritySelectFuture started, should poll all channels and go Pending");
-        let result = timeout(Duration::from_millis(100), select_fut).await;
+        tracing::info!("PrioritySelectStream started, should poll all channels and go Pending");
+        let result = timeout(Duration::from_millis(100), stream.next()).await;
         assert!(
             result.is_ok(),
             "Select should wake up when any message arrives"
         );
 
-        let select_result = result.unwrap();
+        let select_result = result.unwrap().expect("Stream should yield value");
         match select_result {
             SelectResult::Notification(_) => {
                 tracing::info!(
@@ -1418,29 +1611,54 @@ mod tests {
     /// This test demonstrates the bug where recreating PrioritySelectFuture on every
     /// iteration loses waker registration, causing messages to be missed.
     ///
-    /// Currently IGNORED because it fails (demonstrates the bug).
-    /// Will PASS after implementing persistent futures fix.
-    #[ignore = "Demonstrates issue #1932 - lost wakeup race. Remove ignore after fix."]
+    /// This test verifies the fix using PrioritySelectStream which maintains waker registration.
     #[tokio::test]
     #[test_log::test]
     async fn test_sparse_messages_reproduce_race() {
-        tracing::info!("=== Testing sparse messages (should expose race condition) ===");
+        tracing::info!(
+            "=== Testing sparse messages with PrioritySelectStream (verifying fix for #1932) ==="
+        );
 
-        let (notif_tx, mut notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(1);
-        let (_, mut op_rx) = mpsc::channel(1);
-        let mut peers = FuturesUnordered::new();
-        let (_, mut bridge_rx) = mpsc::channel(1);
-        let (_, mut node_rx) = mpsc::channel(1);
-        let (_, _client_rx) = mpsc::channel::<
-            Result<
+        // Mock implementations for testing
+        struct MockHandshake;
+        impl HandshakeEventProvider for MockHandshake {
+            async fn wait_for_events(
+                &mut self,
+            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(HandshakeError::ChannelClosed)
+            }
+        }
+
+        struct MockClient;
+        impl ClientTransactionRelay for MockClient {
+            async fn relay_transaction_result_to_client(
+                &mut self,
+            ) -> Result<
                 (
                     crate::client_events::ClientId,
                     crate::contract::WaitingTransaction,
                 ),
                 anyhow::Error,
-            >,
-        >(1);
-        let (_, _executor_rx) = mpsc::channel::<Result<Transaction, anyhow::Error>>(1);
+            > {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        struct MockExecutor;
+        impl ExecutorTransactionReceiver for MockExecutor {
+            async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
+                sleep(Duration::from_secs(1000)).await;
+                Err(anyhow::anyhow!("closed"))
+            }
+        }
+
+        let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
+        let (_, op_rx) = mpsc::channel(1);
+        let peers = FuturesUnordered::new();
+        let (_, bridge_rx) = mpsc::channel(1);
+        let (_, node_rx) = mpsc::channel(1);
 
         // Spawn sender that sends 5 messages with 200ms gaps
         let sender = tokio::spawn(async move {
@@ -1465,61 +1683,45 @@ mod tests {
             tracing::info!("Sender: Finished sending all messages");
         });
 
+        // Create the stream ONCE - this is the fix!
+        let stream = PrioritySelectStream::new(
+            notif_rx,
+            op_rx,
+            bridge_rx,
+            MockHandshake,
+            node_rx,
+            MockClient,
+            MockExecutor,
+            peers,
+        );
+        tokio::pin!(stream);
+
         let mut received = 0;
         let mut iteration = 0;
 
-        // Receiver recreates futures every iteration (mimics production bug)
+        // Receiver polls the SAME stream repeatedly (the fix - maintains waker registration)
         while received < 5 && iteration < 20 {
             iteration += 1;
-            tracing::info!("Iteration {}: Creating new PrioritySelectFuture", iteration);
-
-            // Create new channels for this iteration to avoid borrow issues
-            let (_, mut client_rx_iter) = mpsc::channel::<
-                Result<
-                    (
-                        crate::client_events::ClientId,
-                        crate::contract::WaitingTransaction,
-                    ),
-                    anyhow::Error,
-                >,
-            >(1);
-            let (_, mut executor_rx_iter) = mpsc::channel::<Result<Transaction, anyhow::Error>>(1);
-
-            let select_fut = PrioritySelectFuture::new(
-                Box::pin(notif_rx.recv()), // NEW future every iteration
-                Box::pin(op_rx.recv()),
-                &mut peers,
-                Box::pin(bridge_rx.recv()),
-                Box::pin(async {
-                    sleep(Duration::from_secs(1000)).await;
-                    Err(HandshakeError::ChannelClosed)
-                }),
-                Box::pin(node_rx.recv()),
-                Box::pin(async move {
-                    client_rx_iter
-                        .recv()
-                        .await
-                        .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
-                }),
-                Box::pin(async move {
-                    executor_rx_iter
-                        .recv()
-                        .await
-                        .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
-                }),
+            tracing::info!(
+                "Iteration {}: Polling PrioritySelectStream (reusing same stream)",
+                iteration
             );
 
-            match timeout(Duration::from_millis(300), select_fut).await {
-                Ok(SelectResult::Notification(Some(_))) => {
+            match timeout(Duration::from_millis(300), stream.as_mut().next()).await {
+                Ok(Some(SelectResult::Notification(Some(_)))) => {
                     received += 1;
                     tracing::info!(
-                        "Iteration {}: Received message {} of 5",
+                        "✅ Iteration {}: Received message {} of 5",
                         iteration,
                         received
                     );
                 }
-                Ok(_) => {
+                Ok(Some(_)) => {
                     tracing::debug!("Iteration {}: Got other event", iteration);
+                }
+                Ok(None) => {
+                    tracing::error!("Stream ended unexpectedly");
+                    break;
                 }
                 Err(_) => {
                     tracing::warn!("Iteration {}: Timeout waiting for message", iteration);
@@ -1533,9 +1735,494 @@ mod tests {
 
         assert_eq!(
             received, 5,
-            "Lost wakeup race! Expected 5 messages but only received {} in {} iterations.\n\
-             This demonstrates the bug: messages were sent but wakers were lost when futures were recreated.",
+            "❌ FAIL: PrioritySelectStream still lost messages! Expected 5 but received {} in {} iterations.\n\
+             The fix should prevent lost wakeups by keeping the stream alive.",
             received, iteration
         );
+        tracing::info!("✅ PASS: All 5 messages received without loss using PrioritySelectStream!");
     }
+
+    /// Test that stream-based approach doesn't lose messages with sparse arrivals
+    /// This reproduces the race condition scenario but with the stream-based fix
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_stream_no_lost_messages_sparse_arrivals() {
+        use tokio_stream::wrappers::ReceiverStream;
+
+        tracing::info!("=== Testing stream approach doesn't lose messages (sparse arrivals) ===");
+
+        let (tx, rx) = mpsc::channel::<String>(10);
+
+        // Convert receiver to stream
+        let stream = ReceiverStream::new(rx);
+
+        // Simple stream wrapper that yields items
+        struct MessageStream<S> {
+            inner: S,
+        }
+
+        impl<S: Stream + Unpin> Stream for MessageStream<S> {
+            type Item = S::Item;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                Pin::new(&mut self.inner).poll_next(cx)
+            }
+        }
+
+        let mut message_stream = MessageStream { inner: stream };
+
+        // Spawn sender that sends 5 messages with 200ms gaps (sparse arrivals)
+        let sender = tokio::spawn(async move {
+            for i in 0..5 {
+                sleep(Duration::from_millis(200)).await;
+                tracing::info!(
+                    "Sender: Sending message {} at {:?}",
+                    i,
+                    std::time::Instant::now()
+                );
+                tx.send(format!("msg{}", i)).await.unwrap();
+                tracing::info!("Sender: Message {} sent successfully", i);
+            }
+        });
+
+        // Receiver loop: call stream.next().await repeatedly
+        // The stream should maintain waker registration across iterations
+        let mut received = 0;
+        for iteration in 1..=20 {
+            tracing::info!("Iteration {}: Calling stream.next().await", iteration);
+
+            let msg = timeout(Duration::from_millis(300), message_stream.next()).await;
+
+            match msg {
+                Ok(Some(msg)) => {
+                    received += 1;
+                    tracing::info!("✓ Received: {} (total: {})", msg, received);
+                }
+                Ok(None) => {
+                    tracing::info!("Stream ended");
+                    break;
+                }
+                Err(_) => {
+                    tracing::info!(
+                        "Timeout on iteration {} (received {} so far)",
+                        iteration,
+                        received
+                    );
+                    if received >= 5 {
+                        break; // All messages received
+                    }
+                }
+            }
+        }
+
+        sender.await.unwrap();
+        tracing::info!("Sender task completed, received {} messages", received);
+
+        assert_eq!(
+            received, 5,
+            "Stream approach should receive ALL messages! Expected 5 but got {}.\n\
+             The stream maintains waker registration across .next().await calls.",
+            received
+        );
+
+        tracing::info!(
+            "✓ SUCCESS: Stream-based approach received all 5 messages with sparse arrivals!"
+        );
+        tracing::info!(
+            "✓ Waker registration was maintained across stream.next().await iterations!"
+        );
+    }
+
+    /// Test that recreating futures on each poll maintains waker registration
+    /// This tests the hypothesis for "special" types with async methods
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_recreating_futures_maintains_waker() {
+        tracing::info!("=== Testing that recreating futures on each poll maintains waker ===");
+
+        // Mock "special" type with an async method and internal state
+        struct MockSpecial {
+            counter: std::sync::Arc<std::sync::Mutex<usize>>,
+            rx: tokio::sync::mpsc::Receiver<String>,
+        }
+
+        impl MockSpecial {
+            // Async method that borrows &mut self
+            async fn wait_for_event(&mut self) -> Option<String> {
+                tracing::info!("MockSpecial::wait_for_event called");
+                let msg = self.rx.recv().await?;
+                let mut counter = self.counter.lock().unwrap();
+                *counter += 1;
+                tracing::info!("MockSpecial: received '{}', counter now {}", msg, *counter);
+                Some(msg)
+            }
+        }
+
+        // Stream that owns MockSpecial and recreates futures on each poll
+        struct TestStream {
+            special: MockSpecial,
+        }
+
+        impl Stream for TestStream {
+            type Item = String;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                // KEY: Create fresh future on EVERY poll
+                let fut = self.special.wait_for_event();
+                tokio::pin!(fut);
+
+                match fut.poll(cx) {
+                    Poll::Ready(Some(msg)) => Poll::Ready(Some(msg)),
+                    Poll::Ready(None) => Poll::Ready(None), // Channel closed
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+
+        let counter = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let (tx, rx) = mpsc::channel::<String>(10);
+
+        let mut test_stream = TestStream {
+            special: MockSpecial {
+                counter: counter.clone(),
+                rx,
+            },
+        };
+
+        // Spawn sender with sparse arrivals (200ms gaps)
+        let sender = tokio::spawn(async move {
+            for i in 0..5 {
+                sleep(Duration::from_millis(200)).await;
+                tracing::info!("Sender: Sending message {}", i);
+                tx.send(format!("msg{}", i)).await.unwrap();
+            }
+        });
+
+        // Receive using stream.next().await in loop
+        let mut received = 0;
+        for iteration in 1..=20 {
+            tracing::info!("Iteration {}: Calling stream.next().await", iteration);
+
+            let msg = timeout(Duration::from_millis(300), test_stream.next()).await;
+
+            match msg {
+                Ok(Some(msg)) => {
+                    received += 1;
+                    tracing::info!("✓ Received: {} (total: {})", msg, received);
+                }
+                Ok(None) => {
+                    tracing::info!("Stream ended");
+                    break;
+                }
+                Err(_) => {
+                    tracing::info!(
+                        "Timeout on iteration {} (received {} so far)",
+                        iteration,
+                        received
+                    );
+                    if received >= 5 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        sender.await.unwrap();
+
+        assert_eq!(
+            received, 5,
+            "Recreating futures on each poll should STILL receive all messages! Got {}",
+            received
+        );
+
+        let final_counter = *counter.lock().unwrap();
+        assert_eq!(final_counter, 5, "Counter should be 5");
+
+        tracing::info!("✓ SUCCESS: Recreating futures on each poll MAINTAINS waker registration!");
+        tracing::info!(
+            "✓ The stream struct staying alive is what matters, not the individual futures!"
+        );
+    }
+
+    /// Test that nested tokio::select! works correctly with stream approach
+    /// This is critical because HandshakeHandler::wait_for_events has a nested select!
+    ///
+    /// This verifies that even when async methods contain nested selects,
+    /// the stream maintains waker registration and doesn't lose messages.
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_recreating_futures_with_nested_select() {
+        use futures::StreamExt;
+
+        tracing::info!("=== Testing stream with NESTED select (like HandshakeHandler) ===");
+
+        // Mock type with nested select (simulating HandshakeHandler pattern)
+        struct MockWithNestedSelect {
+            rx1: tokio::sync::mpsc::Receiver<String>,
+            rx2: tokio::sync::mpsc::Receiver<String>,
+            counter: std::sync::Arc<std::sync::Mutex<usize>>,
+        }
+
+        impl MockWithNestedSelect {
+            // Async method with nested tokio::select! (like wait_for_events)
+            async fn wait_for_event(&mut self) -> String {
+                // NESTED SELECT - just like HandshakeHandler::wait_for_events
+                tokio::select! {
+                    msg1 = self.rx1.recv() => {
+                        if let Some(msg) = msg1 {
+                            let mut counter = self.counter.lock().unwrap();
+                            *counter += 1;
+                            tracing::info!("Nested select: rx1 received '{}', counter {}", msg, *counter);
+                            format!("rx1:{}", msg)
+                        } else {
+                            "rx1:closed".to_string()
+                        }
+                    }
+                    msg2 = self.rx2.recv() => {
+                        if let Some(msg) = msg2 {
+                            let mut counter = self.counter.lock().unwrap();
+                            *counter += 1;
+                            tracing::info!("Nested select: rx2 received '{}', counter {}", msg, *counter);
+                            format!("rx2:{}", msg)
+                        } else {
+                            "rx2:closed".to_string()
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stream that creates fresh futures on each poll - just like PrioritySelectStream
+        struct TestStream {
+            special: MockWithNestedSelect,
+        }
+
+        impl Stream for TestStream {
+            type Item = String;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                // Create fresh future on EVERY poll - this is what PrioritySelectStream does
+                let fut = self.special.wait_for_event();
+                tokio::pin!(fut);
+
+                match fut.poll(cx) {
+                    Poll::Ready(msg) => Poll::Ready(Some(msg)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+
+        let counter = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let (tx1, rx1) = mpsc::channel::<String>(10);
+        let (tx2, rx2) = mpsc::channel::<String>(10);
+
+        // KEY FIX: Send all messages BEFORE starting to receive
+        // This eliminates the race between sender and receiver
+        for i in 0..3 {
+            if i % 2 == 0 {
+                tracing::info!("Sending to rx1: msg{}", i);
+                tx1.send(format!("msg{}", i)).await.unwrap();
+            } else {
+                tracing::info!("Sending to rx2: msg{}", i);
+                tx2.send(format!("msg{}", i)).await.unwrap();
+            }
+        }
+        tracing::info!("All 3 messages sent, now dropping senders");
+        drop(tx1);
+        drop(tx2);
+
+        // Create the stream ONCE and reuse it - key to maintaining waker registration
+        let test_stream = TestStream {
+            special: MockWithNestedSelect {
+                rx1,
+                rx2,
+                counter: counter.clone(),
+            },
+        };
+        tokio::pin!(test_stream);
+
+        // Receive all messages
+        let mut received = Vec::new();
+        for iteration in 1..=10 {
+            tracing::info!("Iteration {}: Calling stream.next().await", iteration);
+
+            let msg = timeout(Duration::from_millis(100), test_stream.as_mut().next()).await;
+
+            match msg {
+                Ok(Some(msg)) => {
+                    if msg.contains("closed") {
+                        tracing::info!("Channel closed: {}", msg);
+                        // Continue to check if other channel has messages
+                        continue;
+                    }
+                    received.push(msg.clone());
+                    tracing::info!("✓ Received: {} (total: {})", msg, received.len());
+
+                    if received.len() >= 3 {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    tracing::info!("Stream ended");
+                    break;
+                }
+                Err(_) => {
+                    tracing::info!(
+                        "Timeout on iteration {} (received {} so far)",
+                        iteration,
+                        received.len()
+                    );
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            received.len(), 3,
+            "Stream with NESTED select should receive all messages! Got {} messages: {:?}",
+            received.len(), received
+        );
+
+        let final_counter = *counter.lock().unwrap();
+        assert_eq!(final_counter, 3, "Counter should be 3");
+
+        tracing::info!(
+            "✅ SUCCESS: Stream with NESTED select (like HandshakeHandler) maintains waker registration!"
+        );
+        tracing::info!("✅ Received all messages: {:?}", received);
+    }
+
+    /// Test the critical edge case: messages arrive with very tight timing
+    /// This simulates what happens in production when messages arrive rapidly
+    /// while the nested select is processing.
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_nested_select_concurrent_arrivals() {
+        use futures::StreamExt;
+
+        tracing::info!("=== Testing nested select with rapid concurrent arrivals ===");
+
+        struct MockWithNestedSelect {
+            rx1: tokio::sync::mpsc::Receiver<String>,
+            rx2: tokio::sync::mpsc::Receiver<String>,
+        }
+
+        impl MockWithNestedSelect {
+            async fn wait_for_event(&mut self) -> String {
+                tokio::select! {
+                    msg1 = self.rx1.recv() => {
+                        if let Some(msg) = msg1 {
+                            tracing::info!("Nested select: rx1 received '{}'", msg);
+                            format!("rx1:{}", msg)
+                        } else {
+                            "rx1:closed".to_string()
+                        }
+                    }
+                    msg2 = self.rx2.recv() => {
+                        if let Some(msg) = msg2 {
+                            tracing::info!("Nested select: rx2 received '{}'", msg);
+                            format!("rx2:{}", msg)
+                        } else {
+                            "rx2:closed".to_string()
+                        }
+                    }
+                }
+            }
+        }
+
+        struct TestStream {
+            special: MockWithNestedSelect,
+        }
+
+        impl Stream for TestStream {
+            type Item = String;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                let fut = self.special.wait_for_event();
+                tokio::pin!(fut);
+                match fut.poll(cx) {
+                    Poll::Ready(msg) => Poll::Ready(Some(msg)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+
+        let (tx1, rx1) = mpsc::channel::<String>(10);
+        let (tx2, rx2) = mpsc::channel::<String>(10);
+
+        let test_stream = TestStream {
+            special: MockWithNestedSelect { rx1, rx2 },
+        };
+        tokio::pin!(test_stream);
+
+        // STRESS TEST: 1000 messages (100x more than original)
+        // Spawn a sender that rapidly sends messages alternating between channels
+        const MESSAGE_COUNT: usize = 1000;
+        tokio::spawn(async move {
+            for i in 0..MESSAGE_COUNT {
+                // Send to alternating channels with minimal delay
+                if i % 2 == 0 {
+                    if i % 100 == 0 {
+                        tracing::info!("Sending msg{} to rx1 ({} sent)", i, i);
+                    }
+                    tx1.send(format!("msg{}", i)).await.unwrap();
+                } else {
+                    if i % 100 == 0 {
+                        tracing::info!("Sending msg{} to rx2 ({} sent)", i, i);
+                    }
+                    tx2.send(format!("msg{}", i)).await.unwrap();
+                }
+                // Tiny delay to allow some interleaving and race conditions
+                sleep(Duration::from_micros(10)).await;
+            }
+            tracing::info!("Sender finished: sent all {} messages", MESSAGE_COUNT);
+        });
+
+        // Receive all messages - if wakers are maintained, we should get all 1000
+        let mut received = Vec::new();
+        for iteration in 0..(MESSAGE_COUNT + 100) {
+            match timeout(Duration::from_millis(100), test_stream.as_mut().next()).await {
+                Ok(Some(msg)) => {
+                    if !msg.contains("closed") {
+                        received.push(msg);
+                        if received.len() % 100 == 0 {
+                            tracing::info!("Received {} of {} messages", received.len(), MESSAGE_COUNT);
+                        }
+                    }
+                    if received.len() >= MESSAGE_COUNT {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::info!("Timeout on iteration {} after receiving {} messages", iteration, received.len());
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            received.len(), MESSAGE_COUNT,
+            "Should receive all {} messages even with rapid arrivals! Got {}. First 10: {:?}, Last 10: {:?}",
+            MESSAGE_COUNT, received.len(),
+            &received[..received.len().min(10)],
+            &received[received.len().saturating_sub(10)..]
+        );
+
+        tracing::info!("✅ SUCCESS: All {} rapid messages received!", MESSAGE_COUNT);
+        tracing::info!("✅ Nested select with stream maintains waker registration under high concurrent load!");
+    }
+
 }
