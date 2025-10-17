@@ -1412,4 +1412,130 @@ mod tests {
             _ => panic!("Unexpected result"),
         }
     }
+
+    /// Test that reproduces the lost wakeup race condition from issue #1932
+    ///
+    /// This test demonstrates the bug where recreating PrioritySelectFuture on every
+    /// iteration loses waker registration, causing messages to be missed.
+    ///
+    /// Currently IGNORED because it fails (demonstrates the bug).
+    /// Will PASS after implementing persistent futures fix.
+    #[ignore = "Demonstrates issue #1932 - lost wakeup race. Remove ignore after fix."]
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_sparse_messages_reproduce_race() {
+        tracing::info!("=== Testing sparse messages (should expose race condition) ===");
+
+        let (notif_tx, mut notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(1);
+        let (_, mut op_rx) = mpsc::channel(1);
+        let mut peers = FuturesUnordered::new();
+        let (_, mut bridge_rx) = mpsc::channel(1);
+        let (_, mut node_rx) = mpsc::channel(1);
+        let (_, _client_rx) = mpsc::channel::<
+            Result<
+                (
+                    crate::client_events::ClientId,
+                    crate::contract::WaitingTransaction,
+                ),
+                anyhow::Error,
+            >,
+        >(1);
+        let (_, _executor_rx) = mpsc::channel::<Result<Transaction, anyhow::Error>>(1);
+
+        // Spawn sender that sends 5 messages with 200ms gaps
+        let sender = tokio::spawn(async move {
+            for i in 0..5 {
+                sleep(Duration::from_millis(200)).await;
+                tracing::info!(
+                    "Sender: Sending message {} at {:?}",
+                    i,
+                    std::time::Instant::now()
+                );
+                let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
+                    crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
+                ));
+                match notif_tx.send(Either::Left(test_msg)).await {
+                    Ok(_) => tracing::info!("Sender: Message {} sent successfully", i),
+                    Err(e) => {
+                        tracing::error!("Sender: Failed to send message {}: {:?}", i, e);
+                        break;
+                    }
+                }
+            }
+            tracing::info!("Sender: Finished sending all messages");
+        });
+
+        let mut received = 0;
+        let mut iteration = 0;
+
+        // Receiver recreates futures every iteration (mimics production bug)
+        while received < 5 && iteration < 20 {
+            iteration += 1;
+            tracing::info!("Iteration {}: Creating new PrioritySelectFuture", iteration);
+
+            // Create new channels for this iteration to avoid borrow issues
+            let (_, mut client_rx_iter) = mpsc::channel::<
+                Result<
+                    (
+                        crate::client_events::ClientId,
+                        crate::contract::WaitingTransaction,
+                    ),
+                    anyhow::Error,
+                >,
+            >(1);
+            let (_, mut executor_rx_iter) = mpsc::channel::<Result<Transaction, anyhow::Error>>(1);
+
+            let select_fut = PrioritySelectFuture::new(
+                Box::pin(notif_rx.recv()), // NEW future every iteration
+                Box::pin(op_rx.recv()),
+                &mut peers,
+                Box::pin(bridge_rx.recv()),
+                Box::pin(async {
+                    sleep(Duration::from_secs(1000)).await;
+                    Err(HandshakeError::ChannelClosed)
+                }),
+                Box::pin(node_rx.recv()),
+                Box::pin(async move {
+                    client_rx_iter
+                        .recv()
+                        .await
+                        .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
+                }),
+                Box::pin(async move {
+                    executor_rx_iter
+                        .recv()
+                        .await
+                        .unwrap_or_else(|| Err(anyhow::anyhow!("closed")))
+                }),
+            );
+
+            match timeout(Duration::from_millis(300), select_fut).await {
+                Ok(SelectResult::Notification(Some(_))) => {
+                    received += 1;
+                    tracing::info!(
+                        "Iteration {}: Received message {} of 5",
+                        iteration,
+                        received
+                    );
+                }
+                Ok(_) => {
+                    tracing::debug!("Iteration {}: Got other event", iteration);
+                }
+                Err(_) => {
+                    tracing::warn!("Iteration {}: Timeout waiting for message", iteration);
+                }
+            }
+        }
+
+        // Wait for sender to finish
+        sender.await.unwrap();
+        tracing::info!("Sender task completed, received {} messages", received);
+
+        assert_eq!(
+            received, 5,
+            "Lost wakeup race! Expected 5 messages but only received {} in {} iterations.\n\
+             This demonstrates the bug: messages were sent but wakers were lost when futures were recreated.",
+            received, iteration
+        );
+    }
 }
