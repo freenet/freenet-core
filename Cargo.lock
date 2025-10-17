@@ -1744,6 +1744,7 @@ dependencies = [
  "testresult",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite 0.27.0",
  "toml",
  "tower-http",
