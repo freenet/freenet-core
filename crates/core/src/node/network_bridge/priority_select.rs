@@ -138,6 +138,12 @@ where
     handshake_handler: H,
     client_wait_for_transaction: C,
     executor_listener: E,
+
+    // Track which channels have been reported as closed (to avoid infinite loop of closure notifications)
+    notification_closed: bool,
+    op_execution_closed: bool,
+    conn_bridge_closed: bool,
+    node_controller_closed: bool,
 }
 
 impl<H, C, E> PrioritySelectStream<H, C, E>
@@ -170,6 +176,10 @@ where
             handshake_handler,
             client_wait_for_transaction,
             executor_listener,
+            notification_closed: false,
+            op_execution_closed: false,
+            conn_bridge_closed: false,
+            node_controller_closed: false,
         }
     }
 
@@ -193,22 +203,41 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
+        // Track if any channel closed (to report after checking all sources)
+        let mut first_closed_channel: Option<SelectResult> = None;
+
         // Priority 1: Notification channel (highest priority)
-        match Pin::new(&mut this.notification).poll_next(cx) {
-            Poll::Ready(Some(msg)) => {
-                return Poll::Ready(Some(SelectResult::Notification(Some(msg))))
+        if !this.notification_closed {
+            match Pin::new(&mut this.notification).poll_next(cx) {
+                Poll::Ready(Some(msg)) => {
+                    return Poll::Ready(Some(SelectResult::Notification(Some(msg))))
+                }
+                Poll::Ready(None) => {
+                    // Channel closed - record it and mark as closed to avoid re-polling
+                    this.notification_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::Notification(None));
+                    }
+                }
+                Poll::Pending => {}
             }
-            Poll::Ready(None) => {} // Channel closed
-            Poll::Pending => {}
         }
 
         // Priority 2: Op execution
-        match Pin::new(&mut this.op_execution).poll_next(cx) {
-            Poll::Ready(Some(msg)) => {
-                return Poll::Ready(Some(SelectResult::OpExecution(Some(msg))))
+        if !this.op_execution_closed {
+            match Pin::new(&mut this.op_execution).poll_next(cx) {
+                Poll::Ready(Some(msg)) => {
+                    return Poll::Ready(Some(SelectResult::OpExecution(Some(msg))))
+                }
+                Poll::Ready(None) => {
+                    // Channel closed - record it and mark as closed to avoid re-polling
+                    this.op_execution_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::OpExecution(None));
+                    }
+                }
+                Poll::Pending => {}
             }
-            Poll::Ready(None) => {}
-            Poll::Pending => {}
         }
 
         // Priority 3: Peer connections (only if not empty)
@@ -220,12 +249,20 @@ where
         }
 
         // Priority 4: Connection bridge
-        match Pin::new(&mut this.conn_bridge).poll_next(cx) {
-            Poll::Ready(Some(msg)) => {
-                return Poll::Ready(Some(SelectResult::ConnBridge(Some(msg))))
+        if !this.conn_bridge_closed {
+            match Pin::new(&mut this.conn_bridge).poll_next(cx) {
+                Poll::Ready(Some(msg)) => {
+                    return Poll::Ready(Some(SelectResult::ConnBridge(Some(msg))))
+                }
+                Poll::Ready(None) => {
+                    // Channel closed - record it and mark as closed to avoid re-polling
+                    this.conn_bridge_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::ConnBridge(None));
+                    }
+                }
+                Poll::Pending => {}
             }
-            Poll::Ready(None) => {}
-            Poll::Pending => {}
         }
 
         // Priority 5: Handshake handler
@@ -238,12 +275,20 @@ where
         }
 
         // Priority 6: Node controller
-        match Pin::new(&mut this.node_controller).poll_next(cx) {
-            Poll::Ready(Some(msg)) => {
-                return Poll::Ready(Some(SelectResult::NodeController(Some(msg))))
+        if !this.node_controller_closed {
+            match Pin::new(&mut this.node_controller).poll_next(cx) {
+                Poll::Ready(Some(msg)) => {
+                    return Poll::Ready(Some(SelectResult::NodeController(Some(msg))))
+                }
+                Poll::Ready(None) => {
+                    // Channel closed - record it and mark as closed to avoid re-polling
+                    this.node_controller_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::NodeController(None));
+                    }
+                }
+                Poll::Pending => {}
             }
-            Poll::Ready(None) => {}
-            Poll::Pending => {}
         }
 
         // Priority 7: Client transaction
@@ -266,6 +311,11 @@ where
                 return Poll::Ready(Some(SelectResult::ExecutorTransaction(result)))
             }
             Poll::Pending => {}
+        }
+
+        // If a channel closed and nothing else is ready, report the closure
+        if let Some(closed) = first_closed_channel {
+            return Poll::Ready(Some(closed));
         }
 
         // All pending
