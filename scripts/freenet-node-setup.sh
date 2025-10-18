@@ -4,12 +4,12 @@
 # Check if required parameters are provided
 if [ -z "$1" ]; then
     echo "Usage: $0 <name> [ws-api-port]"
-    echo "Example: $0 my-node 50509"
+    echo "Example: $0 my-node 7509"
     exit 1
 fi
 
 NAME="$1"
-WS_API_PORT="${3:-50509}"
+WS_API_PORT="${3:-7509}"
 
 # Base Setup
 FREENET_DIR=~/freenet

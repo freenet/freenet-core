@@ -41,7 +41,7 @@ COPY freenet-node-startup.sh /usr/local/bin/freenet-node-startup.sh
 RUN chmod +x /usr/local/bin/freenet-node-startup.sh
 
 # Expose default WebSocket API port
-EXPOSE 50509
+EXPOSE 7509
 
 # Use the startup script as the entrypoint
 CMD ["/usr/local/bin/freenet-node-startup.sh"]
