@@ -47,9 +47,6 @@ pub mod util;
 /// WASM code execution runtime, tailored for the contract and delegate APIs.
 mod wasm_runtime;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod probestack;
-
 /// Exports to build a running local node.
 pub mod local_node {
     use super::*;
