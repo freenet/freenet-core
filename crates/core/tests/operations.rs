@@ -792,30 +792,33 @@ async fn test_multiple_clients_subscription() -> TestResult {
         }
 
         // Third client gets the contract from node C (without subscribing)
-        // Add delay to allow contract to propagate from Node A to Node B/C
-        tracing::info!("Waiting 5 seconds for contract to propagate across nodes...");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        tracing::info!(
-            "Client 3: Sending GET request for contract {} to Node B",
-            contract_key
-        );
+        // Poll until node B establishes ring connections before attempting GET
+        tracing::info!("Waiting for Node B to establish ring connections...");
+        let connectivity_start = std::time::Instant::now();
+        let mut retry_count = 0;
         let get_start = std::time::Instant::now();
-        make_get(&mut client_api_node_b, contract_key, true, false).await?;
 
-        // Wait for get response on third client
-        // Note: Contract propagation from Node A to Node B can take 5-10s locally, longer in CI
+        // Keep trying GET until we get a response (successful or failed, but NOT "no connections")
         loop {
-            let resp =
-                tokio::time::timeout(Duration::from_secs(60), client_api_node_b.recv()).await;
-            match resp {
+            tracing::info!(
+                "Client 3: Sending GET request for contract {} to Node B (attempt {})",
+                contract_key,
+                retry_count + 1
+            );
+            make_get(&mut client_api_node_b, contract_key, true, false).await?;
+
+            match tokio::time::timeout(Duration::from_secs(10), client_api_node_b.recv()).await {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                     key,
                     contract: Some(_),
                     state: _,
                 }))) => {
                     let elapsed = get_start.elapsed();
-                    tracing::info!("Client 3: Received GET response after {:?}", elapsed);
+                    tracing::info!(
+                        "Client 3: Received GET response after {:?} ({} retries)",
+                        elapsed,
+                        retry_count
+                    );
                     assert_eq!(
                         key, contract_key,
                         "Contract key mismatch in GET response for client 3"
@@ -827,17 +830,52 @@ async fn test_multiple_clients_subscription() -> TestResult {
                         "Client 3: unexpected response while waiting for get: {:?}",
                         other
                     );
+                    continue;
                 }
                 Ok(Err(e)) => {
-                    bail!("Client 3: Error receiving get response: {}", e);
+                    let error_msg = e.to_string();
+                    if error_msg.contains("No ring connections found") {
+                        retry_count += 1;
+                        if retry_count > 24 {
+                            // 24 retries * 5s = 120s max wait
+                            bail!(
+                                "Node B failed to establish ring connections after {:?} and {} retries",
+                                connectivity_start.elapsed(),
+                                retry_count
+                            );
+                        }
+                        tracing::info!(
+                            "Node B not yet connected (retry {}/24), waiting 5s... (elapsed: {:?})",
+                            retry_count,
+                            connectivity_start.elapsed()
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    } else {
+                        // Some other error - not a connectivity issue, fail the test
+                        bail!("Client 3: Error receiving get response: {}", e);
+                    }
                 }
                 Err(_) => {
-                    let elapsed = get_start.elapsed();
-                    bail!("Client 3: Timeout waiting for get response after {:?}. Contract may not have propagated from Node A to Node B", elapsed);
+                    retry_count += 1;
+                    if retry_count > 24 {
+                        bail!(
+                            "Client 3: Timeout waiting for GET response after {:?} and {} retries",
+                            connectivity_start.elapsed(),
+                            retry_count
+                        );
+                    }
+                    tracing::info!(
+                        "Client 3: Timeout waiting for GET response (retry {}/24), retrying...",
+                        retry_count
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
                 }
             }
         }
 
+        // Client 3 has now successfully retrieved the contract - proceed with subscribing
         // Explicitly subscribe client 3 to the contract using make_subscribe
         make_subscribe(&mut client_api_node_b, contract_key).await?;
 
