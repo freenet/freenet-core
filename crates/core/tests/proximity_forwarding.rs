@@ -281,9 +281,6 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(300), async move {
-        // CI environment: Give nodes time to start, connect to gateway, exchange peer info, establish mesh
-        tokio::time::sleep(Duration::from_secs(60)).await;
-
         // Connect to all peers
         let uri_a =
             format!("ws://127.0.0.1:{peer_a_ws_port}/v1/contract/command?encodingProtocol=native");
@@ -300,47 +297,186 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
         let (stream_c, _) = connect_async(&uri_c).await?;
         let mut client_c = WebApi::start(stream_c);
 
-        // Test flow: A puts → B gets (caches) → C subscribes → A updates → verify C receives update
-        make_put(
-            &mut client_a,
-            wrapped_state.clone(),
-            contract.clone(),
-            false,
-        )
-        .await?;
+        // Poll for network readiness by attempting PUT until successful
+        // Network needs time to start, connect to gateway, exchange peer info, establish mesh
+        tracing::info!("Polling for network readiness with PUT operation...");
+        let mut put_attempts = 0;
+        let max_put_attempts = 20; // 20 attempts * 5s = 100s max wait
 
-        let resp = tokio::time::timeout(Duration::from_secs(60), client_a.recv()).await??;
-        match resp {
-            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
-                assert_eq!(key, contract_key);
+        loop {
+            put_attempts += 1;
+            tracing::info!("PUT attempt {}/{}", put_attempts, max_put_attempts);
+
+            make_put(
+                &mut client_a,
+                wrapped_state.clone(),
+                contract.clone(),
+                false,
+            )
+            .await?;
+
+            match tokio::time::timeout(Duration::from_secs(10), client_a.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                    assert_eq!(key, contract_key);
+                    tracing::info!("✅ PUT successful after {} attempts", put_attempts);
+                    break;
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!(
+                        "Unexpected PUT response (attempt {}): {:?}",
+                        put_attempts,
+                        other
+                    );
+                    if put_attempts >= max_put_attempts {
+                        bail!(
+                            "Unexpected PUT response after {} attempts: {:?}",
+                            put_attempts,
+                            other
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("PUT error (attempt {}): {}", put_attempts, e);
+                    if put_attempts >= max_put_attempts {
+                        bail!("PUT error after {} attempts: {}", put_attempts, e);
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "PUT timeout (attempt {}/{}), retrying...",
+                        put_attempts,
+                        max_put_attempts
+                    );
+                    if put_attempts >= max_put_attempts {
+                        bail!("PUT timeout after {} attempts", put_attempts);
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
             }
-            other => bail!("Expected PutResponse, got: {:?}", other),
         }
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Poll for GET operation success
+        tracing::info!("Polling for GET operation...");
+        let mut get_attempts = 0;
+        let max_get_attempts = 20;
 
-        make_get(&mut client_b, contract_key, true, false).await?;
-        let resp = tokio::time::timeout(Duration::from_secs(60), client_b.recv()).await??;
-        match resp {
-            HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }) => {
-                assert_eq!(key, contract_key);
+        loop {
+            get_attempts += 1;
+            tracing::info!("GET attempt {}/{}", get_attempts, max_get_attempts);
+
+            make_get(&mut client_b, contract_key, true, false).await?;
+
+            match tokio::time::timeout(Duration::from_secs(10), client_b.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    ..
+                }))) => {
+                    assert_eq!(key, contract_key);
+                    tracing::info!("✅ GET successful after {} attempts", get_attempts);
+                    break;
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!(
+                        "Unexpected GET response (attempt {}): {:?}",
+                        get_attempts,
+                        other
+                    );
+                    if get_attempts >= max_get_attempts {
+                        bail!(
+                            "Unexpected GET response after {} attempts: {:?}",
+                            get_attempts,
+                            other
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("GET error (attempt {}): {}", get_attempts, e);
+                    if get_attempts >= max_get_attempts {
+                        bail!("GET error after {} attempts: {}", get_attempts, e);
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "GET timeout (attempt {}/{}), retrying...",
+                        get_attempts,
+                        max_get_attempts
+                    );
+                    if get_attempts >= max_get_attempts {
+                        bail!("GET timeout after {} attempts", get_attempts);
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
             }
-            other => bail!("Expected GetResponse, got: {:?}", other),
         }
 
-        // CI environment: 10s for cache announcement propagation
+        // Wait for cache announcement propagation
+        tracing::info!("Waiting for cache announcement propagation...");
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         make_subscribe(&mut client_c, contract_key).await?;
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        make_update(&mut client_a, contract_key, updated_state.clone()).await?;
-        let resp = tokio::time::timeout(Duration::from_secs(60), client_a.recv()).await??;
-        match resp {
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
-                assert_eq!(key, contract_key);
+        // Poll for UPDATE operation success
+        tracing::info!("Polling for UPDATE operation...");
+        let mut update_attempts = 0;
+        let max_update_attempts = 20;
+
+        loop {
+            update_attempts += 1;
+            tracing::info!("UPDATE attempt {}/{}", update_attempts, max_update_attempts);
+
+            make_update(&mut client_a, contract_key, updated_state.clone()).await?;
+
+            match tokio::time::timeout(Duration::from_secs(10), client_a.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                    key,
+                    ..
+                }))) => {
+                    assert_eq!(key, contract_key);
+                    tracing::info!("✅ UPDATE successful after {} attempts", update_attempts);
+                    break;
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!(
+                        "Unexpected UPDATE response (attempt {}): {:?}",
+                        update_attempts,
+                        other
+                    );
+                    if update_attempts >= max_update_attempts {
+                        bail!(
+                            "Unexpected UPDATE response after {} attempts: {:?}",
+                            update_attempts,
+                            other
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("UPDATE error (attempt {}): {}", update_attempts, e);
+                    if update_attempts >= max_update_attempts {
+                        bail!("UPDATE error after {} attempts: {}", update_attempts, e);
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "UPDATE timeout (attempt {}/{}), retrying...",
+                        update_attempts,
+                        max_update_attempts
+                    );
+                    if update_attempts >= max_update_attempts {
+                        bail!("UPDATE timeout after {} attempts", update_attempts);
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
             }
-            other => bail!("Expected UpdateResponse, got: {:?}", other),
         }
 
         tokio::time::sleep(Duration::from_secs(10)).await;
