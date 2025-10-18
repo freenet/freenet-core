@@ -1265,6 +1265,18 @@ pub(crate) mod tracer {
         level: Option<LevelFilter>,
         _endpoint: Option<String>,
     ) -> anyhow::Result<()> {
+        // Initialize console subscriber if enabled
+        #[cfg(feature = "console-subscriber")]
+        {
+            if std::env::var("TOKIO_CONSOLE").is_ok() {
+                console_subscriber::init();
+                println!(
+                    "Tokio console subscriber initialized. Connect with 'tokio-console' command."
+                );
+                return Ok(());
+            }
+        }
+
         let default_filter = if cfg!(any(test, debug_assertions)) {
             LevelFilter::DEBUG
         } else {

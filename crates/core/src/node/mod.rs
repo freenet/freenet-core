@@ -875,8 +875,17 @@ where
                 .await;
             }
             NetMessageV1::Put(ref op) => {
+                tracing::debug!(
+                    tx = %op.id(),
+                    "handle_pure_network_message_v1: Processing PUT message"
+                );
                 let op_result =
                     handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
+                tracing::debug!(
+                    tx = %op.id(),
+                    op_result_ok = op_result.is_ok(),
+                    "handle_pure_network_message_v1: PUT handle_op_request completed"
+                );
 
                 // Handle pending operation results (network concern)
                 if is_operation_completed(&op_result) {

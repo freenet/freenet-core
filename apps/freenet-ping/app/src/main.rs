@@ -15,7 +15,7 @@ use ping_client::{
 
 #[derive(clap::Parser)]
 struct Args {
-    #[clap(long, default_value = "localhost:50509")]
+    #[clap(long, default_value = "localhost:7509")]
     host: String,
     #[clap(long, default_value = "info")]
     log_level: tracing::level_filters::LevelFilter,

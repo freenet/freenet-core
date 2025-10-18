@@ -612,7 +612,7 @@ pub struct WebsocketApiArgs {
     #[serde(rename = "ws-api-address", skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
 
-    /// Port to expose the websocket on, default is 50509
+    /// Port to expose the websocket on, default is 7509
     #[arg(long, env = "WS_API_PORT")]
     #[serde(rename = "ws-api-port", skip_serializing_if = "Option::is_none")]
     pub ws_api_port: Option<u16>,
@@ -660,7 +660,7 @@ const fn default_local_address() -> IpAddr {
 
 #[inline]
 const fn default_http_gateway_port() -> u16 {
-    50509
+    7509
 }
 
 #[derive(clap::Parser, Default, Debug, Clone, Serialize, Deserialize)]

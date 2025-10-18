@@ -7,7 +7,7 @@ use dashmap::DashSet;
 use either::{Either, Left, Right};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -18,7 +18,6 @@ use std::{
     sync::Arc,
 };
 use tokio::net::UdpSocket;
-use tokio::select;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::oneshot::{self};
 use tokio::time::timeout;
@@ -28,6 +27,7 @@ use crate::node::network_bridge::handshake::{
     Event as HandshakeEvent, ForwardInfo, HandshakeError, HandshakeHandler, HanshakeHandlerMsg,
     OutboundMessage,
 };
+use crate::node::network_bridge::priority_select;
 use crate::node::{MessageProcessor, PeerId};
 use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
 use crate::transport::{
@@ -173,7 +173,13 @@ impl P2pConnManager {
         mut executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         mut node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
-        tracing::info!(%self.listening_port, %self.listening_ip, %self.is_gateway, key = %self.key_pair.public(), "Opening network listener");
+        tracing::info!(
+            %self.listening_port,
+            %self.listening_ip,
+            %self.is_gateway,
+            key = %self.key_pair.public(),
+            "Opening network listener - will receive from channel"
+        );
 
         let mut state = EventListenerState::new();
 
@@ -206,6 +212,8 @@ impl P2pConnManager {
             );
 
         loop {
+            // Use custom priority select combinator for explicit waker control
+            // This fixes waker registration issues that occurred with nested tokio::select!
             let event = self
                 .wait_for_event(
                     &mut state,
@@ -691,59 +699,109 @@ impl P2pConnManager {
         ))
     }
 
+    /// Wait for next event using custom priority select combinator.
+    /// This implementation uses explicit waker control to fix waker registration issues.
     #[allow(clippy::too_many_arguments)]
     async fn wait_for_event(
         &mut self,
         state: &mut EventListenerState,
         handshake_handler: &mut HandshakeHandler,
-        handshake_handler_msg: &HanshakeHandlerMsg, // already passed here
+        handshake_handler_msg: &HanshakeHandlerMsg,
         notification_channel: &mut EventLoopNotificationsReceiver,
         node_controller: &mut Receiver<NodeEvent>,
         client_wait_for_transaction: &mut ContractHandlerChannel<WaitingResolution>,
         executor_listener: &mut ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     ) -> anyhow::Result<EventResult> {
-        // IMPORTANT: notification_channel MUST come first to prevent starvation
-        // in busy networks where peer_connections is constantly ready.
-        // We use `biased;` to force sequential polling in source order, ensuring
-        // notification_channel is ALWAYS checked first before peer_connections.
-        select! {
-            biased;
-            // Process internal notifications FIRST - these drive operation state machines
-            msg = notification_channel.notifications_receiver.recv() => {
+        let peer_id = &self.bridge.op_manager.ring.connection_manager.pub_key;
+
+        tracing::debug!(
+            peer = %peer_id,
+            "wait_for_event: using custom priority select combinator"
+        );
+
+        let result = priority_select::select_priority(
+            &mut notification_channel.notifications_receiver,
+            &mut notification_channel.op_execution_receiver,
+            &mut state.peer_connections,
+            &mut self.conn_bridge_rx,
+            handshake_handler,
+            node_controller,
+            client_wait_for_transaction,
+            executor_listener,
+        )
+        .await;
+
+        use priority_select::SelectResult;
+        match result {
+            SelectResult::Notification(msg) => {
+                tracing::debug!(
+                    peer = %peer_id,
+                    msg_present = msg.is_some(),
+                    "PrioritySelect: notifications_receiver READY"
+                );
                 Ok(self.handle_notification_msg(msg))
             }
-            msg = notification_channel.op_execution_receiver.recv() => {
+            SelectResult::OpExecution(msg) => {
+                tracing::debug!(
+                    peer = %peer_id,
+                    "PrioritySelect: op_execution_receiver READY"
+                );
                 Ok(self.handle_op_execution(msg, state))
             }
-            // Network messages come after internal notifications
-            msg = state.peer_connections.next(), if !state.peer_connections.is_empty() => {
-                self.handle_peer_connection_msg(msg, state, handshake_handler_msg).await
+            SelectResult::PeerConnection(msg) => {
+                tracing::debug!(
+                    peer = %peer_id,
+                    num_connections = state.peer_connections.len(),
+                    "PrioritySelect: peer_connections READY"
+                );
+                self.handle_peer_connection_msg(msg, state, handshake_handler_msg)
+                    .await
             }
-            msg = self.conn_bridge_rx.recv() => {
+            SelectResult::ConnBridge(msg) => {
+                tracing::debug!(
+                    peer = %peer_id,
+                    "PrioritySelect: conn_bridge_rx READY"
+                );
                 Ok(self.handle_bridge_msg(msg))
             }
-            handshake_event_res = handshake_handler.wait_for_events() => {
-                match handshake_event_res {
+            SelectResult::Handshake(result) => {
+                tracing::debug!(
+                    peer = %peer_id,
+                    "PrioritySelect: handshake event READY"
+                );
+                match result {
                     Ok(event) => {
-                        self.handle_handshake_action(event, state, handshake_handler_msg).await?;
+                        self.handle_handshake_action(event, state, handshake_handler_msg)
+                            .await?;
                         Ok(EventResult::Continue)
                     }
-                    Err(HandshakeError::ChannelClosed) => Ok(EventResult::Event(
-                        ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
-                    )),
-                    Err(e) => {
-                        tracing::warn!("Handshake error: {:?}", e);
-                        Ok(EventResult::Continue)
+                    Err(handshake_error) => {
+                        tracing::error!(?handshake_error, "Handshake handler error");
+                        Ok(EventResult::Event(
+                            ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
+                        ))
                     }
                 }
             }
-            msg = node_controller.recv() => {
+            SelectResult::NodeController(msg) => {
+                tracing::debug!(
+                    peer = %peer_id,
+                    "PrioritySelect: node_controller READY"
+                );
                 Ok(self.handle_node_controller_msg(msg))
             }
-            event_id = client_wait_for_transaction.relay_transaction_result_to_client() => {
+            SelectResult::ClientTransaction(event_id) => {
+                tracing::debug!(
+                    peer = %peer_id,
+                    "PrioritySelect: client_wait_for_transaction READY"
+                );
                 Ok(self.handle_client_transaction_subscription(event_id, state))
             }
-            id = executor_listener.transaction_from_executor() => {
+            SelectResult::ExecutorTransaction(id) => {
+                tracing::debug!(
+                    peer = %peer_id,
+                    "PrioritySelect: executor_listener READY"
+                );
                 Ok(self.handle_executor_transaction(id, state))
             }
         }
@@ -1142,8 +1200,18 @@ impl P2pConnManager {
 
     fn handle_notification_msg(&self, msg: Option<Either<NetMessage, NodeEvent>>) -> EventResult {
         match msg {
-            Some(Left(msg)) => EventResult::Event(ConnEvent::InboundMessage(msg).into()),
-            Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
+            Some(Left(msg)) => {
+                tracing::debug!(
+                    tx = %msg.id(),
+                    msg_type = %msg,
+                    "handle_notification_msg: Received NetMessage notification, converting to InboundMessage"
+                );
+                EventResult::Event(ConnEvent::InboundMessage(msg).into())
+            }
+            Some(Right(action)) => {
+                tracing::debug!("handle_notification_msg: Received NodeEvent notification");
+                EventResult::Event(ConnEvent::NodeAction(action).into())
+            }
             None => EventResult::Continue,
         }
     }
@@ -1305,7 +1373,7 @@ enum EventResult {
 }
 
 #[derive(Debug)]
-enum ConnEvent {
+pub(super) enum ConnEvent {
     InboundMessage(NetMessage),
     OutboundMessage(NetMessage),
     NodeAction(NodeEvent),
@@ -1313,7 +1381,7 @@ enum ConnEvent {
 }
 
 #[derive(Debug)]
-enum ChannelCloseReason {
+pub(super) enum ChannelCloseReason {
     /// Handshake channel closed - potentially transient, continue operation
     Handshake,
     /// Internal bridge channel closed - critical, must shutdown gracefully
@@ -1330,11 +1398,11 @@ enum ProtocolStatus {
     Failed,
 }
 
-struct PeerConnectionInbound {
-    conn: PeerConnection,
+pub(super) struct PeerConnectionInbound {
+    pub conn: PeerConnection,
     /// Receiver for inbound messages for the peer connection
-    rx: Receiver<Either<NetMessage, ConnEvent>>,
-    msg: NetMessage,
+    pub rx: Receiver<Either<NetMessage, ConnEvent>>,
+    pub msg: NetMessage,
 }
 
 async fn peer_connection_listener(
