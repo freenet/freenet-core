@@ -57,7 +57,7 @@ tokio-tungstenite = "0.27.0"
 tower-http = { features = ["fs", "trace"], version = "0.6" }
 ulid = { features = ["serde"], version = "1.1" }
 wasmer = { features = ["sys"], workspace = true }
-wasmer-middlewares = "5.0.4"
+wasmer-middlewares = "6.1.0"
 wasmer-compiler-singlepass = { workspace = true }
 xz2 = { version = "0.1" }
 reqwest = { version = "0.12", features = ["json"] }
