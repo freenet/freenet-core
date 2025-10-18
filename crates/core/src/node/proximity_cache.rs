@@ -12,11 +12,11 @@ use super::PeerId;
 
 /// Proximity cache manager - tracks what contracts this node and its neighbors are caching
 pub struct ProximityCacheManager {
-    /// Contracts we are caching locally (u32 hashes for efficiency)
-    my_cache: Arc<RwLock<HashSet<u32>>>,
+    /// Contracts we are caching locally
+    my_cache: Arc<RwLock<HashSet<ContractInstanceId>>>,
 
     /// What we know about our neighbors' caches
-    /// PeerId -> Set of contract hashes they're caching
+    /// PeerId -> Set of contract IDs they're caching
     neighbor_caches: Arc<DashMap<PeerId, NeighborCache>>,
 
     /// Statistics for monitoring
@@ -26,13 +26,13 @@ pub struct ProximityCacheManager {
     last_batch_announce: Arc<RwLock<Instant>>,
 
     /// Pending removals to be sent in the next batch announcement
-    pending_removals: Arc<RwLock<HashSet<u32>>>,
+    pending_removals: Arc<RwLock<HashSet<ContractInstanceId>>>,
 }
 
 #[derive(Clone, Debug)]
 struct NeighborCache {
-    /// Contract hashes this neighbor is caching
-    contracts: HashSet<u32>,
+    /// Contract IDs this neighbor is caching
+    contracts: HashSet<ContractInstanceId>,
     /// Last time we received an update from this neighbor
     last_update: Instant,
 }
@@ -53,14 +53,14 @@ pub enum ProximityCacheMessage {
     /// Announce contracts we're caching (immediate for additions, batched for removals)
     CacheAnnounce {
         /// Contracts we're now caching
-        added: Vec<u32>,
+        added: Vec<ContractInstanceId>,
         /// Contracts we're no longer caching
-        removed: Vec<u32>,
+        removed: Vec<ContractInstanceId>,
     },
     /// Request neighbor's cache state (for new connections)
     CacheStateRequest,
     /// Response with full cache state
-    CacheStateResponse { contracts: Vec<u32> },
+    CacheStateResponse { contracts: Vec<ContractInstanceId> },
 }
 
 impl ProximityCacheManager {
@@ -74,42 +74,28 @@ impl ProximityCacheManager {
         }
     }
 
-    /// Generate a u32 hash from a ContractInstanceId
-    fn hash_contract(contract_id: &ContractInstanceId) -> u32 {
-        // Use first 4 bytes of the ContractInstanceId as hash
-        let bytes = contract_id.as_bytes();
-        u32::from_le_bytes([
-            bytes.first().copied().unwrap_or(0),
-            bytes.get(1).copied().unwrap_or(0),
-            bytes.get(2).copied().unwrap_or(0),
-            bytes.get(3).copied().unwrap_or(0),
-        ])
-    }
-
     /// Called when we cache a new contract (PUT or successful GET)
     pub async fn on_contract_cached(
         &self,
         contract_key: &ContractKey,
     ) -> Option<ProximityCacheMessage> {
-        let hash = Self::hash_contract(contract_key.id());
+        let contract_id = *contract_key.id();
 
         let mut cache = self.my_cache.write().await;
-        if cache.insert(hash) {
+        if cache.insert(contract_id) {
             info!(
                 contract = %contract_key,
-                hash = hash,
                 "PROXIMITY_PROPAGATION: Added contract to cache"
             );
 
             // Immediate announcement for new cache entries
             Some(ProximityCacheMessage::CacheAnnounce {
-                added: vec![hash],
+                added: vec![contract_id],
                 removed: vec![],
             })
         } else {
             trace!(
                 contract = %contract_key,
-                hash = hash,
                 "PROXIMITY_PROPAGATION: Contract already in cache"
             );
             None
@@ -119,18 +105,17 @@ impl ProximityCacheManager {
     /// Called when we evict a contract from cache
     #[allow(dead_code)] // TODO: This will be called when contract eviction is implemented
     pub async fn on_contract_evicted(&self, contract_key: &ContractKey) {
-        let hash = Self::hash_contract(contract_key.id());
+        let contract_id = *contract_key.id();
 
         let mut cache = self.my_cache.write().await;
-        if cache.remove(&hash) {
+        if cache.remove(&contract_id) {
             debug!(
                 contract = %contract_key,
-                hash = hash,
                 "PROXIMITY_PROPAGATION: Removed contract from cache, adding to pending removals"
             );
             // Add to pending removals for batch processing
             let mut pending = self.pending_removals.write().await;
-            pending.insert(hash);
+            pending.insert(contract_id);
         }
     }
 
@@ -151,16 +136,16 @@ impl ProximityCacheManager {
                 self.neighbor_caches
                     .entry(peer_id.clone())
                     .and_modify(|cache| {
-                        for hash in &added {
-                            cache.contracts.insert(*hash);
+                        for contract_id in &added {
+                            cache.contracts.insert(*contract_id);
                         }
-                        for hash in &removed {
-                            cache.contracts.remove(hash);
+                        for contract_id in &removed {
+                            cache.contracts.remove(contract_id);
                         }
                         cache.last_update = Instant::now();
                     })
                     .or_insert_with(|| NeighborCache {
-                        contracts: added.iter().copied().collect(),
+                        contracts: added.iter().cloned().collect(),
                         last_update: Instant::now(),
                     });
 
@@ -177,7 +162,7 @@ impl ProximityCacheManager {
                 // Send our full cache state
                 let cache = self.my_cache.read().await;
                 let response = ProximityCacheMessage::CacheStateResponse {
-                    contracts: cache.iter().copied().collect(),
+                    contracts: cache.iter().cloned().collect(),
                 };
                 drop(cache);
 
@@ -225,11 +210,11 @@ impl ProximityCacheManager {
 
     /// Check if any neighbors might have this contract cached (for update forwarding)
     pub fn neighbors_with_contract(&self, contract_key: &ContractKey) -> Vec<PeerId> {
-        let hash = Self::hash_contract(contract_key.id());
+        let contract_id = contract_key.id();
 
         let mut neighbors = Vec::new();
         for entry in self.neighbor_caches.iter() {
-            if entry.value().contracts.contains(&hash) {
+            if entry.value().contracts.contains(contract_id) {
                 neighbors.push(entry.key().clone());
             }
         }
@@ -237,7 +222,6 @@ impl ProximityCacheManager {
         if !neighbors.is_empty() {
             debug!(
                 contract = %contract_key,
-                hash = hash,
                 neighbor_count = neighbors.len(),
                 "PROXIMITY_PROPAGATION: Found neighbors with contract"
             );
@@ -263,7 +247,7 @@ impl ProximityCacheManager {
             return None;
         }
 
-        let removals: Vec<u32> = pending.iter().copied().collect();
+        let removals: Vec<ContractInstanceId> = pending.iter().cloned().collect();
         pending.clear();
         drop(pending); // Release lock early
         drop(last_announce); // Release lock early
@@ -289,14 +273,19 @@ impl ProximityCacheManager {
     }
 
     /// Get introspection data for debugging
-    pub async fn get_introspection_data(&self) -> (Vec<u32>, HashMap<String, Vec<u32>>) {
-        let my_cache = self.my_cache.read().await.iter().copied().collect();
+    pub async fn get_introspection_data(
+        &self,
+    ) -> (
+        Vec<ContractInstanceId>,
+        HashMap<String, Vec<ContractInstanceId>>,
+    ) {
+        let my_cache = self.my_cache.read().await.iter().cloned().collect();
 
         let mut neighbor_data = HashMap::new();
         for entry in self.neighbor_caches.iter() {
             neighbor_data.insert(
                 entry.key().to_string(), // Convert PeerId to String for introspection
-                entry.value().contracts.iter().copied().collect(),
+                entry.value().contracts.iter().cloned().collect(),
             );
         }
 
@@ -508,10 +497,10 @@ mod tests {
         let contract_key = create_test_contract_key();
 
         // Add a contract to pending removals manually
-        let hash = ProximityCacheManager::hash_contract(contract_key.id());
+        let contract_id = *contract_key.id();
         {
             let mut pending = cache.pending_removals.write().await;
-            pending.insert(hash);
+            pending.insert(contract_id);
         }
 
         // Force time to pass for batch announcement
@@ -527,7 +516,7 @@ mod tests {
         if let Some(ProximityCacheMessage::CacheAnnounce { added, removed }) = announcement {
             assert!(added.is_empty());
             assert_eq!(removed.len(), 1);
-            assert_eq!(removed[0], hash);
+            assert_eq!(removed[0], contract_id);
         } else {
             panic!("Expected CacheAnnounce message");
         }
@@ -558,10 +547,10 @@ mod tests {
         let contract_key = create_test_contract_key();
 
         // Add a contract to pending removals
-        let hash = ProximityCacheManager::hash_contract(contract_key.id());
+        let contract_id = *contract_key.id();
         {
             let mut pending = cache.pending_removals.write().await;
-            pending.insert(hash);
+            pending.insert(contract_id);
         }
 
         // Try to generate batch announcement too soon - should be rate limited

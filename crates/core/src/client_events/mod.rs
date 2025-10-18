@@ -363,34 +363,62 @@ enum Error {
 async fn handle_proximity_cache_info_query(
     proximity_cache: &Arc<crate::node::proximity_cache::ProximityCacheManager>,
 ) -> freenet_stdlib::client_api::ProximityCacheInfo {
-    let (my_cache_hashes, neighbor_cache_data) = proximity_cache.get_introspection_data().await;
+    let (my_cache_contract_ids, neighbor_cache_data) =
+        proximity_cache.get_introspection_data().await;
     let stats = proximity_cache.get_stats().await;
 
-    let my_cache = my_cache_hashes
+    let my_cache = my_cache_contract_ids
         .into_iter()
-        .map(|hash| freenet_stdlib::client_api::ContractCacheEntry {
-            contract_key: format!("hash_{:08x}", hash),
-            cache_hash: hash,
-            cached_since: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+        .map(|contract_id| {
+            use freenet_stdlib::prelude::ContractKey;
+            let contract_key = ContractKey::from(contract_id);
+            // Use first 4 bytes for backwards-compatible cache_hash field
+            let bytes = contract_id.as_bytes();
+            let cache_hash = u32::from_le_bytes([
+                bytes.first().copied().unwrap_or(0),
+                bytes.get(1).copied().unwrap_or(0),
+                bytes.get(2).copied().unwrap_or(0),
+                bytes.get(3).copied().unwrap_or(0),
+            ]);
+
+            freenet_stdlib::client_api::ContractCacheEntry {
+                contract_key: contract_key.to_string(),
+                cache_hash,
+                cached_since: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            }
         })
         .collect();
 
     let neighbor_caches: Vec<_> = neighbor_cache_data
         .into_iter()
-        .map(
-            |(peer_id, contracts)| freenet_stdlib::client_api::NeighborCacheInfo {
+        .map(|(peer_id, contract_ids)| {
+            // Convert ContractInstanceIds to u32 hashes for backwards compatibility
+            let known_contracts = contract_ids
+                .into_iter()
+                .map(|contract_id| {
+                    let bytes = contract_id.as_bytes();
+                    u32::from_le_bytes([
+                        bytes.first().copied().unwrap_or(0),
+                        bytes.get(1).copied().unwrap_or(0),
+                        bytes.get(2).copied().unwrap_or(0),
+                        bytes.get(3).copied().unwrap_or(0),
+                    ])
+                })
+                .collect();
+
+            freenet_stdlib::client_api::NeighborCacheInfo {
                 peer_id,
-                known_contracts: contracts,
+                known_contracts,
                 last_update: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
                 update_count: 1,
-            },
-        )
+            }
+        })
         .collect();
 
     let total_neighbors = neighbor_caches.len();
