@@ -43,6 +43,47 @@ jobs:
       - name: Test
         run: cargo test --workspace --no-default-features --features trace,websocket,redb
 
+  ubertest:
+    name: Ubertest
+    needs: test_all
+    # TODO: Re-enable when ubertest is stable - currently failing
+    if: false
+
+    runs-on: freenet-default-runner
+
+    env:
+      FREENET_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      UBERTEST_PEER_COUNT: 6  # Fewer peers for faster CI
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        if: success() || steps.test.conclusion == 'failure'
+        with:
+          save-if: false
+
+      - name: Install riverctl
+        run: cargo install riverctl
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run Ubertest
+        run: cargo test --test ubertest --no-default-features --features trace,websocket,redb
+        working-directory: crates/core
+
   clippy_check:
     name: Clippy
 

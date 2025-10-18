@@ -97,17 +97,36 @@ impl Operation for PutOp {
         };
 
         let tx = *msg.id();
+        tracing::debug!(
+            tx = %tx,
+            msg_type = %msg,
+            "PutOp::load_or_init: Attempting to load or initialize operation"
+        );
+
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Put(put_op))) => {
                 // was an existing operation, the other peer messaged back
+                tracing::debug!(
+                    tx = %tx,
+                    state = %put_op.state.as_ref().map(|s| format!("{:?}", s)).unwrap_or_else(|| "None".to_string()),
+                    "PutOp::load_or_init: Found existing PUT operation"
+                );
                 Ok(OpInitialization { op: put_op, sender })
             }
             Ok(Some(op)) => {
+                tracing::warn!(
+                    tx = %tx,
+                    "PutOp::load_or_init: Found operation with wrong type, pushing back"
+                );
                 let _ = op_manager.push(tx, op).await;
                 Err(OpError::OpNotPresent(tx))
             }
             Ok(None) => {
                 // new request to put a new value for a contract, initialize the machine
+                tracing::debug!(
+                    tx = %tx,
+                    "PutOp::load_or_init: No existing operation found, initializing new ReceivedRequest"
+                );
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(PutState::ReceivedRequest),
@@ -116,7 +135,14 @@ impl Operation for PutOp {
                     sender,
                 })
             }
-            Err(err) => Err(err.into()),
+            Err(err) => {
+                tracing::error!(
+                    tx = %tx,
+                    error = %err,
+                    "PutOp::load_or_init: Error popping operation"
+                );
+                Err(err.into())
+            }
         }
     }
 

@@ -341,12 +341,8 @@ async fn test_update_contract() -> TestResult {
     tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
     tracing::info!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
 
-    // Free ports so they don't fail on initialization
-    std::mem::drop(ws_api_port_socket_a);
-    std::mem::drop(network_socket_b);
-    std::mem::drop(ws_api_port_socket_b);
-
     // Start node A (client)
+    std::mem::drop(ws_api_port_socket_a); // Free the port so it does not fail on initialization
     let node_a = async move {
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -358,6 +354,8 @@ async fn test_update_contract() -> TestResult {
     .boxed_local();
 
     // Start node B (gateway)
+    std::mem::drop(network_socket_b); // Free the port so it does not fail on initialization
+    std::mem::drop(ws_api_port_socket_b);
     let node_b = async {
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())

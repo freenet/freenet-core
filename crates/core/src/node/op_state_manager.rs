@@ -147,13 +147,36 @@ impl OpManager {
     /// Useful when transitioning between states that do not require any network communication
     /// with other nodes, like intermediate states before returning.
     pub async fn notify_op_change(&self, msg: NetMessage, op: OpEnum) -> Result<(), OpError> {
+        let tx = *msg.id();
+        let peer_id = &self.ring.connection_manager.pub_key;
+        tracing::debug!(
+            tx = %tx,
+            msg_type = %msg,
+            peer = %peer_id,
+            "notify_op_change: Pushing operation and sending notification"
+        );
+
         // push back the state to the stack
-        self.push(*msg.id(), op).await?;
+        self.push(tx, op).await?;
+
+        tracing::debug!(
+            tx = %tx,
+            peer = %peer_id,
+            "notify_op_change: Operation pushed, sending to event listener"
+        );
+
         self.to_event_listener
             .notifications_sender()
             .send(Either::Left(msg))
-            .await
-            .map_err(Into::into)
+            .await?;
+
+        tracing::debug!(
+            tx = %tx,
+            peer = %peer_id,
+            "notify_op_change: Notification sent successfully"
+        );
+
+        Ok(())
     }
 
     // An early, fast path, return for communicating events in the node to the main message handler,

@@ -270,7 +270,6 @@ impl HandshakeHandler {
     }
 
     /// Processes events related to connection establishment and management.
-    /// This is the main event loop for the HandshakeHandler.
     #[instrument(skip(self))]
     pub async fn wait_for_events(&mut self) -> Result<Event, HandshakeError> {
         loop {
@@ -926,14 +925,14 @@ impl NetworkBridge for ForwardPeerMessage {
 
 #[derive(Debug)]
 struct InboundGwJoinRequest {
-    pub conn: PeerConnection,
-    pub id: Transaction,
-    pub joiner: PeerId,
-    pub location: Option<Location>,
-    pub hops_to_live: usize,
-    pub max_hops_to_live: usize,
-    pub skip_connections: HashSet<PeerId>,
-    pub skip_forwards: HashSet<PeerId>,
+    conn: PeerConnection,
+    id: Transaction,
+    joiner: PeerId,
+    location: Option<Location>,
+    hops_to_live: usize,
+    max_hops_to_live: usize,
+    skip_connections: HashSet<PeerId>,
+    skip_forwards: HashSet<PeerId>,
 }
 
 #[derive(Debug)]
