@@ -1,6 +1,6 @@
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::contract::{ContractHandlerEvent, WaitingTransaction};
-use crate::message::{NetMessageV1, QueryResult};
+use crate::message::{NetMessage, NetMessageV1, QueryResult};
 use crate::node::subscribe::SubscribeMsg;
 use crate::ring::Location;
 use dashmap::DashSet;
@@ -40,7 +40,7 @@ use crate::{
         ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
         WaitingResolution,
     },
-    message::{MessageStats, NetMessage, NodeEvent, Transaction},
+    message::{MessageStats, NodeEvent, Transaction},
     node::{handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager},
     ring::PeerKeyLocation,
     tracing::NetEventLog,
@@ -240,12 +240,26 @@ impl P2pConnManager {
                             )
                             .await?;
                         }
-                        ConnEvent::OutboundMessage(NetMessage::V1(NetMessageV1::Aborted(tx))) => {
+                        ConnEvent::OutboundMessage {
+                            msg: NetMessage::V1(NetMessageV1::Aborted(tx)),
+                            ..
+                        } => {
                             // TODO: handle aborted transaction as internal message
                             tracing::error!(%tx, "Aborted transaction");
                         }
-                        ConnEvent::OutboundMessage(msg) => {
-                            let Some(target_peer) = msg.target() else {
+                        ConnEvent::OutboundMessage {
+                            msg,
+                            explicit_target,
+                        } => {
+                            // Try to get target from message first, fall back to explicit_target
+                            let target_peer = msg.target().or_else(|| {
+                                explicit_target.as_ref().map(|peer_id| PeerKeyLocation {
+                                    peer: peer_id.clone(),
+                                    location: None,
+                                })
+                            });
+
+                            let Some(target_peer) = target_peer else {
                                 let id = *msg.id();
                                 tracing::error!(%id, %msg, "Target peer not set, must be set for connection outbound message");
                                 self.bridge.op_manager.completed(id);
@@ -376,6 +390,12 @@ impl P2pConnManager {
                             NodeEvent::DropConnection(peer) => {
                                 tracing::debug!(%peer, "Dropping connection");
                                 if let Some(conn) = self.connections.remove(&peer) {
+                                    // Clean up proximity cache for disconnected peer
+                                    if let Some(proximity_cache) =
+                                        &self.bridge.op_manager.proximity_cache
+                                    {
+                                        proximity_cache.on_peer_disconnected(&peer);
+                                    }
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     timeout(
                                         Duration::from_secs(1),
@@ -682,6 +702,56 @@ impl P2pConnManager {
                                     Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
                                 }
                             }
+                            NodeEvent::BroadcastProximityCache { from, message } => {
+                                // WORKAROUND: Skip broadcasts in 2-node networks
+                                // This masks an underlying issue where PUT operations flood messages
+                                // in 2-node topologies. The proximity cache itself only broadcasts once
+                                // per contract (verified by logs), but something in PUT handling causes
+                                // a message flood. TODO: Investigate PUT operation message handling.
+                                if self.connections.len() <= 1 {
+                                    tracing::debug!(
+                                        neighbor_count = self.connections.len(),
+                                        "PROXIMITY_PROPAGATION: Skipping broadcast in 2-node network (workaround for PUT flood issue)"
+                                    );
+                                    continue;
+                                }
+
+                                tracing::debug!(
+                                    neighbor_count = self.connections.len(),
+                                    from = %from,
+                                    "PROXIMITY_PROPAGATION: Broadcasting cache announcement to all connected peers"
+                                );
+
+                                // Spawn each send as a separate task to avoid deep call stacks
+                                // This prevents stack overflow when broadcasting to many peers
+                                for peer_id in self.connections.keys() {
+                                    let peer_id = peer_id.clone();
+                                    let from = from.clone();
+                                    let message = message.clone();
+                                    let bridge = self.bridge.clone();
+
+                                    tokio::spawn(async move {
+                                        let net_msg =
+                                            NetMessage::V1(NetMessageV1::ProximityCache {
+                                                from,
+                                                message,
+                                            });
+
+                                        if let Err(err) = bridge.send(&peer_id, net_msg).await {
+                                            tracing::warn!(
+                                                peer = %peer_id,
+                                                error = ?err,
+                                                "PROXIMITY_PROPAGATION: Failed to send broadcast announcement to peer"
+                                            );
+                                        } else {
+                                            tracing::trace!(
+                                                peer = %peer_id,
+                                                "PROXIMITY_PROPAGATION: Successfully sent broadcast announcement to peer"
+                                            );
+                                        }
+                                    });
+                                }
+                            }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
                                     "Disconnecting from network{}",
@@ -899,23 +969,55 @@ impl P2pConnManager {
             tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
         }
         state.awaiting_connection.insert(peer.addr, callback);
+        // Increased timeout from 10s to 60s for CI environments where connection
+        // establishment can be slow. The 10s timeout was causing callbacks to be
+        // orphaned in awaiting_connection, leading to "channel closed" errors.
         let res = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             handshake_handler_msg.establish_conn(peer.clone(), tx, is_gw),
         )
-        .await
-        .inspect_err(|error| {
-            tracing::error!(tx = %tx, "Failed to establish connection: {:?}", error);
-        })?;
+        .await;
+
         match res {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 tracing::debug!(tx = %tx,
                     "Successfully initiated connection process for peer: {:?}",
                     peer
                 );
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::msg(e)),
+            Ok(Err(e)) => {
+                // Connection establishment failed - remove orphaned callback
+                if let Some(mut cb) = state.awaiting_connection.remove(&peer.addr) {
+                    // Notify callback of failure
+                    let _ = cb
+                        .send_result(Err(HandshakeError::ConnectionError(
+                            crate::node::network_bridge::ConnectionError::TransportError(
+                                e.to_string(),
+                            ),
+                        )))
+                        .await;
+                }
+                Err(anyhow::Error::msg(e))
+            }
+            Err(_timeout_err) => {
+                // Timeout - remove orphaned callback to prevent "channel closed" errors
+                tracing::error!(tx = %tx, %peer, "Timeout establishing connection after 60s");
+                if let Some(mut cb) = state.awaiting_connection.remove(&peer.addr) {
+                    // Notify callback of timeout
+                    let _ = cb
+                        .send_result(Err(HandshakeError::ConnectionError(
+                            crate::node::network_bridge::ConnectionError::TransportError(
+                                "connection timeout".to_string(),
+                            ),
+                        )))
+                        .await;
+                }
+                Err(anyhow::anyhow!(
+                    "Timeout establishing connection to {}",
+                    peer
+                ))
+            }
         }
     }
 
@@ -1123,6 +1225,27 @@ impl P2pConnManager {
         self.connections.insert(peer_id.clone(), tx);
         let task = peer_connection_listener(rx, connection).boxed();
         state.peer_connections.push(task);
+
+        // Send cache state request to newly connected peer
+        if let Some(proximity_cache) = &self.bridge.op_manager.proximity_cache {
+            let cache_request = proximity_cache.request_cache_state_from_peer();
+            let cache_msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                from: self
+                    .bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .own_location()
+                    .peer,
+                message: cache_request,
+            });
+
+            tracing::debug!(peer = %peer_id, "Sending cache state request to newly connected peer");
+            if let Err(err) = self.bridge.send(&peer_id, cache_msg).await {
+                tracing::warn!("Failed to send cache state request to {}: {}", peer_id, err);
+            }
+        }
+
         Ok(())
     }
 
@@ -1185,6 +1308,12 @@ impl P2pConnManager {
                             .ring
                             .prune_connection(peer.clone())
                             .await;
+
+                        // Clean up proximity cache for disconnected peer
+                        if let Some(proximity_cache) = &self.bridge.op_manager.proximity_cache {
+                            proximity_cache.on_peer_disconnected(&peer);
+                        }
+
                         self.connections.remove(&peer);
                         handshake_handler_msg.drop_connection(peer).await?;
                     }
@@ -1232,7 +1361,13 @@ impl P2pConnManager {
 
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg).into()),
+            Some(Left((target, msg))) => EventResult::Event(
+                ConnEvent::OutboundMessage {
+                    msg: *msg,
+                    explicit_target: Some(target),
+                }
+                .into(),
+            ),
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
             None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
         }
@@ -1375,7 +1510,12 @@ enum EventResult {
 #[derive(Debug)]
 pub(super) enum ConnEvent {
     InboundMessage(NetMessage),
-    OutboundMessage(NetMessage),
+    OutboundMessage {
+        msg: NetMessage,
+        /// Target peer for messages that don't have an embedded target (e.g., ProximityCache)
+        /// For messages with embedded targets, this is used as fallback
+        explicit_target: Option<PeerId>,
+    },
     NodeAction(NodeEvent),
     ClosedChannel(ChannelCloseReason),
 }

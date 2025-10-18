@@ -147,7 +147,7 @@ impl PeerConnection {
         let last_packet_id = remote_conn.last_packet_id.clone();
 
         let keep_alive_handle = tokio::spawn(async move {
-            tracing::info!(
+            tracing::trace!(
                 target: "freenet_core::transport::keepalive_lifecycle",
                 remote = ?remote_addr,
                 "Keep-alive task STARTED for connection"
@@ -212,7 +212,7 @@ impl PeerConnection {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::trace!(
                             target: "freenet_core::transport::keepalive_lifecycle",
                             remote = ?remote_addr,
                             error = ?e,
@@ -225,7 +225,7 @@ impl PeerConnection {
                 }
             }
 
-            tracing::warn!(
+            tracing::trace!(
                 target: "freenet_core::transport::keepalive_lifecycle",
                 remote = ?remote_addr,
                 total_lifetime_secs = task_start.elapsed().as_secs_f64(),
@@ -234,7 +234,7 @@ impl PeerConnection {
             );
         });
 
-        tracing::info!(remote = ?remote_addr, "PeerConnection created with persistent keep-alive task");
+        tracing::trace!(remote = ?remote_addr, "PeerConnection created with persistent keep-alive task");
 
         Self {
             remote_conn,
@@ -372,7 +372,7 @@ impl PeerConnection {
                     }) else {
                         // Check if this is a 256-byte RSA intro packet
                         if packet_data.data().len() == 256 {
-                            tracing::info!(
+                            tracing::trace!(
                                 remote = ?self.remote_conn.remote_addr,
                                 "Attempting to decrypt potential RSA intro packet"
                             );
@@ -380,7 +380,7 @@ impl PeerConnection {
                             // Try to decrypt as RSA intro packet
                             match self.remote_conn.transport_secret_key.decrypt(packet_data.data()) {
                                 Ok(_decrypted_intro) => {
-                                    tracing::info!(
+                                    tracing::trace!(
                                         remote = ?self.remote_conn.remote_addr,
                                         "Successfully decrypted RSA intro packet, sending ACK"
                                     );
@@ -398,19 +398,19 @@ impl PeerConnection {
                                             .send((self.remote_conn.remote_addr, ack.data().into()))
                                             .await
                                         {
-                                            tracing::warn!(
+                                            tracing::trace!(
                                                 remote = ?self.remote_conn.remote_addr,
                                                 error = ?send_err,
                                                 "Failed to send ACK for intro packet"
                                             );
                                         } else {
-                                            tracing::info!(
+                                            tracing::trace!(
                                                 remote = ?self.remote_conn.remote_addr,
                                                 "Successfully sent ACK for intro packet"
                                             );
                                         }
                                     } else {
-                                        tracing::warn!(
+                                        tracing::trace!(
                                             remote = ?self.remote_conn.remote_addr,
                                             "Failed to create ACK packet for intro"
                                         );

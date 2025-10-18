@@ -217,6 +217,7 @@ pub async fn client_event_handling<ClientEv>(
     mut client_events: ClientEv,
     mut client_responses: ClientResponsesReceiver,
     node_controller: tokio::sync::mpsc::Sender<NodeEvent>,
+    proximity_cache: Arc<crate::node::proximity_cache::ProximityCacheManager>,
 ) -> anyhow::Result<Infallible>
 where
     ClientEv: ClientEventsProxy + Send + 'static,
@@ -245,7 +246,7 @@ where
                     }
                 };
                 let cli_id = req.client_id;
-                let res = process_open_request(req, op_manager.clone(), request_router.clone()).await;
+                let res = process_open_request(req, op_manager.clone(), request_router.clone(), proximity_cache.clone()).await;
                 results.push(async move {
                     match res.await {
                         Ok(Some(Either::Left(res))) => (cli_id, Ok(Some(res))),
@@ -320,6 +321,9 @@ where
                             QueryResult::NodeDiagnostics(response) => {
                                 Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))
                             }
+                            QueryResult::ProximityCache(proximity_info) => {
+                                Ok(HostResponse::QueryResponse(QueryResponse::ProximityCache(proximity_info)))
+                            }
                         };
                         if let Ok(result) = &res {
                             tracing::debug!(%result, "sending client operation response");
@@ -356,10 +360,97 @@ enum Error {
 }
 
 #[inline]
+async fn handle_proximity_cache_info_query(
+    proximity_cache: &Arc<crate::node::proximity_cache::ProximityCacheManager>,
+) -> freenet_stdlib::client_api::ProximityCacheInfo {
+    let (my_cache_contract_ids, neighbor_cache_data) =
+        proximity_cache.get_introspection_data().await;
+    let stats = proximity_cache.get_stats().await;
+
+    let my_cache = my_cache_contract_ids
+        .into_iter()
+        .map(|contract_id| {
+            use freenet_stdlib::prelude::ContractKey;
+            let contract_key = ContractKey::from(contract_id);
+            // Use first 4 bytes for backwards-compatible cache_hash field
+            let bytes = contract_id.as_bytes();
+            let cache_hash = u32::from_le_bytes([
+                bytes.first().copied().unwrap_or(0),
+                bytes.get(1).copied().unwrap_or(0),
+                bytes.get(2).copied().unwrap_or(0),
+                bytes.get(3).copied().unwrap_or(0),
+            ]);
+
+            freenet_stdlib::client_api::ContractCacheEntry {
+                contract_key: contract_key.to_string(),
+                cache_hash,
+                cached_since: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            }
+        })
+        .collect();
+
+    let neighbor_caches: Vec<_> = neighbor_cache_data
+        .into_iter()
+        .map(|(peer_id, contract_ids)| {
+            // Convert ContractInstanceIds to u32 hashes for backwards compatibility
+            let known_contracts = contract_ids
+                .into_iter()
+                .map(|contract_id| {
+                    let bytes = contract_id.as_bytes();
+                    u32::from_le_bytes([
+                        bytes.first().copied().unwrap_or(0),
+                        bytes.get(1).copied().unwrap_or(0),
+                        bytes.get(2).copied().unwrap_or(0),
+                        bytes.get(3).copied().unwrap_or(0),
+                    ])
+                })
+                .collect();
+
+            freenet_stdlib::client_api::NeighborCacheInfo {
+                peer_id,
+                known_contracts,
+                last_update: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                update_count: 1,
+            }
+        })
+        .collect();
+
+    let total_neighbors = neighbor_caches.len();
+    let total_contracts: usize = neighbor_caches
+        .iter()
+        .map(|n| n.known_contracts.len())
+        .sum();
+    let avg_cache_size = if total_neighbors > 0 {
+        total_contracts as f32 / total_neighbors as f32
+    } else {
+        0.0
+    };
+
+    freenet_stdlib::client_api::ProximityCacheInfo {
+        my_cache,
+        neighbor_caches,
+        stats: freenet_stdlib::client_api::ProximityStats {
+            cache_announces_sent: stats.cache_announces_sent,
+            cache_announces_received: stats.cache_announces_received,
+            updates_via_proximity: stats.updates_via_proximity,
+            updates_via_subscription: stats.updates_via_subscription,
+            false_positive_forwards: stats.false_positive_forwards,
+            avg_neighbor_cache_size: avg_cache_size,
+        },
+    }
+}
+
 async fn process_open_request(
     mut request: OpenRequest<'static>,
     op_manager: Arc<OpManager>,
     request_router: Option<Arc<crate::node::RequestRouter>>,
+    proximity_cache: Arc<crate::node::proximity_cache::ProximityCacheManager>,
 ) -> BoxFuture<'static, Result<Option<Either<QueryResult, mpsc::Receiver<QueryResult>>>, Error>> {
     let (callback_tx, callback_rx) = if matches!(
         &*request.request,
@@ -1239,6 +1330,17 @@ async fn process_open_request(
             ClientRequest::NodeQueries(query) => {
                 tracing::debug!("Received node queries from user event: {:?}", query);
 
+                if matches!(
+                    query,
+                    freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo
+                ) {
+                    let proximity_info = handle_proximity_cache_info_query(&proximity_cache).await;
+                    return Ok(Some(Either::Left(QueryResult::ProximityCache(
+                        proximity_info,
+                    ))));
+                }
+
+                // For other queries, we need to use the callback_tx
                 let Some(tx) = callback_tx else {
                     tracing::error!("callback_tx not available for NodeQueries");
                     unreachable!("callback_tx should always be Some for NodeQueries based on initialization logic");
@@ -1258,9 +1360,7 @@ async fn process_open_request(
                         }
                     }
                     freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo => {
-                        // TODO: Implement proximity cache info query
-                        tracing::warn!("ProximityCacheInfo query not yet implemented");
-                        return Ok(None);
+                        unreachable!("ProximityCacheInfo handled above")
                     }
                 };
 

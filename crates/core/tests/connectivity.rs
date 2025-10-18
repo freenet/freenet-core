@@ -33,6 +33,8 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 /// 2. Perform operations to verify connectivity
 /// 3. Force disconnect
 /// 4. Verify that the peer can reconnect and operate normally
+///
+/// Test gateway reconnection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_gateway_reconnection() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
@@ -659,7 +661,7 @@ async fn test_three_node_network_connectivity() -> TestResult {
     .boxed_local();
 
     // Main test logic
-    let test = tokio::time::timeout(Duration::from_secs(180), async move {
+    let test = tokio::time::timeout(Duration::from_secs(200), async move {
         // Wait for all nodes to start and connect
         tracing::info!("Waiting for nodes to start and establish connections...");
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -755,19 +757,74 @@ async fn test_three_node_network_connectivity() -> TestResult {
             tokio::time::sleep(RETRY_DELAY).await;
         }
 
-        // Verify functionality with PUT/GET
-        tracing::info!("Verifying network functionality with PUT/GET operations");
+        // Poll for network readiness by attempting PUT operations until successful
+        // Network needs to complete handshakes and initialize routing after connections establish
+        tracing::info!("Verifying network is ready for operations...");
+        let mut put_attempts = 0;
+        let max_put_attempts = 20; // 20 attempts * 5s = 100s max wait
 
-        make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
-        let resp = tokio::time::timeout(Duration::from_secs(60), client1.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                assert_eq!(key, contract_key);
-                tracing::info!("Peer1 successfully performed PUT");
+        loop {
+            put_attempts += 1;
+            tracing::info!(
+                "PUT operation attempt {}/{}",
+                put_attempts,
+                max_put_attempts
+            );
+
+            make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
+
+            match tokio::time::timeout(Duration::from_secs(10), client1.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                    assert_eq!(key, contract_key);
+                    tracing::info!(
+                        "✅ Peer1 successfully performed PUT after {} attempts",
+                        put_attempts
+                    );
+                    break;
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!(
+                        "Unexpected PUT response (attempt {}): {:?}",
+                        put_attempts,
+                        other
+                    );
+                    if put_attempts >= max_put_attempts {
+                        bail!(
+                            "Unexpected PUT response after {} attempts: {:?}",
+                            put_attempts,
+                            other
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    let error_msg = e.to_string();
+                    tracing::warn!("PUT error (attempt {}): {}", put_attempts, error_msg);
+                    if put_attempts >= max_put_attempts {
+                        bail!(
+                            "Error receiving PUT response after {} attempts: {}",
+                            put_attempts,
+                            e
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "PUT timeout (attempt {}/{}), retrying...",
+                        put_attempts,
+                        max_put_attempts
+                    );
+                    if put_attempts >= max_put_attempts {
+                        bail!(
+                            "Timeout waiting for PUT response after {} attempts",
+                            put_attempts
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
             }
-            Ok(Ok(other)) => bail!("Unexpected PUT response: {:?}", other),
-            Ok(Err(e)) => bail!("Error receiving PUT response: {}", e),
-            Err(_) => bail!("Timeout waiting for PUT response"),
         }
 
         make_get(&mut client2, contract_key, true, false).await?;

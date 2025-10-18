@@ -237,6 +237,29 @@ impl Operation for PutOp {
                                 peer = %sender.peer,
                                 "Marked contract as seeding locally"
                             );
+
+                            // Track contract caching in proximity cache and send announcements
+                            if let Some(proximity_cache) = &op_manager.proximity_cache {
+                                if let Some(cache_msg) =
+                                    proximity_cache.on_contract_cached(&key).await
+                                {
+                                    if let Some(own_peer) =
+                                        op_manager.ring.connection_manager.get_peer_key()
+                                    {
+                                        // Send directly through notification channel (non-blocking via channel buffering)
+                                        let _ = op_manager
+                                            .to_event_listener
+                                            .notifications_sender()
+                                            .send(either::Either::Right(
+                                                crate::message::NodeEvent::BroadcastProximityCache {
+                                                    from: own_peer,
+                                                    message: cache_msg,
+                                                },
+                                            ))
+                                            .await;
+                                    }
+                                }
+                            }
                         }
 
                         tracing::debug!(
@@ -354,6 +377,27 @@ impl Operation for PutOp {
 
                         super::start_subscription_request(op_manager, key).await;
                         op_manager.ring.seed_contract(key);
+
+                        // Track contract caching in proximity cache and send announcements
+                        if let Some(proximity_cache) = &op_manager.proximity_cache {
+                            if let Some(cache_msg) = proximity_cache.on_contract_cached(&key).await
+                            {
+                                if let Some(own_peer) =
+                                    op_manager.ring.connection_manager.get_peer_key()
+                                {
+                                    let _ = op_manager
+                                        .to_event_listener
+                                        .notifications_sender()
+                                        .send(either::Either::Right(
+                                            crate::message::NodeEvent::BroadcastProximityCache {
+                                                from: own_peer,
+                                                message: cache_msg,
+                                            },
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
 
                         true
                     } else {
@@ -542,6 +586,28 @@ impl Operation for PutOp {
                                     "Adding contract to local seed list"
                                 );
                                 op_manager.ring.seed_contract(key);
+
+                                // Track contract caching in proximity cache and send announcements
+                                if let Some(proximity_cache) = &op_manager.proximity_cache {
+                                    if let Some(cache_msg) =
+                                        proximity_cache.on_contract_cached(&key).await
+                                    {
+                                        if let Some(own_peer) =
+                                            op_manager.ring.connection_manager.get_peer_key()
+                                        {
+                                            let _ = op_manager
+                                                .to_event_listener
+                                                .notifications_sender()
+                                                .send(either::Either::Right(
+                                                    crate::message::NodeEvent::BroadcastProximityCache {
+                                                        from: own_peer,
+                                                        message: cache_msg,
+                                                    },
+                                                ))
+                                                .await;
+                                        }
+                                    }
+                                }
                             } else {
                                 tracing::debug!(
                                     tx = %id,
@@ -672,6 +738,27 @@ impl Operation for PutOp {
                             super::start_subscription_request(op_manager, key).await;
                             op_manager.ring.seed_contract(key)
                         };
+
+                        // Track contract caching in proximity cache and send announcements
+                        if let Some(proximity_cache) = &op_manager.proximity_cache {
+                            if let Some(cache_msg) = proximity_cache.on_contract_cached(&key).await
+                            {
+                                if let Some(own_peer) =
+                                    op_manager.ring.connection_manager.get_peer_key()
+                                {
+                                    let _ = op_manager
+                                        .to_event_listener
+                                        .notifications_sender()
+                                        .send(either::Either::Right(
+                                            crate::message::NodeEvent::BroadcastProximityCache {
+                                                from: own_peer,
+                                                message: cache_msg,
+                                            },
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
 
                         // Notify subscribers of dropped contracts
                         if let Some(dropped_key) = dropped_contract {
@@ -988,6 +1075,24 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
             "Adding contract to local seed list"
         );
         op_manager.ring.seed_contract(key);
+
+        // Track contract caching in proximity cache
+        if let Some(proximity_cache) = &op_manager.proximity_cache {
+            if let Some(cache_msg) = proximity_cache.on_contract_cached(&key).await {
+                if let Some(own_peer) = op_manager.ring.connection_manager.get_peer_key() {
+                    let _ = op_manager
+                        .to_event_listener
+                        .notifications_sender()
+                        .send(either::Either::Right(
+                            crate::message::NodeEvent::BroadcastProximityCache {
+                                from: own_peer,
+                                message: cache_msg,
+                            },
+                        ))
+                        .await;
+                }
+            }
+        }
 
         // Determine which peers need to be notified and broadcast the update
         let broadcast_to = op_manager.get_broadcast_targets(&key, &own_location.peer);
