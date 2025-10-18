@@ -244,6 +244,7 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
+            .with_min_connections(1) // 4-node test network needs realistic minimum
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
@@ -254,6 +255,7 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
         let config = peer_a_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
+            .with_min_connections(1) // 4-node test network needs realistic minimum
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
@@ -264,6 +266,7 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
         let config = peer_b_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
+            .with_min_connections(1) // 4-node test network needs realistic minimum
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
@@ -274,6 +277,7 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
         let config = peer_c_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
+            .with_min_connections(1) // 4-node test network needs realistic minimum
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await

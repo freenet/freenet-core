@@ -370,6 +370,13 @@ impl NodeConfig {
             Ok(gateways)
         }
     }
+
+    /// Set minimum number of connections for this node.
+    /// Useful for tests with small networks where the default (25) is unrealistic.
+    pub fn with_min_connections(mut self, min_connections: usize) -> Self {
+        self.min_number_conn = Some(min_connections);
+        self
+    }
 }
 
 /// Gateway node to use for joining the network.
