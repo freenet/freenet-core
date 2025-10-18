@@ -799,6 +799,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         let get_start = std::time::Instant::now();
 
         // Keep trying GET until we get a response (successful or failed, but NOT "no connections")
+        // Use shorter timeout per attempt (5s) with more total attempts (60) to handle slow CI
         loop {
             tracing::info!(
                 "Client 3: Sending GET request for contract {} to Node B (attempt {})",
@@ -807,7 +808,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
             );
             make_get(&mut client_api_node_b, contract_key, true, false).await?;
 
-            match tokio::time::timeout(Duration::from_secs(10), client_api_node_b.recv()).await {
+            match tokio::time::timeout(Duration::from_secs(5), client_api_node_b.recv()).await {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                     key,
                     contract: Some(_),
@@ -836,8 +837,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
                     let error_msg = e.to_string();
                     if error_msg.contains("No ring connections found") {
                         retry_count += 1;
-                        if retry_count > 24 {
-                            // 24 retries * 5s = 120s max wait
+                        if retry_count > 60 {
+                            // 60 retries * 5s = 300s max wait
                             bail!(
                                 "Node B failed to establish ring connections after {:?} and {} retries",
                                 connectivity_start.elapsed(),
@@ -845,11 +846,11 @@ async fn test_multiple_clients_subscription() -> TestResult {
                             );
                         }
                         tracing::info!(
-                            "Node B not yet connected (retry {}/24), waiting 5s... (elapsed: {:?})",
+                            "Node B not yet connected (retry {}/60), waiting 3s... (elapsed: {:?})",
                             retry_count,
                             connectivity_start.elapsed()
                         );
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        tokio::time::sleep(Duration::from_secs(3)).await;
                         continue;
                     } else {
                         // Some other error - not a connectivity issue, fail the test
@@ -858,7 +859,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
                 }
                 Err(_) => {
                     retry_count += 1;
-                    if retry_count > 24 {
+                    if retry_count > 60 {
                         bail!(
                             "Client 3: Timeout waiting for GET response after {:?} and {} retries",
                             connectivity_start.elapsed(),
@@ -866,10 +867,10 @@ async fn test_multiple_clients_subscription() -> TestResult {
                         );
                     }
                     tracing::info!(
-                        "Client 3: Timeout waiting for GET response (retry {}/24), retrying...",
+                        "Client 3: Timeout waiting for GET response (retry {}/60), retrying...",
                         retry_count
                     );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
                     continue;
                 }
             }
