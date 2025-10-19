@@ -285,21 +285,51 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(300), async move {
-        // Connect to all peers
+        // Helper function to connect to WebSocket with retries
+        async fn connect_with_retry(uri: &str, max_attempts: usize) -> anyhow::Result<WebApi> {
+            for attempt in 1..=max_attempts {
+                match connect_async(uri).await {
+                    Ok((stream, _)) => {
+                        tracing::info!("✅ Connected to {} after {} attempt(s)", uri, attempt);
+                        return Ok(WebApi::start(stream));
+                    }
+                    Err(e) => {
+                        if attempt < max_attempts {
+                            tracing::debug!(
+                                "Connection attempt {}/{} failed for {}: {}",
+                                attempt,
+                                max_attempts,
+                                uri,
+                                e
+                            );
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        } else {
+                            anyhow::bail!(
+                                "Failed to connect to {} after {} attempts: {}",
+                                uri,
+                                max_attempts,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            unreachable!()
+        }
+
+        // Connect to all peers with retries (nodes need time to start WebSocket servers)
+        tracing::info!("Connecting to peer WebSocket endpoints...");
         let uri_a =
             format!("ws://127.0.0.1:{peer_a_ws_port}/v1/contract/command?encodingProtocol=native");
-        let (stream_a, _) = connect_async(&uri_a).await?;
-        let mut client_a = WebApi::start(stream_a);
+        let mut client_a = connect_with_retry(&uri_a, 20).await?;
 
         let uri_b =
             format!("ws://127.0.0.1:{peer_b_ws_port}/v1/contract/command?encodingProtocol=native");
-        let (stream_b, _) = connect_async(&uri_b).await?;
-        let mut client_b = WebApi::start(stream_b);
+        let mut client_b = connect_with_retry(&uri_b, 20).await?;
 
         let uri_c =
             format!("ws://127.0.0.1:{peer_c_ws_port}/v1/contract/command?encodingProtocol=native");
-        let (stream_c, _) = connect_async(&uri_c).await?;
-        let mut client_c = WebApi::start(stream_c);
+        let mut client_c = connect_with_retry(&uri_c, 20).await?;
 
         // Poll for network readiness by attempting PUT until successful
         // Network needs time to start, connect to gateway, exchange peer info, establish mesh
