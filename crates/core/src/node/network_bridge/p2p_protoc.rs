@@ -314,12 +314,20 @@ impl P2pConnManager {
                             };
 
                             // Check if message targets self - if so, process locally instead of sending over network
-                            let self_peer_id = ctx.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap();
+                            let self_peer_id = ctx
+                                .bridge
+                                .op_manager
+                                .ring
+                                .connection_manager
+                                .get_peer_key()
+                                .unwrap();
                             if target_peer.peer == self_peer_id {
-                                tracing::debug!(
+                                tracing::error!(
                                     tx = %msg.id(),
                                     msg_type = %msg,
-                                    "Message targets self, processing locally instead of sending over network"
+                                    target_peer = %target_peer,
+                                    self_peer = %self_peer_id,
+                                    "BUG: OutboundMessage targets self! This indicates a routing logic error - messages should not reach OutboundMessage handler if they target self"
                                 );
                                 // Convert to InboundMessage and process locally
                                 ctx.handle_inbound_message(
@@ -391,14 +399,29 @@ impl P2pConnManager {
                                     match timeout(Duration::from_secs(5), result.recv()).await {
                                         Ok(Some(Ok(_))) => {
                                             // Connection established, try sending again
-                                            if let Some(peer_connection) =
-                                                ctx.connections.get(&target_peer.peer)
-                                            {
+                                            // IMPORTANT: Use single get() call to avoid TOCTOU race
+                                            let peer_connection_retry =
+                                                ctx.connections.get(&target_peer.peer);
+                                            tracing::warn!(
+                                                tx = %msg.id(),
+                                                self_peer = %ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                                target = %target_peer.peer,
+                                                conn_map_size = ctx.connections.len(),
+                                                has_connection = peer_connection_retry.is_some(),
+                                                "[CONN_TRACK] LOOKUP: Retry after connection established - checking for connection in HashMap"
+                                            );
+                                            if let Some(peer_connection) = peer_connection_retry {
                                                 if let Err(e) =
                                                     peer_connection.send(Left(msg)).await
                                                 {
                                                     tracing::error!("Failed to send message to peer after establishing connection: {}", e);
                                                 }
+                                            } else {
+                                                tracing::error!(
+                                                    tx = %tx,
+                                                    target = %target_peer.peer,
+                                                    "Connection established successfully but not found in HashMap - possible race condition"
+                                                );
                                             }
                                         }
                                         Ok(Some(Err(e))) => {
@@ -1327,6 +1350,16 @@ impl P2pConnManager {
                         .connection_manager
                         .get_peer_key()
                         .unwrap();
+
+                    tracing::warn!(
+                        tx = %msg.id(),
+                        msg_type = %msg,
+                        target_peer = %target,
+                        self_peer = %self_peer,
+                        target_equals_self = (target.peer == self_peer),
+                        "[ROUTING] handle_notification_msg: Checking if message targets self"
+                    );
+
                     if target.peer != self_peer {
                         // Message targets another peer - send as outbound
                         tracing::info!(
@@ -1340,7 +1373,7 @@ impl P2pConnManager {
                 }
 
                 // Message targets self or has no target - process locally
-                tracing::debug!(
+                tracing::warn!(
                     tx = %msg.id(),
                     msg_type = %msg,
                     "handle_notification_msg: Received NetMessage notification, converting to InboundMessage"
@@ -1375,7 +1408,9 @@ impl P2pConnManager {
 
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg).into()),
+            Some(Left((_target, msg))) => {
+                EventResult::Event(ConnEvent::OutboundMessage(*msg).into())
+            }
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
             None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
         }

@@ -1343,9 +1343,7 @@ pub(crate) mod tracer {
                     .with_writer(std::io::stderr)
                     .boxed()
             } else if to_stderr && !use_json {
-                let layer = tracing_subscriber::fmt::layer()
-                    .with_level(true)
-                    .pretty();
+                let layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
                 let layer = if cfg!(any(test, debug_assertions)) {
                     layer.with_file(true).with_line_number(true)
                 } else {
