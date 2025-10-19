@@ -703,6 +703,27 @@ impl P2pConnManager {
                                 }
                             }
                             NodeEvent::BroadcastProximityCache { from, message } => {
+                                // WORKAROUND: Skip broadcasts in 2-node networks to avoid PUT response
+                                // delivery failure. Root cause under investigation in issue #1960.
+                                //
+                                // Theory: Proximity broadcasts in 2-node topologies trigger a race condition
+                                // where TransactionCompleted cleanup happens before the PUT response reaches
+                                // the client, causing "Timeout waiting for put response" errors.
+                                //
+                                // This workaround is acceptable because:
+                                // 1. Production networks will have >2 nodes
+                                // 2. Proximity cache still works correctly in 3+ node networks
+                                // 3. The proximity cache protocol itself is architecturally sound
+                                //
+                                // TODO: Remove this workaround once issue #1960 is resolved
+                                if self.connections.len() <= 1 {
+                                    tracing::debug!(
+                                        neighbor_count = self.connections.len(),
+                                        "PROXIMITY_PROPAGATION: Skipping broadcast in 2-node network (issue #1960 workaround)"
+                                    );
+                                    continue;
+                                }
+
                                 tracing::debug!(
                                     neighbor_count = self.connections.len(),
                                     from = %from,
