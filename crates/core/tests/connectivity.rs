@@ -144,7 +144,6 @@ async fn test_gateway_reconnection() -> TestResult {
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .with_min_connections(1) // 2-node test network needs realistic minimum
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
@@ -156,7 +155,6 @@ async fn test_gateway_reconnection() -> TestResult {
         let config = peer_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .with_min_connections(1) // 2-node test network needs realistic minimum
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
