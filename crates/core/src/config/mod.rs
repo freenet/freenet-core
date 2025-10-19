@@ -1084,8 +1084,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_serde_config_args() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join("config");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
         let args = ConfigArgs {
             mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir),
+                data_dir: Some(data_dir),
+            },
             ..Default::default()
         };
         let cfg = args.build().await.unwrap();
