@@ -374,6 +374,9 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
                     if put_attempts >= max_put_attempts {
                         bail!("PUT error after {} attempts: {}", put_attempts, e);
                     }
+                    // Reconnect the client (likely disconnected due to peer not ready)
+                    tracing::debug!("Reconnecting client_a after error...");
+                    client_a = connect_with_retry(&uri_a, 20).await?;
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -431,6 +434,9 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
                     if get_attempts >= max_get_attempts {
                         bail!("GET error after {} attempts: {}", get_attempts, e);
                     }
+                    // Reconnect the client (likely disconnected due to peer not ready)
+                    tracing::debug!("Reconnecting client_b after error...");
+                    client_b = connect_with_retry(&uri_b, 20).await?;
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -495,6 +501,9 @@ async fn test_proximity_based_update_forwarding() -> TestResult {
                     if update_attempts >= max_update_attempts {
                         bail!("UPDATE error after {} attempts: {}", update_attempts, e);
                     }
+                    // Reconnect the client (likely disconnected due to error)
+                    tracing::debug!("Reconnecting client_a after error...");
+                    client_a = connect_with_retry(&uri_a, 20).await?;
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
