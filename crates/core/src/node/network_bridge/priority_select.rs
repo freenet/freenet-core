@@ -15,7 +15,7 @@ use crate::contract::{
 };
 use crate::dev_tool::{PeerId, Transaction};
 use crate::message::{NetMessage, NodeEvent};
-use crate::node::network_bridge::handshake::{HandshakeError, HandshakeHandler};
+use crate::node::network_bridge::handshake::HandshakeError;
 use crate::transport::TransportError;
 
 // P2pBridgeEvent type alias for the event bridge channel
@@ -42,13 +42,6 @@ pub(super) enum SelectResult {
     ExecutorTransaction(Result<Transaction, anyhow::Error>),
 }
 
-/// Trait for types that can provide handshake events
-pub(super) trait HandshakeEventProvider: Send + Unpin {
-    fn wait_for_events(
-        &mut self,
-    ) -> impl Future<Output = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Send;
-}
-
 /// Trait for types that can relay client transaction results
 pub(super) trait ClientTransactionRelay: Send + Unpin {
     fn relay_transaction_result_to_client(
@@ -69,16 +62,6 @@ pub(super) trait ExecutorTransactionReceiver: Send + Unpin {
     fn transaction_from_executor(
         &mut self,
     ) -> impl Future<Output = anyhow::Result<Transaction>> + Send;
-}
-
-// Implementations for production types
-impl HandshakeEventProvider for HandshakeHandler {
-    fn wait_for_events(
-        &mut self,
-    ) -> impl Future<Output = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Send
-    {
-        self.wait_for_events()
-    }
 }
 
 impl ClientTransactionRelay for ContractHandlerChannel<WaitingResolution> {
@@ -107,7 +90,7 @@ impl ExecutorTransactionReceiver for ExecutorToEventLoopChannel<NetworkEventList
 
 /// Type alias for the production PrioritySelectStream with concrete types
 pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
-    HandshakeHandler,
+    super::handshake::HandshakeEventStream,
     ContractHandlerChannel<WaitingResolution>,
     ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
 >;
@@ -118,7 +101,7 @@ pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
 /// alive across loop iterations, maintaining waker registration.
 pub(super) struct PrioritySelectStream<H, C, E>
 where
-    H: HandshakeEventProvider,
+    H: Stream<Item = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Unpin,
     C: ClientTransactionRelay,
     E: ExecutorTransactionReceiver,
 {
@@ -133,9 +116,12 @@ where
     peer_connections:
         FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
 
-    // These three are owned and we create futures from them that poll their internal state
-    // Now generic to allow testing with mocks
+    // HandshakeHandler now implements Stream directly - maintains state across polls
+    // Generic to allow testing with mocks
     handshake_handler: H,
+
+    // These two are owned and we create futures from them that poll their internal state
+    // Generic to allow testing with mocks
     client_wait_for_transaction: C,
     executor_listener: E,
 
@@ -148,7 +134,7 @@ where
 
 impl<H, C, E> PrioritySelectStream<H, C, E>
 where
-    H: HandshakeEventProvider,
+    H: Stream<Item = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Unpin,
     C: ClientTransactionRelay,
     E: ExecutorTransactionReceiver,
 {
@@ -194,7 +180,7 @@ where
 
 impl<H, C, E> Stream for PrioritySelectStream<H, C, E>
 where
-    H: HandshakeEventProvider,
+    H: Stream<Item = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Unpin,
     C: ClientTransactionRelay,
     E: ExecutorTransactionReceiver,
 {
@@ -265,12 +251,11 @@ where
             }
         }
 
-        // Priority 5: Handshake handler
-        // Poll the wait_for_events future directly - create it inline
-        let handshake_fut = this.handshake_handler.wait_for_events();
-        tokio::pin!(handshake_fut);
-        match handshake_fut.poll(cx) {
-            Poll::Ready(result) => return Poll::Ready(Some(SelectResult::Handshake(result))),
+        // Priority 5: Handshake handler (now implements Stream)
+        // Poll the handshake handler stream - it maintains state across polls
+        match Pin::new(&mut this.handshake_handler).poll_next(cx) {
+            Poll::Ready(Some(result)) => return Poll::Ready(Some(SelectResult::Handshake(result))),
+            Poll::Ready(None) => {} // Stream ended (shouldn't happen in practice)
             Poll::Pending => {}
         }
 
@@ -330,20 +315,26 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout, Duration};
 
+    /// Mock HandshakeStream for testing that pends forever
+    struct MockHandshakeStream;
+
+    impl Stream for MockHandshakeStream {
+        type Item = Result<crate::node::network_bridge::handshake::Event, HandshakeError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    /// Create a mock HandshakeStream for testing
+    fn create_mock_handshake_stream() -> MockHandshakeStream {
+        MockHandshakeStream
+    }
+
     /// Test PrioritySelectStream with notification arriving after initial poll
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_future_wakeup() {
-        struct MockHandshake;
-        impl HandshakeEventProvider for MockHandshake {
-            async fn wait_for_events(
-                &mut self,
-            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }
-        }
-
         struct MockClient;
         impl ClientTransactionRelay for MockClient {
             async fn relay_transaction_result_to_client(
@@ -389,7 +380,7 @@ mod tests {
             notif_rx,
             op_rx,
             bridge_rx,
-            MockHandshake,
+            create_mock_handshake_stream(),
             node_rx,
             MockClient,
             MockExecutor,
@@ -423,16 +414,6 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_future_priority_ordering() {
-        struct MockHandshake;
-        impl HandshakeEventProvider for MockHandshake {
-            async fn wait_for_events(
-                &mut self,
-            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
-                futures::future::pending::<()>().await;
-                Err(HandshakeError::ChannelClosed)
-            }
-        }
-
         struct MockClient;
         impl ClientTransactionRelay for MockClient {
             async fn relay_transaction_result_to_client(
@@ -484,7 +465,7 @@ mod tests {
             notif_rx,
             op_rx,
             bridge_rx,
-            MockHandshake,
+            create_mock_handshake_stream(),
             node_rx,
             MockClient,
             MockExecutor,
@@ -505,16 +486,6 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_future_concurrent_messages() {
-        struct MockHandshake;
-        impl HandshakeEventProvider for MockHandshake {
-            async fn wait_for_events(
-                &mut self,
-            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }
-        }
-
         struct MockClient;
         impl ClientTransactionRelay for MockClient {
             async fn relay_transaction_result_to_client(
@@ -559,7 +530,7 @@ mod tests {
             notif_rx,
             op_rx,
             bridge_rx,
-            MockHandshake,
+            create_mock_handshake_stream(),
             node_rx,
             MockClient,
             MockExecutor,
@@ -579,16 +550,6 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_priority_select_future_buffered_messages() {
-        struct MockHandshake;
-        impl HandshakeEventProvider for MockHandshake {
-            async fn wait_for_events(
-                &mut self,
-            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }
-        }
-
         struct MockClient;
         impl ClientTransactionRelay for MockClient {
             async fn relay_transaction_result_to_client(
@@ -631,7 +592,7 @@ mod tests {
             notif_rx,
             op_rx,
             bridge_rx,
-            MockHandshake,
+            create_mock_handshake_stream(),
             node_rx,
             MockClient,
             MockExecutor,
@@ -656,16 +617,6 @@ mod tests {
     #[test_log::test]
     async fn test_priority_select_future_rapid_cancellations() {
         use futures::StreamExt;
-
-        struct MockHandshake;
-        impl HandshakeEventProvider for MockHandshake {
-            async fn wait_for_events(
-                &mut self,
-            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }
-        }
 
         struct MockClient;
         impl ClientTransactionRelay for MockClient {
@@ -711,7 +662,7 @@ mod tests {
             notif_rx,
             op_rx,
             bridge_rx,
-            MockHandshake,
+            create_mock_handshake_stream(),
             node_rx,
             MockClient,
             MockExecutor,
@@ -748,16 +699,6 @@ mod tests {
     #[test_log::test]
     async fn test_priority_select_event_loop_simulation() {
         use futures::StreamExt;
-
-        struct MockHandshake;
-        impl HandshakeEventProvider for MockHandshake {
-            async fn wait_for_events(
-                &mut self,
-            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }
-        }
 
         struct MockClient;
         impl ClientTransactionRelay for MockClient {
@@ -840,7 +781,7 @@ mod tests {
             notif_rx,
             op_rx,
             bridge_rx,
-            MockHandshake,
+            create_mock_handshake_stream(),
             node_rx,
             MockClient,
             MockExecutor,
@@ -1157,15 +1098,6 @@ mod tests {
         sleep(Duration::from_micros(100)).await;
 
         // Mock implementations for the stream
-        struct MockHandshake;
-        impl HandshakeEventProvider for MockHandshake {
-            async fn wait_for_events(
-                &mut self,
-            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }
-        }
 
         struct MockClient {
             rx: mpsc::Receiver<
@@ -1230,7 +1162,7 @@ mod tests {
             notif_rx,
             op_rx,
             bridge_rx,
-            MockHandshake,
+            create_mock_handshake_stream(),
             node_rx,
             MockClient {
                 rx: client_rx,
@@ -1483,16 +1415,6 @@ mod tests {
     async fn test_priority_select_all_pending_waker_registration() {
         use futures::StreamExt;
 
-        struct MockHandshake;
-        impl HandshakeEventProvider for MockHandshake {
-            async fn wait_for_events(
-                &mut self,
-            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }
-        }
-
         struct MockClient {
             rx: mpsc::Receiver<
                 Result<
@@ -1621,7 +1543,7 @@ mod tests {
             notif_rx,
             op_rx,
             bridge_rx,
-            MockHandshake,
+            create_mock_handshake_stream(),
             node_rx,
             MockClient {
                 rx: client_rx,
@@ -1682,15 +1604,6 @@ mod tests {
         );
 
         // Mock implementations for testing
-        struct MockHandshake;
-        impl HandshakeEventProvider for MockHandshake {
-            async fn wait_for_events(
-                &mut self,
-            ) -> Result<crate::node::network_bridge::handshake::Event, HandshakeError> {
-                sleep(Duration::from_secs(1000)).await;
-                Err(HandshakeError::ChannelClosed)
-            }
-        }
 
         struct MockClient;
         impl ClientTransactionRelay for MockClient {
@@ -1750,7 +1663,7 @@ mod tests {
             notif_rx,
             op_rx,
             bridge_rx,
-            MockHandshake,
+            create_mock_handshake_stream(),
             node_rx,
             MockClient,
             MockExecutor,
