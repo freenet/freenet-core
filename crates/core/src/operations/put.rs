@@ -466,7 +466,7 @@ impl Operation for PutOp {
                     for peer in broadcast_to.iter() {
                         // Skip if target is self - we don't broadcast to ourselves
                         if peer.peer == self_peer {
-                            tracing::warn!(
+                            tracing::debug!(
                                 tx = %id,
                                 target = %peer.peer,
                                 "Skipping broadcast to self - peer should not be in broadcast_to list"
