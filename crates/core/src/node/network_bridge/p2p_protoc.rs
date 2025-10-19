@@ -292,6 +292,12 @@ impl P2pConnManager {
                                                 {
                                                     tracing::error!("Failed to send message to peer after establishing connection: {}", e);
                                                 }
+                                            } else {
+                                                tracing::error!(
+                                                    tx = %tx,
+                                                    target = %target_peer.peer,
+                                                    "Connection established successfully but not found in HashMap - possible race condition"
+                                                );
                                             }
                                         }
                                         Ok(Some(Err(e))) => {
@@ -1232,7 +1238,9 @@ impl P2pConnManager {
 
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((_, msg))) => EventResult::Event(ConnEvent::OutboundMessage(*msg).into()),
+            Some(Left((_target, msg))) => {
+                EventResult::Event(ConnEvent::OutboundMessage(*msg).into())
+            }
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
             None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
         }

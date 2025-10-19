@@ -258,17 +258,32 @@ impl Operation for PutOp {
                         value.clone()
                     };
 
-                    // Create a SeekNode message to find the target node
-                    // fixme: this node should filter out incoming redundant puts since is the one initiating the request
-                    return_msg = Some(PutMsg::SeekNode {
-                        id: *id,
-                        sender,
-                        target: target.clone(),
-                        value: modified_value, // Use the modified value from put_contract
-                        contract: contract.clone(),
-                        related_contracts: related_contracts.clone(),
-                        htl: *htl,
-                    });
+                    // Determine next forwarding target - find peers closer to the contract location
+                    // Don't reuse the target from RequestPut as that's US (the current processing peer)
+                    let next_target = op_manager
+                        .ring
+                        .closest_potentially_caching(&key, [&sender.peer].as_slice());
+
+                    if let Some(forward_target) = next_target {
+                        // Create a SeekNode message to forward to the next hop
+                        return_msg = Some(PutMsg::SeekNode {
+                            id: *id,
+                            sender,
+                            target: forward_target,
+                            value: modified_value, // Use the modified value from put_contract
+                            contract: contract.clone(),
+                            related_contracts: related_contracts.clone(),
+                            htl: *htl,
+                        });
+                    } else {
+                        // No other peers to forward to - we're the final destination
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "No peers to forward to - handling PUT completion locally"
+                        );
+                        return_msg = None;
+                    }
 
                     // No changes to state yet, still in AwaitResponse state
                     new_state = self.state;
@@ -444,10 +459,20 @@ impl Operation for PutOp {
                     // Get own location and initialize counter
                     let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
+                    let self_peer = op_manager.ring.connection_manager.get_peer_key().unwrap();
 
-                    // Broadcast to all peers in parallel
+                    // Broadcast to all peers in parallel, filtering out self
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
                     for peer in broadcast_to.iter() {
+                        // Skip if target is self - we don't broadcast to ourselves
+                        if peer.peer == self_peer {
+                            tracing::warn!(
+                                tx = %id,
+                                target = %peer.peer,
+                                "Skipping broadcast to self - peer should not be in broadcast_to list"
+                            );
+                            continue;
+                        }
                         let msg = PutMsg::BroadcastTo {
                             id: *id,
                             key: *key,
