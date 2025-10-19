@@ -312,13 +312,45 @@ impl P2pConnManager {
                                 ctx.bridge.op_manager.completed(id);
                                 continue;
                             };
+
+                            // Check if message targets self - if so, process locally instead of sending over network
+                            let self_peer_id = ctx.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap();
+                            if target_peer.peer == self_peer_id {
+                                tracing::debug!(
+                                    tx = %msg.id(),
+                                    msg_type = %msg,
+                                    "Message targets self, processing locally instead of sending over network"
+                                );
+                                // Convert to InboundMessage and process locally
+                                ctx.handle_inbound_message(
+                                    msg,
+                                    &outbound_message,
+                                    &op_manager,
+                                    &mut state,
+                                )
+                                .await?;
+                                continue;
+                            }
+
                             tracing::info!(
                                 tx = %msg.id(),
                                 msg_type = %msg,
                                 target_peer = %target_peer,
                                 "Sending outbound message to peer"
                             );
-                            match ctx.connections.get(&target_peer.peer) {
+                            // IMPORTANT: Use a single get() call to avoid TOCTOU race
+                            // between contains_key() and get(). The connection can be
+                            // removed by another task between those two calls.
+                            let peer_connection = ctx.connections.get(&target_peer.peer);
+                            tracing::warn!(
+                                tx = %msg.id(),
+                                self_peer = %ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                target = %target_peer.peer,
+                                conn_map_size = ctx.connections.len(),
+                                has_connection = peer_connection.is_some(),
+                                "[CONN_TRACK] LOOKUP: Checking for existing connection in HashMap"
+                            );
+                            match peer_connection {
                                 Some(peer_connection) => {
                                     if let Err(e) = peer_connection.send(Left(msg.clone())).await {
                                         tracing::error!(
@@ -414,6 +446,7 @@ impl P2pConnManager {
                                             .await;
 
                                         // Remove from connection map
+                                        tracing::warn!(self_peer = %ctx.bridge.op_manager.ring.connection_manager.pub_key, %peer, conn_map_size = ctx.connections.len(), "[CONN_TRACK] REMOVE: ClosedChannel cleanup - removing from connections HashMap");
                                         ctx.connections.remove(&peer);
 
                                         // Notify handshake handler to clean up
@@ -449,7 +482,7 @@ impl P2pConnManager {
                         }
                         ConnEvent::NodeAction(action) => match action {
                             NodeEvent::DropConnection(peer) => {
-                                tracing::debug!(%peer, "Dropping connection");
+                                tracing::warn!(self_peer = %ctx.bridge.op_manager.ring.connection_manager.pub_key, %peer, conn_map_size = ctx.connections.len(), "[CONN_TRACK] REMOVE: DropConnection event - removing from connections HashMap");
                                 if let Some(conn) = ctx.connections.remove(&peer) {
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     timeout(
@@ -1007,8 +1040,18 @@ impl P2pConnManager {
                         return Ok(());
                     }
                 }
-                let (tx, rx) = mpsc::channel(1);
-                self.connections.insert(joiner.clone(), tx);
+                // Only insert if connection doesn't already exist to avoid dropping existing channel
+                if !self.connections.contains_key(&joiner) {
+                    let (tx, rx) = mpsc::channel(1);
+                    tracing::warn!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %joiner, %id, conn_map_size = self.connections.len(), "[CONN_TRACK] INSERT: InboundConnection - adding to connections HashMap");
+                    self.connections.insert(joiner.clone(), tx);
+                    let task = peer_connection_listener(rx, conn).boxed();
+                    select_stream.push_peer_connection(task);
+                } else {
+                    tracing::warn!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %joiner, %id, conn_map_size = self.connections.len(), "[CONN_TRACK] SKIP INSERT: InboundConnection - connection already exists in HashMap, dropping new connection");
+                    // Connection already exists - drop the new connection object but continue processing the operation
+                    // The conn will be dropped here which closes the duplicate connection attempt
+                }
 
                 // IMPORTANT: Normally we do NOT add connection to ring here!
                 // Connection should only be added after StartJoinReq is accepted
@@ -1042,8 +1085,6 @@ impl P2pConnManager {
                         .push(id, crate::operations::OpEnum::Connect(op))
                         .await?;
                 }
-                let task = peer_connection_listener(rx, conn).boxed();
-                select_stream.push_peer_connection(task);
 
                 if let Some(ForwardInfo {
                     target: forward_to,
@@ -1185,10 +1226,17 @@ impl P2pConnManager {
         } else {
             tracing::warn!(%peer_id, "No callback for connection established");
         }
-        let (tx, rx) = mpsc::channel(10);
-        self.connections.insert(peer_id.clone(), tx);
-        let task = peer_connection_listener(rx, connection).boxed();
-        select_stream.push_peer_connection(task);
+
+        // Only insert if connection doesn't already exist to avoid dropping existing channel
+        if !self.connections.contains_key(&peer_id) {
+            let (tx, rx) = mpsc::channel(10);
+            tracing::warn!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] INSERT: OutboundConnectionSuccessful - adding to connections HashMap");
+            self.connections.insert(peer_id.clone(), tx);
+            let task = peer_connection_listener(rx, connection).boxed();
+            select_stream.push_peer_connection(task);
+        } else {
+            tracing::warn!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] SKIP INSERT: OutboundConnectionSuccessful - connection already exists in HashMap");
+        }
         Ok(())
     }
 
@@ -1246,7 +1294,7 @@ impl P2pConnManager {
                         .keys()
                         .find_map(|k| (k.addr == socket_addr).then(|| k.clone()))
                     {
-                        tracing::debug!(%peer, "Dropping connection");
+                        tracing::warn!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer, socket_addr = %socket_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportError::ConnectionClosed - removing from connections HashMap");
                         self.bridge
                             .op_manager
                             .ring

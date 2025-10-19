@@ -1294,17 +1294,66 @@ pub(crate) mod tracer {
 
         let disabled_logs = std::env::var("FREENET_DISABLE_LOGS").is_ok();
         let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
+        let use_json = std::env::var("FREENET_LOG_FORMAT")
+            .map(|v| v.to_lowercase() == "json")
+            .unwrap_or(false);
+
         let layers = {
-            let fmt_layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
-            let fmt_layer = if cfg!(any(test, debug_assertions)) {
-                fmt_layer.with_file(true).with_line_number(true)
+            // Create the base layer with either pretty or JSON formatting
+            let fmt_layer = if use_json {
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .json()
+                    .boxed()
+            } else {
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .pretty()
+                    .boxed()
+            };
+
+            // Apply file/line number configuration for test/debug builds
+            let fmt_layer = if cfg!(any(test, debug_assertions)) && !use_json {
+                // For pretty format, we can add file/line info
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .pretty()
+                    .with_file(true)
+                    .with_line_number(true)
+                    .boxed()
+            } else if cfg!(any(test, debug_assertions)) && use_json {
+                // For JSON format, file/line are automatically included
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .json()
+                    .with_file(true)
+                    .with_line_number(true)
+                    .boxed()
             } else {
                 fmt_layer
             };
-            let fmt_layer = if to_stderr {
-                fmt_layer.with_writer(std::io::stderr).boxed()
+
+            // Apply stderr writer configuration
+            let fmt_layer = if to_stderr && use_json {
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .json()
+                    .with_file(cfg!(any(test, debug_assertions)))
+                    .with_line_number(cfg!(any(test, debug_assertions)))
+                    .with_writer(std::io::stderr)
+                    .boxed()
+            } else if to_stderr && !use_json {
+                let layer = tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .pretty();
+                let layer = if cfg!(any(test, debug_assertions)) {
+                    layer.with_file(true).with_line_number(true)
+                } else {
+                    layer
+                };
+                layer.with_writer(std::io::stderr).boxed()
             } else {
-                fmt_layer.boxed()
+                fmt_layer
             };
             #[cfg(not(feature = "trace-ot"))]
             {
