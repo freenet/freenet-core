@@ -1,13 +1,9 @@
-use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
-use crate::contract::{ContractHandlerEvent, WaitingTransaction};
-use crate::message::{NetMessageV1, QueryResult};
-use crate::node::subscribe::SubscribeMsg;
-use crate::ring::Location;
 use dashmap::DashSet;
 use either::{Either, Left, Right};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::FutureExt;
+use futures::StreamExt;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -23,13 +19,18 @@ use tokio::sync::oneshot::{self};
 use tokio::time::timeout;
 use tracing::Instrument;
 
+use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
+use crate::contract::{ContractHandlerEvent, WaitingTransaction};
+use crate::message::{NetMessageV1, QueryResult};
 use crate::node::network_bridge::handshake::{
-    Event as HandshakeEvent, ForwardInfo, HandshakeError, HandshakeHandler, HanshakeHandlerMsg,
-    OutboundMessage,
+    Event as HandshakeEvent, ForwardInfo, HandshakeError, HandshakeEventStream, HandshakeHandler,
+    HanshakeHandlerMsg, OutboundMessage,
 };
 use crate::node::network_bridge::priority_select;
+use crate::node::subscribe::SubscribeMsg;
 use crate::node::{MessageProcessor, PeerId};
 use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
+use crate::ring::Location;
 use crate::transport::{
     create_connection_handler, PeerConnection, TransportError, TransportKeypair,
 };
@@ -235,11 +236,13 @@ impl P2pConnManager {
 
         // Create priority select stream ONCE by moving ownership - it stays alive across iterations.
         // This fixes the lost wakeup race condition (issue #1932).
+        // HandshakeEventStream wraps HandshakeHandler and implements Stream properly.
+        let handshake_stream = HandshakeEventStream::new(handshake_handler);
         let select_stream = priority_select::ProductionPrioritySelectStream::new(
             notification_channel.notifications_receiver,
             notification_channel.op_execution_receiver,
             conn_bridge_rx,
-            handshake_handler,
+            handshake_stream,
             node_controller,
             client_wait_for_transaction,
             executor_listener,
@@ -267,8 +270,6 @@ impl P2pConnManager {
             blocked_addresses,
             message_processor,
         };
-
-        use futures::StreamExt;
 
         while let Some(result) = select_stream.as_mut().next().await {
             // Process the result using the existing handler
