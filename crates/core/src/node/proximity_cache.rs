@@ -88,6 +88,11 @@ impl ProximityCacheManager {
                 "PROXIMITY_PROPAGATION: Added contract to cache"
             );
 
+            // Update statistics for immediate announcement
+            let mut stats = self.stats.write().await;
+            stats.cache_announces_sent += 1;
+            drop(stats);
+
             // Immediate announcement for new cache entries
             Some(ProximityCacheMessage::CacheAnnounce {
                 added: vec![contract_id],
@@ -133,6 +138,7 @@ impl ProximityCacheManager {
                 drop(stats);
 
                 // Update our knowledge of this neighbor's cache
+                let now = Instant::now();
                 self.neighbor_caches
                     .entry(peer_id.clone())
                     .and_modify(|cache| {
@@ -142,11 +148,11 @@ impl ProximityCacheManager {
                         for contract_id in &removed {
                             cache.contracts.remove(contract_id);
                         }
-                        cache.last_update = Instant::now();
+                        cache.last_update = now;
                     })
                     .or_insert_with(|| NeighborCache {
                         contracts: added.iter().cloned().collect(),
-                        last_update: Instant::now(),
+                        last_update: now,
                     });
 
                 debug!(
@@ -177,6 +183,10 @@ impl ProximityCacheManager {
                     cache_size = cache_size,
                     "PROXIMITY_PROPAGATION: Sending cache state to neighbor"
                 );
+
+                // Update statistics for cache state response
+                let mut stats = self.stats.write().await;
+                stats.cache_announces_sent += 1;
 
                 Some(response)
             }
@@ -277,15 +287,21 @@ impl ProximityCacheManager {
         &self,
     ) -> (
         Vec<ContractInstanceId>,
-        HashMap<String, Vec<ContractInstanceId>>,
+        HashMap<String, (Vec<ContractInstanceId>, std::time::SystemTime)>,
     ) {
         let my_cache = self.my_cache.read().await.iter().cloned().collect();
+        let now = std::time::SystemTime::now();
 
         let mut neighbor_data = HashMap::new();
         for entry in self.neighbor_caches.iter() {
+            // Calculate SystemTime from Instant by subtracting elapsed time from now
+            let last_update_system_time = now - entry.value().last_update.elapsed();
             neighbor_data.insert(
                 entry.key().to_string(), // Convert PeerId to String for introspection
-                entry.value().contracts.iter().cloned().collect(),
+                (
+                    entry.value().contracts.iter().cloned().collect(),
+                    last_update_system_time,
+                ),
             );
         }
 

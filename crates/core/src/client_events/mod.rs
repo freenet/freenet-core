@@ -394,7 +394,7 @@ async fn handle_proximity_cache_info_query(
 
     let neighbor_caches: Vec<_> = neighbor_cache_data
         .into_iter()
-        .map(|(peer_id, contract_ids)| {
+        .map(|(peer_id, (contract_ids, last_update_time))| {
             // Convert ContractInstanceIds to u32 hashes for backwards compatibility
             let known_contracts = contract_ids
                 .into_iter()
@@ -412,7 +412,7 @@ async fn handle_proximity_cache_info_query(
             freenet_stdlib::client_api::NeighborCacheInfo {
                 peer_id,
                 known_contracts,
-                last_update: std::time::SystemTime::now()
+                last_update: last_update_time
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),

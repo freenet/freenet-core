@@ -605,6 +605,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
+            .with_min_connections(1) // 4-node test network needs realistic minimum
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
@@ -616,6 +617,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
+            .with_min_connections(1) // 4-node test network needs realistic minimum
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
@@ -627,6 +629,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
+            .with_min_connections(1) // 4-node test network needs realistic minimum
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await

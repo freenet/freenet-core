@@ -703,19 +703,6 @@ impl P2pConnManager {
                                 }
                             }
                             NodeEvent::BroadcastProximityCache { from, message } => {
-                                // WORKAROUND: Skip broadcasts in 2-node networks
-                                // This masks an underlying issue where PUT operations flood messages
-                                // in 2-node topologies. The proximity cache itself only broadcasts once
-                                // per contract (verified by logs), but something in PUT handling causes
-                                // a message flood. TODO: Investigate PUT operation message handling.
-                                if self.connections.len() <= 1 {
-                                    tracing::debug!(
-                                        neighbor_count = self.connections.len(),
-                                        "PROXIMITY_PROPAGATION: Skipping broadcast in 2-node network (workaround for PUT flood issue)"
-                                    );
-                                    continue;
-                                }
-
                                 tracing::debug!(
                                     neighbor_count = self.connections.len(),
                                     from = %from,
