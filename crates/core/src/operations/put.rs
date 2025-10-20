@@ -270,7 +270,7 @@ impl Operation for PutOp {
                             id: *id,
                             sender,
                             target: forward_target,
-                            value: modified_value, // Use the modified value from put_contract
+                            value: modified_value,
                             contract: contract.clone(),
                             related_contracts: related_contracts.clone(),
                             htl: *htl,
@@ -459,20 +459,10 @@ impl Operation for PutOp {
                     // Get own location and initialize counter
                     let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
-                    let self_peer = op_manager.ring.connection_manager.get_peer_key().unwrap();
 
-                    // Broadcast to all peers in parallel, filtering out self
+                    // Broadcast to all peers in parallel
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
                     for peer in broadcast_to.iter() {
-                        // Skip if target is self - we don't broadcast to ourselves
-                        if peer.peer == self_peer {
-                            tracing::warn!(
-                                tx = %id,
-                                target = %peer.peer,
-                                "Skipping broadcast to self - peer should not be in broadcast_to list"
-                            );
-                            continue;
-                        }
                         let msg = PutMsg::BroadcastTo {
                             id: *id,
                             key: *key,
