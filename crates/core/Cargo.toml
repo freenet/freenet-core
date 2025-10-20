@@ -7,6 +7,7 @@ publish = true
 description = "Freenet core software"
 license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet-core"
+readme = "README.md"
 
 [[bin]]
 name = "freenet"
