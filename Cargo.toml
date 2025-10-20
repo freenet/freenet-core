@@ -34,7 +34,7 @@ wasmer = "5.0.4"
 wasmer-compiler-singlepass = "5.0.4"
 
 # freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", branch = "main", package = "freenet-stdlib" }
-freenet-stdlib = { version = "0.1.22" }
+freenet-stdlib = { version = "0.1.23" }
 
 # [patch.crates-io]
 # freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", branch = "main" }
