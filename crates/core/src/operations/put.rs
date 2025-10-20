@@ -258,18 +258,30 @@ impl Operation for PutOp {
                         value.clone()
                     };
 
-                    // Determine next forwarding target - find peers closer to the contract location
-                    // Don't reuse the target from RequestPut as that's US (the current processing peer)
-                    let next_target = op_manager
-                        .ring
-                        .closest_potentially_caching(&key, [&sender.peer].as_slice());
+                    // Check if the target is ourself - this is a routing bug that needs correction
+                    let self_peer = op_manager.ring.connection_manager.get_peer_key().unwrap();
+                    let forward_target = if target.peer == self_peer {
+                        // Target points to us - find a different target to prevent self-targeting
+                        tracing::warn!(
+                            tx = %id,
+                            %key,
+                            target = %target.peer,
+                            "RequestPut target is self - finding alternate forwarding target"
+                        );
+                        op_manager
+                            .ring
+                            .closest_potentially_caching(&key, [&sender.peer].as_slice())
+                    } else {
+                        // Target is valid (not self) - use it as intended
+                        Some(target.clone())
+                    };
 
-                    if let Some(forward_target) = next_target {
+                    if let Some(next_target) = forward_target {
                         // Create a SeekNode message to forward to the next hop
                         return_msg = Some(PutMsg::SeekNode {
                             id: *id,
                             sender,
-                            target: forward_target,
+                            target: next_target,
                             value: modified_value, // Use the modified value from put_contract
                             contract: contract.clone(),
                             related_contracts: related_contracts.clone(),
