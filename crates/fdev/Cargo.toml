@@ -6,7 +6,8 @@ rust-version = "1.80"
 publish = true
 description = "Freenet development tool"
 license-file = "LICENSE.md"
-repository = "https://github.com/freenet/freenet"
+repository = "https://github.com/freenet/freenet-core"
+readme = "README.md"
 
 [dependencies]
 bytesize = "2.0"
