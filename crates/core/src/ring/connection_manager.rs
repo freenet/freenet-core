@@ -252,7 +252,13 @@ impl ConnectionManager {
 
     pub fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
         tracing::debug!(%peer, "Adding connection");
-        debug_assert!(self.get_peer_key().expect("should be set") != peer);
+
+        // CRITICAL: Never add self as a connection - this would corrupt routing logic
+        debug_assert!(
+            self.get_peer_key().expect("should be set") != peer,
+            "BUG: Attempted to add self ({}) as connection - this should never happen",
+            peer
+        );
         if was_reserved {
             let old = self
                 .reserved_connections

@@ -258,31 +258,19 @@ impl Operation for PutOp {
                         value.clone()
                     };
 
-                    // Check if the target is ourself - this is a routing bug that needs correction
-                    let self_peer = op_manager.ring.connection_manager.get_peer_key().unwrap();
-                    let forward_target = if target.peer == self_peer {
-                        // Target points to us - find a different target to prevent self-targeting
-                        tracing::warn!(
-                            tx = %id,
-                            %key,
-                            target = %target.peer,
-                            "RequestPut target is self - finding alternate forwarding target"
-                        );
-                        op_manager
-                            .ring
-                            .closest_potentially_caching(&key, [&sender.peer].as_slice())
-                    } else {
-                        // Target is valid (not self) - use it as intended
-                        Some(target.clone())
-                    };
+                    // Determine next forwarding target - find peers closer to the contract location
+                    // Don't reuse the target from RequestPut as that's US (the current processing peer)
+                    let next_target = op_manager
+                        .ring
+                        .closest_potentially_caching(&key, [&sender.peer].as_slice());
 
-                    if let Some(next_target) = forward_target {
+                    if let Some(forward_target) = next_target {
                         // Create a SeekNode message to forward to the next hop
                         return_msg = Some(PutMsg::SeekNode {
                             id: *id,
                             sender,
-                            target: next_target,
-                            value: modified_value, // Use the modified value from put_contract
+                            target: forward_target,
+                            value: modified_value,
                             contract: contract.clone(),
                             related_contracts: related_contracts.clone(),
                             htl: *htl,
@@ -471,20 +459,10 @@ impl Operation for PutOp {
                     // Get own location and initialize counter
                     let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
-                    let self_peer = op_manager.ring.connection_manager.get_peer_key().unwrap();
 
-                    // Broadcast to all peers in parallel, filtering out self
+                    // Broadcast to all peers in parallel
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
                     for peer in broadcast_to.iter() {
-                        // Skip if target is self - we don't broadcast to ourselves
-                        if peer.peer == self_peer {
-                            tracing::debug!(
-                                tx = %id,
-                                target = %peer.peer,
-                                "Skipping broadcast to self - peer should not be in broadcast_to list"
-                            );
-                            continue;
-                        }
                         let msg = PutMsg::BroadcastTo {
                             id: *id,
                             key: *key,

@@ -144,20 +144,37 @@ impl Operation for UpdateOp {
                     let sender = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!(
-                        "UPDATE RequestUpdate: forwarding update for contract {} from {} to {}",
+                        "UPDATE RequestUpdate: received update request for contract {} from {} to {}",
                         key,
                         sender.peer,
                         target.peer
                     );
 
-                    return_msg = Some(UpdateMsg::SeekNode {
-                        id: *id,
-                        sender,
-                        target: target.clone(),
-                        value: value.clone(),
-                        key: *key,
-                        related_contracts: related_contracts.clone(),
-                    });
+                    // Determine next forwarding target - find peers closer to the contract location
+                    // Don't reuse the target from RequestUpdate as that's US (the current processing peer)
+                    let next_target = op_manager
+                        .ring
+                        .closest_potentially_caching(key, [&sender.peer].as_slice());
+
+                    if let Some(forward_target) = next_target {
+                        // Create a SeekNode message to forward to the next hop
+                        return_msg = Some(UpdateMsg::SeekNode {
+                            id: *id,
+                            sender,
+                            target: forward_target,
+                            value: value.clone(),
+                            key: *key,
+                            related_contracts: related_contracts.clone(),
+                        });
+                    } else {
+                        // No other peers to forward to - we're the final destination
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "No peers to forward UPDATE to - handling locally"
+                        );
+                        return_msg = None;
+                    }
 
                     // no changes to state yet, still in AwaitResponse state
                     new_state = self.state;
@@ -666,11 +683,20 @@ pub(crate) async fn request_update(
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to update
-    let target = if let Some(location) = op_manager.ring.subscribers_of(&key) {
-        location
-            .clone()
-            .pop()
-            .ok_or(OpError::RingError(RingError::NoLocation))?
+    let target_from_subscribers = if let Some(subscribers) = op_manager.ring.subscribers_of(&key) {
+        // Clone and filter out self from subscribers to prevent self-targeting
+        let mut filtered_subscribers: Vec<_> = subscribers
+            .iter()
+            .filter(|sub| sub.peer != sender.peer)
+            .cloned()
+            .collect();
+        filtered_subscribers.pop()
+    } else {
+        None
+    };
+
+    let target = if let Some(remote_subscriber) = target_from_subscribers {
+        remote_subscriber
     } else {
         // Find the best peer to send the update to
         let remote_target = op_manager
