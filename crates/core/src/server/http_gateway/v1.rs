@@ -20,9 +20,9 @@ impl HttpGateway {
 
         let router = Router::new()
             .route("/v1", get(home))
-            .route("/v1/contract/web/:key/", get(web_home))
+            .route("/v1/contract/web/{key}/", get(web_home))
             .with_state(config)
-            .route("/v1/contract/web/:key/*path", get(web_subpages))
+            .route("/v1/contract/web/{key}/*path", get(web_subpages))
             .layer(Extension(attested_contracts.clone()))
             .layer(Extension(HttpGatewayRequest(proxy_request_sender)));
 
