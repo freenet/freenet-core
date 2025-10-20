@@ -28,7 +28,7 @@ pub struct BaseConfig {
     #[arg(value_enum, default_value_t=OperationMode::Local, env = "MODE")]
     pub mode: OperationMode,
     /// The port of the running local freenet node websocket API.
-    #[arg(short, long, default_value = "50509", env = "WS_API_PORT")]
+    #[arg(short, long, default_value = "7509", env = "WS_API_PORT")]
     pub(crate) port: u16,
     /// The ip address of freenet node to publish the contract to. If the node is running in local mode,
     /// The default value is `127.0.0.1`.

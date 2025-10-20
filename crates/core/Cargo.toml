@@ -1,12 +1,13 @@
 [package]
 name = "freenet"
-version = "0.1.30"
+version = "0.1.31"
 edition = "2021"
 rust-version = "1.80"
 publish = true
 description = "Freenet core software"
 license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet-core"
+readme = "README.md"
 
 [[bin]]
 name = "freenet"
@@ -39,7 +40,7 @@ headers = "0.4"
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
 itertools = "0.14"
 notify = "8"
-pav_regression = "0.5.2"
+pav_regression = "0.6.1"
 parking_lot = "0.12"
 pin-project = "1"
 rand = { features = ["small_rng"], workspace = true }
@@ -57,7 +58,7 @@ tokio-tungstenite = "0.27.0"
 tower-http = { features = ["fs", "trace"], version = "0.6" }
 ulid = { features = ["serde"], version = "1.1" }
 wasmer = { features = ["sys"], workspace = true }
-wasmer-middlewares = "5.0.4"
+wasmer-middlewares = "6.1.0"
 wasmer-compiler-singlepass = { workspace = true }
 xz2 = { version = "0.1" }
 reqwest = { version = "0.12", features = ["json"] }

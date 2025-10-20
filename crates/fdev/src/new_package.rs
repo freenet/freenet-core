@@ -22,6 +22,12 @@ pub fn create_new_package(config: InitPackageConfig) -> anyhow::Result<()> {
     let path = path
         .or_else(|| env::current_dir().ok())
         .context("Valid path for creating a new package")?;
+    if path.join("freenet.toml").exists() {
+        anyhow::bail!(
+            "A Freenet project already exists in directory: {}",
+            path.display()
+        );
+    }
     match kind {
         ContractKind::WebApp => create_view_package(&path),
         ContractKind::Contract => create_regular_contract(&path),

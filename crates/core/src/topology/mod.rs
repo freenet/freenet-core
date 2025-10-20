@@ -283,6 +283,7 @@ impl TopologyManager {
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
         my_location: &Option<Location>,
         at_time: Instant,
+        current_connections: usize,
     ) -> TopologyAdjustment {
         #[cfg(debug_assertions)]
         {
@@ -294,8 +295,9 @@ impl TopologyManager {
             {
                 LAST_LOG.with(|last_log| {
                     tracing::trace!(
-                        "Adjusting topology at {:?}. Current neighbors: {:?}",
+                        "Adjusting topology at {:?}. Current connections: {}, Filtered neighbors: {}",
                         at_time,
+                        current_connections,
                         neighbor_locations.len()
                     );
                     *last_log.borrow_mut() = Instant::now();
@@ -303,12 +305,12 @@ impl TopologyManager {
             }
         }
 
-        if neighbor_locations.len() < self.limits.min_connections {
+        if current_connections < self.limits.min_connections {
             let mut locations = Vec::new();
-            let below_threshold = self.limits.min_connections - neighbor_locations.len();
+            let below_threshold = self.limits.min_connections - current_connections;
             if below_threshold > 0 {
                 // If we have no connections at all, bootstrap by targeting own location
-                if neighbor_locations.is_empty() {
+                if current_connections == 0 {
                     match my_location {
                         Some(location) => {
                             // The first connect message should target the peer's own
@@ -331,7 +333,7 @@ impl TopologyManager {
                             LAST_LOG.with(|last_log| {
                                 tracing::trace!(
                                     minimum_num_peers_hard_limit = self.limits.min_connections,
-                                    num_peers = neighbor_locations.len(),
+                                    num_peers = current_connections,
                                     to_add = below_threshold,
                                     "Bootstrap: adding first connection at own location"
                                 );
@@ -341,7 +343,7 @@ impl TopologyManager {
                     }
                 }
                 // If we have 1-4 connections, use random locations for diversity
-                else if neighbor_locations.len() < 5 {
+                else if current_connections < 5 {
                     for _i in 0..below_threshold {
                         locations.push(Location::random());
                     }
@@ -356,7 +358,7 @@ impl TopologyManager {
                             LAST_LOG.with(|last_log| {
                                 tracing::trace!(
                                     minimum_num_peers_hard_limit = self.limits.min_connections,
-                                    num_peers = neighbor_locations.len(),
+                                    num_peers = current_connections,
                                     to_add = below_threshold,
                                     "Early stage: adding connections at random locations for diversity"
                                 );
@@ -381,6 +383,16 @@ impl TopologyManager {
             return TopologyAdjustment::AddConnections(locations);
         }
 
+        // Skip resource-based removal in very small networks to avoid destabilizing them
+        // During startup or in small test networks, we need stability more than optimization
+        if current_connections < 5 {
+            debug!(
+                "Skipping resource-based topology adjustment for small network (connections: {})",
+                current_connections
+            );
+            return TopologyAdjustment::NoChange;
+        }
+
         let increase_usage_if_below: RateProportion =
             RateProportion::new(MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION);
         let decrease_usage_if_above: RateProportion =
@@ -392,11 +404,10 @@ impl TopologyManager {
         debug!(?usage_proportion, "Resource usage information");
 
         let adjustment: anyhow::Result<TopologyAdjustment> =
-            if neighbor_locations.len() > self.limits.max_connections {
+            if current_connections > self.limits.max_connections {
                 debug!(
-                    "Number of neighbors ({:?}) is above maximum ({:?}), removing connections",
-                    neighbor_locations.len(),
-                    self.limits.max_connections
+                    "Number of connections ({:?}) is above maximum ({:?}), removing connections",
+                    current_connections, self.limits.max_connections
                 );
 
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Slow);
@@ -721,8 +732,12 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment =
-                resource_manager.adjust_topology(&neighbor_locations, &None, Instant::now());
+            let adjustment = resource_manager.adjust_topology(
+                &neighbor_locations,
+                &None,
+                Instant::now(),
+                peers.len(),
+            );
             match adjustment {
                 TopologyAdjustment::RemoveConnections(peers) => {
                     assert_eq!(peers.len(), 1);
@@ -766,8 +781,12 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment =
-                resource_manager.adjust_topology(&neighbor_locations, &None, Instant::now());
+            let adjustment = resource_manager.adjust_topology(
+                &neighbor_locations,
+                &None,
+                Instant::now(),
+                peers.len(),
+            );
 
             match adjustment {
                 TopologyAdjustment::AddConnections(locations) => {
@@ -807,8 +826,12 @@ mod tests {
                 neighbor_locations.insert(peer.location.unwrap(), vec![]);
             }
 
-            let adjustment =
-                resource_manager.adjust_topology(&neighbor_locations, &None, report_time);
+            let adjustment = resource_manager.adjust_topology(
+                &neighbor_locations,
+                &None,
+                report_time,
+                peers.len(),
+            );
 
             match adjustment {
                 TopologyAdjustment::NoChange => {}
@@ -848,6 +871,7 @@ mod tests {
                 &neighbor_locations,
                 &Some(my_location),
                 report_time,
+                peers.len(),
             );
 
             match adjustment {
@@ -992,6 +1016,7 @@ mod tests {
                 &neighbor_locations,
                 &Some(Location::new(0.5)),
                 Instant::now(),
+                1, // 1 current connection
             );
 
             match adjustment {

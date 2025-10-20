@@ -1,12 +1,13 @@
 [package]
 name = "fdev"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 rust-version = "1.80"
 publish = true
 description = "Freenet development tool"
 license-file = "LICENSE.md"
-repository = "https://github.com/freenet/freenet"
+repository = "https://github.com/freenet/freenet-core"
+readme = "README.md"
 
 [dependencies]
 bytesize = "2.0"
@@ -38,7 +39,7 @@ reqwest = { version = "0.12", features = ["json"] }
 http = "1.2"
 
 # internal
-freenet = { path = "../core", version = "0.1.30" }
+freenet = { path = "../core", version = "0.1.31" }
 freenet-stdlib = { workspace = true }
 
 [features]
