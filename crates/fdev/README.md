@@ -27,8 +27,6 @@ For detailed usage instructions and development setup, see the [GitHub repositor
 
 ## License
 
-Licensed under either:
-- Apache License, Version 2.0
-- MIT License
+Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
 
-at your option.
+See [LICENSE.md](https://github.com/freenet/freenet-core/blob/main/LICENSE.md) for details.
