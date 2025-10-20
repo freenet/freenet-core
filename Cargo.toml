@@ -11,7 +11,7 @@ members = [
 
 [workspace.dependencies]
 arrayvec = { version = "0.7", features = ["serde"] }
-axum = { version = "0.7", default-features = false }
+axum = { version = "0.8", default-features = false }
 blake3 = { version = "1", features = ["std", "traits-preview"] }
 bs58 = "0.5"
 chacha20poly1305 = "0.10"
@@ -34,7 +34,7 @@ wasmer = "6.1.0"
 wasmer-compiler-singlepass = "6.1.0"
 
 # freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", branch = "main", package = "freenet-stdlib" }
-freenet-stdlib = { version = "0.1.22" }
+freenet-stdlib = { version = "0.1.23" }
 
 # [patch.crates-io]
 # freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", branch = "main" }

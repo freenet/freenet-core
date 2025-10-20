@@ -7,6 +7,7 @@ publish = true
 description = "Freenet core software"
 license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet-core"
+readme = "README.md"
 
 [[bin]]
 name = "freenet"
@@ -39,7 +40,7 @@ headers = "0.4"
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
 itertools = "0.14"
 notify = "8"
-pav_regression = "0.5.2"
+pav_regression = "0.6.1"
 parking_lot = "0.12"
 pin-project = "1"
 rand = { features = ["small_rng"], workspace = true }
