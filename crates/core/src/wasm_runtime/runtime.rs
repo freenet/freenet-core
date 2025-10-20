@@ -10,10 +10,8 @@ use freenet_stdlib::{
     prelude::*,
 };
 use std::{collections::HashMap, sync::atomic::AtomicI64};
-use wasmer::{
-    imports, Bytes, CompilerConfig, Imports, Instance, Memory, MemoryType, Module, Store,
-    TypedFunction,
-};
+use wasmer::sys::{CompilerConfig, EngineBuilder};
+use wasmer::{imports, Bytes, Imports, Instance, Memory, MemoryType, Module, Store, TypedFunction};
 use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
@@ -315,7 +313,6 @@ impl Runtime {
 
     fn instance_store_with_config(config: &RuntimeConfig) -> Store {
         use std::sync::Arc;
-        use wasmer::wasmparser::Operator;
         use wasmer_compiler_singlepass::Singlepass;
         use wasmer_middlewares::Metering;
 
@@ -331,6 +328,10 @@ impl Runtime {
             }
         }
 
+        fn operation_cost(_operator: &wasmer::wasmparser::Operator) -> u64 {
+            1
+        }
+
         let (default_cycles, default_margin) = get_cpu_cycles_per_second();
         let cpu_cycles_per_sec = config.cpu_cycles_per_second.unwrap_or(default_cycles);
         let safety_margin = if config.safety_margin >= 0.0 && config.safety_margin <= 1.0 {
@@ -344,15 +345,13 @@ impl Runtime {
             * cpu_cycles_per_sec as f64
             * (1.0 + safety_margin)) as u64;
 
-        let operation_cost = |_operator: &Operator| -> u64 { 1 };
-
         let metering = Arc::new(Metering::new(max_cycles, operation_cost));
         let mut compiler_config = Singlepass::default();
         if config.enable_metering {
             compiler_config.push_middleware(metering.clone());
         }
 
-        let engine = wasmer::EngineBuilder::new(compiler_config).engine();
+        let engine = EngineBuilder::new(compiler_config).engine();
 
         Store::new(&engine)
     }
