@@ -33,13 +33,7 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 /// 2. Perform operations to verify connectivity
 /// 3. Force disconnect
 /// 4. Verify that the peer can reconnect and operate normally
-///
-/// NOTE: This test currently fails due to issue #1960 - outbound-only peers
-/// (public_port: None, network_port: None) cannot reliably receive response
-/// messages because there's no listening port for bidirectional communication.
-/// This is a known architectural limitation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "Issue #1960: outbound-only peer architecture limitation"]
 async fn test_gateway_reconnection() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
@@ -97,10 +91,7 @@ async fn test_gateway_reconnection() -> TestResult {
         ..Default::default()
     };
 
-    // Peer configuration - outbound-only client (no network port)
-    // Note: This test uses an outbound-only peer which cannot reliably
-    // receive responses in the current architecture (issue #1960).
-    // This is a known limitation for peers without public_port/network_port.
+    // Peer configuration
     let temp_dir_peer = tempfile::tempdir()?;
     let peer_key = TransportKeypair::new();
     let peer_transport_keypair = temp_dir_peer.path().join("private.pem");
@@ -151,7 +142,6 @@ async fn test_gateway_reconnection() -> TestResult {
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .with_min_connections(1)
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
@@ -163,7 +153,6 @@ async fn test_gateway_reconnection() -> TestResult {
         let config = peer_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .with_min_connections(1)
             .build(serve_gateway(config.ws_api).await)
             .await?;
         node.run().await
@@ -636,7 +625,6 @@ async fn test_three_node_network_connectivity() -> TestResult {
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .with_min_connections(1)
             .build(serve_gateway(config.ws_api).await)
             .await?;
         tracing::info!("Gateway starting");
@@ -650,7 +638,6 @@ async fn test_three_node_network_connectivity() -> TestResult {
         let config = peer1_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .with_min_connections(1)
             .build(serve_gateway(config.ws_api).await)
             .await?;
         tracing::info!("Peer 1 starting");
@@ -664,7 +651,6 @@ async fn test_three_node_network_connectivity() -> TestResult {
         let config = peer2_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .with_min_connections(1)
             .build(serve_gateway(config.ws_api).await)
             .await?;
         tracing::info!("Peer 2 starting");
@@ -673,7 +659,7 @@ async fn test_three_node_network_connectivity() -> TestResult {
     .boxed_local();
 
     // Main test logic
-    let test = tokio::time::timeout(Duration::from_secs(200), async move {
+    let test = tokio::time::timeout(Duration::from_secs(180), async move {
         // Wait for all nodes to start and connect
         tracing::info!("Waiting for nodes to start and establish connections...");
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -769,74 +755,19 @@ async fn test_three_node_network_connectivity() -> TestResult {
             tokio::time::sleep(RETRY_DELAY).await;
         }
 
-        // Poll for network readiness by attempting PUT operations until successful
-        // Network needs to complete handshakes and initialize routing after connections establish
-        tracing::info!("Verifying network is ready for operations...");
-        let mut put_attempts = 0;
-        let max_put_attempts = 20; // 20 attempts * 5s = 100s max wait
+        // Verify functionality with PUT/GET
+        tracing::info!("Verifying network functionality with PUT/GET operations");
 
-        loop {
-            put_attempts += 1;
-            tracing::info!(
-                "PUT operation attempt {}/{}",
-                put_attempts,
-                max_put_attempts
-            );
-
-            make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
-
-            match tokio::time::timeout(Duration::from_secs(10), client1.recv()).await {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                    assert_eq!(key, contract_key);
-                    tracing::info!(
-                        "✅ Peer1 successfully performed PUT after {} attempts",
-                        put_attempts
-                    );
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    tracing::warn!(
-                        "Unexpected PUT response (attempt {}): {:?}",
-                        put_attempts,
-                        other
-                    );
-                    if put_attempts >= max_put_attempts {
-                        bail!(
-                            "Unexpected PUT response after {} attempts: {:?}",
-                            put_attempts,
-                            other
-                        );
-                    }
-                }
-                Ok(Err(e)) => {
-                    let error_msg = e.to_string();
-                    tracing::warn!("PUT error (attempt {}): {}", put_attempts, error_msg);
-                    if put_attempts >= max_put_attempts {
-                        bail!(
-                            "Error receiving PUT response after {} attempts: {}",
-                            put_attempts,
-                            e
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "PUT timeout (attempt {}/{}), retrying...",
-                        put_attempts,
-                        max_put_attempts
-                    );
-                    if put_attempts >= max_put_attempts {
-                        bail!(
-                            "Timeout waiting for PUT response after {} attempts",
-                            put_attempts
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
+        make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
+        let resp = tokio::time::timeout(Duration::from_secs(60), client1.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Peer1 successfully performed PUT");
             }
+            Ok(Ok(other)) => bail!("Unexpected PUT response: {:?}", other),
+            Ok(Err(e)) => bail!("Error receiving PUT response: {}", e),
+            Err(_) => bail!("Timeout waiting for PUT response"),
         }
 
         make_get(&mut client2, contract_key, true, false).await?;
