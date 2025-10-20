@@ -513,6 +513,7 @@ impl Ring {
                     &neighbor_locations,
                     &self.connection_manager.own_location().location,
                     Instant::now(),
+                    current_connections,
                 );
 
             tracing::info!(
