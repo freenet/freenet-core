@@ -103,9 +103,9 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
                         {
                             tracing::error!(error = %err, "Failed saving report");
-                            tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                                format!("{err}"),
-                            )).into()))
+                            tx.send(Message::Binary(
+                                ControllerResponse::into_fbs_bytes(Err(format!("{err}"))).into(),
+                            ))
                             .await?;
                         }
                         continue;
@@ -124,9 +124,9 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     Ok(change) => {
                         if let Err(err) = state.save_record(ChangesWrapper::PeerChange(change)) {
                             tracing::error!(error = %err, "Failed saving report");
-                            tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                                format!("{err}"),
-                            )).into()))
+                            tx.send(Message::Binary(
+                                ControllerResponse::into_fbs_bytes(Err(format!("{err}"))).into(),
+                            ))
                             .await?;
                         }
                         continue;
@@ -138,9 +138,9 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 }
 
                 tracing::error!(%received_random_id, "The message was not decoded by any fbs type");
-                tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                    decoding_errors.join(", "),
-                )).into()))
+                tx.send(Message::Binary(
+                    ControllerResponse::into_fbs_bytes(Err(decoding_errors.join(", "))).into(),
+                ))
                 .await?;
             }
             Err(e) => {
