@@ -137,47 +137,109 @@ impl Operation for UpdateOp {
                 UpdateMsg::RequestUpdate {
                     id,
                     key,
+                    sender: request_sender,
                     target,
                     related_contracts,
                     value,
                 } => {
-                    let sender = op_manager.ring.connection_manager.own_location();
+                    let self_location = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!(
-                        "UPDATE RequestUpdate: received update request for contract {} from {} to {}",
-                        key,
-                        sender.peer,
+                        tx = %id,
+                        %key,
+                        executing_peer = %self_location.peer,
+                        request_sender = %request_sender.peer,
+                        target_peer = %target.peer,
+                        "UPDATE RequestUpdate: executing_peer={} received request from={} targeting={}",
+                        self_location.peer,
+                        request_sender.peer,
                         target.peer
                     );
 
-                    // Determine next forwarding target - find peers closer to the contract location
-                    // Don't reuse the target from RequestUpdate as that's US (the current processing peer)
-                    let next_target = op_manager
-                        .ring
-                        .closest_potentially_caching(key, [&sender.peer].as_slice());
-
-                    if let Some(forward_target) = next_target {
-                        // Create a SeekNode message to forward to the next hop
-                        return_msg = Some(UpdateMsg::SeekNode {
-                            id: *id,
-                            sender,
-                            target: forward_target,
-                            value: value.clone(),
-                            key: *key,
-                            related_contracts: related_contracts.clone(),
-                        });
-                    } else {
-                        // No other peers to forward to - we're the final destination
+                    // If target is not us, this message is meant for another peer
+                    // This can happen when the initiator processes its own message before sending to network
+                    if target.peer != self_location.peer {
                         tracing::debug!(
                             tx = %id,
                             %key,
-                            "No peers to forward UPDATE to - handling locally"
+                            our_peer = %self_location.peer,
+                            target_peer = %target.peer,
+                            "RequestUpdate target is not us - message will be routed to target"
                         );
+                        // Keep current state, message will be sent to target peer via network
                         return_msg = None;
-                    }
+                        new_state = self.state;
+                    } else {
+                        // Target is us - process the request
+                        // Determine if this is a local request (from our own client) or remote request
+                        let is_local_request =
+                            matches!(&self.state, Some(UpdateState::PrepareRequest { .. }))
+                                || matches!(
+                                    &self.state,
+                                    Some(UpdateState::AwaitingResponse { upstream: None, .. })
+                                );
+                        let upstream = if is_local_request {
+                            None // No upstream - we are the initiator
+                        } else {
+                            Some(request_sender.clone()) // Upstream is the peer that sent us this request
+                        };
 
-                    // no changes to state yet, still in AwaitResponse state
-                    new_state = self.state;
+                        // Determine next forwarding target - find peers closer to the contract location
+                        // Exclude both ourselves AND the request sender to prevent forwarding loops
+                        let next_target = op_manager.ring.closest_potentially_caching(
+                            key,
+                            [&self_location.peer, &request_sender.peer].as_slice(),
+                        );
+
+                        if let Some(forward_target) = next_target {
+                            // Create a SeekNode message to forward to the next hop
+                            return_msg = Some(UpdateMsg::SeekNode {
+                                id: *id,
+                                sender: self_location.clone(),
+                                target: forward_target,
+                                value: value.clone(),
+                                key: *key,
+                                related_contracts: related_contracts.clone(),
+                            });
+                            // Transition to AwaitingResponse state to wait for SuccessfulUpdate
+                            new_state = Some(UpdateState::AwaitingResponse {
+                                key: *key,
+                                upstream,
+                            });
+                        } else {
+                            // No other peers to forward to - we're the final destination
+                            // Update the contract locally and send success response
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                "No peers to forward UPDATE to - completing locally"
+                            );
+
+                            // Update contract locally
+                            let updated_value = update_contract(
+                                op_manager,
+                                *key,
+                                value.clone(),
+                                related_contracts.clone(),
+                            )
+                            .await?;
+
+                            // Create success message to send back to initiator
+                            let raw_state = State::from(updated_value);
+                            let summary = StateSummary::from(raw_state.into_bytes());
+
+                            return_msg = Some(UpdateMsg::SuccessfulUpdate {
+                                id: *id,
+                                target: request_sender.clone(),
+                                summary: summary.clone(),
+                                key: *key,
+                                sender: self_location.clone(),
+                            });
+
+                            // Transition to Finished state
+                            new_state = Some(UpdateState::Finished { key: *key, summary });
+                        }
+                    }
                 }
                 UpdateMsg::SeekNode {
                     id,
@@ -218,36 +280,64 @@ impl Operation for UpdateOp {
                         tracing::debug!(
                             "Peer is seeding or has subscribers for contract. About to update it"
                         );
-                        update_contract(op_manager, *key, value.clone(), related_contracts.clone())
-                            .await?;
+                        let updated_value = update_contract(
+                            op_manager,
+                            *key,
+                            value.clone(),
+                            related_contracts.clone(),
+                        )
+                        .await?;
                         tracing::debug!(
                             tx = %id,
                             "Successfully updated a value for contract {} @ {:?} - update",
                             key,
                             target.location
                         );
+
+                        // If no peers to broadcast to, send success response directly
+                        if broadcast_to.is_empty() {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                "No broadcast targets for SeekNode - completing with SuccessfulUpdate"
+                            );
+
+                            // Create success message to send back to sender
+                            let raw_state = State::from(updated_value);
+                            let summary = StateSummary::from(raw_state.into_bytes());
+
+                            return_msg = Some(UpdateMsg::SuccessfulUpdate {
+                                id: *id,
+                                target: sender.clone(),
+                                summary,
+                                key: *key,
+                                sender: op_manager.ring.connection_manager.own_location(),
+                            });
+                            new_state = None;
+                        } else {
+                            // Have peers to broadcast to - use try_to_broadcast
+                            match try_to_broadcast(
+                                *id,
+                                true,
+                                op_manager,
+                                self.state,
+                                (broadcast_to, sender.clone()),
+                                *key,
+                                value.clone(),
+                                false,
+                            )
+                            .await
+                            {
+                                Ok((state, msg)) => {
+                                    new_state = state;
+                                    return_msg = msg;
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        }
                     } else {
                         tracing::debug!("contract not found in this peer (not seeding and no subscribers). Should throw an error");
                         return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
-                    }
-
-                    match try_to_broadcast(
-                        *id,
-                        true,
-                        op_manager,
-                        self.state,
-                        (broadcast_to, sender.clone()),
-                        *key,
-                        value.clone(),
-                        false,
-                    )
-                    .await
-                    {
-                        Ok((state, msg)) => {
-                            new_state = state;
-                            return_msg = msg;
-                        }
-                        Err(err) => return Err(err),
                     }
                 }
                 UpdateMsg::BroadcastTo {
@@ -707,7 +797,7 @@ pub(crate) async fn request_update(
             // Subscribe to the contract
             op_manager
                 .ring
-                .add_subscriber(&key, sender)
+                .add_subscriber(&key, sender.clone())
                 .map_err(|_| RingError::NoCachingPeers(key))?;
 
             target
@@ -836,6 +926,7 @@ pub(crate) async fn request_update(
     let msg = UpdateMsg::RequestUpdate {
         id,
         key,
+        sender,
         related_contracts,
         target,
         value,
@@ -876,6 +967,7 @@ mod messages {
         RequestUpdate {
             id: Transaction,
             key: ContractKey,
+            sender: PeerKeyLocation,
             target: PeerKeyLocation,
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
@@ -959,7 +1051,9 @@ mod messages {
     impl UpdateMsg {
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
             match self {
+                Self::RequestUpdate { sender, .. } => Some(sender),
                 Self::SeekNode { sender, .. } => Some(sender),
+                Self::SuccessfulUpdate { sender, .. } => Some(sender),
                 Self::BroadcastTo { sender, .. } => Some(sender),
                 _ => None,
             }
