@@ -86,7 +86,7 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
             Ok(msg) => {
                 let msg = match msg {
                     Message::Binary(data) => data,
-                    Message::Text(data) => data.into_bytes(),
+                    Message::Text(data) => data.as_bytes().to_vec().into(),
                     Message::Close(_) => break,
                     Message::Ping(ping) => {
                         tx.send(Message::Pong(ping)).await?;
@@ -103,9 +103,9 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                         if let Err(err) = state.save_record(ChangesWrapper::ContractChange(change))
                         {
                             tracing::error!(error = %err, "Failed saving report");
-                            tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                                format!("{err}"),
-                            ))))
+                            tx.send(Message::Binary(
+                                ControllerResponse::into_fbs_bytes(Err(format!("{err}"))).into(),
+                            ))
                             .await?;
                         }
                         continue;
@@ -124,9 +124,9 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     Ok(change) => {
                         if let Err(err) = state.save_record(ChangesWrapper::PeerChange(change)) {
                             tracing::error!(error = %err, "Failed saving report");
-                            tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                                format!("{err}"),
-                            ))))
+                            tx.send(Message::Binary(
+                                ControllerResponse::into_fbs_bytes(Err(format!("{err}"))).into(),
+                            ))
                             .await?;
                         }
                         continue;
@@ -138,9 +138,9 @@ async fn push_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                 }
 
                 tracing::error!(%received_random_id, "The message was not decoded by any fbs type");
-                tx.send(Message::Binary(ControllerResponse::into_fbs_bytes(Err(
-                    decoding_errors.join(", "),
-                ))))
+                tx.send(Message::Binary(
+                    ControllerResponse::into_fbs_bytes(Err(decoding_errors.join(", "))).into(),
+                ))
                 .await?;
             }
             Err(e) => {
@@ -172,7 +172,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
             peer.value().location,
             peer.value().connections.iter(),
         );
-        tx.send(Message::Binary(msg)).await?;
+        tx.send(Message::Binary(msg.into())).await?;
     }
 
     for transaction in state.transactions_data.iter() {
@@ -352,7 +352,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
 
                 _ => continue,
             };
-            tx.send(Message::Binary(msg)).await?;
+            tx.send(Message::Binary(msg.into())).await?;
         }
     }
 
@@ -369,11 +369,11 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     (from.0 .0, from.1),
                     (to.0 .0, to.1),
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::RemovedConnection { from, at } => {
                 let msg = PeerChange::removed_connection_msg(at.0, from.0);
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::PutRequest {
                 tx_id,
@@ -392,7 +392,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     timestamp,
                     contract_location,
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::PutSuccess {
                 tx_id,
@@ -411,7 +411,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     timestamp,
                     contract_location,
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::BroadcastEmitted {
                 tx_id,
@@ -433,7 +433,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     timestamp,
                     contract_location,
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::BroadcastReceived {
                 tx_id,
@@ -451,7 +451,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     timestamp,
                     contract_location,
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::GetContract {
                 requester,
@@ -469,7 +469,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     contract_location,
                     timestamp,
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::SubscribedToContract {
                 requester,
@@ -489,7 +489,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     at_peer_location,
                     timestamp,
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::UpdateRequest {
                 tx_id,
@@ -507,7 +507,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     timestamp,
                     contract_location,
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::UpdateSuccess {
                 tx_id,
@@ -525,7 +525,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     timestamp,
                     contract_location,
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
             Change::UpdateFailure {
                 tx_id,
@@ -543,7 +543,7 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
                     timestamp,
                     contract_location,
                 );
-                tx.send(Message::Binary(msg)).await?;
+                tx.send(Message::Binary(msg.into())).await?;
             }
         }
     }
