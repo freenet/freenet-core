@@ -75,7 +75,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
@@ -122,10 +122,10 @@ jobs:
       - name: Create Pull Request
         id: create_pr
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           PR_URL=$(gh pr create \
-            --title "🚀 Release ${{ needs.validate.outputs.version }}" \
+            --title "build: release ${{ needs.validate.outputs.version }}" \
             --body "**Automated release PR**
 
           - freenet: → **${{ needs.validate.outputs.version }}**
@@ -142,7 +142,7 @@ jobs:
 
       - name: Enable auto-merge
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           gh pr merge ${{ steps.create_pr.outputs.pr_number }} --squash --auto
           echo "✅ Auto-merge enabled"

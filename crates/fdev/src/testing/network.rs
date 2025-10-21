@@ -344,7 +344,7 @@ async fn handle_outgoing_messages(
         let serialized_msg: Vec<u8> = bincode::serialize(&(event, peer_id.clone()))
             .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
 
-        if let Err(e) = sender.send(Message::Binary(serialized_msg)).await {
+        if let Err(e) = sender.send(Message::Binary(serialized_msg.into())).await {
             tracing::error!(
                 "Failed to send event {} for peer {}: {}",
                 event,

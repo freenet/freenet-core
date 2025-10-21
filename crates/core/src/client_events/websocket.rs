@@ -431,7 +431,7 @@ async fn websocket_interface(
                     },
                     EncodingProtocol::Native => bincode::serialize(&response)?,
                 };
-                server_sink.send(Message::Binary(serialized_res)).await.inspect_err(|err| {
+                server_sink.send(Message::Binary(serialized_res.into())).await.inspect_err(|err| {
                     tracing::debug!(err = %err, "error sending message to client");
                 })?;
             }
@@ -473,8 +473,8 @@ async fn process_client_request(
     encoding_protoc: EncodingProtocol,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
     let msg = match msg {
-        Ok(Message::Binary(data)) => data,
-        Ok(Message::Text(data)) => data.into_bytes(),
+        Ok(Message::Binary(data)) => data.to_vec(),
+        Ok(Message::Text(data)) => data.as_bytes().to_vec(),
         Ok(Message::Close(_)) => return Err(None),
         Ok(Message::Ping(ping)) => return Ok(Some(Message::Pong(ping))),
         Ok(m) => {
@@ -489,7 +489,7 @@ async fn process_client_request(
         match encoding_protoc {
             EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg) {
                 Ok(decoded) => decoded.into_owned(),
-                Err(err) => return Ok(Some(Message::Binary(err.into_fbs_bytes()))),
+                Err(err) => return Ok(Some(Message::Binary(err.into_fbs_bytes().into()))),
             },
             EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg) {
                 Ok(decoded) => decoded.into_owned(),
@@ -501,7 +501,7 @@ async fn process_client_request(
                         .into(),
                     ))
                     .map_err(|err| Some(err.into()))?;
-                    return Ok(Some(Message::Binary(result_error)));
+                    return Ok(Some(Message::Binary(result_error.into())));
                 }
             },
         }
@@ -621,7 +621,7 @@ async fn process_host_response(
                 );
             }
 
-            let send_result = tx.send(Message::Binary(serialized_res)).await;
+            let send_result = tx.send(Message::Binary(serialized_res.into())).await;
 
             // Log WebSocket send result for UPDATE responses
             if let Some(key) = is_update_response {
@@ -659,7 +659,7 @@ async fn process_host_response(
             let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
                 ErrorKind::NodeUnavailable.into(),
             ))?;
-            tx.send(Message::Binary(result_error)).await?;
+            tx.send(Message::Binary(result_error.into())).await?;
             tx.send(Message::Close(None)).await?;
             tracing::warn!("node shut down while handling responses for {client_id}");
             Err(anyhow::anyhow!(
