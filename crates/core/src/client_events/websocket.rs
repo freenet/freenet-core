@@ -53,10 +53,7 @@ const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optima
 impl WebSocketProxy {
     pub fn create_router(server_routing: Router) -> (Self, Router) {
         // Create a default empty attested contracts map
-        let attested_contracts = Arc::new(RwLock::new(HashMap::<
-            AuthToken,
-            (ContractInstanceId, ClientId),
-        >::new()));
+        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
         Self::create_router_with_attested_contracts(server_routing, attested_contracts)
     }
 
@@ -300,7 +297,7 @@ async fn websocket_commands(
                 tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
             }
 
-            if let Some((cid, _)) = attested_contracts_read.get(token) {
+            if let Some((cid, _, _)) = attested_contracts_read.get(token) {
                 tracing::trace!(?token, ?cid, "Found token in attested_contracts map");
                 Some((token.clone(), *cid))
             } else {

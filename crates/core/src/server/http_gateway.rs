@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use axum::extract::Path;
 use axum::response::IntoResponse;
@@ -31,7 +32,10 @@ impl std::ops::Deref for HttpGatewayRequest {
     }
 }
 
-pub type AttestedContractMap = Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>;
+/// Maps authentication tokens to contract instances, client IDs, and last access time.
+/// The Instant tracks when the token was last used to enable time-based expiration.
+pub type AttestedContractMap =
+    Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId, Instant)>>>;
 
 /// A gateway to access and interact with contracts through an HTTP interface.
 pub(crate) struct HttpGateway {
@@ -81,10 +85,11 @@ impl ClientEventsProxy for HttpGateway {
                             .send(HostCallbackResult::NewId { id: cli_id })
                             .map_err(|_e| ErrorKind::NodeUnavailable)?;
                         if let Some((assigned_token, contract)) = assigned_token {
+                            let now = Instant::now();
                             self.attested_contracts
                                 .write()
                                 .map_err(|_| ErrorKind::FailedOperation)?
-                                .insert(assigned_token.clone(), (contract, cli_id));
+                                .insert(assigned_token.clone(), (contract, cli_id, now));
                             tracing::debug!(
                                 ?assigned_token,
                                 ?contract,

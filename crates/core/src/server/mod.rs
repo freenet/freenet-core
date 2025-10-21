@@ -14,6 +14,7 @@ pub(crate) mod path_handlers;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
@@ -137,7 +138,7 @@ pub mod local_node {
                     let attested_contract = token.and_then(|token| {
                         gw.attested_contracts
                             .read()
-                            .map(|guard| guard.get(&token).cloned().map(|(t, _)| t))
+                            .map(|guard| guard.get(&token).cloned().map(|(t, _, _)| t))
                             .ok()
                             .flatten()
                     });
@@ -151,7 +152,7 @@ pub mod local_node {
                     if let Ok(mut guard) = gw.attested_contracts.write() {
                         if let Some(rm_token) = guard
                             .iter()
-                            .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
+                            .find_map(|(k, (_, eid, _))| (eid == &id).then(|| k.clone()))
                         {
                             guard.remove(&rm_token);
                         }
@@ -207,11 +208,11 @@ pub async fn serve_gateway(config: WebsocketApiConfig) -> [BoxedClient; 2] {
 pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {
     let ws_socket = (config.address, config.port).into();
 
-    // Create a shared attested_contracts map
-    let attested_contracts: AttestedContractMap = Arc::new(RwLock::new(HashMap::<
-        AuthToken,
-        (ContractInstanceId, ClientId),
-    >::new()));
+    // Create a shared attested_contracts map with token expiration support
+    let attested_contracts: AttestedContractMap = Arc::new(RwLock::new(HashMap::new()));
+
+    // Spawn background task to clean up expired tokens
+    spawn_token_cleanup_task(attested_contracts.clone());
 
     // Pass the shared map to both HttpGateway and WebSocketProxy
     let (gw, gw_router) =
@@ -221,4 +222,59 @@ pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway
 
     serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
     (gw, ws_proxy)
+}
+
+/// Spawns a background task that periodically removes expired authentication tokens.
+///
+/// Tokens that haven't been used for TOKEN_TTL duration will be removed from the map.
+/// This prevents memory leaks and ensures old tokens don't remain valid indefinitely.
+fn spawn_token_cleanup_task(attested_contracts: AttestedContractMap) {
+    // Token time-to-live: 24 hours (allows for long-lived WebSocket connections)
+    const TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+    // Cleanup interval: run every 5 minutes
+    const CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+        interval.tick().await; // Skip the first immediate tick
+
+        loop {
+            interval.tick().await;
+
+            // Clean up expired tokens
+            if let Ok(mut guard) = attested_contracts.write() {
+                let now = Instant::now();
+                let initial_count = guard.len();
+
+                // Remove tokens that haven't been accessed in TOKEN_TTL
+                guard.retain(|token, (contract_id, client_id, last_used)| {
+                    let elapsed = now.duration_since(*last_used);
+                    let should_keep = elapsed < TOKEN_TTL;
+
+                    if !should_keep {
+                        tracing::info!(
+                            ?token,
+                            ?contract_id,
+                            ?client_id,
+                            elapsed_hours = elapsed.as_secs() / 3600,
+                            "Removing expired authentication token"
+                        );
+                    }
+
+                    should_keep
+                });
+
+                let removed_count = initial_count - guard.len();
+                if removed_count > 0 {
+                    tracing::debug!(
+                        removed_count,
+                        remaining_count = guard.len(),
+                        "Token cleanup completed"
+                    );
+                }
+            } else {
+                tracing::warn!("Failed to acquire write lock for token cleanup");
+            }
+        }
+    });
 }
