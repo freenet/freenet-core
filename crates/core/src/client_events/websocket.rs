@@ -1,8 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
+
+use dashmap::DashMap;
 
 use axum::{
     extract::{
@@ -53,7 +55,7 @@ const PARALLELISM: usize = 10; // TODO: get this from config, or whatever optima
 impl WebSocketProxy {
     pub fn create_router(server_routing: Router) -> (Self, Router) {
         // Create a default empty attested contracts map
-        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
+        let attested_contracts = Arc::new(DashMap::new());
         Self::create_router_with_attested_contracts(server_routing, attested_contracts)
     }
 
@@ -287,17 +289,16 @@ async fn websocket_commands(
     Extension(attested_contracts): Extension<AttestedContractMap>,
 ) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
-        // Get the data we need and immediately drop the lock
+        // Get the data we need from the DashMap
         let auth_and_instance = if let Some(token) = auth_token.as_ref() {
-            let attested_contracts_read = attested_contracts.read().unwrap();
-
             // Only collect and log map contents when trace is enabled
             if tracing::enabled!(tracing::Level::TRACE) {
-                let map_contents: Vec<_> = attested_contracts_read.keys().cloned().collect();
+                let map_contents: Vec<_> = attested_contracts.iter().map(|e| e.key().clone()).collect();
                 tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
             }
 
-            if let Some((cid, _, _)) = attested_contracts_read.get(token) {
+            if let Some(entry) = attested_contracts.get(token) {
+                let (cid, _, _) = entry.value();
                 tracing::trace!(?token, ?cid, "Found token in attested_contracts map");
                 Some((token.clone(), *cid))
             } else {
@@ -307,7 +308,7 @@ async fn websocket_commands(
         } else {
             tracing::trace!("No auth token provided in WebSocket request");
             None
-        }; // RwLockReadGuard is dropped here
+        };
 
         // Only evaluate auth_and_instance for trace when trace is enabled
         if tracing::enabled!(tracing::Level::TRACE) {

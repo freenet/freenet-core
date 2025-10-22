@@ -1334,9 +1334,8 @@ pub async fn run_local_node(
             ClientRequest::DelegateOp(op) => {
                 let attested_contract = token.and_then(|token| {
                     gw.attested_contracts
-                        .read()
-                        .ok()
-                        .and_then(|guard| guard.get(&token).map(|(t, _, _)| *t))
+                        .get(&token)
+                        .map(|entry| entry.value().0)
                 });
                 let op_name = match op {
                     DelegateRequest::RegisterDelegate { .. } => "RegisterDelegate",

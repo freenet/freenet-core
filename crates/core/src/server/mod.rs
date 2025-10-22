@@ -13,8 +13,10 @@ pub(crate) mod path_handlers;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
@@ -149,13 +151,15 @@ pub mod local_node {
                         tracing::info!("disconnecting cause: {cause}");
                     }
                     // fixme: token must live for a bit to allow reconnections
-                    if let Ok(mut guard) = gw.attested_contracts.write() {
-                        if let Some(rm_token) = guard
-                            .iter()
-                            .find_map(|(k, (_, eid, _))| (eid == &id).then(|| k.clone()))
-                        {
-                            guard.remove(&rm_token);
-                        }
+                    if let Some(rm_token) = gw
+                        .attested_contracts
+                        .iter()
+                        .find_map(|entry| {
+                            let (k, (_, eid, _)) = entry.pair();
+                            (eid == &id).then(|| k.clone())
+                        })
+                    {
+                        gw.attested_contracts.remove(&rm_token);
                     }
                     continue;
                 }
@@ -209,7 +213,7 @@ pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway
     let ws_socket = (config.address, config.port).into();
 
     // Create a shared attested_contracts map with token expiration support
-    let attested_contracts: AttestedContractMap = Arc::new(RwLock::new(HashMap::new()));
+    let attested_contracts: AttestedContractMap = Arc::new(DashMap::new());
 
     // Spawn background task to clean up expired tokens
     spawn_token_cleanup_task(attested_contracts.clone());
@@ -242,38 +246,34 @@ fn spawn_token_cleanup_task(attested_contracts: AttestedContractMap) {
             interval.tick().await;
 
             // Clean up expired tokens
-            if let Ok(mut guard) = attested_contracts.write() {
-                let now = Instant::now();
-                let initial_count = guard.len();
+            let now = Instant::now();
+            let initial_count = attested_contracts.len();
 
-                // Remove tokens that haven't been accessed in TOKEN_TTL
-                guard.retain(|token, (contract_id, client_id, last_used)| {
-                    let elapsed = now.duration_since(*last_used);
-                    let should_keep = elapsed < TOKEN_TTL;
+            // Remove tokens that haven't been accessed in TOKEN_TTL
+            attested_contracts.retain(|token, (contract_id, client_id, last_used)| {
+                let elapsed = now.duration_since(*last_used);
+                let should_keep = elapsed < TOKEN_TTL;
 
-                    if !should_keep {
-                        tracing::info!(
-                            ?token,
-                            ?contract_id,
-                            ?client_id,
-                            elapsed_hours = elapsed.as_secs() / 3600,
-                            "Removing expired authentication token"
-                        );
-                    }
-
-                    should_keep
-                });
-
-                let removed_count = initial_count - guard.len();
-                if removed_count > 0 {
-                    tracing::debug!(
-                        removed_count,
-                        remaining_count = guard.len(),
-                        "Token cleanup completed"
+                if !should_keep {
+                    tracing::info!(
+                        ?token,
+                        ?contract_id,
+                        ?client_id,
+                        elapsed_hours = elapsed.as_secs() / 3600,
+                        "Removing expired authentication token"
                     );
                 }
-            } else {
-                tracing::warn!("Failed to acquire write lock for token cleanup");
+
+                should_keep
+            });
+
+            let removed_count = initial_count - attested_contracts.len();
+            if removed_count > 0 {
+                tracing::debug!(
+                    removed_count,
+                    remaining_count = attested_contracts.len(),
+                    "Token cleanup completed"
+                );
             }
         }
     });

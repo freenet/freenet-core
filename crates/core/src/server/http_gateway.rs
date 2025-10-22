@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
+
+use dashmap::DashMap;
 
 use axum::extract::Path;
 use axum::response::IntoResponse;
@@ -34,8 +36,7 @@ impl std::ops::Deref for HttpGatewayRequest {
 
 /// Maps authentication tokens to contract instances, client IDs, and last access time.
 /// The Instant tracks when the token was last used to enable time-based expiration.
-pub type AttestedContractMap =
-    Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId, Instant)>>>;
+pub type AttestedContractMap = Arc<DashMap<AuthToken, (ContractInstanceId, ClientId, Instant)>>;
 
 /// A gateway to access and interact with contracts through an HTTP interface.
 pub(crate) struct HttpGateway {
@@ -47,7 +48,7 @@ pub(crate) struct HttpGateway {
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
-        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
+        let attested_contracts = Arc::new(DashMap::new());
         Self::as_router_with_attested_contracts(socket, attested_contracts)
     }
 
@@ -87,8 +88,6 @@ impl ClientEventsProxy for HttpGateway {
                         if let Some((assigned_token, contract)) = assigned_token {
                             let now = Instant::now();
                             self.attested_contracts
-                                .write()
-                                .map_err(|_| ErrorKind::FailedOperation)?
                                 .insert(assigned_token.clone(), (contract, cli_id, now));
                             tracing::debug!(
                                 ?assigned_token,
