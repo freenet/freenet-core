@@ -139,7 +139,7 @@ pub mod local_node {
                     let attested_contract = token.and_then(|token| {
                         gw.attested_contracts
                             .get(&token)
-                            .map(|entry| entry.contract_id.clone())
+                            .map(|entry| entry.contract_id)
                     });
                     executor.delegate_request(op, attested_contract.as_ref())
                 }
