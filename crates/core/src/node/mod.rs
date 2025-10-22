@@ -1355,8 +1355,6 @@ pub async fn run_local_node(
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
                 }
-                // No longer removing tokens on disconnect - they now expire automatically
-                // based on a TTL mechanism (see server/mod.rs token_cleanup_task)
                 continue;
             }
             _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
