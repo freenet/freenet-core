@@ -11,7 +11,6 @@ pub(crate) mod errors;
 pub(crate) mod http_gateway;
 pub(crate) mod path_handlers;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -139,10 +138,8 @@ pub mod local_node {
                 ClientRequest::DelegateOp(op) => {
                     let attested_contract = token.and_then(|token| {
                         gw.attested_contracts
-                            .read()
-                            .map(|guard| guard.get(&token).cloned().map(|(t, _, _)| t))
-                            .ok()
-                            .flatten()
+                            .get(&token)
+                            .map(|entry| entry.contract_id.clone())
                     });
                     executor.delegate_request(op, attested_contract.as_ref())
                 }
@@ -151,14 +148,10 @@ pub mod local_node {
                         tracing::info!("disconnecting cause: {cause}");
                     }
                     // fixme: token must live for a bit to allow reconnections
-                    if let Some(rm_token) = gw
-                        .attested_contracts
-                        .iter()
-                        .find_map(|entry| {
-                            let (k, attested) = entry.pair();
-                            (attested.client_id == id).then(|| k.clone())
-                        })
-                    {
+                    if let Some(rm_token) = gw.attested_contracts.iter().find_map(|entry| {
+                        let (k, attested) = entry.pair();
+                        (attested.client_id == id).then(|| k.clone())
+                    }) {
                         gw.attested_contracts.remove(&rm_token);
                     }
                     continue;

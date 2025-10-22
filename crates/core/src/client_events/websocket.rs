@@ -293,7 +293,8 @@ async fn websocket_commands(
         let auth_and_instance = if let Some(token) = auth_token.as_ref() {
             // Only collect and log map contents when trace is enabled
             if tracing::enabled!(tracing::Level::TRACE) {
-                let map_contents: Vec<_> = attested_contracts.iter().map(|e| e.key().clone()).collect();
+                let map_contents: Vec<_> =
+                    attested_contracts.iter().map(|e| e.key().clone()).collect();
                 tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
             }
 
