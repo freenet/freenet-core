@@ -112,6 +112,8 @@ pub async fn base_node_test_config_with_rng(
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(ws_api_port),
+            token_ttl_seconds: None,
+            token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),

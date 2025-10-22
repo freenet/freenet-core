@@ -209,7 +209,11 @@ pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway
     let attested_contracts: AttestedContractMap = Arc::new(DashMap::new());
 
     // Spawn background task to clean up expired tokens
-    spawn_token_cleanup_task(attested_contracts.clone());
+    spawn_token_cleanup_task(
+        attested_contracts.clone(),
+        config.token_ttl_seconds,
+        config.token_cleanup_interval_seconds,
+    );
 
     // Pass the shared map to both HttpGateway and WebSocketProxy
     let (gw, gw_router) =
@@ -223,16 +227,23 @@ pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway
 
 /// Spawns a background task that periodically removes expired authentication tokens.
 ///
-/// Tokens that haven't been used for TOKEN_TTL duration will be removed from the map.
+/// Tokens that haven't been used for the specified TTL duration will be removed from the map.
 /// This prevents memory leaks and ensures old tokens don't remain valid indefinitely.
-fn spawn_token_cleanup_task(attested_contracts: AttestedContractMap) {
-    // Token time-to-live: 24 hours (allows for long-lived WebSocket connections)
-    const TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-    // Cleanup interval: run every 5 minutes
-    const CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+///
+/// # Arguments
+/// * `attested_contracts` - The shared map of authentication tokens
+/// * `token_ttl_seconds` - How long tokens remain valid without activity (in seconds)
+/// * `cleanup_interval_seconds` - How often to run the cleanup task (in seconds)
+fn spawn_token_cleanup_task(
+    attested_contracts: AttestedContractMap,
+    token_ttl_seconds: u64,
+    cleanup_interval_seconds: u64,
+) {
+    let token_ttl = Duration::from_secs(token_ttl_seconds);
+    let cleanup_interval = Duration::from_secs(cleanup_interval_seconds);
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+        let mut interval = tokio::time::interval(cleanup_interval);
         interval.tick().await; // Skip the first immediate tick
 
         loop {
@@ -242,10 +253,10 @@ fn spawn_token_cleanup_task(attested_contracts: AttestedContractMap) {
             let now = Instant::now();
             let initial_count = attested_contracts.len();
 
-            // Remove tokens that haven't been accessed in TOKEN_TTL
+            // Remove tokens that haven't been accessed in token_ttl
             attested_contracts.retain(|token, attested| {
                 let elapsed = now.duration_since(attested.last_accessed);
-                let should_keep = elapsed < TOKEN_TTL;
+                let should_keep = elapsed < token_ttl;
 
                 if !should_keep {
                     tracing::info!(
