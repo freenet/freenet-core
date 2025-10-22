@@ -155,8 +155,8 @@ pub mod local_node {
                         .attested_contracts
                         .iter()
                         .find_map(|entry| {
-                            let (k, (_, eid, _)) = entry.pair();
-                            (eid == &id).then(|| k.clone())
+                            let (k, attested) = entry.pair();
+                            (attested.client_id == id).then(|| k.clone())
                         })
                     {
                         gw.attested_contracts.remove(&rm_token);
@@ -250,15 +250,15 @@ fn spawn_token_cleanup_task(attested_contracts: AttestedContractMap) {
             let initial_count = attested_contracts.len();
 
             // Remove tokens that haven't been accessed in TOKEN_TTL
-            attested_contracts.retain(|token, (contract_id, client_id, last_used)| {
-                let elapsed = now.duration_since(*last_used);
+            attested_contracts.retain(|token, attested| {
+                let elapsed = now.duration_since(attested.last_accessed);
                 let should_keep = elapsed < TOKEN_TTL;
 
                 if !should_keep {
                     tracing::info!(
                         ?token,
-                        ?contract_id,
-                        ?client_id,
+                        contract_id = ?attested.contract_id,
+                        client_id = ?attested.client_id,
                         elapsed_hours = elapsed.as_secs() / 3600,
                         "Removing expired authentication token"
                     );

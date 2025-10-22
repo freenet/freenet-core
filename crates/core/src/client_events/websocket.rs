@@ -298,9 +298,9 @@ async fn websocket_commands(
             }
 
             if let Some(entry) = attested_contracts.get(token) {
-                let (cid, _, _) = entry.value();
-                tracing::trace!(?token, ?cid, "Found token in attested_contracts map");
-                Some((token.clone(), *cid))
+                let attested = entry.value();
+                tracing::trace!(?token, contract_id = ?attested.contract_id, "Found token in attested_contracts map");
+                Some((token.clone(), attested.contract_id))
             } else {
                 tracing::warn!(?token, "Auth token not found in attested_contracts map");
                 None

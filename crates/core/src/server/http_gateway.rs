@@ -34,9 +34,30 @@ impl std::ops::Deref for HttpGatewayRequest {
     }
 }
 
-/// Maps authentication tokens to contract instances, client IDs, and last access time.
-/// The Instant tracks when the token was last used to enable time-based expiration.
-pub type AttestedContractMap = Arc<DashMap<AuthToken, (ContractInstanceId, ClientId, Instant)>>;
+/// Represents an attested contract entry with metadata for token expiration.
+#[derive(Clone, Debug)]
+pub struct AttestedContract {
+    /// The contract instance ID
+    pub contract_id: ContractInstanceId,
+    /// The client ID associated with this token
+    pub client_id: ClientId,
+    /// Timestamp of when the token was last accessed (for expiration tracking)
+    pub last_accessed: Instant,
+}
+
+impl AttestedContract {
+    /// Create a new attested contract entry
+    pub fn new(contract_id: ContractInstanceId, client_id: ClientId) -> Self {
+        Self {
+            contract_id,
+            client_id,
+            last_accessed: Instant::now(),
+        }
+    }
+}
+
+/// Maps authentication tokens to attested contract metadata.
+pub type AttestedContractMap = Arc<DashMap<AuthToken, AttestedContract>>;
 
 /// A gateway to access and interact with contracts through an HTTP interface.
 pub(crate) struct HttpGateway {
@@ -86,9 +107,9 @@ impl ClientEventsProxy for HttpGateway {
                             .send(HostCallbackResult::NewId { id: cli_id })
                             .map_err(|_e| ErrorKind::NodeUnavailable)?;
                         if let Some((assigned_token, contract)) = assigned_token {
-                            let now = Instant::now();
+                            let attested = AttestedContract::new(contract, cli_id);
                             self.attested_contracts
-                                .insert(assigned_token.clone(), (contract, cli_id, now));
+                                .insert(assigned_token.clone(), attested);
                             tracing::debug!(
                                 ?assigned_token,
                                 ?contract,
