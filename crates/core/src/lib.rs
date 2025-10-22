@@ -60,7 +60,7 @@ pub mod dev_tool {
     use super::*;
     pub use crate::config::Config;
     pub use client_events::{
-        test::MemoryEventsGen, test::NetworkEventGenerator, ClientEventsProxy, ClientId,
+        test::MemoryEventsGen, test::NetworkEventGenerator, AuthToken, ClientEventsProxy, ClientId,
         OpenRequest,
     };
     pub use contract::{storages::Storage, Executor, OperationMode};

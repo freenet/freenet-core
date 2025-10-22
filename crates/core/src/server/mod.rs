@@ -30,8 +30,10 @@ use crate::{
     config::WebsocketApiConfig,
 };
 
-use crate::server::http_gateway::AttestedContractMap;
 pub use app_packaging::WebApp;
+
+// Export types needed for integration testing
+pub use http_gateway::{AttestedContract, AttestedContractMap};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -200,6 +202,17 @@ pub mod local_node {
 pub async fn serve_gateway(config: WebsocketApiConfig) -> [BoxedClient; 2] {
     let (gw, ws_proxy) = serve_gateway_in(config).await;
     [Box::new(gw), Box::new(ws_proxy)]
+}
+
+/// Serves the gateway and returns the concrete types (for integration testing).
+/// This allows tests to access internal state like the attested_contracts map.
+pub async fn serve_gateway_for_test(
+    config: WebsocketApiConfig,
+) -> (
+    http_gateway::HttpGateway,
+    crate::client_events::websocket::WebSocketProxy,
+) {
+    serve_gateway_in(config).await
 }
 
 pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {

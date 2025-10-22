@@ -45,7 +45,7 @@ impl std::ops::Deref for WebSocketRequest {
     }
 }
 
-pub(crate) struct WebSocketProxy {
+pub struct WebSocketProxy {
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }

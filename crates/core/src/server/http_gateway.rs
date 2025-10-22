@@ -60,8 +60,8 @@ impl AttestedContract {
 pub type AttestedContractMap = Arc<DashMap<AuthToken, AttestedContract>>;
 
 /// A gateway to access and interact with contracts through an HTTP interface.
-pub(crate) struct HttpGateway {
-    pub attested_contracts: AttestedContractMap,
+pub struct HttpGateway {
+    pub(crate) attested_contracts: AttestedContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
@@ -79,6 +79,12 @@ impl HttpGateway {
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
         Self::create_router_v1_with_attested_contracts(socket, attested_contracts)
+    }
+
+    /// Returns a reference to the attested contracts map (for integration testing).
+    /// This allows tests to verify token expiration behavior.
+    pub fn attested_contracts(&self) -> &AttestedContractMap {
+        &self.attested_contracts
     }
 }
 
