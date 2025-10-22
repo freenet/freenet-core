@@ -439,10 +439,10 @@ impl Operation for GetOp {
                         return_msg = None;
                         result = self.result;
                     } else {
-                        // Normal case: operation should be in AwaitingResponse state
+                        // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
                         debug_assert!(matches!(
                             self.state,
-                            Some(GetState::AwaitingResponse { .. })
+                            Some(GetState::ReceivedRequest) | Some(GetState::AwaitingResponse { .. })
                         ));
                         tracing::info!(tx = %id, %key, target = %target.peer, "Seek contract");
 
