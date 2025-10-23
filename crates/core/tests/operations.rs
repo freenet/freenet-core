@@ -873,6 +873,11 @@ async fn test_multiple_clients_subscription() -> TestResult {
             }
         }
 
+        // Allow time for subscriptions to propagate to the seeding node's subscriber registry
+        // This prevents the race condition where UPDATE arrives before subscriptions are fully registered
+        tracing::info!("Waiting 2 seconds for subscriptions to propagate across network...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
         // Create a new to-do list by deserializing the current state, adding a task, and serializing it back
         let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())
             .unwrap_or_else(|_| test_utils::TodoList {

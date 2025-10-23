@@ -193,10 +193,7 @@ impl Operation for UpdateOp {
                             .await
                         {
                             Ok(ContractHandlerEvent::GetResponse {
-                                response:
-                                    Ok(StoreResponse {
-                                        state: Some(_), ..
-                                    }),
+                                response: Ok(StoreResponse { state: Some(_), .. }),
                                 ..
                             }) => {
                                 tracing::debug!(tx = %id, %key, "Contract exists locally, handling UPDATE");
@@ -226,7 +223,8 @@ impl Operation for UpdateOp {
                             .await?;
 
                             // Get broadcast targets for propagating UPDATE to subscribers
-                            let broadcast_to = op_manager.get_broadcast_targets_update(key, &request_sender.peer);
+                            let broadcast_to =
+                                op_manager.get_broadcast_targets_update(key, &request_sender.peer);
 
                             // Create success message to send back
                             let raw_state = State::from(updated_value);
@@ -321,10 +319,7 @@ impl Operation for UpdateOp {
                         .await
                     {
                         Ok(ContractHandlerEvent::GetResponse {
-                            response:
-                                Ok(StoreResponse {
-                                    state: Some(_), ..
-                                }),
+                            response: Ok(StoreResponse { state: Some(_), .. }),
                             ..
                         }) => {
                             tracing::debug!(tx = %id, %key, "Contract exists locally for SeekNode UPDATE");
@@ -337,9 +332,7 @@ impl Operation for UpdateOp {
                     };
 
                     if has_contract {
-                        tracing::debug!(
-                            "Contract found locally - handling UPDATE"
-                        );
+                        tracing::debug!("Contract found locally - handling UPDATE");
                         let updated_value = update_contract(
                             op_manager,
                             *key,
@@ -355,7 +348,8 @@ impl Operation for UpdateOp {
                         );
 
                         // Get broadcast targets
-                        let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
+                        let broadcast_to =
+                            op_manager.get_broadcast_targets_update(key, &sender.peer);
 
                         // If no peers to broadcast to, send success response directly
                         if broadcast_to.is_empty() {

@@ -215,9 +215,7 @@ pub(crate) async fn request_get(
 enum GetState {
     /// A new petition for a get op received from another peer.
     /// The requester field stores who sent us this request, so we can send the result back.
-    ReceivedRequest {
-        requester: Option<PeerKeyLocation>,
-    },
+    ReceivedRequest { requester: Option<PeerKeyLocation> },
     /// Preparing request for get op.
     PrepareRequest {
         key: ContractKey,
@@ -448,7 +446,8 @@ impl Operation for GetOp {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
                         debug_assert!(matches!(
                             self.state,
-                            Some(GetState::ReceivedRequest { .. }) | Some(GetState::AwaitingResponse { .. })
+                            Some(GetState::ReceivedRequest { .. })
+                                | Some(GetState::AwaitingResponse { .. })
                         ));
                         tracing::info!(tx = %id, %key, target = %target.peer, "Seek contract");
 
@@ -482,7 +481,9 @@ impl Operation for GetOp {
 
                                 // Check if this is a forwarded request or a local request
                                 match &self.state {
-                                    Some(GetState::ReceivedRequest { requester }) if requester.is_some() => {
+                                    Some(GetState::ReceivedRequest { requester })
+                                        if requester.is_some() =>
+                                    {
                                         // This is a forwarded request - send result back to requester
                                         let requester = requester.clone().unwrap();
                                         tracing::debug!(tx = %id, "Returning contract {} to requester {}", key, requester.peer);
