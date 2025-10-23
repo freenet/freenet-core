@@ -836,7 +836,11 @@ async fn try_to_broadcast(
             new_state = Some(PutState::Finished { key });
             return_msg = None;
         }
-        Some(PutState::ReceivedRequest | PutState::BroadcastOngoing | PutState::AwaitingResponse { .. }) => {
+        Some(
+            PutState::ReceivedRequest
+            | PutState::BroadcastOngoing
+            | PutState::AwaitingResponse { .. },
+        ) => {
             if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
                 tracing::debug!(
