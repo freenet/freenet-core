@@ -1334,9 +1334,8 @@ pub async fn run_local_node(
             ClientRequest::DelegateOp(op) => {
                 let attested_contract = token.and_then(|token| {
                     gw.attested_contracts
-                        .read()
-                        .ok()
-                        .and_then(|guard| guard.get(&token).map(|(t, _)| *t))
+                        .get(&token)
+                        .map(|entry| entry.value().contract_id)
                 });
                 let op_name = match op {
                     DelegateRequest::RegisterDelegate { .. } => "RegisterDelegate",
@@ -1356,17 +1355,6 @@ pub async fn run_local_node(
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
                 }
-                // FIXME: We're not removing tokens on disconnect to allow WebSocket connections
-                // to use them for authentication. We should implement a proper token expiration
-                // mechanism instead of keeping them forever or removing them immediately.
-                // if let Ok(mut guard) = gw.attested_contracts.write() {
-                //     if let Some(rm_token) = guard
-                //         .iter()
-                //         .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
-                //     {
-                //         guard.remove(&rm_token);
-                //     }
-                // }
                 continue;
             }
             _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),

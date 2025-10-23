@@ -173,6 +173,8 @@ async fn create_peer_config(
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::new(127, 0, 0, 1).into()), // Always use 127.0.0.1 for WebSocket API
             ws_api_port: Some(ws_port),
+            token_ttl_seconds: None,
+            token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
             public_address: Some(peer_ip.into()), // Share localhost IP for P2P network
