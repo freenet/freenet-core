@@ -270,7 +270,7 @@ impl Operation for PutOp {
                             id: *id,
                             sender,
                             target: forward_target,
-                            value: modified_value,
+                            value: modified_value.clone(),
                             contract: contract.clone(),
                             related_contracts: related_contracts.clone(),
                             htl: *htl,
@@ -285,8 +285,17 @@ impl Operation for PutOp {
                         return_msg = None;
                     }
 
-                    // No changes to state yet, still in AwaitResponse state
-                    new_state = self.state;
+                    // Transition to AwaitingResponse state to handle future SuccessfulPut messages
+                    new_state = Some(PutState::AwaitingResponse {
+                        key,
+                        upstream: match &self.state {
+                            Some(PutState::ReceivedRequest) => None,
+                            _ => None,
+                        },
+                        contract: contract.clone(),
+                        state: modified_value,
+                        subscribe: false,
+                    });
                 }
                 PutMsg::SeekNode {
                     id,
@@ -602,6 +611,16 @@ impl Operation for PutOp {
                                 return_msg = None;
                             }
                         }
+                        Some(PutState::Finished { .. }) => {
+                            // Operation already completed - this is a duplicate SuccessfulPut message
+                            // This can happen when multiple peers send success confirmations
+                            tracing::debug!(
+                                tx = %id,
+                                "Received duplicate SuccessfulPut for already completed operation, ignoring"
+                            );
+                            new_state = None; // Mark for completion
+                            return_msg = None;
+                        }
                         _ => return Err(OpError::invalid_transition(self.id)),
                     };
                 }
@@ -817,7 +836,7 @@ async fn try_to_broadcast(
             new_state = Some(PutState::Finished { key });
             return_msg = None;
         }
-        Some(PutState::ReceivedRequest | PutState::BroadcastOngoing) => {
+        Some(PutState::ReceivedRequest | PutState::BroadcastOngoing | PutState::AwaitingResponse { .. }) => {
             if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
                 tracing::debug!(
