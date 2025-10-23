@@ -258,20 +258,44 @@ impl Operation for PutOp {
                         value.clone()
                     };
 
-                    // Create a SeekNode message to find the target node
-                    // fixme: this node should filter out incoming redundant puts since is the one initiating the request
-                    return_msg = Some(PutMsg::SeekNode {
-                        id: *id,
-                        sender,
-                        target: target.clone(),
-                        value: modified_value, // Use the modified value from put_contract
-                        contract: contract.clone(),
-                        related_contracts: related_contracts.clone(),
-                        htl: *htl,
-                    });
+                    // Determine next forwarding target - find peers closer to the contract location
+                    // Don't reuse the target from RequestPut as that's US (the current processing peer)
+                    let next_target = op_manager
+                        .ring
+                        .closest_potentially_caching(&key, [&sender.peer].as_slice());
 
-                    // No changes to state yet, still in AwaitResponse state
-                    new_state = self.state;
+                    if let Some(forward_target) = next_target {
+                        // Create a SeekNode message to forward to the next hop
+                        return_msg = Some(PutMsg::SeekNode {
+                            id: *id,
+                            sender,
+                            target: forward_target,
+                            value: modified_value.clone(),
+                            contract: contract.clone(),
+                            related_contracts: related_contracts.clone(),
+                            htl: *htl,
+                        });
+                    } else {
+                        // No other peers to forward to - we're the final destination
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "No peers to forward to - handling PUT completion locally"
+                        );
+                        return_msg = None;
+                    }
+
+                    // Transition to AwaitingResponse state to handle future SuccessfulPut messages
+                    new_state = Some(PutState::AwaitingResponse {
+                        key,
+                        upstream: match &self.state {
+                            Some(PutState::ReceivedRequest) => None,
+                            _ => None,
+                        },
+                        contract: contract.clone(),
+                        state: modified_value,
+                        subscribe: false,
+                    });
                 }
                 PutMsg::SeekNode {
                     id,
@@ -587,6 +611,16 @@ impl Operation for PutOp {
                                 return_msg = None;
                             }
                         }
+                        Some(PutState::Finished { .. }) => {
+                            // Operation already completed - this is a duplicate SuccessfulPut message
+                            // This can happen when multiple peers send success confirmations
+                            tracing::debug!(
+                                tx = %id,
+                                "Received duplicate SuccessfulPut for already completed operation, ignoring"
+                            );
+                            new_state = None; // Mark for completion
+                            return_msg = None;
+                        }
                         _ => return Err(OpError::invalid_transition(self.id)),
                     };
                 }
@@ -802,7 +836,11 @@ async fn try_to_broadcast(
             new_state = Some(PutState::Finished { key });
             return_msg = None;
         }
-        Some(PutState::ReceivedRequest | PutState::BroadcastOngoing) => {
+        Some(
+            PutState::ReceivedRequest
+            | PutState::BroadcastOngoing
+            | PutState::AwaitingResponse { .. },
+        ) => {
             if broadcast_to.is_empty() && !last_hop {
                 // broadcast complete
                 tracing::debug!(
