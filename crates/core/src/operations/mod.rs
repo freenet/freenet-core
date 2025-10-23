@@ -125,6 +125,7 @@ where
                     tracing::debug!(%id, %target, "sending final message to target");
                     network_bridge.send(&target.peer, msg).await?;
                 }
+                return Ok(Some(updated_state));
             } else {
                 // Normal case: operation in progress, send message and push back
                 let id = *msg.id();
