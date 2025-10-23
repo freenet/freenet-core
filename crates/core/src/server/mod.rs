@@ -11,9 +11,11 @@ pub(crate) mod errors;
 pub(crate) mod http_gateway;
 pub(crate) mod path_handlers;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 use freenet_stdlib::{
     client_api::{ClientError, ClientRequest, HostResponse},
@@ -28,8 +30,10 @@ use crate::{
     config::WebsocketApiConfig,
 };
 
-use crate::server::http_gateway::AttestedContractMap;
 pub use app_packaging::WebApp;
+
+// Export types needed for integration testing
+pub use http_gateway::{AttestedContract, AttestedContractMap};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -136,10 +140,8 @@ pub mod local_node {
                 ClientRequest::DelegateOp(op) => {
                     let attested_contract = token.and_then(|token| {
                         gw.attested_contracts
-                            .read()
-                            .map(|guard| guard.get(&token).cloned().map(|(t, _)| t))
-                            .ok()
-                            .flatten()
+                            .get(&token)
+                            .map(|entry| entry.contract_id)
                     });
                     executor.delegate_request(op, attested_contract.as_ref())
                 }
@@ -148,13 +150,11 @@ pub mod local_node {
                         tracing::info!("disconnecting cause: {cause}");
                     }
                     // fixme: token must live for a bit to allow reconnections
-                    if let Ok(mut guard) = gw.attested_contracts.write() {
-                        if let Some(rm_token) = guard
-                            .iter()
-                            .find_map(|(k, (_, eid))| (eid == &id).then(|| k.clone()))
-                        {
-                            guard.remove(&rm_token);
-                        }
+                    if let Some(rm_token) = gw.attested_contracts.iter().find_map(|entry| {
+                        let (k, attested) = entry.pair();
+                        (attested.client_id == id).then(|| k.clone())
+                    }) {
+                        gw.attested_contracts.remove(&rm_token);
                     }
                     continue;
                 }
@@ -204,14 +204,29 @@ pub async fn serve_gateway(config: WebsocketApiConfig) -> [BoxedClient; 2] {
     [Box::new(gw), Box::new(ws_proxy)]
 }
 
+/// Serves the gateway and returns the concrete types (for integration testing).
+/// This allows tests to access internal state like the attested_contracts map.
+pub async fn serve_gateway_for_test(
+    config: WebsocketApiConfig,
+) -> (
+    http_gateway::HttpGateway,
+    crate::client_events::websocket::WebSocketProxy,
+) {
+    serve_gateway_in(config).await
+}
+
 pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {
     let ws_socket = (config.address, config.port).into();
 
-    // Create a shared attested_contracts map
-    let attested_contracts: AttestedContractMap = Arc::new(RwLock::new(HashMap::<
-        AuthToken,
-        (ContractInstanceId, ClientId),
-    >::new()));
+    // Create a shared attested_contracts map with token expiration support
+    let attested_contracts: AttestedContractMap = Arc::new(DashMap::new());
+
+    // Spawn background task to clean up expired tokens
+    spawn_token_cleanup_task(
+        attested_contracts.clone(),
+        config.token_ttl_seconds,
+        config.token_cleanup_interval_seconds,
+    );
 
     // Pass the shared map to both HttpGateway and WebSocketProxy
     let (gw, gw_router) =
@@ -221,4 +236,62 @@ pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway
 
     serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
     (gw, ws_proxy)
+}
+
+/// Spawns a background task that periodically removes expired authentication tokens.
+///
+/// Tokens that haven't been used for the specified TTL duration will be removed from the map.
+/// This prevents memory leaks and ensures old tokens don't remain valid indefinitely.
+///
+/// # Arguments
+/// * `attested_contracts` - The shared map of authentication tokens
+/// * `token_ttl_seconds` - How long tokens remain valid without activity (in seconds)
+/// * `cleanup_interval_seconds` - How often to run the cleanup task (in seconds)
+fn spawn_token_cleanup_task(
+    attested_contracts: AttestedContractMap,
+    token_ttl_seconds: u64,
+    cleanup_interval_seconds: u64,
+) {
+    let token_ttl = Duration::from_secs(token_ttl_seconds);
+    let cleanup_interval = Duration::from_secs(cleanup_interval_seconds);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.tick().await; // Skip the first immediate tick
+
+        loop {
+            interval.tick().await;
+
+            // Clean up expired tokens
+            let now = Instant::now();
+            let initial_count = attested_contracts.len();
+
+            // Remove tokens that haven't been accessed in token_ttl
+            attested_contracts.retain(|token, attested| {
+                let elapsed = now.duration_since(attested.last_accessed);
+                let should_keep = elapsed < token_ttl;
+
+                if !should_keep {
+                    tracing::info!(
+                        ?token,
+                        contract_id = ?attested.contract_id,
+                        client_id = ?attested.client_id,
+                        elapsed_hours = elapsed.as_secs() / 3600,
+                        "Removing expired authentication token"
+                    );
+                }
+
+                should_keep
+            });
+
+            let removed_count = initial_count - attested_contracts.len();
+            if removed_count > 0 {
+                tracing::debug!(
+                    removed_count,
+                    remaining_count = attested_contracts.len(),
+                    "Token cleanup completed"
+                );
+            }
+        }
+    });
 }

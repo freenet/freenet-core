@@ -101,6 +101,8 @@ impl Default for ConfigArgs {
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
                 ws_api_port: Some(default_http_gateway_port()),
+                token_ttl_seconds: None,
+                token_cleanup_interval_seconds: None,
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -230,6 +232,12 @@ impl ConfigArgs {
             self.mode.get_or_insert(cfg.mode);
             self.ws_api.address.get_or_insert(cfg.ws_api.address);
             self.ws_api.ws_api_port.get_or_insert(cfg.ws_api.port);
+            self.ws_api
+                .token_ttl_seconds
+                .get_or_insert(cfg.ws_api.token_ttl_seconds);
+            self.ws_api
+                .token_cleanup_interval_seconds
+                .get_or_insert(cfg.ws_api.token_cleanup_interval_seconds);
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
         }
@@ -361,6 +369,14 @@ impl ConfigArgs {
                     .ws_api
                     .ws_api_port
                     .unwrap_or(default_http_gateway_port()),
+                token_ttl_seconds: self
+                    .ws_api
+                    .token_ttl_seconds
+                    .unwrap_or(default_token_ttl_seconds()),
+                token_cleanup_interval_seconds: self
+                    .ws_api
+                    .token_cleanup_interval_seconds
+                    .unwrap_or(default_token_cleanup_interval_seconds()),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -616,6 +632,19 @@ pub struct WebsocketApiArgs {
     #[arg(long, env = "WS_API_PORT")]
     #[serde(rename = "ws-api-port", skip_serializing_if = "Option::is_none")]
     pub ws_api_port: Option<u16>,
+
+    /// Token time-to-live in seconds (default is 86400 = 24 hours)
+    #[arg(long, env = "TOKEN_TTL_SECONDS")]
+    #[serde(rename = "token-ttl-seconds", skip_serializing_if = "Option::is_none")]
+    pub token_ttl_seconds: Option<u64>,
+
+    /// Token cleanup interval in seconds (default is 300 = 5 minutes)
+    #[arg(long, env = "TOKEN_CLEANUP_INTERVAL_SECONDS")]
+    #[serde(
+        rename = "token-cleanup-interval-seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub token_cleanup_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -627,6 +656,27 @@ pub struct WebsocketApiConfig {
     /// Port to expose api on
     #[serde(default = "default_http_gateway_port", rename = "ws-api-port")]
     pub port: u16,
+
+    /// Token time-to-live in seconds
+    #[serde(default = "default_token_ttl_seconds", rename = "token-ttl-seconds")]
+    pub token_ttl_seconds: u64,
+
+    /// Token cleanup interval in seconds
+    #[serde(
+        default = "default_token_cleanup_interval_seconds",
+        rename = "token-cleanup-interval-seconds"
+    )]
+    pub token_cleanup_interval_seconds: u64,
+}
+
+#[inline]
+const fn default_token_ttl_seconds() -> u64 {
+    86400 // 24 hours
+}
+
+#[inline]
+const fn default_token_cleanup_interval_seconds() -> u64 {
+    300 // 5 minutes
 }
 
 impl From<SocketAddr> for WebsocketApiConfig {
@@ -634,6 +684,8 @@ impl From<SocketAddr> for WebsocketApiConfig {
         Self {
             address: addr.ip(),
             port: addr.port(),
+            token_ttl_seconds: default_token_ttl_seconds(),
+            token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
         }
     }
 }
@@ -644,6 +696,8 @@ impl Default for WebsocketApiConfig {
         Self {
             address: default_listening_address(),
             port: default_http_gateway_port(),
+            token_ttl_seconds: default_token_ttl_seconds(),
+            token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
         }
     }
 }
