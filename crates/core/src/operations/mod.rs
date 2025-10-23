@@ -115,14 +115,27 @@ where
             return_msg: Some(msg),
             state: Some(updated_state),
         }) => {
-            // updated op
-            let id = *msg.id();
-            tracing::debug!(%id, "updated op state");
-            if let Some(target) = msg.target() {
-                tracing::debug!(%id, %target, "sending updated op state");
-                network_bridge.send(&target.peer, msg).await?;
+            // Check if operation is finalized while sending a message (e.g., forwarding upstream)
+            if updated_state.finalized() {
+                // Operation is complete but needs to send a message
+                let id = *msg.id();
+                tracing::debug!(%id, "operation finalized with message to send");
+                op_manager.completed(id);
+                if let Some(target) = msg.target() {
+                    tracing::debug!(%id, %target, "sending final message to target");
+                    network_bridge.send(&target.peer, msg).await?;
+                }
+                return Ok(Some(updated_state));
+            } else {
+                // Normal case: operation in progress, send message and push back
+                let id = *msg.id();
+                tracing::debug!(%id, "updated op state");
+                if let Some(target) = msg.target() {
+                    tracing::debug!(%id, %target, "sending updated op state");
+                    network_bridge.send(&target.peer, msg).await?;
+                }
+                op_manager.push(id, updated_state).await?;
             }
-            op_manager.push(id, updated_state).await?;
         }
 
         Ok(OperationResult {

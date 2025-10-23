@@ -305,6 +305,7 @@ impl OpManager {
 
     pub fn completed(&self, id: Transaction) {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
+        self.ops.under_progress.remove(&id);
         self.ops.completed.insert(id);
     }
 
