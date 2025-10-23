@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::time::Instant;
+
+use dashmap::DashMap;
 
 use axum::extract::Path;
 use axum::response::IntoResponse;
@@ -31,11 +34,34 @@ impl std::ops::Deref for HttpGatewayRequest {
     }
 }
 
-pub type AttestedContractMap = Arc<RwLock<HashMap<AuthToken, (ContractInstanceId, ClientId)>>>;
+/// Represents an attested contract entry with metadata for token expiration.
+#[derive(Clone, Debug)]
+pub struct AttestedContract {
+    /// The contract instance ID
+    pub contract_id: ContractInstanceId,
+    /// The client ID associated with this token
+    pub client_id: ClientId,
+    /// Timestamp of when the token was last accessed (for expiration tracking)
+    pub last_accessed: Instant,
+}
+
+impl AttestedContract {
+    /// Create a new attested contract entry
+    pub fn new(contract_id: ContractInstanceId, client_id: ClientId) -> Self {
+        Self {
+            contract_id,
+            client_id,
+            last_accessed: Instant::now(),
+        }
+    }
+}
+
+/// Maps authentication tokens to attested contract metadata.
+pub type AttestedContractMap = Arc<DashMap<AuthToken, AttestedContract>>;
 
 /// A gateway to access and interact with contracts through an HTTP interface.
-pub(crate) struct HttpGateway {
-    pub attested_contracts: AttestedContractMap,
+pub struct HttpGateway {
+    pub(crate) attested_contracts: AttestedContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
@@ -43,7 +69,7 @@ pub(crate) struct HttpGateway {
 impl HttpGateway {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
-        let attested_contracts = Arc::new(RwLock::new(HashMap::new()));
+        let attested_contracts = Arc::new(DashMap::new());
         Self::as_router_with_attested_contracts(socket, attested_contracts)
     }
 
@@ -53,6 +79,12 @@ impl HttpGateway {
         attested_contracts: AttestedContractMap,
     ) -> (Self, Router) {
         Self::create_router_v1_with_attested_contracts(socket, attested_contracts)
+    }
+
+    /// Returns a reference to the attested contracts map (for integration testing).
+    /// This allows tests to verify token expiration behavior.
+    pub fn attested_contracts(&self) -> &AttestedContractMap {
+        &self.attested_contracts
     }
 }
 
@@ -81,10 +113,9 @@ impl ClientEventsProxy for HttpGateway {
                             .send(HostCallbackResult::NewId { id: cli_id })
                             .map_err(|_e| ErrorKind::NodeUnavailable)?;
                         if let Some((assigned_token, contract)) = assigned_token {
+                            let attested = AttestedContract::new(contract, cli_id);
                             self.attested_contracts
-                                .write()
-                                .map_err(|_| ErrorKind::FailedOperation)?
-                                .insert(assigned_token.clone(), (contract, cli_id));
+                                .insert(assigned_token.clone(), attested);
                             tracing::debug!(
                                 ?assigned_token,
                                 ?contract,

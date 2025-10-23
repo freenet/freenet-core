@@ -125,7 +125,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           PR_URL=$(gh pr create \
-            --title "chore: release ${{ needs.validate.outputs.version }}" \
+            --title "build: release ${{ needs.validate.outputs.version }}" \
             --body "**Automated release PR**
 
           - freenet: → **${{ needs.validate.outputs.version }}**

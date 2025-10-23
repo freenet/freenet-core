@@ -570,16 +570,10 @@ impl Operation for UpdateOp {
                                 summary.size()
                             );
 
-                            // Mark operation as finished (pattern matching in mod.rs will handle completion)
-                            new_state = Some(UpdateState::Finished {
-                                key,
-                                summary: summary.clone(),
-                            });
-
                             if let Some(upstream) = upstream {
-                                // Intermediate node: Forward success to upstream
+                                // Intermediate node: Forward success to upstream and complete operation
                                 tracing::debug!(
-                                    "UPDATE: Forwarding SuccessfulUpdate to upstream peer {:?}",
+                                    "UPDATE: Forwarding SuccessfulUpdate to upstream peer {:?} and completing operation",
                                     upstream
                                 );
                                 return_msg = Some(UpdateMsg::SuccessfulUpdate {
@@ -589,12 +583,20 @@ impl Operation for UpdateOp {
                                     key,
                                     sender: op_manager.ring.connection_manager.own_location(),
                                 });
+                                // Set state to None so OpManager marks this operation as completed
+                                // This prevents duplicate SuccessfulUpdate messages from being processed
+                                new_state = None;
                             } else {
                                 // Operation originated locally (no upstream peer)
+                                // Preserve Finished state so client can receive the result
                                 tracing::debug!(
                                     "UPDATE: Operation {} completed successfully (originated locally)",
                                     id
                                 );
+                                new_state = Some(UpdateState::Finished {
+                                    key,
+                                    summary: summary.clone(),
+                                });
                                 return_msg = None;
                             }
                         }

@@ -66,6 +66,8 @@ async fn test_gateway_reconnection() -> TestResult {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(gateway_ws_port),
+            token_ttl_seconds: None,
+            token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -107,6 +109,8 @@ async fn test_gateway_reconnection() -> TestResult {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(peer_ws_port),
+            token_ttl_seconds: None,
+            token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -329,6 +333,8 @@ async fn test_basic_gateway_connectivity() -> TestResult {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(ws_port),
+            token_ttl_seconds: None,
+            token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -500,6 +506,8 @@ async fn test_three_node_network_connectivity() -> TestResult {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(gateway_ws_port),
+            token_ttl_seconds: None,
+            token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -548,6 +556,8 @@ async fn test_three_node_network_connectivity() -> TestResult {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(peer1_ws_port),
+            token_ttl_seconds: None,
+            token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -587,6 +597,8 @@ async fn test_three_node_network_connectivity() -> TestResult {
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(peer2_ws_port),
+            token_ttl_seconds: None,
+            token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
