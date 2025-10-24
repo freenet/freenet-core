@@ -1,4 +1,6 @@
 // TODO: complete update logic in the network
+use std::collections::HashSet;
+
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
@@ -516,6 +518,7 @@ impl OpManager {
         key: &ContractKey,
         sender: &PeerId,
     ) -> Vec<PeerKeyLocation> {
+        // Get subscription-based targets (existing logic)
         let subscribers = self
             .ring
             .subscribers_of(key)
@@ -528,18 +531,53 @@ impl OpManager {
             })
             .unwrap_or_default();
 
+        // Get proximity-based targets (new logic)
+        let proximity_targets = if let Some(proximity_cache) = &self.proximity_cache {
+            // Get neighbors who have cached this contract
+            let neighbor_peers = proximity_cache.neighbors_with_contract(key);
+
+            // Convert PeerIds to PeerKeyLocation, filtering out the sender
+            neighbor_peers
+                .into_iter()
+                .filter(|peer| peer != sender)
+                .map(PeerKeyLocation::from)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        // Combine both subscription and proximity targets, avoiding duplicates
+        let subscription_count = subscribers.len();
+        let mut seen_peers = HashSet::new();
+        let mut all_targets = Vec::new();
+
+        for subscriber in subscribers {
+            seen_peers.insert(subscriber.peer.clone());
+            all_targets.push(subscriber);
+        }
+
+        for proximity_target in proximity_targets {
+            if seen_peers.insert(proximity_target.peer.clone()) {
+                all_targets.push(proximity_target);
+            }
+        }
+
         // Trace update propagation for debugging
-        if !subscribers.is_empty() {
+        if !all_targets.is_empty() {
+            let proximity_count = all_targets.len() - subscription_count;
+
             tracing::info!(
-                "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={}",
+                "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={} (sub={} prox={})",
                 key,
                 sender,
-                subscribers
+                all_targets
                     .iter()
                     .map(|s| format!("{:.8}", s.peer))
                     .collect::<Vec<_>>()
                     .join(","),
-                subscribers.len()
+                all_targets.len(),
+                subscription_count,
+                proximity_count
             );
         } else {
             tracing::warn!(
@@ -549,7 +587,7 @@ impl OpManager {
             );
         }
 
-        subscribers
+        all_targets
     }
 }
 

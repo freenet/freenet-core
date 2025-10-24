@@ -45,6 +45,7 @@ impl<ER> Builder<ER> {
             self.event_register.clone(),
             connection_manager.clone(),
             result_router_tx,
+            None,
         )?);
         std::mem::drop(_guard);
         let (executor_listener, executor_sender) = executor_channel(op_manager.clone());
