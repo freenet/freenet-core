@@ -95,8 +95,7 @@ async fn create_test_node_config(
 /// Set RUST_LOG environment variable to control log levels (default: info).
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_get_error_notification() -> anyhow::Result<()> {
-    // test_log::test automatically sets up logging to only show on failure
-    // No need to call set_logger() manually
+    // test_log handles logging setup
 
     // Start a single isolated node (no peers)
     let ws_port = 50900;
@@ -196,9 +195,8 @@ async fn test_get_error_notification() -> anyhow::Result<()> {
 ///
 /// This test verifies that when a PUT operation fails (e.g., invalid contract),
 /// the client receives an error response rather than hanging indefinitely.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_put_error_notification() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
 
     // Start a single isolated node (no peers)
     let ws_port = 50910;
@@ -306,9 +304,8 @@ async fn test_put_error_notification() -> anyhow::Result<()> {
 ///
 /// This test verifies that when an UPDATE operation fails (e.g., contract doesn't exist),
 /// the client receives an error response rather than hanging indefinitely.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_update_error_notification() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
 
     // Start a single isolated node (no peers)
     let ws_port = 50920;
@@ -418,11 +415,10 @@ async fn test_update_error_notification() -> anyhow::Result<()> {
 ///
 /// Scenario: Connect 2 peers (gateway + peer1), establish connection, then forcibly
 /// drop the peer to trigger connection errors.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
     use std::net::TcpListener;
 
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
 
     // Create network sockets for gateway and peer
     let gateway_network_socket = TcpListener::bind("127.0.0.1:0")?;

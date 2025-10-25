@@ -36,7 +36,7 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 /// Uses test_log to only show logs on failure, and with_peer_id to distinguish gateway/peer logs.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_gateway_reconnection() -> TestResult {
-    // test_log automatically sets up logging - no manual set_logger() needed
+    // test_log handles logging setup
 
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -324,7 +324,7 @@ async fn test_basic_gateway_connectivity() -> TestResult {
     use freenet_stdlib::client_api::{ClientRequest, WebApi};
     use tokio_tungstenite::connect_async;
 
-    // test_log automatically sets up logging
+    // test_log handles logging setup
 
     // Use the test utilities to create a simple network
     let network_socket = TcpListener::bind("127.0.0.1:0")?;
@@ -484,7 +484,7 @@ async fn test_three_node_network_connectivity() -> TestResult {
     use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
     use std::collections::HashSet;
 
-    // test_log automatically sets up logging
+    // test_log handles logging setup
 
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";

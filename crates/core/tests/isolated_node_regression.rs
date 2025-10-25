@@ -90,9 +90,8 @@ async fn create_test_node_config(
 /// - PUT operations cache contracts locally without network timeouts (PR #1781)
 /// - GET operations retrieve from local cache without self-routing attempts (PR #1806)
 /// - Complete workflow functions properly without peer connections
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_isolated_node_put_get_workflow() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
 
     // Start a single isolated node (no peers)
     let ws_port = 50700;
@@ -246,9 +245,8 @@ async fn test_isolated_node_put_get_workflow() -> anyhow::Result<()> {
 /// 3. Result delivered to Client 1, TX removed from tracking
 /// 4. Client 2 sends identical GET request → Router tries to reuse removed TX
 /// 5. Bug: Client 2 never receives response
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_concurrent_get_deduplication_race() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
 
     // Start a single isolated node (no peers) - ensures instant completion
     let ws_port = 50900;
@@ -429,9 +427,8 @@ async fn test_concurrent_get_deduplication_race() -> anyhow::Result<()> {
 /// when the contract exists locally but no remote peers are available.
 /// Tests the fix in PR #1844 where SubscribeResponse messages were not being
 /// delivered to WebSocket clients for local contracts.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
 
     // Start a single isolated node (no peers)
     let ws_port = 50800;
@@ -607,9 +604,8 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
 /// - UPDATE operation updates the contract state
 /// - UPDATE returns UpdateResponse without timeout (issue #1884)
 /// - GET operation retrieves updated state
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_isolated_node_update_operation() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
 
     // Start a single isolated node (no peers)
     let ws_port = 50702;
