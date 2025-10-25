@@ -173,67 +173,70 @@ tracing::debug!(test_node = %test_node, "Connecting to peers");
 
 ### 3. JSON Logging for Structured Output
 
-**⚠️ Important Limitation:** `test-log` does **NOT** support JSON output format.
+Freenet provides two approaches for test logging, depending on your needs:
 
-When using `#[test_log::test]`, logs will always be in pretty-printed format regardless of `FREENET_LOG_FORMAT` setting. This is because `test-log` sets up its own tracing subscriber before our code runs.
+#### Approach 1: Unit Tests with `test-log` (Pretty Format Only)
 
-**Why this happens:**
-- `test-log` initializes tracing with a basic pretty-format subscriber
-- Our `init_tracer()` function (which checks `FREENET_LOG_FORMAT`) never runs
-- The environment variable is simply ignored in tests
+`test-log` is perfect for **unit tests** where you want logs only on failure:
 
-#### For Production Code (JSON works)
-
-```bash
-# JSON logging works in production
-FREENET_LOG_FORMAT=json cargo run
-
-# This produces proper JSON output
-{"timestamp":"2025-10-25T12:34:56.789Z","level":"INFO",...}
-```
-
-#### For Tests (JSON doesn't work with test-log)
-
-```bash
-# This will NOT produce JSON (still pretty format)
-FREENET_LOG_FORMAT=json cargo test
-
-# Output will still be:
-# [INFO  freenet::node] Starting gateway
-```
-
-#### Workarounds for JSON in Tests
-
-**Option 1: Accept Pretty Format (Recommended)**
-- Pretty format is actually better for human debugging
-- Test logs are for developers, not log aggregation systems
-- The `test_node` field still provides clear identification
-
-**Option 2: Skip test-log for Specific Tests**
 ```rust
-// Don't use #[test_log::test] for tests that need JSON
+#[test_log::test]
+fn my_unit_test() {
+    tracing::info!("This only shows if test fails");
+    assert_eq!(1 + 1, 2);
+}
+```
+
+**Limitation:** `test-log` does NOT support JSON format. Logs are always pretty-printed.
+
+#### Approach 2: Integration Tests with `TestLogger` (JSON Support!)
+
+For **integration tests** that need JSON output, use the custom `TestLogger`:
+
+```rust
+use freenet::test_utils::TestLogger;
+
 #[tokio::test]
 async fn test_with_json_output() -> TestResult {
-    // Manually initialize logging with JSON
-    std::env::set_var("FREENET_LOG_FORMAT", "json");
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+    let _logger = TestLogger::new()
+        .with_json()
+        .with_level("info")
+        .init();
 
-    // Now logs will be JSON
-    // NOTE: Logs will ALWAYS show (even if test passes)
+    tracing::info!("This will be JSON formatted");
+    // Logs show in JSON format and appear on test failure
     Ok(())
 }
 ```
 
-**Option 3: Use CI with Different Configuration**
-```yaml
-# .github/workflows/ci.yml
-- name: Run tests with verbose logging for CI analysis
-  env:
-    RUST_LOG: debug
-  run: |
-    # Don't rely on JSON in tests
-    # Instead, parse pretty format or capture to files
-    cargo test --workspace 2>&1 | tee test-output.log
+**TestLogger Features:**
+- ✅ JSON or pretty format
+- ✅ Configurable log levels
+- ✅ Works with tokio tests
+- ✅ Shows logs only on failure (like test-log)
+- ✅ Log capturing for programmatic inspection
+
+#### JSON Format Example
+
+When using `TestLogger::new().with_json()`, you get structured JSON output:
+
+```json
+{
+  "timestamp": "2025-10-25T12:34:56.789Z",
+  "level": "INFO",
+  "target": "freenet::node",
+  "message": "Starting gateway",
+  "span": {
+    "test_node": "gateway",
+    "name": "test_peer"
+  },
+  "spans": [
+    {
+      "test_node": "gateway",
+      "name": "test_peer"
+    }
+  ]
+}
 ```
 
 #### Production JSON Format (for reference)
@@ -260,47 +263,148 @@ In production (not tests), JSON logging works properly:
 - Better integration with log aggregation tools (ELK, Loki)
 - Structured data for filtering and analysis
 - Preserves field types (numbers, booleans, etc.)
+- Can filter logs by peer using `jq` or similar tools
 
-### 4. Environment Variables for Test Logging
+**Example: Multi-Peer Test with TestLogger + JSON**
+
+```rust
+use freenet::test_utils::{TestLogger, with_peer_id};
+
+#[tokio::test]
+async fn test_multi_peer_network() -> TestResult {
+    // Initialize JSON logging for the test
+    let _logger = TestLogger::new()
+        .with_json()
+        .with_level("info")
+        .init();
+
+    // Start gateway with peer identification
+    let gateway = async {
+        let _span = with_peer_id("gateway");
+        tracing::info!("Starting gateway");
+        // All logs here include test_node="gateway"
+        start_gateway_node().await
+    };
+
+    // Start peer 1
+    let peer1 = async {
+        let _span = with_peer_id("peer-1");
+        tracing::info!("Starting peer 1");
+        // All logs here include test_node="peer-1"
+        start_peer_node(1).await
+    };
+
+    tokio::try_join!(gateway, peer1)?;
+    Ok(())
+}
+```
+
+**Filtering JSON logs by peer:**
+```bash
+# Get all gateway logs
+cargo test test_multi_peer -- --nocapture | jq 'select(.span.test_node == "gateway")'
+
+# Get all peer-1 logs
+cargo test test_multi_peer -- --nocapture | jq 'select(.span.test_node == "peer-1")'
+```
+
+### 4. Log Capturing and Inspection
+
+`TestLogger` can capture logs for programmatic inspection:
+
+```rust
+use freenet::test_utils::TestLogger;
+
+#[tokio::test]
+async fn test_with_log_assertions() -> TestResult {
+    let logger = TestLogger::new()
+        .capture_logs()  // Enable log capturing
+        .with_level("info")
+        .init();
+
+    tracing::info!("Operation started");
+    perform_operation().await?;
+    tracing::info!("Operation completed");
+
+    // Assert on log content
+    assert!(logger.contains("Operation started"));
+    assert!(logger.contains("Operation completed"));
+    assert_eq!(logger.log_count(), 2);
+
+    // Get specific logs
+    let error_logs = logger.logs_matching(|log| log.contains("ERROR"));
+    assert!(error_logs.is_empty(), "Should have no errors");
+
+    Ok(())
+}
+```
+
+**TestLogger API:**
+- `contains(message)` - Check if any log contains the message
+- `logs()` - Get all captured logs as Vec<String>
+- `logs_matching(predicate)` - Get logs that match a filter
+- `log_count()` - Count total captured logs
+
+### 5. Environment Variables for Test Logging
 
 | Variable | Purpose | Example |
 |----------|---------|---------|
 | `RUST_LOG` | Control log levels per module | `debug`, `freenet::node=trace` |
-| `FREENET_LOG_FORMAT` | Use JSON logging | `json` |
-| `FREENET_LOG_TO_STDERR` | Redirect logs to stderr | `1` or `true` |
-| `FREENET_DISABLE_LOGS` | Disable all logging | `1` or `true` |
 
-**Combined Usage:**
+**Usage:**
 
 ```bash
-# Debug logs in JSON format to stderr
-RUST_LOG=debug FREENET_LOG_FORMAT=json FREENET_LOG_TO_STDERR=1 cargo test
+# Run tests with debug logs
+RUST_LOG=debug cargo test
 
-# Trace specific modules with JSON
-RUST_LOG=freenet::operations::get=trace FREENET_LOG_FORMAT=json cargo test
+# Trace specific modules
+RUST_LOG=freenet::operations::get=trace cargo test
 
 # Run specific test with detailed logging
 RUST_LOG=trace cargo test test_gateway_reconnection
 ```
 
+**Note:** `FREENET_LOG_FORMAT` and other env vars only work in production, not with test-log. Use `TestLogger` for JSON in tests.
+
 ## Best Practices
 
-### 1. Use `test-log::test` for All New Tests
+### 1. Choose the Right Logging Approach
 
-**Do:**
+**Unit Tests:** Use `test-log::test`
+```rust
+#[test_log::test]
+fn my_unit_test() {
+    tracing::info!("Test started");
+    assert_eq!(1 + 1, 2);
+}
+```
+
+**Integration Tests (Simple):** Use `test-log::test`
 ```rust
 #[test_log::test(tokio::test)]
-async fn my_test() -> TestResult {
+async fn simple_integration_test() -> TestResult {
     tracing::info!("Test started");
     Ok(())
 }
 ```
 
-**Don't:**
+**Integration Tests (with JSON or multi-peer):** Use `TestLogger`
+```rust
+use freenet::test_utils::TestLogger;
+
+#[tokio::test]
+async fn multi_peer_test() -> TestResult {
+    let _logger = TestLogger::new().with_json().init();
+    // Test with JSON output and peer identification
+    Ok(())
+}
+```
+
+**Don't:** Use deprecated manual logging
 ```rust
 #[tokio::test]
 async fn my_test() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);  // Deprecated
+    freenet::config::set_logger(Some(LevelFilter::INFO), None);  // ❌ Deprecated
     Ok(())
 }
 ```
