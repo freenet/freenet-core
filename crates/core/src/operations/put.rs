@@ -163,6 +163,7 @@ impl Operation for PutOp {
             match input {
                 PutMsg::RequestPut {
                     id,
+                    sender,
                     contract,
                     related_contracts,
                     value,
@@ -171,7 +172,7 @@ impl Operation for PutOp {
                 } => {
                     // Get the contract key and own location
                     let key = contract.key();
-                    let sender = op_manager.ring.connection_manager.own_location();
+                    let own_location = op_manager.ring.connection_manager.own_location();
 
                     tracing::info!(
                         "Requesting put for contract {} from {} to {}",
@@ -268,34 +269,41 @@ impl Operation for PutOp {
                         // Create a SeekNode message to forward to the next hop
                         return_msg = Some(PutMsg::SeekNode {
                             id: *id,
-                            sender,
+                            sender: sender.clone(),
                             target: forward_target,
                             value: modified_value.clone(),
                             contract: contract.clone(),
                             related_contracts: related_contracts.clone(),
                             htl: *htl,
                         });
+
+                        // Transition to AwaitingResponse state to handle future SuccessfulPut messages
+                        new_state = Some(PutState::AwaitingResponse {
+                            key,
+                            upstream: Some(sender.clone()),
+                            contract: contract.clone(),
+                            state: modified_value,
+                            subscribe: false,
+                        });
                     } else {
                         // No other peers to forward to - we're the final destination
                         tracing::debug!(
                             tx = %id,
                             %key,
-                            "No peers to forward to - handling PUT completion locally"
+                            "No peers to forward to - handling PUT completion locally, sending SuccessfulPut back to sender"
                         );
-                        return_msg = None;
-                    }
 
-                    // Transition to AwaitingResponse state to handle future SuccessfulPut messages
-                    new_state = Some(PutState::AwaitingResponse {
-                        key,
-                        upstream: match &self.state {
-                            Some(PutState::ReceivedRequest) => None,
-                            _ => None,
-                        },
-                        contract: contract.clone(),
-                        state: modified_value,
-                        subscribe: false,
-                    });
+                        // Send SuccessfulPut back to the sender (upstream node)
+                        return_msg = Some(PutMsg::SuccessfulPut {
+                            id: *id,
+                            target: sender.clone(),
+                            key,
+                            sender: own_location,
+                        });
+
+                        // Mark operation as finished
+                        new_state = Some(PutState::Finished { key });
+                    }
                 }
                 PutMsg::SeekNode {
                     id,
@@ -1110,6 +1118,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
     // Create RequestPut message and forward to target peer
     let msg = PutMsg::RequestPut {
         id,
+        sender: own_location,
         contract,
         related_contracts,
         value,
@@ -1272,6 +1281,7 @@ mod messages {
         /// Internal node instruction to find a route to the target node.
         RequestPut {
             id: Transaction,
+            sender: PeerKeyLocation,
             contract: ContractContainer,
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,

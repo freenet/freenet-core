@@ -229,6 +229,15 @@ impl OpManager {
     }
 
     pub async fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
+        // Check if operation is already completed - don't push back to HashMap
+        if self.ops.completed.contains(&id) {
+            tracing::debug!(
+                tx = %id,
+                "OpManager: Ignoring push for already completed operation"
+            );
+            return Ok(());
+        }
+
         if let Some(tx) = self.ops.under_progress.remove(&id) {
             if tx.timed_out() {
                 self.ops.completed.insert(tx);
