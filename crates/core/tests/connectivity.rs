@@ -33,10 +33,16 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 /// 3. Force disconnect
 /// 4. Verify that the peer can reconnect and operate normally
 ///
-/// Uses test_log to only show logs on failure, and with_peer_id to distinguish gateway/peer logs.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+/// Uses TestLogger with JSON output for structured logging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_gateway_reconnection() -> TestResult {
-    // test_log handles logging setup
+    use freenet::test_utils::TestLogger;
+
+    // Initialize TestLogger with JSON format
+    let _logger = TestLogger::new()
+        .with_json()
+        .with_level("info")
+        .init();
 
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -318,13 +324,18 @@ async fn test_gateway_reconnection() -> TestResult {
 
 /// Simplified test to verify basic gateway connectivity
 ///
-/// Uses test_log to only show logs on failure, and with_peer_id to distinguish gateway logs.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+/// Uses TestLogger with JSON output and peer ID for better debugging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_basic_gateway_connectivity() -> TestResult {
     use freenet_stdlib::client_api::{ClientRequest, WebApi};
+    use freenet::test_utils::TestLogger;
     use tokio_tungstenite::connect_async;
 
-    // test_log handles logging setup
+    // Initialize TestLogger with JSON format for structured output
+    let _logger = TestLogger::new()
+        .with_json()
+        .with_level("info")
+        .init();
 
     // Use the test utilities to create a simple network
     let network_socket = TcpListener::bind("127.0.0.1:0")?;
@@ -478,13 +489,18 @@ async fn test_basic_gateway_connectivity() -> TestResult {
 /// 7. Other peers connect to PublicIP:54321
 /// 8. Router forwards to peer's internal 192.168.1.100:8080 ✅
 ///
-/// Uses test_log to only show logs on failure, and with_peer_id to distinguish gateway/peer logs.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+/// Uses TestLogger with JSON output for structured logging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_three_node_network_connectivity() -> TestResult {
+    use freenet::test_utils::TestLogger;
     use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
     use std::collections::HashSet;
 
-    // test_log handles logging setup
+    // Initialize TestLogger with JSON format
+    let _logger = TestLogger::new()
+        .with_json()
+        .with_level("info")
+        .init();
 
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
