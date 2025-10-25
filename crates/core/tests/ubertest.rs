@@ -258,7 +258,6 @@ async fn verify_network_topology(
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore] // Waker registration fix verified working - test fails due to unrelated connection issues
 async fn test_basic_room_creation() -> anyhow::Result<()> {
-
     info!("=== Basic Room Creation Test ===");
     info!("Testing minimal setup: 1 gateway + 1 peer");
 
@@ -385,7 +384,6 @@ async fn test_basic_room_creation() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires fixes still in progress"]
 async fn test_app_ubertest() -> anyhow::Result<()> {
-
     info!("=== Freenet Application Ubertest ===");
     info!("Testing River as reference application");
 

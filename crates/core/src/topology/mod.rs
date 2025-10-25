@@ -672,218 +672,207 @@ mod tests {
 
     use super::*;
     use crate::ring::Distance;
-    use crate::test_utils::with_tracing;
     use std::time::Duration;
 
-    #[test]
+    #[test_log::test]
     fn test_resource_manager_report() {
-        with_tracing(|| {
-            // Create a TopologyManager with arbitrary limits
-            let limits = Limits {
-                max_upstream_bandwidth: Rate::new_per_second(1000.0),
-                max_downstream_bandwidth: Rate::new_per_second(1000.0),
-                max_connections: 200,
-                min_connections: 5,
-            };
-            let mut resource_manager = TopologyManager::new(limits);
+        // Create a TopologyManager with arbitrary limits
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut resource_manager = TopologyManager::new(limits);
 
-            // Report some usage and test that the total and attributed usage are updated
-            let attribution = AttributionSource::Peer(PeerKeyLocation::random());
-            let now = Instant::now();
-            resource_manager.report_resource_usage(
-                &attribution,
-                ResourceType::InboundBandwidthBytes,
-                100.0,
-                now,
-            );
-            assert_eq!(
-                resource_manager
-                    .meter
-                    .attributed_usage_rate(&attribution, &ResourceType::InboundBandwidthBytes, now)
-                    .unwrap()
-                    .per_second(),
-                100.0
-            );
-        });
+        // Report some usage and test that the total and attributed usage are updated
+        let attribution = AttributionSource::Peer(PeerKeyLocation::random());
+        let now = Instant::now();
+        resource_manager.report_resource_usage(
+            &attribution,
+            ResourceType::InboundBandwidthBytes,
+            100.0,
+            now,
+        );
+        assert_eq!(
+            resource_manager
+                .meter
+                .attributed_usage_rate(&attribution, &ResourceType::InboundBandwidthBytes, now)
+                .unwrap()
+                .per_second(),
+            100.0
+        );
     }
 
-    #[test]
+    #[test_log::test]
     fn test_remove_connections() {
-        with_tracing(|| {
-            let mut resource_manager = setup_topology_manager(1000.0);
-            let peers = generate_random_peers(5);
-            // Total bw usage will be way higher than the limit of 1000
-            let bw_usage_by_peer = vec![1000, 1100, 1200, 2000, 1600];
-            // Report usage from outside the ramp-up time window so it isn't ignored
-            let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
-            report_resource_usage(
-                &mut resource_manager,
-                &peers,
-                &bw_usage_by_peer,
-                report_time,
-            );
-            let requests_per_peer = vec![20, 19, 18, 9, 9];
-            report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
-            let worst_ix = find_worst_peer(&peers, &bw_usage_by_peer, &requests_per_peer);
-            assert_eq!(worst_ix, 3);
-            let worst_peer = &peers[worst_ix];
-            let mut neighbor_locations = BTreeMap::new();
-            for peer in &peers {
-                neighbor_locations.insert(peer.location.unwrap(), vec![]);
-            }
+        let mut resource_manager = setup_topology_manager(1000.0);
+        let peers = generate_random_peers(5);
+        // Total bw usage will be way higher than the limit of 1000
+        let bw_usage_by_peer = vec![1000, 1100, 1200, 2000, 1600];
+        // Report usage from outside the ramp-up time window so it isn't ignored
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        report_resource_usage(
+            &mut resource_manager,
+            &peers,
+            &bw_usage_by_peer,
+            report_time,
+        );
+        let requests_per_peer = vec![20, 19, 18, 9, 9];
+        report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
+        let worst_ix = find_worst_peer(&peers, &bw_usage_by_peer, &requests_per_peer);
+        assert_eq!(worst_ix, 3);
+        let worst_peer = &peers[worst_ix];
+        let mut neighbor_locations = BTreeMap::new();
+        for peer in &peers {
+            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+        }
 
-            let adjustment = resource_manager.adjust_topology(
-                &neighbor_locations,
-                &None,
-                Instant::now(),
-                peers.len(),
-            );
-            match adjustment {
-                TopologyAdjustment::RemoveConnections(peers) => {
-                    assert_eq!(peers.len(), 1);
-                    assert_eq!(peers[0], *worst_peer);
-                }
-                _ => panic!("Expected to remove a peer, adjustment was {adjustment:?}"),
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &None,
+            Instant::now(),
+            peers.len(),
+        );
+        match adjustment {
+            TopologyAdjustment::RemoveConnections(peers) => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0], *worst_peer);
             }
-        });
+            _ => panic!("Expected to remove a peer, adjustment was {adjustment:?}"),
+        }
     }
 
-    #[test]
+    #[test_log::test]
     fn test_add_connections() {
-        with_tracing(|| {
-            let mut resource_manager = setup_topology_manager(1000.0);
-            // Generate 5 peers with locations specified in a vec!
-            let mut peers: Vec<PeerKeyLocation> = generate_random_peers(5);
-            let peer_locations: Vec<Location> = [0.1, 0.3, 0.5, 0.7, 0.9]
-                .into_iter()
-                .map(Location::new)
-                .collect();
-            for (ix, peer) in peers.iter_mut().enumerate() {
-                peer.location = Some(peer_locations[ix]);
+        let mut resource_manager = setup_topology_manager(1000.0);
+        // Generate 5 peers with locations specified in a vec!
+        let mut peers: Vec<PeerKeyLocation> = generate_random_peers(5);
+        let peer_locations: Vec<Location> = [0.1, 0.3, 0.5, 0.7, 0.9]
+            .into_iter()
+            .map(Location::new)
+            .collect();
+        for (ix, peer) in peers.iter_mut().enumerate() {
+            peer.location = Some(peer_locations[ix]);
+        }
+
+        // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
+        // the TopologyManager to add a connection
+        let bw_usage_by_peer = vec![10, 20, 30, 25, 30];
+        // Report usage from outside the ramp-up time window so it isn't ignored
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        report_resource_usage(
+            &mut resource_manager,
+            &peers,
+            &bw_usage_by_peer,
+            report_time,
+        );
+        let requests_per_peer = vec![20, 19, 18, 9, 9];
+        report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
+
+        let mut neighbor_locations = BTreeMap::new();
+        for peer in &peers {
+            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+        }
+
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &None,
+            Instant::now(),
+            peers.len(),
+        );
+
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                assert_eq!(locations.len(), 1);
+                // Location should be between peers[0] and peers[1] because they have the highest
+                // number of requests per hour for any adjacent peers
+                assert!(locations[0] >= peers[0].location.unwrap());
+                assert!(locations[0] <= peers[1].location.unwrap());
             }
-
-            // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
-            // the TopologyManager to add a connection
-            let bw_usage_by_peer = vec![10, 20, 30, 25, 30];
-            // Report usage from outside the ramp-up time window so it isn't ignored
-            let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
-            report_resource_usage(
-                &mut resource_manager,
-                &peers,
-                &bw_usage_by_peer,
-                report_time,
-            );
-            let requests_per_peer = vec![20, 19, 18, 9, 9];
-            report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
-
-            let mut neighbor_locations = BTreeMap::new();
-            for peer in &peers {
-                neighbor_locations.insert(peer.location.unwrap(), vec![]);
-            }
-
-            let adjustment = resource_manager.adjust_topology(
-                &neighbor_locations,
-                &None,
-                Instant::now(),
-                peers.len(),
-            );
-
-            match adjustment {
-                TopologyAdjustment::AddConnections(locations) => {
-                    assert_eq!(locations.len(), 1);
-                    // Location should be between peers[0] and peers[1] because they have the highest
-                    // number of requests per hour for any adjacent peers
-                    assert!(locations[0] >= peers[0].location.unwrap());
-                    assert!(locations[0] <= peers[1].location.unwrap());
-                }
-                _ => panic!("Expected to add a connection, adjustment was {adjustment:?}"),
-            }
-        });
+            _ => panic!("Expected to add a connection, adjustment was {adjustment:?}"),
+        }
     }
 
     // Test with no adjustment because the usage is within acceptable bounds
-    #[test]
+    #[test_log::test]
     fn test_no_adjustment() {
-        with_tracing(|| {
-            let mut resource_manager = setup_topology_manager(1000.0);
-            let peers = generate_random_peers(5);
-            // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
-            // the TopologyManager to add a connection
-            let bw_usage_by_peer = vec![150, 200, 100, 100, 200];
-            // Report usage from outside the ramp-up time window so it isn't ignored
-            let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
-            report_resource_usage(
-                &mut resource_manager,
-                &peers,
-                &bw_usage_by_peer,
-                report_time,
-            );
-            let requests_per_peer = vec![20, 19, 18, 9, 9];
-            report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
+        let mut resource_manager = setup_topology_manager(1000.0);
+        let peers = generate_random_peers(5);
+        // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
+        // the TopologyManager to add a connection
+        let bw_usage_by_peer = vec![150, 200, 100, 100, 200];
+        // Report usage from outside the ramp-up time window so it isn't ignored
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        report_resource_usage(
+            &mut resource_manager,
+            &peers,
+            &bw_usage_by_peer,
+            report_time,
+        );
+        let requests_per_peer = vec![20, 19, 18, 9, 9];
+        report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
 
-            let mut neighbor_locations = BTreeMap::new();
-            for peer in &peers {
-                neighbor_locations.insert(peer.location.unwrap(), vec![]);
-            }
+        let mut neighbor_locations = BTreeMap::new();
+        for peer in &peers {
+            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+        }
 
-            let adjustment = resource_manager.adjust_topology(
-                &neighbor_locations,
-                &None,
-                report_time,
-                peers.len(),
-            );
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &None,
+            report_time,
+            peers.len(),
+        );
 
-            match adjustment {
-                TopologyAdjustment::NoChange => {}
-                _ => panic!("Expected no adjustment, adjustment was {adjustment:?}"),
-            }
-        });
+        match adjustment {
+            TopologyAdjustment::NoChange => {}
+            _ => panic!("Expected no adjustment, adjustment was {adjustment:?}"),
+        }
     }
 
     // Test with no peers
-    #[test]
+    #[test_log::test]
     fn test_no_peers() {
-        with_tracing(|| {
-            let mut resource_manager = setup_topology_manager(1000.0);
-            let peers = generate_random_peers(0);
-            // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
-            // the TopologyManager to add a connection
-            let bw_usage_by_peer = vec![];
-            // Report usage from outside the ramp-up time window so it isn't ignored
-            let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
-            report_resource_usage(
-                &mut resource_manager,
-                &peers,
-                &bw_usage_by_peer,
-                report_time,
-            );
-            let requests_per_peer = vec![];
-            report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
+        let mut resource_manager = setup_topology_manager(1000.0);
+        let peers = generate_random_peers(0);
+        // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
+        // the TopologyManager to add a connection
+        let bw_usage_by_peer = vec![];
+        // Report usage from outside the ramp-up time window so it isn't ignored
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        report_resource_usage(
+            &mut resource_manager,
+            &peers,
+            &bw_usage_by_peer,
+            report_time,
+        );
+        let requests_per_peer = vec![];
+        report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
 
-            let mut neighbor_locations = BTreeMap::new();
-            for peer in &peers {
-                neighbor_locations.insert(peer.location.unwrap(), vec![]);
-            }
+        let mut neighbor_locations = BTreeMap::new();
+        for peer in &peers {
+            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+        }
 
-            let my_location = Location::random();
+        let my_location = Location::random();
 
-            let adjustment = resource_manager.adjust_topology(
-                &neighbor_locations,
-                &Some(my_location),
-                report_time,
-                peers.len(),
-            );
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &Some(my_location),
+            report_time,
+            peers.len(),
+        );
 
-            match adjustment {
-                TopologyAdjustment::AddConnections(v) => {
-                    assert!(!v.is_empty());
-                    for location in v {
-                        assert_eq!(location, my_location);
-                    }
+        match adjustment {
+            TopologyAdjustment::AddConnections(v) => {
+                assert!(!v.is_empty());
+                for location in v {
+                    assert_eq!(location, my_location);
                 }
-                _ => panic!("Expected AddConnections, but was: {adjustment:?}"),
             }
-        });
+            _ => panic!("Expected AddConnections, but was: {adjustment:?}"),
+        }
     }
 
     fn setup_topology_manager(max_downstream_rate: f64) -> TopologyManager {
@@ -996,49 +985,47 @@ mod tests {
 
     // Test that with 1 connection and min_connections=25, we get diverse random locations
     // instead of 24 duplicates of the same location
-    #[test]
+    #[test_log::test]
     fn test_no_duplicate_connections_with_few_peers() {
-        with_tracing(|| {
-            let limits = Limits {
-                max_upstream_bandwidth: Rate::new_per_second(1000.0),
-                max_downstream_bandwidth: Rate::new_per_second(1000.0),
-                max_connections: 200,
-                min_connections: 25,
-            };
-            let mut topology_manager = TopologyManager::new(limits);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 25,
+        };
+        let mut topology_manager = TopologyManager::new(limits);
 
-            // Simulate having 1 existing connection
-            let mut neighbor_locations = BTreeMap::new();
-            let peer = PeerKeyLocation::random();
-            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+        // Simulate having 1 existing connection
+        let mut neighbor_locations = BTreeMap::new();
+        let peer = PeerKeyLocation::random();
+        neighbor_locations.insert(peer.location.unwrap(), vec![]);
 
-            let adjustment = topology_manager.adjust_topology(
-                &neighbor_locations,
-                &Some(Location::new(0.5)),
-                Instant::now(),
-                1, // 1 current connection
-            );
+        let adjustment = topology_manager.adjust_topology(
+            &neighbor_locations,
+            &Some(Location::new(0.5)),
+            Instant::now(),
+            1, // 1 current connection
+        );
 
-            match adjustment {
-                TopologyAdjustment::AddConnections(locations) => {
-                    // Should request 24 more connections to reach min of 25
-                    assert_eq!(locations.len(), 24);
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                // Should request 24 more connections to reach min of 25
+                assert_eq!(locations.len(), 24);
 
-                    // With random locations, we should NOT get all duplicates
-                    // Check that we have at least some diversity (not all identical)
-                    let unique_locations: std::collections::HashSet<_> = locations.iter().collect();
+                // With random locations, we should NOT get all duplicates
+                // Check that we have at least some diversity (not all identical)
+                let unique_locations: std::collections::HashSet<_> = locations.iter().collect();
 
-                    // Should have more than 1 unique location (proving no duplicates)
-                    assert!(
-                        unique_locations.len() > 1,
-                        "Expected diverse locations but got {} unique locations out of {}",
-                        unique_locations.len(),
-                        locations.len()
-                    );
-                }
-                _ => panic!("Expected AddConnections, got {adjustment:?}"),
+                // Should have more than 1 unique location (proving no duplicates)
+                assert!(
+                    unique_locations.len() > 1,
+                    "Expected diverse locations but got {} unique locations out of {}",
+                    unique_locations.len(),
+                    locations.len()
+                );
             }
-        });
+            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+        }
     }
 }
 

@@ -129,11 +129,8 @@ async fn get_contract(
 }
 
 /// Test PUT operation across two peers (gateway and peer)
-///
-/// Uses test_log to only show logs on failure, and with_peer_id to distinguish peer logs.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_put_contract() -> TestResult {
-    // test_log handles logging setup
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();

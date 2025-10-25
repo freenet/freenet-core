@@ -92,7 +92,6 @@ async fn create_test_node_config(
 /// - Complete workflow functions properly without peer connections
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_isolated_node_put_get_workflow() -> anyhow::Result<()> {
-
     // Start a single isolated node (no peers)
     let ws_port = 50700;
     let network_port = 50701;
@@ -247,7 +246,6 @@ async fn test_isolated_node_put_get_workflow() -> anyhow::Result<()> {
 /// 5. Bug: Client 2 never receives response
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_concurrent_get_deduplication_race() -> anyhow::Result<()> {
-
     // Start a single isolated node (no peers) - ensures instant completion
     let ws_port = 50900;
     let network_port = 50901;
@@ -429,7 +427,6 @@ async fn test_concurrent_get_deduplication_race() -> anyhow::Result<()> {
 /// delivered to WebSocket clients for local contracts.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
-
     // Start a single isolated node (no peers)
     let ws_port = 50800;
     let network_port = 50801;
@@ -606,7 +603,6 @@ async fn test_isolated_node_local_subscription() -> anyhow::Result<()> {
 /// - GET operation retrieves updated state
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_isolated_node_update_operation() -> anyhow::Result<()> {
-
     // Start a single isolated node (no peers)
     let ws_port = 50702;
     let network_port = 50703;

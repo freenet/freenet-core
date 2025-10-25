@@ -32,13 +32,10 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 /// 2. Perform operations to verify connectivity
 /// 3. Force disconnect
 /// 4. Verify that the peer can reconnect and operate normally
-///
-/// Uses TestLogger with JSON output for structured logging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_gateway_reconnection() -> TestResult {
     use freenet::test_utils::TestLogger;
 
-    // Initialize TestLogger with JSON format
     let _logger = TestLogger::new()
         .with_json()
         .with_level("info")
@@ -323,15 +320,12 @@ async fn test_gateway_reconnection() -> TestResult {
 }
 
 /// Simplified test to verify basic gateway connectivity
-///
-/// Uses TestLogger with JSON output and peer ID for better debugging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_basic_gateway_connectivity() -> TestResult {
     use freenet_stdlib::client_api::{ClientRequest, WebApi};
     use freenet::test_utils::TestLogger;
     use tokio_tungstenite::connect_async;
 
-    // Initialize TestLogger with JSON format for structured output
     let _logger = TestLogger::new()
         .with_json()
         .with_level("info")
@@ -488,15 +482,12 @@ async fn test_basic_gateway_connectivity() -> TestResult {
 /// 6. Peer's PeerId is set from config: PublicIP:54321
 /// 7. Other peers connect to PublicIP:54321
 /// 8. Router forwards to peer's internal 192.168.1.100:8080 ✅
-///
-/// Uses TestLogger with JSON output for structured logging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_three_node_network_connectivity() -> TestResult {
     use freenet::test_utils::TestLogger;
     use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
     use std::collections::HashSet;
 
-    // Initialize TestLogger with JSON format
     let _logger = TestLogger::new()
         .with_json()
         .with_level("info")

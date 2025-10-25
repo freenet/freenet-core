@@ -90,12 +90,8 @@ async fn create_test_node_config(
 /// hanging indefinitely.
 ///
 /// Fixes: #1858
-///
-/// Note: Uses #[test_log::test] to only show logs when the test fails.
-/// Set RUST_LOG environment variable to control log levels (default: info).
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_get_error_notification() -> anyhow::Result<()> {
-    // test_log handles logging setup
 
     // Start a single isolated node (no peers)
     let ws_port = 50900;
@@ -197,7 +193,6 @@ async fn test_get_error_notification() -> anyhow::Result<()> {
 /// the client receives an error response rather than hanging indefinitely.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_put_error_notification() -> anyhow::Result<()> {
-
     // Start a single isolated node (no peers)
     let ws_port = 50910;
     let network_port = 50911;
@@ -306,7 +301,6 @@ async fn test_put_error_notification() -> anyhow::Result<()> {
 /// the client receives an error response rather than hanging indefinitely.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_update_error_notification() -> anyhow::Result<()> {
-
     // Start a single isolated node (no peers)
     let ws_port = 50920;
     let network_port = 50921;
@@ -418,8 +412,6 @@ async fn test_update_error_notification() -> anyhow::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
     use std::net::TcpListener;
-
-
     // Create network sockets for gateway and peer
     let gateway_network_socket = TcpListener::bind("127.0.0.1:0")?;
     let gateway_ws_socket = TcpListener::bind("127.0.0.1:0")?;

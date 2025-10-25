@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-
 use clap::ValueEnum;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, WebApi},
@@ -40,7 +39,7 @@ use crate::util::workspace::get_workspace_target_dir;
 /// `peer` field which contains the actual cryptographic PeerId.
 pub fn set_peer_id(peer_id: impl Into<String>) {
     let peer_id = peer_id.into();
-    tracing::Span::current().record("test_node", &peer_id.as_str());
+    tracing::Span::current().record("test_node", peer_id);
 }
 
 /// Create a span with a peer identifier that will be included in all logs
@@ -64,10 +63,14 @@ pub fn set_peer_id(peer_id: impl Into<String>) {
 /// # Note
 /// The field name `test_node` is used to avoid conflicts with the production
 /// `peer` field which contains the actual cryptographic PeerId.
-#[must_use = "Span must be held for the duration of the operation"]
-pub fn with_peer_id(peer_id: impl Into<String>) -> tracing::Span {
+///
+/// # Important
+/// The returned guard must be held for the entire duration you want the peer ID
+/// to be active. When the guard is dropped, the span exits.
+#[must_use = "Span guard must be held for the duration of the operation"]
+pub fn with_peer_id(peer_id: impl Into<String>) -> impl Drop {
     let peer_id = peer_id.into();
-    tracing::info_span!("test_peer", test_node = %peer_id)
+    tracing::info_span!("test_peer", test_node = %peer_id).entered()
 }
 
 /// Execute a function with tracing enabled.
@@ -107,16 +110,10 @@ pub enum LogFormat {
 /// - JSON output support
 /// - Per-test configuration
 /// - Log capturing for inspection
-/// - Automatic peer identification
 ///
 /// # Peer Identification
 ///
-/// When using `with_peer_id()`, the peer ID is set as a span that wraps all logs.
-/// - **Pretty format**: Span context is visible in the output
-/// - **JSON format**: Use `with_span_list(true)` to see spans, or use `with_peer_id()`
-///   from separate async blocks to distinguish different peers
-///
-/// For multi-peer tests, you can also use `with_peer_id()` function in each async block:
+/// For multi-peer tests, use the `with_peer_id()` function in each async block:
 /// ```ignore
 /// let gateway = async {
 ///     let _span = with_peer_id("gateway");
@@ -145,11 +142,9 @@ pub enum LogFormat {
 pub struct TestLogger {
     format: LogFormat,
     level: String,
-    peer_id: Option<String>,
     capture: bool,
     captured_logs: Arc<Mutex<Vec<String>>>,
     _guard: Option<tracing::subscriber::DefaultGuard>,
-    _span: Option<tracing::span::EnteredSpan>,
 }
 
 impl TestLogger {
@@ -164,11 +159,9 @@ impl TestLogger {
         Self {
             format: LogFormat::Pretty,
             level: "info".to_string(),
-            peer_id: None,
             capture: false,
             captured_logs: Arc::new(Mutex::new(Vec::new())),
             _guard: None,
-            _span: None,
         }
     }
 
@@ -192,19 +185,6 @@ impl TestLogger {
     /// ```
     pub fn with_level(mut self, level: impl Into<String>) -> Self {
         self.level = level.into();
-        self
-    }
-
-    /// Set a peer identifier that will be included in all logs.
-    ///
-    /// This adds a `test_node` field to all log messages.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let logger = TestLogger::new().with_peer_id("gateway");
-    /// ```
-    pub fn with_peer_id(mut self, peer_id: impl Into<String>) -> Self {
-        self.peer_id = Some(peer_id.into());
         self
     }
 
@@ -235,11 +215,13 @@ impl TestLogger {
     /// // Logger is active while _logger is in scope
     /// ```
     pub fn init(mut self) -> Self {
-        use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+        use tracing_subscriber::{
+            fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+        };
 
         // Create env filter from level
-        let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&self.level));
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.level));
 
         // Build the appropriate layer based on format
         // Note: Span fields are automatically included in logs within those spans
@@ -252,10 +234,7 @@ impl TestLogger {
                         .pretty()
                         .boxed()
                 } else {
-                    fmt::layer()
-                        .with_test_writer()
-                        .pretty()
-                        .boxed()
+                    fmt::layer().with_test_writer().pretty().boxed()
                 }
             }
             LogFormat::Json => {
@@ -278,18 +257,10 @@ impl TestLogger {
             }
         };
 
-        let subscriber = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(layer);
+        let subscriber = tracing_subscriber::registry().with(env_filter).with(layer);
 
         // Set as default subscriber
         self._guard = Some(subscriber.set_default());
-
-        // Create peer ID span if provided
-        if let Some(peer_id) = &self.peer_id {
-            let span = tracing::info_span!("test_peer", test_node = %peer_id);
-            self._span = Some(span.entered());
-        }
 
         self
     }
@@ -327,10 +298,7 @@ impl TestLogger {
     /// # Panics
     /// Panics if log capturing was not enabled with `capture_logs()`.
     pub fn logs_matching(&self, filter: impl Fn(&str) -> bool) -> Vec<String> {
-        self.logs()
-            .into_iter()
-            .filter(|log| filter(log))
-            .collect()
+        self.logs().into_iter().filter(|log| filter(log)).collect()
     }
 
     /// Get the number of captured log entries.
@@ -792,10 +760,7 @@ mod test {
 
     #[test]
     fn test_logger_basic() {
-        let _logger = TestLogger::new()
-            .with_pretty()
-            .with_level("info")
-            .init();
+        let _logger = TestLogger::new().with_pretty().with_level("info").init();
 
         tracing::info!("Test log message");
         tracing::warn!("Test warning");
@@ -803,10 +768,7 @@ mod test {
 
     #[test]
     fn test_logger_json() {
-        let _logger = TestLogger::new()
-            .with_json()
-            .with_level("debug")
-            .init();
+        let _logger = TestLogger::new().with_json().with_level("debug").init();
 
         tracing::info!("JSON formatted message");
         tracing::debug!("Debug message");
@@ -814,20 +776,16 @@ mod test {
 
     #[test]
     fn test_logger_with_peer_id() {
-        let _logger = TestLogger::new()
-            .with_peer_id("test-peer")
-            .with_level("info")
-            .init();
+        let _logger = TestLogger::new().with_level("info").init();
+
+        let _span = with_peer_id("test-peer");
 
         tracing::info!("Message with peer ID");
     }
 
     #[test]
     fn test_logger_capture() {
-        let logger = TestLogger::new()
-            .capture_logs()
-            .with_level("info")
-            .init();
+        let logger = TestLogger::new().capture_logs().with_level("info").init();
 
         tracing::info!("Captured message 1");
         tracing::warn!("Captured message 2");
@@ -838,7 +796,11 @@ mod test {
         assert!(logger.contains("Captured message 2"));
         assert!(logger.contains("Captured message 3"));
         // Pretty format produces multiple lines per log entry, so we check >= 3
-        assert!(logger.log_count() >= 3, "Expected at least 3 log entries, got {}", logger.log_count());
+        assert!(
+            logger.log_count() >= 3,
+            "Expected at least 3 log entries, got {}",
+            logger.log_count()
+        );
     }
 
     #[test]
@@ -856,11 +818,9 @@ mod test {
 
     #[tokio::test]
     async fn test_logger_async() {
-        let _logger = TestLogger::new()
-            .with_json()
-            .with_peer_id("async-peer")
-            .with_level("debug")
-            .init();
+        let _logger = TestLogger::new().with_json().with_level("debug").init();
+
+        let _span = with_peer_id("async-peer");
 
         tracing::info!("Async test message");
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -892,7 +852,9 @@ mod test {
 
         // The JSON should have spans array with test_node field
         let json_str = logs.join("\n");
-        assert!(json_str.contains("test_peer") || json_str.contains("gateway"),
-                "Should contain span information");
+        assert!(
+            json_str.contains("test_peer") || json_str.contains("gateway"),
+            "Should contain span information"
+        );
     }
 }
