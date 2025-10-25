@@ -6,7 +6,7 @@ use freenet::{
     server::serve_gateway,
     test_utils::{
         self, load_delegate, make_get, make_put, make_subscribe, make_update,
-        verify_contract_exists,
+        verify_contract_exists, with_peer_id,
     },
 };
 use freenet_stdlib::{
@@ -128,9 +128,12 @@ async fn get_contract(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// Test PUT operation across two peers (gateway and peer)
+///
+/// Uses test_log to only show logs on failure, and with_peer_id to distinguish peer logs.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_put_contract() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+    // test_log automatically sets up logging
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
@@ -170,11 +173,14 @@ async fn test_put_contract() -> TestResult {
 
     std::mem::drop(ws_api_port_socket_a); // Free the port so it does not fail on initialization
     let node_a = async move {
+        let _span = with_peer_id("peer-a");
+        tracing::info!("Starting peer A node");
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Peer A node running");
         node.run().await
     }
     .boxed_local();
@@ -182,11 +188,14 @@ async fn test_put_contract() -> TestResult {
     std::mem::drop(network_socket_b); // Free the port so it does not fail on initialization
     std::mem::drop(ws_api_port_socket_b);
     let node_b = async {
+        let _span = with_peer_id("gateway");
+        tracing::info!("Starting gateway node");
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Gateway node running");
         node.run().await
     }
     .boxed_local();
