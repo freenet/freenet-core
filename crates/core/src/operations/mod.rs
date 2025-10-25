@@ -106,10 +106,29 @@ where
             return_msg: None,
             state: Some(final_state),
         }) if final_state.finalized() => {
-            // operation finished_completely with result
-            tracing::debug!(%tx_id, "operation finished_completely with result");
-            op_manager.completed(tx_id);
-            return Ok(Some(final_state));
+            // Check if operation has pending sub-operations
+            if op_manager.all_sub_operations_completed(tx_id) {
+                // All sub-operations done, finalize immediately
+                tracing::debug!(%tx_id, "operation finished_completely with all sub-operations complete");
+                op_manager.completed(tx_id);
+                return Ok(Some(final_state));
+            } else {
+                // Parent reached finished state but children still pending
+                tracing::warn!(
+                    %tx_id,
+                    "Parent operation finished but DEFERRING completion - awaiting sub-operation(s) to complete"
+                );
+
+                // Store in pending_finalization map (move final_state)
+                op_manager.pending_finalization.insert(tx_id, final_state);
+
+                // Don't send response to client yet - atomicity guarantee
+                tracing::info!(
+                    %tx_id,
+                    "Response to client DEFERRED until all sub-operations complete"
+                );
+                return Ok(None);
+            }
         }
         Ok(OperationResult {
             return_msg: Some(msg),
@@ -319,14 +338,55 @@ impl<T> From<SendError<T>> for OpError {
     }
 }
 
-/// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
-async fn start_subscription_request(op_manager: &OpManager, key: ContractKey) {
-    // Always try to subscribe, even if we're at optimal location
-    // The k_closest_potentially_caching logic in subscribe::request_subscribe
-    // will find alternative peers if needed
-    let sub_op = subscribe::start_op(key);
-    if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
-        tracing::warn!(%error, "Error subscribing to contract");
+/// Start a subscription request as a sub-operation of a parent transaction.
+/// This version registers the sub-operation relationship for atomicity tracking.
+/// Returns the child transaction ID on success, or error on failure.
+async fn start_subscription_request(
+    op_manager: &OpManager,
+    parent_tx: Transaction,
+    key: ContractKey,
+) -> Result<Transaction, OpError> {
+    // Create child transaction linked to parent
+    let child_tx = Transaction::new_child_of::<subscribe::SubscribeMsg>(&parent_tx);
+
+    // Register parent-child relationship
+    op_manager.register_sub_operation(parent_tx, child_tx);
+
+    tracing::info!(
+        parent_tx = %parent_tx,
+        child_tx = %child_tx,
+        %key,
+        "Registered SUBSCRIBE as sub-operation of PUT/GET"
+    );
+
+    // Create subscription operation with child transaction
+    let sub_op = subscribe::start_op_with_id(key, child_tx);
+
+    // Execute subscription
+    match subscribe::request_subscribe(op_manager, sub_op).await {
+        Ok(_) => {
+            tracing::debug!(
+                parent_tx = %parent_tx,
+                child_tx = %child_tx,
+                "Subscription sub-operation initiated successfully"
+            );
+            Ok(child_tx)
+        }
+        Err(error) => {
+            tracing::error!(
+                parent_tx = %parent_tx,
+                child_tx = %child_tx,
+                error = %error,
+                "Subscription sub-operation failed"
+            );
+
+            // Propagate failure to parent
+            let error_msg = format!("{}", error);
+            op_manager
+                .sub_operation_failed(child_tx, &error_msg)
+                .await?;
+            Err(error)
+        }
     }
 }
 

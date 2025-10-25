@@ -991,7 +991,8 @@ impl Operation for GetOp {
                                     let mut new_skip_list = skip_list.clone();
                                     new_skip_list.insert(sender.peer.clone());
 
-                                    super::start_subscription_request(op_manager, key).await;
+                                    let _ = super::start_subscription_request(op_manager, id, key)
+                                        .await;
                                 }
                             }
                             ContractHandlerEvent::PutResponse {

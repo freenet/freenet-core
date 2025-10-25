@@ -376,7 +376,7 @@ impl Operation for PutOp {
                             skip_list.insert(target.peer.clone());
                         }
 
-                        super::start_subscription_request(op_manager, key).await;
+                        let _ = super::start_subscription_request(op_manager, *id, key).await;
                         op_manager.ring.seed_contract(key);
 
                         true
@@ -583,10 +583,9 @@ impl Operation for PutOp {
                                     peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
                                     "Starting subscription request"
                                 );
-                                // TODO: Make put operation atomic by linking it to the completion of this subscription request.
-                                // Currently we can't link one transaction to another transaction's result, which would be needed
-                                // to make this fully atomic. This should be addressed in a future refactoring.
-                                super::start_subscription_request(op_manager, key).await;
+                                // Phase 2: Enforce atomicity by propagating errors
+                                // If subscription fails, the PUT operation will fail atomically
+                                super::start_subscription_request(op_manager, *id, key).await?;
                             }
 
                             tracing::info!(
@@ -703,7 +702,7 @@ impl Operation for PutOp {
 
                         // Start subscription and handle dropped contracts
                         let (dropped_contract, old_subscribers) = {
-                            super::start_subscription_request(op_manager, key).await;
+                            let _ = super::start_subscription_request(op_manager, *id, key).await;
                             op_manager.ring.seed_contract(key)
                         };
 

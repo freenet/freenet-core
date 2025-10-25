@@ -8,7 +8,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
@@ -77,6 +77,12 @@ pub(crate) struct OpManager {
     pub peer_ready: Arc<AtomicBool>,
     /// Whether this node is a gateway
     pub is_gateway: bool,
+    /// Maps parent transaction to set of child transactions for sub-operation tracking
+    sub_operations: Arc<DashMap<Transaction, HashSet<Transaction>>>,
+    /// Operations that reached Finished state but have pending children
+    pub(crate) pending_finalization: Arc<DashMap<Transaction, OpEnum>>,
+    /// Reverse index: child -> parent (for O(1) parent lookup)
+    parent_of: Arc<DashMap<Transaction, Transaction>>,
 }
 
 impl OpManager {
@@ -135,6 +141,9 @@ impl OpManager {
             result_router_tx,
             peer_ready,
             is_gateway,
+            sub_operations: Arc::new(DashMap::new()),
+            pending_finalization: Arc::new(DashMap::new()),
+            parent_of: Arc::new(DashMap::new()),
         })
     }
 
@@ -307,6 +316,112 @@ impl OpManager {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.under_progress.remove(&id);
         self.ops.completed.insert(id);
+
+        // Check if this is a sub-operation that can trigger parent finalization
+        if let Some(parent_entry) = self.parent_of.get(&id) {
+            let parent_tx = *parent_entry;
+
+            tracing::debug!(
+                child_tx = %id,
+                parent_tx = %parent_tx,
+                "Sub-operation completed, checking if parent can finalize"
+            );
+
+            // Check if ALL siblings are now complete
+            if self.all_sub_operations_completed(parent_tx) {
+                // All siblings completed, check if parent is pending finalization
+                if let Some((_key, parent_op)) = self.pending_finalization.remove(&parent_tx) {
+                    tracing::warn!(
+                        parent_tx = %parent_tx,
+                        child_tx = %id,
+                        "ALL sub-operations completed - FINALIZING parent and sending response to client"
+                    );
+
+                    // Send result to client via result router
+                    let host_result = parent_op.to_host_result();
+                    if let Err(e) = self.result_router_tx.try_send((parent_tx, host_result)) {
+                        tracing::error!(
+                            parent_tx = %parent_tx,
+                            error = %e,
+                            "Failed to send parent result to client after sub-operation completion"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        parent_tx = %parent_tx,
+                        "All sub-ops complete but parent already finalized (not deferred)"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    parent_tx = %parent_tx,
+                    child_tx = %id,
+                    "Sub-op completed but parent still waiting for other sub-operations"
+                );
+            }
+        }
+    }
+
+    /// Register a sub-operation relationship between parent and child transactions.
+    pub fn register_sub_operation(&self, parent: Transaction, child: Transaction) {
+        self.sub_operations
+            .entry(parent)
+            .or_insert_with(HashSet::new)
+            .insert(child);
+
+        self.parent_of.insert(child, parent);
+
+        tracing::debug!(
+            parent_tx = %parent,
+            child_tx = %child,
+            "Registered sub-operation"
+        );
+    }
+
+    /// Check if all sub-operations of a parent have completed.
+    pub fn all_sub_operations_completed(&self, parent: Transaction) -> bool {
+        match self.sub_operations.get(&parent) {
+            None => true, // No sub-operations
+            Some(children) => children
+                .iter()
+                .all(|child| self.ops.completed.contains(child)),
+        }
+    }
+
+    /// Handle sub-operation failure - propagate error to parent.
+    pub async fn sub_operation_failed(
+        &self,
+        child: Transaction,
+        error_msg: &str,
+    ) -> Result<(), OpError> {
+        tracing::error!(
+            child_tx = %child,
+            error = %error_msg,
+            "Sub-operation failed, propagating to parent"
+        );
+
+        if let Some(parent_entry) = self.parent_of.get(&child) {
+            let parent_tx = *parent_entry;
+
+            self.completed(parent_tx);
+
+            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: format!("Sub-operation {} failed: {}", child, error_msg).into(),
+            }
+            .into());
+
+            self.result_router_tx
+                .send((parent_tx, error_result))
+                .await
+                .map_err(|_| OpError::NotificationError)?;
+
+            tracing::info!(
+                parent_tx = %parent_tx,
+                child_tx = %child,
+                "Parent operation marked as failed due to child failure"
+            );
+        }
+        Ok(())
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
