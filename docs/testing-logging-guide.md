@@ -115,6 +115,8 @@ RUST_LOG=info,freenet::node=debug,freenet::operations::get=trace cargo test
 
 When running multi-peer tests, it's critical to distinguish which logs come from which peer.
 
+**Important:** The test helper uses the field name `test_node` to avoid conflicts with the production code's `peer` field (which contains the actual cryptographic PeerId).
+
 #### Method 1: Using `with_peer_id()` (Recommended)
 
 ```rust
@@ -124,7 +126,7 @@ async fn start_gateway(config: Config) -> Result<()> {
     let _span = with_peer_id("gateway");
     tracing::info!("Initializing gateway");
     tracing::debug!("Gateway config: {:?}", config);
-    // All logs in this scope will have peer_id="gateway"
+    // All logs in this scope will have test_node="gateway"
     Ok(())
 }
 
@@ -132,7 +134,7 @@ async fn start_peer(id: usize, config: Config) -> Result<()> {
     let _span = with_peer_id(format!("peer-{}", id));
     tracing::info!("Initializing peer");
     tracing::debug!("Peer config: {:?}", config);
-    // All logs in this scope will have peer_id="peer-N"
+    // All logs in this scope will have test_node="peer-N"
     Ok(())
 }
 
@@ -151,15 +153,23 @@ async fn test_network() -> TestResult {
 }
 ```
 
-#### Method 2: Manual Logging with Peer ID
+**Understanding the log fields:**
+- `test_node="gateway"` - Human-readable test label (from `with_peer_id()`)
+- `peer=PeerId(...)` - Actual cryptographic peer ID (from production code)
 
-For more granular control, include the peer ID in individual log statements:
+These fields complement each other in logs - you'll often see both!
+
+#### Method 2: Manual Logging with Test Node Label
+
+For more granular control, include the test node label in individual log statements:
 
 ```rust
-let peer_id = "gateway";
-tracing::info!(peer_id = %peer_id, "Starting node");
-tracing::debug!(peer_id = %peer_id, "Connecting to peers");
+let test_node = "gateway";
+tracing::info!(test_node = %test_node, "Starting node");
+tracing::debug!(test_node = %test_node, "Connecting to peers");
 ```
+
+**Note:** Don't use `peer_id` or `peer` in test code manually - these conflict with production logging fields.
 
 ### 3. JSON Logging for Structured Output
 
@@ -182,7 +192,8 @@ RUST_LOG=debug FREENET_LOG_FORMAT=json cargo test
   "target": "freenet::node",
   "fields": {
     "message": "Starting gateway",
-    "peer_id": "gateway"
+    "test_node": "gateway",
+    "peer": "PeerId(abc123...)"
   },
   "file": "src/node/mod.rs",
   "line": 123

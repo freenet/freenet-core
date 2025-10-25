@@ -18,25 +18,28 @@ use crate::util::workspace::get_workspace_target_dir;
 
 /// Set the peer identifier for the current thread's tracing context.
 ///
-/// This adds a `peer_id` field to all log messages from this thread, making it
+/// This adds a `test_node` field to all log messages from this thread, making it
 /// easier to distinguish logs from different peers in multi-peer tests.
 ///
 /// # Example
 /// ```ignore
 /// set_peer_id("gateway");
-/// tracing::info!("Starting gateway");  // Will include peer_id="gateway"
+/// tracing::info!("Starting gateway");  // Will include test_node="gateway"
 ///
 /// set_peer_id("peer-1");
-/// tracing::info!("Starting peer 1");   // Will include peer_id="peer-1"
+/// tracing::info!("Starting peer 1");   // Will include test_node="peer-1"
 /// ```
 ///
 /// # Note
 /// This should be called at the start of each peer's initialization in tests.
 /// When using `#[test_log::test]`, the test framework will automatically
 /// configure tracing to show these fields.
+///
+/// The field name `test_node` is used to avoid conflicts with the production
+/// `peer` field which contains the actual cryptographic PeerId.
 pub fn set_peer_id(peer_id: impl Into<String>) {
     let peer_id = peer_id.into();
-    tracing::Span::current().record("peer_id", &peer_id.as_str());
+    tracing::Span::current().record("test_node", &peer_id.as_str());
 }
 
 /// Create a span with a peer identifier that will be included in all logs
@@ -46,20 +49,24 @@ pub fn set_peer_id(peer_id: impl Into<String>) {
 /// ```ignore
 /// async fn start_gateway() {
 ///     let _span = with_peer_id("gateway");
-///     tracing::info!("Starting gateway");  // Will include peer_id="gateway"
+///     tracing::info!("Starting gateway");  // Will include test_node="gateway"
 ///     // ... gateway initialization
 /// }
 ///
 /// async fn start_peer(id: usize) {
 ///     let _span = with_peer_id(format!("peer-{}", id));
-///     tracing::info!("Starting peer");  // Will include peer_id="peer-N"
+///     tracing::info!("Starting peer");  // Will include test_node="peer-N"
 ///     // ... peer initialization
 /// }
 /// ```
+///
+/// # Note
+/// The field name `test_node` is used to avoid conflicts with the production
+/// `peer` field which contains the actual cryptographic PeerId.
 #[must_use = "Span must be held for the duration of the operation"]
 pub fn with_peer_id(peer_id: impl Into<String>) -> tracing::Span {
     let peer_id = peer_id.into();
-    tracing::info_span!("peer", peer_id = %peer_id)
+    tracing::info_span!("test_peer", test_node = %peer_id)
 }
 
 /// Execute a function with tracing enabled.
