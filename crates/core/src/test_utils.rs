@@ -16,6 +16,64 @@ use serde::{Deserialize, Serialize};
 
 use crate::util::workspace::get_workspace_target_dir;
 
+/// Set the peer identifier for the current thread's tracing context.
+///
+/// This adds a `peer_id` field to all log messages from this thread, making it
+/// easier to distinguish logs from different peers in multi-peer tests.
+///
+/// # Example
+/// ```ignore
+/// set_peer_id("gateway");
+/// tracing::info!("Starting gateway");  // Will include peer_id="gateway"
+///
+/// set_peer_id("peer-1");
+/// tracing::info!("Starting peer 1");   // Will include peer_id="peer-1"
+/// ```
+///
+/// # Note
+/// This should be called at the start of each peer's initialization in tests.
+/// When using `#[test_log::test]`, the test framework will automatically
+/// configure tracing to show these fields.
+pub fn set_peer_id(peer_id: impl Into<String>) {
+    let peer_id = peer_id.into();
+    tracing::Span::current().record("peer_id", &peer_id.as_str());
+}
+
+/// Create a span with a peer identifier that will be included in all logs
+/// within the span.
+///
+/// # Example
+/// ```ignore
+/// async fn start_gateway() {
+///     let _span = with_peer_id("gateway");
+///     tracing::info!("Starting gateway");  // Will include peer_id="gateway"
+///     // ... gateway initialization
+/// }
+///
+/// async fn start_peer(id: usize) {
+///     let _span = with_peer_id(format!("peer-{}", id));
+///     tracing::info!("Starting peer");  // Will include peer_id="peer-N"
+///     // ... peer initialization
+/// }
+/// ```
+#[must_use = "Span must be held for the duration of the operation"]
+pub fn with_peer_id(peer_id: impl Into<String>) -> tracing::Span {
+    let peer_id = peer_id.into();
+    tracing::info_span!("peer", peer_id = %peer_id)
+}
+
+/// Execute a function with tracing enabled.
+///
+/// This function is now deprecated in favor of using the `#[test_log::test]` macro
+/// which provides better integration with test frameworks and only shows logs for
+/// failing tests.
+///
+/// # Deprecated
+/// Use `#[test_log::test]` or `#[test_log::test(tokio::test)]` instead.
+#[deprecated(
+    since = "0.1.0",
+    note = "Use #[test_log::test] or #[test_log::test(tokio::test)] instead"
+)]
 pub fn with_tracing<T>(f: impl FnOnce() -> T) -> T {
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

@@ -90,9 +90,13 @@ async fn create_test_node_config(
 /// hanging indefinitely.
 ///
 /// Fixes: #1858
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+///
+/// Note: Uses #[test_log::test] to only show logs when the test fails.
+/// Set RUST_LOG environment variable to control log levels (default: info).
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_get_error_notification() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::INFO), None);
+    // test_log::test automatically sets up logging to only show on failure
+    // No need to call set_logger() manually
 
     // Start a single isolated node (no peers)
     let ws_port = 50900;

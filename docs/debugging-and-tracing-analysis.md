@@ -4,6 +4,8 @@
 **Branch:** claude/improve-debugging-tracing-011CUTwcrjFqfCbsTzxDYdwo
 **Purpose:** Comprehensive analysis of debugging, tracing, and testing capabilities in Freenet Core
 
+> **📚 Quick Start:** See [Testing and Logging Guide](testing-logging-guide.md) for practical usage examples
+
 ## Table of Contents
 
 1. [Executive Summary](#executive-summary)
@@ -1298,17 +1300,102 @@ By implementing the recommendations in this document, we can significantly impro
 - **Distributed tracing**: OpenTelemetry re-enabled, Jaeger integration working
 - **Developer onboarding**: New developers can debug issues in <1 week
 
+### Improvements Already Implemented
+
+The following improvements have been implemented on this branch:
+
+#### 1. Test-Log Integration (Phase 1: Quick Wins - Completed)
+
+**Changes:**
+- Updated `crates/core/src/test_utils.rs` to deprecate the old `with_tracing()` function
+- Added documentation and examples for using `#[test_log::test]` macro
+- Updated `crates/core/tests/error_notification.rs` as a reference example
+- Tests now only show logs when they fail (cleaner output)
+
+**Benefits:**
+- ✅ Cleaner test output - only failing tests show logs
+- ✅ Better test runner integration
+- ✅ Respects `RUST_LOG` environment variable
+- ✅ Works with both sync and async tests
+
+**Usage:**
+```rust
+#[test_log::test(tokio::test)]
+async fn my_test() -> TestResult {
+    // Logs only shown if test fails
+    tracing::info!("Test started");
+    Ok(())
+}
+```
+
+#### 2. Peer Identification in Logs (Phase 1: Quick Wins - Completed)
+
+**Changes:**
+- Added `with_peer_id()` function to `crates/core/src/test_utils.rs`
+- Provides easy peer identification in multi-peer tests
+- All logs within a span include the `peer_id` field
+
+**Benefits:**
+- ✅ Easy to distinguish logs from different peers
+- ✅ Works with both pretty and JSON log formats
+- ✅ Simple API with span-based scoping
+- ✅ Automatic cleanup when span drops
+
+**Usage:**
+```rust
+let _span = with_peer_id("gateway");
+tracing::info!("Starting");  // Includes peer_id="gateway"
+```
+
+#### 3. JSON Logging Support (Phase 1: Quick Wins - Completed)
+
+**Changes:**
+- Merged JSON logging implementation from `fix/network-event-loop-waker-registration` branch
+- Updated `crates/core/src/tracing/mod.rs` to support `FREENET_LOG_FORMAT=json`
+- Works in both production and test environments
+
+**Benefits:**
+- ✅ Structured logs for CI/CD parsing
+- ✅ Better integration with log aggregation tools
+- ✅ Preserves field types (numbers, booleans)
+- ✅ Easy to filter and analyze
+
+**Usage:**
+```bash
+FREENET_LOG_FORMAT=json cargo test
+```
+
+#### 4. Comprehensive Testing Logging Guide (Phase 2: Documentation - Completed)
+
+**Changes:**
+- Created `docs/testing-logging-guide.md` with:
+  - Quick start examples
+  - Detailed usage instructions
+  - Best practices and common patterns
+  - Troubleshooting guide
+  - Migration guide for existing tests
+
+**Benefits:**
+- ✅ Clear documentation for developers
+- ✅ Examples for all common scenarios
+- ✅ Reduces onboarding time
+- ✅ Establishes testing standards
+
+**See:** [Testing and Logging Guide](testing-logging-guide.md)
+
 ### Next Steps
 
-1. Review this analysis with the team
-2. Prioritize recommendations based on team needs
-3. Create GitHub issues for each improvement
-4. Assign owners and timelines
-5. Track progress in project board
+1. ✅ ~~Review this analysis with the team~~ (Analysis complete)
+2. ✅ ~~Implement Phase 1 quick wins~~ (Completed)
+3. **Migrate existing tests** to use `#[test_log::test]` and peer identification
+4. **Continue with Phase 2**: API documentation (OpenAPI/Swagger)
+5. **Continue with Phase 3**: Observability (Prometheus, Distributed Tracing)
+6. Create GitHub issues for remaining improvements
+7. Track progress in project board
 
 ---
 
-**Document Version:** 1.0
+**Document Version:** 1.1
 **Last Updated:** October 25, 2025
 **Authors:** Claude (AI Assistant)
-**Review Status:** Pending team review
+**Review Status:** Phase 1 improvements implemented, pending team review
