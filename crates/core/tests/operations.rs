@@ -1455,6 +1455,15 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
                 assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
                 put_response_received = true;
             }
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed: _,
+            }))) => {
+                bail!(
+                    "Client 1: Received unexpected SubscribeResponse for contract {key} - \
+                         sub-operations should not send client notifications"
+                );
+            }
             Ok(Ok(other)) => {
                 tracing::debug!(
                     "Client 1: Received non-PUT response while waiting for PUT: {:?}",

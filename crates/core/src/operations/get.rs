@@ -1025,7 +1025,9 @@ impl Operation for GetOp {
                                     if !is_subscribed_contract {
                                         tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                         op_manager.ring.seed_contract(key);
-                                        super::start_subscription_request(op_manager, key).await;
+                                        let child_tx =
+                                            super::start_subscription_request(op_manager, id, key)
+                                                .await;
                                     }
                                 }
                                 ContractHandlerEvent::PutResponse {

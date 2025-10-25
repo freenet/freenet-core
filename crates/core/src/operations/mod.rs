@@ -106,10 +106,45 @@ where
             return_msg: None,
             state: Some(final_state),
         }) if final_state.finalized() => {
-            // operation finished_completely with result
-            tracing::debug!(%tx_id, "operation finished_completely with result");
-            op_manager.completed(tx_id);
-            return Ok(Some(final_state));
+            if op_manager.failed_parents.remove(&tx_id).is_some() {
+                tracing::warn!(
+                    "Operation {} reached finalized state after a sub-operation failure; dropping client response",
+                    tx_id
+                );
+                op_manager.completed(tx_id);
+                return Ok(None);
+            }
+            // Check if operation has pending sub-operations
+            if op_manager.all_sub_operations_completed(tx_id) {
+                // All sub-operations done, finalize immediately
+                tracing::info!(
+                    ">>> OPERATION COMPLETE | tx={} type={:?} | All sub-operations finished (if any)",
+                    tx_id,
+                    tx_id.transaction_type()
+                );
+                op_manager.completed(tx_id);
+                return Ok(Some(final_state));
+            } else {
+                // Parent reached finished state but children still pending
+                let pending_count = op_manager.count_pending_sub_operations(tx_id);
+                tracing::warn!(
+                    ">>> WAITING FOR SUB-OPS | parent={} type={:?} | Pending: {} sub-operation(s) | CLIENT RESPONSE BLOCKED",
+                    tx_id,
+                    tx_id.transaction_type(),
+                    pending_count
+                );
+
+                // Store in pending_finalization map (move final_state)
+                op_manager.pending_finalization.insert(tx_id, final_state);
+
+                tracing::warn!(
+                    ">>> CLIENT RESPONSE DEFERRED | tx={} | Operation in pending_finalization, will complete when sub-ops finish",
+                    tx_id
+                );
+
+                // Don't send response to client yet - atomicity guarantee
+                return Ok(None);
+            }
         }
         Ok(OperationResult {
             return_msg: Some(msg),
@@ -332,15 +367,90 @@ impl<T> From<SendError<T>> for OpError {
     }
 }
 
-/// If the contract is not found, it will try to get it first if the `try_get` parameter is set.
-async fn start_subscription_request(op_manager: &OpManager, key: ContractKey) {
-    // Always try to subscribe, even if we're at optimal location
-    // The k_closest_potentially_caching logic in subscribe::request_subscribe
-    // will find alternative peers if needed
-    let sub_op = subscribe::start_op(key);
-    if let Err(error) = subscribe::request_subscribe(op_manager, sub_op).await {
-        tracing::warn!(%error, "Error subscribing to contract");
+/// Start a subscription request as a sub-operation of a parent transaction.
+/// This version registers the sub-operation relationship for atomicity tracking and
+/// spawns the subscription task in the background to prevent race conditions.
+/// Returns the child transaction ID immediately.
+fn start_subscription_request(
+    op_manager: &OpManager,
+    parent_tx: Transaction,
+    key: ContractKey,
+) -> Transaction {
+    // CRITICAL: Register expected sub-operation BEFORE creating child to prevent race condition
+    // where child completes before parent reaches finalized state
+    op_manager.expect_sub_operation(parent_tx);
+
+    // Create child transaction linked to parent
+    let child_tx = Transaction::new_child_of::<subscribe::SubscribeMsg>(&parent_tx);
+
+    // Register parent-child relationship
+    op_manager.register_sub_operation(parent_tx, child_tx);
+
+    tracing::warn!(
+        ">>> SUB-OP CREATED | parent={} ({:?}) → child={} (SUBSCRIBE) | contract={} | parent_of registered",
+        parent_tx,
+        parent_tx.transaction_type(),
+        child_tx,
+        key
+    );
+
+    // Verify registration immediately
+    if op_manager.is_sub_operation(child_tx) {
+        tracing::debug!("✓ parent_of mapping verified for child={}", child_tx);
+    } else {
+        tracing::error!(
+            "✗ parent_of mapping MISSING immediately after registration for child={}",
+            child_tx
+        );
     }
+
+    // Clone op_manager for background task (all fields are Arc, so this is cheap)
+    let op_manager_cloned = op_manager.clone();
+
+    // Spawn subscription task in background to allow parent to proceed to finalization
+    tokio::spawn(async move {
+        // Yield to allow parent operation to reach finalized state before child completes
+        // This prevents race condition where child completes before parent enters pending_finalization
+        tokio::task::yield_now().await;
+
+        // Create subscription operation with child transaction
+        let sub_op = subscribe::start_op_with_id(key, child_tx);
+
+        // Execute subscription
+        match subscribe::request_subscribe(&op_manager_cloned, sub_op).await {
+            Ok(_) => {
+                tracing::debug!(
+                    child_tx = %child_tx,
+                    parent_tx = %parent_tx,
+                    "subscription sub-operation completed successfully"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    parent_tx = %parent_tx,
+                    child_tx = %child_tx,
+                    error = %error,
+                    "subscription sub-operation failed"
+                );
+
+                // Propagate failure to parent
+                let error_msg = format!("{}", error);
+                if let Err(e) = op_manager_cloned
+                    .sub_operation_failed(child_tx, &error_msg)
+                    .await
+                {
+                    tracing::error!(
+                        parent_tx = %parent_tx,
+                        child_tx = %child_tx,
+                        error = %e,
+                        "failed to propagate sub-operation failure to parent"
+                    );
+                }
+            }
+        }
+    });
+
+    child_tx
 }
 
 async fn has_contract(op_manager: &OpManager, key: ContractKey) -> Result<bool, OpError> {
