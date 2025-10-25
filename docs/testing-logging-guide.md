@@ -173,17 +173,72 @@ tracing::debug!(test_node = %test_node, "Connecting to peers");
 
 ### 3. JSON Logging for Structured Output
 
-For better parsing and analysis, especially in CI/CD, use JSON logging:
+**⚠️ Important Limitation:** `test-log` does **NOT** support JSON output format.
+
+When using `#[test_log::test]`, logs will always be in pretty-printed format regardless of `FREENET_LOG_FORMAT` setting. This is because `test-log` sets up its own tracing subscriber before our code runs.
+
+**Why this happens:**
+- `test-log` initializes tracing with a basic pretty-format subscriber
+- Our `init_tracer()` function (which checks `FREENET_LOG_FORMAT`) never runs
+- The environment variable is simply ignored in tests
+
+#### For Production Code (JSON works)
 
 ```bash
-# Run tests with JSON formatted logs
-FREENET_LOG_FORMAT=json cargo test
+# JSON logging works in production
+FREENET_LOG_FORMAT=json cargo run
 
-# Combine with specific log levels
-RUST_LOG=debug FREENET_LOG_FORMAT=json cargo test
+# This produces proper JSON output
+{"timestamp":"2025-10-25T12:34:56.789Z","level":"INFO",...}
 ```
 
-**JSON Log Format:**
+#### For Tests (JSON doesn't work with test-log)
+
+```bash
+# This will NOT produce JSON (still pretty format)
+FREENET_LOG_FORMAT=json cargo test
+
+# Output will still be:
+# [INFO  freenet::node] Starting gateway
+```
+
+#### Workarounds for JSON in Tests
+
+**Option 1: Accept Pretty Format (Recommended)**
+- Pretty format is actually better for human debugging
+- Test logs are for developers, not log aggregation systems
+- The `test_node` field still provides clear identification
+
+**Option 2: Skip test-log for Specific Tests**
+```rust
+// Don't use #[test_log::test] for tests that need JSON
+#[tokio::test]
+async fn test_with_json_output() -> TestResult {
+    // Manually initialize logging with JSON
+    std::env::set_var("FREENET_LOG_FORMAT", "json");
+    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+
+    // Now logs will be JSON
+    // NOTE: Logs will ALWAYS show (even if test passes)
+    Ok(())
+}
+```
+
+**Option 3: Use CI with Different Configuration**
+```yaml
+# .github/workflows/ci.yml
+- name: Run tests with verbose logging for CI analysis
+  env:
+    RUST_LOG: debug
+  run: |
+    # Don't rely on JSON in tests
+    # Instead, parse pretty format or capture to files
+    cargo test --workspace 2>&1 | tee test-output.log
+```
+
+#### Production JSON Format (for reference)
+
+In production (not tests), JSON logging works properly:
 
 ```json
 {
@@ -370,27 +425,7 @@ async fn test_multi_peer_put_operation() -> TestResult {
 }
 ```
 
-### Pattern 2: Testing with JSON Logs in CI
-
-```yaml
-# .github/workflows/ci.yml
-- name: Run tests with JSON logging
-  env:
-    RUST_LOG: debug
-    FREENET_LOG_FORMAT: json
-  run: cargo test --workspace 2>&1 | tee test-output.json
-
-- name: Parse test logs
-  run: |
-    jq 'select(.level == "ERROR")' test-output.json > errors.json
-    if [ -s errors.json ]; then
-      echo "Errors found in test run:"
-      cat errors.json
-      exit 1
-    fi
-```
-
-### Pattern 3: Debugging Specific Operations
+### Pattern 2: Debugging Specific Operations
 
 ```bash
 # Debug only GET operations
@@ -399,8 +434,8 @@ RUST_LOG=freenet::operations::get=trace cargo test test_get_operation
 # Debug all operations
 RUST_LOG=freenet::operations=debug cargo test
 
-# Trace specific test with JSON output
-RUST_LOG=trace FREENET_LOG_FORMAT=json cargo test test_gateway_reconnection > test.log
+# Trace specific test (note: output will be pretty format, not JSON)
+RUST_LOG=trace cargo test test_gateway_reconnection -- --nocapture > test.log
 ```
 
 ## Troubleshooting
@@ -454,6 +489,39 @@ RUST_LOG=debug cargo test my_test -- --nocapture
 
 # Or force the test to fail temporarily to see logs
 ```
+
+### Issue: JSON logging doesn't work in tests (FREENET_LOG_FORMAT=json has no effect)
+
+**Problem:** When running tests with `FREENET_LOG_FORMAT=json`, logs are still in pretty format.
+
+**Reason:** `test-log` sets up its own tracing subscriber before our code runs, so our JSON formatting logic is never executed.
+
+**Solution Options:**
+
+1. **Accept pretty format** (recommended for tests):
+   ```bash
+   # Tests will always be pretty format with test-log
+   RUST_LOG=debug cargo test
+   ```
+
+2. **Skip test-log for specific tests** that need JSON:
+   ```rust
+   #[tokio::test]  // NOT test_log::test
+   async fn test_with_json() -> TestResult {
+       std::env::set_var("FREENET_LOG_FORMAT", "json");
+       freenet::config::set_logger(Some(LevelFilter::INFO), None);
+       // Logs will be JSON, but will ALWAYS show (even if test passes)
+       Ok(())
+   }
+   ```
+
+3. **Use JSON in production** only:
+   ```bash
+   # JSON works fine in production
+   FREENET_LOG_FORMAT=json cargo run
+   ```
+
+**Note:** Pretty format is actually better for test debugging. JSON is more useful for production log aggregation.
 
 ## Migration Guide
 
