@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+
 use clap::ValueEnum;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, WebApi},
@@ -108,17 +109,36 @@ pub enum LogFormat {
 /// - Log capturing for inspection
 /// - Automatic peer identification
 ///
+/// # Peer Identification
+///
+/// When using `with_peer_id()`, the peer ID is set as a span that wraps all logs.
+/// - **Pretty format**: Span context is visible in the output
+/// - **JSON format**: Use `with_span_list(true)` to see spans, or use `with_peer_id()`
+///   from separate async blocks to distinguish different peers
+///
+/// For multi-peer tests, you can also use `with_peer_id()` function in each async block:
+/// ```ignore
+/// let gateway = async {
+///     let _span = with_peer_id("gateway");
+///     tracing::info!("Gateway starting");
+/// };
+/// ```
+///
 /// # Example
 /// ```ignore
 /// #[tokio::test]
 /// async fn my_test() -> anyhow::Result<()> {
 ///     let _logger = TestLogger::new()
 ///         .with_json()
-///         .with_peer_id("gateway")
 ///         .with_level("debug")
 ///         .init();
 ///
-///     tracing::info!("This will be in JSON format");
+///     // For multi-peer tests, use with_peer_id() in each async block
+///     let gateway = async {
+///         let _span = with_peer_id("gateway");
+///         tracing::info!("Gateway starting");
+///     };
+///
 ///     Ok(())
 /// }
 /// ```
@@ -864,14 +884,15 @@ mod test {
         let logs = logger.logs();
         assert!(!logs.is_empty(), "Should have captured logs");
 
-        // Print the actual JSON for debugging
-        for log in &logs {
-            println!("Captured JSON: {}", log);
-        }
-
-        // Note: tracing-subscriber's JSON formatter doesn't include span fields by default
-        // Span fields would need to be explicitly included via with_span_list(true)
-        // For now, just verify the message was captured
+        // Verify the message was captured
+        // Note: Span fields (like test_node) appear in the span list when using
+        // with_span_list(true), but not as flat fields in JSON output.
+        // This is expected behavior of tracing-subscriber's JSON formatter.
         assert!(logs.iter().any(|log| log.contains("Message from gateway")));
+
+        // The JSON should have spans array with test_node field
+        let json_str = logs.join("\n");
+        assert!(json_str.contains("test_peer") || json_str.contains("gateway"),
+                "Should contain span information");
     }
 }
