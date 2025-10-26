@@ -267,9 +267,11 @@ impl Operation for PutOp {
 
                     if let Some(forward_target) = next_target {
                         // Create a SeekNode message to forward to the next hop
+                        // IMPORTANT: sender must be own_location (current forwarding node) so that
+                        // responses come back through us, not directly to the original client
                         return_msg = Some(PutMsg::SeekNode {
                             id: *id,
-                            sender: sender.clone(),
+                            sender: own_location,
                             target: forward_target,
                             value: modified_value.clone(),
                             contract: contract.clone(),
