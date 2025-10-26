@@ -482,6 +482,7 @@ impl Ring {
             }
 
             let current_connections = self.connection_manager.get_open_connections();
+            let pending_connection_targets = pending_conn_adds.len();
             let neighbor_locations = {
                 let peers = self.connection_manager.get_connections_by_location();
                 tracing::debug!(
@@ -520,18 +521,39 @@ impl Ring {
                 ?adjustment,
                 current_connections,
                 is_gateway,
-                pending_adds = pending_conn_adds.len(),
+                pending_adds = pending_connection_targets,
                 "Topology adjustment result"
             );
 
             match adjustment {
                 TopologyAdjustment::AddConnections(target_locs) => {
-                    tracing::info!(
-                        "Adding {} locations to pending connections (total pending: {})",
+                    let allowed = calculate_allowed_connection_additions(
+                        current_connections,
+                        pending_connection_targets,
+                        self.connection_manager.min_connections,
+                        self.connection_manager.max_connections,
                         target_locs.len(),
-                        pending_conn_adds.len() + target_locs.len()
                     );
-                    pending_conn_adds.extend(target_locs);
+
+                    if allowed == 0 {
+                        tracing::debug!(
+                            requested = target_locs.len(),
+                            current_connections,
+                            pending = pending_connection_targets,
+                            min_connections = self.connection_manager.min_connections,
+                            max_connections = self.connection_manager.max_connections,
+                            "Skipping queuing new connection targets – backlog already satisfies capacity constraints"
+                        );
+                    } else {
+                        let total_pending_after = pending_connection_targets + allowed;
+                        tracing::info!(
+                            requested = target_locs.len(),
+                            allowed,
+                            total_pending_after,
+                            "Queuing additional connection targets"
+                        );
+                        pending_conn_adds.extend(target_locs.into_iter().take(allowed));
+                    }
                 }
                 TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
                     for peer in should_disconnect_peers.drain(..) {
@@ -667,6 +689,61 @@ impl Ring {
             .await?;
         tracing::info!(tx = %id, "FindOptimalPeer request sent");
         Ok(Some(id))
+    }
+}
+
+fn calculate_allowed_connection_additions(
+    current_connections: usize,
+    pending_connections: usize,
+    min_connections: usize,
+    max_connections: usize,
+    requested: usize,
+) -> usize {
+    if requested == 0 {
+        return 0;
+    }
+
+    let effective_connections = current_connections.saturating_add(pending_connections);
+    if effective_connections >= max_connections {
+        return 0;
+    }
+
+    let mut available_capacity = max_connections - effective_connections;
+
+    if current_connections < min_connections {
+        let deficit_to_min = min_connections.saturating_sub(effective_connections);
+        available_capacity = available_capacity.min(deficit_to_min);
+    }
+
+    available_capacity.min(requested)
+}
+
+#[cfg(test)]
+mod pending_additions_tests {
+    use super::calculate_allowed_connection_additions;
+
+    #[test]
+    fn respects_minimum_when_backlog_exists() {
+        let allowed = calculate_allowed_connection_additions(1, 24, 25, 200, 24);
+        assert_eq!(allowed, 0, "Backlog should satisfy minimum deficit");
+    }
+
+    #[test]
+    fn permits_requests_until_minimum_is_met() {
+        let allowed = calculate_allowed_connection_additions(1, 0, 25, 200, 24);
+        assert_eq!(allowed, 24);
+    }
+
+    #[test]
+    fn caps_additions_at_available_capacity() {
+        let allowed = calculate_allowed_connection_additions(190, 5, 25, 200, 10);
+        assert_eq!(allowed, 5);
+    }
+
+    #[test]
+    fn respects_requested_when_capacity_allows() {
+        let allowed = calculate_allowed_connection_additions(50, 0, 25, 200, 3);
+        assert_eq!(allowed, 3);
     }
 }
 
