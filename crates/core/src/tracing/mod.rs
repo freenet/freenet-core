@@ -23,10 +23,19 @@ use crate::{
 pub(crate) use opentelemetry_tracer::OTEventRegister;
 pub(crate) use test::TestEventListener;
 
+// Re-export for use in tests
+pub use event_aggregator::{
+    EventLogAggregator, EventSource, RoutingPath, TransactionFlowEvent, AOFEventSource,
+    WebSocketEventCollector,
+};
+
 use crate::node::OpManager;
 
 /// An append-only log for network events.
 mod aof;
+
+/// Event aggregation across multiple nodes for debugging and testing.
+pub mod event_aggregator;
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -374,13 +383,13 @@ impl<'a> NetEventLog<'a> {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-struct NetLogMessage {
-    tx: Transaction,
-    datetime: DateTime<Utc>,
-    peer_id: PeerId,
-    kind: EventKind,
+pub(crate) struct NetLogMessage {
+    pub(crate) tx: Transaction,
+    pub(crate) datetime: DateTime<Utc>,
+    pub(crate) peer_id: PeerId,
+    pub(crate) kind: EventKind,
 }
 
 impl NetLogMessage {
@@ -1419,7 +1428,7 @@ pub(super) mod test {
     pub(crate) struct TestEventListener {
         node_labels: Arc<DashMap<NodeLabel, TransportPublicKey>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
-        logs: Arc<tokio::sync::Mutex<Vec<NetLogMessage>>>,
+        pub(crate) logs: Arc<tokio::sync::Mutex<Vec<NetLogMessage>>>,
         network_metrics_server:
             Arc<tokio::sync::Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
     }
