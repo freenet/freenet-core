@@ -1303,9 +1303,9 @@ impl P2pConnManager {
                 tracing::debug!("handle_notification_msg: Received NodeEvent notification");
                 EventResult::Event(ConnEvent::NodeAction(action).into())
             }
-            None => {
-                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Notification).into())
-            }
+            None => EventResult::Event(
+                ConnEvent::ClosedChannel(ChannelCloseReason::Notification).into(),
+            ),
         }
     }
 
