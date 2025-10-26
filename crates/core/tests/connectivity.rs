@@ -4,7 +4,7 @@ use freenet::{
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{self, make_get, make_put},
+    test_utils::{self, make_get, make_put, with_peer_id},
 };
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
@@ -20,7 +20,6 @@ use std::{
 use testresult::TestResult;
 use tokio::select;
 use tokio_tungstenite::connect_async;
-use tracing::level_filters::LevelFilter;
 
 static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
     Mutex::new(rand::rngs::StdRng::from_seed(
@@ -35,7 +34,9 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 /// 4. Verify that the peer can reconnect and operate normally
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_gateway_reconnection() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+    use freenet::test_utils::TestLogger;
+
+    let _logger = TestLogger::new().with_json().with_level("info").init();
 
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -141,24 +142,30 @@ async fn test_gateway_reconnection() -> TestResult {
     std::mem::drop(gateway_ws_socket);
     std::mem::drop(peer_ws_socket);
 
-    // Start gateway node
+    // Start gateway node with peer identification
     let gateway = async {
+        let _span = with_peer_id("gateway");
+        tracing::info!("Starting gateway node");
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Gateway node running");
         node.run().await
     }
     .boxed_local();
 
-    // Start peer node
+    // Start peer node with peer identification
     let peer = async move {
+        let _span = with_peer_id("peer-1");
+        tracing::info!("Starting peer node");
         let config = peer_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Peer node running");
         node.run().await
     }
     .boxed_local();
@@ -312,10 +319,11 @@ async fn test_gateway_reconnection() -> TestResult {
 /// Simplified test to verify basic gateway connectivity
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_basic_gateway_connectivity() -> TestResult {
+    use freenet::test_utils::TestLogger;
     use freenet_stdlib::client_api::{ClientRequest, WebApi};
     use tokio_tungstenite::connect_async;
 
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+    let _logger = TestLogger::new().with_json().with_level("info").init();
 
     // Use the test utilities to create a simple network
     let network_socket = TcpListener::bind("127.0.0.1:0")?;
@@ -364,13 +372,16 @@ async fn test_basic_gateway_connectivity() -> TestResult {
     std::mem::drop(network_socket);
     std::mem::drop(ws_socket);
 
-    // Start the gateway node
+    // Start the gateway node with peer identification
     let gateway = async {
+        let _span = with_peer_id("gateway");
+        tracing::info!("Starting gateway node");
         let config = config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Gateway node running");
         node.run().await
     }
     .boxed_local();
@@ -467,10 +478,11 @@ async fn test_basic_gateway_connectivity() -> TestResult {
 /// 8. Router forwards to peer's internal 192.168.1.100:8080 ✅
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_three_node_network_connectivity() -> TestResult {
+    use freenet::test_utils::TestLogger;
     use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
     use std::collections::HashSet;
 
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
+    let _logger = TestLogger::new().with_json().with_level("info").init();
 
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -632,40 +644,46 @@ async fn test_three_node_network_connectivity() -> TestResult {
     std::mem::drop(peer2_network_socket);
     std::mem::drop(peer2_ws_socket);
 
-    // Start gateway node
+    // Start gateway node with peer identification
     let gateway = async {
+        let _span = with_peer_id("gateway");
+        tracing::info!("Starting gateway node");
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
-        tracing::info!("Gateway starting");
+        tracing::info!("Gateway node running");
         node.run().await
     }
     .boxed_local();
 
-    // Start first peer node
+    // Start first peer node with peer identification
     let peer1 = async move {
+        let _span = with_peer_id("peer-1");
         tokio::time::sleep(Duration::from_secs(5)).await;
+        tracing::info!("Starting peer 1 node");
         let config = peer1_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
-        tracing::info!("Peer 1 starting");
+        tracing::info!("Peer 1 node running");
         node.run().await
     }
     .boxed_local();
 
-    // Start second peer node
+    // Start second peer node with peer identification
     let peer2 = async move {
+        let _span = with_peer_id("peer-2");
         tokio::time::sleep(Duration::from_secs(10)).await;
+        tracing::info!("Starting peer 2 node");
         let config = peer2_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
-        tracing::info!("Peer 2 starting");
+        tracing::info!("Peer 2 node running");
         node.run().await
     }
     .boxed_local();

@@ -6,7 +6,7 @@ use freenet::{
     server::serve_gateway,
     test_utils::{
         self, load_delegate, make_get, make_put, make_subscribe, make_update,
-        verify_contract_exists,
+        verify_contract_exists, with_peer_id,
     },
 };
 use freenet_stdlib::{
@@ -26,7 +26,7 @@ use testresult::TestResult;
 use tokio::select;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::{span, Instrument, Level};
 
 static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
     Mutex::new(rand::rngs::StdRng::from_seed(
@@ -128,9 +128,9 @@ async fn get_contract(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// Test PUT operation across two peers (gateway and peer)
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_put_contract() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
@@ -170,11 +170,14 @@ async fn test_put_contract() -> TestResult {
 
     std::mem::drop(ws_api_port_socket_a); // Free the port so it does not fail on initialization
     let node_a = async move {
+        let _span = with_peer_id("peer-a");
+        tracing::info!("Starting peer A node");
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Peer A node running");
         node.run().await
     }
     .boxed_local();
@@ -182,11 +185,14 @@ async fn test_put_contract() -> TestResult {
     std::mem::drop(network_socket_b); // Free the port so it does not fail on initialization
     std::mem::drop(ws_api_port_socket_b);
     let node_b = async {
+        let _span = with_peer_id("gateway");
+        tracing::info!("Starting gateway node");
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Gateway node running");
         node.run().await
     }
     .boxed_local();
@@ -297,10 +303,8 @@ async fn test_put_contract() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_update_contract() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -538,10 +542,8 @@ async fn test_update_contract() -> TestResult {
 // but the PUT caching refactor (commits 2cd337b5-0d432347) changed the subscription semantics.
 // Re-enabled after recent fixes to subscription logic - previously exhibited race conditions.
 // If this test becomes flaky again, see issue #1798 for historical context.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_multiple_clients_subscription() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -1224,10 +1226,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_get_with_subscribe_flag() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -1524,10 +1524,8 @@ async fn test_get_with_subscribe_flag() -> TestResult {
 }
 
 // FIXME Update notification is not received
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_put_with_subscribe_flag() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -1874,9 +1872,8 @@ async fn test_put_with_subscribe_flag() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_delegate_request() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
     const TEST_DELEGATE: &str = "test-delegate-integration";
 
     // Configure environment variables for optimized release build
@@ -2090,11 +2087,9 @@ async fn test_delegate_request() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore = "Long-running test (90s) - needs update for new keep-alive constants"]
 async fn test_gateway_packet_size_change_after_60s() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -2316,11 +2311,9 @@ async fn test_gateway_packet_size_change_after_60s() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore = "Long-running test (75s) - run with --ignored flag"]
 async fn test_production_decryption_error_scenario() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-
     // This test attempts to reproduce the exact production scenario:
     // 1. Client connects to gateway (vega)
     // 2. Connection works fine for ~60 seconds with 48-byte packets
@@ -2555,10 +2548,8 @@ async fn wait_for_subscribe_response(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_subscription_introspection() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-
     // Load test contract - not used in this simplified test
     const TEST_CONTRACT: &str = "test-contract-integration";
     let _contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -2697,10 +2688,8 @@ async fn test_subscription_introspection() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_update_no_change_notification() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
-
     // Load test contract that properly handles NoChange
     const TEST_CONTRACT: &str = "test-contract-update-nochange";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;

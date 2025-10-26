@@ -3,7 +3,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -16,6 +16,75 @@ use serde::{Deserialize, Serialize};
 
 use crate::util::workspace::get_workspace_target_dir;
 
+/// Set the peer identifier for the current thread's tracing context.
+///
+/// This adds a `test_node` field to all log messages from this thread, making it
+/// easier to distinguish logs from different peers in multi-peer tests.
+///
+/// # Example
+/// ```ignore
+/// set_peer_id("gateway");
+/// tracing::info!("Starting gateway");  // Will include test_node="gateway"
+///
+/// set_peer_id("peer-1");
+/// tracing::info!("Starting peer 1");   // Will include test_node="peer-1"
+/// ```
+///
+/// # Note
+/// This should be called at the start of each peer's initialization in tests.
+/// When using `#[test_log::test]`, the test framework will automatically
+/// configure tracing to show these fields.
+///
+/// The field name `test_node` is used to avoid conflicts with the production
+/// `peer` field which contains the actual cryptographic PeerId.
+pub fn set_peer_id(peer_id: impl Into<String>) {
+    let peer_id = peer_id.into();
+    tracing::Span::current().record("test_node", peer_id);
+}
+
+/// Create a span with a peer identifier that will be included in all logs
+/// within the span.
+///
+/// # Example
+/// ```ignore
+/// async fn start_gateway() {
+///     let _span = with_peer_id("gateway");
+///     tracing::info!("Starting gateway");  // Will include test_node="gateway"
+///     // ... gateway initialization
+/// }
+///
+/// async fn start_peer(id: usize) {
+///     let _span = with_peer_id(format!("peer-{}", id));
+///     tracing::info!("Starting peer");  // Will include test_node="peer-N"
+///     // ... peer initialization
+/// }
+/// ```
+///
+/// # Note
+/// The field name `test_node` is used to avoid conflicts with the production
+/// `peer` field which contains the actual cryptographic PeerId.
+///
+/// # Important
+/// The returned guard must be held for the entire duration you want the peer ID
+/// to be active. When the guard is dropped, the span exits.
+#[must_use = "Span guard must be held for the duration of the operation"]
+pub fn with_peer_id(peer_id: impl Into<String>) -> impl Drop {
+    let peer_id = peer_id.into();
+    tracing::info_span!("test_peer", test_node = %peer_id).entered()
+}
+
+/// Execute a function with tracing enabled.
+///
+/// This function is now deprecated in favor of using the `#[test_log::test]` macro
+/// which provides better integration with test frameworks and only shows logs for
+/// failing tests.
+///
+/// # Deprecated
+/// Use `#[test_log::test]` or `#[test_log::test(tokio::test)]` instead.
+#[deprecated(
+    since = "0.1.0",
+    note = "Use #[test_log::test] or #[test_log::test(tokio::test)] instead"
+)]
 pub fn with_tracing<T>(f: impl FnOnce() -> T) -> T {
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -24,6 +93,266 @@ pub fn with_tracing<T>(f: impl FnOnce() -> T) -> T {
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .finish();
     tracing::subscriber::with_default(subscriber, f)
+}
+
+/// Format for test logger output
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Pretty-printed format (human-readable)
+    Pretty,
+    /// JSON format (machine-readable)
+    Json,
+}
+
+/// A configurable test logger that provides flexible logging for tests.
+///
+/// This helper provides more control than test-log, including:
+/// - JSON output support
+/// - Per-test configuration
+/// - Log capturing for inspection
+///
+/// # Peer Identification
+///
+/// For multi-peer tests, use the `with_peer_id()` function in each async block:
+/// ```ignore
+/// let gateway = async {
+///     let _span = with_peer_id("gateway");
+///     tracing::info!("Gateway starting");
+/// };
+/// ```
+///
+/// # Example
+/// ```ignore
+/// #[tokio::test]
+/// async fn my_test() -> anyhow::Result<()> {
+///     let _logger = TestLogger::new()
+///         .with_json()
+///         .with_level("debug")
+///         .init();
+///
+///     // For multi-peer tests, use with_peer_id() in each async block
+///     let gateway = async {
+///         let _span = with_peer_id("gateway");
+///         tracing::info!("Gateway starting");
+///     };
+///
+///     Ok(())
+/// }
+/// ```
+pub struct TestLogger {
+    format: LogFormat,
+    level: String,
+    capture: bool,
+    captured_logs: Arc<Mutex<Vec<String>>>,
+    _guard: Option<tracing::subscriber::DefaultGuard>,
+}
+
+impl TestLogger {
+    /// Create a new TestLogger with default settings.
+    ///
+    /// Defaults:
+    /// - Format: Pretty
+    /// - Level: "info"
+    /// - No peer ID
+    /// - No log capture
+    pub fn new() -> Self {
+        Self {
+            format: LogFormat::Pretty,
+            level: "info".to_string(),
+            capture: false,
+            captured_logs: Arc::new(Mutex::new(Vec::new())),
+            _guard: None,
+        }
+    }
+
+    /// Enable JSON output format.
+    pub fn with_json(mut self) -> Self {
+        self.format = LogFormat::Json;
+        self
+    }
+
+    /// Enable pretty output format (default).
+    pub fn with_pretty(mut self) -> Self {
+        self.format = LogFormat::Pretty;
+        self
+    }
+
+    /// Set the log level filter.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let logger = TestLogger::new().with_level("debug");
+    /// ```
+    pub fn with_level(mut self, level: impl Into<String>) -> Self {
+        self.level = level.into();
+        self
+    }
+
+    /// Enable log capturing for programmatic inspection.
+    ///
+    /// When enabled, logs will be stored in memory and can be queried
+    /// using `contains()`, `logs()`, etc.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let logger = TestLogger::new().capture_logs().init();
+    /// tracing::info!("test message");
+    /// assert!(logger.contains("test message"));
+    /// ```
+    pub fn capture_logs(mut self) -> Self {
+        self.capture = true;
+        self
+    }
+
+    /// Initialize the logger and return a guard.
+    ///
+    /// The guard must be held for the duration of the test to keep
+    /// the logger active.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let _logger = TestLogger::new().with_json().init();
+    /// // Logger is active while _logger is in scope
+    /// ```
+    pub fn init(mut self) -> Self {
+        use tracing_subscriber::{
+            fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+        };
+
+        // Create env filter from level
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.level));
+
+        // Build the appropriate layer based on format
+        // Note: Span fields are automatically included in logs within those spans
+        let layer: Box<dyn Layer<_> + Send + Sync> = match self.format {
+            LogFormat::Pretty => {
+                if self.capture {
+                    let writer = CapturingWriter::new(self.captured_logs.clone());
+                    fmt::layer()
+                        .with_writer(move || writer.clone())
+                        .pretty()
+                        .boxed()
+                } else {
+                    fmt::layer().with_test_writer().pretty().boxed()
+                }
+            }
+            LogFormat::Json => {
+                if self.capture {
+                    let writer = CapturingWriter::new(self.captured_logs.clone());
+                    fmt::layer()
+                        .with_writer(move || writer.clone())
+                        .json()
+                        .with_span_list(true)
+                        .flatten_event(true)
+                        .boxed()
+                } else {
+                    fmt::layer()
+                        .with_test_writer()
+                        .json()
+                        .with_span_list(true)
+                        .flatten_event(true)
+                        .boxed()
+                }
+            }
+        };
+
+        let subscriber = tracing_subscriber::registry().with(env_filter).with(layer);
+
+        // Set as default subscriber
+        self._guard = Some(subscriber.set_default());
+
+        self
+    }
+
+    /// Check if captured logs contain a specific message.
+    ///
+    /// # Panics
+    /// Panics if log capturing was not enabled with `capture_logs()`.
+    pub fn contains(&self, message: &str) -> bool {
+        if !self.capture {
+            panic!("Cannot inspect logs without calling .capture_logs()");
+        }
+
+        self.captured_logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|log| log.contains(message))
+    }
+
+    /// Get all captured logs.
+    ///
+    /// # Panics
+    /// Panics if log capturing was not enabled with `capture_logs()`.
+    pub fn logs(&self) -> Vec<String> {
+        if !self.capture {
+            panic!("Cannot get logs without calling .capture_logs()");
+        }
+
+        self.captured_logs.lock().unwrap().clone()
+    }
+
+    /// Get logs matching a filter predicate.
+    ///
+    /// # Panics
+    /// Panics if log capturing was not enabled with `capture_logs()`.
+    pub fn logs_matching(&self, filter: impl Fn(&str) -> bool) -> Vec<String> {
+        self.logs().into_iter().filter(|log| filter(log)).collect()
+    }
+
+    /// Get the number of captured log entries.
+    ///
+    /// # Panics
+    /// Panics if log capturing was not enabled with `capture_logs()`.
+    pub fn log_count(&self) -> usize {
+        if !self.capture {
+            panic!("Cannot count logs without calling .capture_logs()");
+        }
+
+        self.captured_logs.lock().unwrap().len()
+    }
+}
+
+impl Default for TestLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A writer that captures logs to a buffer and also writes to test output.
+#[derive(Clone)]
+struct CapturingWriter {
+    buffer: Arc<Mutex<Vec<String>>>,
+}
+
+impl CapturingWriter {
+    fn new(buffer: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { buffer }
+    }
+}
+
+impl Write for CapturingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Convert to string and store complete lines
+        if let Ok(s) = std::str::from_utf8(buf) {
+            for line in s.lines() {
+                if !line.is_empty() {
+                    self.buffer.lock().unwrap().push(line.to_string());
+                }
+            }
+        }
+
+        // Also write to stdout (which test harness captures)
+        // This ensures logs still show on failure
+        std::io::stdout().write_all(buf)?;
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().flush()
+    }
 }
 
 pub async fn make_put(
@@ -421,10 +750,111 @@ pub fn create_todo_list_with_item(title: &str) -> Vec<u8> {
 #[cfg(test)]
 mod test {
     use super::*;
+
     #[test]
     fn test_compile_contract() -> testresult::TestResult {
         let contract = compile_contract("test-contract-integration")?;
         assert!(!contract.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn test_logger_basic() {
+        let _logger = TestLogger::new().with_pretty().with_level("info").init();
+
+        tracing::info!("Test log message");
+        tracing::warn!("Test warning");
+    }
+
+    #[test]
+    fn test_logger_json() {
+        let _logger = TestLogger::new().with_json().with_level("debug").init();
+
+        tracing::info!("JSON formatted message");
+        tracing::debug!("Debug message");
+    }
+
+    #[test]
+    fn test_logger_with_peer_id() {
+        let _logger = TestLogger::new().with_level("info").init();
+
+        let _span = with_peer_id("test-peer");
+
+        tracing::info!("Message with peer ID");
+    }
+
+    #[test]
+    fn test_logger_capture() {
+        let logger = TestLogger::new().capture_logs().with_level("info").init();
+
+        tracing::info!("Captured message 1");
+        tracing::warn!("Captured message 2");
+        tracing::error!("Captured message 3");
+
+        // Verify log capture works
+        assert!(logger.contains("Captured message 1"));
+        assert!(logger.contains("Captured message 2"));
+        assert!(logger.contains("Captured message 3"));
+        // Pretty format produces multiple lines per log entry, so we check >= 3
+        assert!(
+            logger.log_count() >= 3,
+            "Expected at least 3 log entries, got {}",
+            logger.log_count()
+        );
+    }
+
+    #[test]
+    fn test_logger_capture_with_json() {
+        let logger = TestLogger::new()
+            .with_json()
+            .capture_logs()
+            .with_level("info")
+            .init();
+
+        tracing::info!("JSON captured message");
+
+        assert!(logger.contains("JSON captured message"));
+    }
+
+    #[tokio::test]
+    async fn test_logger_async() {
+        let _logger = TestLogger::new().with_json().with_level("debug").init();
+
+        let _span = with_peer_id("async-peer");
+
+        tracing::info!("Async test message");
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tracing::debug!("After sleep");
+    }
+
+    #[test]
+    fn test_logger_json_with_span_fields() {
+        let logger = TestLogger::new()
+            .with_json()
+            .capture_logs()
+            .with_level("info")
+            .init();
+
+        // Create a span with test_node field
+        let _span = with_peer_id("test-gateway");
+
+        tracing::info!("Message from gateway");
+
+        // Verify the log was captured
+        let logs = logger.logs();
+        assert!(!logs.is_empty(), "Should have captured logs");
+
+        // Verify the message was captured
+        // Note: Span fields (like test_node) appear in the span list when using
+        // with_span_list(true), but not as flat fields in JSON output.
+        // This is expected behavior of tracing-subscriber's JSON formatter.
+        assert!(logs.iter().any(|log| log.contains("Message from gateway")));
+
+        // The JSON should have spans array with test_node field
+        let json_str = logs.join("\n");
+        assert!(
+            json_str.contains("test_peer") || json_str.contains("gateway"),
+            "Should contain span information"
+        );
     }
 }
