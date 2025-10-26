@@ -18,6 +18,21 @@ DRY_RUN=false
 SKIP_TESTS=false
 DEPLOY_LOCAL=false
 DEPLOY_REMOTE=false
+RESUME=false
+STATE_FILE=""
+
+# Release steps for state tracking
+declare -A RELEASE_STEPS=(
+    [1]="PR_CREATED"
+    [2]="PR_MERGED"
+    [3]="TAG_CREATED"
+    [4]="RELEASE_CREATED"
+    [5]="CRATES_PUBLISHED"
+    [6]="LOCAL_DEPLOYED"
+    [7]="MATRIX_ANNOUNCED"
+)
+
+CURRENT_STEP=0
 
 show_help() {
     echo "Freenet Release Script"
@@ -33,6 +48,7 @@ show_help() {
     echo "  --deploy-local      Deploy to local gateway after release (optional)"
     echo "  --deploy-remote     Deploy to remote gateways after release (optional)"
     echo "  --skip-tests        Skip pre-release tests"
+    echo "  --resume STATE_FILE Resume failed release from state file"
     echo "  --dry-run           Show what would be done without executing"
     echo "  --help              Show this help"
     echo
@@ -63,6 +79,11 @@ while [[ $# -gt 0 ]]; do
         --skip-tests)
             SKIP_TESTS=true
             shift
+            ;;
+        --resume)
+            RESUME=true
+            STATE_FILE="$2"
+            shift 2
             ;;
         --dry-run)
             DRY_RUN=true

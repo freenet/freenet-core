@@ -14,6 +14,8 @@ BINARY_PATH=""
 SERVICE_NAME="freenet-gateway"
 INSTALL_PATH="/usr/local/bin/freenet"
 DRY_RUN=false
+ALL_INSTANCES=false
+VERIFY_VERSION=true
 
 show_help() {
     echo "Deploy Freenet Gateway Locally"
@@ -24,11 +26,14 @@ show_help() {
     echo "  --binary PATH       Path to freenet binary (default: auto-detect from cargo build)"
     echo "  --service NAME      Service name (default: freenet-gateway)"
     echo "  --install-path PATH Installation path (default: /usr/local/bin/freenet)"
+    echo "  --all-instances     Deploy to gateway + all peer instances (peer-01 to peer-10)"
+    echo "  --no-verify         Skip version verification after deployment"
     echo "  --dry-run           Show what would be done without executing"
     echo "  --help              Show this help"
     echo
     echo "Examples:"
-    echo "  $0                                    # Use default cargo release binary"
+    echo "  $0                                    # Deploy to gateway only"
+    echo "  $0 --all-instances                   # Deploy to gateway + all 10 peers"
     echo "  $0 --binary ./target/release/freenet # Specify custom binary"
     echo "  $0 --dry-run                         # Preview actions"
     echo
@@ -52,6 +57,14 @@ while [[ $# -gt 0 ]]; do
         --install-path)
             INSTALL_PATH="$2"
             shift 2
+            ;;
+        --all-instances)
+            ALL_INSTANCES=true
+            shift
+            ;;
+        --no-verify)
+            VERIFY_VERSION=false
+            shift
             ;;
         --dry-run)
             DRY_RUN=true
@@ -149,20 +162,61 @@ echo
 
 check_privileges
 
+# Wait for binary to be released by all processes
+wait_for_binary_release() {
+    local max_wait=30
+    local waited=0
+
+    while sudo lsof "$INSTALL_PATH" &>/dev/null; do
+        if [[ $waited -ge $max_wait ]]; then
+            echo "⚠️  Timeout waiting for binary to be released"
+            echo "     Processes still using $INSTALL_PATH:"
+            sudo lsof "$INSTALL_PATH" || true
+            return 1
+        fi
+
+        if [[ $waited -eq 0 ]]; then
+            echo -n "  Waiting for binary to be released"
+        fi
+        echo -n "."
+        sleep 1
+        ((waited++))
+    done
+
+    if [[ $waited -gt 0 ]]; then
+        echo " ✓"
+    fi
+    return 0
+}
+
 # Service management functions
 stop_service() {
+    local service_arg="$1"
+
     case "$SERVICE_MANAGER" in
         systemd)
-            if systemctl is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
-                echo -n "  Stopping systemd service... "
+            if systemctl is-active --quiet "$service_arg.service" 2>/dev/null; then
+                echo -n "  Stopping systemd service ($service_arg)... "
                 if [[ "$DRY_RUN" == "true" ]]; then
                     echo "[DRY RUN]"
                 else
-                    sudo systemctl stop "$SERVICE_NAME.service"
+                    # Temporarily disable to prevent auto-restart
+                    local was_enabled=false
+                    if systemctl is-enabled --quiet "$service_arg.service" 2>/dev/null; then
+                        was_enabled=true
+                        sudo systemctl disable "$service_arg.service" --quiet
+                    fi
+
+                    sudo systemctl stop "$service_arg.service"
                     echo "✓"
+
+                    # Store enabled state for later restoration
+                    if [[ "$was_enabled" == "true" ]]; then
+                        echo "$service_arg" >> /tmp/freenet-deploy-reenable.list
+                    fi
                 fi
             else
-                echo "  ℹ️  Service not running, skipping stop"
+                echo "  ℹ️  Service $service_arg not running, skipping stop"
             fi
             ;;
         launchd)
@@ -191,18 +245,25 @@ stop_service() {
 }
 
 start_service() {
+    local service_arg="$1"
+
     case "$SERVICE_MANAGER" in
         systemd)
-            if systemctl list-unit-files | grep -q "^$SERVICE_NAME.service" 2>/dev/null; then
-                echo -n "  Starting systemd service... "
+            if systemctl list-unit-files | grep -q "^$service_arg.service" 2>/dev/null; then
+                echo -n "  Starting systemd service ($service_arg)... "
                 if [[ "$DRY_RUN" == "true" ]]; then
                     echo "[DRY RUN]"
                 else
-                    sudo systemctl start "$SERVICE_NAME.service"
+                    # Re-enable if it was enabled before
+                    if [[ -f /tmp/freenet-deploy-reenable.list ]] && grep -q "^$service_arg$" /tmp/freenet-deploy-reenable.list; then
+                        sudo systemctl enable "$service_arg.service" --quiet
+                    fi
+
+                    sudo systemctl start "$service_arg.service"
                     echo "✓"
                 fi
             else
-                echo "  ⚠️  Service unit file not found, cannot start automatically"
+                echo "  ⚠️  Service unit file not found for $service_arg, cannot start automatically"
                 echo "     Start manually with: $INSTALL_PATH [args]"
             fi
             ;;
@@ -228,25 +289,33 @@ start_service() {
 }
 
 verify_service() {
+    local service_arg="$1"
+    local expected_version="$2"
+
     case "$SERVICE_MANAGER" in
         systemd)
-            if systemctl list-unit-files | grep -q "^$SERVICE_NAME.service" 2>/dev/null; then
-                echo -n "  Verifying service status... "
+            if systemctl list-unit-files | grep -q "^$service_arg.service" 2>/dev/null; then
+                echo -n "  Verifying service status ($service_arg)... "
                 sleep 2  # Give service time to start
-                if systemctl is-active --quiet "$SERVICE_NAME.service"; then
+                if systemctl is-active --quiet "$service_arg.service"; then
                     local running_version=$("$INSTALL_PATH" --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "unknown")
+
+                    # Verify version matches
+                    if [[ "$VERIFY_VERSION" == "true" ]] && [[ "$expected_version" != "unknown" ]] && [[ "$running_version" != "$expected_version" ]]; then
+                        echo "✗"
+                        echo "  ⚠️  Version mismatch!"
+                        echo "     Expected: $expected_version"
+                        echo "     Got:      $running_version"
+                        return 1
+                    fi
+
                     echo "✓"
                     echo "  ✓ Version: $running_version"
                     echo "  ✓ Service: Running"
-
-                    # Show recent logs
-                    echo
-                    echo "Recent logs:"
-                    sudo journalctl -u "$SERVICE_NAME.service" -n 10 --no-pager
                 else
                     echo "✗"
                     echo "  ⚠️  Service failed to start"
-                    echo "     Check logs with: sudo journalctl -u $SERVICE_NAME.service -n 50"
+                    echo "     Check logs with: sudo journalctl -u $service_arg.service -n 50"
                     return 1
                 fi
             fi
@@ -261,11 +330,30 @@ verify_service() {
     esac
 }
 
+# Determine which services to deploy
+SERVICES_TO_DEPLOY=("$SERVICE_NAME")
+if [[ "$ALL_INSTANCES" == "true" ]]; then
+    SERVICES_TO_DEPLOY=(freenet-gateway freenet-peer-{01..10})
+fi
+
+# Clear reenable list from previous runs
+rm -f /tmp/freenet-deploy-reenable.list
+
 # Main deployment steps
 echo "Deployment Steps:"
 echo
 
-stop_service
+# Stop all services
+for service in "${SERVICES_TO_DEPLOY[@]}"; do
+    stop_service "$service"
+done
+
+# Wait for binary to be released
+if [[ "$DRY_RUN" == "false" ]]; then
+    wait_for_binary_release || {
+        echo "⚠️  Failed to wait for binary release. Proceeding anyway..."
+    }
+fi
 
 echo -n "  Installing binary to $INSTALL_PATH... "
 if [[ "$DRY_RUN" == "true" ]]; then
@@ -275,6 +363,9 @@ else
     if [[ -f "$INSTALL_PATH" ]]; then
         sudo cp "$INSTALL_PATH" "$INSTALL_PATH.backup"
     fi
+
+    # Remove old binary first
+    sudo rm -f "$INSTALL_PATH"
 
     sudo cp "$BINARY_PATH" "$INSTALL_PATH"
     sudo chmod 755 "$INSTALL_PATH"
@@ -289,11 +380,21 @@ else
     echo "✓"
 fi
 
-start_service
+# Start all services
+for service in "${SERVICES_TO_DEPLOY[@]}"; do
+    start_service "$service"
+done
 
+# Verify services
 if [[ "$DRY_RUN" == "false" ]] && [[ "$SERVICE_MANAGER" == "systemd" ]]; then
-    verify_service
+    echo
+    for service in "${SERVICES_TO_DEPLOY[@]}"; do
+        verify_service "$service" "$BINARY_VERSION" || true
+    done
 fi
+
+# Clean up reenable list
+rm -f /tmp/freenet-deploy-reenable.list
 
 echo
 echo "✅ Deployment complete!"
