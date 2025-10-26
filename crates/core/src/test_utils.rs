@@ -809,3 +809,92 @@ mod test {
         );
     }
 }
+
+// Event aggregator test utilities
+pub mod event_aggregator_utils {
+    //! Test utilities for event log aggregation.
+
+    use crate::tracing::{AOFEventSource, EventLogAggregator};
+    use anyhow::Result;
+    use std::path::PathBuf;
+
+    /// A handle to collect node information for aggregation.
+    #[derive(Debug, Clone)]
+    pub struct NodeLogInfo {
+        /// Human-readable label for the node (e.g., "node-a", "gateway")
+        pub label: String,
+        /// Path to the node's event log file
+        pub event_log_path: PathBuf,
+    }
+
+    impl NodeLogInfo {
+        /// Create a new node log info.
+        pub fn new(label: impl Into<String>, event_log_path: PathBuf) -> Self {
+            Self {
+                label: label.into(),
+                event_log_path,
+            }
+        }
+    }
+
+    /// Builder for creating an EventLogAggregator from test nodes.
+    pub struct TestAggregatorBuilder {
+        nodes: Vec<NodeLogInfo>,
+    }
+
+    impl TestAggregatorBuilder {
+        /// Create a new builder.
+        pub fn new() -> Self {
+            Self { nodes: Vec::new() }
+        }
+
+        /// Add a node to aggregate from.
+        pub fn add_node(mut self, label: impl Into<String>, event_log_path: PathBuf) -> Self {
+            self.nodes.push(NodeLogInfo::new(label, event_log_path));
+            self
+        }
+
+        /// Add multiple nodes from config directories.
+        pub fn add_nodes_from_configs(mut self, configs: Vec<(String, PathBuf)>) -> Self {
+            for (label, config_dir) in configs {
+                let event_log = config_dir.join("event_log");
+                let local_log = config_dir.join("_EVENT_LOG_LOCAL");
+
+                let log_path = if event_log.exists() {
+                    event_log
+                } else if local_log.exists() {
+                    local_log
+                } else {
+                    tracing::warn!(
+                        "No event log found for {} in {:?}, using event_log path",
+                        label,
+                        config_dir
+                    );
+                    event_log
+                };
+
+                self.nodes.push(NodeLogInfo::new(label, log_path));
+            }
+            self
+        }
+
+        /// Build the aggregator.
+        pub async fn build(self) -> Result<EventLogAggregator> {
+            let sources = self
+                .nodes
+                .into_iter()
+                .map(|node| (node.event_log_path, Some(node.label)))
+                .collect();
+
+            EventLogAggregator::from_aof_files(sources).await
+        }
+    }
+
+    impl Default for TestAggregatorBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
+pub use event_aggregator_utils::{NodeLogInfo, TestAggregatorBuilder};
