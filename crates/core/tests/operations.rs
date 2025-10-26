@@ -6,7 +6,7 @@ use freenet::{
     server::serve_gateway,
     test_utils::{
         self, load_delegate, make_get, make_put, make_subscribe, make_update,
-        verify_contract_exists, with_peer_id,
+        verify_contract_exists, with_peer_id, TestLogger,
     },
 };
 use freenet_stdlib::{
@@ -544,6 +544,12 @@ async fn test_update_contract() -> TestResult {
 // If this test becomes flaky again, see issue #1798 for historical context.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_multiple_clients_subscription() -> TestResult {
+    // Initialize test logger with JSON format for better debugging
+    let _logger = TestLogger::new()
+        .with_json()
+        .with_level("freenet::operations::connect=debug,freenet::node::network_bridge::p2p_protoc=info,info")
+        .init();
+
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -606,33 +612,42 @@ async fn test_multiple_clients_subscription() -> TestResult {
 
     // Start node A (first client)
     let node_a = async move {
+        let _span = with_peer_id("node-a");
+        tracing::info!("Starting node A");
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Node A running");
         node.run().await
     }
     .boxed_local();
 
     // Start GW node
     let node_gw = async {
+        let _span = with_peer_id("gateway");
+        tracing::info!("Starting gateway node");
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Gateway node running");
         node.run().await
     }
     .boxed_local();
 
     // Start node B (second client)
     let node_b = async {
+        let _span = with_peer_id("node-b");
+        tracing::info!("Starting node B");
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
             .build(serve_gateway(config.ws_api).await)
             .await?;
+        tracing::info!("Node B running");
         node.run().await
     }
     .boxed_local();
