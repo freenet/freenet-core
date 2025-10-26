@@ -433,7 +433,7 @@ create_release_pr() {
     
     echo -n "  Creating auto-merge PR... "
     pr_number=$(gh pr create \
-        --title "🚀 Release $VERSION" \
+        --title "chore: release $VERSION" \
         --body "**Automated release PR**
 
 - freenet: → **$VERSION**  
