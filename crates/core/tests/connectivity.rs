@@ -36,10 +36,7 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 async fn test_gateway_reconnection() -> TestResult {
     use freenet::test_utils::TestLogger;
 
-    let _logger = TestLogger::new()
-        .with_json()
-        .with_level("info")
-        .init();
+    let _logger = TestLogger::new().with_json().with_level("info").init();
 
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -322,14 +319,11 @@ async fn test_gateway_reconnection() -> TestResult {
 /// Simplified test to verify basic gateway connectivity
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_basic_gateway_connectivity() -> TestResult {
-    use freenet_stdlib::client_api::{ClientRequest, WebApi};
     use freenet::test_utils::TestLogger;
+    use freenet_stdlib::client_api::{ClientRequest, WebApi};
     use tokio_tungstenite::connect_async;
 
-    let _logger = TestLogger::new()
-        .with_json()
-        .with_level("info")
-        .init();
+    let _logger = TestLogger::new().with_json().with_level("info").init();
 
     // Use the test utilities to create a simple network
     let network_socket = TcpListener::bind("127.0.0.1:0")?;
@@ -488,10 +482,7 @@ async fn test_three_node_network_connectivity() -> TestResult {
     use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
     use std::collections::HashSet;
 
-    let _logger = TestLogger::new()
-        .with_json()
-        .with_level("info")
-        .init();
+    let _logger = TestLogger::new().with_json().with_level("info").init();
 
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";

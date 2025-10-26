@@ -818,12 +818,8 @@ mod tests {
             neighbor_locations.insert(peer.location.unwrap(), vec![]);
         }
 
-        let adjustment = resource_manager.adjust_topology(
-            &neighbor_locations,
-            &None,
-            report_time,
-            peers.len(),
-        );
+        let adjustment =
+            resource_manager.adjust_topology(&neighbor_locations, &None, report_time, peers.len());
 
         match adjustment {
             TopologyAdjustment::NoChange => {}

@@ -92,7 +92,6 @@ async fn create_test_node_config(
 /// Fixes: #1858
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_get_error_notification() -> anyhow::Result<()> {
-
     // Start a single isolated node (no peers)
     let ws_port = 50900;
     let network_port = 50901;

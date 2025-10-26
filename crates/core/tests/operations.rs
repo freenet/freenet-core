@@ -305,7 +305,6 @@ async fn test_put_contract() -> TestResult {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_update_contract() -> TestResult {
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -545,7 +544,6 @@ async fn test_update_contract() -> TestResult {
 // If this test becomes flaky again, see issue #1798 for historical context.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_multiple_clients_subscription() -> TestResult {
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -1230,7 +1228,6 @@ async fn test_multiple_clients_subscription() -> TestResult {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_get_with_subscribe_flag() -> TestResult {
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -1529,7 +1526,6 @@ async fn test_get_with_subscribe_flag() -> TestResult {
 // FIXME Update notification is not received
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_put_with_subscribe_flag() -> TestResult {
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -2094,7 +2090,6 @@ async fn test_delegate_request() -> TestResult {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore = "Long-running test (90s) - needs update for new keep-alive constants"]
 async fn test_gateway_packet_size_change_after_60s() -> TestResult {
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -2319,7 +2314,6 @@ async fn test_gateway_packet_size_change_after_60s() -> TestResult {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore = "Long-running test (75s) - run with --ignored flag"]
 async fn test_production_decryption_error_scenario() -> TestResult {
-
     // This test attempts to reproduce the exact production scenario:
     // 1. Client connects to gateway (vega)
     // 2. Connection works fine for ~60 seconds with 48-byte packets
@@ -2556,7 +2550,6 @@ async fn wait_for_subscribe_response(
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_subscription_introspection() -> TestResult {
-
     // Load test contract - not used in this simplified test
     const TEST_CONTRACT: &str = "test-contract-integration";
     let _contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -2697,7 +2690,6 @@ async fn test_subscription_introspection() -> TestResult {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_update_no_change_notification() -> TestResult {
-
     // Load test contract that properly handles NoChange
     const TEST_CONTRACT: &str = "test-contract-update-nochange";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
