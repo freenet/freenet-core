@@ -300,6 +300,12 @@ impl ContractExecutor for Executor<Runtime> {
                 if updated_state.as_ref() == current_state.as_ref() {
                     Ok(UpsertResult::NoChange)
                 } else {
+                    // Persist the updated state before returning
+                    self.state_store
+                        .update(&key, updated_state.clone())
+                        .await
+                        .map_err(ExecutorError::other)?;
+
                     // todo: forward delta like we are doing with puts
                     tracing::warn!("Delta updates are not yet supported");
                     Ok(UpsertResult::Updated(updated_state))

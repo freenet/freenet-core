@@ -367,7 +367,7 @@ create_release_pr() {
 
     # Check if a release PR for this version already exists or was merged
     echo -n "  Checking for existing release PR... "
-    local existing_pr=$(gh pr list --search "Release $VERSION OR 🚀 Release $VERSION" --state all --limit 1 --json number,state,title --jq '.[] | "\(.number)|\(.state)|\(.title)"' 2>/dev/null || echo "")
+    local existing_pr=$(gh pr list --head "$branch_name" --state all --limit 1 --json number,state,title --jq '.[] | "\(.number)|\(.state)|\(.title)"' 2>/dev/null || echo "")
 
     if [[ -n "$existing_pr" ]]; then
         local pr_number=$(echo "$existing_pr" | cut -d'|' -f1)
