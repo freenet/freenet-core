@@ -15,8 +15,6 @@ jobs:
     concurrency:
       group: auto-label
       cancel-in-progress: false
-    # Only run if issue doesn't have a T- label
-    if: "!contains(join(github.event.issue.labels.*.name, ','), 'T-')"
 
     steps:
       - name: Check user account age to prevent spam
@@ -69,6 +67,8 @@ jobs:
             const issueTitle = context.payload.issue.title;
             const issueBody = context.payload.issue.body || '';
             const issueNumber = context.payload.issue.number;
+            const existingLabels = context.payload.issue.labels.map(l => l.name);
+            const existingLabelsStr = existingLabels.join(', ') || 'none';
 
             // Truncate very long issue bodies to prevent abuse
             const maxBodyLength = 8000;
@@ -86,6 +86,7 @@ jobs:
             <issue_content>
             Issue #${issueNumber}
             Title: ${issueTitle}
+            Current labels: ${existingLabelsStr}
 
             Body:
             ${truncatedBody}
@@ -149,7 +150,7 @@ jobs:
             // Call OpenAI GPT-5 mini API
             const requestBody = JSON.stringify({
               model: 'gpt-5-mini',
-              max_tokens: 1024,
+              max_completion_tokens: 1024,
               response_format: { type: "json_object" },
               messages: [{
                 role: 'system',
@@ -224,6 +225,21 @@ jobs:
 
             // Apply labels
             if (labelsToApply.length > 0) {
+              // Remove existing labels
+              for (const label of existingLabels) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    name: label
+                  });
+                } catch (e) {
+                  console.log(`Could not remove label ${label}:`, e.message);
+                }
+              }
+
+              // Add new labels
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -240,17 +256,16 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issueNumber,
-                body: `🤖 **Auto-labeled by GPT-5**
+                body: `🤖 **Auto-labeled**
 
             Applied labels:
             ${confidenceList}
 
             **Reasoning:** ${analysis.reasoning}
 
-            If these labels are incorrect, please update them. This helps improve the auto-labeling system.
+            Previous labels: \`${existingLabelsStr}\`
 
-            ---
-            <sub>Powered by [GPT-5 mini](https://openai.com/index/introducing-gpt-5-for-developers/) | [Workflow](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main/.github/workflows/auto-label-issues.yml)</sub>`
+            If these labels are incorrect, please update them. This helps improve the auto-labeling system.`
               });
 
               console.log('Successfully applied labels and posted comment');
