@@ -1148,13 +1148,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
             }
         }
 
-        // Wait for subscriptions to fully propagate across nodes before UPDATE
-        // Issue #2001: Race condition where UPDATE can start before cross-node subscriptions
-        // are fully registered. Even though we receive SubscribeResponse, the subscription
-        // may not have propagated through the ring to all nodes yet.
-        tracing::info!("All clients subscribed, waiting 5 seconds for cross-node propagation...");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        tracing::info!("Proceeding with UPDATE operation");
+        tracing::info!("All clients subscribed, proceeding with UPDATE operation");
 
         // Create a new to-do list by deserializing the current state, adding a task, and serializing it back
         let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())
