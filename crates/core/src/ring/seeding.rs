@@ -213,34 +213,42 @@ mod tests {
             .is_ok());
 
         // Verify all subscribers are present
-        let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-        assert_eq!(subs.len(), 3);
+        {
+            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
+            assert_eq!(subs.len(), 3);
+        }
 
         // Remove peer2
         seeding_manager.remove_subscriber_by_peer(&contract_key, &peer2);
 
         // Verify peer2 was removed
-        let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-        assert_eq!(subs.len(), 2);
-        assert!(!subs.iter().any(|p| p.peer == peer2));
-        assert!(subs.iter().any(|p| p.peer == peer1));
-        assert!(subs.iter().any(|p| p.peer == peer3));
+        {
+            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
+            assert_eq!(subs.len(), 2);
+            assert!(!subs.iter().any(|p| p.peer == peer2));
+            assert!(subs.iter().any(|p| p.peer == peer1));
+            assert!(subs.iter().any(|p| p.peer == peer3));
+        }
 
         // Remove peer1
         seeding_manager.remove_subscriber_by_peer(&contract_key, &peer1);
 
         // Verify peer1 was removed
-        let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-        assert_eq!(subs.len(), 1);
-        assert!(!subs.iter().any(|p| p.peer == peer1));
-        assert!(subs.iter().any(|p| p.peer == peer3));
+        {
+            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
+            assert_eq!(subs.len(), 1);
+            assert!(!subs.iter().any(|p| p.peer == peer1));
+            assert!(subs.iter().any(|p| p.peer == peer3));
+        }
 
         // Remove non-existent peer (should not error)
         seeding_manager.remove_subscriber_by_peer(&contract_key, &peer2);
 
         // Verify count unchanged
-        let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-        assert_eq!(subs.len(), 1);
+        {
+            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
+            assert_eq!(subs.len(), 1);
+        }
     }
 
     #[test]
