@@ -15,8 +15,6 @@ jobs:
     concurrency:
       group: auto-label
       cancel-in-progress: false
-    # Only run if issue doesn't have a T- label
-    if: "!contains(join(github.event.issue.labels.*.name, ','), 'T-')"
 
     steps:
       - name: Check user account age to prevent spam
@@ -69,6 +67,8 @@ jobs:
             const issueTitle = context.payload.issue.title;
             const issueBody = context.payload.issue.body || '';
             const issueNumber = context.payload.issue.number;
+            const existingLabels = context.payload.issue.labels.map(l => l.name);
+            const existingLabelsStr = existingLabels.join(', ') || 'none';
 
             // Truncate very long issue bodies to prevent abuse
             const maxBodyLength = 8000;
@@ -86,6 +86,7 @@ jobs:
             <issue_content>
             Issue #${issueNumber}
             Title: ${issueTitle}
+            Current labels: ${existingLabelsStr}
 
             Body:
             ${truncatedBody}
@@ -224,6 +225,21 @@ jobs:
 
             // Apply labels
             if (labelsToApply.length > 0) {
+              // Remove existing labels
+              for (const label of existingLabels) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    name: label
+                  });
+                } catch (e) {
+                  console.log(`Could not remove label ${label}:`, e.message);
+                }
+              }
+
+              // Add new labels
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -246,6 +262,8 @@ jobs:
             ${confidenceList}
 
             **Reasoning:** ${analysis.reasoning}
+
+            Previous labels: \`${existingLabelsStr}\`
 
             If these labels are incorrect, please update them. This helps improve the auto-labeling system.`
               });
