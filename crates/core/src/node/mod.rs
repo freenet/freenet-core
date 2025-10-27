@@ -827,6 +827,26 @@ async fn process_message_v1<CB>(
                 op_manager.ring.remove_subscriber(key, from);
                 break;
             }
+            NetMessageV1::ProximityCache { from, ref message } => {
+                tracing::debug!(?from, "Processing proximity cache message");
+
+                // Handle the proximity cache message
+                if let Some(response) = op_manager
+                    .proximity_cache
+                    .handle_message(from.clone(), message.clone())
+                    .await
+                {
+                    // Send response directly back to the sender
+                    let response_msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                        from: op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                        message: response,
+                    });
+                    if let Err(err) = conn_manager.send(&from, response_msg).await {
+                        tracing::error!(%err, ?from, "Failed to send proximity cache response");
+                    }
+                }
+                break;
+            }
             _ => break, // Exit the loop if no applicable message type is found
         }
     }
@@ -1046,6 +1066,26 @@ where
                     from
                 );
                 op_manager.ring.remove_subscriber(key, from);
+                break;
+            }
+            NetMessageV1::ProximityCache { from, ref message } => {
+                tracing::debug!(?from, "Processing proximity cache message (pure network)");
+
+                // Handle the proximity cache message
+                if let Some(response) = op_manager
+                    .proximity_cache
+                    .handle_message(from.clone(), message.clone())
+                    .await
+                {
+                    // Send response directly back to the sender
+                    let response_msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                        from: op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                        message: response,
+                    });
+                    if let Err(err) = conn_manager.send(&from, response_msg).await {
+                        tracing::error!(%err, ?from, "Failed to send proximity cache response");
+                    }
+                }
                 break;
             }
             _ => break, // Exit the loop if no applicable message type is found

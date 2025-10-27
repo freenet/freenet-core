@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -10,10 +10,13 @@ use tracing::{debug, info, trace};
 
 use super::PeerId;
 
+/// Batch announcement interval - how often to send batched removal announcements
+const BATCH_ANNOUNCEMENT_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Proximity cache manager - tracks what contracts this node and its neighbors are caching
 pub struct ProximityCacheManager {
     /// Contracts we are caching locally
-    my_cache: Arc<RwLock<HashSet<ContractInstanceId>>>,
+    my_cache: Arc<DashSet<ContractInstanceId>>,
 
     /// What we know about our neighbors' caches
     /// PeerId -> Set of contract IDs they're caching
@@ -66,16 +69,21 @@ pub enum ProximityCacheMessage {
     CacheStateResponse { contracts: Vec<ContractInstanceId> },
 }
 
-#[allow(dead_code)] // Some methods reserved for future use (stats, introspection, lifecycle management)
-impl ProximityCacheManager {
-    pub fn new() -> Self {
+impl Default for ProximityCacheManager {
+    fn default() -> Self {
         Self {
-            my_cache: Arc::new(RwLock::new(HashSet::new())),
+            my_cache: Arc::new(DashSet::new()),
             neighbor_caches: Arc::new(DashMap::new()),
             stats: Arc::new(RwLock::new(ProximityStats::default())),
             last_batch_announce: Arc::new(RwLock::new(Instant::now())),
             pending_removals: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+}
+
+impl ProximityCacheManager {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Called when we cache a new contract (PUT or successful GET)
@@ -85,8 +93,7 @@ impl ProximityCacheManager {
     ) -> Option<ProximityCacheMessage> {
         let contract_id = *contract_key.id();
 
-        let mut cache = self.my_cache.write().await;
-        if cache.insert(contract_id) {
+        if self.my_cache.insert(contract_id) {
             info!(
                 contract = %contract_key,
                 "PROXIMITY_PROPAGATION: Added contract to cache"
@@ -116,8 +123,7 @@ impl ProximityCacheManager {
     pub async fn on_contract_evicted(&self, contract_key: &ContractKey) {
         let contract_id = *contract_key.id();
 
-        let mut cache = self.my_cache.write().await;
-        if cache.remove(&contract_id) {
+        if self.my_cache.remove(&contract_id).is_some() {
             debug!(
                 contract = %contract_key,
                 "PROXIMITY_PROPAGATION: Removed contract from cache, adding to pending removals"
@@ -130,7 +136,6 @@ impl ProximityCacheManager {
 
     /// Process a proximity cache message from a neighbor
     /// Returns an optional response message that should be sent back to the peer
-    #[allow(dead_code)] // Reserved for future proximity cache message handling
     pub async fn handle_message(
         &self,
         peer_id: PeerId,
@@ -160,10 +165,11 @@ impl ProximityCacheManager {
                         last_update: now,
                     });
 
-                debug!(
+                info!(
                     peer = %peer_id,
                     added = added.len(),
                     removed = removed.len(),
+                    total_contracts = self.neighbor_caches.get(&peer_id).map(|c| c.contracts.len()).unwrap_or(0),
                     "PROXIMITY_PROPAGATION: Updated neighbor cache knowledge"
                 );
                 None
@@ -171,11 +177,9 @@ impl ProximityCacheManager {
 
             ProximityCacheMessage::CacheStateRequest => {
                 // Send our full cache state
-                let cache = self.my_cache.read().await;
                 let response = ProximityCacheMessage::CacheStateResponse {
-                    contracts: cache.iter().cloned().collect(),
+                    contracts: self.my_cache.iter().map(|r| *r.key()).collect(),
                 };
-                drop(cache);
 
                 let cache_size =
                     if let ProximityCacheMessage::CacheStateResponse { contracts } = &response {
@@ -228,6 +232,7 @@ impl ProximityCacheManager {
     pub fn neighbors_with_contract(&self, contract_key: &ContractKey) -> Vec<PeerId> {
         let contract_id = contract_key.id();
 
+        let total_neighbors = self.neighbor_caches.len();
         let mut neighbors = Vec::new();
         for entry in self.neighbor_caches.iter() {
             if entry.value().contracts.contains(contract_id) {
@@ -235,23 +240,24 @@ impl ProximityCacheManager {
             }
         }
 
-        if !neighbors.is_empty() {
-            debug!(
-                contract = %contract_key,
-                neighbor_count = neighbors.len(),
-                "PROXIMITY_PROPAGATION: Found neighbors with contract"
-            );
-        }
+        info!(
+            contract = %contract_key,
+            neighbor_count = neighbors.len(),
+            total_neighbors = total_neighbors,
+            neighbors = ?neighbors.iter().map(|p| format!("{:.8}", p)).collect::<Vec<_>>(),
+            "PROXIMITY_PROPAGATION: Query for neighbors with contract"
+        );
 
         neighbors
     }
 
     /// Generate a batch announcement for pending removals (called periodically)
+    #[allow(dead_code)]
     pub async fn generate_batch_announcement(&self) -> Option<ProximityCacheMessage> {
         let mut last_announce = self.last_batch_announce.write().await;
 
         // Only send batch announcements every 30 seconds
-        if last_announce.elapsed() < Duration::from_secs(30) {
+        if last_announce.elapsed() < BATCH_ANNOUNCEMENT_INTERVAL {
             return None;
         }
 
@@ -284,29 +290,32 @@ impl ProximityCacheManager {
     }
 
     /// Get current statistics
+    #[allow(dead_code)]
     pub async fn get_stats(&self) -> ProximityStats {
         self.stats.read().await.clone()
     }
 
     /// Get introspection data for debugging
+    /// Returns (my_cache, neighbor_data) where neighbor_data maps peer IDs to
+    /// (cached contracts, time since last update)
+    #[allow(dead_code)]
     pub async fn get_introspection_data(
         &self,
     ) -> (
         Vec<ContractInstanceId>,
-        HashMap<String, (Vec<ContractInstanceId>, std::time::SystemTime)>,
+        HashMap<String, (Vec<ContractInstanceId>, Duration)>,
     ) {
-        let my_cache = self.my_cache.read().await.iter().cloned().collect();
-        let now = std::time::SystemTime::now();
+        let my_cache = self.my_cache.iter().map(|r| *r.key()).collect();
 
         let mut neighbor_data = HashMap::new();
         for entry in self.neighbor_caches.iter() {
-            // Calculate SystemTime from Instant by subtracting elapsed time from now
-            let last_update_system_time = now - entry.value().last_update.elapsed();
+            // Use elapsed time since last update (monotonic, not affected by system clock changes)
+            let time_since_update = entry.value().last_update.elapsed();
             neighbor_data.insert(
                 entry.key().to_string(), // Convert PeerId to String for introspection
                 (
                     entry.value().contracts.iter().cloned().collect(),
-                    last_update_system_time,
+                    time_since_update,
                 ),
             );
         }
@@ -336,6 +345,7 @@ impl ProximityCacheManager {
     }
 
     /// Get list of all known neighbor peer IDs for sending batch announcements
+    #[allow(dead_code)]
     pub fn get_neighbor_ids(&self) -> Vec<PeerId> {
         self.neighbor_caches
             .iter()
@@ -345,6 +355,7 @@ impl ProximityCacheManager {
 
     /// Create a periodic task for batch announcements that sends through the event loop
     /// This should be spawned as a background task when the node starts
+    #[allow(dead_code)]
     pub fn spawn_periodic_batch_announcements(
         self: Arc<Self>,
         event_loop_notifier: crate::node::EventLoopNotificationsSender,
@@ -353,7 +364,7 @@ impl ProximityCacheManager {
         use crate::config::GlobalExecutor;
 
         GlobalExecutor::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(BATCH_ANNOUNCEMENT_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             info!("PROXIMITY_PROPAGATION: Periodic batch announcement task started");
@@ -424,6 +435,7 @@ impl ProximityCacheManager {
 
     /// Handle peer disconnection by removing them from the neighbor cache
     /// This prevents stale data from accumulating and avoids forwarding updates to disconnected peers
+    #[allow(dead_code)]
     pub fn on_peer_disconnected(&self, peer_id: &PeerId) {
         if let Some((_, removed_cache)) = self.neighbor_caches.remove(peer_id) {
             debug!(
@@ -436,6 +448,7 @@ impl ProximityCacheManager {
 
     /// Cleanup stale neighbor entries based on last_update timestamp
     /// This provides an alternative to explicit disconnect notifications
+    #[allow(dead_code)]
     pub async fn cleanup_stale_neighbors(&self, max_age: Duration) {
         let now = Instant::now();
         let mut removed_count = 0;

@@ -211,6 +211,64 @@ pub(crate) async fn request_get(
     Ok(())
 }
 
+async fn announce_proximity_cache(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    own_peer: &PeerId,
+    tx: &Transaction,
+    context: &'static str,
+) {
+    match op_manager.proximity_cache.on_contract_cached(key).await {
+        Some(announcement) => {
+            tracing::info!(
+                tx = %tx,
+                %key,
+                peer = %own_peer,
+                ?announcement,
+                %context,
+                "PROXIMITY_ANNOUNCEMENT: GET sending BroadcastProximityCache event"
+            );
+            let event = crate::message::NodeEvent::BroadcastProximityCache {
+                from: own_peer.clone(),
+                message: announcement,
+            };
+            match op_manager
+                .to_event_listener
+                .notifications_sender()
+                .send(either::Either::Right(event))
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(
+                        tx = %tx,
+                        %key,
+                        %context,
+                        "PROXIMITY_ANNOUNCEMENT: GET send() succeeded"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        tx = %tx,
+                        %key,
+                        %context,
+                        error = %e,
+                        "PROXIMITY_ANNOUNCEMENT: GET send() failed!"
+                    );
+                }
+            }
+        }
+        None => {
+            tracing::info!(
+                tx = %tx,
+                %key,
+                peer = %own_peer,
+                %context,
+                "PROXIMITY_ANNOUNCEMENT: GET on_contract_cached returned None (already in cache)"
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 enum GetState {
     /// A new petition for a get op received from another peer.
@@ -966,7 +1024,16 @@ impl Operation for GetOp {
                         op_manager.ring.should_seed(&key)
                     };
 
-                    // Put contract locally if needed
+                    tracing::info!(
+                        tx = %id,
+                        %key,
+                        is_original_requester,
+                        subscribe_requested,
+                        should_put,
+                        peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                        "PROXIMITY_ANNOUNCEMENT: GET evaluating whether to cache contract"
+                    );
+
                     if should_put {
                         // First check if the local state matches the incoming state
                         // to avoid triggering validation errors in contracts that implement
@@ -985,12 +1052,11 @@ impl Operation for GetOp {
                                         state: Some(local), ..
                                     }),
                                 ..
-                            }) => {
-                                // Compare the actual state bytes
-                                local.as_ref() == value.as_ref()
-                            }
+                            }) => local.as_ref() == value.as_ref(),
                             _ => false, // No local state or error - we should try to cache
                         };
+
+                        let own_peer = op_manager.ring.connection_manager.get_peer_key().unwrap();
 
                         if state_matches {
                             tracing::debug!(
@@ -998,16 +1064,47 @@ impl Operation for GetOp {
                                 %key,
                                 "Local state matches network state, skipping redundant cache"
                             );
-                            // State already cached and identical, mark as seeded if needed
-                            if !op_manager.ring.is_seeding_contract(&key) {
-                                tracing::debug!(tx = %id, %key, "Marking contract as seeded");
+                            let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
+                            tracing::info!(
+                                tx = %id,
+                                %key,
+                                peer = %own_peer,
+                                is_subscribed_contract,
+                                "PROXIMITY_ANNOUNCEMENT: GET checking if should announce (state match)"
+                            );
+                            if !is_subscribed_contract {
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    peer = %own_peer,
+                                    "Contract not cached @ peer, caching (state match)"
+                                );
                                 op_manager.ring.seed_contract(key);
-                                // Announce to proximity cache that we're caching this contract
-                                op_manager.proximity_cache.on_contract_cached(&key).await;
+                                announce_proximity_cache(
+                                    op_manager,
+                                    &key,
+                                    &own_peer,
+                                    &id,
+                                    "state match",
+                                )
+                                .await;
                                 super::start_subscription_request(op_manager, key).await;
+                            } else {
+                                tracing::info!(
+                                    tx = %id,
+                                    %key,
+                                    peer = %own_peer,
+                                    "PROXIMITY_ANNOUNCEMENT: GET skipping announcement - contract already subscribed (state match)"
+                                );
                             }
                         } else {
-                            tracing::debug!(tx = %id, %key, %is_original_requester, %subscribe_requested, "Putting contract at executor - state differs from local cache");
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                %is_original_requester,
+                                %subscribe_requested,
+                                "Putting contract at executor - state differs from local cache"
+                            );
                             let res = op_manager
                                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
                                     key,
@@ -1022,19 +1119,34 @@ impl Operation for GetOp {
                                     tracing::debug!(tx = %id, %key, "Contract put at executor");
                                     let is_subscribed_contract =
                                         op_manager.ring.is_seeding_contract(&key);
+                                    tracing::info!(
+                                        tx = %id,
+                                        %key,
+                                        peer = %own_peer,
+                                        is_subscribed_contract,
+                                        "PROXIMITY_ANNOUNCEMENT: GET checking if should announce"
+                                    );
 
-                                    // Start subscription if not already seeding
                                     if !is_subscribed_contract {
-                                        tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
+                                        tracing::debug!(
+                                            tx = %id,
+                                            %key,
+                                            peer = %own_peer,
+                                            "Contract not cached @ peer, caching"
+                                        );
                                         op_manager.ring.seed_contract(key);
-
-                                        // Announce to proximity cache that we've cached this contract
-                                        op_manager.proximity_cache.on_contract_cached(&key).await;
-
-                                        let mut new_skip_list = skip_list.clone();
-                                        new_skip_list.insert(sender.peer.clone());
-
+                                        announce_proximity_cache(
+                                            op_manager, &key, &own_peer, &id, "put",
+                                        )
+                                        .await;
                                         super::start_subscription_request(op_manager, key).await;
+                                    } else {
+                                        tracing::info!(
+                                            tx = %id,
+                                            %key,
+                                            peer = %own_peer,
+                                            "PROXIMITY_ANNOUNCEMENT: GET skipping announcement - contract already subscribed"
+                                        );
                                     }
                                 }
                                 ContractHandlerEvent::PutResponse {

@@ -844,6 +844,7 @@ where
             msg = conn_manager.recv() => { msg.map(Either::Left) }
             msg = notification_channel.notifications_receiver.recv() => {
                 if let Some(msg) = msg {
+                    tracing::info!(?msg, "PROXIMITY_ANNOUNCEMENT: Received from notifications channel");
                     Ok(msg)
                 } else {
                     anyhow::bail!("notification channel shutdown, fatal error");
@@ -936,7 +937,42 @@ where
                     unimplemented!()
                 }
                 NodeEvent::BroadcastProximityCache { from, message } => {
-                    tracing::debug!(%from, ?message, "BroadcastProximityCache event in testing_impl - skipping");
+                    tracing::info!(
+                        %from,
+                        ?message,
+                        "PROXIMITY_ANNOUNCEMENT: BroadcastProximityCache event received"
+                    );
+
+                    // Broadcast ProximityCache message to all connected peers (except sender)
+                    use crate::message::{NetMessage, NetMessageV1};
+                    let connected_peers: Vec<_> = op_manager
+                        .ring
+                        .connection_manager
+                        .connected_peers()
+                        .filter(|peer| peer != &from)
+                        .collect();
+
+                    tracing::info!(
+                        %from,
+                        ?message,
+                        peer_count = connected_peers.len(),
+                        peers = ?connected_peers.iter().map(|p| format!("{:.8}", p)).collect::<Vec<_>>(),
+                        "PROXIMITY_ANNOUNCEMENT: Broadcasting ProximityCache to connected peers"
+                    );
+
+                    let msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                        from: from.clone(),
+                        message: message.clone(),
+                    });
+
+                    for peer in &connected_peers {
+                        tracing::info!(%peer, "PROXIMITY_ANNOUNCEMENT: Sending ProximityCache to peer");
+                        if let Err(e) = conn_manager.send(peer, msg.clone()).await {
+                            tracing::warn!(%peer, "Failed to send ProximityCache: {}", e);
+                        } else {
+                            tracing::info!(%peer, "PROXIMITY_ANNOUNCEMENT: Successfully sent ProximityCache to peer");
+                        }
+                    }
                     continue;
                 }
                 NodeEvent::SendMessage { target, msg } => {

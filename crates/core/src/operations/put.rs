@@ -230,6 +230,14 @@ impl Operation for PutOp {
                         .await?;
 
                         // Mark as seeded locally if not already
+                        tracing::info!(
+                            tx = %id,
+                            %key,
+                            peer = %sender.peer,
+                            is_already_seeding = is_already_seeding,
+                            "PROXIMITY_ANNOUNCEMENT: PUT checking if should announce"
+                        );
+
                         if !is_already_seeding {
                             op_manager.ring.seed_contract(key);
                             tracing::debug!(
@@ -239,8 +247,68 @@ impl Operation for PutOp {
                                 "Marked contract as seeding locally"
                             );
 
-                            // Announce to proximity cache that we've cached this contract
-                            op_manager.proximity_cache.on_contract_cached(&key).await;
+                            // Announce to proximity cache that we've cached this contract and broadcast to neighbors
+                            match op_manager.proximity_cache.on_contract_cached(&key).await {
+                                Some(announcement) => {
+                                    tracing::info!(
+                                        tx = %id,
+                                        %key,
+                                        peer = %sender.peer,
+                                        ?announcement,
+                                        "PROXIMITY_ANNOUNCEMENT: PUT sending BroadcastProximityCache event"
+                                    );
+                                    let from =
+                                        op_manager.ring.connection_manager.get_peer_key().unwrap();
+                                    tracing::info!(
+                                        tx = %id,
+                                        %key,
+                                        %from,
+                                        "PROXIMITY_ANNOUNCEMENT: PUT about to call send() on notifications channel"
+                                    );
+                                    match op_manager
+                                        .to_event_listener
+                                        .notifications_sender()
+                                        .send(either::Either::Right(
+                                            crate::message::NodeEvent::BroadcastProximityCache {
+                                                from,
+                                                message: announcement,
+                                            },
+                                        ))
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            tracing::info!(
+                                                tx = %id,
+                                                %key,
+                                                "PROXIMITY_ANNOUNCEMENT: PUT send() succeeded"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                tx = %id,
+                                                %key,
+                                                error = %e,
+                                                "PROXIMITY_ANNOUNCEMENT: PUT send() failed!"
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    tracing::info!(
+                                        tx = %id,
+                                        %key,
+                                        peer = %sender.peer,
+                                        "PROXIMITY_ANNOUNCEMENT: PUT on_contract_cached returned None (already in cache)"
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::info!(
+                                tx = %id,
+                                %key,
+                                peer = %sender.peer,
+                                "PROXIMITY_ANNOUNCEMENT: PUT skipping announcement - contract already seeded"
+                            );
                         }
 
                         tracing::debug!(
