@@ -5,42 +5,73 @@
 //! - WebSocket streams (real-time collection during tests)
 //! - TestEventListener (in-memory collection for unit tests)
 //!
+//! # Architecture Overview
+//!
+//! ## Production Behavior (EventRegister)
+//!
+//! Each node in production runs EventRegister which:
+//! 1. Writes events to its own local AOF file (separated per node)
+//! 2. Optionally reports events to a centralized WebSocket server (Network Monitor)
+//! 3. Continues working even if WebSocket server is unavailable
+//!
+//! This means nodes ALWAYS have separated event logs, just like in production.
+//!
+//! ## WebSocketEventCollector = Centralized Server
+//!
+//! The WebSocketEventCollector is NOT a replacement for EventRegister.
+//! It's a CENTRALIZED SERVER that:
+//! - Listens for WebSocket connections from multiple nodes
+//! - Receives copies of events from each node
+//! - Aggregates them in real-time for debugging during tests
+//!
+//! Each node still:
+//! - Has its own EventRegister instance
+//! - Writes to its own separated AOF file
+//! - Independently reports to the collector
+//!
 //! # Example Usage
 //!
-//! ## Integration Tests with WebSocket
+//! ## Integration Tests with WebSocket (Real-time Aggregation)
 //! ```ignore
-//! // Start WebSocket collector before nodes
-//! let aggregator = EventLogAggregator::with_websocket_collector(55010).await?;
+//! // 1. Start centralized collector BEFORE nodes
+//! let collector = EventLogAggregator::with_websocket_collector(55010).await?;
 //!
-//! // Start nodes (they connect automatically via FDEV_NETWORK_METRICS_SERVER_PORT)
+//! // 2. Configure nodes to report to collector
 //! std::env::set_var("FDEV_NETWORK_METRICS_SERVER_PORT", "55010");
+//!
+//! // 3. Start nodes - each has its own EventRegister + AOF file
+//! //    They will ALSO report to the collector via WebSocket
+//! let (config_a, temp_a) = create_node_config(...).await?;  // Has own AOF
+//! let (config_b, temp_b) = create_node_config(...).await?;  // Has own AOF
 //! let node_a = start_node(config_a).await?;
 //! let node_b = start_node(config_b).await?;
 //!
-//! // Run operations...
+//! // 4. Run operations...
 //! let tx = make_put(&mut client, state, contract).await?;
 //!
-//! // Query transaction flow
-//! let flow = aggregator.get_transaction_flow(&tx).await?;
-//! println!("Transaction flow: {:#?}", flow);
+//! // 5. Query collector DURING test (real-time from WebSocket)
+//! let flow = collector.get_transaction_flow(&tx).await?;
+//! println!("Real-time flow: {:#?}", flow);
 //!
-//! // Export graph
-//! let graph = aggregator.export_mermaid_graph(&tx)?;
-//! println!("{}", graph);
+//! // 6. Can ALSO read from AOF files post-test
+//! let aof_aggregator = TestAggregatorBuilder::new()
+//!     .add_node("node-a", temp_a.path().join("_EVENT_LOG_LOCAL"))
+//!     .add_node("node-b", temp_b.path().join("_EVENT_LOG_LOCAL"))
+//!     .build().await?;
 //! ```
 //!
-//! ## Post-Test AOF Analysis
+//! ## Post-Test AOF Analysis (Recommended for Most Tests)
 //! ```ignore
-//! // After test completes, aggregate from AOF files
+//! // Simpler: Just read AOF files after test completes
+//! // No WebSocket setup needed, behavior identical to production
 //! let aggregator = EventLogAggregator::from_aof_files(vec![
-//!     node_a_temp_dir.path().join("event_log"),
-//!     node_b_temp_dir.path().join("event_log"),
-//!     gateway_temp_dir.path().join("event_log"),
+//!     (node_a_temp_dir.path().join("_EVENT_LOG_LOCAL"), Some("node-a".into())),
+//!     (node_b_temp_dir.path().join("_EVENT_LOG_LOCAL"), Some("node-b".into())),
 //! ]).await?;
 //!
 //! // Analyze
-//! let flow = aggregator.get_transaction_flow(&tx)?;
-//! let routing_path = aggregator.get_routing_path(&tx)?;
+//! let flow = aggregator.get_transaction_flow(&tx).await?;
+//! let routing_path = aggregator.get_routing_path(&tx).await?;
 //! ```
 
 use super::{EventKind, NetLogMessage};
@@ -126,10 +157,53 @@ impl EventSource for AOFEventSource {
     }
 }
 
-/// Event source that collects events via WebSocket in real-time.
+/// Centralized WebSocket server that collects events from multiple nodes in real-time.
 ///
-/// This starts a WebSocket server that nodes can connect to and push events.
-/// Compatible with the existing EventRegister WebSocket client.
+/// # Architecture
+///
+/// This is a **CENTRALIZED SERVER** that runs during tests to aggregate events
+/// from multiple nodes. It does NOT replace EventRegister on nodes.
+///
+/// ## How It Works
+///
+/// 1. **Start collector** before starting any nodes
+/// 2. **Nodes connect** to the collector via WebSocket (port 55010 by default)
+/// 3. **Each node still has** its own EventRegister writing to separated AOF files
+/// 4. **Nodes report copies** of events to the collector in real-time
+/// 5. **Collector aggregates** events from all nodes in memory
+/// 6. **Tests can query** the collector while nodes are running
+///
+/// ## Node Behavior
+///
+/// Each node continues to work exactly like in production:
+/// - Has its own EventRegister instance
+/// - Writes to its own local AOF file (e.g., `/tmp/node_a/.freenet/event_log`)
+/// - Independently connects to the collector WebSocket server
+/// - Sends copies of events to the collector
+/// - Works even if collector is unavailable (falls back to AOF-only)
+///
+/// ## Use Cases
+///
+/// - **Real-time debugging**: Query transaction flows while test is running
+/// - **Live monitoring**: Watch events as they happen across nodes
+/// - **Test assertions**: Verify expected flows before test completes
+///
+/// ## Example
+///
+/// ```ignore
+/// // Start collector
+/// let collector = WebSocketEventCollector::new(55010).await?;
+///
+/// // Tell nodes to report to collector
+/// std::env::set_var("FDEV_NETWORK_METRICS_SERVER_PORT", "55010");
+///
+/// // Start nodes (each with own EventRegister + AOF)
+/// let node_a = start_node(config_a).await?;  // Writes to own AOF + reports to collector
+/// let node_b = start_node(config_b).await?;  // Writes to own AOF + reports to collector
+///
+/// // Query collector in real-time
+/// let events = collector.get_events().await?;
+/// ```
 pub struct WebSocketEventCollector {
     events: Arc<RwLock<Vec<NetLogMessage>>>,
     peer_labels: Arc<RwLock<HashMap<PeerId, String>>>,
@@ -137,10 +211,17 @@ pub struct WebSocketEventCollector {
 }
 
 impl WebSocketEventCollector {
-    /// Create and start a WebSocket event collector.
+    /// Create and start a centralized WebSocket event collector server.
+    ///
+    /// This starts a WebSocket server that listens for connections from nodes.
+    /// Nodes will connect and stream copies of their events to this collector.
     ///
     /// # Arguments
     /// * `port` - Port to listen on (default: 55010)
+    ///
+    /// # Note
+    /// This does NOT replace EventRegister on nodes. Each node still maintains
+    /// its own separated AOF file and EventRegister instance.
     pub async fn new(port: u16) -> Result<Self> {
         let events = Arc::new(RwLock::new(Vec::new()));
         let peer_labels = Arc::new(RwLock::new(HashMap::new()));
@@ -306,16 +387,39 @@ impl EventLogAggregator {
         Ok(Self::new(sources))
     }
 
-    /// Create an aggregator with a WebSocket collector.
+    /// Create an aggregator with a centralized WebSocket collector server.
     ///
-    /// This starts a WebSocket server that nodes can connect to.
-    /// Set `FDEV_NETWORK_METRICS_SERVER_PORT` environment variable to the port.
+    /// This starts a WebSocket server that nodes will connect to and report events.
+    /// Each node still maintains its own EventRegister and AOF file.
+    ///
+    /// # Behavior
+    ///
+    /// - Starts WebSocket server on specified port
+    /// - Nodes connect and stream copies of events
+    /// - Each node still has separated AOF files
+    /// - Collector aggregates events from all nodes in real-time
+    ///
+    /// # Usage
+    ///
+    /// 1. Start collector BEFORE starting nodes
+    /// 2. Set `FDEV_NETWORK_METRICS_SERVER_PORT` environment variable
+    /// 3. Start nodes (they will connect to collector)
+    /// 4. Query aggregator during or after test
     ///
     /// # Example
     /// ```ignore
+    /// // 1. Start collector
     /// let aggregator = EventLogAggregator::with_websocket_collector(55010).await?;
+    ///
+    /// // 2. Configure nodes to report to collector
     /// std::env::set_var("FDEV_NETWORK_METRICS_SERVER_PORT", "55010");
-    /// // Now start your nodes...
+    ///
+    /// // 3. Start nodes (each with own EventRegister + AOF file)
+    /// let node_a = start_node(config_a).await?;
+    /// let node_b = start_node(config_b).await?;
+    ///
+    /// // 4. Query in real-time
+    /// let flow = aggregator.get_transaction_flow(&tx).await?;
     /// ```
     pub async fn with_websocket_collector(port: u16) -> Result<Self> {
         let collector = WebSocketEventCollector::new(port).await?;
