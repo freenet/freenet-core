@@ -302,6 +302,12 @@ impl Ring {
         self.seeding_manager.add_subscriber(contract, subscriber)
     }
 
+    /// Remove a subscriber by peer ID from a specific contract
+    pub fn remove_subscriber(&self, contract: &ContractKey, peer: &PeerId) {
+        self.seeding_manager
+            .remove_subscriber_by_peer(contract, peer)
+    }
+
     pub fn subscribers_of(
         &self,
         contract: &ContractKey,

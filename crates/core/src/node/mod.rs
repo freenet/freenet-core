@@ -802,10 +802,15 @@ async fn process_message_v1<CB>(
                 )
                 .await;
             }
-            NetMessageV1::Unsubscribed { ref key, .. } => {
-                if let Err(error) = subscribe(op_manager, *key, None).await {
-                    tracing::error!(%error, "Failed to subscribe to contract");
-                }
+            NetMessageV1::Unsubscribed {
+                ref key, ref from, ..
+            } => {
+                tracing::debug!(
+                    "Received Unsubscribed message for contract {} from peer {}",
+                    key,
+                    from
+                );
+                op_manager.ring.remove_subscriber(key, from);
                 break;
             }
             _ => break, // Exit the loop if no applicable message type is found
@@ -1018,10 +1023,15 @@ where
                 )
                 .await;
             }
-            NetMessageV1::Unsubscribed { ref key, .. } => {
-                if let Err(error) = subscribe(op_manager, *key, None).await {
-                    tracing::error!(%error, "Failed to subscribe to contract");
-                }
+            NetMessageV1::Unsubscribed {
+                ref key, ref from, ..
+            } => {
+                tracing::debug!(
+                    "Received Unsubscribed message for contract {} from peer {}",
+                    key,
+                    from
+                );
+                op_manager.ring.remove_subscriber(key, from);
                 break;
             }
             _ => break, // Exit the loop if no applicable message type is found
