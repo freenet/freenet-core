@@ -42,59 +42,6 @@ pub fn set_peer_id(peer_id: impl Into<String>) {
     tracing::Span::current().record("test_node", peer_id);
 }
 
-/// Create a span with a peer identifier that will be included in all logs
-/// within the span.
-///
-/// # Example
-/// ```ignore
-/// async fn start_gateway() {
-///     let _span = with_peer_id("gateway");
-///     tracing::info!("Starting gateway");  // Will include test_node="gateway"
-///     // ... gateway initialization
-/// }
-///
-/// async fn start_peer(id: usize) {
-///     let _span = with_peer_id(format!("peer-{}", id));
-///     tracing::info!("Starting peer");  // Will include test_node="peer-N"
-///     // ... peer initialization
-/// }
-/// ```
-///
-/// # Note
-/// The field name `test_node` is used to avoid conflicts with the production
-/// `peer` field which contains the actual cryptographic PeerId.
-///
-/// # Important
-/// The returned guard must be held for the entire duration you want the peer ID
-/// to be active. When the guard is dropped, the span exits.
-#[must_use = "Span guard must be held for the duration of the operation"]
-pub fn with_peer_id(peer_id: impl Into<String>) -> impl Drop {
-    let peer_id = peer_id.into();
-    tracing::info_span!("test_peer", test_node = %peer_id).entered()
-}
-
-/// Execute a function with tracing enabled.
-///
-/// This function is now deprecated in favor of using the `#[test_log::test]` macro
-/// which provides better integration with test frameworks and only shows logs for
-/// failing tests.
-///
-/// # Deprecated
-/// Use `#[test_log::test]` or `#[test_log::test(tokio::test)]` instead.
-#[deprecated(
-    since = "0.1.0",
-    note = "Use #[test_log::test] or #[test_log::test(tokio::test)] instead"
-)]
-pub fn with_tracing<T>(f: impl FnOnce() -> T) -> T {
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_line_number(true)
-        .with_file(true)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .finish();
-    tracing::subscriber::with_default(subscriber, f)
-}
-
 /// Format for test logger output
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -113,16 +60,20 @@ pub enum LogFormat {
 ///
 /// # Peer Identification
 ///
-/// For multi-peer tests, use the `with_peer_id()` function in each async block:
+/// For multi-peer tests, use `.instrument()` to attach isolated spans:
 /// ```ignore
+/// use tracing::Instrument;
+///
 /// let gateway = async {
-///     let _span = with_peer_id("gateway");
 ///     tracing::info!("Gateway starting");
-/// };
+/// }
+/// .instrument(tracing::info_span!("test_peer", test_node = "gateway"));
 /// ```
 ///
 /// # Example
 /// ```ignore
+/// use tracing::Instrument;
+///
 /// #[tokio::test]
 /// async fn my_test() -> anyhow::Result<()> {
 ///     let _logger = TestLogger::new()
@@ -130,11 +81,11 @@ pub enum LogFormat {
 ///         .with_level("debug")
 ///         .init();
 ///
-///     // For multi-peer tests, use with_peer_id() in each async block
+///     // For multi-peer tests, use .instrument() to isolate spans
 ///     let gateway = async {
-///         let _span = with_peer_id("gateway");
 ///         tracing::info!("Gateway starting");
-///     };
+///     }
+///     .instrument(tracing::info_span!("test_peer", test_node = "gateway"));
 ///
 ///     Ok(())
 /// }
@@ -778,7 +729,7 @@ mod test {
     fn test_logger_with_peer_id() {
         let _logger = TestLogger::new().with_level("info").init();
 
-        let _span = with_peer_id("test-peer");
+        let _span = tracing::info_span!("test_peer", test_node = "test-peer").entered();
 
         tracing::info!("Message with peer ID");
     }
@@ -820,7 +771,7 @@ mod test {
     async fn test_logger_async() {
         let _logger = TestLogger::new().with_json().with_level("debug").init();
 
-        let _span = with_peer_id("async-peer");
+        let _span = tracing::info_span!("test_peer", test_node = "async-peer").entered();
 
         tracing::info!("Async test message");
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -836,7 +787,7 @@ mod test {
             .init();
 
         // Create a span with test_node field
-        let _span = with_peer_id("test-gateway");
+        let _span = tracing::info_span!("test_peer", test_node = "test-gateway").entered();
 
         tracing::info!("Message from gateway");
 
