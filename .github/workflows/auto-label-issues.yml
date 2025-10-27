@@ -149,7 +149,7 @@ jobs:
             // Call OpenAI GPT-5 mini API
             const requestBody = JSON.stringify({
               model: 'gpt-5-mini',
-              max_tokens: 1024,
+              max_completion_tokens: 1024,
               response_format: { type: "json_object" },
               messages: [{
                 role: 'system',
@@ -240,17 +240,14 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issueNumber,
-                body: `🤖 **Auto-labeled by GPT-5**
+                body: `🤖 **Auto-labeled**
 
             Applied labels:
             ${confidenceList}
 
             **Reasoning:** ${analysis.reasoning}
 
-            If these labels are incorrect, please update them. This helps improve the auto-labeling system.
-
-            ---
-            <sub>Powered by [GPT-5 mini](https://openai.com/index/introducing-gpt-5-for-developers/) | [Workflow](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main/.github/workflows/auto-label-issues.yml)</sub>`
+            If these labels are incorrect, please update them. This helps improve the auto-labeling system.`
               });
 
               console.log('Successfully applied labels and posted comment');
