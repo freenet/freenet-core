@@ -1148,6 +1148,8 @@ async fn test_multiple_clients_subscription() -> TestResult {
             }
         }
 
+        tracing::info!("All clients subscribed, proceeding with UPDATE operation");
+
         // Create a new to-do list by deserializing the current state, adding a task, and serializing it back
         let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())
             .unwrap_or_else(|_| test_utils::TodoList {
