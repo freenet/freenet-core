@@ -6,7 +6,7 @@ use freenet::{
     server::serve_gateway,
     test_utils::{
         self, load_delegate, make_get, make_put, make_subscribe, make_update,
-        verify_contract_exists, with_peer_id, TestLogger,
+        verify_contract_exists, TestLogger,
     },
 };
 use freenet_stdlib::{
@@ -170,7 +170,6 @@ async fn test_put_contract() -> TestResult {
 
     std::mem::drop(ws_api_port_socket_a); // Free the port so it does not fail on initialization
     let node_a = async move {
-        let _span = with_peer_id("peer-a");
         tracing::info!("Starting peer A node");
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -180,12 +179,12 @@ async fn test_put_contract() -> TestResult {
         tracing::info!("Peer A node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "peer-a"))
     .boxed_local();
 
     std::mem::drop(network_socket_b); // Free the port so it does not fail on initialization
     std::mem::drop(ws_api_port_socket_b);
     let node_b = async {
-        let _span = with_peer_id("gateway");
         tracing::info!("Starting gateway node");
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -195,6 +194,7 @@ async fn test_put_contract() -> TestResult {
         tracing::info!("Gateway node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "gateway"))
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(180), async {
@@ -586,7 +586,6 @@ async fn test_put_merge_persists_state() -> TestResult {
     // Start node A (peer)
     std::mem::drop(ws_api_port_socket_a);
     let node_a = async move {
-        let _span = with_peer_id("peer-a");
         tracing::info!("Starting peer A node");
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -596,13 +595,13 @@ async fn test_put_merge_persists_state() -> TestResult {
         tracing::info!("Peer A node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "peer-a"))
     .boxed_local();
 
     // Start node B (gateway)
     std::mem::drop(network_socket_b);
     std::mem::drop(ws_api_port_socket_b);
     let node_b = async {
-        let _span = with_peer_id("gateway");
         tracing::info!("Starting gateway node");
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -612,6 +611,7 @@ async fn test_put_merge_persists_state() -> TestResult {
         tracing::info!("Gateway node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "gateway"))
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(180), async {
@@ -868,7 +868,6 @@ async fn test_multiple_clients_subscription() -> TestResult {
 
     // Start node A (first client)
     let node_a = async move {
-        let _span = with_peer_id("node-a");
         tracing::info!("Starting node A");
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -878,11 +877,11 @@ async fn test_multiple_clients_subscription() -> TestResult {
         tracing::info!("Node A running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "node-a"))
     .boxed_local();
 
     // Start GW node
     let node_gw = async {
-        let _span = with_peer_id("gateway");
         tracing::info!("Starting gateway node");
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -892,11 +891,11 @@ async fn test_multiple_clients_subscription() -> TestResult {
         tracing::info!("Gateway node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "gateway"))
     .boxed_local();
 
     // Start node B (second client)
     let node_b = async {
-        let _span = with_peer_id("node-b");
         tracing::info!("Starting node B");
         let config = config_b.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -906,6 +905,7 @@ async fn test_multiple_clients_subscription() -> TestResult {
         tracing::info!("Node B running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "node-b"))
     .boxed_local();
 
     let test = tokio::time::timeout(Duration::from_secs(600), async {
