@@ -2,6 +2,16 @@
 //!
 //! This test shows how to use the EventLogAggregator to correlate transactions
 //! across multiple nodes for debugging purposes.
+//!
+//! # Architecture
+//!
+//! Each node in this test:
+//! - Has its own EventRegister instance
+//! - Writes to its own separated AOF file (just like production)
+//! - Works independently
+//!
+//! The aggregator reads these separated AOF files after the test completes
+//! and correlates events across nodes.
 
 use anyhow::Result as TestResult;
 use freenet::{
@@ -109,11 +119,19 @@ fn gw_config(public_port: u16, path: &std::path::Path) -> anyhow::Result<freenet
 
 /// Example integration test showing event log aggregation.
 ///
-/// This test:
-/// 1. Starts multiple nodes (gateway + 2 client nodes)
-/// 2. Performs a PUT operation
-/// 3. Collects event logs from all nodes after test completion
-/// 4. Uses EventLogAggregator to analyze the transaction flow
+/// This test demonstrates the AOF-based aggregation mode (Mode 1 - recommended).
+///
+/// Architecture:
+/// - Each node has its own EventRegister writing to separated AOF files
+/// - This matches production behavior exactly
+/// - After test completes, we read all AOF files and aggregate them
+///
+/// Steps:
+/// 1. Start multiple nodes (gateway + 1 client node)
+/// 2. Each node writes to its own separated AOF file
+/// 3. Perform a PUT operation
+/// 4. After test completes, collect event logs from all nodes
+/// 5. Use EventLogAggregator to analyze the transaction flow across nodes
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore] // Run with --ignored flag to execute
 async fn test_put_operation_with_event_aggregation() -> TR {

@@ -9,6 +9,65 @@ The Event Log Aggregator provides a powerful system for correlating transactions
 - **Understanding network behavior** - Visualize message routing and timing
 - **Test assertions** - Verify expected transaction flows
 
+## Important: Node Event Storage Architecture
+
+### Each Node Has Separated Event Logs (Always)
+
+**In ALL scenarios (production, tests, unit tests with EventRegister), each node maintains its own separated event log:**
+
+- Node A: `/path/to/node_a/.freenet/event_log`
+- Node B: `/path/to/node_b/.freenet/event_log`
+- Gateway: `/path/to/gateway/.freenet/event_log`
+
+**This separation is identical to production behavior.**
+
+### EventRegister = Per-Node Component
+
+Each node runs its own `EventRegister` instance which:
+1. **Writes to local AOF file** - Separated per node, survives crashes
+2. **Optionally reports to WebSocket server** - Centralized aggregation (Network Monitor or test collector)
+3. **Works independently** - Continues even if WebSocket unavailable
+
+```
+┌─────────────┐         ┌─────────────┐         ┌─────────────┐
+│   Node A    │         │   Node B    │         │  Gateway    │
+├─────────────┤         ├─────────────┤         ├─────────────┤
+│EventRegister│         │EventRegister│         │EventRegister│
+│     ↓       │         │     ↓       │         │     ↓       │
+│  AOF File   │         │  AOF File   │         │  AOF File   │
+│(separated)  │         │(separated)  │         │(separated)  │
+│     ↓       │         │     ↓       │         │     ↓       │
+│ WebSocket   │────────>│ WebSocket   │────────>│ WebSocket   │
+│   Client    │    ╲    │   Client    │    │    │   Client    │
+└─────────────┘     ╲   └─────────────┘    │    └─────────────┘
+                     ╲                      │
+                      ╲                     │
+                       ↘                    ↓
+                    ┌──────────────────────────────┐
+                    │ WebSocket Collector (Server) │
+                    │   Centralized Aggregation    │
+                    └──────────────────────────────┘
+```
+
+### WebSocketEventCollector = Centralized Server
+
+The `WebSocketEventCollector` is **NOT a replacement** for `EventRegister`.
+It's a **CENTRALIZED SERVER** that:
+
+- Runs in the test harness (not on nodes)
+- Listens for connections from multiple nodes
+- Receives **copies** of events from each node
+- Aggregates events in real-time for test queries
+
+**Nodes continue to work exactly like production:**
+- Each has its own EventRegister
+- Each writes to its own separated AOF file
+- Each independently reports to the collector (optional)
+
+### Unit Tests Exception: SimNetwork
+
+**Only in unit tests using SimNetwork**, all nodes share a single `TestEventListener` for performance (no file I/O). This is a special case for fast in-memory testing.
+
 ## Architecture
 
 ```
@@ -78,28 +137,40 @@ async fn test_with_event_aggregation() -> TestResult {
 
 ### Mode 2: WebSocket Real-Time Collection (Advanced)
 
-For real-time event collection during test execution:
+For real-time event collection during test execution. **Important**: Each node still maintains its own EventRegister and separated AOF file. The WebSocket collector is a centralized server that receives copies of events.
 
 ```rust
 use freenet::tracing::EventLogAggregator;
 
 #[tokio::test]
 async fn test_with_realtime_aggregation() -> TestResult {
-    // Start WebSocket collector BEFORE nodes
+    // 1. Start centralized WebSocket collector BEFORE nodes
     let aggregator = EventLogAggregator::with_websocket_collector(55010).await?;
 
-    // Set environment variable so nodes connect to collector
+    // 2. Configure nodes to report to collector
     std::env::set_var("FDEV_NETWORK_METRICS_SERVER_PORT", "55010");
 
-    // Start nodes (they will automatically connect to collector)
+    // 3. Start nodes
+    //    Each node will have:
+    //    - Its own EventRegister instance
+    //    - Its own separated AOF file (e.g., /tmp/node_a/.freenet/event_log)
+    //    - A WebSocket client that reports to the collector
+    let (config_a, temp_a) = base_node_test_config(...).await?;  // Has own AOF
+    let (config_b, temp_b) = base_node_test_config(...).await?;  // Has own AOF
     let node_a = start_node(config_a).await?;
     let node_b = start_node(config_b).await?;
 
-    // Run operations...
+    // 4. Run operations...
     let tx = make_put(&mut client, state, contract).await?;
 
-    // Query aggregator in real-time
+    // 5. Query aggregator in real-time (from WebSocket collector)
     let flow = aggregator.get_transaction_flow(&tx).await?;
+
+    // 6. Can ALSO read from separated AOF files post-test
+    let aof_aggregator = TestAggregatorBuilder::new()
+        .add_node("node-a", temp_a.path().join("_EVENT_LOG_LOCAL"))
+        .add_node("node-b", temp_b.path().join("_EVENT_LOG_LOCAL"))
+        .build().await?;
 
     Ok(())
 }
@@ -212,10 +283,12 @@ graph TD
 
 ### Integration Tests
 
-1. **Use AOF mode** (Mode 1) for integration tests - it's simpler and more reliable
-2. **Keep temp directories** until after aggregation
-3. **Add meaningful node labels** for easier debugging
-4. **Export graphs** for failed tests to understand what went wrong
+1. **Use AOF mode** (Mode 1) for most integration tests - it's simpler and more reliable
+2. **Nodes always have separated AOF files** - This matches production behavior exactly
+3. **WebSocket mode is optional** - Use it for real-time debugging, but AOF-only is sufficient
+4. **Keep temp directories** until after aggregation
+5. **Add meaningful node labels** for easier debugging
+6. **Export graphs** for failed tests to understand what went wrong
 
 ```rust
 let aggregator = TestAggregatorBuilder::new()
