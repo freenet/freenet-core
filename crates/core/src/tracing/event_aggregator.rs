@@ -81,19 +81,34 @@ use chrono::{DateTime, Utc};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 
-/// A source of network events that can be queried by the aggregator.
+/// Enum representing different types of event sources.
 ///
-/// This trait abstracts over different event sources:
-/// - AOF files (historical events from disk)
-/// - WebSocket streams (real-time events during test execution)
-/// - TestEventListener (in-memory events from unit tests)
-#[async_trait::async_trait]
-pub trait EventSource: Send + Sync {
+/// This enum provides a concrete type that can use native async fn
+/// without requiring trait objects (which are not dyn-compatible with async fn).
+///
+/// Variants:
+/// - Aof: Historical events from disk files
+/// - WebSocket: Real-time events during test execution
+/// - TestListener: In-memory events from unit tests
+#[derive(Clone)]
+pub enum EventSourceType {
+    Aof(AOFEventSource),
+    WebSocket(Arc<WebSocketEventCollector>),
+    TestListener(TestEventListenerSource),
+}
+
+impl EventSourceType {
     /// Get all events collected by this source.
-    async fn get_events(&self) -> Result<Vec<NetLogMessage>>;
+    pub async fn get_events(&self) -> Result<Vec<NetLogMessage>> {
+        match self {
+            Self::Aof(source) => source.get_events().await,
+            Self::WebSocket(source) => source.get_events().await,
+            Self::TestListener(source) => source.get_events().await,
+        }
+    }
 
     /// Get events for a specific transaction.
-    async fn get_events_for_transaction(&self, tx: &Transaction) -> Result<Vec<NetLogMessage>> {
+    pub async fn get_events_for_transaction(&self, tx: &Transaction) -> Result<Vec<NetLogMessage>> {
         let all_events = self.get_events().await?;
         Ok(all_events
             .into_iter()
@@ -102,12 +117,17 @@ pub trait EventSource: Send + Sync {
     }
 
     /// Get a human-readable label for this source (e.g., "node-a", "gateway").
-    fn get_label(&self) -> Option<String> {
-        None
+    pub fn get_label(&self) -> Option<String> {
+        match self {
+            Self::Aof(source) => source.get_label(),
+            Self::WebSocket(_) => None,
+            Self::TestListener(_) => None,
+        }
     }
 }
 
 /// Event source that reads from AOF (append-only file) logs.
+#[derive(Clone)]
 pub struct AOFEventSource {
     path: PathBuf,
     label: Option<String>,
@@ -127,10 +147,7 @@ impl AOFEventSource {
             cached_events: Arc::new(RwLock::new(None)),
         }
     }
-}
 
-#[async_trait::async_trait]
-impl EventSource for AOFEventSource {
     async fn get_events(&self) -> Result<Vec<NetLogMessage>> {
         // Check cache first
         {
@@ -301,16 +318,14 @@ impl WebSocketEventCollector {
     pub fn port(&self) -> u16 {
         self.port
     }
-}
 
-#[async_trait::async_trait]
-impl EventSource for WebSocketEventCollector {
     async fn get_events(&self) -> Result<Vec<NetLogMessage>> {
         Ok(self.events.read().await.clone())
     }
 }
 
 /// Event source that wraps a TestEventListener for unit tests.
+#[derive(Clone)]
 pub struct TestEventListenerSource {
     listener: Arc<super::TestEventListener>,
 }
@@ -320,10 +335,7 @@ impl TestEventListenerSource {
     pub fn new(listener: Arc<super::TestEventListener>) -> Self {
         Self { listener }
     }
-}
 
-#[async_trait::async_trait]
-impl EventSource for TestEventListenerSource {
     async fn get_events(&self) -> Result<Vec<NetLogMessage>> {
         let logs = self.listener.logs.lock().await;
         Ok(logs.clone())
@@ -356,13 +368,13 @@ pub struct RoutingPath {
 
 /// Main aggregator that collects and correlates events from multiple sources.
 pub struct EventLogAggregator {
-    sources: Vec<Box<dyn EventSource>>,
+    sources: Vec<EventSourceType>,
     cached_events: Arc<RwLock<Option<Vec<NetLogMessage>>>>,
 }
 
 impl EventLogAggregator {
     /// Create a new aggregator from multiple event sources.
-    pub fn new(sources: Vec<Box<dyn EventSource>>) -> Self {
+    pub fn new(sources: Vec<EventSourceType>) -> Self {
         Self {
             sources,
             cached_events: Arc::new(RwLock::new(None)),
@@ -374,14 +386,14 @@ impl EventLogAggregator {
     /// # Example
     /// ```ignore
     /// let aggregator = EventLogAggregator::from_aof_files(vec![
-    ///     PathBuf::from("/tmp/node_a/event_log"),
-    ///     PathBuf::from("/tmp/node_b/event_log"),
+    ///     (PathBuf::from("/tmp/node_a/event_log"), Some("node-a".into())),
+    ///     (PathBuf::from("/tmp/node_b/event_log"), Some("node-b".into())),
     /// ]).await?;
     /// ```
     pub async fn from_aof_files(paths: Vec<(PathBuf, Option<String>)>) -> Result<Self> {
-        let sources: Vec<Box<dyn EventSource>> = paths
+        let sources: Vec<EventSourceType> = paths
             .into_iter()
-            .map(|(path, label)| Box::new(AOFEventSource::new(path, label)) as Box<dyn EventSource>)
+            .map(|(path, label)| EventSourceType::Aof(AOFEventSource::new(path, label)))
             .collect();
 
         Ok(Self::new(sources))
@@ -422,13 +434,15 @@ impl EventLogAggregator {
     /// let flow = aggregator.get_transaction_flow(&tx).await?;
     /// ```
     pub async fn with_websocket_collector(port: u16) -> Result<Self> {
-        let collector = WebSocketEventCollector::new(port).await?;
-        Ok(Self::new(vec![Box::new(collector)]))
+        let collector = Arc::new(WebSocketEventCollector::new(port).await?);
+        Ok(Self::new(vec![EventSourceType::WebSocket(collector)]))
     }
 
     /// Create an aggregator from a TestEventListener (for unit tests).
     pub fn from_test_listener(listener: Arc<super::TestEventListener>) -> Self {
-        Self::new(vec![Box::new(TestEventListenerSource::new(listener))])
+        Self::new(vec![EventSourceType::TestListener(
+            TestEventListenerSource::new(listener),
+        )])
     }
 
     /// Get all events from all sources.

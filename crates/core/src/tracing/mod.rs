@@ -25,7 +25,7 @@ pub(crate) use test::TestEventListener;
 
 // Re-export for use in tests
 pub use event_aggregator::{
-    EventLogAggregator, EventSource, RoutingPath, TransactionFlowEvent, AOFEventSource,
+    AOFEventSource, EventLogAggregator, EventSourceType, RoutingPath, TransactionFlowEvent,
     WebSocketEventCollector,
 };
 
@@ -385,11 +385,11 @@ impl<'a> NetEventLog<'a> {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub(crate) struct NetLogMessage {
-    pub(crate) tx: Transaction,
-    pub(crate) datetime: DateTime<Utc>,
-    pub(crate) peer_id: PeerId,
-    pub(crate) kind: EventKind,
+pub struct NetLogMessage {
+    pub tx: Transaction,
+    pub datetime: DateTime<Utc>,
+    pub peer_id: PeerId,
+    pub kind: EventKind,
 }
 
 impl NetLogMessage {
@@ -1111,7 +1111,7 @@ mod opentelemetry_tracer {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
 // todo: make this take by ref instead, probably will need an owned version
-enum EventKind {
+pub enum EventKind {
     Connect(ConnectEvent),
     Put(PutEvent),
     // todo: make this a sequence like Put

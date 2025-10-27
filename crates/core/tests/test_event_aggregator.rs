@@ -13,31 +13,27 @@
 //! The aggregator reads these separated AOF files after the test completes
 //! and correlates events across nodes.
 
-use anyhow::Result as TestResult;
 use freenet::{
-    config::{ConfigArgs, NetworkArgs, SecretArgs, WebsocketApiArgs},
+    config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
     test_utils::{
-        load_contract, make_put, make_subscribe, with_peer_id, NodeLogInfo,
-        TestAggregatorBuilder, TestLogger,
+        load_contract, make_put, with_peer_id, TestAggregatorBuilder, TestLogger,
     },
     tracing::EventLogAggregator,
 };
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
 use futures::FutureExt;
-use rand::{random, Rng, SeedableRng};
+use rand::{Rng, SeedableRng};
 use std::{
     net::{Ipv4Addr, TcpListener},
-    path::PathBuf,
     sync::{LazyLock, Mutex},
     time::Duration,
 };
-use testresult::TestResult as TR;
 use tokio::select;
 use tokio_tungstenite::connect_async;
 
@@ -87,16 +83,13 @@ async fn base_node_test_config(
             bandwidth_limit: None,
             blocked_addresses: None,
         },
-        config_paths: {
-            freenet::config::ConfigPathsArgs {
-                config_dir: Some(temp_dir.path().to_path_buf()),
-                contracts_dir: None,
-                delegates_dir: None,
-                secrets_dir: None,
-            }
+        config_paths: freenet::config::ConfigPathsArgs {
+            config_dir: Some(temp_dir.path().to_path_buf()),
+            data_dir: Some(temp_dir.path().to_path_buf()),
         },
-        secret_config: SecretArgs {
-            transport_keypair: transport_keypair.to_string_lossy().to_string(),
+        secrets: SecretArgs {
+            transport_keypair: Some(transport_keypair),
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -104,15 +97,15 @@ async fn base_node_test_config(
     Ok((config, PresetConfig { temp_dir }))
 }
 
-fn gw_config(public_port: u16, path: &std::path::Path) -> anyhow::Result<freenet::config::GatewayConfig> {
-    let config = freenet::config::GatewayConfig {
-        public_port,
-        address: Ipv4Addr::LOCALHOST.into(),
-        public_key: {
-            let key_path = path.join("public.pem");
-            let key_data = std::fs::read_to_string(key_path)?;
-            key_data
-        },
+fn gw_config(
+    public_port: u16,
+    path: &std::path::Path,
+    location: f64,
+) -> anyhow::Result<InlineGwConfig> {
+    let config = InlineGwConfig {
+        address: (Ipv4Addr::LOCALHOST, public_port).into(),
+        location: Some(location),
+        public_key_path: path.join("public.pem"),
     };
     Ok(config)
 }
@@ -134,7 +127,7 @@ fn gw_config(public_port: u16, path: &std::path::Path) -> anyhow::Result<freenet
 /// 5. Use EventLogAggregator to analyze the transaction flow across nodes
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore] // Run with --ignored flag to execute
-async fn test_put_operation_with_event_aggregation() -> TR {
+async fn test_put_operation_with_event_aggregation() -> anyhow::Result<()> {
     // Initialize test logger
     let _logger = TestLogger::new()
         .with_json()
@@ -147,8 +140,7 @@ async fn test_put_operation_with_event_aggregation() -> TR {
     let contract_key = contract.key();
 
     // Create initial state
-    let initial_state = freenet_stdlib::prelude::State::from(vec![]);
-    let wrapped_state = WrappedState::from(initial_state);
+    let wrapped_state = WrappedState::from(vec![]);
 
     // Create network sockets
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
@@ -165,8 +157,9 @@ async fn test_put_operation_with_event_aggregation() -> TR {
         )
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
+        let location = cfg.network_api.location.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config(public_port, &path)?)
+        (cfg, preset, gw_config(public_port, &path, location)?)
     };
 
     // Configure client node A
@@ -231,7 +224,7 @@ async fn test_put_operation_with_event_aggregation() -> TR {
         make_put(&mut client_api, wrapped_state.clone(), contract.clone(), false).await?;
 
         // Wait for put response
-        let put_tx = loop {
+        let _put_tx = loop {
             let resp = tokio::time::timeout(Duration::from_secs(30), client_api.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
