@@ -422,7 +422,7 @@ create_release_pr() {
         run_cmd "Creating release branch" git checkout -b "$branch_name"
     fi
 
-    run_cmd "Committing version bump" git commit -m "chore: bump versions to $VERSION
+    run_cmd "Committing version bump" git commit -m "build: bump versions to $VERSION
 
 - freenet: → $VERSION
 - fdev: → $FDEV_VERSION
@@ -433,7 +433,7 @@ create_release_pr() {
     
     echo -n "  Creating auto-merge PR... "
     pr_number=$(gh pr create \
-        --title "chore: release $VERSION" \
+        --title "build: release $VERSION" \
         --body "**Automated release PR**
 
 - freenet: → **$VERSION**  
