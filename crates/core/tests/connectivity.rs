@@ -4,7 +4,7 @@ use freenet::{
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{self, make_get, make_put, with_peer_id},
+    test_utils::{self, make_get, make_put},
 };
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
@@ -20,6 +20,7 @@ use std::{
 use testresult::TestResult;
 use tokio::select;
 use tokio_tungstenite::connect_async;
+use tracing::Instrument;
 
 static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
     Mutex::new(rand::rngs::StdRng::from_seed(
@@ -144,7 +145,6 @@ async fn test_gateway_reconnection() -> TestResult {
 
     // Start gateway node with peer identification
     let gateway = async {
-        let _span = with_peer_id("gateway");
         tracing::info!("Starting gateway node");
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -154,11 +154,11 @@ async fn test_gateway_reconnection() -> TestResult {
         tracing::info!("Gateway node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "gateway"))
     .boxed_local();
 
     // Start peer node with peer identification
     let peer = async move {
-        let _span = with_peer_id("peer-1");
         tracing::info!("Starting peer node");
         let config = peer_config.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -168,6 +168,7 @@ async fn test_gateway_reconnection() -> TestResult {
         tracing::info!("Peer node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "peer-1"))
     .boxed_local();
 
     // Main test logic
@@ -374,7 +375,6 @@ async fn test_basic_gateway_connectivity() -> TestResult {
 
     // Start the gateway node with peer identification
     let gateway = async {
-        let _span = with_peer_id("gateway");
         tracing::info!("Starting gateway node");
         let config = config.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -384,6 +384,7 @@ async fn test_basic_gateway_connectivity() -> TestResult {
         tracing::info!("Gateway node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "gateway"))
     .boxed_local();
 
     // Test logic
@@ -646,7 +647,6 @@ async fn test_three_node_network_connectivity() -> TestResult {
 
     // Start gateway node with peer identification
     let gateway = async {
-        let _span = with_peer_id("gateway");
         tracing::info!("Starting gateway node");
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -656,11 +656,11 @@ async fn test_three_node_network_connectivity() -> TestResult {
         tracing::info!("Gateway node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "gateway"))
     .boxed_local();
 
     // Start first peer node with peer identification
     let peer1 = async move {
-        let _span = with_peer_id("peer-1");
         tokio::time::sleep(Duration::from_secs(5)).await;
         tracing::info!("Starting peer 1 node");
         let config = peer1_config.build().await?;
@@ -671,11 +671,11 @@ async fn test_three_node_network_connectivity() -> TestResult {
         tracing::info!("Peer 1 node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "peer-1"))
     .boxed_local();
 
     // Start second peer node with peer identification
     let peer2 = async move {
-        let _span = with_peer_id("peer-2");
         tokio::time::sleep(Duration::from_secs(10)).await;
         tracing::info!("Starting peer 2 node");
         let config = peer2_config.build().await?;
@@ -686,6 +686,7 @@ async fn test_three_node_network_connectivity() -> TestResult {
         tracing::info!("Peer 2 node running");
         node.run().await
     }
+    .instrument(tracing::info_span!("test_peer", test_node = "peer-2"))
     .boxed_local();
 
     // Main test logic
