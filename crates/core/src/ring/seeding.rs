@@ -140,11 +140,124 @@ impl SeedingManager {
         });
     }
 
+    /// Remove a subscriber by peer ID from a specific contract
+    pub fn remove_subscriber_by_peer(&self, contract: &ContractKey, peer: &crate::node::PeerId) {
+        if let Some(mut subs) = self.subscribers.get_mut(contract) {
+            if let Some(pos) = subs.iter().position(|l| &l.peer == peer) {
+                subs.swap_remove(pos);
+                tracing::debug!(
+                    "Removed peer {} from subscriber list for contract {}",
+                    peer,
+                    contract
+                );
+            }
+        }
+    }
+
     /// Get all subscriptions across all contracts
     pub fn all_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
         self.subscribers
             .iter()
             .map(|entry| (*entry.key(), entry.value().clone()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::PeerId;
+    use crate::transport::TransportKeypair;
+    use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    // Helper to create test PeerIds without expensive key generation
+    fn test_peer_id(id: u8) -> PeerId {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, id)), 1000 + id as u16);
+        let pub_key = TransportKeypair::new().public().clone();
+        PeerId::new(addr, pub_key)
+    }
+
+    #[test]
+    fn test_remove_subscriber_by_peer() {
+        let seeding_manager = SeedingManager::new();
+        let contract_key = ContractKey::from(ContractInstanceId::new([1u8; 32]));
+
+        // Create test peers
+        let peer1 = test_peer_id(1);
+        let peer2 = test_peer_id(2);
+        let peer3 = test_peer_id(3);
+
+        let peer_loc1 = PeerKeyLocation {
+            peer: peer1.clone(),
+            location: Some(Location::try_from(0.1).unwrap()),
+        };
+        let peer_loc2 = PeerKeyLocation {
+            peer: peer2.clone(),
+            location: Some(Location::try_from(0.2).unwrap()),
+        };
+        let peer_loc3 = PeerKeyLocation {
+            peer: peer3.clone(),
+            location: Some(Location::try_from(0.3).unwrap()),
+        };
+
+        // Add subscribers
+        assert!(seeding_manager
+            .add_subscriber(&contract_key, peer_loc1.clone())
+            .is_ok());
+        assert!(seeding_manager
+            .add_subscriber(&contract_key, peer_loc2.clone())
+            .is_ok());
+        assert!(seeding_manager
+            .add_subscriber(&contract_key, peer_loc3.clone())
+            .is_ok());
+
+        // Verify all subscribers are present
+        {
+            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
+            assert_eq!(subs.len(), 3);
+        }
+
+        // Remove peer2
+        seeding_manager.remove_subscriber_by_peer(&contract_key, &peer2);
+
+        // Verify peer2 was removed
+        {
+            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
+            assert_eq!(subs.len(), 2);
+            assert!(!subs.iter().any(|p| p.peer == peer2));
+            assert!(subs.iter().any(|p| p.peer == peer1));
+            assert!(subs.iter().any(|p| p.peer == peer3));
+        }
+
+        // Remove peer1
+        seeding_manager.remove_subscriber_by_peer(&contract_key, &peer1);
+
+        // Verify peer1 was removed
+        {
+            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
+            assert_eq!(subs.len(), 1);
+            assert!(!subs.iter().any(|p| p.peer == peer1));
+            assert!(subs.iter().any(|p| p.peer == peer3));
+        }
+
+        // Remove non-existent peer (should not error)
+        seeding_manager.remove_subscriber_by_peer(&contract_key, &peer2);
+
+        // Verify count unchanged
+        {
+            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
+            assert_eq!(subs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_remove_subscriber_from_nonexistent_contract() {
+        let seeding_manager = SeedingManager::new();
+        let contract_key = ContractKey::from(ContractInstanceId::new([2u8; 32]));
+        let peer = test_peer_id(1);
+
+        // Should not panic when removing from non-existent contract
+        seeding_manager.remove_subscriber_by_peer(&contract_key, &peer);
     }
 }
