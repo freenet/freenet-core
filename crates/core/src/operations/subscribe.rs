@@ -101,31 +101,20 @@ pub(crate) async fn request_subscribe(
                         tracing::debug!(%key, tx = %id, subscriber = %subscriber.peer, "Successfully registered local subscriber");
                     }
 
-                    // Only notify client if this is a top-level operation (not a sub-operation)
-                    // Sub-operations complete silently and their parent handles client notification
-                    if sub_op.id.parent_id().is_none() {
-                        tracing::debug!(%id, "Top-level subscribe operation, notifying client");
-                        match op_manager
-                            .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
-                                tx: *id,
-                                key: *key,
-                                subscribed: true,
-                            })
-                            .await
-                        {
-                            Ok(()) => {
-                                tracing::info!(%key, tx = %id, "Successfully sent LocalSubscribeComplete event to client")
-                            }
-                            Err(e) => {
-                                tracing::error!(%key, tx = %id, error = %e, "Failed to send LocalSubscribeComplete event")
-                            }
+                    match op_manager
+                        .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
+                            tx: *id,
+                            key: *key,
+                            subscribed: true,
+                        })
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::debug!(%key, tx = %id, "sent LocalSubscribeComplete event")
                         }
-                    } else {
-                        tracing::debug!(
-                            %id,
-                            parent = ?sub_op.id.parent_id(),
-                            "Sub-operation subscribe completing silently (no client notification)"
-                        );
+                        Err(e) => {
+                            tracing::error!(%key, tx = %id, error = %e, "failed to send LocalSubscribeComplete event")
+                        }
                     }
 
                     // Mark subscription as completed for atomicity tracking

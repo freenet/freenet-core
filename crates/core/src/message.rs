@@ -35,9 +35,8 @@ use ulid::Ulid;
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Transaction {
     id: Ulid,
-    /// Optional parent transaction ID for hierarchical sub-operations.
-    /// When a transaction spawns child operations (e.g., PUT spawning SUBSCRIBE),
-    /// this field tracks the parent-child relationship for atomicity guarantees.
+    /// Parent transaction ID for child operations spawned by this transaction.
+    /// Enables atomicity tracking for composite operations (e.g., PUT with SUBSCRIBE).
     parent: Option<Ulid>,
 }
 
@@ -53,18 +52,22 @@ impl Transaction {
         Self::update(ty.0, id, None)
     }
 
-    /// Create a new child transaction linked to a parent.
-    /// The child inherits the transaction type specified, while maintaining
-    /// a reference to its parent for atomicity tracking.
+    /// Creates a child transaction with the specified type, linked to the parent
+    /// for atomicity tracking in composite operations.
     pub(crate) fn new_child_of<T: TxType>(parent: &Transaction) -> Self {
         let ty = <T as TxType>::tx_type_id();
         let id = Ulid::new();
         Self::update(ty.0, id, Some(parent.id))
     }
 
-    /// Get the parent transaction ID, if this is a sub-operation.
+    /// Returns the parent transaction ID for child operations.
     pub fn parent_id(&self) -> Option<&Ulid> {
         self.parent.as_ref()
+    }
+
+    /// Returns true if this transaction is a child operation.
+    pub fn is_sub_operation(&self) -> bool {
+        self.parent.is_some()
     }
 
     pub(crate) fn transaction_type(&self) -> TransactionType {

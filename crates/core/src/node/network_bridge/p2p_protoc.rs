@@ -798,30 +798,22 @@ impl P2pConnManager {
                                 key,
                                 subscribed,
                             } => {
-                                tracing::info!("Received LocalSubscribeComplete event for transaction: {tx}, contract: {key}");
+                                tracing::debug!(%tx, %key, "local subscribe complete");
 
-                                // Defensive check: this should only be called for top-level operations
-                                // Sub-operations should not send client notifications
                                 if !op_manager.is_sub_operation(tx) {
-                                    // Deliver SubscribeResponse to client via result router
-                                    tracing::debug!("Sending SubscribeResponse to result router for transaction: {tx}");
                                     let response = Ok(HostResponse::ContractResponse(
                                         ContractResponse::SubscribeResponse { key, subscribed },
                                     ));
 
                                     match op_manager.result_router_tx.send((tx, response)).await {
                                         Ok(()) => {
-                                            tracing::info!("Successfully sent SubscribeResponse to client for transaction: {tx}");
-                                            // Clean up client subscription after successful delivery
+                                            tracing::debug!(%tx, "sent subscribe response to client");
                                             state.tx_to_client.remove(&tx);
                                         }
-                                        Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
+                                        Err(e) => {
+                                            tracing::error!(%tx, error = %e, "failed to send subscribe response")
+                                        }
                                     }
-                                } else {
-                                    tracing::warn!(
-                                        %tx,
-                                        "LocalSubscribeComplete called for sub-operation, skipping client notification"
-                                    );
                                 }
                             }
                             NodeEvent::Disconnect { cause } => {

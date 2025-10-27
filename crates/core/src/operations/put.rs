@@ -181,7 +181,6 @@ impl Operation for PutOp {
                         target.peer
                     );
 
-                    // Extract subscribe flag from current state
                     let subscribe = match &self.state {
                         Some(PutState::PrepareRequest { subscribe, .. }) => *subscribe,
                         Some(PutState::AwaitingResponse { subscribe, .. }) => *subscribe,
@@ -631,21 +630,14 @@ impl Operation for PutOp {
                                 "Peer completed contract value put",
                             );
 
-                            // Mark operation as finished BEFORE starting sub-operations
                             new_state = Some(PutState::Finished { key });
 
-                            // Start subscription if requested by client
-                            // The subscription will be created as a sub-operation
                             if subscribe {
                                 tracing::debug!(
                                     tx = %id,
                                     %key,
-                                    was_seeding = is_seeding_contract,
-                                    peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
-                                    "Starting subscription request as sub-operation"
+                                    "starting child subscription for PUT operation"
                                 );
-                                // Initiate subscription as background sub-operation
-                                // It will execute asynchronously while PUT waits in pending_finalization
                                 let _child_tx =
                                     super::start_subscription_request(op_manager, *id, key);
                             }
@@ -861,7 +853,6 @@ async fn try_to_broadcast(
     let new_state;
     let return_msg;
 
-    // Extract subscribe flag from current state
     let subscribe = match &state {
         Some(PutState::AwaitingResponse { subscribe, .. }) => *subscribe,
         _ => false,

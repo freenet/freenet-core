@@ -114,35 +114,22 @@ where
                 op_manager.completed(tx_id);
                 return Ok(None);
             }
-            // Check if operation has pending sub-operations
             if op_manager.all_sub_operations_completed(tx_id) {
-                // All sub-operations done, finalize immediately
-                tracing::info!(
-                    ">>> OPERATION COMPLETE | tx={} type={:?} | All sub-operations finished (if any)",
-                    tx_id,
-                    tx_id.transaction_type()
-                );
+                tracing::debug!(%tx_id, "operation complete");
                 op_manager.completed(tx_id);
                 return Ok(Some(final_state));
             } else {
-                // Parent reached finished state but children still pending
                 let pending_count = op_manager.count_pending_sub_operations(tx_id);
-                tracing::warn!(
-                    ">>> WAITING FOR SUB-OPS | parent={} type={:?} | Pending: {} sub-operation(s) | CLIENT RESPONSE BLOCKED",
-                    tx_id,
-                    tx_id.transaction_type(),
-                    pending_count
+                tracing::debug!(
+                    %tx_id,
+                    pending_count,
+                    "root operation awaiting child completion"
                 );
 
-                // Store in pending_finalization map (move final_state)
-                op_manager.pending_finalization.insert(tx_id, final_state);
+                op_manager
+                    .root_ops_awaiting_sub_ops
+                    .insert(tx_id, final_state);
 
-                tracing::warn!(
-                    ">>> CLIENT RESPONSE DEFERRED | tx={} | Operation in pending_finalization, will complete when sub-ops finish",
-                    tx_id
-                );
-
-                // Don't send response to client yet - atomicity guarantee
                 return Ok(None);
             }
         }
@@ -150,11 +137,9 @@ where
             return_msg: Some(msg),
             state: Some(updated_state),
         }) => {
-            // Check if operation is finalized while sending a message (e.g., forwarding upstream)
             if updated_state.finalized() {
-                // Operation is complete but needs to send a message
                 let id = *msg.id();
-                tracing::debug!(%id, "operation finalized with message to send");
+                tracing::debug!(%id, "operation finalized with outgoing message");
                 op_manager.completed(id);
                 if let Some(target) = msg.target() {
                     tracing::debug!(%id, %target, "sending final message to target");
@@ -162,9 +147,8 @@ where
                 }
                 return Ok(Some(updated_state));
             } else {
-                // Normal case: operation in progress, send message and push back
                 let id = *msg.id();
-                tracing::debug!(%id, "updated op state");
+                tracing::debug!(%id, "operation in progress");
                 if let Some(target) = msg.target() {
                     tracing::debug!(%id, %target, "sending updated op state");
                     network_bridge.send(&target.peer, msg).await?;
@@ -190,7 +174,6 @@ where
             return_msg: None,
             state: Some(updated_state),
         }) => {
-            // interim state
             let id = *updated_state.id();
             op_manager.push(id, updated_state).await?;
         }
@@ -199,7 +182,6 @@ where
             state: None,
         }) => {
             op_manager.completed(tx_id);
-            // finished the operation at this node, informing back
 
             if let Some(target) = msg.target() {
                 tracing::debug!(%tx_id, target=%target.peer, "sending back message to target");
@@ -210,7 +192,6 @@ where
             return_msg: None,
             state: None,
         }) => {
-            // operation finished_completely
             op_manager.completed(tx_id);
         }
     }
@@ -367,84 +348,45 @@ impl<T> From<SendError<T>> for OpError {
     }
 }
 
-/// Start a subscription request as a sub-operation of a parent transaction.
-/// This version registers the sub-operation relationship for atomicity tracking and
-/// spawns the subscription task in the background to prevent race conditions.
-/// Returns the child transaction ID immediately.
+/// Initiates a subscription as a child operation of the parent transaction.
+/// Registers the relationship for atomicity tracking and spawns the subscription
+/// task asynchronously to prevent blocking the parent operation.
 fn start_subscription_request(
     op_manager: &OpManager,
     parent_tx: Transaction,
     key: ContractKey,
 ) -> Transaction {
-    // CRITICAL: Register expected sub-operation BEFORE creating child to prevent race condition
-    // where child completes before parent reaches finalized state
     op_manager.expect_sub_operation(parent_tx);
-
-    // Create child transaction linked to parent
     let child_tx = Transaction::new_child_of::<subscribe::SubscribeMsg>(&parent_tx);
-
-    // Register parent-child relationship
     op_manager.register_sub_operation(parent_tx, child_tx);
 
-    tracing::warn!(
-        ">>> SUB-OP CREATED | parent={} ({:?}) → child={} (SUBSCRIBE) | contract={} | parent_of registered",
-        parent_tx,
-        parent_tx.transaction_type(),
-        child_tx,
-        key
+    tracing::debug!(
+        %parent_tx,
+        %child_tx,
+        %key,
+        "created child subscription operation"
     );
 
-    // Verify registration immediately
-    if op_manager.is_sub_operation(child_tx) {
-        tracing::debug!("✓ parent_of mapping verified for child={}", child_tx);
-    } else {
-        tracing::error!(
-            "✗ parent_of mapping MISSING immediately after registration for child={}",
-            child_tx
-        );
-    }
-
-    // Clone op_manager for background task (all fields are Arc, so this is cheap)
     let op_manager_cloned = op_manager.clone();
 
-    // Spawn subscription task in background to allow parent to proceed to finalization
     tokio::spawn(async move {
-        // Yield to allow parent operation to reach finalized state before child completes
-        // This prevents race condition where child completes before parent enters pending_finalization
         tokio::task::yield_now().await;
 
-        // Create subscription operation with child transaction
         let sub_op = subscribe::start_op_with_id(key, child_tx);
 
-        // Execute subscription
         match subscribe::request_subscribe(&op_manager_cloned, sub_op).await {
             Ok(_) => {
-                tracing::debug!(
-                    child_tx = %child_tx,
-                    parent_tx = %parent_tx,
-                    "subscription sub-operation completed successfully"
-                );
+                tracing::debug!(%child_tx, %parent_tx, "child subscription completed");
             }
             Err(error) => {
-                tracing::error!(
-                    parent_tx = %parent_tx,
-                    child_tx = %child_tx,
-                    error = %error,
-                    "subscription sub-operation failed"
-                );
+                tracing::error!(%parent_tx, %child_tx, %error, "child subscription failed");
 
-                // Propagate failure to parent
                 let error_msg = format!("{}", error);
                 if let Err(e) = op_manager_cloned
                     .sub_operation_failed(child_tx, &error_msg)
                     .await
                 {
-                    tracing::error!(
-                        parent_tx = %parent_tx,
-                        child_tx = %child_tx,
-                        error = %e,
-                        "failed to propagate sub-operation failure to parent"
-                    );
+                    tracing::error!(%parent_tx, %child_tx, %e, "failed to propagate failure");
                 }
             }
         }
