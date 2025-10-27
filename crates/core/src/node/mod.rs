@@ -71,6 +71,7 @@ mod message_processor;
 mod network_bridge;
 mod op_state_manager;
 mod p2p_impl;
+pub(crate) mod proximity_cache;
 mod request_router;
 pub(crate) mod testing_impl;
 

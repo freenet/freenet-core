@@ -815,6 +815,30 @@ impl P2pConnManager {
                                     Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
                                 }
                             }
+                            NodeEvent::BroadcastProximityCache { from, message } => {
+                                // Broadcast ProximityCache message to all connected peers
+                                tracing::debug!(
+                                    %from,
+                                    ?message,
+                                    peer_count = ctx.connections.len(),
+                                    "Broadcasting ProximityCache message to connected peers"
+                                );
+
+                                use crate::message::{NetMessage, NetMessageV1};
+                                let msg = NetMessage::V1(NetMessageV1::ProximityCache {
+                                    from: from.clone(),
+                                    message: message.clone(),
+                                });
+
+                                for peer in ctx.connections.keys() {
+                                    if peer != &from {
+                                        tracing::debug!(%peer, "Sending ProximityCache to peer");
+                                        if let Err(e) = ctx.bridge.send(peer, msg.clone()).await {
+                                            tracing::warn!(%peer, "Failed to send ProximityCache: {}", e);
+                                        }
+                                    }
+                                }
+                            }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
                                     "Disconnecting from network{}",

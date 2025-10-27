@@ -657,18 +657,32 @@ impl OpManager {
             })
             .unwrap_or_default();
 
+        // Get neighbors who have this contract cached (proximity-based targeting)
+        let interested_neighbors = self.proximity_cache.neighbors_with_contract(key);
+
+        // Combine subscribers and interested neighbors, removing duplicates and sender
+        let mut targets = subscribers;
+        for neighbor in interested_neighbors {
+            if &neighbor != sender && !targets.iter().any(|t| t.peer == neighbor) {
+                targets.push(PeerKeyLocation {
+                    peer: neighbor,
+                    location: None,
+                });
+            }
+        }
+
         // Trace update propagation for debugging
-        if !subscribers.is_empty() {
+        if !targets.is_empty() {
             tracing::info!(
                 "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={}",
                 key,
                 sender,
-                subscribers
+                targets
                     .iter()
                     .map(|s| format!("{:.8}", s.peer))
                     .collect::<Vec<_>>()
                     .join(","),
-                subscribers.len()
+                targets.len()
             );
         } else {
             tracing::warn!(
@@ -678,7 +692,7 @@ impl OpManager {
             );
         }
 
-        subscribers
+        targets
     }
 }
 

@@ -935,6 +935,10 @@ where
                 NodeEvent::QueryNodeDiagnostics { .. } => {
                     unimplemented!()
                 }
+                NodeEvent::BroadcastProximityCache { from, message } => {
+                    tracing::debug!(%from, ?message, "BroadcastProximityCache event in testing_impl - skipping");
+                    continue;
+                }
                 NodeEvent::SendMessage { target, msg } => {
                     tracing::debug!(tx = %msg.id(), %target, "SendMessage event in testing_impl");
                     conn_manager.send(&target, *msg).await?;

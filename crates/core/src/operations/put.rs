@@ -238,6 +238,9 @@ impl Operation for PutOp {
                                 peer = %sender.peer,
                                 "Marked contract as seeding locally"
                             );
+
+                            // Announce to proximity cache that we've cached this contract
+                            op_manager.proximity_cache.on_contract_cached(&key).await;
                         }
 
                         tracing::debug!(

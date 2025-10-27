@@ -1002,6 +1002,8 @@ impl Operation for GetOp {
                             if !op_manager.ring.is_seeding_contract(&key) {
                                 tracing::debug!(tx = %id, %key, "Marking contract as seeded");
                                 op_manager.ring.seed_contract(key);
+                                // Announce to proximity cache that we're caching this contract
+                                op_manager.proximity_cache.on_contract_cached(&key).await;
                                 super::start_subscription_request(op_manager, key).await;
                             }
                         } else {
@@ -1025,6 +1027,13 @@ impl Operation for GetOp {
                                     if !is_subscribed_contract {
                                         tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                         op_manager.ring.seed_contract(key);
+
+                                        // Announce to proximity cache that we've cached this contract
+                                        op_manager.proximity_cache.on_contract_cached(&key).await;
+
+                                        let mut new_skip_list = skip_list.clone();
+                                        new_skip_list.insert(sender.peer.clone());
+
                                         super::start_subscription_request(op_manager, key).await;
                                     }
                                 }
