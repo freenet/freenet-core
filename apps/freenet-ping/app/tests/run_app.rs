@@ -1520,7 +1520,7 @@ async fn test_ping_application_loop() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Flaky in CI - gateways crash during startup with 'channel closed'. Works locally but fails in CI. See issue #2029 for multi-gateway coordination investigation. Single-gateway variant (run_app_partially_connected_network.rs) works reliably."]
+#[ignore = "Test has never worked - gateway nodes fail on startup with channel closed errors"]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
@@ -1694,10 +1694,6 @@ async fn test_ping_partially_connected_network() -> TestResult {
         gateway_futures.push(gateway_future);
     }
 
-    // Wait for gateways to initialize before starting regular nodes
-    // Increased delay for CI environment - multiple gateways need more time to coordinate
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
     // Start all regular nodes
     let regular_node_futures = FuturesUnordered::new();
     for config in node_configs.into_iter() {
@@ -1710,6 +1706,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             node.run().await
         }
         .boxed_local();
+        tokio::time::sleep(Duration::from_secs(2)).await;
         regular_node_futures.push(regular_node_future);
     }
 
@@ -1753,20 +1750,24 @@ async fn test_ping_partially_connected_network() -> TestResult {
                           i, NUM_GATEWAYS, num_connections);
         }
 
-        // Load the ping contract using load_contract which compiles it at test execution time
+        // Load the ping contract
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
         tracing::info!(path=%path_to_code.display(), "loading contract code");
+        let code = std::fs::read(path_to_code)
+            .ok()
+            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
+        let code_hash = CodeHash::from_code(&code);
 
         // Create ping contract options
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(60),
             tag: APP_TAG.to_string(),
-            code_key: "".to_string(), // Will be set by load_contract
+            code_key: code_hash.to_string(),
         };
 
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = common::load_contract(&path_to_code, params)?;
+        let container = ContractContainer::try_from((code, &params))?;
         let contract_key = container.key();
 
         // Choose a node to publish the contract
