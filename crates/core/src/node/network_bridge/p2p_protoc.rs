@@ -1020,23 +1020,64 @@ impl P2pConnManager {
             tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
         }
         state.awaiting_connection.insert(peer.addr, callback);
-        let res = timeout(
+        match timeout(
             Duration::from_secs(10),
             handshake_handler_msg.establish_conn(peer.clone(), tx, is_gw),
         )
         .await
-        .inspect_err(|error| {
-            tracing::error!(tx = %tx, "Failed to establish connection: {:?}", error);
-        })?;
-        match res {
-            Ok(()) => {
-                tracing::debug!(tx = %tx,
+        {
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    tx = %tx,
                     "Successfully initiated connection process for peer: {:?}",
                     peer
                 );
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::msg(e)),
+            Ok(Err(e)) => {
+                tracing::error!(
+                    tx = %tx,
+                    remote = %peer,
+                    "Handshake handler failed while queuing connection request: {}",
+                    e
+                );
+                if let Some(mut cb) = state.awaiting_connection.remove(&peer.addr) {
+                    cb.send_result(Err(HandshakeError::ChannelClosed))
+                        .await
+                        .inspect_err(|err| {
+                            tracing::debug!(
+                                remote = %peer,
+                                "Failed to notify caller about handshake failure: {:?}",
+                                err
+                            );
+                        })
+                        .ok();
+                }
+                Err(anyhow::Error::new(e))
+            }
+            Err(elapsed) => {
+                tracing::warn!(
+                    tx = %tx,
+                    remote = %peer,
+                    elapsed = ?elapsed,
+                    "Timed out while queuing handshake request; treating as connection failure"
+                );
+                if let Some(mut cb) = state.awaiting_connection.remove(&peer.addr) {
+                    cb.send_result(Err(HandshakeError::ConnectionError(
+                        ConnectionError::Timeout,
+                    )))
+                    .await
+                    .inspect_err(|err| {
+                        tracing::debug!(
+                            remote = %peer,
+                            "Failed to notify caller about handshake timeout: {:?}",
+                            err
+                        );
+                    })
+                    .ok();
+                }
+                Ok(())
+            }
         }
     }
 
