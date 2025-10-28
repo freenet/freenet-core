@@ -1011,7 +1011,27 @@ pub(crate) async fn request_update(
     };
 
     // Normal case: we found a remote target
+    // Apply the update locally first to ensure the initiating peer has the updated state
     let id = update_op.id;
+
+    tracing::debug!(
+        tx = %id,
+        %key,
+        target_peer = %target.peer,
+        "Applying UPDATE locally before forwarding to target peer"
+    );
+
+    // Apply update locally - this ensures the initiating peer serves the updated state
+    // even if the remote UPDATE times out or fails
+    let updated_value =
+        update_contract(op_manager, key, value.clone(), related_contracts.clone()).await?;
+
+    tracing::debug!(
+        tx = %id,
+        %key,
+        "Local update complete, now forwarding UPDATE to target peer"
+    );
+
     if let Some(stats) = &mut update_op.stats {
         stats.target = Some(target.clone());
     }
@@ -1026,7 +1046,7 @@ pub(crate) async fn request_update(
         sender,
         related_contracts,
         target,
-        value,
+        value: updated_value, // Send the updated value, not the original
     };
 
     let op = UpdateOp {
