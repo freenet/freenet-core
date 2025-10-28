@@ -1520,6 +1520,7 @@ async fn test_ping_application_loop() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "Flaky in CI - gateways crash during startup with 'channel closed'. Works locally but fails in CI. See issue #2029 for multi-gateway coordination investigation. Single-gateway variant (run_app_partially_connected_network.rs) works reliably."]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
