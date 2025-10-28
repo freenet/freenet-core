@@ -1096,7 +1096,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         return Ok(());
     }
 
-    // At least one peer found - forward to network
+    // At least one peer found - cache locally first, then forward to network
     let target_peer = target.unwrap();
 
     tracing::debug!(
@@ -1104,14 +1104,40 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         %key,
         target_peer = %target_peer.peer,
         target_location = ?target_peer.location,
-        "Forwarding PUT to target peer"
+        "Caching state locally before forwarding PUT to target peer"
+    );
+
+    // Cache the contract state locally before forwarding
+    // This ensures the publishing node has immediate access to the new state
+    let updated_value = put_contract(
+        op_manager,
+        key,
+        value.clone(),
+        related_contracts.clone(),
+        &contract,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            tx = %id,
+            %key,
+            error = %e,
+            "Failed to cache state locally before forwarding PUT"
+        );
+        e
+    })?;
+
+    tracing::debug!(
+        tx = %id,
+        %key,
+        "Local cache updated, now forwarding PUT to target peer"
     );
 
     put_op.state = Some(PutState::AwaitingResponse {
         key,
         upstream: None,
         contract: contract.clone(),
-        state: value.clone(),
+        state: updated_value.clone(),
         subscribe,
     });
 
@@ -1121,7 +1147,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         sender: own_location,
         contract,
         related_contracts,
-        value,
+        value: updated_value,
         htl,
         target: target_peer,
     };

@@ -226,6 +226,17 @@ async fn test_gateway_reconnection() -> TestResult {
                     recv_contract.as_ref().expect("Contract should exist").key(),
                     contract_key
                 );
+                if recv_state != wrapped_state {
+                    eprintln!("State mismatch!");
+                    eprintln!(
+                        "Expected state: {:?}",
+                        String::from_utf8_lossy(wrapped_state.as_ref())
+                    );
+                    eprintln!(
+                        "Received state: {:?}",
+                        String::from_utf8_lossy(recv_state.as_ref())
+                    );
+                }
                 assert_eq!(recv_state, wrapped_state);
                 tracing::info!("Initial GET successful");
             }

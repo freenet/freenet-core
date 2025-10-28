@@ -86,7 +86,8 @@ impl ContractInterface for Contract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         // Deserialize the current state
-        let mut todo_list: TodoList = match serde_json::from_slice(state.as_ref()) {
+        let original_state_bytes = state.as_ref();
+        let mut todo_list: TodoList = match serde_json::from_slice(original_state_bytes) {
             Ok(list) => list,
             Err(e) => return Err(ContractError::Deser(e.to_string())),
         };
@@ -161,16 +162,23 @@ impl ContractInterface for Contract {
             }
         }
 
-        // Increment the state version
-        todo_list.version += 1;
+        // Check if the state actually changed by comparing serialized forms
+        let new_state_bytes =
+            serde_json::to_vec(&todo_list).map_err(|e| ContractError::Other(e.to_string()))?;
+        let state_changed = original_state_bytes != new_state_bytes.as_slice();
 
-        // Serialize the new state
-        let new_state = match serde_json::to_vec(&todo_list) {
-            Ok(bytes) => State::from(bytes),
-            Err(e) => return Err(ContractError::Other(e.to_string())),
-        };
-
-        Ok(UpdateModification::valid(new_state))
+        // Only increment version if the state actually changed
+        // This prevents double-incrementing when the same state is merged at multiple peers
+        if state_changed {
+            todo_list.version += 1;
+            // Re-serialize with incremented version
+            let new_state =
+                serde_json::to_vec(&todo_list).map_err(|e| ContractError::Other(e.to_string()))?;
+            Ok(UpdateModification::valid(State::from(new_state)))
+        } else {
+            // Reuse already serialized bytes since state didn't change
+            Ok(UpdateModification::valid(State::from(new_state_bytes)))
+        }
     }
 
     fn summarize_state(
