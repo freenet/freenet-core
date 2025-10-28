@@ -136,6 +136,11 @@ impl OpManager {
         } else {
             tracing::info_span!(parent: current_span, "garbage_cleanup_task")
         };
+        let parent_of = Arc::new(DashMap::new());
+        let failed_parents = Arc::new(DashSet::new());
+        let sub_operations = Arc::new(DashMap::new());
+        let expected_sub_operations = Arc::new(DashMap::new());
+
         GlobalExecutor::spawn(
             garbage_cleanup_task(
                 rx,
@@ -143,6 +148,8 @@ impl OpManager {
                 ring.live_tx_tracker.clone(),
                 notification_channel.clone(),
                 event_register,
+                parent_of.clone(),
+                result_router_tx.clone(),
             )
             .instrument(garbage_span),
         );
@@ -167,11 +174,11 @@ impl OpManager {
             result_router_tx,
             peer_ready,
             is_gateway,
-            sub_operations: Arc::new(DashMap::new()),
+            sub_operations,
             root_ops_awaiting_sub_ops: Arc::new(DashMap::new()),
-            parent_of: Arc::new(DashMap::new()),
-            expected_sub_operations: Arc::new(DashMap::new()),
-            failed_parents: Arc::new(DashSet::new()),
+            parent_of,
+            expected_sub_operations,
+            failed_parents,
         })
     }
 
@@ -479,6 +486,24 @@ impl OpManager {
         self.parent_of.insert(child, parent);
     }
 
+    /// Atomically registers both expected count and parent-child relationship.
+    /// This prevents race conditions where children complete before registration.
+    pub fn expect_and_register_sub_operation(&self, parent: Transaction, child: Transaction) {
+        // Increment expected count
+        self.expected_sub_operations
+            .entry(parent)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+
+        // Register parent-child relationship
+        self.sub_operations
+            .entry(parent)
+            .or_insert_with(HashSet::new)
+            .insert(child);
+
+        self.parent_of.insert(child, parent);
+    }
+
     /// Returns true if all child operations of the parent have completed.
     pub fn all_sub_operations_completed(&self, parent: Transaction) -> bool {
         if let Some(expected) = self.expected_sub_operations.get(&parent) {
@@ -520,6 +545,8 @@ impl OpManager {
 
         if let Some(parent_entry) = self.parent_of.get(&child) {
             let parent_tx = *parent_entry;
+            drop(parent_entry);
+
             self.remove_child_link(parent_tx, child);
             self.mark_sub_op_completed(parent_tx);
 
@@ -543,6 +570,10 @@ impl OpManager {
                     "Sub-operation failed before root operation started awaiting"
                 );
                 self.failed_parents.insert(parent_tx);
+                // Clean up tracking to prevent memory leak
+                self.cleanup_parent_tracking(parent_tx);
+                // Mark parent as completed to prevent duplicate responses
+                self.completed(parent_tx);
             }
 
             self.spawn_client_result(parent_tx, error_result);
@@ -601,6 +632,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     live_tx_tracker: LiveTransactionTracker,
     event_loop_notifier: EventLoopNotificationsSender,
     mut event_register: ER,
+    parent_of: Arc<DashMap<Transaction, Transaction>>,
+    result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
@@ -640,6 +673,25 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
                         tracing::debug!("Transaction timed out: {tx}");
+
+                        // Check if this is a child operation and propagate timeout to parent
+                        if let Some(parent_entry) = parent_of.get(&tx) {
+                            let parent_tx = *parent_entry;
+                            drop(parent_entry);
+
+                            tracing::warn!(
+                                child_tx = %tx,
+                                parent_tx = %parent_tx,
+                                "Child operation timed out, propagating failure to parent"
+                            );
+
+                            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                                cause: format!("Sub-operation {} timed out", tx).into(),
+                            }.into());
+
+                            let _ = result_router_tx.send((parent_tx, error_result)).await;
+                        }
+
                         notify_transaction_timeout(&event_loop_notifier, tx).await;
                         live_tx_tracker.remove_finished_transaction(tx);
                     }
@@ -669,6 +721,25 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     };
                     if removed {
                         tracing::debug!("Transaction timed out: {tx}");
+
+                        // Check if this is a child operation and propagate timeout to parent
+                        if let Some(parent_entry) = parent_of.get(&tx) {
+                            let parent_tx = *parent_entry;
+                            drop(parent_entry);
+
+                            tracing::warn!(
+                                child_tx = %tx,
+                                parent_tx = %parent_tx,
+                                "Child operation timed out, propagating failure to parent"
+                            );
+
+                            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                                cause: format!("Sub-operation {} timed out", tx).into(),
+                            }.into());
+
+                            let _ = result_router_tx.send((parent_tx, error_result)).await;
+                        }
+
                         notify_transaction_timeout(&event_loop_notifier, tx).await;
                         live_tx_tracker.remove_finished_transaction(tx);
                     }

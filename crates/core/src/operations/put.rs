@@ -633,13 +633,21 @@ impl Operation for PutOp {
                             new_state = Some(PutState::Finished { key });
 
                             if subscribe {
-                                tracing::debug!(
-                                    tx = %id,
-                                    %key,
-                                    "starting child subscription for PUT operation"
-                                );
-                                let _child_tx =
-                                    super::start_subscription_request(op_manager, *id, key);
+                                // Check if this parent has already failed due to a previous child failure
+                                if !op_manager.failed_parents.contains(id) {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        %key,
+                                        "starting child subscription for PUT operation"
+                                    );
+                                    let _child_tx =
+                                        super::start_subscription_request(op_manager, *id, key);
+                                } else {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        "not starting subscription for failed parent operation"
+                                    );
+                                }
                             }
 
                             // Forward success message upstream if needed

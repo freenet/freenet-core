@@ -356,9 +356,8 @@ fn start_subscription_request(
     parent_tx: Transaction,
     key: ContractKey,
 ) -> Transaction {
-    op_manager.expect_sub_operation(parent_tx);
     let child_tx = Transaction::new_child_of::<subscribe::SubscribeMsg>(&parent_tx);
-    op_manager.register_sub_operation(parent_tx, child_tx);
+    op_manager.expect_and_register_sub_operation(parent_tx, child_tx);
 
     tracing::debug!(
         %parent_tx,
