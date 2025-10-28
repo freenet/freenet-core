@@ -814,7 +814,7 @@ mod test {
 pub mod event_aggregator_utils {
     //! Test utilities for event log aggregation.
 
-    use crate::tracing::{AOFEventSource, EventLogAggregator};
+    use crate::tracing::EventLogAggregator;
     use anyhow::Result;
     use std::path::PathBuf;
 
@@ -879,7 +879,7 @@ pub mod event_aggregator_utils {
         }
 
         /// Build the aggregator.
-        pub async fn build(self) -> Result<EventLogAggregator> {
+        pub async fn build(self) -> Result<EventLogAggregator<crate::tracing::AOFEventSource>> {
             let sources = self
                 .nodes
                 .into_iter()

@@ -25,7 +25,7 @@ pub(crate) use test::TestEventListener;
 
 // Re-export for use in tests
 pub use event_aggregator::{
-    AOFEventSource, EventLogAggregator, EventSourceType, RoutingPath, TransactionFlowEvent,
+    AOFEventSource, EventLogAggregator, EventSource, RoutingPath, TransactionFlowEvent,
     WebSocketEventCollector,
 };
 
@@ -1110,6 +1110,7 @@ mod opentelemetry_tracer {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
+#[allow(private_interfaces)]
 // todo: make this take by ref instead, probably will need an owned version
 pub enum EventKind {
     Connect(ConnectEvent),

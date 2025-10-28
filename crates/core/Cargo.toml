@@ -16,7 +16,6 @@ path = "src/bin/freenet.rs"
 [dependencies]
 ahash = "0.8"
 anyhow = "1"
-async-trait = "0.1"
 aes-gcm = "0.10"
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
 bincode = "1"
