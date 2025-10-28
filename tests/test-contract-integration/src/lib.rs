@@ -86,17 +86,16 @@ impl ContractInterface for Contract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         // Deserialize the current state
-        let mut todo_list: TodoList = match serde_json::from_slice(state.as_ref()) {
+        let original_state_bytes = state.as_ref();
+        let mut todo_list: TodoList = match serde_json::from_slice(original_state_bytes) {
             Ok(list) => list,
             Err(e) => return Err(ContractError::Deser(e.to_string())),
         };
 
         // Process each update operation
-        let mut had_delta_updates = false;
         for update in data {
             match update {
                 UpdateData::Delta(delta) => {
-                    had_delta_updates = true;
                     let operation: TodoOperation = match serde_json::from_slice(delta.as_ref()) {
                         Ok(op) => op,
                         Err(e) => return Err(ContractError::Deser(e.to_string())),
@@ -158,17 +157,19 @@ impl ContractInterface for Contract {
                             return Err(ContractError::InvalidUpdate);
                         }
                     }
-
-                    // For full state replacements, don't increment version
-                    // The incoming state already has its own version
                 }
                 _ => return Err(ContractError::InvalidUpdate),
             }
         }
 
-        // Increment the state version for delta updates only
-        // Full state replacements already have their version set
-        if had_delta_updates {
+        // Check if the state actually changed by comparing serialized forms
+        let new_state_bytes =
+            serde_json::to_vec(&todo_list).map_err(|e| ContractError::Other(e.to_string()))?;
+        let state_changed = original_state_bytes != new_state_bytes.as_slice();
+
+        // Only increment version if the state actually changed
+        // This prevents double-incrementing when the same state is merged at multiple peers
+        if state_changed {
             todo_list.version += 1;
         }
 
