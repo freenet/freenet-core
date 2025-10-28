@@ -1023,8 +1023,17 @@ pub(crate) async fn request_update(
 
     // Apply update locally - this ensures the initiating peer serves the updated state
     // even if the remote UPDATE times out or fails
-    let updated_value =
-        update_contract(op_manager, key, value.clone(), related_contracts.clone()).await?;
+    let updated_value = update_contract(op_manager, key, value.clone(), related_contracts.clone())
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                tx = %id,
+                %key,
+                error = %e,
+                "Failed to apply update locally before forwarding UPDATE"
+            );
+            e
+        })?;
 
     tracing::debug!(
         tx = %id,

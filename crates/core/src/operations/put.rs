@@ -1116,7 +1116,16 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         related_contracts.clone(),
         &contract,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            tx = %id,
+            %key,
+            error = %e,
+            "Failed to cache state locally before forwarding PUT"
+        );
+        e
+    })?;
 
     tracing::debug!(
         tx = %id,

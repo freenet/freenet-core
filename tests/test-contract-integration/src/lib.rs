@@ -171,15 +171,14 @@ impl ContractInterface for Contract {
         // This prevents double-incrementing when the same state is merged at multiple peers
         if state_changed {
             todo_list.version += 1;
+            // Re-serialize with incremented version
+            let new_state =
+                serde_json::to_vec(&todo_list).map_err(|e| ContractError::Other(e.to_string()))?;
+            Ok(UpdateModification::valid(State::from(new_state)))
+        } else {
+            // Reuse already serialized bytes since state didn't change
+            Ok(UpdateModification::valid(State::from(new_state_bytes)))
         }
-
-        // Serialize the new state
-        let new_state = match serde_json::to_vec(&todo_list) {
-            Ok(bytes) => State::from(bytes),
-            Err(e) => return Err(ContractError::Other(e.to_string())),
-        };
-
-        Ok(UpdateModification::valid(new_state))
     }
 
     fn summarize_state(
