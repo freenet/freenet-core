@@ -18,10 +18,7 @@ use freenet::{
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{
-        load_contract, make_put, with_peer_id, TestAggregatorBuilder, TestLogger,
-    },
-    tracing::EventLogAggregator,
+    test_utils::{load_contract, make_put, TestAggregatorBuilder, TestLogger},
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse, WebApi},
@@ -183,7 +180,6 @@ async fn test_put_operation_with_event_aggregation() -> anyhow::Result<()> {
 
     // Start gateway node
     let node_gw = async {
-        let _span = with_peer_id("gateway");
         tracing::info!("Starting gateway node");
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
@@ -197,7 +193,6 @@ async fn test_put_operation_with_event_aggregation() -> anyhow::Result<()> {
 
     // Start node A (client)
     let node_a = async move {
-        let _span = with_peer_id("node-a");
         tracing::info!("Starting node A");
         let config = config_a.build().await?;
         let node = NodeConfig::new(config.clone())
