@@ -1520,7 +1520,6 @@ async fn test_ping_application_loop() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Flaky in CI with 3 gateways - gateways timeout during initialization. Single-gateway variant (run_app_partially_connected_network.rs) works reliably."]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
@@ -1695,7 +1694,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
     }
 
     // Wait for gateways to initialize before starting regular nodes
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Increased delay for CI environment - multiple gateways need more time to coordinate
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Start all regular nodes
     let regular_node_futures = FuturesUnordered::new();
