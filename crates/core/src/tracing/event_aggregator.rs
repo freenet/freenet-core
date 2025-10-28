@@ -569,4 +569,55 @@ mod tests {
         let events = aggregator.get_all_events().await.unwrap();
         assert_eq!(events.len(), 0);
     }
+
+    #[tokio::test]
+    async fn test_aggregator_with_aof_sources() {
+        // Create mock event log paths
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log1 = temp_dir.path().join("node1_log");
+        let log2 = temp_dir.path().join("node2_log");
+
+        // Create empty log files
+        std::fs::write(&log1, []).unwrap();
+        std::fs::write(&log2, []).unwrap();
+
+        // Create aggregator with AOF sources using factory method
+        let aggregator = EventLogAggregator::<AOFEventSource>::from_aof_files(vec![
+            (log1, Some("node-1".into())),
+            (log2, Some("node-2".into())),
+        ])
+        .await
+        .unwrap();
+
+        // Verify we can get events (should be empty for this test)
+        let events = aggregator.get_all_events().await.unwrap();
+        assert_eq!(events.len(), 0, "No events expected from empty logs");
+
+        // Verify we can call it multiple times (caching works)
+        let events2 = aggregator.get_all_events().await.unwrap();
+        assert_eq!(events2.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_cache_clearing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log = temp_dir.path().join("node_log");
+        std::fs::write(&log, []).unwrap();
+
+        let aggregator = EventLogAggregator::<AOFEventSource>::from_aof_files(vec![
+            (log, Some("node".into())),
+        ])
+        .await
+        .unwrap();
+
+        // Get events (populates cache)
+        let _events = aggregator.get_all_events().await.unwrap();
+
+        // Clear cache
+        aggregator.clear_cache().await;
+
+        // Should still work after clearing
+        let events = aggregator.get_all_events().await.unwrap();
+        assert_eq!(events.len(), 0);
+    }
 }

@@ -219,7 +219,7 @@ async fn test_put_operation_with_event_aggregation() -> anyhow::Result<()> {
         make_put(&mut client_api, wrapped_state.clone(), contract.clone(), false).await?;
 
         // Wait for put response
-        let _put_tx = loop {
+        loop {
             let resp = tokio::time::timeout(Duration::from_secs(30), client_api.recv()).await;
             match resp {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
@@ -237,7 +237,7 @@ async fn test_put_operation_with_event_aggregation() -> anyhow::Result<()> {
                     anyhow::bail!("Timeout waiting for put response");
                 }
             }
-        };
+        }
 
         // Wait a bit for events to be written
         tokio::time::sleep(Duration::from_secs(2)).await;
