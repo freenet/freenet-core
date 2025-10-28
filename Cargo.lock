@@ -1694,7 +1694,6 @@ dependencies = [
  "ahash",
  "anyhow",
  "arbitrary",
- "async-trait",
  "axum 0.8.6",
  "bincode",
  "blake3",
