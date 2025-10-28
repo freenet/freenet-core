@@ -92,9 +92,11 @@ impl ContractInterface for Contract {
         };
 
         // Process each update operation
+        let mut had_delta_updates = false;
         for update in data {
             match update {
                 UpdateData::Delta(delta) => {
+                    had_delta_updates = true;
                     let operation: TodoOperation = match serde_json::from_slice(delta.as_ref()) {
                         Ok(op) => op,
                         Err(e) => return Err(ContractError::Deser(e.to_string())),
@@ -156,13 +158,19 @@ impl ContractInterface for Contract {
                             return Err(ContractError::InvalidUpdate);
                         }
                     }
+
+                    // For full state replacements, don't increment version
+                    // The incoming state already has its own version
                 }
                 _ => return Err(ContractError::InvalidUpdate),
             }
         }
 
-        // Increment the state version
-        todo_list.version += 1;
+        // Increment the state version for delta updates only
+        // Full state replacements already have their version set
+        if had_delta_updates {
+            todo_list.version += 1;
+        }
 
         // Serialize the new state
         let new_state = match serde_json::to_vec(&todo_list) {
