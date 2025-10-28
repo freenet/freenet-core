@@ -1038,11 +1038,11 @@ impl P2pConnManager {
                 tracing::error!(
                     tx = %tx,
                     remote = %peer,
-                    "Handshake handler failed while queuing connection request: {}",
-                    e
+                    error = ?e,
+                    "Handshake handler failed while queuing connection request"
                 );
                 if let Some(mut cb) = state.awaiting_connection.remove(&peer.addr) {
-                    cb.send_result(Err(HandshakeError::ChannelClosed))
+                    cb.send_result(Err(e))
                         .await
                         .inspect_err(|err| {
                             tracing::debug!(
@@ -1053,7 +1053,7 @@ impl P2pConnManager {
                         })
                         .ok();
                 }
-                Err(anyhow::Error::new(e))
+                Ok(())
             }
             Err(elapsed) => {
                 tracing::warn!(
