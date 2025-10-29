@@ -285,7 +285,7 @@ impl LogFile {
         let _guard: tokio::sync::MutexGuard<'_, ()> = FILE_LOCK.lock().await;
         let mut file = BufReader::new(OpenOptions::new().read(true).open(event_log_path).await?);
 
-        Self::read_all_events_from(& mut file).await
+        Self::read_all_events_from(&mut file).await
     }
 
     async fn read_all_events_from(

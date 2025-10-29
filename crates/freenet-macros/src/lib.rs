@@ -26,11 +26,11 @@
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, ItemFn};
 
-mod parser;
 mod codegen;
+mod parser;
 
-use parser::FreenetTestArgs;
 use codegen::generate_test_code;
+use parser::FreenetTestArgs;
 
 /// Attribute macro for Freenet integration tests
 ///
@@ -43,7 +43,8 @@ use codegen::generate_test_code;
 ///
 /// # Attributes
 ///
-/// - `nodes` (required): Array of node labels, first is gateway
+/// - `nodes` (required): Array of node labels
+/// - `gateways` (optional): Array of nodes that should be gateways. If not specified, the first node is a gateway.
 /// - `timeout_secs` (optional): Test timeout in seconds (default: 180)
 /// - `startup_wait_secs` (optional): Node startup wait in seconds (default: 15)
 /// - `aggregate_events` (optional): When to aggregate events:
@@ -56,18 +57,30 @@ use codegen::generate_test_code;
 ///   - `"current_thread"`: Single-threaded runtime
 /// - `tokio_worker_threads` (optional): Number of worker threads for multi_thread flavor (default: 4)
 ///
-/// # Example
+/// # Examples
 ///
+/// ## Single Gateway (default)
+/// ```ignore
+/// #[freenet_test(nodes = ["gateway", "peer-1"])]
+/// async fn test_simple(ctx: &mut TestContext) -> TestResult {
+///     let gateway = ctx.gateway()?;  // First node
+///     Ok(())
+/// }
+/// ```
+///
+/// ## Multiple Gateways
 /// ```ignore
 /// #[freenet_test(
-///     nodes = ["gateway", "peer-1", "peer-2"],
+///     nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
+///     gateways = ["gw-1", "gw-2"],
 ///     timeout_secs = 180,
 ///     aggregate_events = "on_failure",
 ///     tokio_flavor = "multi_thread",
 ///     tokio_worker_threads = 8
 /// )]
-/// async fn test_multi_peer_operation(ctx: &mut TestContext) -> TestResult {
-///     // Test code with access to ctx
+/// async fn test_multi_gateway(ctx: &mut TestContext) -> TestResult {
+///     let gateways = ctx.gateways();  // All gateway nodes
+///     let peers = ctx.peers();        // All peer nodes
 ///     Ok(())
 /// }
 /// ```

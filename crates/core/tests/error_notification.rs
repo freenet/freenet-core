@@ -11,13 +11,13 @@ use freenet::{
     dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
-    test_utils::{load_contract, make_get, TestContext, TestResult},
+    test_utils::{load_contract, make_get, TestContext},
 };
+use freenet_macros::freenet_test;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, WebApi},
     prelude::*,
 };
-use freenet_macros::freenet_test;
 use futures::FutureExt;
 use std::{
     net::Ipv4Addr,
@@ -223,9 +223,7 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
         }
     }
 
-    println!(
-        "UPDATE error notification test passed - client did not hang on operation failure"
-    );
+    println!("UPDATE error notification test passed - client did not hang on operation failure");
 
     // Properly close the client
     client

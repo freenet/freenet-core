@@ -6,7 +6,7 @@
 //! - TestContext creation
 //! - Event aggregation and failure reporting
 
-use freenet::test_utils::{TestContext, TestResult};
+use freenet::test_utils::TestContext;
 use freenet_macros::freenet_test;
 
 /// Simple test with just a gateway node
@@ -142,5 +142,63 @@ async fn test_current_thread_runtime(ctx: &mut TestContext) -> TestResult {
         "Test with current_thread runtime - gateway on port {}",
         gateway.ws_port
     );
+    Ok(())
+}
+
+/// Test with multiple gateways
+#[freenet_test(
+    nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
+    gateways = ["gw-1", "gw-2"],
+    timeout_secs = 120,
+    startup_wait_secs = 15
+)]
+async fn test_multiple_gateways(ctx: &mut TestContext) -> TestResult {
+    // This test has two gateway nodes and two peer nodes
+
+    // Get all gateways
+    let gateways = ctx.gateways();
+    tracing::info!("Found {} gateway nodes", gateways.len());
+    assert_eq!(gateways.len(), 2);
+
+    for gw in &gateways {
+        tracing::info!(
+            "Gateway '{}': ws_port={}, network_port={:?}, is_gateway={}",
+            gw.label,
+            gw.ws_port,
+            gw.network_port,
+            gw.is_gateway
+        );
+        assert!(gw.is_gateway);
+        assert!(gw.network_port.is_some(), "Gateways should have network ports");
+    }
+
+    // Get all peers
+    let peers = ctx.peers();
+    tracing::info!("Found {} peer nodes", peers.len());
+    assert_eq!(peers.len(), 2);
+
+    for peer in &peers {
+        tracing::info!(
+            "Peer '{}': ws_port={}, network_port={:?}, is_gateway={}",
+            peer.label,
+            peer.ws_port,
+            peer.network_port,
+            peer.is_gateway
+        );
+        assert!(!peer.is_gateway);
+        assert!(peer.network_port.is_none(), "Peers should not have network ports");
+    }
+
+    // Verify specific nodes
+    let gw1 = ctx.node("gw-1")?;
+    let gw2 = ctx.node("gw-2")?;
+    let peer1 = ctx.node("peer-1")?;
+    let peer2 = ctx.node("peer-2")?;
+
+    assert!(gw1.is_gateway);
+    assert!(gw2.is_gateway);
+    assert!(!peer1.is_gateway);
+    assert!(!peer2.is_gateway);
+
     Ok(())
 }

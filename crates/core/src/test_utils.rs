@@ -853,10 +853,8 @@ impl TestContext {
     /// Create a new TestContext from node information.
     pub fn new(nodes: Vec<NodeInfo>) -> Self {
         let node_order: Vec<String> = nodes.iter().map(|n| n.label.clone()).collect();
-        let nodes_map: HashMap<String, NodeInfo> = nodes
-            .into_iter()
-            .map(|n| (n.label.clone(), n))
-            .collect();
+        let nodes_map: HashMap<String, NodeInfo> =
+            nodes.into_iter().map(|n| (n.label.clone(), n)).collect();
 
         Self {
             nodes: nodes_map,
@@ -871,13 +869,37 @@ impl TestContext {
             .ok_or_else(|| anyhow::anyhow!("Node '{}' not found", label))
     }
 
-    /// Get the gateway node (first node).
+    /// Get the first gateway node.
+    ///
+    /// Note: If multiple gateways exist, use `gateways()` to get all of them.
     pub fn gateway(&self) -> anyhow::Result<&NodeInfo> {
-        let first_label = self
-            .node_order
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("No nodes in context"))?;
-        self.node(first_label)
+        // Find first gateway node
+        for label in &self.node_order {
+            if let Ok(node) = self.node(label) {
+                if node.is_gateway {
+                    return Ok(node);
+                }
+            }
+        }
+        Err(anyhow::anyhow!("No gateway nodes found"))
+    }
+
+    /// Get all gateway nodes.
+    pub fn gateways(&self) -> Vec<&NodeInfo> {
+        self.node_order
+            .iter()
+            .filter_map(|label| self.node(label).ok())
+            .filter(|node| node.is_gateway)
+            .collect()
+    }
+
+    /// Get all peer (non-gateway) nodes.
+    pub fn peers(&self) -> Vec<&NodeInfo> {
+        self.node_order
+            .iter()
+            .filter_map(|label| self.node(label).ok())
+            .filter(|node| !node.is_gateway)
+            .collect()
     }
 
     /// Get the path to a node's event log.
@@ -936,7 +958,7 @@ impl TestContext {
                             writeln!(
                                 &mut report,
                                 "  {}: {} events",
-                                &peer_id[..8.min(peer_id.len())],  // Show first 8 chars
+                                &peer_id[..8.min(peer_id.len())], // Show first 8 chars
                                 peer_events.len()
                             )
                             .unwrap();
@@ -999,7 +1021,7 @@ impl TestContext {
                         writeln!(
                             &mut report,
                             "  {}: {} events",
-                            &peer_id[..8.min(peer_id.len())],  // Show first 8 chars
+                            &peer_id[..8.min(peer_id.len())], // Show first 8 chars
                             peer_events.len()
                         )
                         .unwrap();

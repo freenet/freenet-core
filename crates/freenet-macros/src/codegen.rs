@@ -5,6 +5,17 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, Result};
 
+/// Helper to determine if a node is a gateway
+fn is_gateway(args: &FreenetTestArgs, node_label: &str, node_idx: usize) -> bool {
+    if let Some(ref gateways) = args.gateways {
+        // Explicit gateway list provided - check if this node is in it
+        gateways.contains(&node_label.to_string())
+    } else {
+        // No explicit list - first node is gateway (backward compatibility)
+        node_idx == 0
+    }
+}
+
 /// Generate the expanded test code from the macro attributes and test function
 pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<TokenStream> {
     let test_fn_name = &input_fn.sig.ident;
@@ -87,12 +98,12 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
 fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
     let mut setup_code = Vec::new();
 
-    for (idx, _node_label) in args.nodes.iter().enumerate() {
+    for (idx, node_label) in args.nodes.iter().enumerate() {
         let config_var = format_ident!("config_{}", idx);
         let temp_var = format_ident!("temp_{}", idx);
-        let is_gateway = idx == 0; // First node is gateway
+        let is_gw = is_gateway(args, node_label, idx);
 
-        let gateway_setup = if is_gateway {
+        let gateway_setup = if is_gw {
             quote! {
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
@@ -276,7 +287,7 @@ fn generate_context_creation_only(args: &FreenetTestArgs) -> TokenStream {
         let ws_port_var = format_ident!("ws_port_{}", idx);
         let network_port_var = format_ident!("network_port_{}", idx);
         let location_var = format_ident!("location_{}", idx);
-        let is_gateway = idx == 0;
+        let is_gw = is_gateway(args, node_label, idx);
 
         node_infos.push(quote! {
             NodeInfo {
@@ -284,7 +295,7 @@ fn generate_context_creation_only(args: &FreenetTestArgs) -> TokenStream {
                 temp_dir_path: #temp_var.path().to_path_buf(),
                 ws_port: #ws_port_var,
                 network_port: #network_port_var,
-                is_gateway: #is_gateway,
+                is_gateway: #is_gw,
                 location: #location_var,
             }
         });

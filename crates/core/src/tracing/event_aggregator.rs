@@ -132,7 +132,6 @@ impl AOFEventSource {
             cached_events: Arc::new(RwLock::new(None)),
         }
     }
-
 }
 
 impl EventSource for AOFEventSource {
@@ -404,7 +403,10 @@ impl<S: EventSource> EventLogAggregator<S> {
     }
 
     /// Get all events for a specific transaction, ordered by timestamp.
-    pub async fn get_transaction_flow(&self, tx: &Transaction) -> Result<Vec<TransactionFlowEvent>> {
+    pub async fn get_transaction_flow(
+        &self,
+        tx: &Transaction,
+    ) -> Result<Vec<TransactionFlowEvent>> {
         let all_events = self.get_all_events().await?;
 
         let flow: Vec<TransactionFlowEvent> = all_events
@@ -604,11 +606,10 @@ mod tests {
         let log = temp_dir.path().join("node_log");
         std::fs::write(&log, []).unwrap();
 
-        let aggregator = EventLogAggregator::<AOFEventSource>::from_aof_files(vec![
-            (log, Some("node".into())),
-        ])
-        .await
-        .unwrap();
+        let aggregator =
+            EventLogAggregator::<AOFEventSource>::from_aof_files(vec![(log, Some("node".into()))])
+                .await
+                .unwrap();
 
         // Get events (populates cache)
         let _events = aggregator.get_all_events().await.unwrap();

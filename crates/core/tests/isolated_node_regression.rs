@@ -7,14 +7,14 @@
 //! 4. SUBSCRIBE operations complete successfully for local contracts
 //! 5. UPDATE operations complete successfully for local contracts
 
-use freenet::{
-    test_utils::{load_contract, make_get, make_put, make_subscribe, make_update, TestContext, TestResult},
+use freenet::test_utils::{
+    load_contract, make_get, make_put, make_subscribe, make_update, TestContext,
 };
+use freenet_macros::freenet_test;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
-use freenet_macros::freenet_test;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
@@ -399,7 +399,9 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
     // has been validated - both clients successfully receive SubscribeResponse.
     // Update notification delivery can be tested once UPDATE is fixed for isolated nodes.
 
-    println!("Local subscription test completed successfully - both clients received SubscribeResponse");
+    println!(
+        "Local subscription test completed successfully - both clients received SubscribeResponse"
+    );
 
     // Properly close clients
     client1
@@ -497,8 +499,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
     // Verify UPDATE succeeded
     match update_result {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-            key,
-            ..
+            key, ..
         }))) => {
             assert_eq!(key, contract_key);
             println!("UPDATE operation successful in {:?}", update_elapsed);

@@ -3,8 +3,10 @@
 /// Parsed arguments for the `#[freenet_test]` attribute
 #[derive(Debug, Clone)]
 pub struct FreenetTestArgs {
-    /// Node labels (first is gateway)
+    /// All node labels
     pub nodes: Vec<String>,
+    /// Which nodes are gateways (if not specified, first node is gateway)
+    pub gateways: Option<Vec<String>>,
     /// Test timeout in seconds
     pub timeout_secs: u64,
     /// Node startup wait in seconds
@@ -35,6 +37,7 @@ pub enum AggregateEventsMode {
 impl syn::parse::Parse for FreenetTestArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut nodes = None;
+        let mut gateways = None;
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
         let mut aggregate_events = AggregateEventsMode::OnFailure;
@@ -72,6 +75,31 @@ impl syn::parse::Parse for FreenetTestArgs {
                     }
 
                     nodes = Some(node_list);
+                }
+                "gateways" => {
+                    // Parse array literal: ["gateway-1", "gateway-2", ...]
+                    let content;
+                    syn::bracketed!(content in input);
+
+                    let mut gateway_list = Vec::new();
+                    while !content.is_empty() {
+                        let lit: syn::LitStr = content.parse()?;
+                        gateway_list.push(lit.value());
+
+                        // Handle optional trailing comma
+                        if content.peek(syn::Token![,]) {
+                            content.parse::<syn::Token![,]>()?;
+                        }
+                    }
+
+                    if gateway_list.is_empty() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "gateways array cannot be empty if specified",
+                        ));
+                    }
+
+                    gateways = Some(gateway_list);
                 }
                 "timeout_secs" => {
                     let lit: syn::LitInt = input.parse()?;
@@ -139,11 +167,26 @@ impl syn::parse::Parse for FreenetTestArgs {
         }
 
         let nodes = nodes.ok_or_else(|| {
-            input.error("Required attribute 'nodes' is missing. Example: nodes = [\"gateway\", \"peer-1\"]")
+            input.error(
+                "Required attribute 'nodes' is missing. Example: nodes = [\"gateway\", \"peer-1\"]",
+            )
         })?;
+
+        // Validate gateways if specified
+        if let Some(ref gateway_list) = gateways {
+            for gateway in gateway_list {
+                if !nodes.contains(gateway) {
+                    return Err(input.error(format!(
+                        "Gateway '{}' is not in the nodes list. All gateways must be present in nodes.",
+                        gateway
+                    )));
+                }
+            }
+        }
 
         Ok(FreenetTestArgs {
             nodes,
+            gateways,
             timeout_secs,
             startup_wait_secs,
             aggregate_events,
