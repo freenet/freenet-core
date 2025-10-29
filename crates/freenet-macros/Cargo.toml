@@ -1,9 +1,9 @@
 [package]
-name = "freenet-test-macros"
+name = "freenet-macros"
 version = "0.1.0"
 edition = "2021"
 authors = ["Freenet Contributors"]
-description = "Procedural macros for Freenet integration tests"
+description = "Procedural macros for Freenet"
 license = "MIT OR Apache-2.0"
 
 [lib]

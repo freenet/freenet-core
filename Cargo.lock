@@ -1747,8 +1747,8 @@ dependencies = [
  "directories",
  "either",
  "flatbuffers 25.9.23",
+ "freenet-macros 0.1.0",
  "freenet-stdlib",
- "freenet-test-macros",
  "futures 0.3.31",
  "headers",
  "hickory-resolver",
@@ -1796,6 +1796,17 @@ dependencies = [
  "winapi",
  "wmi",
  "xz2",
+]
+
+[[package]]
+name = "freenet-macros"
+version = "0.1.0"
+dependencies = [
+ "darling 0.20.11",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+ "trybuild",
 ]
 
 [[package]]
@@ -1866,7 +1877,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers 24.12.23",
- "freenet-macros",
+ "freenet-macros 0.1.2",
  "futures 0.3.31",
  "js-sys",
  "once_cell",
@@ -1883,17 +1894,6 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "web-sys",
-]
-
-[[package]]
-name = "freenet-test-macros"
-version = "0.1.0"
-dependencies = [
- "darling 0.20.11",
- "proc-macro2",
- "quote",
- "syn 2.0.106",
- "trybuild",
 ]
 
 [[package]]

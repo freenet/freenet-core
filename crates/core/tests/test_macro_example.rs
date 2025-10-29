@@ -7,7 +7,7 @@
 //! - Event aggregation and failure reporting
 
 use freenet::test_utils::{TestContext, TestResult};
-use freenet_test_macros::freenet_test;
+use freenet_macros::freenet_test;
 
 /// Simple test with just a gateway node
 #[freenet_test(nodes = ["gateway"])]
