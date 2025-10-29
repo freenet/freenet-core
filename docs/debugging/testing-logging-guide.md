@@ -763,11 +763,139 @@ else
 fi
 ```
 
+## Advanced: Multi-Node Event Aggregation
+
+For complex debugging scenarios involving multiple nodes, you can use the **Event Log Aggregator** to correlate events across the distributed network.
+
+### When to Use Event Aggregation
+
+Use event aggregation when you need to:
+- Understand how a transaction flows through multiple nodes
+- Debug state propagation across the network
+- Identify which nodes processed a specific operation
+- Visualize the routing path of a transaction
+- Perform post-mortem analysis of failed tests
+
+### Quick Example
+
+```rust
+use freenet::test_utils::TestAggregatorBuilder;
+
+#[tokio::test]
+async fn test_with_event_aggregation() -> TestResult {
+    // 1. Start nodes (each writes to separated AOF log)
+    let (config_gw, temp_gw) = create_node_config(...).await?;
+    let (config_a, temp_a) = create_node_config(...).await?;
+
+    let gateway = start_node(config_gw).await?;
+    let node_a = start_node(config_a).await?;
+
+    // 2. Perform operations
+    let tx_id = perform_put(&mut client, state, contract).await?;
+
+    // 3. Aggregate logs from all nodes
+    let aggregator = TestAggregatorBuilder::new()
+        .add_node("gateway", temp_gw.path().join("_EVENT_LOG_LOCAL"))
+        .add_node("node-a", temp_a.path().join("_EVENT_LOG_LOCAL"))
+        .build()
+        .await?;
+
+    // 4. Analyze transaction flow across nodes
+    let flow = aggregator.get_transaction_flow(&tx_id).await?;
+
+    for event in &flow {
+        println!(
+            "{:?} at {} on {}",
+            event.event_kind,
+            event.timestamp,
+            event.peer_label.as_ref().unwrap_or(&"unknown".to_string())
+        );
+    }
+
+    // 5. Get routing path
+    let path = aggregator.get_routing_path(&tx_id).await?;
+    assert!(path.path.len() >= 2, "Should visit multiple nodes");
+
+    // 6. Export visualization
+    let graph = aggregator.export_mermaid_graph(&tx_id).await?;
+    println!("{}", graph);  // Mermaid diagram in test output
+
+    Ok(())
+}
+```
+
+### Event Aggregation Output
+
+```
+# Transaction flow output:
+PutEvent::Request at 2025-10-28T10:00:01Z on node-a
+PutEvent::Forwarded at 2025-10-28T10:00:02Z on gateway
+PutEvent::Success at 2025-10-28T10:00:03Z on gateway
+```
+
+```mermaid
+graph TD
+    N0["node-a\nPutEvent::Request"]
+    N1["gateway\nPutEvent::Forwarded"]
+    N2["gateway\nPutEvent::Success"]
+    N0 --> N1
+    N1 --> N2
+```
+
+### Combining with Logging
+
+Event aggregation works best when combined with proper logging:
+
+```rust
+use freenet::test_utils::{TestLogger, TestAggregatorBuilder};
+
+#[tokio::test]
+async fn test_complex_operation() -> TestResult {
+    // 1. Set up structured JSON logging
+    let _logger = TestLogger::new()
+        .with_json()
+        .with_level("freenet=debug,info")
+        .init();
+
+    // 2. Run test with logging...
+    let (temp_gw, temp_a) = run_multi_node_test().await?;
+
+    // 3. Use event aggregator for post-mortem analysis
+    let aggregator = TestAggregatorBuilder::new()
+        .add_node("gateway", temp_gw.path().join("_EVENT_LOG_LOCAL"))
+        .add_node("node-a", temp_a.path().join("_EVENT_LOG_LOCAL"))
+        .build()
+        .await?;
+
+    // Both logging (from TestLogger) and events (from aggregator) available
+    let all_events = aggregator.get_all_events().await?;
+    println!("Total events across all nodes: {}", all_events.len());
+
+    Ok(())
+}
+```
+
+### Best Practices
+
+1. **Always keep node logs separated** - Each node writes to its own AOF file (matches production)
+2. **Aggregate after test completes** - Don't try to aggregate while nodes are running
+3. **Use meaningful node labels** - `add_node("gateway", ...)` helps identify nodes in output
+4. **Export graphs for failed tests** - Visual representation helps debugging
+5. **Combine with structured logging** - Use both for complete picture
+
+### See Also
+
+- **Full documentation**: `../EVENT_AGGREGATOR.md`
+- **Integration test example**: `crates/core/tests/test_event_aggregator.rs`
+- **Related issue**: #2014 (structured operation tracing)
+- **General testing**: `../TESTING.md`
+
 ## References
 
 - [test-log crate documentation](https://docs.rs/test-log/)
 - [tracing crate documentation](https://docs.rs/tracing/)
 - [TESTING.md](../TESTING.md) - General testing guidelines
+- [EVENT_AGGREGATOR.md](../EVENT_AGGREGATOR.md) - Event aggregation guide
 - [debugging-and-tracing-analysis.md](debugging-and-tracing-analysis.md) - Comprehensive analysis
 
 ## Contributing

@@ -200,6 +200,62 @@ async fn test_network_behavior() -> TestResult {
 }
 ```
 
+## Debugging Multi-Node Operations
+
+### Event Log Aggregation
+
+When debugging distributed operations across multiple nodes, use the Event Log Aggregator to correlate transactions and analyze flow:
+
+**Setup:**
+```rust
+use freenet::test_utils::TestAggregatorBuilder;
+
+#[tokio::test]
+async fn test_distributed_operation() -> TestResult {
+    // 1. Start nodes (each writes to its own AOF log)
+    let (config_gw, temp_gw) = create_node_config(...).await?;
+    let (config_a, temp_a) = create_node_config(...).await?;
+
+    let gateway = start_node(config_gw).await?;
+    let node_a = start_node(config_a).await?;
+
+    // 2. Run operations and capture transaction ID
+    let tx_id = perform_put_operation(&mut client).await?;
+
+    // 3. After test completes, aggregate logs from all nodes
+    let aggregator = TestAggregatorBuilder::new()
+        .add_node("gateway", temp_gw.path().join("_EVENT_LOG_LOCAL"))
+        .add_node("node-a", temp_a.path().join("_EVENT_LOG_LOCAL"))
+        .build()
+        .await?;
+
+    // 4. Analyze transaction flow
+    let flow = aggregator.get_transaction_flow(&tx_id).await?;
+    println!("Transaction visited {} nodes", flow.len());
+
+    // 5. Get routing path
+    let path = aggregator.get_routing_path(&tx_id).await?;
+    println!("Path: {:?}", path.path);
+
+    // 6. Export visualization
+    let graph = aggregator.export_mermaid_graph(&tx_id).await?;
+    println!("{}", graph);  // Shows in test output
+
+    Ok(())
+}
+```
+
+**Benefits:**
+- **Multi-node correlation** - See how operations flow through the network
+- **Timeline reconstruction** - Events sorted chronologically across all nodes
+- **Visual debugging** - Mermaid graphs show transaction paths
+- **Post-mortem analysis** - Analyze failed tests to understand what happened
+
+**See Also:**
+- Full documentation: `docs/EVENT_AGGREGATOR.md`
+- Integration test example: `crates/core/tests/test_event_aggregator.rs`
+- Related to Issue #2014 (structured operation tracing)
+
 ## Code Review Requirements
 
 ### For PRs Touching Critical Paths:
@@ -303,6 +359,8 @@ fi
 - **Test Utilities**: `crates/core/src/test_utils/`
 - **Example Tests**: `crates/core/tests/connectivity.rs`
 - **CI Configuration**: `.github/workflows/tests.yml`
+- **Event Log Aggregation**: `docs/EVENT_AGGREGATOR.md`
+- **Logging Guide**: `docs/debugging/testing-logging-guide.md`
 
 ## Questions?
 
