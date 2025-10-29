@@ -1942,8 +1942,15 @@ async fn test_put_with_subscribe_flag() -> TestResult {
     Ok(())
 }
 
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn test_delegate_request() -> TestResult {
+#[freenet_test(
+    nodes = ["gateway", "client-node"],
+    auto_connect_peers = true,
+    timeout_secs = 180,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
     const TEST_DELEGATE: &str = "test-delegate-integration";
 
     // Configure environment variables for optimized release build
@@ -1956,80 +1963,23 @@ async fn test_delegate_request() -> TestResult {
     let delegate = load_delegate(TEST_DELEGATE, params.clone())?;
     let delegate_key = delegate.key().clone();
 
-    // Create sockets for ports
-    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_client = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-
-    // Configure gateway node
-    let (config_gw, preset_cfg_gw, gw_cfg) = {
-        let (cfg, preset) = base_node_test_config(
-            true,
-            vec![],
-            Some(network_socket_gw.local_addr()?.port()),
-            ws_api_port_socket_gw.local_addr()?.port(),
-        )
-        .await?;
-        let public_port = cfg.network_api.public_port.unwrap();
-        let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config(public_port, &path)?)
-    };
-
-    // Configure client node
-    let (config_client, preset_cfg_client) = base_node_test_config(
-        false,
-        vec![serde_json::to_string(&gw_cfg)?],
-        None,
-        ws_api_port_socket_client.local_addr()?.port(),
-    )
-    .await?;
-    let ws_api_port_client = config_client.ws_api.ws_api_port.unwrap();
+    let client_node = ctx.node("client-node")?;
+    let gateway = ctx.node("gateway")?;
+    let ws_api_port_client = client_node.ws_port;
 
     // Log data directories for debugging
-    tracing::info!(
-        "Client node data dir: {:?}",
-        preset_cfg_client.temp_dir.path()
+    tracing::info!("Client node data dir: {:?}", client_node.temp_dir_path);
+    tracing::info!("Gateway node data dir: {:?}", gateway.temp_dir_path);
+
+    // Give extra time for peer to connect to gateway
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Connect to the client node's WebSocket API
+    let uri = format!(
+        "ws://127.0.0.1:{ws_api_port_client}/v1/contract/command?encodingProtocol=native"
     );
-    tracing::info!("Gateway node data dir: {:?}", preset_cfg_gw.temp_dir.path());
-
-    // Free ports so they don't fail on initialization
-    std::mem::drop(ws_api_port_socket_client);
-    std::mem::drop(network_socket_gw);
-    std::mem::drop(ws_api_port_socket_gw);
-
-    // Start gateway node
-    let node_gw = async {
-        let config = config_gw.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
-        node.run().await
-    }
-    .boxed_local();
-
-    // Start client node
-    let node_client = async move {
-        let config = config_client.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
-        node.run().await
-    }
-    .boxed_local();
-
-    // Wait for the nodes to start and run the test
-    let test = tokio::time::timeout(Duration::from_secs(180), async {
-        // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(20)).await;
-
-        // Connect to the client node's WebSocket API
-        let uri = format!(
-            "ws://127.0.0.1:{ws_api_port_client}/v1/contract/command?encodingProtocol=native"
-        );
-        let (stream, _) = connect_async(&uri).await?;
-        let mut client = WebApi::start(stream);
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client = WebApi::start(stream);
 
         // Register the delegate in the node
         client
@@ -2133,26 +2083,6 @@ async fn test_delegate_request() -> TestResult {
                 );
             }
         }
-
-        Ok::<_, anyhow::Error>(())
-    });
-
-    // Wait for test completion or node failures
-    select! {
-        gw = node_gw => {
-            let Err(e) = gw;
-            return Err(anyhow!("Gateway node failed: {}", e).into())
-        }
-        client = node_client => {
-            let Err(e) = client;
-            return Err(anyhow!("Client node failed: {}", e).into())
-        }
-        r = test => {
-            r??;
-            // Keep nodes alive for pending operations to complete
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        }
-    }
 
     Ok(())
 }
