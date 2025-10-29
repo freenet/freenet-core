@@ -555,7 +555,7 @@ impl OpManager {
             }
             .into());
 
-            if let Some((_key, _)) = self.root_ops_awaiting_sub_ops.remove(&parent_tx) {
+            if self.root_ops_awaiting_sub_ops.remove(&parent_tx).is_some() {
                 tracing::warn!(
                     root_tx = %parent_tx,
                     child_tx = %child,
