@@ -467,25 +467,6 @@ impl OpManager {
         }
     }
 
-    /// Registers an expected child operation for the parent transaction.
-    /// Must be called before spawning the child to prevent completion race conditions.
-    pub fn expect_sub_operation(&self, parent: Transaction) {
-        self.expected_sub_operations
-            .entry(parent)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-    }
-
-    /// Registers parent-child transaction relationship for atomicity tracking.
-    pub fn register_sub_operation(&self, parent: Transaction, child: Transaction) {
-        self.sub_operations
-            .entry(parent)
-            .or_insert_with(HashSet::new)
-            .insert(child);
-
-        self.parent_of.insert(child, parent);
-    }
-
     /// Atomically registers both expected count and parent-child relationship.
     /// This prevents race conditions where children complete before registration.
     pub fn expect_and_register_sub_operation(&self, parent: Transaction, child: Transaction) {
@@ -498,7 +479,7 @@ impl OpManager {
         // Register parent-child relationship
         self.sub_operations
             .entry(parent)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(child);
 
         self.parent_of.insert(child, parent);
