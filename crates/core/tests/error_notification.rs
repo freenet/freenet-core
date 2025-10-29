@@ -7,8 +7,6 @@
 //! - #1858: Clients hang when operations fail (no error notification)
 
 use freenet::{
-    config::{ConfigArgs, NetworkArgs, SecretArgs, WebsocketApiArgs},
-    dev_tool::TransportKeypair,
     local_node::NodeConfig,
     server::serve_gateway,
     test_utils::{load_contract, make_get, TestContext},

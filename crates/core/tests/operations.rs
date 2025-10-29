@@ -154,10 +154,12 @@ async fn test_put_contract(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Node A (peer-a) ws_port: {}", ws_api_port_peer_a);
     tracing::info!("Node B (gateway) ws_port: {}", ws_api_port_peer_b);
 
+    // Give extra time for peer to connect to gateway
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     // Connect to node A's websocket API
-    let uri = format!(
-        "ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native"
-    );
+    let uri =
+        format!("ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native");
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_a = WebApi::start(stream);
 
@@ -261,86 +263,88 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Node A (peer-a) data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
 
+    // Give extra time for peer to connect to gateway
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     // Connect to node A websocket API
-    let uri =
-        format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
+    let uri = format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_a = WebApi::start(stream);
 
-        // Put contract with initial state
-        make_put(
-            &mut client_api_a,
-            wrapped_state.clone(),
-            contract.clone(),
-            false,
-        )
-        .await?;
+    // Put contract with initial state
+    make_put(
+        &mut client_api_a,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
 
-        // Wait for put response (increased timeout for CI environments)
-        tracing::info!("Waiting for PUT response...");
-        let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                tracing::info!("PUT successful for contract: {}", key);
-                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
-            }
-            Ok(Ok(other)) => {
-                tracing::warn!("unexpected response while waiting for put: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Error receiving put response: {}", e);
-            }
-            Err(_) => {
-                bail!("Timeout waiting for put response after 120 seconds");
-            }
+    // Wait for put response (increased timeout for CI environments)
+    tracing::info!("Waiting for PUT response...");
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            tracing::info!("PUT successful for contract: {}", key);
+            assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
         }
+        Ok(Ok(other)) => {
+            tracing::warn!("unexpected response while waiting for put: {:?}", other);
+        }
+        Ok(Err(e)) => {
+            bail!("Error receiving put response: {}", e);
+        }
+        Err(_) => {
+            bail!("Timeout waiting for put response after 120 seconds");
+        }
+    }
 
-        // Create a new to-do list by deserializing the current state, adding a task, and serializing it back
-        let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())
-            .unwrap_or_else(|_| test_utils::TodoList {
-                tasks: Vec::new(),
-                version: 0,
-            });
-
-        // Add a task directly to the list
-        todo_list.tasks.push(test_utils::Task {
-            id: 1,
-            title: "Implement contract".to_string(),
-            description: "Create a smart contract for the todo list".to_string(),
-            completed: false,
-            priority: 3,
+    // Create a new to-do list by deserializing the current state, adding a task, and serializing it back
+    let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())
+        .unwrap_or_else(|_| test_utils::TodoList {
+            tasks: Vec::new(),
+            version: 0,
         });
 
-        // Serialize the updated list back to bytes
-        let updated_bytes = serde_json::to_vec(&todo_list).unwrap();
-        let updated_state = WrappedState::from(updated_bytes);
+    // Add a task directly to the list
+    todo_list.tasks.push(test_utils::Task {
+        id: 1,
+        title: "Implement contract".to_string(),
+        description: "Create a smart contract for the todo list".to_string(),
+        completed: false,
+        priority: 3,
+    });
 
-        let expected_version_after_update = todo_list.version + 1;
+    // Serialize the updated list back to bytes
+    let updated_bytes = serde_json::to_vec(&todo_list).unwrap();
+    let updated_state = WrappedState::from(updated_bytes);
 
-        make_update(&mut client_api_a, contract_key, updated_state.clone()).await?;
+    let expected_version_after_update = todo_list.version + 1;
 
-        // Wait for update response
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-                key,
-                summary: _,
-            }))) => {
-                assert_eq!(
-                    key, contract_key,
-                    "Contract key mismatch in UPDATE response"
-                );
-            }
-            Ok(Ok(other)) => {
-                bail!("unexpected response while waiting for update: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Client A: Error receiving update response: {}", e);
-            }
-            Err(_) => {
-                bail!("Client A: Timeout waiting for update response");
-            }
+    make_update(&mut client_api_a, contract_key, updated_state.clone()).await?;
+
+    // Wait for update response
+    let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key,
+            summary: _,
+        }))) => {
+            assert_eq!(
+                key, contract_key,
+                "Contract key mismatch in UPDATE response"
+            );
         }
+        Ok(Ok(other)) => {
+            bail!("unexpected response while waiting for update: {:?}", other);
+        }
+        Ok(Err(e)) => {
+            bail!("Client A: Error receiving update response: {}", e);
+        }
+        Err(_) => {
+            bail!("Client A: Timeout waiting for update response");
+        }
+    }
 
     // Verify the updated state with GET
     {
@@ -430,108 +434,109 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Node A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
 
+    // Give extra time for peer to connect to gateway
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     // Connect to node A's websocket API
-    let uri = format!(
-        "ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native"
-    );
+    let uri =
+        format!("ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native");
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_a = WebApi::start(stream);
 
-        // First PUT: Store initial contract state
-        tracing::info!("Sending first PUT with initial state...");
-        make_put(
-            &mut client_api_a,
-            initial_wrapped_state.clone(),
-            contract.clone(),
-            false,
-        )
-        .await?;
+    // First PUT: Store initial contract state
+    tracing::info!("Sending first PUT with initial state...");
+    make_put(
+        &mut client_api_a,
+        initial_wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
 
-        // Wait for first put response
-        let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                tracing::info!("First PUT successful for contract: {}", key);
-                assert_eq!(key, contract_key);
-            }
-            Ok(Ok(other)) => {
-                bail!("Unexpected response for first PUT: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Error receiving first PUT response: {}", e);
-            }
-            Err(_) => {
-                bail!("Timeout waiting for first PUT response");
-            }
+    // Wait for first put response
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            tracing::info!("First PUT successful for contract: {}", key);
+            assert_eq!(key, contract_key);
         }
-
-        // Wait a bit to ensure state is fully cached
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Create updated state with more data (simulating a state merge)
-        let mut updated_todo_list: test_utils::TodoList =
-            serde_json::from_slice(initial_wrapped_state.as_ref()).unwrap();
-
-        // Add multiple tasks to make the state larger
-        for i in 1..=5 {
-            updated_todo_list.tasks.push(test_utils::Task {
-                id: i,
-                title: format!("Task {}", i),
-                description: format!("Description for task {}", i),
-                completed: false,
-                priority: i as u8,
-            });
+        Ok(Ok(other)) => {
+            bail!("Unexpected response for first PUT: {:?}", other);
         }
-
-        let updated_bytes = serde_json::to_vec(&updated_todo_list).unwrap();
-        let updated_wrapped_state = WrappedState::from(updated_bytes);
-
-        tracing::info!(
-            "Initial state size: {} bytes, Updated state size: {} bytes",
-            initial_wrapped_state.as_ref().len(),
-            updated_wrapped_state.as_ref().len()
-        );
-
-        // Second PUT: Update the already-cached contract with new state
-        // This tests the bug fix - the merged state should be persisted
-        tracing::info!("Sending second PUT with updated state...");
-        make_put(
-            &mut client_api_a,
-            updated_wrapped_state.clone(),
-            contract.clone(),
-            false,
-        )
-        .await?;
-
-        // Wait for second put response
-        let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                tracing::info!("Second PUT successful for contract: {}", key);
-                assert_eq!(key, contract_key);
-            }
-            Ok(Ok(other)) => {
-                bail!("Unexpected response for second PUT: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Error receiving second PUT response: {}", e);
-            }
-            Err(_) => {
-                bail!("Timeout waiting for second PUT response");
-            }
+        Ok(Err(e)) => {
+            bail!("Error receiving first PUT response: {}", e);
         }
+        Err(_) => {
+            bail!("Timeout waiting for first PUT response");
+        }
+    }
 
-        // Wait a bit to ensure the merge and persistence completes
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait a bit to ensure state is fully cached
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // The key test: GET from gateway to verify it persisted the merged state
-        // This is the bug from issue #1995 - gateway receives PUT for already-cached
-        // contract, merges state, but doesn't persist it
-        let uri = format!(
-            "ws://127.0.0.1:{ws_api_port_peer_b}/v1/contract/command?encodingProtocol=native"
-        );
-        let (stream, _) = connect_async(&uri).await?;
-        let mut client_api_gateway = WebApi::start(stream);
+    // Create updated state with more data (simulating a state merge)
+    let mut updated_todo_list: test_utils::TodoList =
+        serde_json::from_slice(initial_wrapped_state.as_ref()).unwrap();
+
+    // Add multiple tasks to make the state larger
+    for i in 1..=5 {
+        updated_todo_list.tasks.push(test_utils::Task {
+            id: i,
+            title: format!("Task {}", i),
+            description: format!("Description for task {}", i),
+            completed: false,
+            priority: i as u8,
+        });
+    }
+
+    let updated_bytes = serde_json::to_vec(&updated_todo_list).unwrap();
+    let updated_wrapped_state = WrappedState::from(updated_bytes);
+
+    tracing::info!(
+        "Initial state size: {} bytes, Updated state size: {} bytes",
+        initial_wrapped_state.as_ref().len(),
+        updated_wrapped_state.as_ref().len()
+    );
+
+    // Second PUT: Update the already-cached contract with new state
+    // This tests the bug fix - the merged state should be persisted
+    tracing::info!("Sending second PUT with updated state...");
+    make_put(
+        &mut client_api_a,
+        updated_wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    // Wait for second put response
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            tracing::info!("Second PUT successful for contract: {}", key);
+            assert_eq!(key, contract_key);
+        }
+        Ok(Ok(other)) => {
+            bail!("Unexpected response for second PUT: {:?}", other);
+        }
+        Ok(Err(e)) => {
+            bail!("Error receiving second PUT response: {}", e);
+        }
+        Err(_) => {
+            bail!("Timeout waiting for second PUT response");
+        }
+    }
+
+    // Wait a bit to ensure the merge and persistence completes
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The key test: GET from gateway to verify it persisted the merged state
+    // This is the bug from issue #1995 - gateway receives PUT for already-cached
+    // contract, merges state, but doesn't persist it
+    let uri =
+        format!("ws://127.0.0.1:{ws_api_port_peer_b}/v1/contract/command?encodingProtocol=native");
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client_api_gateway = WebApi::start(stream);
 
     tracing::info!("Getting contract from gateway to verify merged state was persisted...");
     let (response_contract_gw, response_state_gw) = get_contract(
@@ -2637,6 +2642,9 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
     tracing::info!("Node data dir: {:?}", peer_node.temp_dir_path);
 
+    // Give extra time for peer to connect to gateway
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     // Connect to gateway websocket API
     let uri_gw =
         format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
@@ -2644,43 +2652,42 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
     let mut client_gw = WebApi::start(stream_gw);
 
     // Connect to node websocket API
-    let uri_node = format!(
-        "ws://127.0.0.1:{ws_api_port_node}/v1/contract/command?encodingProtocol=native"
-    );
+    let uri_node =
+        format!("ws://127.0.0.1:{ws_api_port_node}/v1/contract/command?encodingProtocol=native");
     let (stream_node, _) = connect_async(&uri_node).await?;
     let _client_node = WebApi::start(stream_node);
 
-        // First just test that we can query subscription info
-        tracing::info!("Testing basic subscription query without any subscriptions");
+    // First just test that we can query subscription info
+    tracing::info!("Testing basic subscription query without any subscriptions");
 
-        // Query subscription info from gateway
-        tracing::info!("Querying subscription info from gateway");
-        client_gw
-            .send(ClientRequest::NodeQueries(
-                freenet_stdlib::client_api::NodeQuery::SubscriptionInfo,
-            ))
-            .await?;
+    // Query subscription info from gateway
+    tracing::info!("Querying subscription info from gateway");
+    client_gw
+        .send(ClientRequest::NodeQueries(
+            freenet_stdlib::client_api::NodeQuery::SubscriptionInfo,
+        ))
+        .await?;
 
-        // Wait for subscription info response
-        let resp = timeout(Duration::from_secs(5), client_gw.recv()).await??;
+    // Wait for subscription info response
+    let resp = timeout(Duration::from_secs(5), client_gw.recv()).await??;
 
-        match resp {
-            HostResponse::QueryResponse(QueryResponse::NetworkDebug(info)) => {
-                tracing::info!("Gateway subscription info:");
-                tracing::info!("  Connected peers: {:?}", info.connected_peers);
-                tracing::info!("  Total subscriptions: {}", info.subscriptions.len());
+    match resp {
+        HostResponse::QueryResponse(QueryResponse::NetworkDebug(info)) => {
+            tracing::info!("Gateway subscription info:");
+            tracing::info!("  Connected peers: {:?}", info.connected_peers);
+            tracing::info!("  Total subscriptions: {}", info.subscriptions.len());
 
-                // Should be empty since we haven't subscribed to anything
-                assert!(
-                    info.subscriptions.is_empty(),
-                    "Expected no subscriptions initially"
-                );
-                tracing::info!("Test passed - query subscription info works");
-            }
-            other => {
-                bail!("Unexpected response: {:?}", other);
-            }
+            // Should be empty since we haven't subscribed to anything
+            assert!(
+                info.subscriptions.is_empty(),
+                "Expected no subscriptions initially"
+            );
+            tracing::info!("Test passed - query subscription info works");
         }
+        other => {
+            bail!("Unexpected response: {:?}", other);
+        }
+    }
 
     Ok(())
 }
@@ -2721,66 +2728,68 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
     tracing::info!("Node A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
 
+    // Give extra time for peer to connect to gateway
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     // Connect to node A websocket API
-    let uri =
-        format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
+    let uri = format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_a = WebApi::start(stream);
 
-        // Put contract with initial state
-        make_put(
-            &mut client_api_a,
-            wrapped_state.clone(),
-            contract.clone(),
-            false,
-        )
-        .await?;
+    // Put contract with initial state
+    make_put(
+        &mut client_api_a,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
 
-        // Wait for put response
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
-            }
-            Ok(Ok(other)) => {
-                tracing::warn!("unexpected response while waiting for put: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Error receiving put response: {}", e);
-            }
-            Err(_) => {
-                bail!("Timeout waiting for put response");
-            }
+    // Wait for put response
+    let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
         }
-
-        // Now update with the EXACT SAME state (should trigger UpdateNoChange)
-        tracing::info!("Sending UPDATE with identical state to trigger UpdateNoChange");
-        make_update(&mut client_api_a, contract_key, wrapped_state.clone()).await?;
-
-        // Wait for update response - THIS SHOULD NOT TIMEOUT
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-                key,
-                summary: _,
-            }))) => {
-                assert_eq!(
-                    key, contract_key,
-                    "Contract key mismatch in UPDATE response"
-                );
-                tracing::info!("SUCCESS: Received UpdateResponse for no-change update");
-            }
-            Ok(Ok(other)) => {
-                bail!("Unexpected response while waiting for update: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Error receiving update response: {}", e);
-            }
-            Err(_) => {
-                // This is where the test will currently fail
-                bail!("TIMEOUT waiting for update response - UpdateNoChange bug: client not notified when update results in no state change");
-            }
+        Ok(Ok(other)) => {
+            tracing::warn!("unexpected response while waiting for put: {:?}", other);
         }
+        Ok(Err(e)) => {
+            bail!("Error receiving put response: {}", e);
+        }
+        Err(_) => {
+            bail!("Timeout waiting for put response");
+        }
+    }
+
+    // Now update with the EXACT SAME state (should trigger UpdateNoChange)
+    tracing::info!("Sending UPDATE with identical state to trigger UpdateNoChange");
+    make_update(&mut client_api_a, contract_key, wrapped_state.clone()).await?;
+
+    // Wait for update response - THIS SHOULD NOT TIMEOUT
+    let resp = tokio::time::timeout(Duration::from_secs(30), client_api_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key,
+            summary: _,
+        }))) => {
+            assert_eq!(
+                key, contract_key,
+                "Contract key mismatch in UPDATE response"
+            );
+            tracing::info!("SUCCESS: Received UpdateResponse for no-change update");
+        }
+        Ok(Ok(other)) => {
+            bail!("Unexpected response while waiting for update: {:?}", other);
+        }
+        Ok(Err(e)) => {
+            bail!("Error receiving update response: {}", e);
+        }
+        Err(_) => {
+            // This is where the test will currently fail
+            bail!("TIMEOUT waiting for update response - UpdateNoChange bug: client not notified when update results in no state change");
+        }
+    }
 
     Ok(())
 }

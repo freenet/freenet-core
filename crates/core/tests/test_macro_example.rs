@@ -169,7 +169,10 @@ async fn test_multiple_gateways(ctx: &mut TestContext) -> TestResult {
             gw.is_gateway
         );
         assert!(gw.is_gateway);
-        assert!(gw.network_port.is_some(), "Gateways should have network ports");
+        assert!(
+            gw.network_port.is_some(),
+            "Gateways should have network ports"
+        );
     }
 
     // Get all peers
@@ -186,7 +189,10 @@ async fn test_multiple_gateways(ctx: &mut TestContext) -> TestResult {
             peer.is_gateway
         );
         assert!(!peer.is_gateway);
-        assert!(peer.network_port.is_none(), "Peers should not have network ports");
+        assert!(
+            peer.network_port.is_none(),
+            "Peers should not have network ports"
+        );
     }
 
     // Verify specific nodes
@@ -219,7 +225,11 @@ async fn test_auto_connect_peers(ctx: &mut TestContext) -> TestResult {
 
     tracing::info!("Gateway '{}': ws_port={}", gateway.label, gateway.ws_port);
     for peer in &peers {
-        tracing::info!("Peer '{}': ws_port={} (configured to connect to gateway)", peer.label, peer.ws_port);
+        tracing::info!(
+            "Peer '{}': ws_port={} (configured to connect to gateway)",
+            peer.label,
+            peer.ws_port
+        );
     }
 
     assert_eq!(peers.len(), 2);
@@ -243,16 +253,27 @@ async fn test_multi_gateway_auto_connect(ctx: &mut TestContext) -> TestResult {
     let gateways = ctx.gateways();
     let peers = ctx.peers();
 
-    tracing::info!("Test with {} gateways and {} peers", gateways.len(), peers.len());
+    tracing::info!(
+        "Test with {} gateways and {} peers",
+        gateways.len(),
+        peers.len()
+    );
 
     for gw in &gateways {
-        tracing::info!("Gateway '{}': ws_port={}, network_port={:?}",
-            gw.label, gw.ws_port, gw.network_port);
+        tracing::info!(
+            "Gateway '{}': ws_port={}, network_port={:?}",
+            gw.label,
+            gw.ws_port,
+            gw.network_port
+        );
     }
 
     for peer in &peers {
-        tracing::info!("Peer '{}': ws_port={} (configured to connect to all gateways)",
-            peer.label, peer.ws_port);
+        tracing::info!(
+            "Peer '{}': ws_port={} (configured to connect to all gateways)",
+            peer.label,
+            peer.ws_port
+        );
     }
 
     assert_eq!(gateways.len(), 2);
