@@ -477,10 +477,7 @@ impl OpManager {
             .or_insert(1);
 
         // Register parent-child relationship
-        self.sub_operations
-            .entry(parent)
-            .or_default()
-            .insert(child);
+        self.sub_operations.entry(parent).or_default().insert(child);
 
         self.parent_of.insert(child, parent);
     }
