@@ -648,7 +648,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         TransactionType::Subscribe => ops.subscribe.remove(&tx).is_none(),
                         TransactionType::Update => ops.update.remove(&tx).is_none(),
                     };
-                    if still_waiting  {
+                    if still_waiting {
                         delayed.push(tx);
                     } else {
                         ops.under_progress.remove(&tx);
