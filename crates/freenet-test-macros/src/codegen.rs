@@ -16,11 +16,14 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
     // Generate node setup code
     let node_setup = generate_node_setup(&args);
 
-    // Generate node startup tasks
+    // Extract values before configs are moved
+    let value_extraction = generate_value_extraction(&args);
+
+    // Generate node startup tasks (moves configs)
     let node_tasks = generate_node_tasks(&args);
 
-    // Generate TestContext creation
-    let context_creation = generate_context_creation(&args);
+    // Generate TestContext creation (uses extracted values)
+    let context_creation = generate_context_creation_only(&args);
 
     // Generate test coordination with select!
     let test_coordination = generate_test_coordination(&args, &inner_fn_name);
@@ -50,10 +53,13 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             // 2. Create node configurations
             #node_setup
 
-            // 3. Start nodes with instrumentation
+            // 3. Extract values before configs are moved
+            #value_extraction
+
+            // 4. Start nodes with instrumentation
             #node_tasks
 
-            // 4. Build TestContext
+            // 5. Build TestContext
             #context_creation
 
             // 5. Run test with coordination
@@ -100,7 +106,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     std::mem::drop(network_socket);
                     std::mem::drop(ws_socket);
 
-                    let location: f64 = rand::Rng::random(&mut rand::thread_rng());
+                    let location: f64 = rand::Rng::random(&mut rand::rng());
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
@@ -155,7 +161,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     let ws_port = ws_socket.local_addr()?.port();
                     std::mem::drop(ws_socket);
 
-                    let location: f64 = rand::Rng::random(&mut rand::thread_rng());
+                    let location: f64 = rand::Rng::random(&mut rand::rng());
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
@@ -236,23 +242,47 @@ fn generate_node_tasks(args: &FreenetTestArgs) -> TokenStream {
     }
 }
 
-/// Generate TestContext creation
-fn generate_context_creation(args: &FreenetTestArgs) -> TokenStream {
+/// Extract values from configs before they're moved
+fn generate_value_extraction(args: &FreenetTestArgs) -> TokenStream {
+    let mut value_extractions = Vec::new();
+
+    for (idx, _node_label) in args.nodes.iter().enumerate() {
+        let config_var = format_ident!("config_{}", idx);
+        let ws_port_var = format_ident!("ws_port_{}", idx);
+        let network_port_var = format_ident!("network_port_{}", idx);
+        let location_var = format_ident!("location_{}", idx);
+
+        value_extractions.push(quote! {
+            let #ws_port_var = #config_var.ws_api.ws_api_port.unwrap();
+            let #network_port_var = #config_var.network_api.public_port;
+            let #location_var = #config_var.network_api.location.unwrap();
+        });
+    }
+
+    quote! {
+        #(#value_extractions)*
+    }
+}
+
+/// Generate TestContext creation (uses already-extracted values)
+fn generate_context_creation_only(args: &FreenetTestArgs) -> TokenStream {
     let mut node_infos = Vec::new();
 
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let temp_var = format_ident!("temp_{}", idx);
-        let config_var = format_ident!("config_{}", idx);
+        let ws_port_var = format_ident!("ws_port_{}", idx);
+        let network_port_var = format_ident!("network_port_{}", idx);
+        let location_var = format_ident!("location_{}", idx);
         let is_gateway = idx == 0;
 
         node_infos.push(quote! {
             NodeInfo {
                 label: #node_label.to_string(),
                 temp_dir_path: #temp_var.path().to_path_buf(),
-                ws_port: #config_var.ws_api.ws_api_port.unwrap(),
-                network_port: #config_var.network_api.public_port,
+                ws_port: #ws_port_var,
+                network_port: #network_port_var,
                 is_gateway: #is_gateway,
-                location: #config_var.network_api.location.unwrap(),
+                location: #location_var,
             }
         });
     }
