@@ -404,8 +404,15 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
 
 /// Test that a second PUT to an already cached contract persists the merged state.
 /// This is a regression test for issue #1995.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn test_put_merge_persists_state() -> TestResult {
+#[freenet_test(
+    nodes = ["gateway", "peer-a"],
+    auto_connect_peers = true,
+    timeout_secs = 180,
+    startup_wait_secs = 15,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -415,82 +422,20 @@ async fn test_put_merge_persists_state() -> TestResult {
     let initial_state = test_utils::create_empty_todo_list();
     let initial_wrapped_state = WrappedState::from(initial_state);
 
-    // Create network sockets
-    let network_socket_b = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_a = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_b = TcpListener::bind("127.0.0.1:0")?;
+    let peer_a = ctx.node("peer-a")?;
+    let gateway = ctx.node("gateway")?;
+    let ws_api_port_peer_a = peer_a.ws_port;
+    let ws_api_port_peer_b = gateway.ws_port;
 
-    // Configure gateway node B
-    let (config_b, preset_cfg_b, config_b_gw) = {
-        let (cfg, preset) = base_node_test_config(
-            true,
-            vec![],
-            Some(network_socket_b.local_addr()?.port()),
-            ws_api_port_socket_b.local_addr()?.port(),
-        )
-        .await?;
-        let public_port = cfg.network_api.public_port.unwrap();
-        let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config(public_port, &path)?)
-    };
-    let ws_api_port_peer_b = config_b.ws_api.ws_api_port.unwrap();
+    tracing::info!("Node A data dir: {:?}", peer_a.temp_dir_path);
+    tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
 
-    // Configure peer node A
-    let (config_a, preset_cfg_a) = base_node_test_config(
-        false,
-        vec![serde_json::to_string(&config_b_gw)?],
-        None,
-        ws_api_port_socket_a.local_addr()?.port(),
-    )
-    .await?;
-    let ws_api_port_peer_a = config_a.ws_api.ws_api_port.unwrap();
-
-    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
-    tracing::info!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
-
-    // Start node A (peer)
-    std::mem::drop(ws_api_port_socket_a);
-    let node_a = async move {
-        tracing::info!("Starting peer A node");
-        let config = config_a.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
-        tracing::info!("Peer A node running");
-        node.run().await
-    }
-    .instrument(tracing::info_span!("test_peer", test_node = "peer-a"))
-    .boxed_local();
-
-    // Start node B (gateway)
-    std::mem::drop(network_socket_b);
-    std::mem::drop(ws_api_port_socket_b);
-    let node_b = async {
-        tracing::info!("Starting gateway node");
-        let config = config_b.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
-        tracing::info!("Gateway node running");
-        node.run().await
-    }
-    .instrument(tracing::info_span!("test_peer", test_node = "gateway"))
-    .boxed_local();
-
-    let test = tokio::time::timeout(Duration::from_secs(180), async {
-        // Wait for nodes to start up
-        tracing::info!("Waiting for nodes to start up...");
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        tracing::info!("Nodes should be ready, proceeding with test...");
-
-        // Connect to node A's websocket API
-        let uri = format!(
-            "ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native"
-        );
-        let (stream, _) = connect_async(&uri).await?;
-        let mut client_api_a = WebApi::start(stream);
+    // Connect to node A's websocket API
+    let uri = format!(
+        "ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native"
+    );
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client_api_a = WebApi::start(stream);
 
         // First PUT: Store initial contract state
         tracing::info!("Sending first PUT with initial state...");
@@ -588,72 +533,54 @@ async fn test_put_merge_persists_state() -> TestResult {
         let (stream, _) = connect_async(&uri).await?;
         let mut client_api_gateway = WebApi::start(stream);
 
-        tracing::info!("Getting contract from gateway to verify merged state was persisted...");
-        let (response_contract_gw, response_state_gw) = get_contract(
-            &mut client_api_gateway,
-            contract_key,
-            &preset_cfg_b.temp_dir,
-        )
+    tracing::info!("Getting contract from gateway to verify merged state was persisted...");
+    let (response_contract_gw, response_state_gw) = get_contract(
+        &mut client_api_gateway,
+        contract_key,
+        &gateway.temp_dir_path,
+    )
+    .await?;
+
+    assert_eq!(response_contract_gw.key(), contract_key);
+
+    let response_todo_list_gw: test_utils::TodoList =
+        serde_json::from_slice(response_state_gw.as_ref())
+            .expect("Failed to deserialize state from gateway");
+
+    tracing::info!(
+        "Gateway returned state with {} tasks, size {} bytes",
+        response_todo_list_gw.tasks.len(),
+        response_state_gw.as_ref().len()
+    );
+
+    // This is the key assertion for issue #1995:
+    // Gateway received a PUT for an already-cached contract, merged the states,
+    // and should have PERSISTED the merged state (not just computed it)
+    assert_eq!(
+        response_todo_list_gw.tasks.len(),
+        5,
+        "Gateway should return merged state with 5 tasks (issue #1995: merged state must be persisted)"
+    );
+
+    // Verify the state size matches as additional confirmation
+    assert_eq!(
+        response_state_gw.as_ref().len(),
+        updated_wrapped_state.as_ref().len(),
+        "Gateway state size should match the updated state"
+    );
+
+    tracing::info!(
+        "✓ Test passed: Gateway correctly persisted merged state after second PUT (issue #1995 fixed)"
+    );
+
+    // Cleanup
+    client_api_a
+        .send(ClientRequest::Disconnect { cause: None })
         .await?;
-
-        assert_eq!(response_contract_gw.key(), contract_key);
-
-        let response_todo_list_gw: test_utils::TodoList =
-            serde_json::from_slice(response_state_gw.as_ref())
-                .expect("Failed to deserialize state from gateway");
-
-        tracing::info!(
-            "Gateway returned state with {} tasks, size {} bytes",
-            response_todo_list_gw.tasks.len(),
-            response_state_gw.as_ref().len()
-        );
-
-        // This is the key assertion for issue #1995:
-        // Gateway received a PUT for an already-cached contract, merged the states,
-        // and should have PERSISTED the merged state (not just computed it)
-        assert_eq!(
-            response_todo_list_gw.tasks.len(),
-            5,
-            "Gateway should return merged state with 5 tasks (issue #1995: merged state must be persisted)"
-        );
-
-        // Verify the state size matches as additional confirmation
-        assert_eq!(
-            response_state_gw.as_ref().len(),
-            updated_wrapped_state.as_ref().len(),
-            "Gateway state size should match the updated state"
-        );
-
-        tracing::info!(
-            "✓ Test passed: Gateway correctly persisted merged state after second PUT (issue #1995 fixed)"
-        );
-
-        // Cleanup
-        client_api_a
-            .send(ClientRequest::Disconnect { cause: None })
-            .await?;
-        client_api_gateway
-            .send(ClientRequest::Disconnect { cause: None })
-            .await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        Ok::<_, anyhow::Error>(())
-    });
-
-    select! {
-        a = node_a => {
-            let Err(a) = a;
-            return Err(anyhow!(a).into());
-        }
-        b = node_b => {
-            let Err(b) = b;
-            return Err(anyhow!(b).into());
-        }
-        r = test => {
-            r??;
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        }
-    }
+    client_api_gateway
+        .send(ClientRequest::Disconnect { cause: None })
+        .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     Ok(())
 }
@@ -2686,8 +2613,15 @@ async fn wait_for_subscribe_response(
     }
 }
 
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn test_subscription_introspection() -> TestResult {
+#[freenet_test(
+    nodes = ["gateway", "peer-node"],
+    auto_connect_peers = true,
+    timeout_secs = 180,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
     // Load test contract - not used in this simplified test
     const TEST_CONTRACT: &str = "test-contract-integration";
     let _contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -2695,83 +2629,26 @@ async fn test_subscription_introspection() -> TestResult {
     // Create initial state - not used in this simplified test
     let _initial_state = test_utils::create_empty_todo_list();
 
-    // Setup network sockets
-    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let network_socket_node = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node = TcpListener::bind("127.0.0.1:0")?;
+    let gateway = ctx.node("gateway")?;
+    let peer_node = ctx.node("peer-node")?;
+    let ws_api_port_gw = gateway.ws_port;
+    let ws_api_port_node = peer_node.ws_port;
 
-    // Configure gateway node
-    let (config_gw, preset_cfg_gw, config_gw_info) = {
-        let (cfg, preset) = base_node_test_config(
-            true,
-            vec![],
-            Some(network_socket_gw.local_addr()?.port()),
-            ws_api_port_socket_gw.local_addr()?.port(),
-        )
-        .await?;
-        let public_port = cfg.network_api.public_port.unwrap();
-        let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config(public_port, &path)?)
-    };
-    let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
+    tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
+    tracing::info!("Node data dir: {:?}", peer_node.temp_dir_path);
 
-    // Configure regular node
-    let (config_node, preset_cfg_node) = base_node_test_config(
-        false,
-        vec![serde_json::to_string(&config_gw_info)?],
-        Some(network_socket_node.local_addr()?.port()),
-        ws_api_port_socket_node.local_addr()?.port(),
-    )
-    .await?;
-    let ws_api_port_node = config_node.ws_api.ws_api_port.unwrap();
+    // Connect to gateway websocket API
+    let uri_gw =
+        format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
+    let (stream_gw, _) = connect_async(&uri_gw).await?;
+    let mut client_gw = WebApi::start(stream_gw);
 
-    tracing::info!("Gateway data dir: {:?}", preset_cfg_gw.temp_dir.path());
-    tracing::info!("Node data dir: {:?}", preset_cfg_node.temp_dir.path());
-
-    // Free ports
-    std::mem::drop(network_socket_gw);
-    std::mem::drop(network_socket_node);
-    std::mem::drop(ws_api_port_socket_gw);
-    std::mem::drop(ws_api_port_socket_node);
-
-    // Start nodes
-    let node_gw = async {
-        let config = config_gw.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
-        node.run().await
-    }
-    .boxed_local();
-
-    let node_regular = async {
-        let config = config_node.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
-        node.run().await
-    }
-    .boxed_local();
-
-    let test = tokio::time::timeout(Duration::from_secs(180), async {
-        // Wait for nodes to start and connect
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
-        // Connect to gateway websocket API
-        let uri_gw =
-            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
-        let (stream_gw, _) = connect_async(&uri_gw).await?;
-        let mut client_gw = WebApi::start(stream_gw);
-
-        // Connect to node websocket API
-        let uri_node = format!(
-            "ws://127.0.0.1:{ws_api_port_node}/v1/contract/command?encodingProtocol=native"
-        );
-        let (stream_node, _) = connect_async(&uri_node).await?;
-        let _client_node = WebApi::start(stream_node);
+    // Connect to node websocket API
+    let uri_node = format!(
+        "ws://127.0.0.1:{ws_api_port_node}/v1/contract/command?encodingProtocol=native"
+    );
+    let (stream_node, _) = connect_async(&uri_node).await?;
+    let _client_node = WebApi::start(stream_node);
 
         // First just test that we can query subscription info
         tracing::info!("Testing basic subscription query without any subscriptions");
@@ -2805,29 +2682,18 @@ async fn test_subscription_introspection() -> TestResult {
             }
         }
 
-        Ok::<_, anyhow::Error>(())
-    });
-
-    // Run test with timeout
-    select! {
-        gw = node_gw => {
-            let Err(e) = gw;
-            return Err(anyhow!("Gateway node failed: {}", e).into())
-        }
-        node = node_regular => {
-            let Err(e) = node;
-            return Err(anyhow!("Regular node failed: {}", e).into())
-        }
-        r = test => {
-            r??
-        }
-    }
-
     Ok(())
 }
 
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn test_update_no_change_notification() -> TestResult {
+#[freenet_test(
+    nodes = ["gateway", "peer-a"],
+    auto_connect_peers = true,
+    timeout_secs = 180,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult {
     // Load test contract that properly handles NoChange
     const TEST_CONTRACT: &str = "test-contract-update-nochange";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -2847,75 +2713,19 @@ async fn test_update_no_change_notification() -> TestResult {
     let initial_state_bytes = serde_json::to_vec(&initial_state)?;
     let wrapped_state = WrappedState::from(initial_state_bytes);
 
-    // Create network sockets
-    let network_socket_b = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_a = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_b = TcpListener::bind("127.0.0.1:0")?;
-
-    // Configure gateway node B
-    let (config_b, preset_cfg_b, config_b_gw) = {
-        let (cfg, preset) = base_node_test_config(
-            true,
-            vec![],
-            Some(network_socket_b.local_addr()?.port()),
-            ws_api_port_socket_b.local_addr()?.port(),
-        )
-        .await?;
-        let public_port = cfg.network_api.public_port.unwrap();
-        let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config(public_port, &path)?)
-    };
-
-    // Configure client node A
-    let (config_a, preset_cfg_a) = base_node_test_config(
-        false,
-        vec![serde_json::to_string(&config_b_gw)?],
-        None,
-        ws_api_port_socket_a.local_addr()?.port(),
-    )
-    .await?;
-    let ws_api_port = config_a.ws_api.ws_api_port.unwrap();
+    let peer_a = ctx.node("peer-a")?;
+    let gateway = ctx.node("gateway")?;
+    let ws_api_port = peer_a.ws_port;
 
     // Log data directories for debugging
-    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
-    tracing::info!("Node B (gw) data dir: {:?}", preset_cfg_b.temp_dir.path());
+    tracing::info!("Node A data dir: {:?}", peer_a.temp_dir_path);
+    tracing::info!("Node B (gw) data dir: {:?}", gateway.temp_dir_path);
 
-    // Free ports so they don't fail on initialization
-    std::mem::drop(ws_api_port_socket_a);
-    std::mem::drop(network_socket_b);
-    std::mem::drop(ws_api_port_socket_b);
-
-    // Start node A (client)
-    let node_a = async move {
-        let config = config_a.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
-        node.run().await
-    }
-    .boxed_local();
-
-    // Start node B (gateway)
-    let node_b = async {
-        let config = config_b.build().await?;
-        let node = NodeConfig::new(config.clone())
-            .await?
-            .build(serve_gateway(config.ws_api).await)
-            .await?;
-        node.run().await
-    }
-    .boxed_local();
-
-    let test = tokio::time::timeout(Duration::from_secs(180), async {
-        // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(20)).await;
-
-        // Connect to node A websocket API
-        let uri =
-            format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
-        let (stream, _) = connect_async(&uri).await?;
-        let mut client_api_a = WebApi::start(stream);
+    // Connect to node A websocket API
+    let uri =
+        format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client_api_a = WebApi::start(stream);
 
         // Put contract with initial state
         make_put(
@@ -2971,25 +2781,6 @@ async fn test_update_no_change_notification() -> TestResult {
                 bail!("TIMEOUT waiting for update response - UpdateNoChange bug: client not notified when update results in no state change");
             }
         }
-
-        Ok::<(), anyhow::Error>(())
-    });
-
-    select! {
-        a = node_a => {
-            let Err(a) = a;
-            return Err(anyhow!(a).into());
-        }
-        b = node_b => {
-            let Err(b) = b;
-            return Err(anyhow!(b).into());
-        }
-        r = test => {
-            r??;
-            // Give time for cleanup before dropping nodes
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        }
-    }
 
     Ok(())
 }
