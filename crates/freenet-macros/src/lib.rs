@@ -53,9 +53,9 @@ use parser::FreenetTestArgs;
 ///   - `"never"`: Never aggregate
 /// - `log_level` (optional): Log level filter (default: "freenet=debug,info")
 /// - `tokio_flavor` (optional): Tokio runtime flavor:
-///   - `"multi_thread"` (default): Multi-threaded runtime
-///   - `"current_thread"`: Single-threaded runtime
-/// - `tokio_worker_threads` (optional): Number of worker threads for multi_thread flavor (default: 4)
+///   - `"current_thread"` (default): Single-threaded runtime
+///   - `"multi_thread"`: Multi-threaded runtime
+/// - `tokio_worker_threads` (optional): Number of worker threads for multi_thread flavor (no default)
 ///
 /// # Examples
 ///

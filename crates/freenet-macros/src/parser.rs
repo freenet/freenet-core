@@ -42,8 +42,8 @@ impl syn::parse::Parse for FreenetTestArgs {
         let mut startup_wait_secs = 15;
         let mut aggregate_events = AggregateEventsMode::OnFailure;
         let mut log_level = "freenet=debug,info".to_string();
-        let mut tokio_flavor = TokioFlavor::MultiThread;
-        let mut tokio_worker_threads = Some(4);
+        let mut tokio_flavor = TokioFlavor::CurrentThread;
+        let mut tokio_worker_threads = None;
 
         // Parse key-value pairs
         while !input.is_empty() {
