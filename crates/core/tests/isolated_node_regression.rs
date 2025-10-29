@@ -25,7 +25,12 @@ use tokio_tungstenite::connect_async;
 /// - PUT operations cache contracts locally without network timeouts (PR #1781)
 /// - GET operations retrieve from local cache without self-routing attempts (PR #1806)
 /// - Complete workflow functions properly without peer connections
-#[freenet_test(nodes = ["gateway"], timeout_secs = 60, startup_wait_secs = 10)]
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 60,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread"
+)]
 async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
     let ws_port = gateway.ws_port;
@@ -140,7 +145,12 @@ async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResul
 /// 3. Result delivered to Client 1, TX removed from tracking
 /// 4. Client 2 sends identical GET request → Router tries to reuse removed TX
 /// 5. Bug: Client 2 never receives response
-#[freenet_test(nodes = ["gateway"], timeout_secs = 60, startup_wait_secs = 10)]
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 60,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread"
+)]
 async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
     let ws_port = gateway.ws_port;
@@ -283,7 +293,12 @@ async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestRe
 /// when the contract exists locally but no remote peers are available.
 /// Tests the fix in PR #1844 where SubscribeResponse messages were not being
 /// delivered to WebSocket clients for local contracts.
-#[freenet_test(nodes = ["gateway"], timeout_secs = 60, startup_wait_secs = 10)]
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 60,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread"
+)]
 async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
     let ws_port = gateway.ws_port;
@@ -422,7 +437,12 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
 /// - UPDATE operation updates the contract state
 /// - UPDATE returns UpdateResponse without timeout (issue #1884)
 /// - GET operation retrieves updated state
-#[freenet_test(nodes = ["gateway"], timeout_secs = 60, startup_wait_secs = 10)]
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 60,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread"
+)]
 async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
     let ws_port = gateway.ws_port;

@@ -7,6 +7,8 @@ pub struct FreenetTestArgs {
     pub nodes: Vec<String>,
     /// Which nodes are gateways (if not specified, first node is gateway)
     pub gateways: Option<Vec<String>>,
+    /// Whether peers should auto-connect to gateways
+    pub auto_connect_peers: bool,
     /// Test timeout in seconds
     pub timeout_secs: u64,
     /// Node startup wait in seconds
@@ -38,6 +40,7 @@ impl syn::parse::Parse for FreenetTestArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut nodes = None;
         let mut gateways = None;
+        let mut auto_connect_peers = false;
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
         let mut aggregate_events = AggregateEventsMode::OnFailure;
@@ -152,6 +155,10 @@ impl syn::parse::Parse for FreenetTestArgs {
                     let lit: syn::LitInt = input.parse()?;
                     tokio_worker_threads = Some(lit.base10_parse()?);
                 }
+                "auto_connect_peers" => {
+                    let lit: syn::LitBool = input.parse()?;
+                    auto_connect_peers = lit.value;
+                }
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -187,6 +194,7 @@ impl syn::parse::Parse for FreenetTestArgs {
         Ok(FreenetTestArgs {
             nodes,
             gateways,
+            auto_connect_peers,
             timeout_secs,
             startup_wait_secs,
             aggregate_events,

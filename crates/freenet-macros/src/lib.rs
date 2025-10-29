@@ -45,6 +45,7 @@ use parser::FreenetTestArgs;
 ///
 /// - `nodes` (required): Array of node labels
 /// - `gateways` (optional): Array of nodes that should be gateways. If not specified, the first node is a gateway.
+/// - `auto_connect_peers` (optional): If true, peer nodes are configured to connect to all gateway nodes (default: false)
 /// - `timeout_secs` (optional): Test timeout in seconds (default: 180)
 /// - `startup_wait_secs` (optional): Node startup wait in seconds (default: 15)
 /// - `aggregate_events` (optional): When to aggregate events:
@@ -81,6 +82,22 @@ use parser::FreenetTestArgs;
 /// async fn test_multi_gateway(ctx: &mut TestContext) -> TestResult {
 ///     let gateways = ctx.gateways();  // All gateway nodes
 ///     let peers = ctx.peers();        // All peer nodes
+///     Ok(())
+/// }
+/// ```
+///
+/// ## Auto-Connect Peers to Gateways
+/// ```ignore
+/// #[freenet_test(
+///     nodes = ["gateway", "peer-1", "peer-2"],
+///     auto_connect_peers = true,  // Peers will connect to gateway
+///     timeout_secs = 120
+/// )]
+/// async fn test_with_connections(ctx: &mut TestContext) -> TestResult {
+///     // Peers are configured to discover and connect to the gateway
+///     let gateway = ctx.gateway()?;
+///     let peers = ctx.peers();
+///     // Test peer-gateway interactions...
 ///     Ok(())
 /// }
 /// ```

@@ -98,13 +98,15 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
 fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
     let mut setup_code = Vec::new();
 
+    // First pass: Generate all gateway and peer configurations
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let config_var = format_ident!("config_{}", idx);
         let temp_var = format_ident!("temp_{}", idx);
         let is_gw = is_gateway(args, node_label, idx);
 
-        let gateway_setup = if is_gw {
-            quote! {
+        if is_gw {
+            // Gateway node configuration
+            setup_code.push(quote! {
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
                     let key = freenet::dev_tool::TransportKeypair::new();
@@ -155,15 +157,71 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
                     (config, temp_dir)
                 };
+            });
+        }
+    }
 
-                let gateway_info_0 = freenet::config::InlineGwConfig {
-                    address: (std::net::Ipv4Addr::LOCALHOST, config_0.network_api.public_port.unwrap()).into(),
-                    location: config_0.network_api.location,
-                    public_key_path: temp_0.path().join("public.pem"),
+    // Second pass: Generate gateway info variables
+    // We need these for both auto_connect_peers and backward compatibility
+    for (idx, node_label) in args.nodes.iter().enumerate() {
+        let is_gw = is_gateway(args, node_label, idx);
+        if is_gw {
+            let gateway_info_var = format_ident!("gateway_info_{}", idx);
+            let config_var = format_ident!("config_{}", idx);
+            let temp_var = format_ident!("temp_{}", idx);
+
+            setup_code.push(quote! {
+                let #gateway_info_var = freenet::config::InlineGwConfig {
+                    address: (std::net::Ipv4Addr::LOCALHOST, #config_var.network_api.public_port.unwrap()).into(),
+                    location: #config_var.network_api.location,
+                    public_key_path: #temp_var.path().join("public.pem"),
                 };
-            }
-        } else {
-            quote! {
+            });
+        }
+    }
+
+    // Third pass: Generate peer configurations (non-gateway nodes)
+    for (idx, node_label) in args.nodes.iter().enumerate() {
+        let config_var = format_ident!("config_{}", idx);
+        let temp_var = format_ident!("temp_{}", idx);
+        let is_gw = is_gateway(args, node_label, idx);
+
+        if !is_gw {
+            // Collect gateway info variables to serialize
+            let gateways_config = if args.auto_connect_peers {
+                // Collect all gateway_info_X variables
+                let gateway_vars: Vec<_> = args
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(gw_idx, gw_label)| is_gateway(args, gw_label, *gw_idx))
+                    .map(|(gw_idx, _)| format_ident!("gateway_info_{}", gw_idx))
+                    .collect();
+
+                quote! {
+                    Some(vec![
+                        #(serde_json::to_string(&#gateway_vars)?),*
+                    ])
+                }
+            } else {
+                // Backward compatibility: use first gateway only
+                let first_gateway_idx = args
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find(|(gw_idx, gw_label)| is_gateway(args, gw_label, *gw_idx))
+                    .map(|(gw_idx, _)| gw_idx)
+                    .expect("At least one gateway must exist");
+
+                let first_gateway_var = format_ident!("gateway_info_{}", first_gateway_idx);
+
+                quote! {
+                    Some(vec![serde_json::to_string(&#first_gateway_var)?])
+                }
+            };
+
+            // Peer node configuration
+            setup_code.push(quote! {
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
                     let key = freenet::dev_tool::TransportKeypair::new();
@@ -189,7 +247,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             public_port: None,
                             is_gateway: false,
                             skip_load_from_network: true,
-                            gateways: Some(vec![serde_json::to_string(&gateway_info_0)?]),
+                            gateways: #gateways_config,
                             location: Some(location),
                             ignore_protocol_checking: true,
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
@@ -210,10 +268,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
                     (config, temp_dir)
                 };
-            }
-        };
-
-        setup_code.push(gateway_setup);
+            });
+        }
     }
 
     quote! {
