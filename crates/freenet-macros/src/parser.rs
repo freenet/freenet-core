@@ -13,6 +13,16 @@ pub struct FreenetTestArgs {
     pub aggregate_events: AggregateEventsMode,
     /// Log level filter
     pub log_level: String,
+    /// Tokio runtime flavor
+    pub tokio_flavor: TokioFlavor,
+    /// Tokio worker threads
+    pub tokio_worker_threads: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokioFlavor {
+    MultiThread,
+    CurrentThread,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +39,8 @@ impl syn::parse::Parse for FreenetTestArgs {
         let mut startup_wait_secs = 15;
         let mut aggregate_events = AggregateEventsMode::OnFailure;
         let mut log_level = "freenet=debug,info".to_string();
+        let mut tokio_flavor = TokioFlavor::MultiThread;
+        let mut tokio_worker_threads = Some(4);
 
         // Parse key-value pairs
         while !input.is_empty() {
@@ -91,6 +103,27 @@ impl syn::parse::Parse for FreenetTestArgs {
                     let lit: syn::LitStr = input.parse()?;
                     log_level = lit.value();
                 }
+                "tokio_flavor" => {
+                    let lit: syn::LitStr = input.parse()?;
+                    tokio_flavor = match lit.value().as_str() {
+                        "multi_thread" => TokioFlavor::MultiThread,
+                        "current_thread" => TokioFlavor::CurrentThread,
+                        other => {
+                            return Err(syn::Error::new(
+                                lit.span(),
+                                format!(
+                                    "Invalid tokio_flavor value: '{}'. \
+                                     Must be 'multi_thread' or 'current_thread'",
+                                    other
+                                ),
+                            ))
+                        }
+                    };
+                }
+                "tokio_worker_threads" => {
+                    let lit: syn::LitInt = input.parse()?;
+                    tokio_worker_threads = Some(lit.base10_parse()?);
+                }
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -115,6 +148,8 @@ impl syn::parse::Parse for FreenetTestArgs {
             startup_wait_secs,
             aggregate_events,
             log_level,
+            tokio_flavor,
+            tokio_worker_threads,
         })
     }
 }

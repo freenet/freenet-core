@@ -51,6 +51,10 @@ use codegen::generate_test_code;
 ///   - `"always"`: Always show event analysis
 ///   - `"never"`: Never aggregate
 /// - `log_level` (optional): Log level filter (default: "freenet=debug,info")
+/// - `tokio_flavor` (optional): Tokio runtime flavor:
+///   - `"multi_thread"` (default): Multi-threaded runtime
+///   - `"current_thread"`: Single-threaded runtime
+/// - `tokio_worker_threads` (optional): Number of worker threads for multi_thread flavor (default: 4)
 ///
 /// # Example
 ///
@@ -58,7 +62,9 @@ use codegen::generate_test_code;
 /// #[freenet_test(
 ///     nodes = ["gateway", "peer-1", "peer-2"],
 ///     timeout_secs = 180,
-///     aggregate_events = "on_failure"
+///     aggregate_events = "on_failure",
+///     tokio_flavor = "multi_thread",
+///     tokio_worker_threads = 8
 /// )]
 /// async fn test_multi_peer_operation(ctx: &mut TestContext) -> TestResult {
 ///     // Test code with access to ctx

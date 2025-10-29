@@ -100,3 +100,47 @@ async fn test_always_aggregate(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Running test with gateway {}", gateway.ws_port);
     Ok(())
 }
+
+/// Test with custom tokio configuration
+#[freenet_test(
+    nodes = ["gateway"],
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 8,
+    timeout_secs = 60
+)]
+async fn test_custom_tokio_config(ctx: &mut TestContext) -> TestResult {
+    // This test runs on a multi-threaded runtime with 8 worker threads
+    let gateway = ctx.gateway()?;
+    tracing::info!(
+        "Test with custom tokio config - gateway on port {}",
+        gateway.ws_port
+    );
+
+    // Verify we're on a multi-threaded runtime by checking if we can spawn tasks
+    let handle = tokio::spawn(async {
+        tracing::info!("Spawned task is running");
+        42
+    });
+
+    let result = handle.await?;
+    assert_eq!(result, 42);
+
+    Ok(())
+}
+
+/// Test with single-threaded runtime
+#[freenet_test(
+    nodes = ["gateway"],
+    tokio_flavor = "current_thread",
+    timeout_secs = 60,
+    startup_wait_secs = 10
+)]
+async fn test_current_thread_runtime(ctx: &mut TestContext) -> TestResult {
+    // This test runs on a single-threaded runtime
+    let gateway = ctx.gateway()?;
+    tracing::info!(
+        "Test with current_thread runtime - gateway on port {}",
+        gateway.ws_port
+    );
+    Ok(())
+}

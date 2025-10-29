@@ -34,8 +34,11 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
     // Build the complete generated code
     let log_level = &args.log_level;
 
+    // Generate tokio::test attribute with configuration
+    let tokio_attr = generate_tokio_attr(&args);
+
     let generated = quote! {
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #tokio_attr
         async fn #test_fn_name() -> freenet::test_utils::TestResult {
             use freenet::test_utils::{TestContext, TestLogger, NodeInfo};
             use std::time::{Duration, Instant};
@@ -363,5 +366,35 @@ fn generate_failure_reporting(args: &FreenetTestArgs) -> TokenStream {
         AggregateEventsMode::Never => quote! {
             // No reporting
         },
+    }
+}
+
+/// Generate tokio::test attribute with configuration
+fn generate_tokio_attr(args: &FreenetTestArgs) -> TokenStream {
+    use crate::parser::TokioFlavor;
+
+    let flavor = match args.tokio_flavor {
+        TokioFlavor::MultiThread => quote! { "multi_thread" },
+        TokioFlavor::CurrentThread => quote! { "current_thread" },
+    };
+
+    // worker_threads is only valid for multi_thread flavor
+    match (args.tokio_flavor, args.tokio_worker_threads) {
+        (TokioFlavor::MultiThread, Some(worker_threads)) => {
+            quote! {
+                #[tokio::test(flavor = #flavor, worker_threads = #worker_threads)]
+            }
+        }
+        (TokioFlavor::CurrentThread, _) => {
+            // current_thread doesn't support worker_threads
+            quote! {
+                #[tokio::test(flavor = #flavor)]
+            }
+        }
+        (TokioFlavor::MultiThread, None) => {
+            quote! {
+                #[tokio::test(flavor = #flavor)]
+            }
+        }
     }
 }
