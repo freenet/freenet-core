@@ -48,7 +48,12 @@ async fn main() -> Result<()> {
     // Create aggregator
     println!("📂 Loading event logs...\n");
     for (i, (path, label)) in log_paths.iter().enumerate() {
-        println!("   {}. {} → {:?}", i + 1, label.as_ref().unwrap_or(&"unknown".to_string()), path);
+        println!(
+            "   {}. {} → {:?}",
+            i + 1,
+            label.as_ref().unwrap_or(&"unknown".to_string()),
+            path
+        );
     }
 
     let aggregator = EventLogAggregator::<AOFEventSource>::from_aof_files(log_paths).await?;
@@ -75,7 +80,11 @@ async fn main() -> Result<()> {
     let mut transactions = std::collections::HashSet::new();
 
     for event in &events {
-        let event_type = format!("{:?}", event.kind).split('(').next().unwrap_or("Unknown").to_string();
+        let event_type = format!("{:?}", event.kind)
+            .split('(')
+            .next()
+            .unwrap_or("Unknown")
+            .to_string();
         *event_types.entry(event_type).or_insert(0) += 1;
 
         let node_id = format!("{:.8}", event.peer_id.to_string());
@@ -102,9 +111,18 @@ async fn main() -> Result<()> {
     if let (Some(first), Some(last)) = (events.first(), events.last()) {
         let duration = last.datetime.signed_duration_since(first.datetime);
         println!("⏱️  Timeline:");
-        println!("   Start: {}", first.datetime.format("%Y-%m-%d %H:%M:%S%.3f"));
-        println!("   End:   {}", last.datetime.format("%Y-%m-%d %H:%M:%S%.3f"));
-        println!("   Duration: {:.2}s", duration.num_milliseconds() as f64 / 1000.0);
+        println!(
+            "   Start: {}",
+            first.datetime.format("%Y-%m-%d %H:%M:%S%.3f")
+        );
+        println!(
+            "   End:   {}",
+            last.datetime.format("%Y-%m-%d %H:%M:%S%.3f")
+        );
+        println!(
+            "   Duration: {:.2}s",
+            duration.num_milliseconds() as f64 / 1000.0
+        );
     }
 
     // Analyze a specific transaction if we have any
@@ -119,12 +137,11 @@ async fn main() -> Result<()> {
         println!("📍 Transaction Path ({} hops):\n", flow.len());
         for (i, event) in flow.iter().enumerate() {
             let timestamp = event.timestamp.format("%H:%M:%S%.3f");
-            let node_label = event.peer_label.as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or("unknown");
+            let node_label = event.peer_label.as_deref().unwrap_or("unknown");
             let event_kind = format!("{:?}", event.event_kind);
 
-            println!("   {}. [{}] {} on {}",
+            println!(
+                "   {}. [{}] {} on {}",
                 i + 1,
                 timestamp,
                 event_kind.split('(').next().unwrap_or(&event_kind),
@@ -143,7 +160,10 @@ async fn main() -> Result<()> {
                 }
             }
             if let Some(duration) = routing.duration {
-                println!("\n   Total Duration: {:.3}s", duration.num_milliseconds() as f64 / 1000.0);
+                println!(
+                    "\n   Total Duration: {:.3}s",
+                    duration.num_milliseconds() as f64 / 1000.0
+                );
             }
         }
 
@@ -191,7 +211,10 @@ fn parse_args(args: &[String]) -> Result<Vec<(PathBuf, Option<String>)>> {
                     } else {
                         Some(format!("peer-{}", log_paths.len()))
                     };
-                    let is_auto_label = label.as_ref().map(|l| l.starts_with("peer-")).unwrap_or(true);
+                    let is_auto_label = label
+                        .as_ref()
+                        .map(|l| l.starts_with("peer-"))
+                        .unwrap_or(true);
                     log_paths.push((PathBuf::from(&args[i + 1]), label));
                     i += if is_auto_label { 2 } else { 3 };
                 } else {
@@ -206,7 +229,8 @@ fn parse_args(args: &[String]) -> Result<Vec<(PathBuf, Option<String>)>> {
                     if path.is_dir() {
                         let event_log = path.join("_EVENT_LOG_LOCAL");
                         if event_log.exists() {
-                            let label = path.file_name()
+                            let label = path
+                                .file_name()
                                 .and_then(|n| n.to_str())
                                 .map(|s| s.to_string());
                             log_paths.push((event_log, label));

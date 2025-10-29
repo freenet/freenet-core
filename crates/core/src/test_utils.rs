@@ -810,6 +810,215 @@ mod test {
     }
 }
 
+// Test context for integration tests
+use std::collections::HashMap;
+
+/// Information about a node in a test
+#[derive(Debug)]
+pub struct NodeInfo {
+    /// Human-readable label (e.g., "gateway", "peer-1")
+    pub label: String,
+    /// Path to temp directory for this node's data
+    pub temp_dir_path: PathBuf,
+    /// WebSocket API port
+    pub ws_port: u16,
+    /// Network port (None for non-gateway nodes)
+    pub network_port: Option<u16>,
+    /// Whether this is a gateway node
+    pub is_gateway: bool,
+    /// Node's location in the ring
+    pub location: f64,
+}
+
+/// Test result type for test functions
+pub type TestResult = anyhow::Result<()>;
+
+/// Test context providing access to nodes and event aggregation.
+///
+/// This is the main interface for interacting with test infrastructure in
+/// multi-node integration tests. It provides:
+/// - Node information access
+/// - Event log aggregation and failure reporting
+///
+/// Note: WebSocket client management is left to the test code for simplicity.
+/// Use `tokio_tungstenite::connect_async` and `WebApi::start` to create clients.
+pub struct TestContext {
+    /// Node information, indexed by label
+    nodes: HashMap<String, NodeInfo>,
+    /// Node labels in order they were added (for indexing)
+    node_order: Vec<String>,
+}
+
+impl TestContext {
+    /// Create a new TestContext from node information.
+    pub fn new(nodes: Vec<NodeInfo>) -> Self {
+        let node_order: Vec<String> = nodes.iter().map(|n| n.label.clone()).collect();
+        let nodes_map: HashMap<String, NodeInfo> = nodes
+            .into_iter()
+            .map(|n| (n.label.clone(), n))
+            .collect();
+
+        Self {
+            nodes: nodes_map,
+            node_order,
+        }
+    }
+
+    /// Get a reference to a node by label.
+    pub fn node(&self, label: &str) -> anyhow::Result<&NodeInfo> {
+        self.nodes
+            .get(label)
+            .ok_or_else(|| anyhow::anyhow!("Node '{}' not found", label))
+    }
+
+    /// Get the gateway node (first node).
+    pub fn gateway(&self) -> anyhow::Result<&NodeInfo> {
+        let first_label = self
+            .node_order
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No nodes in context"))?;
+        self.node(first_label)
+    }
+
+    /// Get the path to a node's event log.
+    pub fn event_log_path(&self, node_label: &str) -> anyhow::Result<PathBuf> {
+        let node = self.node(node_label)?;
+        Ok(node.temp_dir_path.join("_EVENT_LOG_LOCAL"))
+    }
+
+    /// Get all node labels in order.
+    pub fn node_labels(&self) -> &[String] {
+        &self.node_order
+    }
+
+    /// Aggregate events from all nodes.
+    pub async fn aggregate_events(
+        &self,
+    ) -> anyhow::Result<crate::tracing::EventLogAggregator<crate::tracing::AOFEventSource>> {
+        let mut builder = TestAggregatorBuilder::new();
+        for label in &self.node_order {
+            let path = self.event_log_path(label)?;
+            builder = builder.add_node(label, path);
+        }
+        builder.build().await
+    }
+
+    /// Generate a comprehensive failure report with event aggregation.
+    pub async fn generate_failure_report(&self, error: &anyhow::Error) -> String {
+        use std::fmt::Write;
+
+        let mut report = String::new();
+        writeln!(&mut report, "\n{}", "=".repeat(80)).unwrap();
+        writeln!(&mut report, "TEST FAILURE REPORT").unwrap();
+        writeln!(&mut report, "{}", "=".repeat(80)).unwrap();
+        writeln!(&mut report, "\nError: {:#}", error).unwrap();
+
+        // Try to aggregate events
+        match self.aggregate_events().await {
+            Ok(aggregator) => {
+                writeln!(&mut report, "\n{}", "-".repeat(80)).unwrap();
+                writeln!(&mut report, "EVENT LOG SUMMARY").unwrap();
+                writeln!(&mut report, "{}", "-".repeat(80)).unwrap();
+
+                match aggregator.get_all_events().await {
+                    Ok(events) => {
+                        writeln!(&mut report, "\nTotal events: {}", events.len()).unwrap();
+
+                        // Group by peer_id
+                        let mut by_peer: HashMap<String, Vec<_>> = HashMap::new();
+                        for event in &events {
+                            let peer_str = event.peer_id.to_string();
+                            by_peer.entry(peer_str).or_default().push(event);
+                        }
+
+                        writeln!(&mut report, "\nEvents by peer:").unwrap();
+                        for (peer_id, peer_events) in by_peer.iter() {
+                            writeln!(
+                                &mut report,
+                                "  {}: {} events",
+                                &peer_id[..8.min(peer_id.len())],  // Show first 8 chars
+                                peer_events.len()
+                            )
+                            .unwrap();
+                        }
+
+                        // Show last 10 events
+                        writeln!(&mut report, "\nLast 10 events:").unwrap();
+                        let last_events = events.iter().rev().take(10).collect::<Vec<_>>();
+                        for (i, event) in last_events.iter().rev().enumerate() {
+                            let peer_str = event.peer_id.to_string();
+                            writeln!(
+                                &mut report,
+                                "  {}. [{}] {} - {:?}",
+                                i + 1,
+                                &peer_str[..8.min(peer_str.len())],
+                                event.datetime.format("%H:%M:%S%.3f"),
+                                event.kind
+                            )
+                            .unwrap();
+                        }
+                    }
+                    Err(e) => {
+                        writeln!(&mut report, "\nFailed to get events: {}", e).unwrap();
+                    }
+                }
+            }
+            Err(e) => {
+                writeln!(&mut report, "\nFailed to aggregate events: {}", e).unwrap();
+            }
+        }
+
+        writeln!(&mut report, "\n{}", "=".repeat(80)).unwrap();
+        report
+    }
+
+    /// Generate a success summary with event statistics.
+    pub async fn generate_success_summary(&self) -> String {
+        use std::fmt::Write;
+
+        let mut report = String::new();
+        writeln!(&mut report, "\n{}", "-".repeat(80)).unwrap();
+        writeln!(&mut report, "TEST SUCCESS SUMMARY").unwrap();
+        writeln!(&mut report, "{}", "-".repeat(80)).unwrap();
+
+        // Try to aggregate events
+        match self.aggregate_events().await {
+            Ok(aggregator) => match aggregator.get_all_events().await {
+                Ok(events) => {
+                    writeln!(&mut report, "\nTotal events: {}", events.len()).unwrap();
+
+                    // Group by peer_id
+                    let mut by_peer: HashMap<String, Vec<_>> = HashMap::new();
+                    for event in &events {
+                        let peer_str = event.peer_id.to_string();
+                        by_peer.entry(peer_str).or_default().push(event);
+                    }
+
+                    writeln!(&mut report, "\nEvents by peer:").unwrap();
+                    for (peer_id, peer_events) in by_peer.iter() {
+                        writeln!(
+                            &mut report,
+                            "  {}: {} events",
+                            &peer_id[..8.min(peer_id.len())],  // Show first 8 chars
+                            peer_events.len()
+                        )
+                        .unwrap();
+                    }
+                }
+                Err(e) => {
+                    writeln!(&mut report, "\nFailed to get events: {}", e).unwrap();
+                }
+            },
+            Err(e) => {
+                writeln!(&mut report, "\nFailed to aggregate events: {}", e).unwrap();
+            }
+        }
+
+        writeln!(&mut report, "{}", "-".repeat(80)).unwrap();
+        report
+    }
+}
+
 // Event aggregator test utilities
 pub mod event_aggregator_utils {
     //! Test utilities for event log aggregation.
