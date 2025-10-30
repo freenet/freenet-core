@@ -6,7 +6,6 @@ use freenet_stdlib::{
     prelude::*,
 };
 use std::time::Duration;
-use testresult::TestResult;
 use tokio_tungstenite::connect_async;
 
 /// Test gateway reconnection:
@@ -174,9 +173,9 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
     nodes = ["gateway"],
     timeout_secs = 30,
     startup_wait_secs = 5,
+    aggregate_events = "always",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4,
-    aggregate_events = "always"
 )]
 async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
     // Get the gateway node from context

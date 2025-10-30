@@ -905,7 +905,8 @@ impl TestContext {
     /// Get the path to a node's event log.
     pub fn event_log_path(&self, node_label: &str) -> anyhow::Result<PathBuf> {
         let node = self.node(node_label)?;
-        Ok(node.temp_dir_path.join("_EVENT_LOG_LOCAL"))
+        // Nodes run in Network mode, so they create _EVENT_LOG not _EVENT_LOG_LOCAL
+        Ok(node.temp_dir_path.join("_EVENT_LOG"))
     }
 
     /// Get all node labels in order.

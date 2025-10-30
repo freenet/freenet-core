@@ -135,7 +135,8 @@ async fn get_contract(
     timeout_secs = 180,
     startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
-    tokio_worker_threads = 4
+    tokio_worker_threads = 4,
+    aggregate_events = "always"
 )]
 async fn test_put_contract(ctx: &mut TestContext) -> TestResult {
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -660,8 +661,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 
     // Wait for put response
     loop {
-        let resp =
-            tokio::time::timeout(Duration::from_secs(120), client_api1_node_a.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(120), client_api1_node_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
@@ -688,8 +688,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 
     // Wait for subscribe response
     loop {
-        let resp =
-            tokio::time::timeout(Duration::from_secs(30), client_api1_node_a.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api1_node_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
@@ -723,8 +722,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 
     // Wait for get response on second client
     loop {
-        let resp =
-            tokio::time::timeout(Duration::from_secs(30), client_api2_node_a.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api2_node_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
@@ -751,8 +749,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 
     // Wait for subscribe response
     loop {
-        let resp =
-            tokio::time::timeout(Duration::from_secs(30), client_api2_node_a.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api2_node_a.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
@@ -796,8 +793,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
     // Wait for get response on third client
     // Note: Contract propagation from Node A to Node B can take 5-10s locally, longer in CI
     loop {
-        let resp =
-            tokio::time::timeout(Duration::from_secs(60), client_api_node_b.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_node_b.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
@@ -833,8 +829,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 
     // Wait for subscribe response
     loop {
-        let resp =
-            tokio::time::timeout(Duration::from_secs(60), client_api_node_b.recv()).await;
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_node_b.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
@@ -928,9 +923,10 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                     tracing::info!("Client 1: Received update response for contract {}", key);
                     received_update_response = true;
                 }
-                Ok(Ok(HostResponse::ContractResponse(
-                    ContractResponse::UpdateNotification { key, update },
-                ))) => {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                    key,
+                    update,
+                }))) => {
                     assert_eq!(
                         key, contract_key,
                         "Contract key mismatch in UPDATE notification for client 1"
@@ -940,15 +936,10 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                     match update {
                         UpdateData::State(state) => {
                             let received_todo_list: test_utils::TodoList =
-                                serde_json::from_slice(state.as_ref()).expect(
-                                    "Failed to deserialize state from update notification",
-                                );
+                                serde_json::from_slice(state.as_ref())
+                                    .expect("Failed to deserialize state from update notification");
 
-                            assert_eq!(
-                                received_todo_list.tasks.len(),
-                                1,
-                                "Should have one task"
-                            );
+                            assert_eq!(received_todo_list.tasks.len(), 1, "Should have one task");
                             assert_eq!(
                                 received_todo_list.tasks[0].id, expected_task.id,
                                 "Task ID should match"
@@ -958,8 +949,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                                 "Task title should match"
                             );
                             assert_eq!(
-                                received_todo_list.tasks[0].description,
-                                expected_task.description,
+                                received_todo_list.tasks[0].description, expected_task.description,
                                 "Task description should match"
                             );
                             assert_eq!(
@@ -1004,9 +994,10 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
             let resp =
                 tokio::time::timeout(Duration::from_secs(1), client_api2_node_a.recv()).await;
             match resp {
-                Ok(Ok(HostResponse::ContractResponse(
-                    ContractResponse::UpdateNotification { key, update },
-                ))) => {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                    key,
+                    update,
+                }))) => {
                     assert_eq!(
                         key, contract_key,
                         "Contract key mismatch in UPDATE notification for client 2"
@@ -1016,15 +1007,10 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                     match update {
                         UpdateData::State(state) => {
                             let received_todo_list: test_utils::TodoList =
-                                serde_json::from_slice(state.as_ref()).expect(
-                                    "Failed to deserialize state from update notification",
-                                );
+                                serde_json::from_slice(state.as_ref())
+                                    .expect("Failed to deserialize state from update notification");
 
-                            assert_eq!(
-                                received_todo_list.tasks.len(),
-                                1,
-                                "Should have one task"
-                            );
+                            assert_eq!(received_todo_list.tasks.len(), 1, "Should have one task");
                             assert_eq!(
                                 received_todo_list.tasks[0].id, expected_task.id,
                                 "Task ID should match"
@@ -1034,8 +1020,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                                 "Task title should match"
                             );
                             assert_eq!(
-                                received_todo_list.tasks[0].description,
-                                expected_task.description,
+                                received_todo_list.tasks[0].description, expected_task.description,
                                 "Task description should match"
                             );
                             assert_eq!(
@@ -1077,12 +1062,12 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 
         // Check for notification on client 3 (on different node)
         if !client_node_b_received_notification {
-            let resp =
-                tokio::time::timeout(Duration::from_secs(1), client_api_node_b.recv()).await;
+            let resp = tokio::time::timeout(Duration::from_secs(1), client_api_node_b.recv()).await;
             match resp {
-                Ok(Ok(HostResponse::ContractResponse(
-                    ContractResponse::UpdateNotification { key, update },
-                ))) => {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                    key,
+                    update,
+                }))) => {
                     assert_eq!(
                         key, contract_key,
                         "Contract key mismatch in UPDATE notification for client 3"
@@ -1092,15 +1077,10 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                     match update {
                         UpdateData::State(state) => {
                             let received_todo_list: test_utils::TodoList =
-                                serde_json::from_slice(state.as_ref()).expect(
-                                    "Failed to deserialize state from update notification",
-                                );
+                                serde_json::from_slice(state.as_ref())
+                                    .expect("Failed to deserialize state from update notification");
 
-                            assert_eq!(
-                                received_todo_list.tasks.len(),
-                                1,
-                                "Should have one task"
-                            );
+                            assert_eq!(received_todo_list.tasks.len(), 1, "Should have one task");
                             assert_eq!(
                                 received_todo_list.tasks[0].id, expected_task.id,
                                 "Task ID should match"
@@ -1110,8 +1090,7 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                                 "Task title should match"
                             );
                             assert_eq!(
-                                received_todo_list.tasks[0].description,
-                                expected_task.description,
+                                received_todo_list.tasks[0].description, expected_task.description,
                                 "Task description should match"
                             );
                             assert_eq!(
@@ -1220,200 +1199,196 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect first client to node A's websocket API (for putting the contract)
-    let uri_a = format!(
-        "ws://127.0.0.1:{ws_api_port_a}/v1/contract/command?encodingProtocol=native"
-    );
+    let uri_a =
+        format!("ws://127.0.0.1:{ws_api_port_a}/v1/contract/command?encodingProtocol=native");
     let (stream1, _) = connect_async(&uri_a).await?;
     let mut client_api1_node_a = WebApi::start(stream1);
 
-        tracing::info!("Client 1: Put contract with initial state");
+    tracing::info!("Client 1: Put contract with initial state");
 
-        // First client puts contract with initial state (without subscribing)
-        make_put(
-            &mut client_api1_node_a,
-            wrapped_state.clone(),
-            contract.clone(),
-            false, // subscribe=false
-        )
-        .await?;
+    // First client puts contract with initial state (without subscribing)
+    make_put(
+        &mut client_api1_node_a,
+        wrapped_state.clone(),
+        contract.clone(),
+        false, // subscribe=false
+    )
+    .await?;
 
-        // Wait for put response (increased timeout for CI environments)
-        let resp = tokio::time::timeout(Duration::from_secs(45), client_api1_node_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
-            }
-            Ok(Ok(other)) => {
-                bail!("unexpected response while waiting for put: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Client 1: Error receiving put response: {}", e);
-            }
-            Err(_) => {
-                bail!("Client 1: Timeout waiting for put response");
-            }
+    // Wait for put response (increased timeout for CI environments)
+    let resp = tokio::time::timeout(Duration::from_secs(45), client_api1_node_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
         }
-
-        tracing::warn!("Client 1: Successfully put contract {}", contract_key);
-
-        // Connect second client to node A's websocket API (for getting with auto-subscribe)
-        let (stream2, _) = connect_async(&uri_a).await?;
-        let mut client_api2_node_a = WebApi::start(stream2);
-
-        // Second client gets the contract with auto-subscribe
-        make_get(&mut client_api2_node_a, contract_key, true, true).await?;
-
-        // Wait for get response on second client
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api2_node_a.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                key,
-                contract: Some(_),
-                state: _,
-            }))) => {
-                assert_eq!(key, contract_key, "Contract key mismatch in GET response");
-            }
-            Ok(Ok(other)) => {
-                bail!("unexpected response while waiting for get: {:?}", other);
-            }
-            Ok(Err(e)) => {
-                bail!("Client 2: Error receiving get response: {}", e);
-            }
-            Err(_) => {
-                bail!("Client 2: Timeout waiting for get response");
-            }
+        Ok(Ok(other)) => {
+            bail!("unexpected response while waiting for put: {:?}", other);
         }
+        Ok(Err(e)) => {
+            bail!("Client 1: Error receiving put response: {}", e);
+        }
+        Err(_) => {
+            bail!("Client 1: Timeout waiting for put response");
+        }
+    }
 
-        // Create a new to-do list by deserializing the current state, adding a task, and serializing it back
-        let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())
-            .unwrap_or_else(|_| test_utils::TodoList {
-                tasks: Vec::new(),
-                version: 0,
-            });
+    tracing::warn!("Client 1: Successfully put contract {}", contract_key);
 
-        // Add a task directly to the list
-        todo_list.tasks.push(test_utils::Task {
-            id: 1,
-            title: "Test auto-subscribe with GET".to_string(),
-            description: "Verify that auto-subscribe works with GET operation".to_string(),
-            completed: false,
-            priority: 5,
+    // Connect second client to node A's websocket API (for getting with auto-subscribe)
+    let (stream2, _) = connect_async(&uri_a).await?;
+    let mut client_api2_node_a = WebApi::start(stream2);
+
+    // Second client gets the contract with auto-subscribe
+    make_get(&mut client_api2_node_a, contract_key, true, true).await?;
+
+    // Wait for get response on second client
+    let resp = tokio::time::timeout(Duration::from_secs(30), client_api2_node_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key,
+            contract: Some(_),
+            state: _,
+        }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in GET response");
+        }
+        Ok(Ok(other)) => {
+            bail!("unexpected response while waiting for get: {:?}", other);
+        }
+        Ok(Err(e)) => {
+            bail!("Client 2: Error receiving get response: {}", e);
+        }
+        Err(_) => {
+            bail!("Client 2: Timeout waiting for get response");
+        }
+    }
+
+    // Create a new to-do list by deserializing the current state, adding a task, and serializing it back
+    let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())
+        .unwrap_or_else(|_| test_utils::TodoList {
+            tasks: Vec::new(),
+            version: 0,
         });
 
-        // Serialize the updated list back to bytes
-        let updated_bytes = serde_json::to_vec(&todo_list).unwrap();
-        let updated_state = WrappedState::from(updated_bytes);
+    // Add a task directly to the list
+    todo_list.tasks.push(test_utils::Task {
+        id: 1,
+        title: "Test auto-subscribe with GET".to_string(),
+        description: "Verify that auto-subscribe works with GET operation".to_string(),
+        completed: false,
+        priority: 5,
+    });
 
-        // First client updates the contract
-        make_update(&mut client_api1_node_a, contract_key, updated_state.clone()).await?;
+    // Serialize the updated list back to bytes
+    let updated_bytes = serde_json::to_vec(&todo_list).unwrap();
+    let updated_state = WrappedState::from(updated_bytes);
 
-        // Wait for update response
-        let resp = tokio::time::timeout(Duration::from_secs(30), client_api1_node_a.recv()).await;
+    // First client updates the contract
+    make_update(&mut client_api1_node_a, contract_key, updated_state.clone()).await?;
+
+    // Wait for update response
+    let resp = tokio::time::timeout(Duration::from_secs(30), client_api1_node_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key,
+            summary: _,
+        }))) => {
+            assert_eq!(
+                key, contract_key,
+                "Contract key mismatch in UPDATE response"
+            );
+        }
+        Ok(Ok(other)) => {
+            bail!("unexpected response while waiting for update: {:?}", other);
+        }
+        Ok(Err(e)) => {
+            bail!("Client 1: Error receiving update response: {}", e);
+        }
+        Err(_) => {
+            bail!("Client 1: Timeout waiting for update response");
+        }
+    }
+
+    // Expected task after update
+    let expected_task = test_utils::Task {
+        id: 1,
+        title: "Test auto-subscribe with GET".to_string(),
+        description: "Verify that auto-subscribe works with GET operation".to_string(),
+        completed: false,
+        priority: 5,
+    };
+
+    // Wait for update notification on client 2 (should be auto-subscribed)
+    let mut client2_node_a_received_notification = false;
+
+    // Try for up to 30 seconds to receive the notification
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < Duration::from_secs(30) && !client2_node_a_received_notification {
+        let resp = tokio::time::timeout(Duration::from_secs(1), client_api2_node_a.recv()).await;
         match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
                 key,
-                summary: _,
+                update,
             }))) => {
                 assert_eq!(
                     key, contract_key,
-                    "Contract key mismatch in UPDATE response"
+                    "Contract key mismatch in UPDATE notification for client 2"
                 );
+
+                // Verify update content
+                match update {
+                    UpdateData::State(state) => {
+                        let received_todo_list: test_utils::TodoList =
+                            serde_json::from_slice(state.as_ref())
+                                .expect("Failed to deserialize state from update notification");
+
+                        assert_eq!(received_todo_list.tasks.len(), 1, "Should have one task");
+                        assert_eq!(
+                            received_todo_list.tasks[0].id, expected_task.id,
+                            "Task ID should match"
+                        );
+                        assert_eq!(
+                            received_todo_list.tasks[0].title, expected_task.title,
+                            "Task title should match"
+                        );
+                        assert_eq!(
+                            received_todo_list.tasks[0].description, expected_task.description,
+                            "Task description should match"
+                        );
+                        assert_eq!(
+                            received_todo_list.tasks[0].completed, expected_task.completed,
+                            "Task completed status should match"
+                        );
+                        assert_eq!(
+                            received_todo_list.tasks[0].priority, expected_task.priority,
+                            "Task priority should match"
+                        );
+
+                        tracing::info!("Client 1: Successfully verified update content");
+                    }
+                    _ => {
+                        tracing::warn!("Client 1: Received unexpected update type: {:?}", update);
+                    }
+                }
+                client2_node_a_received_notification = true;
+                break;
             }
             Ok(Ok(other)) => {
                 bail!("unexpected response while waiting for update: {:?}", other);
             }
             Ok(Err(e)) => {
-                bail!("Client 1: Error receiving update response: {}", e);
+                tracing::error!("Client 2: Timeout waiting for update: {}", e);
             }
             Err(_) => {
-                bail!("Client 1: Timeout waiting for update response");
+                tracing::error!("Client 2: Timeout waiting for update response");
             }
         }
 
-        // Expected task after update
-        let expected_task = test_utils::Task {
-            id: 1,
-            title: "Test auto-subscribe with GET".to_string(),
-            description: "Verify that auto-subscribe works with GET operation".to_string(),
-            completed: false,
-            priority: 5,
-        };
+        // Small delay before trying again
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-        // Wait for update notification on client 2 (should be auto-subscribed)
-        let mut client2_node_a_received_notification = false;
-
-        // Try for up to 30 seconds to receive the notification
-        let start_time = std::time::Instant::now();
-        while start_time.elapsed() < Duration::from_secs(30) && !client2_node_a_received_notification {
-            let resp = tokio::time::timeout(Duration::from_secs(1), client_api2_node_a.recv()).await;
-            match resp {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-                    key,
-                    update,
-                }))) => {
-                    assert_eq!(
-                        key, contract_key,
-                        "Contract key mismatch in UPDATE notification for client 2"
-                    );
-
-                    // Verify update content
-                    match update {
-                        UpdateData::State(state) => {
-                            let received_todo_list: test_utils::TodoList =
-                                serde_json::from_slice(state.as_ref())
-                                    .expect("Failed to deserialize state from update notification");
-
-                            assert_eq!(received_todo_list.tasks.len(), 1, "Should have one task");
-                            assert_eq!(
-                                received_todo_list.tasks[0].id, expected_task.id,
-                                "Task ID should match"
-                            );
-                            assert_eq!(
-                                received_todo_list.tasks[0].title, expected_task.title,
-                                "Task title should match"
-                            );
-                            assert_eq!(
-                                received_todo_list.tasks[0].description, expected_task.description,
-                                "Task description should match"
-                            );
-                            assert_eq!(
-                                received_todo_list.tasks[0].completed, expected_task.completed,
-                                "Task completed status should match"
-                            );
-                            assert_eq!(
-                                received_todo_list.tasks[0].priority, expected_task.priority,
-                                "Task priority should match"
-                            );
-
-                            tracing::info!("Client 1: Successfully verified update content");
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "Client 1: Received unexpected update type: {:?}",
-                                update
-                            );
-                        }
-                    }
-                    client2_node_a_received_notification = true;
-                    break;
-                }
-                Ok(Ok(other)) => {
-                    bail!("unexpected response while waiting for update: {:?}", other);
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Client 2: Timeout waiting for update: {}", e);
-                }
-                Err(_) => {
-                    tracing::error!("Client 2: Timeout waiting for update response");
-                }
-            }
-
-            // Small delay before trying again
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        // Assert that client 1 received the notification (proving auto-subscribe worked)
-        assert!(
+    // Assert that client 1 received the notification (proving auto-subscribe worked)
+    assert!(
             client2_node_a_received_notification,
             "Client 2 did not receive update notification within timeout period (auto-subscribe via GET failed)"
         );
@@ -1598,7 +1573,9 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
             }
             Err(_) => {
                 // Timeout on recv - continue looping with outer timeout check
-                tracing::debug!("Client 2: No message received in 5s, continuing to wait for UPDATE response");
+                tracing::debug!(
+                    "Client 2: No message received in 5s, continuing to wait for UPDATE response"
+                );
             }
         }
     }
@@ -1665,10 +1642,7 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
                         tracing::info!("Client 1: Successfully verified update content");
                     }
                     _ => {
-                        tracing::warn!(
-                            "Client 1: Received unexpected update type: {:?}",
-                            update
-                        );
+                        tracing::warn!("Client 1: Received unexpected update type: {:?}", update);
                     }
                 }
                 client1_received_notification = true;
@@ -1737,114 +1711,113 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to the client node's WebSocket API
-    let uri = format!(
-        "ws://127.0.0.1:{ws_api_port_client}/v1/contract/command?encodingProtocol=native"
-    );
+    let uri =
+        format!("ws://127.0.0.1:{ws_api_port_client}/v1/contract/command?encodingProtocol=native");
     let (stream, _) = connect_async(&uri).await?;
     let mut client = WebApi::start(stream);
 
-        // Register the delegate in the node
-        client
-            .send(ClientRequest::DelegateOp(
-                freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
-                    delegate: delegate.clone(),
-                    cipher: freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
-                    nonce: freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
-                },
-            ))
-            .await?;
+    // Register the delegate in the node
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                delegate: delegate.clone(),
+                cipher: freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+                nonce: freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+            },
+        ))
+        .await?;
 
-        // Wait for registration response
-        let resp = tokio::time::timeout(Duration::from_secs(10), client.recv()).await??;
-        match resp {
-            HostResponse::DelegateResponse { key, values: _ } => {
-                assert_eq!(
-                    key, delegate_key,
-                    "Delegate key mismatch in register response"
-                );
-                println!("Successfully registered delegate with key: {key}");
-            }
-            other => {
-                bail!(
-                    "Unexpected response while waiting for register: {:?}",
-                    other
-                );
-            }
+    // Wait for registration response
+    let resp = tokio::time::timeout(Duration::from_secs(10), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, values: _ } => {
+            assert_eq!(
+                key, delegate_key,
+                "Delegate key mismatch in register response"
+            );
+            println!("Successfully registered delegate with key: {key}");
         }
-
-        // Create message for the delegate
-        use serde::{Deserialize, Serialize};
-        #[derive(Debug, Serialize, Deserialize)]
-        enum InboundAppMessage {
-            TestRequest(String),
+        other => {
+            bail!(
+                "Unexpected response while waiting for register: {:?}",
+                other
+            );
         }
+    }
 
-        let app_id = ContractInstanceId::new([0; 32]);
-        let request_data = "test-request-data".to_string();
-        let payload = bincode::serialize(&InboundAppMessage::TestRequest(request_data.clone()))?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+    // Create message for the delegate
+    use serde::{Deserialize, Serialize};
+    #[derive(Debug, Serialize, Deserialize)]
+    enum InboundAppMessage {
+        TestRequest(String),
+    }
 
-        // Send request to the delegate
-        client
-            .send(ClientRequest::DelegateOp(
-                freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
-                    key: delegate_key.clone(),
-                    params: params.clone(),
-                    inbound: vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
-                },
-            ))
-            .await?;
+    let app_id = ContractInstanceId::new([0; 32]);
+    let request_data = "test-request-data".to_string();
+    let payload = bincode::serialize(&InboundAppMessage::TestRequest(request_data.clone()))?;
+    let app_msg = ApplicationMessage::new(app_id, payload);
 
-        // Wait for delegate response
-        let resp = tokio::time::timeout(Duration::from_secs(10), client.recv()).await??;
+    // Send request to the delegate
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: params.clone(),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+            },
+        ))
+        .await?;
 
-        match resp {
-            HostResponse::DelegateResponse {
-                key,
-                values: outbound,
-            } => {
-                assert_eq!(key, delegate_key, "Delegate key mismatch in response");
+    // Wait for delegate response
+    let resp = tokio::time::timeout(Duration::from_secs(10), client.recv()).await??;
 
-                assert!(!outbound.is_empty(), "No output messages from delegate");
+    match resp {
+        HostResponse::DelegateResponse {
+            key,
+            values: outbound,
+        } => {
+            assert_eq!(key, delegate_key, "Delegate key mismatch in response");
 
-                let app_msg = match &outbound[0] {
-                    OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-                    other => bail!("Expected ApplicationMessage, got {:?}", other),
-                };
+            assert!(!outbound.is_empty(), "No output messages from delegate");
 
-                assert!(app_msg.processed, "Message not marked as processed");
+            let app_msg = match &outbound[0] {
+                OutboundDelegateMsg::ApplicationMessage(msg) => msg,
+                other => bail!("Expected ApplicationMessage, got {:?}", other),
+            };
 
-                #[derive(Debug, Deserialize)]
-                enum OutboundAppMessage {
-                    TestResponse(String, Vec<u8>),
+            assert!(app_msg.processed, "Message not marked as processed");
+
+            #[derive(Debug, Deserialize)]
+            enum OutboundAppMessage {
+                TestResponse(String, Vec<u8>),
+            }
+
+            let response: OutboundAppMessage = bincode::deserialize(&app_msg.payload)?;
+
+            match response {
+                OutboundAppMessage::TestResponse(text, data) => {
+                    assert_eq!(
+                        text,
+                        format!("Processed: {request_data}"),
+                        "Response text doesn't match expected format"
+                    );
+                    assert_eq!(
+                        data,
+                        vec![4, 5, 6],
+                        "Response data doesn't match expected value"
+                    );
+
+                    println!("Successfully received and verified delegate response");
                 }
-
-                let response: OutboundAppMessage = bincode::deserialize(&app_msg.payload)?;
-
-                match response {
-                    OutboundAppMessage::TestResponse(text, data) => {
-                        assert_eq!(
-                            text,
-                            format!("Processed: {request_data}"),
-                            "Response text doesn't match expected format"
-                        );
-                        assert_eq!(
-                            data,
-                            vec![4, 5, 6],
-                            "Response data doesn't match expected value"
-                        );
-
-                        println!("Successfully received and verified delegate response");
-                    }
-                }
-            }
-            other => {
-                bail!(
-                    "Unexpected response while waiting for delegate response: {:?}",
-                    other
-                );
             }
         }
+        other => {
+            bail!(
+                "Unexpected response while waiting for delegate response: {:?}",
+                other
+            );
+        }
+    }
 
     Ok(())
 }

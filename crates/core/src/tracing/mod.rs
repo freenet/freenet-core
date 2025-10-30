@@ -462,10 +462,11 @@ impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct EventRegister {
     log_file: Arc<PathBuf>,
     log_sender: mpsc::Sender<NetLogMessage>,
+    // Track the number of clones to know when to flush
+    clone_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Records from a new session must have higher than this ts.
@@ -477,11 +478,12 @@ impl EventRegister {
     pub fn new(event_log_path: PathBuf) -> Self {
         let (log_sender, log_recv) = mpsc::channel(1000);
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
-        let log_file = Arc::new(event_log_path);
+        let log_file = Arc::new(event_log_path.clone());
         GlobalExecutor::spawn(Self::record_logs(log_recv, log_file.clone()));
         Self {
             log_sender,
-            log_file,
+            log_file: Arc::new(event_log_path),
+            clone_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         }
     }
 
@@ -539,6 +541,31 @@ impl EventRegister {
             Err(err) => {
                 tracing::error!("Failed encode batch: {err}");
             }
+        }
+    }
+}
+
+impl Clone for EventRegister {
+    fn clone(&self) -> Self {
+        // Increment the reference count when cloning
+        self.clone_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            log_file: self.log_file.clone(),
+            log_sender: self.log_sender.clone(),
+            clone_count: self.clone_count.clone(),
+        }
+    }
+}
+
+impl Drop for EventRegister {
+    fn drop(&mut self) {
+        // Decrement the reference count
+        let prev_count = self.clone_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+        // If this was the last instance (count was 1, now 0), the sender will be dropped
+        // and the channel will close, triggering the flush in record_logs
+        if prev_count == 1 {
+            tracing::debug!("Last EventRegister instance dropped, channel will close and trigger flush");
         }
     }
 }

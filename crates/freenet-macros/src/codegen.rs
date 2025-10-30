@@ -384,8 +384,18 @@ fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident
     select_arms.push(quote! {
         result = test_future => {
             match result {
-                Ok(Ok(val)) => Ok(val),
-                Ok(Err(e)) => Err(e),
+                Ok(Ok(val)) => {
+                    // Give event loggers time to flush their batches
+                    // The EventRegister is cloned multiple times, so all senders need to be dropped
+                    // before the record_logs task will exit and flush remaining events
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok(val)
+                },
+                Ok(Err(e)) => {
+                    // Also flush on error
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Err(e)
+                },
                 Err(_) => Err(anyhow!("Test timed out after {} seconds", #timeout_secs)),
             }
         }
