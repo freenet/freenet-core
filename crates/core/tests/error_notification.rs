@@ -40,7 +40,13 @@ static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
 /// hanging indefinitely.
 ///
 /// Fixes: #1858
-#[freenet_test(nodes = ["gateway"], timeout_secs = 60, startup_wait_secs = 10)]
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 60,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
 async fn test_get_error_notification(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
     let ws_port = gateway.ws_port;
@@ -101,7 +107,13 @@ async fn test_get_error_notification(ctx: &mut TestContext) -> TestResult {
 ///
 /// This test verifies that when a PUT operation fails (e.g., invalid contract),
 /// the client receives an error response rather than hanging indefinitely.
-#[freenet_test(nodes = ["gateway"], timeout_secs = 60, startup_wait_secs = 10)]
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 60,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
 async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
     let ws_port = gateway.ws_port;
@@ -170,7 +182,13 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
 ///
 /// This test verifies that when an UPDATE operation fails (e.g., contract doesn't exist),
 /// the client receives an error response rather than hanging indefinitely.
-#[freenet_test(nodes = ["gateway"], timeout_secs = 60, startup_wait_secs = 10)]
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 60,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
 async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
     let ws_port = gateway.ws_port;
