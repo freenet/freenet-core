@@ -83,11 +83,14 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             #node_tasks
 
             // 7. Run test with coordination
+            // Note: Panics in test logic will cause the test to fail via tokio::test,
+            // but won't trigger enhanced event reporting. This is a known limitation.
+            // Consider using Result<T, E> returns instead of panics for better diagnostics.
             let test_result = {
                 #test_coordination
             };
 
-            // 6. Handle failure reporting
+            // 8. Handle failure reporting (only for Result::Err, not panics)
             #failure_reporting
 
             test_result

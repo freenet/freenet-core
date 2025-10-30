@@ -429,6 +429,50 @@ EVENT LOG SUMMARY
 
 ## Troubleshooting
 
+### Panic Doesn't Show Event Report
+
+**Problem:** Test panics but no event aggregation report is generated
+
+**Cause:** The macro catches `Result::Err` but not panics. Panics unwind the stack before reaching the event reporting code.
+
+**Solution:** Use `Result`-based error handling instead of panics:
+
+```rust
+// ❌ BAD: Panics - no event report generated
+#[freenet_test(nodes = ["gateway", "peer"])]
+async fn test_operation(ctx: &mut TestContext) -> TestResult {
+    let value = get_value()?;
+    assert_eq!(value, 42);  // PANIC if fails - no enhanced diagnostics!
+    Ok(())
+}
+
+// ✅ GOOD: Returns error - full event report generated
+#[freenet_test(nodes = ["gateway", "peer"])]
+async fn test_operation(ctx: &mut TestContext) -> TestResult {
+    let value = get_value()?;
+    ensure!(value == 42, "Expected 42, got {}", value);  // Returns Err with report!
+    Ok(())
+}
+
+// ✅ ALSO GOOD: Use bail! for custom error messages
+#[freenet_test(nodes = ["gateway", "peer"])]
+async fn test_operation(ctx: &mut TestContext) -> TestResult {
+    let value = get_value()?;
+    if value != 42 {
+        bail!("Expected 42, got {} - check event logs for details", value);
+    }
+    Ok(())
+}
+```
+
+**Best Practices:**
+- Use `anyhow::ensure!` instead of `assert!`
+- Use `anyhow::bail!` instead of `panic!`
+- Use `?` operator instead of `.unwrap()` or `.expect()`
+- Return descriptive errors to make reports more useful
+
+**Future Enhancement:** Panic handling will be added in a future version (tracked in roadmap).
+
 ### Test Times Out During Startup
 
 **Problem:** Test fails with timeout before your test logic runs
