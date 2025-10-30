@@ -58,6 +58,304 @@ async fn test_multi_peer_network() -> TestResult {
 }
 ```
 
+## Using the `#[freenet_test]` Macro
+
+**⭐ Recommended for All New Integration Tests**
+
+The `#[freenet_test]` macro dramatically simplifies integration test authoring by automating node setup, event aggregation, and comprehensive failure reporting.
+
+### Quick Example
+
+```rust
+use freenet::test_utils::TestContext;
+use freenet_macros::freenet_test;
+
+#[freenet_test(
+    nodes = ["gateway", "peer-1", "peer-2"],
+    auto_connect_peers = true,
+    aggregate_events = "on_failure"  // Automatic event aggregation!
+)]
+async fn test_network_operation(ctx: &mut TestContext) -> TestResult {
+    // Nodes are already started and configured
+    let gateway = ctx.gateway()?;
+    let peers = ctx.peers();
+
+    // Your test logic here...
+
+    Ok(())
+}
+```
+
+**What you get automatically:**
+- ✅ Nodes created with temp directories
+- ✅ Gateways and peers configured
+- ✅ Auto-connect between peers and gateways
+- ✅ Event aggregation and detailed failure reports
+- ✅ Proper cleanup on test completion
+
+### Key Macro Attributes
+
+| Attribute | Purpose | Example |
+|-----------|---------|---------|
+| `nodes` | Node labels (required) | `nodes = ["gateway", "peer-1"]` |
+| `auto_connect_peers` | Auto-configure connections | `auto_connect_peers = true` |
+| `aggregate_events` | When to show reports | `aggregate_events = "on_failure"` |
+| `timeout_secs` | Test timeout | `timeout_secs = 120` |
+| `startup_wait_secs` | Node startup wait time | `startup_wait_secs = 15` |
+| `tokio_flavor` | Runtime type | `tokio_flavor = "multi_thread"` |
+
+### Before vs After
+
+**Before (Manual Setup)**:
+```rust
+#[tokio::test]
+async fn test_operation() -> TestResult {
+    // 50+ lines of boilerplate:
+    let temp_gw = tempfile::tempdir()?;
+    let gw_config = create_gateway_config(temp_gw.path())?;
+    let (gw_node, _) = start_node(gw_config).await?;
+
+    let temp_p1 = tempfile::tempdir()?;
+    let p1_config = create_peer_config(temp_p1.path(), &gw_info)?;
+    let (p1_node, _) = start_node(p1_config).await?;
+
+    // ... more setup
+    // ... test logic
+    // ... manual cleanup
+}
+```
+
+**After (With Macro)**:
+```rust
+#[freenet_test(
+    nodes = ["gateway", "peer-1"],
+    auto_connect_peers = true
+)]
+async fn test_operation(ctx: &mut TestContext) -> TestResult {
+    // Nodes ready, connections established
+    // Your test logic here
+    Ok(())
+}
+```
+
+**Result**: 50+ lines reduced to 5!
+
+### Common Patterns
+
+#### Basic Gateway Test
+```rust
+#[freenet_test(nodes = ["gateway"])]
+async fn test_gateway_starts(ctx: &mut TestContext) -> TestResult {
+    let gateway = ctx.gateway()?;
+    assert!(gateway.is_gateway);
+    Ok(())
+}
+```
+
+#### Multi-Node with Operations
+```rust
+#[freenet_test(
+    nodes = ["gateway", "peer-1", "peer-2"],
+    auto_connect_peers = true,
+    timeout_secs = 180,
+    startup_wait_secs = 15
+)]
+async fn test_contract_replication(ctx: &mut TestContext) -> TestResult {
+    // Your PUT/GET operations here
+    Ok(())
+}
+```
+
+#### Multiple Gateways
+```rust
+#[freenet_test(
+    nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
+    gateways = ["gw-1", "gw-2"],
+    auto_connect_peers = true
+)]
+async fn test_multi_gateway(ctx: &mut TestContext) -> TestResult {
+    let gateways = ctx.gateways();
+    assert_eq!(gateways.len(), 2);
+    Ok(())
+}
+```
+
+### See Also
+- **Full macro documentation**: `../../crates/freenet-macros/README.md`
+- **Enhanced reporting details**: See "Enhanced Test Reporting" section below
+
+## Enhanced Test Reporting
+
+When tests fail (or with `aggregate_events = "always"`), Freenet automatically generates comprehensive diagnostic reports with full event details and visualizations.
+
+### What You Get
+
+#### 1. Console Summary with Statistics
+
+```
+================================================================================
+TEST FAILURE REPORT
+================================================================================
+
+Error: Timeout waiting for PUT response
+
+📊 Event Statistics:
+  Total events: 15
+  By type: Connect: 3, Put: 4, Route: 6, Ignored: 2
+
+  By peer:
+    v6MWKgqK: 8 events
+    v6MWKgqJ: 4 events
+
+📅 Event Timeline (showing first 10):
+  [     0ms] v6MWKgqK 🔗 Connect(Connected)
+  [     5ms] v6MWKgqJ 🔗 Connect(Connected)
+  [ 11158ms] v6MWKgqK 📤 Put(Request { ... })
+  [ 11193ms] v6MWKgqJ 🔀 Route(RoutingMessage { ... })
+```
+
+#### 2. Detailed Event Log (Markdown)
+**Location**: `/tmp/freenet-test-{test-name}-{timestamp}/events.md`
+
+Contains **full event details** (no truncation!):
+```markdown
+### 📤 Put - [ 11158ms]
+
+- **Peer ID**: `v6MWKgqKXYZ...`
+- **Transaction**: `Transaction(abc123...)`
+- **Timestamp**: 2025-10-30T17:30:45.123Z
+
+**Event Details**:
+\`\`\`rust
+Put(Request {
+    contract_key: ContractKey {
+        instance: ContractInstanceId(...),
+        code: CodeHash(...),
+        // ... COMPLETE DETAILS - NO TRUNCATION!
+    },
+    state: WrappedState(...),
+    fetch_contract: false,
+})
+\`\`\`
+```
+
+#### 3. Mermaid Flow Diagram
+**Location**: `/tmp/freenet-test-{test-name}-{timestamp}/event-flow.mmd`
+
+Visual flowchart showing event sequence:
+```mermaid
+graph TD
+    N0["v6MWKgqK 🔗 Connect"]
+    N1["v6MWKgqJ 🔗 Connect"]
+    N2["v6MWKgqK 📤 Put"]
+    N3["v6MWKgqJ 🔀 Route"]
+    N0 --> N1
+    N1 --> N2
+    N2 --> N3
+```
+
+#### 4. Clickable File Links
+
+```
+📁 Detailed Reports Generated:
+  📄 Full event log:     file:///tmp/freenet-test-test_failure-.../events.md
+  📊 Event flow diagram: file:///tmp/freenet-test-test_failure-.../event-flow.mmd
+
+💡 Tip: View diagram at https://mermaid.live or in VS Code
+```
+
+### Viewing the Reports
+
+#### Option 1: Click Links
+Most modern terminals support `file://` links:
+- **Mac**: Cmd+Click on the link
+- **Windows/Linux**: Ctrl+Click on the link
+
+#### Option 2: Manual Navigation
+```bash
+# Navigate to temp directory
+cd /tmp/freenet-test-*
+
+# View event log
+cat events.md
+
+# Open in editor
+code events.md
+```
+
+#### Option 3: View Mermaid Diagram
+```bash
+# In VS Code (install Mermaid Preview extension)
+code event-flow.mmd
+
+# Or copy to Mermaid Live Editor
+cat event-flow.mmd | pbcopy  # Mac
+# Paste at https://mermaid.live
+
+# Or view in GitHub (upload as gist - auto-renders)
+```
+
+### Real-World Debugging Example
+
+**Problem**: Test times out waiting for PUT response
+
+**With Enhanced Reporting**:
+
+1. **Check console for links**:
+   ```
+   📁 Detailed Reports:
+     📄 file:///tmp/freenet-test-test_put-20251030-180000/events.md
+   ```
+
+2. **Open `events.md` and search for "Put"**:
+   ```markdown
+   ### 📤 Put - [  5123ms]
+   Put(Request { contract_key: ..., state: ... })
+
+   ### 🔀 Route - [  5150ms]
+   Route(RoutingMessage { target: PeerId(...) })
+
+   # No Put(Success) event found!
+   ```
+
+3. **Open `event-flow.mmd` to visualize**:
+   ```mermaid
+   graph TD
+       N0["peer 📤 Put"]
+       N1["gateway 🔀 Route"]
+       N2["... nothing after"]
+   ```
+
+4. **Conclusion**: Operation reached gateway but response never came back
+   - Focus debugging on: gateway state machine or response routing
+
+**Result**: Problem identified in minutes instead of hours!
+
+### Event Icons Reference
+
+| Icon | Event Type | Meaning |
+|------|-----------|---------|
+| 🔗 | Connect | Peer connection established |
+| 📤 | Put | Contract storage operation |
+| 📥 | Get | Contract retrieval operation |
+| 🔀 | Route | Message routing event |
+| 🔄 | Update | Contract state update |
+| 🔔 | Subscribe | Subscription established |
+| ❌ | Disconnect | Peer disconnected |
+| ⏭️ | Ignored | Event was ignored |
+
+### Finding Old Reports
+```bash
+# List all test reports
+ls -lt /tmp/freenet-test-* | head -20
+
+# Find reports from today
+find /tmp -name "freenet-test-*" -mtime -1
+
+# Search for specific test
+ls -d /tmp/freenet-test-test_put_contract-*
+```
+
 ## Detailed Usage
 
 ### 1. Using `test-log` for Test Logging
