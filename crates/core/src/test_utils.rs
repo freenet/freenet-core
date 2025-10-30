@@ -1006,6 +1006,35 @@ impl TestContext {
                             )
                             .unwrap();
                         }
+
+                        // Generate detailed reports in temp directory
+                        if !events.is_empty() {
+                            match self.generate_detailed_reports("test_failure", &aggregator).await {
+                                Ok(report_dir) => {
+                                    writeln!(&mut report, "\n📁 Detailed Reports Generated:").unwrap();
+                                    writeln!(
+                                        &mut report,
+                                        "  📄 Full event log:     file://{}/events.md",
+                                        report_dir.display()
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        &mut report,
+                                        "  📊 Event flow diagram: file://{}/event-flow.mmd",
+                                        report_dir.display()
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        &mut report,
+                                        "\n💡 Tip: View diagram at https://mermaid.live or in VS Code"
+                                    )
+                                    .unwrap();
+                                }
+                                Err(e) => {
+                                    writeln!(&mut report, "\n⚠️ Failed to generate detailed reports: {}", e).unwrap();
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         writeln!(&mut report, "\nFailed to get events: {}", e).unwrap();
@@ -1022,6 +1051,106 @@ impl TestContext {
     }
 
     /// Generate a success summary with event statistics.
+    /// Generate detailed reports in temp directory and return the path.
+    async fn generate_detailed_reports(
+        &self,
+        test_name: &str,
+        aggregator: &crate::tracing::EventLogAggregator<crate::tracing::AOFEventSource>,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        use std::fmt::Write as FmtWrite;
+        use std::io::Write as IoWrite;
+
+        // Create temp directory for reports
+        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let report_dir = std::path::PathBuf::from(format!(
+            "/tmp/freenet-test-{}-{}",
+            test_name, timestamp
+        ));
+        std::fs::create_dir_all(&report_dir)?;
+
+        // Generate detailed events markdown
+        let events = aggregator.get_all_events().await?;
+        let mut events_md = String::new();
+        writeln!(&mut events_md, "# Detailed Event Log: {}\n", test_name)?;
+        writeln!(&mut events_md, "**Generated**: {}", chrono::Utc::now())?;
+        writeln!(&mut events_md, "**Total Events**: {}\n", events.len())?;
+
+        if !events.is_empty() {
+            writeln!(&mut events_md, "## Events by Timestamp\n")?;
+            let start_time = events.first().unwrap().datetime;
+
+            for event in &events {
+                let elapsed = (event.datetime - start_time).num_milliseconds();
+                let (icon, type_name) = match &event.kind {
+                    crate::tracing::EventKind::Connect(..) => ("🔗", "Connect"),
+                    crate::tracing::EventKind::Put(..) => ("📤", "Put"),
+                    crate::tracing::EventKind::Get { .. } => ("📥", "Get"),
+                    crate::tracing::EventKind::Route(..) => ("🔀", "Route"),
+                    crate::tracing::EventKind::Update(..) => ("🔄", "Update"),
+                    crate::tracing::EventKind::Subscribed { .. } => ("🔔", "Subscribe"),
+                    crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
+                    crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
+                };
+
+                writeln!(&mut events_md, "### {} {} - [{:>6}ms]\n", icon, type_name, elapsed)?;
+                writeln!(&mut events_md, "- **Peer ID**: `{}`", event.peer_id)?;
+                writeln!(&mut events_md, "- **Transaction**: `{}`", event.tx)?;
+                writeln!(&mut events_md, "- **Timestamp**: {}", event.datetime)?;
+                writeln!(&mut events_md, "\n**Event Details**:\n```rust\n{:#?}\n```\n", event.kind)?;
+            }
+        }
+
+        let events_md_path = report_dir.join("events.md");
+        let mut events_file = std::fs::File::create(&events_md_path)?;
+        events_file.write_all(events_md.as_bytes())?;
+
+        // Generate Mermaid diagram showing event flow
+        let mut mermaid = String::from("```mermaid\ngraph TD\n");
+        mermaid.push_str("    %% Event Flow Diagram\n");
+
+        let mut prev_id: Option<String> = None;
+        for (idx, event) in events.iter().enumerate().take(50) { // Limit to 50 for readability
+            let node_id = format!("N{}", idx);
+            let peer_short = &event.peer_id.to_string()[..8.min(event.peer_id.to_string().len())];
+            let (icon, type_name) = match &event.kind {
+                crate::tracing::EventKind::Connect(..) => ("🔗", "Connect"),
+                crate::tracing::EventKind::Put(..) => ("📤", "Put"),
+                crate::tracing::EventKind::Get { .. } => ("📥", "Get"),
+                crate::tracing::EventKind::Route(..) => ("🔀", "Route"),
+                crate::tracing::EventKind::Update(..) => ("🔄", "Update"),
+                crate::tracing::EventKind::Subscribed { .. } => ("🔔", "Subscribe"),
+                crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
+                crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
+            };
+
+            writeln!(
+                &mut mermaid,
+                "    {}[\"{} {}\\n{}\"]",
+                node_id, peer_short, icon, type_name
+            )?;
+
+            if let Some(prev) = prev_id {
+                writeln!(&mut mermaid, "    {} --> {}", prev, node_id)?;
+            }
+            prev_id = Some(node_id);
+        }
+
+        if events.len() > 50 {
+            writeln!(&mut mermaid, "    NMore[\"... and {} more events\"]", events.len() - 50)?;
+            if let Some(prev) = prev_id {
+                writeln!(&mut mermaid, "    {} -.-> NMore", prev)?;
+            }
+        }
+
+        mermaid.push_str("```\n");
+
+        let mermaid_path = report_dir.join("event-flow.mmd");
+        let mut mermaid_file = std::fs::File::create(&mermaid_path)?;
+        mermaid_file.write_all(mermaid.as_bytes())?;
+
+        Ok(report_dir)
+    }
+
     pub async fn generate_success_summary(&self) -> String {
         use std::fmt::Write;
 
@@ -1116,6 +1245,35 @@ impl TestContext {
                                 .collect::<String>()
                         )
                         .unwrap();
+                    }
+
+                    // Generate detailed reports in temp directory
+                    if !events.is_empty() {
+                        match self.generate_detailed_reports("test_success", &aggregator).await {
+                            Ok(report_dir) => {
+                                writeln!(&mut report, "\n📁 Detailed Reports Generated:").unwrap();
+                                writeln!(
+                                    &mut report,
+                                    "  📄 Full event log:     file://{}/events.md",
+                                    report_dir.display()
+                                )
+                                .unwrap();
+                                writeln!(
+                                    &mut report,
+                                    "  📊 Event flow diagram: file://{}/event-flow.mmd",
+                                    report_dir.display()
+                                )
+                                .unwrap();
+                                writeln!(
+                                    &mut report,
+                                    "\n💡 Tip: View diagram at https://mermaid.live or in VS Code"
+                                )
+                                .unwrap();
+                            }
+                            Err(e) => {
+                                writeln!(&mut report, "\n⚠️ Failed to generate detailed reports: {}", e).unwrap();
+                            }
+                        }
                     }
                 }
                 Err(e) => {
