@@ -429,49 +429,55 @@ EVENT LOG SUMMARY
 
 ## Troubleshooting
 
-### Panic Doesn't Show Event Report
+### Panic Handling (✅ Now Supported!)
 
-**Problem:** Test panics but no event aggregation report is generated
+**Good News:** The macro now catches panics and generates event aggregation reports!
 
-**Cause:** The macro catches `Result::Err` but not panics. Panics unwind the stack before reaching the event reporting code.
+**How It Works:** The test is spawned in a separate tokio task, allowing the macro to catch panics via `JoinError` and convert them to regular errors before reporting.
 
-**Solution:** Use `Result`-based error handling instead of panics:
+**Example:**
 
 ```rust
-// ❌ BAD: Panics - no event report generated
+// ✅ Both work now - panic is caught and report is generated!
 #[freenet_test(nodes = ["gateway", "peer"])]
-async fn test_operation(ctx: &mut TestContext) -> TestResult {
+async fn test_with_assertion(ctx: &mut TestContext) -> TestResult {
     let value = get_value()?;
-    assert_eq!(value, 42);  // PANIC if fails - no enhanced diagnostics!
+    assert_eq!(value, 42);  // Panic is caught - full event report generated!
     Ok(())
 }
 
-// ✅ GOOD: Returns error - full event report generated
 #[freenet_test(nodes = ["gateway", "peer"])]
-async fn test_operation(ctx: &mut TestContext) -> TestResult {
+async fn test_with_ensure(ctx: &mut TestContext) -> TestResult {
     let value = get_value()?;
-    ensure!(value == 42, "Expected 42, got {}", value);  // Returns Err with report!
-    Ok(())
-}
-
-// ✅ ALSO GOOD: Use bail! for custom error messages
-#[freenet_test(nodes = ["gateway", "peer"])]
-async fn test_operation(ctx: &mut TestContext) -> TestResult {
-    let value = get_value()?;
-    if value != 42 {
-        bail!("Expected 42, got {} - check event logs for details", value);
-    }
+    ensure!(value == 42, "Expected 42, got {}", value);  // Also generates report
     Ok(())
 }
 ```
 
-**Best Practices:**
-- Use `anyhow::ensure!` instead of `assert!`
-- Use `anyhow::bail!` instead of `panic!`
-- Use `?` operator instead of `.unwrap()` or `.expect()`
-- Return descriptive errors to make reports more useful
+**What You Get on Panic:**
+```
+================================================================================
+TEST FAILURE REPORT
+================================================================================
 
-**Future Enhancement:** Panic handling will be added in a future version (tracked in roadmap).
+Error: Test panicked: assertion `left == right` failed
+  left: 1
+ right: 2
+
+📊 Event Statistics:
+  Total events: 5
+  By type: Connect: 2, ...
+
+📁 Detailed Reports Generated:
+  📄 Full event log:     file:///tmp/freenet-test-.../events.md
+  📊 Event flow diagram: file:///tmp/freenet-test-.../event-flow.mmd
+```
+
+**Best Practices:**
+- Both `assert!` and `ensure!` work fine now
+- Use `assert!` for simple equality checks
+- Use `ensure!` for more descriptive error messages
+- Both generate full event reports with timelines and diagrams
 
 ### Test Times Out During Startup
 

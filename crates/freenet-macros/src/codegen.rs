@@ -82,15 +82,37 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             // 6. Start node tasks (run already-built nodes)
             #node_tasks
 
-            // 7. Run test with coordination
-            // Note: Panics in test logic will cause the test to fail via tokio::test,
-            // but won't trigger enhanced event reporting. This is a known limitation.
-            // Consider using Result<T, E> returns instead of panics for better diagnostics.
-            let test_result = {
+            // 7. Run test with coordination and panic handling
+            // Spawn test in a separate task so we can catch panics
+            let test_handle = tokio::spawn(async move {
                 #test_coordination
+            });
+
+            // Wait for test to complete and catch panics
+            let test_result = match test_handle.await {
+                Ok(result) => result,
+                Err(join_error) => {
+                    // Task panicked - convert to error
+                    if join_error.is_panic() {
+                        let panic_msg = if let Ok(panic) = join_error.try_into_panic() {
+                            if let Some(s) = panic.downcast_ref::<&str>() {
+                                format!("Test panicked: {}", s)
+                            } else if let Some(s) = panic.downcast_ref::<String>() {
+                                format!("Test panicked: {}", s)
+                            } else {
+                                "Test panicked with no message".to_string()
+                            }
+                        } else {
+                            "Test panicked".to_string()
+                        };
+                        Err(anyhow!(panic_msg))
+                    } else {
+                        Err(anyhow!("Test task was cancelled"))
+                    }
+                }
             };
 
-            // 8. Handle failure reporting (only for Result::Err, not panics)
+            // 8. Handle failure reporting (now catches panics too!)
             #failure_reporting
 
             test_result
