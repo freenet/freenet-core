@@ -1026,15 +1026,37 @@ impl TestContext {
         use std::fmt::Write;
 
         let mut report = String::new();
-        writeln!(&mut report, "\n{}", "-".repeat(80)).unwrap();
+        writeln!(&mut report, "\n{}", "=".repeat(80)).unwrap();
         writeln!(&mut report, "TEST SUCCESS SUMMARY").unwrap();
-        writeln!(&mut report, "{}", "-".repeat(80)).unwrap();
+        writeln!(&mut report, "{}", "=".repeat(80)).unwrap();
 
         // Try to aggregate events
         match self.aggregate_events().await {
             Ok(aggregator) => match aggregator.get_all_events().await {
-                Ok(events) => {
-                    writeln!(&mut report, "\nTotal events: {}", events.len()).unwrap();
+                Ok(mut events) => {
+                    writeln!(&mut report, "\n📊 Event Statistics:").unwrap();
+                    writeln!(&mut report, "  Total events: {}", events.len()).unwrap();
+
+                    // Count by event type
+                    let mut by_type: HashMap<String, usize> = HashMap::new();
+                    for event in &events {
+                        let type_name = match &event.kind {
+                            crate::tracing::EventKind::Connect(..) => "Connect",
+                            crate::tracing::EventKind::Put(..) => "Put",
+                            crate::tracing::EventKind::Get { .. } => "Get",
+                            crate::tracing::EventKind::Route(..) => "Route",
+                            crate::tracing::EventKind::Update(..) => "Update",
+                            crate::tracing::EventKind::Subscribed { .. } => "Subscribe",
+                            crate::tracing::EventKind::Disconnected { .. } => "Disconnect",
+                            crate::tracing::EventKind::Ignored => "Ignored",
+                        };
+                        *by_type.entry(type_name.to_string()).or_default() += 1;
+                    }
+
+                    writeln!(&mut report, "\n  By type:").unwrap();
+                    for (event_type, count) in by_type.iter() {
+                        writeln!(&mut report, "    {}: {}", event_type, count).unwrap();
+                    }
 
                     // Group by peer_id
                     let mut by_peer: HashMap<String, Vec<_>> = HashMap::new();
@@ -1043,27 +1065,65 @@ impl TestContext {
                         by_peer.entry(peer_str).or_default().push(event);
                     }
 
-                    writeln!(&mut report, "\nEvents by peer:").unwrap();
+                    writeln!(&mut report, "\n  By peer:").unwrap();
                     for (peer_id, peer_events) in by_peer.iter() {
                         writeln!(
                             &mut report,
-                            "  {}: {} events",
-                            &peer_id[..8.min(peer_id.len())], // Show first 8 chars
+                            "    {}: {} events",
+                            &peer_id[..8.min(peer_id.len())],
                             peer_events.len()
+                        )
+                        .unwrap();
+                    }
+
+                    // Sort events by timestamp for timeline
+                    events.sort_by_key(|e| e.datetime);
+
+                    // Show timeline of key events (simplified, showing all events)
+                    writeln!(&mut report, "\n📅 Event Timeline:").unwrap();
+                    let start_time = events.first().map(|e| e.datetime).unwrap_or_else(chrono::Utc::now);
+
+                    for event in &events {
+                        let elapsed = (event.datetime - start_time).num_milliseconds();
+                        let peer_short = &event.peer_id.to_string()[..8.min(event.peer_id.to_string().len())];
+
+                        // Get event type icon
+                        let (icon, _type_name) = match &event.kind {
+                            crate::tracing::EventKind::Connect(..) => ("🔗", "Connect"),
+                            crate::tracing::EventKind::Put(..) => ("📤", "Put"),
+                            crate::tracing::EventKind::Get { .. } => ("📥", "Get"),
+                            crate::tracing::EventKind::Route(..) => ("🔀", "Route"),
+                            crate::tracing::EventKind::Update(..) => ("🔄", "Update"),
+                            crate::tracing::EventKind::Subscribed { .. } => ("🔔", "Subscribe"),
+                            crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
+                            crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
+                        };
+
+                        // Format event details (using Debug for now to avoid private field access)
+                        writeln!(
+                            &mut report,
+                            "  [{:>6}ms] {} {} {}",
+                            elapsed,
+                            peer_short,
+                            icon,
+                            format!("{:?}", event.kind)
+                                .chars()
+                                .take(60)
+                                .collect::<String>()
                         )
                         .unwrap();
                     }
                 }
                 Err(e) => {
-                    writeln!(&mut report, "\nFailed to get events: {}", e).unwrap();
+                    writeln!(&mut report, "\n❌ Failed to get events: {}", e).unwrap();
                 }
             },
             Err(e) => {
-                writeln!(&mut report, "\nFailed to aggregate events: {}", e).unwrap();
+                writeln!(&mut report, "\n❌ Failed to aggregate events: {}", e).unwrap();
             }
         }
 
-        writeln!(&mut report, "{}", "-".repeat(80)).unwrap();
+        writeln!(&mut report, "\n{}", "=".repeat(80)).unwrap();
         report
     }
 }
