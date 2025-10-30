@@ -1846,7 +1846,7 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
     tokio_worker_threads = 4
 )]
 async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> TestResult {
-    use freenet_stdlib::prelude::Location;
+    use freenet::dev_tool::Location;
 
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;

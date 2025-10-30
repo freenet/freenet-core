@@ -429,55 +429,44 @@ EVENT LOG SUMMARY
 
 ## Troubleshooting
 
-### Panic Handling (✅ Now Supported!)
+### Panics Don't Trigger Event Reports
 
-**Good News:** The macro now catches panics and generates event aggregation reports!
+**Limitation:** If your test panics (using `assert!`, `unwrap()`, `panic!()`), the enhanced event reporting will NOT be generated.
 
-**How It Works:** The test is spawned in a separate tokio task, allowing the macro to catch panics via `JoinError` and convert them to regular errors before reporting.
+**Why:** Catching panics in async code while maintaining `Send` bounds and avoiding borrow/move issues with `TestContext` is technically complex. Panics unwind the stack before reaching the event reporting code.
 
-**Example:**
+**Solution:** Use `Result`-based error handling for better diagnostics:
 
 ```rust
-// ✅ Both work now - panic is caught and report is generated!
+// ❌ Panics - no event report
 #[freenet_test(nodes = ["gateway", "peer"])]
 async fn test_with_assertion(ctx: &mut TestContext) -> TestResult {
     let value = get_value()?;
-    assert_eq!(value, 42);  // Panic is caught - full event report generated!
+    assert_eq!(value, 42);  // PANIC - no event report!
     Ok(())
 }
 
+// ✅ Returns error - full event report generated
 #[freenet_test(nodes = ["gateway", "peer"])]
 async fn test_with_ensure(ctx: &mut TestContext) -> TestResult {
     let value = get_value()?;
-    ensure!(value == 42, "Expected 42, got {}", value);  // Also generates report
+    ensure!(value == 42, "Expected 42, got {}", value);  // Gets full report!
     Ok(())
 }
 ```
 
-**What You Get on Panic:**
-```
-================================================================================
-TEST FAILURE REPORT
-================================================================================
-
-Error: Test panicked: assertion `left == right` failed
-  left: 1
- right: 2
-
-📊 Event Statistics:
-  Total events: 5
-  By type: Connect: 2, ...
-
-📁 Detailed Reports Generated:
-  📄 Full event log:     file:///tmp/freenet-test-.../events.md
-  📊 Event flow diagram: file:///tmp/freenet-test-.../event-flow.mmd
-```
-
 **Best Practices:**
-- Both `assert!` and `ensure!` work fine now
-- Use `assert!` for simple equality checks
-- Use `ensure!` for more descriptive error messages
-- Both generate full event reports with timelines and diagrams
+- Use `ensure!(condition, "msg")` instead of `assert!(condition)`
+- Use `value?` instead of `value.unwrap()`
+- Use `bail!("error")` instead of `panic!("error")`
+- Return descriptive errors to make reports more useful
+
+**Why Not Fix This?** Catching panics requires either:
+- `tokio::spawn` (causes ctx move/borrow issues)
+- `std::panic::catch_unwind` (doesn't work with async/await)
+- Custom panic hooks (global state, thread-safety issues)
+
+Each approach has significant trade-offs. Using `Result`-based errors is the idiomatic Rust approach anyway!
 
 ### Test Times Out During Startup
 

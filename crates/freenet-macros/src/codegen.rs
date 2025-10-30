@@ -82,37 +82,15 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             // 6. Start node tasks (run already-built nodes)
             #node_tasks
 
-            // 7. Run test with coordination and panic handling
-            // Spawn test in a separate task so we can catch panics
-            let test_handle = tokio::spawn(async move {
+            // 7. Run test with coordination
+            // Note: Catching panics in async code while maintaining Send bounds
+            // and avoiding ctx move issues is complex. For now, use Result-based
+            // errors (bail!, ensure!) for best diagnostics.
+            let test_result = {
                 #test_coordination
-            });
-
-            // Wait for test to complete and catch panics
-            let test_result = match test_handle.await {
-                Ok(result) => result,
-                Err(join_error) => {
-                    // Task panicked - convert to error
-                    if join_error.is_panic() {
-                        let panic_msg = if let Ok(panic) = join_error.try_into_panic() {
-                            if let Some(s) = panic.downcast_ref::<&str>() {
-                                format!("Test panicked: {}", s)
-                            } else if let Some(s) = panic.downcast_ref::<String>() {
-                                format!("Test panicked: {}", s)
-                            } else {
-                                "Test panicked with no message".to_string()
-                            }
-                        } else {
-                            "Test panicked".to_string()
-                        };
-                        Err(anyhow!(panic_msg))
-                    } else {
-                        Err(anyhow!("Test task was cancelled"))
-                    }
-                }
             };
 
-            // 8. Handle failure reporting (now catches panics too!)
+            // 8. Handle failure reporting
             #failure_reporting
 
             test_result
