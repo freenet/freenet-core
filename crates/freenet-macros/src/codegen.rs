@@ -30,11 +30,14 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
     // Extract values before configs are moved
     let value_extraction = generate_value_extraction(&args);
 
-    // Generate node startup tasks (moves configs)
-    let node_tasks = generate_node_tasks(&args);
+    // Build nodes and collect flush handles
+    let node_builds = generate_node_builds(&args);
 
-    // Generate TestContext creation (uses extracted values)
-    let context_creation = generate_context_creation_only(&args);
+    // Generate TestContext creation with flush handles
+    let context_creation = generate_context_creation_with_handles(&args);
+
+    // Generate node startup tasks (runs already-built nodes)
+    let node_tasks = generate_node_tasks(&args);
 
     // Generate test coordination with select!
     let test_coordination = generate_test_coordination(&args, &inner_fn_name);
@@ -70,13 +73,16 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             // 3. Extract values before configs are moved
             #value_extraction
 
-            // 4. Start nodes with instrumentation
-            #node_tasks
+            // 4. Build nodes and collect flush handles
+            #node_builds
 
-            // 5. Build TestContext
+            // 5. Build TestContext with flush handles
             #context_creation
 
-            // 5. Run test with coordination
+            // 6. Start node tasks (run already-built nodes)
+            #node_tasks
+
+            // 7. Run test with coordination
             let test_result = {
                 #test_coordination
             };
@@ -277,24 +283,42 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
     }
 }
 
-/// Generate node startup tasks
+/// Generate node building and flush handle collection
+fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
+    let mut builds = Vec::new();
+
+    for (idx, node_label) in args.nodes.iter().enumerate() {
+        let node_var = format_ident!("node_{}", idx);
+        let flush_handle_var = format_ident!("flush_handle_{}", idx);
+        let config_var = format_ident!("config_{}", idx);
+
+        builds.push(quote! {
+            tracing::info!("Building node: {}", #node_label);
+            let built_config = #config_var.build().await?;
+            let (#node_var, #flush_handle_var) = freenet::local_node::NodeConfig::new(built_config.clone())
+                .await?
+                .build_with_flush_handle(freenet::server::serve_gateway(built_config.ws_api).await)
+                .await?;
+        });
+    }
+
+    quote! {
+        #(#builds)*
+    }
+}
+
+/// Generate node startup tasks (after nodes are built)
 fn generate_node_tasks(args: &FreenetTestArgs) -> TokenStream {
     let mut tasks = Vec::new();
 
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let task_var = format_ident!("node_task_{}", idx);
-        let config_var = format_ident!("config_{}", idx);
+        let node_var = format_ident!("node_{}", idx);
 
         tasks.push(quote! {
             let #task_var = {
-                let config = #config_var;
+                let node = #node_var;
                 async move {
-                    tracing::info!("Starting node: {}", #node_label);
-                    let built_config = config.build().await?;
-                    let node = freenet::local_node::NodeConfig::new(built_config.clone())
-                        .await?
-                        .build(freenet::server::serve_gateway(built_config.ws_api).await)
-                        .await?;
                     tracing::info!("Node running: {}", #node_label);
                     node.run().await
                 }
@@ -334,15 +358,17 @@ fn generate_value_extraction(args: &FreenetTestArgs) -> TokenStream {
     }
 }
 
-/// Generate TestContext creation (uses already-extracted values)
-fn generate_context_creation_only(args: &FreenetTestArgs) -> TokenStream {
+/// Generate TestContext creation with flush handles
+fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream {
     let mut node_infos = Vec::new();
+    let mut flush_handle_pairs = Vec::new();
 
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let temp_var = format_ident!("temp_{}", idx);
         let ws_port_var = format_ident!("ws_port_{}", idx);
         let network_port_var = format_ident!("network_port_{}", idx);
         let location_var = format_ident!("location_{}", idx);
+        let flush_handle_var = format_ident!("flush_handle_{}", idx);
         let is_gw = is_gateway(args, node_label, idx);
 
         node_infos.push(quote! {
@@ -355,12 +381,17 @@ fn generate_context_creation_only(args: &FreenetTestArgs) -> TokenStream {
                 location: #location_var,
             }
         });
+
+        flush_handle_pairs.push(quote! {
+            (#node_label.to_string(), #flush_handle_var)
+        });
     }
 
     quote! {
-        let mut ctx = TestContext::new(vec![
-            #(#node_infos),*
-        ]);
+        let mut ctx = TestContext::with_flush_handles(
+            vec![#(#node_infos),*],
+            vec![#(#flush_handle_pairs),*]
+        );
     }
 }
 

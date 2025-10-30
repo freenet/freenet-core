@@ -847,6 +847,8 @@ pub struct TestContext {
     nodes: HashMap<String, NodeInfo>,
     /// Node labels in order they were added (for indexing)
     node_order: Vec<String>,
+    /// Flush handles for event aggregation (optional for backward compatibility)
+    flush_handles: HashMap<String, crate::tracing::EventFlushHandle>,
 }
 
 impl TestContext {
@@ -859,6 +861,24 @@ impl TestContext {
         Self {
             nodes: nodes_map,
             node_order,
+            flush_handles: HashMap::new(),
+        }
+    }
+
+    /// Create a new TestContext with flush handles for event aggregation.
+    pub fn with_flush_handles(
+        nodes: Vec<NodeInfo>,
+        flush_handles: Vec<(String, crate::tracing::EventFlushHandle)>,
+    ) -> Self {
+        let node_order: Vec<String> = nodes.iter().map(|n| n.label.clone()).collect();
+        let nodes_map: HashMap<String, NodeInfo> =
+            nodes.into_iter().map(|n| (n.label.clone(), n)).collect();
+        let flush_handles_map: HashMap<String, crate::tracing::EventFlushHandle> =
+            flush_handles.into_iter().collect();
+        Self {
+            nodes: nodes_map,
+            node_order,
+            flush_handles: flush_handles_map,
         }
     }
 
@@ -918,8 +938,11 @@ impl TestContext {
     pub async fn aggregate_events(
         &self,
     ) -> anyhow::Result<crate::tracing::EventLogAggregator<crate::tracing::AOFEventSource>> {
-        // TODO: Collect and use EventFlushHandles from nodes to flush explicitly
-        // For now, rely on BATCH_SIZE=5 and drop-based flush after 5-second wait
+        // Flush all event registers before aggregating
+        for (label, handle) in &self.flush_handles {
+            tracing::debug!("Flushing events for node: {}", label);
+            handle.flush().await;
+        }
 
         let mut builder = TestAggregatorBuilder::new();
         for label in &self.node_order {
