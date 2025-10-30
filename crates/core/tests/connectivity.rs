@@ -1,15 +1,13 @@
 use anyhow::bail;
-use freenet::{
-    test_utils::{self, make_get, make_put, TestContext},
-};
+use freenet::test_utils::{self, make_get, make_put, TestContext};
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
 use std::time::Duration;
-use tokio_tungstenite::connect_async;
 use testresult::TestResult;
+use tokio_tungstenite::connect_async;
 
 /// Test gateway reconnection:
 /// 1. Start a gateway and a peer connected to it
@@ -21,6 +19,7 @@ use testresult::TestResult;
     auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 15,
+    aggregate_events = "always",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -176,7 +175,8 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
     timeout_secs = 30,
     startup_wait_secs = 5,
     tokio_flavor = "multi_thread",
-    tokio_worker_threads = 4
+    tokio_worker_threads = 4,
+    aggregate_events = "always"
 )]
 async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
     // Get the gateway node from context
@@ -257,6 +257,7 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
     auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 30,
+    aggregate_events = "always",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
