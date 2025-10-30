@@ -1009,9 +1009,13 @@ impl TestContext {
 
                         // Generate detailed reports in temp directory
                         if !events.is_empty() {
-                            match self.generate_detailed_reports("test_failure", &aggregator).await {
+                            match self
+                                .generate_detailed_reports("test_failure", &aggregator)
+                                .await
+                            {
                                 Ok(report_dir) => {
-                                    writeln!(&mut report, "\n📁 Detailed Reports Generated:").unwrap();
+                                    writeln!(&mut report, "\n📁 Detailed Reports Generated:")
+                                        .unwrap();
                                     writeln!(
                                         &mut report,
                                         "  📄 Full event log:     file://{}/events.md",
@@ -1031,7 +1035,12 @@ impl TestContext {
                                     .unwrap();
                                 }
                                 Err(e) => {
-                                    writeln!(&mut report, "\n⚠️ Failed to generate detailed reports: {}", e).unwrap();
+                                    writeln!(
+                                        &mut report,
+                                        "\n⚠️ Failed to generate detailed reports: {}",
+                                        e
+                                    )
+                                    .unwrap();
                                 }
                             }
                         }
@@ -1062,10 +1071,8 @@ impl TestContext {
 
         // Create temp directory for reports
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-        let report_dir = std::path::PathBuf::from(format!(
-            "/tmp/freenet-test-{}-{}",
-            test_name, timestamp
-        ));
+        let report_dir =
+            std::path::PathBuf::from(format!("/tmp/freenet-test-{}-{}", test_name, timestamp));
         std::fs::create_dir_all(&report_dir)?;
 
         // Generate detailed events markdown
@@ -1092,11 +1099,19 @@ impl TestContext {
                     crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
                 };
 
-                writeln!(&mut events_md, "### {} {} - [{:>6}ms]\n", icon, type_name, elapsed)?;
+                writeln!(
+                    &mut events_md,
+                    "### {} {} - [{:>6}ms]\n",
+                    icon, type_name, elapsed
+                )?;
                 writeln!(&mut events_md, "- **Peer ID**: `{}`", event.peer_id)?;
                 writeln!(&mut events_md, "- **Transaction**: `{}`", event.tx)?;
                 writeln!(&mut events_md, "- **Timestamp**: {}", event.datetime)?;
-                writeln!(&mut events_md, "\n**Event Details**:\n```rust\n{:#?}\n```\n", event.kind)?;
+                writeln!(
+                    &mut events_md,
+                    "\n**Event Details**:\n```rust\n{:#?}\n```\n",
+                    event.kind
+                )?;
             }
         }
 
@@ -1109,7 +1124,8 @@ impl TestContext {
         mermaid.push_str("    %% Event Flow Diagram\n");
 
         let mut prev_id: Option<String> = None;
-        for (idx, event) in events.iter().enumerate().take(50) { // Limit to 50 for readability
+        for (idx, event) in events.iter().enumerate().take(50) {
+            // Limit to 50 for readability
             let node_id = format!("N{}", idx);
             let peer_short = &event.peer_id.to_string()[..8.min(event.peer_id.to_string().len())];
             let (icon, type_name) = match &event.kind {
@@ -1136,7 +1152,11 @@ impl TestContext {
         }
 
         if events.len() > 50 {
-            writeln!(&mut mermaid, "    NMore[\"... and {} more events\"]", events.len() - 50)?;
+            writeln!(
+                &mut mermaid,
+                "    NMore[\"... and {} more events\"]",
+                events.len() - 50
+            )?;
             if let Some(prev) = prev_id {
                 writeln!(&mut mermaid, "    {} -.-> NMore", prev)?;
             }
@@ -1249,7 +1269,10 @@ impl TestContext {
 
                     // Generate detailed reports in temp directory
                     if !events.is_empty() {
-                        match self.generate_detailed_reports("test_success", &aggregator).await {
+                        match self
+                            .generate_detailed_reports("test_success", &aggregator)
+                            .await
+                        {
                             Ok(report_dir) => {
                                 writeln!(&mut report, "\n📁 Detailed Reports Generated:").unwrap();
                                 writeln!(
@@ -1271,7 +1294,12 @@ impl TestContext {
                                 .unwrap();
                             }
                             Err(e) => {
-                                writeln!(&mut report, "\n⚠️ Failed to generate detailed reports: {}", e).unwrap();
+                                writeln!(
+                                    &mut report,
+                                    "\n⚠️ Failed to generate detailed reports: {}",
+                                    e
+                                )
+                                .unwrap();
                             }
                         }
                     }
