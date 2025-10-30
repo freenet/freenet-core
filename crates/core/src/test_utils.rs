@@ -918,6 +918,9 @@ impl TestContext {
     pub async fn aggregate_events(
         &self,
     ) -> anyhow::Result<crate::tracing::EventLogAggregator<crate::tracing::AOFEventSource>> {
+        // TODO: Collect and use EventFlushHandles from nodes to flush explicitly
+        // For now, rely on BATCH_SIZE=5 and drop-based flush after 5-second wait
+
         let mut builder = TestAggregatorBuilder::new();
         for label in &self.node_order {
             let path = self.event_log_path(label)?;
