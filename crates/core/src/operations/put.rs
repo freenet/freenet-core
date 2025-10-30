@@ -477,6 +477,39 @@ impl Operation for PutOp {
                     let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
 
+                    if upstream.peer == sender.peer {
+                        // Originator reached the subscription tree. We can
+                        // complete the local operation immediately.
+                        tracing::trace!(
+                            tx = %id,
+                            %key,
+                            "PUT originator reached subscription tree; completing locally"
+                        );
+                        new_state = Some(PutState::Finished { key: *key });
+                    } else {
+                        // Notify the upstream hop right away so the request
+                        // path does not wait for the broadcast to finish.
+                        let ack = PutMsg::SuccessfulPut {
+                            id: *id,
+                            target: upstream.clone(),
+                            key: *key,
+                            sender: sender.clone(),
+                        };
+
+                        tracing::trace!(
+                            tx = %id,
+                            %key,
+                            upstream = %upstream.peer,
+                            "Forwarding SuccessfulPut upstream before broadcast"
+                        );
+
+                        conn_manager
+                            .send(&upstream.peer, NetMessage::from(ack))
+                            .await?;
+
+                        new_state = None;
+                    }
+
                     // Broadcast to all peers in parallel
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
                     for peer in broadcast_to.iter() {
@@ -526,14 +559,7 @@ impl Operation for PutOp {
                         "Successfully broadcasted put into contract {key} to {broadcasted_to} peers"
                     );
 
-                    // Subscriber nodes have been notified of the change, the operation is completed
-                    return_msg = Some(PutMsg::SuccessfulPut {
-                        id: *id,
-                        target: upstream.clone(),
-                        key: *key,
-                        sender,
-                    });
-                    new_state = None;
+                    return_msg = None;
                 }
                 PutMsg::SuccessfulPut { id, .. } => {
                     match self.state {
