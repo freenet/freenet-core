@@ -200,9 +200,139 @@ async fn test_network_behavior() -> TestResult {
 }
 ```
 
+## Using the `#[freenet_test]` Macro
+
+**Recommended for All New Tests**
+
+The `#[freenet_test]` macro simplifies integration test authoring by automating node setup, event aggregation, and failure reporting.
+
+### Quick Start
+
+```rust
+use freenet::test_utils::TestContext;
+use freenet_macros::freenet_test;
+
+#[freenet_test(
+    nodes = ["gateway", "peer-1", "peer-2"],
+    auto_connect_peers = true,
+    aggregate_events = "on_failure"
+)]
+async fn test_network_operation(ctx: &mut TestContext) -> TestResult {
+    // Nodes are already started and configured
+    let gateway = ctx.gateway()?;
+    let peers = ctx.peers();
+
+    // Your test logic here...
+
+    Ok(())
+}
+```
+
+### Key Features
+
+1. **Automatic Node Setup** - Gateway and peer nodes created with temp directories
+2. **Event Aggregation** - Automatic collection and detailed reporting of events
+3. **Auto-Connect** - `auto_connect_peers = true` configures peer-to-gateway connections
+4. **Enhanced Failure Reports** - Detailed statistics, timelines, and event breakdowns
+
+### Enhanced Event Reporting
+
+When tests fail (or with `aggregate_events = "always"`), you get comprehensive diagnostics:
+
+```
+================================================================================
+TEST FAILURE REPORT
+================================================================================
+
+Error: Timeout waiting for PUT response
+
+--------------------------------------------------------------------------------
+EVENT LOG SUMMARY
+--------------------------------------------------------------------------------
+
+📊 Event Statistics:
+  Total events: 15
+
+  By type:
+    Connect: 3
+    Put: 4
+    Route: 6
+    Ignored: 2
+
+  By peer:
+    v6MWKgqK: 8 events
+    v6MWKgqJ: 4 events
+    v6MWKgqI: 3 events
+
+📅 Event Timeline:
+  [     0ms] v6MWKgqK 🔗 Connect(Connected { ... })
+  [     5ms] v6MWKgqJ 🔗 Connect(Connected { ... })
+  [    10ms] v6MWKgqI 🔗 Connect(Connected { ... })
+  [ 11158ms] v6MWKgqK 📤 Put(Request { contract_key: ... })
+  [ 11193ms] v6MWKgqJ 🔀 Route(RoutingMessage { ... })
+  [ 11245ms] v6MWKgqI 📤 Put(PutSuccess { key: ... })
+
+================================================================================
+```
+
+**This detailed output helps you:**
+- Understand what events occurred during the test
+- See the timeline of operations with millisecond precision
+- Identify which peers were involved in each operation
+- Debug distributed operations across multiple nodes
+
+### Common Patterns
+
+#### Basic Connectivity Test
+```rust
+#[freenet_test(nodes = ["gateway"])]
+async fn test_gateway_starts(ctx: &mut TestContext) -> TestResult {
+    let gateway = ctx.gateway()?;
+    assert!(gateway.is_gateway);
+    Ok(())
+}
+```
+
+#### Multi-Node with Operations
+```rust
+#[freenet_test(
+    nodes = ["gateway", "peer-1", "peer-2"],
+    auto_connect_peers = true,
+    timeout_secs = 180,
+    startup_wait_secs = 15
+)]
+async fn test_contract_replication(ctx: &mut TestContext) -> TestResult {
+    // Nodes ready, connections established
+    // Your PUT/GET operations here
+    Ok(())
+}
+```
+
+#### Multiple Gateways
+```rust
+#[freenet_test(
+    nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
+    gateways = ["gw-1", "gw-2"],
+    auto_connect_peers = true
+)]
+async fn test_multi_gateway_topology(ctx: &mut TestContext) -> TestResult {
+    let gateways = ctx.gateways();
+    assert_eq!(gateways.len(), 2);
+    Ok(())
+}
+```
+
+### See Also
+
+- **Full macro documentation**: `crates/freenet-macros/README.md`
+- **Usage examples**: `crates/core/tests/test_macro_example.rs`
+- **Event aggregation**: `docs/EVENT_AGGREGATOR.md`
+
 ## Debugging Multi-Node Operations
 
-### Event Log Aggregation
+### Manual Event Log Aggregation
+
+If you need more control than the automatic aggregation provided by `#[freenet_test]`, you can use the Event Log Aggregator directly
 
 When debugging distributed operations across multiple nodes, use the Event Log Aggregator to correlate transactions and analyze flow:
 

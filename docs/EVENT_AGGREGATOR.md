@@ -97,6 +97,32 @@ It's a **CENTRALIZED SERVER** that:
     └────────────────┘ └────────────┘ └────────────────┘
 ```
 
+## Quick Start: Automatic Integration with Tests
+
+**New in 2025:** The `#[freenet_test]` macro provides automatic event aggregation for integration tests.
+
+```rust
+use freenet::test_utils::TestContext;
+use freenet_macros::freenet_test;
+
+#[freenet_test(
+    nodes = ["gateway", "peer-1", "peer-2"],
+    aggregate_events = "on_failure"  // Automatic event aggregation!
+)]
+async fn test_network_operation(ctx: &mut TestContext) -> TestResult {
+    // Your test logic here...
+    // On failure, you automatically get:
+    // - Event statistics by type
+    // - Per-peer event counts
+    // - Chronological timeline with timestamps
+    // - Visual icons for each event type
+
+    Ok(())
+}
+```
+
+**See:** `crates/freenet-macros/README.md` for full macro documentation.
+
 ## Usage Modes
 
 ### Mode 1: Post-Test AOF Analysis (Recommended for Integration Tests)

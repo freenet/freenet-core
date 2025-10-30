@@ -336,10 +336,7 @@ impl NodeConfig {
                 let event_reg = EventRegister::new(self.config.event_log());
                 let flush_handle = event_reg.flush_handle();
                 (
-                    CombinedRegister::new([
-                        Box::new(event_reg),
-                        Box::new(OTEventRegister::new()),
-                    ]),
+                    CombinedRegister::new([Box::new(event_reg), Box::new(OTEventRegister::new())]),
                     flush_handle,
                 )
             }

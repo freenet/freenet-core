@@ -20,8 +20,8 @@ pub(super) const MAX_LOG_RECORDS: usize = 100_000;
 #[cfg(test)]
 pub(super) const MAX_LOG_RECORDS: usize = 10_000;
 pub(super) const REMOVE_RECS: usize = 1000 + EVENT_REGISTER_BATCH_SIZE; // making space for 1000 new records
-// Reduced from 100 to 5 to ensure events are written more frequently,
-// especially important for integration tests which generate few events
+                                                                        // Reduced from 100 to 5 to ensure events are written more frequently,
+                                                                        // especially important for integration tests which generate few events
 const EVENT_REGISTER_BATCH_SIZE: usize = 5;
 pub(super) const BATCH_SIZE: usize = EVENT_REGISTER_BATCH_SIZE;
 

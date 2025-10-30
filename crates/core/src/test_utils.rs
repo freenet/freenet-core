@@ -1081,11 +1081,15 @@ impl TestContext {
 
                     // Show timeline of key events (simplified, showing all events)
                     writeln!(&mut report, "\n📅 Event Timeline:").unwrap();
-                    let start_time = events.first().map(|e| e.datetime).unwrap_or_else(chrono::Utc::now);
+                    let start_time = events
+                        .first()
+                        .map(|e| e.datetime)
+                        .unwrap_or_else(chrono::Utc::now);
 
                     for event in &events {
                         let elapsed = (event.datetime - start_time).num_milliseconds();
-                        let peer_short = &event.peer_id.to_string()[..8.min(event.peer_id.to_string().len())];
+                        let peer_short =
+                            &event.peer_id.to_string()[..8.min(event.peer_id.to_string().len())];
 
                         // Get event type icon
                         let (icon, _type_name) = match &event.kind {

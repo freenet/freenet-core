@@ -463,6 +463,7 @@ impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
 }
 
 // Internal message type for the event logger
+#[allow(clippy::large_enum_variant)]
 enum EventLogCommand {
     Log(NetLogMessage),
     Flush(tokio::sync::oneshot::Sender<()>),
@@ -595,21 +596,13 @@ impl EventRegister {
             }
         }
     }
-
-    /// Request a flush of pending events and wait for completion
-    pub async fn flush(&self) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.log_sender.send(EventLogCommand::Flush(tx)).await.is_ok() {
-            // Wait for flush to complete (with timeout)
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
-        }
-    }
 }
 
 impl Clone for EventRegister {
     fn clone(&self) -> Self {
         // Increment the reference count when cloning
-        self.clone_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.clone_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self {
             log_file: self.log_file.clone(),
             log_sender: self.log_sender.clone(),
@@ -622,12 +615,16 @@ impl Clone for EventRegister {
 impl Drop for EventRegister {
     fn drop(&mut self) {
         // Decrement the reference count
-        let prev_count = self.clone_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let prev_count = self
+            .clone_count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
         // If this was the last instance (count was 1, now 0), the sender will be dropped
         // and the channel will close, triggering the flush in record_logs
         if prev_count == 1 {
-            tracing::debug!("Last EventRegister instance dropped, channel will close and trigger flush");
+            tracing::debug!(
+                "Last EventRegister instance dropped, channel will close and trigger flush"
+            );
         }
     }
 }
