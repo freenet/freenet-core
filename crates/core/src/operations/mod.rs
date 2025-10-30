@@ -106,7 +106,7 @@ where
             return_msg: None,
             state: Some(final_state),
         }) if final_state.finalized() => {
-            if op_manager.failed_parents.remove(&tx_id).is_some() {
+            if op_manager.failed_parents().remove(&tx_id).is_some() {
                 tracing::warn!(
                     "Operation {} reached finalized state after a sub-operation failure; dropping client response",
                     tx_id
@@ -127,7 +127,7 @@ where
                 );
 
                 op_manager
-                    .root_ops_awaiting_sub_ops
+                    .root_ops_awaiting_sub_ops()
                     .insert(tx_id, final_state);
 
                 return Ok(None);

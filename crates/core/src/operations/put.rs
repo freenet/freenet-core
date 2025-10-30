@@ -390,7 +390,8 @@ impl Operation for PutOp {
                             skip_list.insert(target.peer.clone());
                         }
 
-                        let _ = super::start_subscription_request(op_manager, *id, key);
+                        let child_tx = super::start_subscription_request(op_manager, *id, key);
+                        tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                         op_manager.ring.seed_contract(key);
 
                         true
@@ -634,14 +635,15 @@ impl Operation for PutOp {
 
                             if subscribe {
                                 // Check if this parent has already failed due to a previous child failure
-                                if !op_manager.failed_parents.contains(id) {
+                                if !op_manager.failed_parents().contains(id) {
                                     tracing::debug!(
                                         tx = %id,
                                         %key,
                                         "starting child subscription for PUT operation"
                                     );
-                                    let _child_tx =
+                                    let child_tx =
                                         super::start_subscription_request(op_manager, *id, key);
+                                    tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                                 } else {
                                     tracing::warn!(
                                         tx = %id,
@@ -754,7 +756,8 @@ impl Operation for PutOp {
 
                         // Start subscription and handle dropped contracts
                         let (dropped_contract, old_subscribers) = {
-                            let _ = super::start_subscription_request(op_manager, *id, key);
+                            let child_tx = super::start_subscription_request(op_manager, *id, key);
+                            tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                             op_manager.ring.seed_contract(key)
                         };
 

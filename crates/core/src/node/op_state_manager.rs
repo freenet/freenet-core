@@ -51,135 +51,32 @@ pub(crate) enum OpNotAvailable {
     Completed,
 }
 
-#[derive(Default)]
-struct Ops {
-    connect: DashMap<Transaction, ConnectOp>,
-    put: DashMap<Transaction, PutOp>,
-    get: DashMap<Transaction, GetOp>,
-    subscribe: DashMap<Transaction, SubscribeOp>,
-    update: DashMap<Transaction, UpdateOp>,
-    completed: DashSet<Transaction>,
-    under_progress: DashSet<Transaction>,
-}
-
-/// Thread safe and friendly data structure to maintain state of the different operations
-/// and enable their execution.
-pub(crate) struct OpManager {
-    pub ring: Arc<Ring>,
-    ops: Arc<Ops>,
-    pub(crate) to_event_listener: EventLoopNotificationsSender,
-    pub ch_outbound: Arc<ContractHandlerChannel<SenderHalve>>,
-    new_transactions: tokio::sync::mpsc::Sender<Transaction>,
-    pub result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
-    /// Indicates whether the peer is ready to process client operations.
-    /// For gateways: always true (peer_id is set from config)
-    /// For regular peers: true only after first successful network handshake sets peer_id
-    pub peer_ready: Arc<AtomicBool>,
-    /// Whether this node is a gateway
-    pub is_gateway: bool,
+/// Manages sub-operation tracking for atomic operation execution.
+/// Ensures atomicity: clients receive success only when all sub-operations succeed.
+#[derive(Default, Clone)]
+struct SubOperationTracker {
     /// Parent-to-children mapping for sub-operation tracking.
     sub_operations: Arc<DashMap<Transaction, HashSet<Transaction>>>,
     /// Root operations awaiting sub-operation completion before client notification.
-    /// Ensures atomicity: clients receive success only when all sub-operations succeed.
-    pub(crate) root_ops_awaiting_sub_ops: Arc<DashMap<Transaction, OpEnum>>,
+    root_ops_awaiting_sub_ops: Arc<DashMap<Transaction, OpEnum>>,
     /// Child-to-parent index for O(1) parent lookups.
     parent_of: Arc<DashMap<Transaction, Transaction>>,
     /// Expected sub-operation count per root operation. Pre-registered before spawning
     /// to prevent race conditions where children complete before parent registration.
     expected_sub_operations: Arc<DashMap<Transaction, usize>>,
     /// Root operations with at least one failed sub-operation.
-    pub(crate) failed_parents: Arc<DashSet<Transaction>>,
+    failed_parents: Arc<DashSet<Transaction>>,
 }
 
-impl Clone for OpManager {
-    fn clone(&self) -> Self {
+impl SubOperationTracker {
+    fn new() -> Self {
         Self {
-            ring: self.ring.clone(),
-            ops: self.ops.clone(),
-            to_event_listener: self.to_event_listener.clone(),
-            ch_outbound: self.ch_outbound.clone(),
-            new_transactions: self.new_transactions.clone(),
-            result_router_tx: self.result_router_tx.clone(),
-            peer_ready: self.peer_ready.clone(),
-            is_gateway: self.is_gateway,
-            sub_operations: self.sub_operations.clone(),
-            root_ops_awaiting_sub_ops: self.root_ops_awaiting_sub_ops.clone(),
-            parent_of: self.parent_of.clone(),
-            expected_sub_operations: self.expected_sub_operations.clone(),
-            failed_parents: self.failed_parents.clone(),
-        }
-    }
-}
-
-impl OpManager {
-    pub(super) fn new<ER: NetEventRegister + Clone>(
-        notification_channel: EventLoopNotificationsSender,
-        ch_outbound: ContractHandlerChannel<SenderHalve>,
-        config: &NodeConfig,
-        event_register: ER,
-        connection_manager: ConnectionManager,
-        result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
-    ) -> anyhow::Result<Self> {
-        let ring = Ring::new(
-            config,
-            notification_channel.clone(),
-            event_register.clone(),
-            config.is_gateway,
-            connection_manager,
-        )?;
-        let ops = Arc::new(Ops::default());
-
-        let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
-        let current_span = tracing::Span::current();
-        let garbage_span = if current_span.is_none() {
-            tracing::info_span!("garbage_cleanup_task")
-        } else {
-            tracing::info_span!(parent: current_span, "garbage_cleanup_task")
-        };
-        let parent_of = Arc::new(DashMap::new());
-        let failed_parents = Arc::new(DashSet::new());
-        let sub_operations = Arc::new(DashMap::new());
-        let expected_sub_operations = Arc::new(DashMap::new());
-
-        GlobalExecutor::spawn(
-            garbage_cleanup_task(
-                rx,
-                ops.clone(),
-                ring.live_tx_tracker.clone(),
-                notification_channel.clone(),
-                event_register,
-                parent_of.clone(),
-                result_router_tx.clone(),
-            )
-            .instrument(garbage_span),
-        );
-
-        // Gateways are ready immediately (peer_id set from config)
-        // Regular peers become ready after first handshake
-        let is_gateway = config.is_gateway;
-        let peer_ready = Arc::new(AtomicBool::new(is_gateway));
-
-        if is_gateway {
-            tracing::debug!("Gateway node: peer_ready set to true immediately");
-        } else {
-            tracing::debug!("Regular peer node: peer_ready will be set after first handshake");
-        }
-
-        Ok(Self {
-            ring,
-            ops,
-            to_event_listener: notification_channel,
-            ch_outbound: Arc::new(ch_outbound),
-            new_transactions,
-            result_router_tx,
-            peer_ready,
-            is_gateway,
-            sub_operations,
+            sub_operations: Arc::new(DashMap::new()),
             root_ops_awaiting_sub_ops: Arc::new(DashMap::new()),
-            parent_of,
-            expected_sub_operations,
-            failed_parents,
-        })
+            parent_of: Arc::new(DashMap::new()),
+            expected_sub_operations: Arc::new(DashMap::new()),
+            failed_parents: Arc::new(DashSet::new()),
+        }
     }
 
     /// Marks a child operation as completed and decrements the expected counter.
@@ -226,6 +123,175 @@ impl OpManager {
     fn cleanup_parent_tracking(&self, parent: Transaction) {
         self.expected_sub_operations.remove(&parent);
         self.sub_operations.remove(&parent);
+    }
+
+    /// Atomically registers both expected count and parent-child relationship.
+    /// This prevents race conditions where children complete before registration.
+    fn expect_and_register_sub_operation(&self, parent: Transaction, child: Transaction) {
+        // Increment expected count
+        self.expected_sub_operations
+            .entry(parent)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+
+        // Register parent-child relationship
+        self.sub_operations.entry(parent).or_default().insert(child);
+
+        self.parent_of.insert(child, parent);
+    }
+
+    /// Returns true if all child operations of the parent have completed.
+    fn all_sub_operations_completed(
+        &self,
+        parent: Transaction,
+        completed_ops: &DashSet<Transaction>,
+    ) -> bool {
+        if let Some(expected) = self.expected_sub_operations.get(&parent) {
+            if *expected > 0 {
+                return false;
+            }
+        }
+
+        match self.sub_operations.get(&parent) {
+            None => true,
+            Some(children) => children.iter().all(|child| completed_ops.contains(child)),
+        }
+    }
+
+    /// Returns the number of pending child operations for the parent.
+    fn count_pending_sub_operations(
+        &self,
+        parent: Transaction,
+        completed_ops: &DashSet<Transaction>,
+    ) -> usize {
+        match self.sub_operations.get(&parent) {
+            None => 0,
+            Some(children) => children
+                .iter()
+                .filter(|child| !completed_ops.contains(child))
+                .count(),
+        }
+    }
+
+    /// Check if a transaction is a sub-operation (has a parent transaction).
+    /// Sub-operations should not send responses directly to clients.
+    fn is_sub_operation(&self, tx: Transaction) -> bool {
+        self.parent_of.contains_key(&tx)
+    }
+
+    fn get_parent(&self, child: Transaction) -> Option<Transaction> {
+        self.parent_of.get(&child).map(|entry| *entry)
+    }
+}
+
+#[derive(Default)]
+struct Ops {
+    connect: DashMap<Transaction, ConnectOp>,
+    put: DashMap<Transaction, PutOp>,
+    get: DashMap<Transaction, GetOp>,
+    subscribe: DashMap<Transaction, SubscribeOp>,
+    update: DashMap<Transaction, UpdateOp>,
+    completed: DashSet<Transaction>,
+    under_progress: DashSet<Transaction>,
+}
+
+/// Thread safe and friendly data structure to maintain state of the different operations
+/// and enable their execution.
+pub(crate) struct OpManager {
+    pub ring: Arc<Ring>,
+    ops: Arc<Ops>,
+    pub(crate) to_event_listener: EventLoopNotificationsSender,
+    pub ch_outbound: Arc<ContractHandlerChannel<SenderHalve>>,
+    new_transactions: tokio::sync::mpsc::Sender<Transaction>,
+    pub result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
+    /// Indicates whether the peer is ready to process client operations.
+    /// For gateways: always true (peer_id is set from config)
+    /// For regular peers: true only after first successful network handshake sets peer_id
+    pub peer_ready: Arc<AtomicBool>,
+    /// Whether this node is a gateway
+    pub is_gateway: bool,
+    /// Sub-operation tracking for atomic operation execution
+    sub_op_tracker: SubOperationTracker,
+}
+
+impl Clone for OpManager {
+    fn clone(&self) -> Self {
+        Self {
+            ring: self.ring.clone(),
+            ops: self.ops.clone(),
+            to_event_listener: self.to_event_listener.clone(),
+            ch_outbound: self.ch_outbound.clone(),
+            new_transactions: self.new_transactions.clone(),
+            result_router_tx: self.result_router_tx.clone(),
+            peer_ready: self.peer_ready.clone(),
+            is_gateway: self.is_gateway,
+            sub_op_tracker: self.sub_op_tracker.clone(),
+        }
+    }
+}
+
+impl OpManager {
+    pub(super) fn new<ER: NetEventRegister + Clone>(
+        notification_channel: EventLoopNotificationsSender,
+        ch_outbound: ContractHandlerChannel<SenderHalve>,
+        config: &NodeConfig,
+        event_register: ER,
+        connection_manager: ConnectionManager,
+        result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
+    ) -> anyhow::Result<Self> {
+        let ring = Ring::new(
+            config,
+            notification_channel.clone(),
+            event_register.clone(),
+            config.is_gateway,
+            connection_manager,
+        )?;
+        let ops = Arc::new(Ops::default());
+
+        let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
+        let current_span = tracing::Span::current();
+        let garbage_span = if current_span.is_none() {
+            tracing::info_span!("garbage_cleanup_task")
+        } else {
+            tracing::info_span!(parent: current_span, "garbage_cleanup_task")
+        };
+        let sub_op_tracker = SubOperationTracker::new();
+
+        GlobalExecutor::spawn(
+            garbage_cleanup_task(
+                rx,
+                ops.clone(),
+                ring.live_tx_tracker.clone(),
+                notification_channel.clone(),
+                event_register,
+                sub_op_tracker.clone(),
+                result_router_tx.clone(),
+            )
+            .instrument(garbage_span),
+        );
+
+        // Gateways are ready immediately (peer_id set from config)
+        // Regular peers become ready after first handshake
+        let is_gateway = config.is_gateway;
+        let peer_ready = Arc::new(AtomicBool::new(is_gateway));
+
+        if is_gateway {
+            tracing::debug!("Gateway node: peer_ready set to true immediately");
+        } else {
+            tracing::debug!("Regular peer node: peer_ready will be set after first handshake");
+        }
+
+        Ok(Self {
+            ring,
+            ops,
+            to_event_listener: notification_channel,
+            ch_outbound: Arc::new(ch_outbound),
+            new_transactions,
+            result_router_tx,
+            peer_ready,
+            is_gateway,
+            sub_op_tracker,
+        })
     }
 
     fn spawn_client_result(&self, tx: Transaction, host_result: HostResult) {
@@ -434,14 +500,13 @@ impl OpManager {
         self.ops.under_progress.remove(&id);
         self.ops.completed.insert(id);
 
-        if let Some(parent_entry) = self.parent_of.get(&id) {
-            let parent_tx = *parent_entry;
-            drop(parent_entry);
+        if let Some(parent_tx) = self.sub_op_tracker.get_parent(id) {
+            self.sub_op_tracker.remove_child_link(parent_tx, id);
+            self.sub_op_tracker.mark_sub_op_completed(parent_tx);
 
-            self.remove_child_link(parent_tx, id);
-            self.mark_sub_op_completed(parent_tx);
-
-            let remaining = self.count_pending_sub_operations(parent_tx);
+            let remaining = self
+                .sub_op_tracker
+                .count_pending_sub_operations(parent_tx, &self.ops.completed);
             tracing::debug!(
                 %id,
                 %parent_tx,
@@ -449,15 +514,22 @@ impl OpManager {
                 "child operation completed"
             );
 
-            if self.all_sub_operations_completed(parent_tx) {
-                if let Some((_key, parent_op)) = self.root_ops_awaiting_sub_ops.remove(&parent_tx) {
+            if self
+                .sub_op_tracker
+                .all_sub_operations_completed(parent_tx, &self.ops.completed)
+            {
+                if let Some((_key, parent_op)) = self
+                    .sub_op_tracker
+                    .root_ops_awaiting_sub_ops
+                    .remove(&parent_tx)
+                {
                     tracing::info!(
                         %parent_tx,
                         "root operation completed after all children finished"
                     );
 
-                    self.cleanup_parent_tracking(parent_tx);
-                    self.failed_parents.remove(&parent_tx);
+                    self.sub_op_tracker.cleanup_parent_tracking(parent_tx);
+                    self.sub_op_tracker.failed_parents.remove(&parent_tx);
                     self.completed(parent_tx);
 
                     let host_result = parent_op.to_host_result();
@@ -470,43 +542,20 @@ impl OpManager {
     /// Atomically registers both expected count and parent-child relationship.
     /// This prevents race conditions where children complete before registration.
     pub fn expect_and_register_sub_operation(&self, parent: Transaction, child: Transaction) {
-        // Increment expected count
-        self.expected_sub_operations
-            .entry(parent)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-
-        // Register parent-child relationship
-        self.sub_operations.entry(parent).or_default().insert(child);
-
-        self.parent_of.insert(child, parent);
+        self.sub_op_tracker
+            .expect_and_register_sub_operation(parent, child);
     }
 
     /// Returns true if all child operations of the parent have completed.
     pub fn all_sub_operations_completed(&self, parent: Transaction) -> bool {
-        if let Some(expected) = self.expected_sub_operations.get(&parent) {
-            if *expected > 0 {
-                return false;
-            }
-        }
-
-        match self.sub_operations.get(&parent) {
-            None => true,
-            Some(children) => children
-                .iter()
-                .all(|child| self.ops.completed.contains(child)),
-        }
+        self.sub_op_tracker
+            .all_sub_operations_completed(parent, &self.ops.completed)
     }
 
     /// Returns the number of pending child operations for the parent.
     pub fn count_pending_sub_operations(&self, parent: Transaction) -> usize {
-        match self.sub_operations.get(&parent) {
-            None => 0,
-            Some(children) => children
-                .iter()
-                .filter(|child| !self.ops.completed.contains(child))
-                .count(),
-        }
+        self.sub_op_tracker
+            .count_pending_sub_operations(parent, &self.ops.completed)
     }
 
     /// Handle sub-operation failure - propagate error to parent.
@@ -521,25 +570,27 @@ impl OpManager {
             "Sub-operation failed, propagating to root"
         );
 
-        if let Some(parent_entry) = self.parent_of.get(&child) {
-            let parent_tx = *parent_entry;
-            drop(parent_entry);
-
-            self.remove_child_link(parent_tx, child);
-            self.mark_sub_op_completed(parent_tx);
+        if let Some(parent_tx) = self.sub_op_tracker.get_parent(child) {
+            self.sub_op_tracker.remove_child_link(parent_tx, child);
+            self.sub_op_tracker.mark_sub_op_completed(parent_tx);
 
             let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
                 cause: format!("Sub-operation {} failed: {}", child, error_msg).into(),
             }
             .into());
 
-            if self.root_ops_awaiting_sub_ops.remove(&parent_tx).is_some() {
+            if self
+                .sub_op_tracker
+                .root_ops_awaiting_sub_ops
+                .remove(&parent_tx)
+                .is_some()
+            {
                 tracing::warn!(
                     root_tx = %parent_tx,
                     child_tx = %child,
                     "Root operation aborted due to sub-operation failure"
                 );
-                self.cleanup_parent_tracking(parent_tx);
+                self.sub_op_tracker.cleanup_parent_tracking(parent_tx);
                 self.completed(parent_tx);
             } else {
                 tracing::warn!(
@@ -547,9 +598,9 @@ impl OpManager {
                     child_tx = %child,
                     "Sub-operation failed before root operation started awaiting"
                 );
-                self.failed_parents.insert(parent_tx);
+                self.sub_op_tracker.failed_parents.insert(parent_tx);
                 // Clean up tracking to prevent memory leak
-                self.cleanup_parent_tracking(parent_tx);
+                self.sub_op_tracker.cleanup_parent_tracking(parent_tx);
                 // Mark parent as completed to prevent duplicate responses
                 self.completed(parent_tx);
             }
@@ -567,7 +618,17 @@ impl OpManager {
     /// Check if a transaction is a sub-operation (has a parent transaction).
     /// Sub-operations should not send responses directly to clients.
     pub fn is_sub_operation(&self, tx: Transaction) -> bool {
-        self.parent_of.contains_key(&tx)
+        self.sub_op_tracker.is_sub_operation(tx)
+    }
+
+    /// Exposes root operations awaiting sub-operation completion.
+    pub(crate) fn root_ops_awaiting_sub_ops(&self) -> &Arc<DashMap<Transaction, OpEnum>> {
+        &self.sub_op_tracker.root_ops_awaiting_sub_ops
+    }
+
+    /// Exposes failed parent operations.
+    pub(crate) fn failed_parents(&self) -> &Arc<DashSet<Transaction>> {
+        &self.sub_op_tracker.failed_parents
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
@@ -610,7 +671,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     live_tx_tracker: LiveTransactionTracker,
     event_loop_notifier: EventLoopNotificationsSender,
     mut event_register: ER,
-    parent_of: Arc<DashMap<Transaction, Transaction>>,
+    sub_op_tracker: SubOperationTracker,
     result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
@@ -653,10 +714,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         tracing::debug!("Transaction timed out: {tx}");
 
                         // Check if this is a child operation and propagate timeout to parent
-                        if let Some(parent_entry) = parent_of.get(&tx) {
-                            let parent_tx = *parent_entry;
-                            drop(parent_entry);
-
+                        if let Some(parent_tx) = sub_op_tracker.get_parent(tx) {
                             tracing::warn!(
                                 child_tx = %tx,
                                 parent_tx = %parent_tx,
@@ -701,10 +759,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         tracing::debug!("Transaction timed out: {tx}");
 
                         // Check if this is a child operation and propagate timeout to parent
-                        if let Some(parent_entry) = parent_of.get(&tx) {
-                            let parent_tx = *parent_entry;
-                            drop(parent_entry);
-
+                        if let Some(parent_tx) = sub_op_tracker.get_parent(tx) {
                             tracing::warn!(
                                 child_tx = %tx,
                                 parent_tx = %parent_tx,
