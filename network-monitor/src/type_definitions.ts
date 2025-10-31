@@ -84,7 +84,6 @@ export enum MessageType {
     SeekNode = "SeekNode",
     BroadcastTo = "BroadcastTo",
     Broadcasting = "Broadcasting",
-    SuccessfulUpdate = "SuccessfulUpdate",
     UpdateForward = "UpdateForward",
 }
 

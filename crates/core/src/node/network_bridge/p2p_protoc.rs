@@ -1662,7 +1662,6 @@ fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
             // Update messages have sender in some variants
             NetMessageV1::Update(update_msg) => match update_msg {
                 UpdateMsg::SeekNode { sender, .. } => Some(sender.clone()),
-                UpdateMsg::SuccessfulUpdate { sender, .. } => Some(sender.clone()),
                 UpdateMsg::Broadcasting { sender, .. } => Some(sender.clone()),
                 UpdateMsg::BroadcastTo { sender, .. } => Some(sender.clone()),
                 _ => None,
