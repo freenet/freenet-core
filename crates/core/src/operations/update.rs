@@ -314,10 +314,7 @@ impl Operation for UpdateOp {
                                     key: *key,
                                     related_contracts: related_contracts.clone(),
                                 });
-                                new_state = Some(UpdateState::AwaitingResponse {
-                                    _key: *key,
-                                    _upstream: upstream,
-                                });
+                                new_state = None;
                             } else {
                                 // No peers available and we don't have the contract - error
                                 tracing::error!(
@@ -448,10 +445,7 @@ impl Operation for UpdateOp {
                                 key: *key,
                                 related_contracts: related_contracts.clone(),
                             });
-                            new_state = Some(UpdateState::AwaitingResponse {
-                                _key: *key,
-                                _upstream: Some(sender.clone()),
-                            });
+                            new_state = None;
                         } else {
                             // No more peers to try - error
                             tracing::error!(
@@ -470,11 +464,6 @@ impl Operation for UpdateOp {
                     sender,
                     target,
                 } => {
-                    if let Some(UpdateState::AwaitingResponse { .. }) = self.state {
-                        tracing::debug!("Trying to broadcast to a peer that was the initiator of the op because it received the client request, or is in the middle of a seek node process");
-                        return Err(OpError::StatePushed);
-                    }
-
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let UpdateExecution {
                         value: updated_value,
@@ -738,7 +727,7 @@ async fn update_contract(
         }
     };
 
-    let update_data = UpdateData::State(State::from(state));
+    let update_data = UpdateData::State(State::from(state.clone()));
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
             key,
@@ -773,21 +762,51 @@ async fn update_contract(
             Err(OpError::UnexpectedOpState)
         }
         Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
-            if let Some(prev_state) = previous_state {
-                let prev_bytes = State::from(prev_state.clone()).into_bytes();
-                let summary = StateSummary::from(prev_bytes.clone());
-                Ok(UpdateExecution {
-                    value: prev_state,
-                    summary,
-                    changed: false,
-                })
-            } else {
-                tracing::warn!(
-                    %key,
-                    "Contract reported UpdateNoChange but no previous state was available"
-                );
-                Err(OpError::UnexpectedOpState)
-            }
+            let resolved_state = match previous_state {
+                Some(prev_state) => prev_state,
+                None => {
+                    match op_manager
+                        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                            key,
+                            return_contract_code: false,
+                        })
+                        .await
+                    {
+                        Ok(ContractHandlerEvent::GetResponse {
+                            response:
+                                Ok(StoreResponse {
+                                    state: Some(current),
+                                    ..
+                                }),
+                            ..
+                        }) => current,
+                        Ok(other) => {
+                            tracing::debug!(
+                                ?other,
+                                %key,
+                                "Fallback fetch for UpdateNoChange returned no state; using requested state"
+                            );
+                            state.clone()
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                %key,
+                                %err,
+                                "Fallback fetch for UpdateNoChange failed; using requested state"
+                            );
+                            state.clone()
+                        }
+                    }
+                }
+            };
+
+            let bytes = State::from(resolved_state.clone()).into_bytes();
+            let summary = StateSummary::from(bytes);
+            Ok(UpdateExecution {
+                value: resolved_state,
+                summary,
+                changed: false,
+            })
         }
         Err(err) => Err(err.into()),
         Ok(other) => {
@@ -1074,6 +1093,9 @@ async fn deliver_update_result(
     key: ContractKey,
     summary: StateSummary<'static>,
 ) -> Result<(), OpError> {
+    // NOTE: UPDATE is modeled as fire-and-forget: once the merge succeeds on the
+    // seed/subscriber peer we surface success to the host immediately and allow
+    // the broadcast fan-out to proceed asynchronously.
     let op = UpdateOp {
         id,
         state: Some(UpdateState::Finished {
@@ -1235,10 +1257,6 @@ mod messages {
 #[derive(Debug)]
 pub enum UpdateState {
     ReceivedRequest,
-    AwaitingResponse {
-        _key: ContractKey,
-        _upstream: Option<PeerKeyLocation>,
-    },
     Finished {
         key: ContractKey,
         summary: StateSummary<'static>,
