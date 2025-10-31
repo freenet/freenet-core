@@ -38,7 +38,8 @@ pub mod server;
 mod topology;
 
 /// Tracing and loging infrastructure. Includes our custom event log register. Tracing collectors, etc.
-mod tracing;
+#[cfg_attr(test, allow(dead_code))]
+pub mod tracing;
 
 /// Code for communicating with other peers over UDP, handles hole-punching, error handling, etc.
 mod transport;

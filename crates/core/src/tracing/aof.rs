@@ -20,7 +20,9 @@ pub(super) const MAX_LOG_RECORDS: usize = 100_000;
 #[cfg(test)]
 pub(super) const MAX_LOG_RECORDS: usize = 10_000;
 pub(super) const REMOVE_RECS: usize = 1000 + EVENT_REGISTER_BATCH_SIZE; // making space for 1000 new records
-const EVENT_REGISTER_BATCH_SIZE: usize = 100;
+                                                                        // Reduced from 100 to 5 to ensure events are written more frequently,
+                                                                        // especially important for integration tests which generate few events
+const EVENT_REGISTER_BATCH_SIZE: usize = 5;
 pub(super) const BATCH_SIZE: usize = EVENT_REGISTER_BATCH_SIZE;
 
 type DefaultEndian = byteorder::BigEndian;
@@ -278,6 +280,74 @@ impl LogFile {
         ));
 
         Ok(())
+    }
+
+    /// Read all events from an AOF file (for event aggregation).
+    pub async fn read_all_events(event_log_path: &Path) -> anyhow::Result<Vec<NetLogMessage>> {
+        let _guard: tokio::sync::MutexGuard<'_, ()> = FILE_LOCK.lock().await;
+        let mut file = BufReader::new(OpenOptions::new().read(true).open(event_log_path).await?);
+
+        Self::read_all_events_from(&mut file).await
+    }
+
+    async fn read_all_events_from(
+        file: &mut (impl AsyncRead + AsyncSeek + Unpin),
+    ) -> anyhow::Result<Vec<NetLogMessage>> {
+        let new_records_ts = NEW_RECORDS_TS
+            .get()
+            .map(|ts| {
+                ts.duration_since(std::time::UNIX_EPOCH)
+                    .expect("should be older than unix epoch")
+                    .as_secs() as i64
+            })
+            .unwrap_or(0);
+
+        let mut buffers = Vec::new();
+        loop {
+            let mut header = [0; EVENT_LOG_HEADER_SIZE];
+
+            // Read the length prefix
+            if let Err(error) = file.read_exact(&mut header).await {
+                if matches!(error.kind(), io::ErrorKind::UnexpectedEof) {
+                    break;
+                } else {
+                    let pos = file.stream_position().await;
+                    tracing::error!(%error, ?pos, "error while trying to read file");
+                    return Err(error.into());
+                }
+            }
+
+            let length = DefaultEndian::read_u32(&header[..4]);
+            let mut buf = vec![0; length as usize];
+            file.read_exact(&mut buf).await?;
+            buffers.push(buf);
+        }
+
+        if buffers.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Deserialize in blocking task to avoid blocking async runtime
+        let deserialized = tokio::task::spawn_blocking(move || {
+            let mut events = vec![];
+            for buf in buffers {
+                match bincode::deserialize::<NetLogMessage>(&buf) {
+                    Ok(record) => {
+                        let record_ts = record.datetime.timestamp();
+                        if record_ts >= new_records_ts {
+                            events.push(record);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, "Failed to deserialize event record");
+                    }
+                }
+            }
+            events
+        })
+        .await?;
+
+        Ok(deserialized)
     }
 
     pub async fn get_router_events(

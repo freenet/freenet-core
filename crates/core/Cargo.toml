@@ -88,6 +88,7 @@ serde = { version = "1.0", features = ["derive"] }
 arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
+freenet-macros = { path = "../freenet-macros" }
 httptest = "0.16"
 statrs = "0.18"
 tempfile = "3"

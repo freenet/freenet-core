@@ -23,10 +23,19 @@ use crate::{
 pub(crate) use opentelemetry_tracer::OTEventRegister;
 pub(crate) use test::TestEventListener;
 
+// Re-export for use in tests
+pub use event_aggregator::{
+    AOFEventSource, EventLogAggregator, EventSource, RoutingPath, TransactionFlowEvent,
+    WebSocketEventCollector,
+};
+
 use crate::node::OpManager;
 
 /// An append-only log for network events.
 mod aof;
+
+/// Event aggregation across multiple nodes for debugging and testing.
+pub mod event_aggregator;
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -361,13 +370,13 @@ impl<'a> NetEventLog<'a> {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-struct NetLogMessage {
-    tx: Transaction,
-    datetime: DateTime<Utc>,
-    peer_id: PeerId,
-    kind: EventKind,
+pub struct NetLogMessage {
+    pub tx: Transaction,
+    pub datetime: DateTime<Utc>,
+    pub peer_id: PeerId,
+    pub kind: EventKind,
 }
 
 impl NetLogMessage {
@@ -440,10 +449,36 @@ impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
     }
 }
 
+// Internal message type for the event logger
+#[allow(clippy::large_enum_variant)]
+enum EventLogCommand {
+    Log(NetLogMessage),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Handle for flushing an EventRegister (can be stored separately for testing)
 #[derive(Clone)]
+pub struct EventFlushHandle {
+    sender: mpsc::Sender<EventLogCommand>,
+}
+
+impl EventFlushHandle {
+    /// Request a flush and wait for completion
+    pub async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.sender.send(EventLogCommand::Flush(tx)).await.is_ok() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+        }
+    }
+}
+
 pub(crate) struct EventRegister {
     log_file: Arc<PathBuf>,
-    log_sender: mpsc::Sender<NetLogMessage>,
+    log_sender: mpsc::Sender<EventLogCommand>,
+    // Track the number of clones to know when to flush
+    clone_count: Arc<std::sync::atomic::AtomicUsize>,
+    // Handle for external flushing
+    flush_handle: EventFlushHandle,
 }
 
 /// Records from a new session must have higher than this ts.
@@ -455,16 +490,28 @@ impl EventRegister {
     pub fn new(event_log_path: PathBuf) -> Self {
         let (log_sender, log_recv) = mpsc::channel(1000);
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
-        let log_file = Arc::new(event_log_path);
+        let log_file = Arc::new(event_log_path.clone());
         GlobalExecutor::spawn(Self::record_logs(log_recv, log_file.clone()));
+
+        let flush_handle = EventFlushHandle {
+            sender: log_sender.clone(),
+        };
+
         Self {
             log_sender,
-            log_file,
+            log_file: Arc::new(event_log_path),
+            clone_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            flush_handle,
         }
     }
 
+    /// Get a handle for flushing this EventRegister (for testing)
+    pub fn flush_handle(&self) -> EventFlushHandle {
+        self.flush_handle.clone()
+    }
+
     async fn record_logs(
-        mut log_recv: mpsc::Receiver<NetLogMessage>,
+        mut log_recv: mpsc::Receiver<EventLogCommand>,
         event_log_path: Arc<PathBuf>,
     ) {
         use futures::StreamExt;
@@ -487,12 +534,22 @@ impl EventRegister {
                 futures::future::pending().boxed()
             };
             tokio::select! {
-                log = log_recv.recv() => {
-                    let Some(log) = log else { break; };
-                    if let Some(ws) = ws.as_mut() {
-                        send_to_metrics_server(ws, &log).await;
+                cmd = log_recv.recv() => {
+                    let Some(cmd) = cmd else { break; };
+                    match cmd {
+                        EventLogCommand::Log(log) => {
+                            if let Some(ws) = ws.as_mut() {
+                                send_to_metrics_server(ws, &log).await;
+                            }
+                            event_log.persist_log(log).await;
+                        }
+                        EventLogCommand::Flush(reply) => {
+                            // Flush any remaining events in the batch
+                            Self::flush_batch(&mut event_log).await;
+                            // Signal completion
+                            let _ = reply.send(());
+                        }
                     }
-                    event_log.persist_log(log).await;
                 }
                 ws_msg = ws_recv => {
                     if let Some((ws, ws_msg)) = ws.as_mut().zip(ws_msg) {
@@ -502,21 +559,59 @@ impl EventRegister {
             }
         }
 
-        // store remaining logs
+        // store remaining logs on channel close
+        Self::flush_batch(&mut event_log).await;
+    }
+
+    async fn flush_batch(event_log: &mut aof::LogFile) {
         let moved_batch = std::mem::replace(&mut event_log.batch, aof::Batch::new(aof::BATCH_SIZE));
         let batch_writes = moved_batch.num_writes;
+        if batch_writes == 0 {
+            return;
+        }
         match aof::LogFile::encode_batch(&moved_batch) {
             Ok(batch_serialized_data) => {
                 if !batch_serialized_data.is_empty()
                     && event_log.write_all(&batch_serialized_data).await.is_err()
                 {
-                    panic!("Failed writting event log");
+                    tracing::error!("Failed writing remaining event log batch");
                 }
                 event_log.update_recs(batch_writes);
             }
             Err(err) => {
                 tracing::error!("Failed encode batch: {err}");
             }
+        }
+    }
+}
+
+impl Clone for EventRegister {
+    fn clone(&self) -> Self {
+        // Increment the reference count when cloning
+        self.clone_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            log_file: self.log_file.clone(),
+            log_sender: self.log_sender.clone(),
+            clone_count: self.clone_count.clone(),
+            flush_handle: self.flush_handle.clone(),
+        }
+    }
+}
+
+impl Drop for EventRegister {
+    fn drop(&mut self) {
+        // Decrement the reference count
+        let prev_count = self
+            .clone_count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+        // If this was the last instance (count was 1, now 0), the sender will be dropped
+        // and the channel will close, triggering the flush in record_logs
+        if prev_count == 1 {
+            tracing::debug!(
+                "Last EventRegister instance dropped, channel will close and trigger flush"
+            );
         }
     }
 }
@@ -528,7 +623,7 @@ impl NetEventRegister for EventRegister {
     ) -> BoxFuture<'a, ()> {
         async {
             for log_msg in NetLogMessage::to_log_message(logs) {
-                let _ = self.log_sender.send(log_msg).await;
+                let _ = self.log_sender.send(EventLogCommand::Log(log_msg)).await;
             }
         }
         .boxed()
@@ -1088,8 +1183,9 @@ mod opentelemetry_tracer {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
+#[allow(private_interfaces)]
 // todo: make this take by ref instead, probably will need an owned version
-enum EventKind {
+pub enum EventKind {
     Connect(ConnectEvent),
     Put(PutEvent),
     // todo: make this a sequence like Put
@@ -1406,7 +1502,7 @@ pub(super) mod test {
     pub(crate) struct TestEventListener {
         node_labels: Arc<DashMap<NodeLabel, TransportPublicKey>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
-        logs: Arc<tokio::sync::Mutex<Vec<NetLogMessage>>>,
+        pub(crate) logs: Arc<tokio::sync::Mutex<Vec<NetLogMessage>>>,
         network_metrics_server:
             Arc<tokio::sync::Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
     }

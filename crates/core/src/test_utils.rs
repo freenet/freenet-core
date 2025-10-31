@@ -809,3 +809,600 @@ mod test {
         );
     }
 }
+
+// Test context for integration tests
+use std::collections::HashMap;
+
+/// Information about a node in a test
+#[derive(Debug)]
+pub struct NodeInfo {
+    /// Human-readable label (e.g., "gateway", "peer-1")
+    pub label: String,
+    /// Path to temp directory for this node's data
+    pub temp_dir_path: PathBuf,
+    /// WebSocket API port
+    pub ws_port: u16,
+    /// Network port (None for non-gateway nodes)
+    pub network_port: Option<u16>,
+    /// Whether this is a gateway node
+    pub is_gateway: bool,
+    /// Node's location in the ring
+    pub location: f64,
+}
+
+/// Test result type for test functions
+pub type TestResult = anyhow::Result<()>;
+
+/// Test context providing access to nodes and event aggregation.
+///
+/// This is the main interface for interacting with test infrastructure in
+/// multi-node integration tests. It provides:
+/// - Node information access
+/// - Event log aggregation and failure reporting
+///
+/// Note: WebSocket client management is left to the test code for simplicity.
+/// Use `tokio_tungstenite::connect_async` and `WebApi::start` to create clients.
+pub struct TestContext {
+    /// Node information, indexed by label
+    nodes: HashMap<String, NodeInfo>,
+    /// Node labels in order they were added (for indexing)
+    node_order: Vec<String>,
+    /// Flush handles for event aggregation (optional for backward compatibility)
+    flush_handles: HashMap<String, crate::tracing::EventFlushHandle>,
+}
+
+impl TestContext {
+    /// Create a new TestContext from node information.
+    pub fn new(nodes: Vec<NodeInfo>) -> Self {
+        let node_order: Vec<String> = nodes.iter().map(|n| n.label.clone()).collect();
+        let nodes_map: HashMap<String, NodeInfo> =
+            nodes.into_iter().map(|n| (n.label.clone(), n)).collect();
+
+        Self {
+            nodes: nodes_map,
+            node_order,
+            flush_handles: HashMap::new(),
+        }
+    }
+
+    /// Create a new TestContext with flush handles for event aggregation.
+    pub fn with_flush_handles(
+        nodes: Vec<NodeInfo>,
+        flush_handles: Vec<(String, crate::tracing::EventFlushHandle)>,
+    ) -> Self {
+        let node_order: Vec<String> = nodes.iter().map(|n| n.label.clone()).collect();
+        let nodes_map: HashMap<String, NodeInfo> =
+            nodes.into_iter().map(|n| (n.label.clone(), n)).collect();
+        let flush_handles_map: HashMap<String, crate::tracing::EventFlushHandle> =
+            flush_handles.into_iter().collect();
+        Self {
+            nodes: nodes_map,
+            node_order,
+            flush_handles: flush_handles_map,
+        }
+    }
+
+    /// Get a reference to a node by label.
+    pub fn node(&self, label: &str) -> anyhow::Result<&NodeInfo> {
+        self.nodes
+            .get(label)
+            .ok_or_else(|| anyhow::anyhow!("Node '{}' not found", label))
+    }
+
+    /// Get the first gateway node.
+    ///
+    /// Note: If multiple gateways exist, use `gateways()` to get all of them.
+    pub fn gateway(&self) -> anyhow::Result<&NodeInfo> {
+        // Find first gateway node
+        for label in &self.node_order {
+            if let Ok(node) = self.node(label) {
+                if node.is_gateway {
+                    return Ok(node);
+                }
+            }
+        }
+        Err(anyhow::anyhow!("No gateway nodes found"))
+    }
+
+    /// Get all gateway nodes.
+    pub fn gateways(&self) -> Vec<&NodeInfo> {
+        self.node_order
+            .iter()
+            .filter_map(|label| self.node(label).ok())
+            .filter(|node| node.is_gateway)
+            .collect()
+    }
+
+    /// Get all peer (non-gateway) nodes.
+    pub fn peers(&self) -> Vec<&NodeInfo> {
+        self.node_order
+            .iter()
+            .filter_map(|label| self.node(label).ok())
+            .filter(|node| !node.is_gateway)
+            .collect()
+    }
+
+    /// Get the path to a node's event log.
+    pub fn event_log_path(&self, node_label: &str) -> anyhow::Result<PathBuf> {
+        let node = self.node(node_label)?;
+        // Nodes run in Network mode, so they create _EVENT_LOG not _EVENT_LOG_LOCAL
+        Ok(node.temp_dir_path.join("_EVENT_LOG"))
+    }
+
+    /// Get all node labels in order.
+    pub fn node_labels(&self) -> &[String] {
+        &self.node_order
+    }
+
+    /// Aggregate events from all nodes.
+    pub async fn aggregate_events(
+        &self,
+    ) -> anyhow::Result<crate::tracing::EventLogAggregator<crate::tracing::AOFEventSource>> {
+        // Flush all event registers before aggregating
+        for (label, handle) in &self.flush_handles {
+            tracing::debug!("Flushing events for node: {}", label);
+            handle.flush().await;
+        }
+
+        let mut builder = TestAggregatorBuilder::new();
+        for label in &self.node_order {
+            let path = self.event_log_path(label)?;
+            builder = builder.add_node(label, path);
+        }
+        builder.build().await
+    }
+
+    /// Generate a comprehensive failure report with event aggregation.
+    pub async fn generate_failure_report(&self, error: &anyhow::Error) -> String {
+        use std::fmt::Write;
+
+        let mut report = String::new();
+        writeln!(&mut report, "\n{}", "=".repeat(80)).unwrap();
+        writeln!(&mut report, "TEST FAILURE REPORT").unwrap();
+        writeln!(&mut report, "{}", "=".repeat(80)).unwrap();
+        writeln!(&mut report, "\nError: {:#}", error).unwrap();
+
+        // Try to aggregate events
+        match self.aggregate_events().await {
+            Ok(aggregator) => {
+                writeln!(&mut report, "\n{}", "-".repeat(80)).unwrap();
+                writeln!(&mut report, "EVENT LOG SUMMARY").unwrap();
+                writeln!(&mut report, "{}", "-".repeat(80)).unwrap();
+
+                match aggregator.get_all_events().await {
+                    Ok(events) => {
+                        writeln!(&mut report, "\nTotal events: {}", events.len()).unwrap();
+
+                        // Group by peer_id
+                        let mut by_peer: HashMap<String, Vec<_>> = HashMap::new();
+                        for event in &events {
+                            let peer_str = event.peer_id.to_string();
+                            by_peer.entry(peer_str).or_default().push(event);
+                        }
+
+                        writeln!(&mut report, "\nEvents by peer:").unwrap();
+                        for (peer_id, peer_events) in by_peer.iter() {
+                            writeln!(
+                                &mut report,
+                                "  {}: {} events",
+                                &peer_id[..8.min(peer_id.len())], // Show first 8 chars
+                                peer_events.len()
+                            )
+                            .unwrap();
+                        }
+
+                        // Show last 10 events
+                        writeln!(&mut report, "\nLast 10 events:").unwrap();
+                        let last_events = events.iter().rev().take(10).collect::<Vec<_>>();
+                        for (i, event) in last_events.iter().rev().enumerate() {
+                            let peer_str = event.peer_id.to_string();
+                            writeln!(
+                                &mut report,
+                                "  {}. [{}] {} - {:?}",
+                                i + 1,
+                                &peer_str[..8.min(peer_str.len())],
+                                event.datetime.format("%H:%M:%S%.3f"),
+                                event.kind
+                            )
+                            .unwrap();
+                        }
+
+                        // Generate detailed reports in temp directory
+                        if !events.is_empty() {
+                            match self
+                                .generate_detailed_reports("test_failure", &aggregator)
+                                .await
+                            {
+                                Ok(report_dir) => {
+                                    writeln!(&mut report, "\n📁 Detailed Reports Generated:")
+                                        .unwrap();
+                                    writeln!(
+                                        &mut report,
+                                        "  📄 Full event log:     file://{}/events.md",
+                                        report_dir.display()
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        &mut report,
+                                        "  📊 Event flow diagram: file://{}/event-flow.mmd",
+                                        report_dir.display()
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        &mut report,
+                                        "\n💡 Tip: View diagram at https://mermaid.live or in VS Code"
+                                    )
+                                    .unwrap();
+                                }
+                                Err(e) => {
+                                    writeln!(
+                                        &mut report,
+                                        "\n⚠️ Failed to generate detailed reports: {}",
+                                        e
+                                    )
+                                    .unwrap();
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        writeln!(&mut report, "\nFailed to get events: {}", e).unwrap();
+                    }
+                }
+            }
+            Err(e) => {
+                writeln!(&mut report, "\nFailed to aggregate events: {}", e).unwrap();
+            }
+        }
+
+        writeln!(&mut report, "\n{}", "=".repeat(80)).unwrap();
+        report
+    }
+
+    /// Generate a success summary with event statistics.
+    /// Generate detailed reports in temp directory and return the path.
+    async fn generate_detailed_reports(
+        &self,
+        test_name: &str,
+        aggregator: &crate::tracing::EventLogAggregator<crate::tracing::AOFEventSource>,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        use std::fmt::Write as FmtWrite;
+        use std::io::Write as IoWrite;
+
+        // Create temp directory for reports
+        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let report_dir =
+            std::path::PathBuf::from(format!("/tmp/freenet-test-{}-{}", test_name, timestamp));
+        std::fs::create_dir_all(&report_dir)?;
+
+        // Generate detailed events markdown
+        let events = aggregator.get_all_events().await?;
+        let mut events_md = String::new();
+        writeln!(&mut events_md, "# Detailed Event Log: {}\n", test_name)?;
+        writeln!(&mut events_md, "**Generated**: {}", chrono::Utc::now())?;
+        writeln!(&mut events_md, "**Total Events**: {}\n", events.len())?;
+
+        if !events.is_empty() {
+            writeln!(&mut events_md, "## Events by Timestamp\n")?;
+            let start_time = events.first().unwrap().datetime;
+
+            for event in &events {
+                let elapsed = (event.datetime - start_time).num_milliseconds();
+                let (icon, type_name) = match &event.kind {
+                    crate::tracing::EventKind::Connect(..) => ("🔗", "Connect"),
+                    crate::tracing::EventKind::Put(..) => ("📤", "Put"),
+                    crate::tracing::EventKind::Get { .. } => ("📥", "Get"),
+                    crate::tracing::EventKind::Route(..) => ("🔀", "Route"),
+                    crate::tracing::EventKind::Update(..) => ("🔄", "Update"),
+                    crate::tracing::EventKind::Subscribed { .. } => ("🔔", "Subscribe"),
+                    crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
+                    crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
+                };
+
+                writeln!(
+                    &mut events_md,
+                    "### {} {} - [{:>6}ms]\n",
+                    icon, type_name, elapsed
+                )?;
+                writeln!(&mut events_md, "- **Peer ID**: `{}`", event.peer_id)?;
+                writeln!(&mut events_md, "- **Transaction**: `{}`", event.tx)?;
+                writeln!(&mut events_md, "- **Timestamp**: {}", event.datetime)?;
+                writeln!(
+                    &mut events_md,
+                    "\n**Event Details**:\n```rust\n{:#?}\n```\n",
+                    event.kind
+                )?;
+            }
+        }
+
+        let events_md_path = report_dir.join("events.md");
+        let mut events_file = std::fs::File::create(&events_md_path)?;
+        events_file.write_all(events_md.as_bytes())?;
+
+        // Generate Mermaid diagram showing event flow
+        let mut mermaid = String::from("```mermaid\ngraph TD\n");
+        mermaid.push_str("    %% Event Flow Diagram\n");
+
+        let mut prev_id: Option<String> = None;
+        for (idx, event) in events.iter().enumerate().take(50) {
+            // Limit to 50 for readability
+            let node_id = format!("N{}", idx);
+            let peer_short = &event.peer_id.to_string()[..8.min(event.peer_id.to_string().len())];
+            let (icon, type_name) = match &event.kind {
+                crate::tracing::EventKind::Connect(..) => ("🔗", "Connect"),
+                crate::tracing::EventKind::Put(..) => ("📤", "Put"),
+                crate::tracing::EventKind::Get { .. } => ("📥", "Get"),
+                crate::tracing::EventKind::Route(..) => ("🔀", "Route"),
+                crate::tracing::EventKind::Update(..) => ("🔄", "Update"),
+                crate::tracing::EventKind::Subscribed { .. } => ("🔔", "Subscribe"),
+                crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
+                crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
+            };
+
+            writeln!(
+                &mut mermaid,
+                "    {}[\"{} {}\\n{}\"]",
+                node_id, peer_short, icon, type_name
+            )?;
+
+            if let Some(prev) = prev_id {
+                writeln!(&mut mermaid, "    {} --> {}", prev, node_id)?;
+            }
+            prev_id = Some(node_id);
+        }
+
+        if events.len() > 50 {
+            writeln!(
+                &mut mermaid,
+                "    NMore[\"... and {} more events\"]",
+                events.len() - 50
+            )?;
+            if let Some(prev) = prev_id {
+                writeln!(&mut mermaid, "    {} -.-> NMore", prev)?;
+            }
+        }
+
+        mermaid.push_str("```\n");
+
+        let mermaid_path = report_dir.join("event-flow.mmd");
+        let mut mermaid_file = std::fs::File::create(&mermaid_path)?;
+        mermaid_file.write_all(mermaid.as_bytes())?;
+
+        Ok(report_dir)
+    }
+
+    pub async fn generate_success_summary(&self) -> String {
+        use std::fmt::Write;
+
+        let mut report = String::new();
+        writeln!(&mut report, "\n{}", "=".repeat(80)).unwrap();
+        writeln!(&mut report, "TEST SUCCESS SUMMARY").unwrap();
+        writeln!(&mut report, "{}", "=".repeat(80)).unwrap();
+
+        // Try to aggregate events
+        match self.aggregate_events().await {
+            Ok(aggregator) => match aggregator.get_all_events().await {
+                Ok(mut events) => {
+                    writeln!(&mut report, "\n📊 Event Statistics:").unwrap();
+                    writeln!(&mut report, "  Total events: {}", events.len()).unwrap();
+
+                    // Count by event type
+                    let mut by_type: HashMap<String, usize> = HashMap::new();
+                    for event in &events {
+                        let type_name = match &event.kind {
+                            crate::tracing::EventKind::Connect(..) => "Connect",
+                            crate::tracing::EventKind::Put(..) => "Put",
+                            crate::tracing::EventKind::Get { .. } => "Get",
+                            crate::tracing::EventKind::Route(..) => "Route",
+                            crate::tracing::EventKind::Update(..) => "Update",
+                            crate::tracing::EventKind::Subscribed { .. } => "Subscribe",
+                            crate::tracing::EventKind::Disconnected { .. } => "Disconnect",
+                            crate::tracing::EventKind::Ignored => "Ignored",
+                        };
+                        *by_type.entry(type_name.to_string()).or_default() += 1;
+                    }
+
+                    writeln!(&mut report, "\n  By type:").unwrap();
+                    for (event_type, count) in by_type.iter() {
+                        writeln!(&mut report, "    {}: {}", event_type, count).unwrap();
+                    }
+
+                    // Group by peer_id
+                    let mut by_peer: HashMap<String, Vec<_>> = HashMap::new();
+                    for event in &events {
+                        let peer_str = event.peer_id.to_string();
+                        by_peer.entry(peer_str).or_default().push(event);
+                    }
+
+                    writeln!(&mut report, "\n  By peer:").unwrap();
+                    for (peer_id, peer_events) in by_peer.iter() {
+                        writeln!(
+                            &mut report,
+                            "    {}: {} events",
+                            &peer_id[..8.min(peer_id.len())],
+                            peer_events.len()
+                        )
+                        .unwrap();
+                    }
+
+                    // Sort events by timestamp for timeline
+                    events.sort_by_key(|e| e.datetime);
+
+                    // Show timeline of key events (simplified, showing all events)
+                    writeln!(&mut report, "\n📅 Event Timeline:").unwrap();
+                    let start_time = events
+                        .first()
+                        .map(|e| e.datetime)
+                        .unwrap_or_else(chrono::Utc::now);
+
+                    for event in &events {
+                        let elapsed = (event.datetime - start_time).num_milliseconds();
+                        let peer_short =
+                            &event.peer_id.to_string()[..8.min(event.peer_id.to_string().len())];
+
+                        // Get event type icon
+                        let (icon, _type_name) = match &event.kind {
+                            crate::tracing::EventKind::Connect(..) => ("🔗", "Connect"),
+                            crate::tracing::EventKind::Put(..) => ("📤", "Put"),
+                            crate::tracing::EventKind::Get { .. } => ("📥", "Get"),
+                            crate::tracing::EventKind::Route(..) => ("🔀", "Route"),
+                            crate::tracing::EventKind::Update(..) => ("🔄", "Update"),
+                            crate::tracing::EventKind::Subscribed { .. } => ("🔔", "Subscribe"),
+                            crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
+                            crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
+                        };
+
+                        // Format event details (using Debug for now to avoid private field access)
+                        writeln!(
+                            &mut report,
+                            "  [{:>6}ms] {} {} {}",
+                            elapsed,
+                            peer_short,
+                            icon,
+                            format!("{:?}", event.kind)
+                                .chars()
+                                .take(60)
+                                .collect::<String>()
+                        )
+                        .unwrap();
+                    }
+
+                    // Generate detailed reports in temp directory
+                    if !events.is_empty() {
+                        match self
+                            .generate_detailed_reports("test_success", &aggregator)
+                            .await
+                        {
+                            Ok(report_dir) => {
+                                writeln!(&mut report, "\n📁 Detailed Reports Generated:").unwrap();
+                                writeln!(
+                                    &mut report,
+                                    "  📄 Full event log:     file://{}/events.md",
+                                    report_dir.display()
+                                )
+                                .unwrap();
+                                writeln!(
+                                    &mut report,
+                                    "  📊 Event flow diagram: file://{}/event-flow.mmd",
+                                    report_dir.display()
+                                )
+                                .unwrap();
+                                writeln!(
+                                    &mut report,
+                                    "\n💡 Tip: View diagram at https://mermaid.live or in VS Code"
+                                )
+                                .unwrap();
+                            }
+                            Err(e) => {
+                                writeln!(
+                                    &mut report,
+                                    "\n⚠️ Failed to generate detailed reports: {}",
+                                    e
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    writeln!(&mut report, "\n❌ Failed to get events: {}", e).unwrap();
+                }
+            },
+            Err(e) => {
+                writeln!(&mut report, "\n❌ Failed to aggregate events: {}", e).unwrap();
+            }
+        }
+
+        writeln!(&mut report, "\n{}", "=".repeat(80)).unwrap();
+        report
+    }
+}
+
+// Event aggregator test utilities
+pub mod event_aggregator_utils {
+    //! Test utilities for event log aggregation.
+
+    use crate::tracing::EventLogAggregator;
+    use anyhow::Result;
+    use std::path::PathBuf;
+
+    /// A handle to collect node information for aggregation.
+    #[derive(Debug, Clone)]
+    pub struct NodeLogInfo {
+        /// Human-readable label for the node (e.g., "node-a", "gateway")
+        pub label: String,
+        /// Path to the node's event log file
+        pub event_log_path: PathBuf,
+    }
+
+    impl NodeLogInfo {
+        /// Create a new node log info.
+        pub fn new(label: impl Into<String>, event_log_path: PathBuf) -> Self {
+            Self {
+                label: label.into(),
+                event_log_path,
+            }
+        }
+    }
+
+    /// Builder for creating an EventLogAggregator from test nodes.
+    pub struct TestAggregatorBuilder {
+        nodes: Vec<NodeLogInfo>,
+    }
+
+    impl TestAggregatorBuilder {
+        /// Create a new builder.
+        pub fn new() -> Self {
+            Self { nodes: Vec::new() }
+        }
+
+        /// Add a node to aggregate from.
+        pub fn add_node(mut self, label: impl Into<String>, event_log_path: PathBuf) -> Self {
+            self.nodes.push(NodeLogInfo::new(label, event_log_path));
+            self
+        }
+
+        /// Add multiple nodes from config directories.
+        pub fn add_nodes_from_configs(mut self, configs: Vec<(String, PathBuf)>) -> Self {
+            for (label, config_dir) in configs {
+                let event_log = config_dir.join("event_log");
+                let local_log = config_dir.join("_EVENT_LOG_LOCAL");
+
+                let log_path = if event_log.exists() {
+                    event_log
+                } else if local_log.exists() {
+                    local_log
+                } else {
+                    tracing::warn!(
+                        "No event log found for {} in {:?}, using event_log path",
+                        label,
+                        config_dir
+                    );
+                    event_log
+                };
+
+                self.nodes.push(NodeLogInfo::new(label, log_path));
+            }
+            self
+        }
+
+        /// Build the aggregator.
+        pub async fn build(self) -> Result<EventLogAggregator<crate::tracing::AOFEventSource>> {
+            let sources = self
+                .nodes
+                .into_iter()
+                .map(|node| (node.event_log_path, Some(node.label)))
+                .collect();
+
+            EventLogAggregator::from_aof_files(sources).await
+        }
+    }
+
+    impl Default for TestAggregatorBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
+pub use event_aggregator_utils::{NodeLogInfo, TestAggregatorBuilder};

@@ -58,6 +58,304 @@ async fn test_multi_peer_network() -> TestResult {
 }
 ```
 
+## Using the `#[freenet_test]` Macro
+
+**⭐ Recommended for All New Integration Tests**
+
+The `#[freenet_test]` macro dramatically simplifies integration test authoring by automating node setup, event aggregation, and comprehensive failure reporting.
+
+### Quick Example
+
+```rust
+use freenet::test_utils::TestContext;
+use freenet_macros::freenet_test;
+
+#[freenet_test(
+    nodes = ["gateway", "peer-1", "peer-2"],
+    auto_connect_peers = true,
+    aggregate_events = "on_failure"  // Automatic event aggregation!
+)]
+async fn test_network_operation(ctx: &mut TestContext) -> TestResult {
+    // Nodes are already started and configured
+    let gateway = ctx.gateway()?;
+    let peers = ctx.peers();
+
+    // Your test logic here...
+
+    Ok(())
+}
+```
+
+**What you get automatically:**
+- ✅ Nodes created with temp directories
+- ✅ Gateways and peers configured
+- ✅ Auto-connect between peers and gateways
+- ✅ Event aggregation and detailed failure reports
+- ✅ Proper cleanup on test completion
+
+### Key Macro Attributes
+
+| Attribute | Purpose | Example |
+|-----------|---------|---------|
+| `nodes` | Node labels (required) | `nodes = ["gateway", "peer-1"]` |
+| `auto_connect_peers` | Auto-configure connections | `auto_connect_peers = true` |
+| `aggregate_events` | When to show reports | `aggregate_events = "on_failure"` |
+| `timeout_secs` | Test timeout | `timeout_secs = 120` |
+| `startup_wait_secs` | Node startup wait time | `startup_wait_secs = 15` |
+| `tokio_flavor` | Runtime type | `tokio_flavor = "multi_thread"` |
+
+### Before vs After
+
+**Before (Manual Setup)**:
+```rust
+#[tokio::test]
+async fn test_operation() -> TestResult {
+    // 50+ lines of boilerplate:
+    let temp_gw = tempfile::tempdir()?;
+    let gw_config = create_gateway_config(temp_gw.path())?;
+    let (gw_node, _) = start_node(gw_config).await?;
+
+    let temp_p1 = tempfile::tempdir()?;
+    let p1_config = create_peer_config(temp_p1.path(), &gw_info)?;
+    let (p1_node, _) = start_node(p1_config).await?;
+
+    // ... more setup
+    // ... test logic
+    // ... manual cleanup
+}
+```
+
+**After (With Macro)**:
+```rust
+#[freenet_test(
+    nodes = ["gateway", "peer-1"],
+    auto_connect_peers = true
+)]
+async fn test_operation(ctx: &mut TestContext) -> TestResult {
+    // Nodes ready, connections established
+    // Your test logic here
+    Ok(())
+}
+```
+
+**Result**: 50+ lines reduced to 5!
+
+### Common Patterns
+
+#### Basic Gateway Test
+```rust
+#[freenet_test(nodes = ["gateway"])]
+async fn test_gateway_starts(ctx: &mut TestContext) -> TestResult {
+    let gateway = ctx.gateway()?;
+    assert!(gateway.is_gateway);
+    Ok(())
+}
+```
+
+#### Multi-Node with Operations
+```rust
+#[freenet_test(
+    nodes = ["gateway", "peer-1", "peer-2"],
+    auto_connect_peers = true,
+    timeout_secs = 180,
+    startup_wait_secs = 15
+)]
+async fn test_contract_replication(ctx: &mut TestContext) -> TestResult {
+    // Your PUT/GET operations here
+    Ok(())
+}
+```
+
+#### Multiple Gateways
+```rust
+#[freenet_test(
+    nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
+    gateways = ["gw-1", "gw-2"],
+    auto_connect_peers = true
+)]
+async fn test_multi_gateway(ctx: &mut TestContext) -> TestResult {
+    let gateways = ctx.gateways();
+    assert_eq!(gateways.len(), 2);
+    Ok(())
+}
+```
+
+### See Also
+- **Full macro documentation**: `../../crates/freenet-macros/README.md`
+- **Enhanced reporting details**: See "Enhanced Test Reporting" section below
+
+## Enhanced Test Reporting
+
+When tests fail (or with `aggregate_events = "always"`), Freenet automatically generates comprehensive diagnostic reports with full event details and visualizations.
+
+### What You Get
+
+#### 1. Console Summary with Statistics
+
+```
+================================================================================
+TEST FAILURE REPORT
+================================================================================
+
+Error: Timeout waiting for PUT response
+
+📊 Event Statistics:
+  Total events: 15
+  By type: Connect: 3, Put: 4, Route: 6, Ignored: 2
+
+  By peer:
+    v6MWKgqK: 8 events
+    v6MWKgqJ: 4 events
+
+📅 Event Timeline (showing first 10):
+  [     0ms] v6MWKgqK 🔗 Connect(Connected)
+  [     5ms] v6MWKgqJ 🔗 Connect(Connected)
+  [ 11158ms] v6MWKgqK 📤 Put(Request { ... })
+  [ 11193ms] v6MWKgqJ 🔀 Route(RoutingMessage { ... })
+```
+
+#### 2. Detailed Event Log (Markdown)
+**Location**: `/tmp/freenet-test-{test-name}-{timestamp}/events.md`
+
+Contains **full event details** (no truncation!):
+```markdown
+### 📤 Put - [ 11158ms]
+
+- **Peer ID**: `v6MWKgqKXYZ...`
+- **Transaction**: `Transaction(abc123...)`
+- **Timestamp**: 2025-10-30T17:30:45.123Z
+
+**Event Details**:
+\`\`\`rust
+Put(Request {
+    contract_key: ContractKey {
+        instance: ContractInstanceId(...),
+        code: CodeHash(...),
+        // ... COMPLETE DETAILS - NO TRUNCATION!
+    },
+    state: WrappedState(...),
+    fetch_contract: false,
+})
+\`\`\`
+```
+
+#### 3. Mermaid Flow Diagram
+**Location**: `/tmp/freenet-test-{test-name}-{timestamp}/event-flow.mmd`
+
+Visual flowchart showing event sequence:
+```mermaid
+graph TD
+    N0["v6MWKgqK 🔗 Connect"]
+    N1["v6MWKgqJ 🔗 Connect"]
+    N2["v6MWKgqK 📤 Put"]
+    N3["v6MWKgqJ 🔀 Route"]
+    N0 --> N1
+    N1 --> N2
+    N2 --> N3
+```
+
+#### 4. Clickable File Links
+
+```
+📁 Detailed Reports Generated:
+  📄 Full event log:     file:///tmp/freenet-test-test_failure-.../events.md
+  📊 Event flow diagram: file:///tmp/freenet-test-test_failure-.../event-flow.mmd
+
+💡 Tip: View diagram at https://mermaid.live or in VS Code
+```
+
+### Viewing the Reports
+
+#### Option 1: Click Links
+Most modern terminals support `file://` links:
+- **Mac**: Cmd+Click on the link
+- **Windows/Linux**: Ctrl+Click on the link
+
+#### Option 2: Manual Navigation
+```bash
+# Navigate to temp directory
+cd /tmp/freenet-test-*
+
+# View event log
+cat events.md
+
+# Open in editor
+code events.md
+```
+
+#### Option 3: View Mermaid Diagram
+```bash
+# In VS Code (install Mermaid Preview extension)
+code event-flow.mmd
+
+# Or copy to Mermaid Live Editor
+cat event-flow.mmd | pbcopy  # Mac
+# Paste at https://mermaid.live
+
+# Or view in GitHub (upload as gist - auto-renders)
+```
+
+### Real-World Debugging Example
+
+**Problem**: Test times out waiting for PUT response
+
+**With Enhanced Reporting**:
+
+1. **Check console for links**:
+   ```
+   📁 Detailed Reports:
+     📄 file:///tmp/freenet-test-test_put-20251030-180000/events.md
+   ```
+
+2. **Open `events.md` and search for "Put"**:
+   ```markdown
+   ### 📤 Put - [  5123ms]
+   Put(Request { contract_key: ..., state: ... })
+
+   ### 🔀 Route - [  5150ms]
+   Route(RoutingMessage { target: PeerId(...) })
+
+   # No Put(Success) event found!
+   ```
+
+3. **Open `event-flow.mmd` to visualize**:
+   ```mermaid
+   graph TD
+       N0["peer 📤 Put"]
+       N1["gateway 🔀 Route"]
+       N2["... nothing after"]
+   ```
+
+4. **Conclusion**: Operation reached gateway but response never came back
+   - Focus debugging on: gateway state machine or response routing
+
+**Result**: Problem identified in minutes instead of hours!
+
+### Event Icons Reference
+
+| Icon | Event Type | Meaning |
+|------|-----------|---------|
+| 🔗 | Connect | Peer connection established |
+| 📤 | Put | Contract storage operation |
+| 📥 | Get | Contract retrieval operation |
+| 🔀 | Route | Message routing event |
+| 🔄 | Update | Contract state update |
+| 🔔 | Subscribe | Subscription established |
+| ❌ | Disconnect | Peer disconnected |
+| ⏭️ | Ignored | Event was ignored |
+
+### Finding Old Reports
+```bash
+# List all test reports
+ls -lt /tmp/freenet-test-* | head -20
+
+# Find reports from today
+find /tmp -name "freenet-test-*" -mtime -1
+
+# Search for specific test
+ls -d /tmp/freenet-test-test_put_contract-*
+```
+
 ## Detailed Usage
 
 ### 1. Using `test-log` for Test Logging
@@ -763,11 +1061,139 @@ else
 fi
 ```
 
+## Advanced: Multi-Node Event Aggregation
+
+For complex debugging scenarios involving multiple nodes, you can use the **Event Log Aggregator** to correlate events across the distributed network.
+
+### When to Use Event Aggregation
+
+Use event aggregation when you need to:
+- Understand how a transaction flows through multiple nodes
+- Debug state propagation across the network
+- Identify which nodes processed a specific operation
+- Visualize the routing path of a transaction
+- Perform post-mortem analysis of failed tests
+
+### Quick Example
+
+```rust
+use freenet::test_utils::TestAggregatorBuilder;
+
+#[tokio::test]
+async fn test_with_event_aggregation() -> TestResult {
+    // 1. Start nodes (each writes to separated AOF log)
+    let (config_gw, temp_gw) = create_node_config(...).await?;
+    let (config_a, temp_a) = create_node_config(...).await?;
+
+    let gateway = start_node(config_gw).await?;
+    let node_a = start_node(config_a).await?;
+
+    // 2. Perform operations
+    let tx_id = perform_put(&mut client, state, contract).await?;
+
+    // 3. Aggregate logs from all nodes
+    let aggregator = TestAggregatorBuilder::new()
+        .add_node("gateway", temp_gw.path().join("_EVENT_LOG_LOCAL"))
+        .add_node("node-a", temp_a.path().join("_EVENT_LOG_LOCAL"))
+        .build()
+        .await?;
+
+    // 4. Analyze transaction flow across nodes
+    let flow = aggregator.get_transaction_flow(&tx_id).await?;
+
+    for event in &flow {
+        println!(
+            "{:?} at {} on {}",
+            event.event_kind,
+            event.timestamp,
+            event.peer_label.as_ref().unwrap_or(&"unknown".to_string())
+        );
+    }
+
+    // 5. Get routing path
+    let path = aggregator.get_routing_path(&tx_id).await?;
+    assert!(path.path.len() >= 2, "Should visit multiple nodes");
+
+    // 6. Export visualization
+    let graph = aggregator.export_mermaid_graph(&tx_id).await?;
+    println!("{}", graph);  // Mermaid diagram in test output
+
+    Ok(())
+}
+```
+
+### Event Aggregation Output
+
+```
+# Transaction flow output:
+PutEvent::Request at 2025-10-28T10:00:01Z on node-a
+PutEvent::Forwarded at 2025-10-28T10:00:02Z on gateway
+PutEvent::Success at 2025-10-28T10:00:03Z on gateway
+```
+
+```mermaid
+graph TD
+    N0["node-a\nPutEvent::Request"]
+    N1["gateway\nPutEvent::Forwarded"]
+    N2["gateway\nPutEvent::Success"]
+    N0 --> N1
+    N1 --> N2
+```
+
+### Combining with Logging
+
+Event aggregation works best when combined with proper logging:
+
+```rust
+use freenet::test_utils::{TestLogger, TestAggregatorBuilder};
+
+#[tokio::test]
+async fn test_complex_operation() -> TestResult {
+    // 1. Set up structured JSON logging
+    let _logger = TestLogger::new()
+        .with_json()
+        .with_level("freenet=debug,info")
+        .init();
+
+    // 2. Run test with logging...
+    let (temp_gw, temp_a) = run_multi_node_test().await?;
+
+    // 3. Use event aggregator for post-mortem analysis
+    let aggregator = TestAggregatorBuilder::new()
+        .add_node("gateway", temp_gw.path().join("_EVENT_LOG_LOCAL"))
+        .add_node("node-a", temp_a.path().join("_EVENT_LOG_LOCAL"))
+        .build()
+        .await?;
+
+    // Both logging (from TestLogger) and events (from aggregator) available
+    let all_events = aggregator.get_all_events().await?;
+    println!("Total events across all nodes: {}", all_events.len());
+
+    Ok(())
+}
+```
+
+### Best Practices
+
+1. **Always keep node logs separated** - Each node writes to its own AOF file (matches production)
+2. **Aggregate after test completes** - Don't try to aggregate while nodes are running
+3. **Use meaningful node labels** - `add_node("gateway", ...)` helps identify nodes in output
+4. **Export graphs for failed tests** - Visual representation helps debugging
+5. **Combine with structured logging** - Use both for complete picture
+
+### See Also
+
+- **Full documentation**: `../EVENT_AGGREGATOR.md`
+- **Integration test example**: `crates/core/tests/test_event_aggregator.rs`
+- **Related issue**: #2014 (structured operation tracing)
+- **General testing**: `../TESTING.md`
+
 ## References
 
 - [test-log crate documentation](https://docs.rs/test-log/)
 - [tracing crate documentation](https://docs.rs/tracing/)
 - [TESTING.md](../TESTING.md) - General testing guidelines
+- [EVENT_AGGREGATOR.md](../EVENT_AGGREGATOR.md) - Event aggregation guide
 - [debugging-and-tracing-analysis.md](debugging-and-tracing-analysis.md) - Comprehensive analysis
 
 ## Contributing

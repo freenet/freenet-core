@@ -320,18 +320,31 @@ impl NodeConfig {
         self,
         clients: [BoxedClient; CLIENTS],
     ) -> anyhow::Result<Node> {
-        let event_register = {
+        let (node, _flush_handle) = self.build_with_flush_handle(clients).await?;
+        Ok(node)
+    }
+
+    /// Builds a node and returns flush handle for event aggregation (for testing).
+    pub async fn build_with_flush_handle<const CLIENTS: usize>(
+        self,
+        clients: [BoxedClient; CLIENTS],
+    ) -> anyhow::Result<(Node, crate::tracing::EventFlushHandle)> {
+        let (event_register, flush_handle) = {
             #[cfg(feature = "trace-ot")]
             {
                 use super::tracing::{CombinedRegister, OTEventRegister};
-                CombinedRegister::new([
-                    Box::new(EventRegister::new(self.config.event_log())),
-                    Box::new(OTEventRegister::new()),
-                ])
+                let event_reg = EventRegister::new(self.config.event_log());
+                let flush_handle = event_reg.flush_handle();
+                (
+                    CombinedRegister::new([Box::new(event_reg), Box::new(OTEventRegister::new())]),
+                    flush_handle,
+                )
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new(self.config.event_log())
+                let event_reg = EventRegister::new(self.config.event_log());
+                let flush_handle = event_reg.flush_handle();
+                (event_reg, flush_handle)
             }
         };
         let cfg = self.config.clone();
@@ -342,7 +355,7 @@ impl NodeConfig {
             cfg,
         )
         .await?;
-        Ok(Node(node))
+        Ok((Node(node), flush_handle))
     }
 
     pub fn get_peer_id(&self) -> Option<PeerId> {

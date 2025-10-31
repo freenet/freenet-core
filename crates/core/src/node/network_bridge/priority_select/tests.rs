@@ -1623,31 +1623,53 @@ async fn test_recreating_futures_with_nested_select() {
         rx1: tokio::sync::mpsc::Receiver<String>,
         rx2: tokio::sync::mpsc::Receiver<String>,
         counter: std::sync::Arc<std::sync::Mutex<usize>>,
+        rx1_closed: bool,
+        rx2_closed: bool,
     }
 
     impl MockWithNestedSelect {
         // Async method with nested tokio::select! (like wait_for_events)
         async fn wait_for_event(&mut self) -> String {
-            // NESTED SELECT - just like HandshakeHandler::wait_for_events
-            tokio::select! {
-                msg1 = self.rx1.recv() => {
-                    if let Some(msg) = msg1 {
-                        let mut counter = self.counter.lock().unwrap();
-                        *counter += 1;
-                        tracing::info!("Nested select: rx1 received '{}', counter {}", msg, *counter);
-                        format!("rx1:{}", msg)
-                    } else {
-                        "rx1:closed".to_string()
+            loop {
+                // NESTED SELECT - just like HandshakeHandler::wait_for_events
+                tokio::select! {
+                    msg1 = self.rx1.recv(), if !self.rx1_closed => {
+                        match msg1 {
+                            Some(msg) => {
+                                let mut counter = self.counter.lock().unwrap();
+                                *counter += 1;
+                                tracing::info!("Nested select: rx1 received '{}', counter {}", msg, *counter);
+                                return format!("rx1:{}", msg);
+                            }
+                            None => {
+                                self.rx1_closed = true;
+                                if self.rx2_closed {
+                                    return "rx1:closed".to_string();
+                                }
+                                continue;
+                            }
+                        }
                     }
-                }
-                msg2 = self.rx2.recv() => {
-                    if let Some(msg) = msg2 {
-                        let mut counter = self.counter.lock().unwrap();
-                        *counter += 1;
-                        tracing::info!("Nested select: rx2 received '{}', counter {}", msg, *counter);
-                        format!("rx2:{}", msg)
-                    } else {
-                        "rx2:closed".to_string()
+                    msg2 = self.rx2.recv(), if !self.rx2_closed => {
+                        match msg2 {
+                            Some(msg) => {
+                                let mut counter = self.counter.lock().unwrap();
+                                *counter += 1;
+                                tracing::info!("Nested select: rx2 received '{}', counter {}", msg, *counter);
+                                return format!("rx2:{}", msg);
+                            }
+                            None => {
+                                self.rx2_closed = true;
+                                if self.rx1_closed {
+                                    return "rx2:closed".to_string();
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    // If both channels are closed we break out with a final notification
+                    else => {
+                        return "both_closed".to_string();
                     }
                 }
             }
@@ -1699,6 +1721,8 @@ async fn test_recreating_futures_with_nested_select() {
             rx1,
             rx2,
             counter: counter.clone(),
+            rx1_closed: false,
+            rx2_closed: false,
         },
     };
     tokio::pin!(test_stream);
@@ -1769,25 +1793,46 @@ async fn test_nested_select_concurrent_arrivals() {
     struct MockWithNestedSelect {
         rx1: tokio::sync::mpsc::Receiver<String>,
         rx2: tokio::sync::mpsc::Receiver<String>,
+        rx1_closed: bool,
+        rx2_closed: bool,
     }
 
     impl MockWithNestedSelect {
         async fn wait_for_event(&mut self) -> String {
-            tokio::select! {
-                msg1 = self.rx1.recv() => {
-                    if let Some(msg) = msg1 {
-                        tracing::info!("Nested select: rx1 received '{}'", msg);
-                        format!("rx1:{}", msg)
-                    } else {
-                        "rx1:closed".to_string()
+            loop {
+                tokio::select! {
+                    msg1 = self.rx1.recv(), if !self.rx1_closed => {
+                        match msg1 {
+                            Some(msg) => {
+                                tracing::info!("Nested select: rx1 received '{}'", msg);
+                                return format!("rx1:{}", msg);
+                            }
+                            None => {
+                                self.rx1_closed = true;
+                                if self.rx2_closed {
+                                    return "rx1:closed".to_string();
+                                }
+                                continue;
+                            }
+                        }
                     }
-                }
-                msg2 = self.rx2.recv() => {
-                    if let Some(msg) = msg2 {
-                        tracing::info!("Nested select: rx2 received '{}'", msg);
-                        format!("rx2:{}", msg)
-                    } else {
-                        "rx2:closed".to_string()
+                    msg2 = self.rx2.recv(), if !self.rx2_closed => {
+                        match msg2 {
+                            Some(msg) => {
+                                tracing::info!("Nested select: rx2 received '{}'", msg);
+                                return format!("rx2:{}", msg);
+                            }
+                            None => {
+                                self.rx2_closed = true;
+                                if self.rx1_closed {
+                                    return "rx2:closed".to_string();
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    else => {
+                        return "both_closed".to_string();
                     }
                 }
             }
@@ -1815,7 +1860,12 @@ async fn test_nested_select_concurrent_arrivals() {
     let (tx2, rx2) = mpsc::channel::<String>(10);
 
     let test_stream = TestStream {
-        special: MockWithNestedSelect { rx1, rx2 },
+        special: MockWithNestedSelect {
+            rx1,
+            rx2,
+            rx1_closed: false,
+            rx2_closed: false,
+        },
     };
     tokio::pin!(test_stream);
 
