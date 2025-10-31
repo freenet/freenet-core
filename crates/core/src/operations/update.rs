@@ -749,6 +749,10 @@ async fn update_contract(
                 None => true,
             };
 
+            // NOTE: change detection currently relies on byte-level equality. Contracts that
+            // produce semantically identical states with different encodings must normalize their
+            // serialization (e.g., sort map keys) to avoid redundant broadcasts.
+
             Ok(UpdateExecution {
                 value: new_val,
                 summary,

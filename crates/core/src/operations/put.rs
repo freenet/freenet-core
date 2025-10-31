@@ -478,12 +478,13 @@ impl Operation for PutOp {
                     let mut broadcasted_to = *broadcasted_to;
 
                     if upstream.peer == sender.peer {
-                        // Originator reached the subscription tree. We can
-                        // complete the local operation immediately.
-                        tracing::trace!(
+                        // Originator reached the subscription tree. This path should be filtered
+                        // out by the deduplication layer, so treat it as a warning if it happens
+                        // to help surface potential bugs.
+                        tracing::warn!(
                             tx = %id,
                             %key,
-                            "PUT originator reached subscription tree; completing locally"
+                            "PUT originator re-entered broadcast loop; dedup should have completed"
                         );
                         new_state = Some(PutState::Finished { key: *key });
                     } else {
