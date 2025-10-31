@@ -52,10 +52,10 @@ async fn test_multi_node(ctx: &mut TestContext) -> TestResult {
     assert!(!peer1.is_gateway);
     assert!(!peer2.is_gateway);
 
-    // Gateway has network port, peers don't
+    // Gateway and peers expose network ports for direct connectivity
     assert!(gateway.network_port.is_some());
-    assert!(peer1.network_port.is_none());
-    assert!(peer2.network_port.is_none());
+    assert!(peer1.network_port.is_some());
+    assert!(peer2.network_port.is_some());
 
     // All nodes have unique locations
     assert_ne!(gateway.location, peer1.location);
@@ -190,8 +190,8 @@ async fn test_multiple_gateways(ctx: &mut TestContext) -> TestResult {
         );
         assert!(!peer.is_gateway);
         assert!(
-            peer.network_port.is_none(),
-            "Peers should not have network ports"
+            peer.network_port.is_some(),
+            "Peers should expose network ports for direct connectivity"
         );
     }
 

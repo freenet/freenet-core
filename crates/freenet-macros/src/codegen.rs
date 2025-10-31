@@ -3,7 +3,7 @@
 use crate::parser::{AggregateEventsMode, FreenetTestArgs};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemFn, Result};
+use syn::{ItemFn, LitInt, Result};
 
 /// Helper to determine if a node is a gateway
 fn is_gateway(args: &FreenetTestArgs, node_label: &str, node_idx: usize) -> bool {
@@ -109,7 +109,6 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
 fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
     let mut setup_code = Vec::new();
 
-    // First pass: Generate all gateway and peer configurations
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let config_var = format_ident!("config_{}", idx);
         let temp_var = format_ident!("temp_{}", idx);
@@ -295,6 +294,25 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 /// Generate node building and flush handle collection
 fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
     let mut builds = Vec::new();
+    let node_count = args.nodes.len();
+
+    // Encourage small test networks to converge to a mesh quickly.
+    let connection_tuning = if node_count > 1 {
+        let min_connections = (node_count - 1).max(1);
+        let max_connections = std::cmp::max(min_connections + 2, min_connections * 2);
+
+        let min_lit = LitInt::new(&min_connections.to_string(), proc_macro2::Span::call_site());
+        let max_lit = LitInt::new(&max_connections.to_string(), proc_macro2::Span::call_site());
+
+        quote! {
+            let min_connections: usize = #min_lit;
+            let max_connections: usize = #max_lit;
+            node_config.min_number_of_connections(min_connections);
+            node_config.max_number_of_connections(max_connections);
+        }
+    } else {
+        quote! {}
+    };
 
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let node_var = format_ident!("node_{}", idx);
@@ -304,8 +322,9 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
         builds.push(quote! {
             tracing::info!("Building node: {}", #node_label);
             let built_config = #config_var.build().await?;
-            let (#node_var, #flush_handle_var) = freenet::local_node::NodeConfig::new(built_config.clone())
-                .await?
+            let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
+            #connection_tuning
+            let (#node_var, #flush_handle_var) = node_config
                 .build_with_flush_handle(freenet::server::serve_gateway(built_config.ws_api).await)
                 .await?;
         });
