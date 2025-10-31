@@ -20,6 +20,7 @@ fn is_gateway(args: &FreenetTestArgs, node_label: &str, node_idx: usize) -> bool
 pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<TokenStream> {
     let test_fn_name = &input_fn.sig.ident;
     let inner_fn_name = format_ident!("{}_inner", test_fn_name);
+    let attrs = &input_fn.attrs;
 
     // Extract test body
     let test_body = &input_fn.block;
@@ -53,6 +54,7 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
 
     let generated = quote! {
         #tokio_attr
+        #(#attrs)*
         async fn #test_fn_name() -> freenet::test_utils::TestResult {
             use freenet::test_utils::{TestContext, TestLogger, NodeInfo};
             use std::time::{Duration, Instant};
