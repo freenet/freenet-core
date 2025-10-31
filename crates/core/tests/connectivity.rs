@@ -13,6 +13,9 @@ use tokio_tungstenite::connect_async;
 /// 2. Perform operations to verify connectivity
 /// 3. Force disconnect
 /// 4. Verify that the peer can reconnect and operate normally
+/// NOTE: The freenet_test macro configures each peer with a public network port
+/// so auto_connect_peers ensures they can form a full mesh rather than only
+/// connecting to the gateway.
 #[freenet_test(
     nodes = ["gateway", "peer"],
     auto_connect_peers = true,
@@ -246,11 +249,6 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
 /// 7. Other peers connect to PublicIP:54321
 /// 8. Router forwards to peer's internal 192.168.1.100:8080 ✅
 ///
-/// NOTE: This test requires P2P mesh connectivity between peers.
-/// The freenet_test macro's auto_connect_peers feature handles gateway connections
-/// but may not fully support peer-to-peer mesh formation. This test is temporarily
-/// marked as ignored pending investigation of P2P mesh connectivity setup.
-#[ignore = "P2P mesh connectivity needs investigation - auto_connect_peers may not establish peer-to-peer links"]
 #[freenet_test(
     nodes = ["gateway", "peer1", "peer2"],
     auto_connect_peers = true,

@@ -240,6 +240,10 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
+                    let network_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+                    let network_port = network_socket.local_addr()?.port();
+                    std::mem::drop(network_socket);
+
                     let ws_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
                     let ws_port = ws_socket.local_addr()?.port();
                     std::mem::drop(ws_socket);
@@ -255,14 +259,14 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                         },
                         network_api: freenet::config::NetworkArgs {
                             public_address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
-                            public_port: None,
+                            public_port: Some(network_port),
                             is_gateway: false,
                             skip_load_from_network: true,
                             gateways: #gateways_config,
                             location: Some(location),
                             ignore_protocol_checking: true,
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
-                            network_port: None,
+                            network_port: Some(network_port),
                             bandwidth_limit: None,
                             blocked_addresses: None,
                         },
