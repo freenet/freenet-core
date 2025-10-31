@@ -312,19 +312,6 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Update(UpdateMsg::SuccessfulUpdate {
-                id,
-                target,
-                sender,
-                key,
-                ..
-            }) => EventKind::Update(UpdateEvent::UpdateSuccess {
-                id: *id,
-                requester: sender.clone(),
-                target: target.clone(),
-                key: *key,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
             NetMessageV1::Update(UpdateMsg::Broadcasting {
                 new_value,
                 broadcast_to,

@@ -133,8 +133,12 @@ where
                 if let Some(target) = msg.target() {
                     tracing::debug!(%id, %target, "sending updated op state");
                     network_bridge.send(&target.peer, msg).await?;
+                    op_manager.push(id, updated_state).await?;
+                } else {
+                    tracing::debug!(%id, "queueing op state for local processing");
+                    op_manager.notify_op_change(msg, updated_state).await?;
+                    return Err(OpError::StatePushed);
                 }
-                op_manager.push(id, updated_state).await?;
             }
         }
 
