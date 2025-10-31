@@ -1,11 +1,12 @@
 // TODO: complete update logic in the network
+use either::Either;
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 pub(crate) use self::messages::UpdateMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
-use crate::message::{InnerMessage, NetMessage, Transaction};
+use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
 use crate::node::IsOperationCompleted;
 use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
@@ -58,6 +59,12 @@ impl UpdateOp {
 
 struct UpdateStats {
     target: Option<PeerKeyLocation>,
+}
+
+struct UpdateExecution {
+    value: WrappedState,
+    summary: StateSummary<'static>,
+    changed: bool,
 }
 
 pub(crate) struct UpdateResult {}
@@ -173,11 +180,7 @@ impl Operation for UpdateOp {
                         // Target is us - process the request
                         // Determine if this is a local request (from our own client) or remote request
                         let is_local_request =
-                            matches!(&self.state, Some(UpdateState::PrepareRequest { .. }))
-                                || matches!(
-                                    &self.state,
-                                    Some(UpdateState::AwaitingResponse { upstream: None, .. })
-                                );
+                            matches!(&self.state, Some(UpdateState::PrepareRequest { .. }));
                         let upstream = if is_local_request {
                             None // No upstream - we are the initiator
                         } else {
@@ -214,7 +217,11 @@ impl Operation for UpdateOp {
                             );
 
                             // Update contract locally
-                            let updated_value = update_contract(
+                            let UpdateExecution {
+                                value: updated_value,
+                                summary,
+                                changed,
+                            } = update_contract(
                                 op_manager,
                                 *key,
                                 value.clone(),
@@ -222,43 +229,65 @@ impl Operation for UpdateOp {
                             )
                             .await?;
 
-                            // Get broadcast targets for propagating UPDATE to subscribers
-                            let broadcast_to =
-                                op_manager.get_broadcast_targets_update(key, &request_sender.peer);
+                            if !changed {
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    "UPDATE yielded no state change, skipping broadcast"
+                                );
 
-                            // Create success message to send back
-                            let raw_state = State::from(updated_value);
-                            let summary = StateSummary::from(raw_state.into_bytes());
+                                if upstream.is_none() {
+                                    new_state = Some(UpdateState::Finished {
+                                        key: *key,
+                                        summary: summary.clone(),
+                                    });
+                                } else {
+                                    new_state = None;
+                                }
 
-                            if broadcast_to.is_empty() {
-                                // No peers to broadcast to - just send success response
-                                return_msg = Some(UpdateMsg::SuccessfulUpdate {
-                                    id: *id,
-                                    target: request_sender.clone(),
-                                    summary: summary.clone(),
-                                    key: *key,
-                                    sender: self_location.clone(),
-                                });
-                                new_state = Some(UpdateState::Finished { key: *key, summary });
+                                return_msg = None;
                             } else {
-                                // Broadcast to other peers
-                                match try_to_broadcast(
-                                    *id,
-                                    true, // last_hop - we're handling locally
-                                    op_manager,
-                                    self.state,
-                                    (broadcast_to, request_sender.clone()),
-                                    *key,
-                                    value.clone(),
-                                    false,
-                                )
-                                .await
-                                {
-                                    Ok((state, msg)) => {
-                                        new_state = state;
-                                        return_msg = msg;
+                                // Get broadcast targets for propagating UPDATE to subscribers
+                                let broadcast_to = op_manager
+                                    .get_broadcast_targets_update(key, &request_sender.peer);
+
+                                if broadcast_to.is_empty() {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        %key,
+                                        "No broadcast targets, completing UPDATE locally"
+                                    );
+
+                                    if upstream.is_none() {
+                                        new_state = Some(UpdateState::Finished {
+                                            key: *key,
+                                            summary: summary.clone(),
+                                        });
+                                    } else {
+                                        new_state = None;
                                     }
-                                    Err(err) => return Err(err),
+
+                                    return_msg = None;
+                                } else {
+                                    // Broadcast to other peers
+                                    match try_to_broadcast(
+                                        *id,
+                                        true, // last_hop - we're handling locally
+                                        op_manager,
+                                        self.state,
+                                        (broadcast_to, request_sender.clone()),
+                                        *key,
+                                        updated_value.clone(),
+                                        false,
+                                    )
+                                    .await
+                                    {
+                                        Ok((state, msg)) => {
+                                            new_state = state;
+                                            return_msg = msg;
+                                        }
+                                        Err(err) => return Err(err),
+                                    }
                                 }
                             }
                         } else {
@@ -285,11 +314,7 @@ impl Operation for UpdateOp {
                                     key: *key,
                                     related_contracts: related_contracts.clone(),
                                 });
-                                // Transition to AwaitingResponse state to wait for SuccessfulUpdate
-                                new_state = Some(UpdateState::AwaitingResponse {
-                                    key: *key,
-                                    upstream,
-                                });
+                                new_state = None;
                             } else {
                                 // No peers available and we don't have the contract - error
                                 tracing::error!(
@@ -333,7 +358,11 @@ impl Operation for UpdateOp {
 
                     if has_contract {
                         tracing::debug!("Contract found locally - handling UPDATE");
-                        let updated_value = update_contract(
+                        let UpdateExecution {
+                            value: updated_value,
+                            summary: _summary, // summary not used here yet
+                            changed,
+                        } = update_contract(
                             op_manager,
                             *key,
                             value.clone(),
@@ -347,49 +376,48 @@ impl Operation for UpdateOp {
                             target.location
                         );
 
-                        // Get broadcast targets
-                        let broadcast_to =
-                            op_manager.get_broadcast_targets_update(key, &sender.peer);
-
-                        // If no peers to broadcast to, send success response directly
-                        if broadcast_to.is_empty() {
+                        if !changed {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                "No broadcast targets for SeekNode - completing with SuccessfulUpdate"
+                                "SeekNode update produced no change, stopping propagation"
                             );
-
-                            // Create success message to send back to sender
-                            let raw_state = State::from(updated_value);
-                            let summary = StateSummary::from(raw_state.into_bytes());
-
-                            return_msg = Some(UpdateMsg::SuccessfulUpdate {
-                                id: *id,
-                                target: sender.clone(),
-                                summary,
-                                key: *key,
-                                sender: op_manager.ring.connection_manager.own_location(),
-                            });
                             new_state = None;
+                            return_msg = None;
                         } else {
-                            // Have peers to broadcast to - use try_to_broadcast
-                            match try_to_broadcast(
-                                *id,
-                                true,
-                                op_manager,
-                                self.state,
-                                (broadcast_to, sender.clone()),
-                                *key,
-                                value.clone(),
-                                false,
-                            )
-                            .await
-                            {
-                                Ok((state, msg)) => {
-                                    new_state = state;
-                                    return_msg = msg;
+                            // Get broadcast targets
+                            let broadcast_to =
+                                op_manager.get_broadcast_targets_update(key, &sender.peer);
+
+                            // If no peers to broadcast to, nothing else to do
+                            if broadcast_to.is_empty() {
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    "No broadcast targets for SeekNode - completing locally"
+                                );
+                                new_state = None;
+                                return_msg = None;
+                            } else {
+                                // Have peers to broadcast to - use try_to_broadcast
+                                match try_to_broadcast(
+                                    *id,
+                                    true,
+                                    op_manager,
+                                    self.state,
+                                    (broadcast_to, sender.clone()),
+                                    *key,
+                                    updated_value.clone(),
+                                    false,
+                                )
+                                .await
+                                {
+                                    Ok((state, msg)) => {
+                                        new_state = state;
+                                        return_msg = msg;
+                                    }
+                                    Err(err) => return Err(err),
                                 }
-                                Err(err) => return Err(err),
                             }
                         }
                     } else {
@@ -417,10 +445,7 @@ impl Operation for UpdateOp {
                                 key: *key,
                                 related_contracts: related_contracts.clone(),
                             });
-                            new_state = Some(UpdateState::AwaitingResponse {
-                                key: *key,
-                                upstream: Some(sender.clone()),
-                            });
+                            new_state = None;
                         } else {
                             // No more peers to try - error
                             tracing::error!(
@@ -439,13 +464,12 @@ impl Operation for UpdateOp {
                     sender,
                     target,
                 } => {
-                    if let Some(UpdateState::AwaitingResponse { .. }) = self.state {
-                        tracing::debug!("Trying to broadcast to a peer that was the initiator of the op because it received the client request, or is in the middle of a seek node process");
-                        return Err(OpError::StatePushed);
-                    }
-
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
-                    let new_value = update_contract(
+                    let UpdateExecution {
+                        value: updated_value,
+                        summary: _summary,
+                        changed,
+                    } = update_contract(
                         op_manager,
                         *key,
                         new_value.clone(),
@@ -454,31 +478,42 @@ impl Operation for UpdateOp {
                     .await?;
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
-                    let broadcast_to = op_manager.get_broadcast_targets_update(key, &sender.peer);
+                    if !changed {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "BroadcastTo update produced no change, ending propagation"
+                        );
+                        new_state = None;
+                        return_msg = None;
+                    } else {
+                        let broadcast_to =
+                            op_manager.get_broadcast_targets_update(key, &sender.peer);
 
-                    tracing::debug!(
-                        "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
-                        key,
-                        target.location
-                    );
+                        tracing::debug!(
+                            "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
+                            key,
+                            target.location
+                        );
 
-                    match try_to_broadcast(
-                        *id,
-                        false,
-                        op_manager,
-                        self.state,
-                        (broadcast_to, sender.clone()),
-                        *key,
-                        new_value,
-                        true,
-                    )
-                    .await
-                    {
-                        Ok((state, msg)) => {
-                            new_state = state;
-                            return_msg = msg;
+                        match try_to_broadcast(
+                            *id,
+                            false,
+                            op_manager,
+                            self.state,
+                            (broadcast_to, sender.clone()),
+                            *key,
+                            updated_value.clone(),
+                            true,
+                        )
+                        .await
+                        {
+                            Ok((state, msg)) => {
+                                new_state = state;
+                                return_msg = msg;
+                            }
+                            Err(err) => return Err(err),
                         }
-                        Err(err) => return Err(err),
                     }
                 }
                 UpdateMsg::Broadcasting {
@@ -487,7 +522,7 @@ impl Operation for UpdateOp {
                     broadcasted_to,
                     key,
                     new_value,
-                    upstream,
+                    upstream: _upstream,
                     ..
                 } => {
                     let sender = op_manager.ring.connection_manager.own_location();
@@ -537,87 +572,9 @@ impl Operation for UpdateOp {
                         "Successfully broadcasted update contract {key} to {broadcasted_to} peers - Broadcasting"
                     );
 
-                    let raw_state = State::from(new_value.clone());
-
-                    let summary = StateSummary::from(raw_state.into_bytes());
-
-                    // Subscriber nodes have been notified of the change, the operation is complete
-                    return_msg = Some(UpdateMsg::SuccessfulUpdate {
-                        id: *id,
-                        target: upstream.clone(),
-                        summary,
-                        sender: sender.clone(),
-                        key: *key,
-                    });
-
+                    // Subscriber nodes have been notified of the change
                     new_state = None;
-                }
-                UpdateMsg::SuccessfulUpdate { id, summary, .. } => {
-                    match self.state {
-                        Some(UpdateState::AwaitingResponse { key, upstream }) => {
-                            tracing::debug!(
-                                tx = %id,
-                                %key,
-                                this_peer = ?op_manager.ring.connection_manager.get_peer_key(),
-                                ?upstream,
-                                "Peer completed contract value update - SuccessfulUpdate",
-                            );
-
-                            tracing::debug!(
-                                "UPDATE operation {} completed successfully for key {} with summary length {}",
-                                id,
-                                key,
-                                summary.size()
-                            );
-
-                            if let Some(upstream) = upstream {
-                                // Intermediate node: Forward success to upstream and complete operation
-                                tracing::debug!(
-                                    "UPDATE: Forwarding SuccessfulUpdate to upstream peer {:?} and completing operation",
-                                    upstream
-                                );
-                                return_msg = Some(UpdateMsg::SuccessfulUpdate {
-                                    id: *id,
-                                    target: upstream,
-                                    summary: summary.clone(),
-                                    key,
-                                    sender: op_manager.ring.connection_manager.own_location(),
-                                });
-                                // Set state to None so OpManager marks this operation as completed
-                                // This prevents duplicate SuccessfulUpdate messages from being processed
-                                new_state = None;
-                            } else {
-                                // Operation originated locally (no upstream peer)
-                                // Preserve Finished state so client can receive the result
-                                tracing::debug!(
-                                    "UPDATE: Operation {} completed successfully (originated locally)",
-                                    id
-                                );
-                                new_state = Some(UpdateState::Finished {
-                                    key,
-                                    summary: summary.clone(),
-                                });
-                                return_msg = None;
-                            }
-                        }
-                        Some(UpdateState::ReceivedRequest) => {
-                            // This is the target node that processed the update
-                            // It should have already sent the response, this shouldn't happen
-                            tracing::error!(
-                                tx = %id,
-                                "UPDATE: Unexpected SuccessfulUpdate in ReceivedRequest state",
-                            );
-                            return Err(OpError::invalid_transition(self.id));
-                        }
-                        _ => {
-                            tracing::error!(
-                                state = ?self.state,
-                                "invalid transition in UpdateMsg::SuccessfulUpdate -> match self.state"
-                            );
-
-                            return Err(OpError::invalid_transition(self.id));
-                        }
-                    };
+                    return_msg = None;
                 }
                 _ => return Err(OpError::UnexpectedOpState),
             }
@@ -644,24 +601,17 @@ async fn try_to_broadcast(
     match state {
         Some(UpdateState::ReceivedRequest | UpdateState::BroadcastOngoing) => {
             if broadcast_to.is_empty() && !last_hop {
-                // broadcast complete
                 tracing::debug!(
                     "Empty broadcast list while updating value for contract {} - try_to_broadcast",
                     key
                 );
 
                 return_msg = None;
+                new_state = None;
 
                 if is_from_a_broadcasted_to_peer {
-                    new_state = None;
                     return Ok((new_state, return_msg));
                 }
-
-                // means the whole tx finished so can return early
-                new_state = Some(UpdateState::AwaitingResponse {
-                    key,
-                    upstream: Some(upstream),
-                });
             } else if !broadcast_to.is_empty() {
                 tracing::debug!(
                     "Callback to start broadcasting to other nodes. List size {}",
@@ -678,29 +628,9 @@ async fn try_to_broadcast(
                     upstream,
                     sender: op_manager.ring.connection_manager.own_location(),
                 });
-
-                let op = UpdateOp {
-                    id,
-                    state: new_state,
-                    stats: None,
-                };
-                op_manager
-                    .notify_op_change(NetMessage::from(return_msg.unwrap()), OpEnum::Update(op))
-                    .await?;
-                return Err(OpError::StatePushed);
             } else {
-                let raw_state = State::from(new_value);
-
-                let summary = StateSummary::from(raw_state.into_bytes());
-
                 new_state = None;
-                return_msg = Some(UpdateMsg::SuccessfulUpdate {
-                    id,
-                    target: upstream,
-                    summary,
-                    key,
-                    sender: op_manager.ring.connection_manager.own_location(),
-                });
+                return_msg = None;
             }
         }
         _ => return Err(OpError::invalid_transition(id)),
@@ -775,8 +705,29 @@ async fn update_contract(
     key: ContractKey,
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
-) -> Result<WrappedState, OpError> {
-    let update_data = UpdateData::State(State::from(state));
+) -> Result<UpdateExecution, OpError> {
+    let previous_state = match op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            key,
+            return_contract_code: false,
+        })
+        .await
+    {
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Ok(StoreResponse { state, .. }),
+            ..
+        }) => state,
+        Ok(other) => {
+            tracing::trace!(?other, %key, "Unexpected get response while preparing update summary");
+            None
+        }
+        Err(err) => {
+            tracing::debug!(%key, %err, "Failed to fetch existing contract state before update");
+            None
+        }
+    };
+
+    let update_data = UpdateData::State(State::from(state.clone()));
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
             key,
@@ -787,15 +738,85 @@ async fn update_contract(
     {
         Ok(ContractHandlerEvent::UpdateResponse {
             new_value: Ok(new_val),
-        }) => Ok(new_val),
-        Ok(ContractHandlerEvent::UpdateResponse {
-            new_value: Err(_rr),
         }) => {
-            tracing::error!("Failed to update contract value");
+            let new_bytes = State::from(new_val.clone()).into_bytes();
+            let summary = StateSummary::from(new_bytes.clone());
+            let changed = match previous_state.as_ref() {
+                Some(prev_state) => {
+                    let prev_bytes = State::from(prev_state.clone()).into_bytes();
+                    prev_bytes != new_bytes
+                }
+                None => true,
+            };
+
+            // NOTE: change detection currently relies on byte-level equality. Contracts that
+            // produce semantically identical states with different encodings must normalize their
+            // serialization (e.g., sort map keys) to avoid redundant broadcasts.
+
+            Ok(UpdateExecution {
+                value: new_val,
+                summary,
+                changed,
+            })
+        }
+        Ok(ContractHandlerEvent::UpdateResponse {
+            new_value: Err(err),
+        }) => {
+            tracing::error!(%key, %err, "Failed to update contract value");
             Err(OpError::UnexpectedOpState)
         }
+        Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+            let resolved_state = match previous_state {
+                Some(prev_state) => prev_state,
+                None => {
+                    match op_manager
+                        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                            key,
+                            return_contract_code: false,
+                        })
+                        .await
+                    {
+                        Ok(ContractHandlerEvent::GetResponse {
+                            response:
+                                Ok(StoreResponse {
+                                    state: Some(current),
+                                    ..
+                                }),
+                            ..
+                        }) => current,
+                        Ok(other) => {
+                            tracing::debug!(
+                                ?other,
+                                %key,
+                                "Fallback fetch for UpdateNoChange returned no state; using requested state"
+                            );
+                            state.clone()
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                %key,
+                                %err,
+                                "Fallback fetch for UpdateNoChange failed; using requested state"
+                            );
+                            state.clone()
+                        }
+                    }
+                }
+            };
+
+            let bytes = State::from(resolved_state.clone()).into_bytes();
+            let summary = StateSummary::from(bytes);
+            Ok(UpdateExecution {
+                value: resolved_state,
+                summary,
+                changed: false,
+            })
+        }
         Err(err) => Err(err.into()),
-        Ok(_) => Err(OpError::UnexpectedOpState),
+        Ok(other) => {
+            tracing::error!(?other, %key, "Unexpected event from contract handler during update");
+            Err(OpError::UnexpectedOpState)
+        }
     }
 }
 
@@ -925,7 +946,11 @@ pub(crate) async fn request_update(
             // 2. Either seeding the contract OR has subscribers (verified above)
             // Note: This handles both truly isolated nodes and nodes where subscribers exist
             // but no suitable remote caching peer was found.
-            let updated_value = update_contract(op_manager, key, value, related_contracts).await?;
+            let UpdateExecution {
+                value: updated_value,
+                summary,
+                changed,
+            } = update_contract(op_manager, key, value, related_contracts).await?;
 
             tracing::debug!(
                 tx = %id,
@@ -933,8 +958,20 @@ pub(crate) async fn request_update(
                 "Successfully updated contract locally on isolated node"
             );
 
+            if !changed {
+                tracing::debug!(
+                    tx = %id,
+                    %key,
+                    "Local update resulted in no change; finishing without broadcast"
+                );
+                deliver_update_result(op_manager, id, key, summary.clone()).await?;
+                return Ok(());
+            }
+
             // Check if there are any subscribers to broadcast to
             let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
+
+            deliver_update_result(op_manager, id, key, summary.clone()).await?;
 
             if broadcast_to.is_empty() {
                 // No subscribers - operation complete
@@ -943,31 +980,6 @@ pub(crate) async fn request_update(
                     %key,
                     "No broadcast targets, completing UPDATE operation locally"
                 );
-
-                // Set up state for SuccessfulUpdate message handling
-                update_op.state = Some(UpdateState::AwaitingResponse {
-                    key,
-                    upstream: None,
-                });
-
-                // Create a StateSummary from the updated value
-                let raw_state = State::from(updated_value);
-                let summary = StateSummary::from(raw_state.into_bytes());
-
-                // Create a SuccessfulUpdate message to trigger the completion handling
-                let success_msg = UpdateMsg::SuccessfulUpdate {
-                    id,
-                    target: sender.clone(),
-                    summary,
-                    sender: sender.clone(),
-                    key,
-                };
-
-                // Use notify_op_change to trigger the completion handling
-                op_manager
-                    .notify_op_change(NetMessage::from(success_msg), OpEnum::Update(update_op))
-                    .await?;
-
                 return Ok(());
             } else {
                 // There are subscribers - broadcast the update
@@ -980,7 +992,7 @@ pub(crate) async fn request_update(
 
                 let broadcast_state = Some(UpdateState::ReceivedRequest);
 
-                let (new_state, return_msg) = try_to_broadcast(
+                let (_new_state, return_msg) = try_to_broadcast(
                     id,
                     false,
                     op_manager,
@@ -992,17 +1004,20 @@ pub(crate) async fn request_update(
                 )
                 .await?;
 
-                update_op.state = new_state;
-
                 if let Some(msg) = return_msg {
                     op_manager
-                        .notify_op_change(NetMessage::from(msg), OpEnum::Update(update_op))
-                        .await?;
-                } else {
-                    // Complete the operation locally if no further messages needed
-                    let raw_state = State::from(WrappedState::new(vec![]));
-                    let summary = StateSummary::from(raw_state.into_bytes());
-                    update_op.state = Some(UpdateState::Finished { key, summary });
+                        .to_event_listener
+                        .notifications_sender()
+                        .send(Either::Left(NetMessage::from(msg)))
+                        .await
+                        .map_err(|error| {
+                            tracing::error!(
+                                tx = %id,
+                                %error,
+                                "Failed to enqueue UPDATE broadcast message"
+                            );
+                            OpError::NotificationError
+                        })?;
                 }
 
                 return Ok(());
@@ -1023,7 +1038,11 @@ pub(crate) async fn request_update(
 
     // Apply update locally - this ensures the initiating peer serves the updated state
     // even if the remote UPDATE times out or fails
-    let updated_value = update_contract(op_manager, key, value.clone(), related_contracts.clone())
+    let UpdateExecution {
+        value: updated_value,
+        summary,
+        changed: _changed,
+    } = update_contract(op_manager, key, value.clone(), related_contracts.clone())
         .await
         .map_err(|e| {
             tracing::error!(
@@ -1045,10 +1064,7 @@ pub(crate) async fn request_update(
         stats.target = Some(target.clone());
     }
 
-    let new_state = Some(UpdateState::AwaitingResponse {
-        key,
-        upstream: None,
-    });
+    deliver_update_result(op_manager, id, key, summary.clone()).await?;
     let msg = UpdateMsg::RequestUpdate {
         id,
         key,
@@ -1058,15 +1074,70 @@ pub(crate) async fn request_update(
         value: updated_value, // Send the updated value, not the original
     };
 
+    op_manager
+        .to_event_listener
+        .notifications_sender()
+        .send(Either::Left(NetMessage::from(msg)))
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                tx = %id,
+                %error,
+                "Failed to enqueue UPDATE RequestUpdate message"
+            );
+            OpError::NotificationError
+        })?;
+
+    Ok(())
+}
+
+async fn deliver_update_result(
+    op_manager: &OpManager,
+    id: Transaction,
+    key: ContractKey,
+    summary: StateSummary<'static>,
+) -> Result<(), OpError> {
+    // NOTE: UPDATE is modeled as fire-and-forget: once the merge succeeds on the
+    // seed/subscriber peer we surface success to the host immediately and allow
+    // the broadcast fan-out to proceed asynchronously.
     let op = UpdateOp {
-        state: new_state,
         id,
-        stats: update_op.stats,
+        state: Some(UpdateState::Finished {
+            key,
+            summary: summary.clone(),
+        }),
+        stats: None,
     };
 
+    let host_result = op.to_host_result();
+
     op_manager
-        .notify_op_change(NetMessage::from(msg), OpEnum::Update(op))
-        .await?;
+        .result_router_tx
+        .send((id, host_result))
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                tx = %id,
+                %error,
+                "Failed to send UPDATE result to result router"
+            );
+            OpError::NotificationError
+        })?;
+
+    if let Err(error) = op_manager
+        .to_event_listener
+        .notifications_sender()
+        .send(Either::Right(NodeEvent::TransactionCompleted(id)))
+        .await
+    {
+        tracing::warn!(
+            tx = %id,
+            %error,
+            "Failed to notify transaction completion for UPDATE"
+        );
+    }
+
+    op_manager.completed(id);
 
     Ok(())
 }
@@ -1080,7 +1151,7 @@ impl IsOperationCompleted for UpdateOp {
 mod messages {
     use std::{borrow::Borrow, fmt::Display};
 
-    use freenet_stdlib::prelude::{ContractKey, RelatedContracts, StateSummary, WrappedState};
+    use freenet_stdlib::prelude::{ContractKey, RelatedContracts, WrappedState};
     use serde::{Deserialize, Serialize};
 
     use crate::{
@@ -1098,15 +1169,6 @@ mod messages {
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
             value: WrappedState,
-        },
-        /// Value successfully inserted/updated.
-        SuccessfulUpdate {
-            id: Transaction,
-            target: PeerKeyLocation,
-            #[serde(deserialize_with = "StateSummary::deser_state_summary")]
-            summary: StateSummary<'static>,
-            sender: PeerKeyLocation,
-            key: ContractKey,
         },
         AwaitUpdate {
             id: Transaction,
@@ -1145,7 +1207,6 @@ mod messages {
         fn id(&self) -> &Transaction {
             match self {
                 UpdateMsg::RequestUpdate { id, .. } => id,
-                UpdateMsg::SuccessfulUpdate { id, .. } => id,
                 UpdateMsg::AwaitUpdate { id, .. } => id,
                 UpdateMsg::SeekNode { id, .. } => id,
                 UpdateMsg::Broadcasting { id, .. } => id,
@@ -1156,7 +1217,6 @@ mod messages {
         fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
             match self {
                 UpdateMsg::RequestUpdate { target, .. } => Some(target),
-                UpdateMsg::SuccessfulUpdate { target, .. } => Some(target),
                 UpdateMsg::SeekNode { target, .. } => Some(target),
                 UpdateMsg::BroadcastTo { target, .. } => Some(target),
                 _ => None,
@@ -1179,7 +1239,6 @@ mod messages {
             match self {
                 Self::RequestUpdate { sender, .. } => Some(sender),
                 Self::SeekNode { sender, .. } => Some(sender),
-                Self::SuccessfulUpdate { sender, .. } => Some(sender),
                 Self::BroadcastTo { sender, .. } => Some(sender),
                 _ => None,
             }
@@ -1190,7 +1249,6 @@ mod messages {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 UpdateMsg::RequestUpdate { id, .. } => write!(f, "RequestUpdate(id: {id})"),
-                UpdateMsg::SuccessfulUpdate { id, .. } => write!(f, "SuccessfulUpdate(id: {id})"),
                 UpdateMsg::AwaitUpdate { id } => write!(f, "AwaitUpdate(id: {id})"),
                 UpdateMsg::SeekNode { id, .. } => write!(f, "SeekNode(id: {id})"),
                 UpdateMsg::Broadcasting { id, .. } => write!(f, "Broadcasting(id: {id})"),
@@ -1203,10 +1261,6 @@ mod messages {
 #[derive(Debug)]
 pub enum UpdateState {
     ReceivedRequest,
-    AwaitingResponse {
-        key: ContractKey,
-        upstream: Option<PeerKeyLocation>,
-    },
     Finished {
         key: ContractKey,
         summary: StateSummary<'static>,
