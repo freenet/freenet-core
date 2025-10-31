@@ -269,7 +269,7 @@ impl Operation for PutOp {
                         // Create a SeekNode message to forward to the next hop
                         return_msg = Some(PutMsg::SeekNode {
                             id: *id,
-                            sender: sender.clone(),
+                            sender: own_location.clone(),
                             target: forward_target,
                             value: modified_value.clone(),
                             contract: contract.clone(),
@@ -298,7 +298,7 @@ impl Operation for PutOp {
                             id: *id,
                             target: sender.clone(),
                             key,
-                            sender: own_location,
+                            sender: own_location.clone(),
                         });
 
                         // Mark operation as finished

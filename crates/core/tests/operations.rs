@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail};
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
-    dev_tool::TransportKeypair,
+    dev_tool::{Location, TransportKeypair},
     local_node::NodeConfig,
     server::serve_gateway,
     test_utils::{
@@ -96,6 +96,11 @@ fn gw_config(port: u16, path: &Path) -> anyhow::Result<InlineGwConfig> {
         location: Some(random()),
         public_key_path: path.join("public.pem"),
     })
+}
+
+fn ring_distance(a: f64, b: f64) -> f64 {
+    let diff = (a - b).abs();
+    diff.min(1.0 - diff)
 }
 
 async fn get_contract(
@@ -296,6 +301,220 @@ async fn test_put_contract() -> TestResult {
         r = test => {
             r??;
             // Give time for cleanup before dropping nodes
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Ensure a client-only peer receives PutResponse when the contract is seeded on a third hop.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_put_contract_three_hop_returns_response() -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+    let contract_location = Location::from(&contract_key);
+
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_a = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_b = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_port_socket_c = TcpListener::bind("127.0.0.1:0")?;
+
+    let (mut config_b, preset_cfg_b, mut config_b_gw) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![],
+            Some(network_socket_gw.local_addr()?.port()),
+            ws_api_port_socket_b.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    let gateway_location = 0.25;
+    config_b.network_api.location = Some(gateway_location);
+    config_b_gw.location = Some(gateway_location);
+    let gw_config_json = serde_json::to_string(&config_b_gw)?;
+
+    let (mut config_c, preset_cfg_c) = base_node_test_config(
+        false,
+        vec![gw_config_json.clone()],
+        None,
+        ws_api_port_socket_c.local_addr()?.port(),
+    )
+    .await?;
+    let ws_api_port_peer_c = config_c.ws_api.ws_api_port.unwrap();
+    let mut target_location = contract_location.as_f64();
+    if ring_distance(target_location, gateway_location) < 0.05 {
+        target_location = (target_location + 0.1).rem_euclid(1.0);
+    }
+    config_c.network_api.location = Some(target_location);
+    assert!(
+        ring_distance(target_location, gateway_location) > 0.02,
+        "target location unexpectedly close to gateway"
+    );
+
+    let (mut config_a, preset_cfg_a) = base_node_test_config(
+        false,
+        vec![gw_config_json.clone()],
+        None,
+        ws_api_port_socket_a.local_addr()?.port(),
+    )
+    .await?;
+    let mut far_location = (target_location + 0.5).rem_euclid(1.0);
+    if ring_distance(far_location, target_location) < 0.05 {
+        far_location = (far_location + 0.25).rem_euclid(1.0);
+    }
+    config_a.network_api.location = Some(far_location);
+    assert!(
+        ring_distance(far_location, target_location) > 0.02,
+        "client location unexpectedly close to target"
+    );
+    let ws_api_port_peer_a = config_a.ws_api.ws_api_port.unwrap();
+    let ws_api_port_peer_b = config_b.ws_api.ws_api_port.unwrap();
+
+    tracing::info!("Node A data dir: {:?}", preset_cfg_a.temp_dir.path());
+    tracing::info!("Gateway node data dir: {:?}", preset_cfg_b.temp_dir.path());
+    tracing::info!("Node C data dir: {:?}", preset_cfg_c.temp_dir.path());
+
+    std::mem::drop(ws_api_port_socket_a);
+    std::mem::drop(ws_api_port_socket_b);
+    std::mem::drop(ws_api_port_socket_c);
+    std::mem::drop(network_socket_gw);
+
+    let node_a = async move {
+        tracing::info!("Starting peer A node (client)");
+        let config = config_a.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        tracing::info!("Peer A node running");
+        node.run().await
+    }
+    .instrument(tracing::info_span!("test_peer", test_node = "peer-a"))
+    .boxed_local();
+
+    let node_c = async move {
+        tracing::info!("Starting peer C node (target)");
+        let config = config_c.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        tracing::info!("Peer C node running");
+        node.run().await
+    }
+    .instrument(tracing::info_span!("test_peer", test_node = "peer-c"))
+    .boxed_local();
+
+    let node_b = async {
+        tracing::info!("Starting gateway node");
+        let config = config_b.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        tracing::info!("Gateway node running");
+        node.run().await
+    }
+    .instrument(tracing::info_span!("test_peer", test_node = "gateway"))
+    .boxed_local();
+
+    let test = tokio::time::timeout(Duration::from_secs(240), async {
+        tracing::info!("Waiting for nodes to establish connections...");
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        let uri_a = format!(
+            "ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native"
+        );
+        let (stream_a, _) = connect_async(&uri_a).await?;
+        let mut client_api_a = WebApi::start(stream_a);
+
+        make_put(
+            &mut client_api_a,
+            wrapped_state.clone(),
+            contract.clone(),
+            false,
+        )
+        .await?;
+
+        tracing::info!("Waiting for PUT response from peer A...");
+        let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                tracing::info!("PUT successful for contract: {}", key);
+                assert_eq!(key, contract_key);
+            }
+            Ok(Ok(other)) => {
+                bail!("Unexpected response while waiting for put: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                bail!("Error receiving put response: {}", e);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for put response after 120 seconds");
+            }
+        }
+
+        let uri_c = format!(
+            "ws://127.0.0.1:{ws_api_port_peer_c}/v1/contract/command?encodingProtocol=native"
+        );
+        let (stream_c, _) = connect_async(&uri_c).await?;
+        let mut client_api_c = WebApi::start(stream_c);
+        let (response_contract, response_state) =
+            get_contract(&mut client_api_c, contract_key, &preset_cfg_c.temp_dir).await?;
+        assert_eq!(response_contract, contract);
+        assert_eq!(response_state, wrapped_state);
+
+        client_api_c
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        client_api_a
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let uri_b = format!(
+            "ws://127.0.0.1:{ws_api_port_peer_b}/v1/contract/command?encodingProtocol=native"
+        );
+        let (stream_b, _) = connect_async(&uri_b).await?;
+        let mut client_api_b = WebApi::start(stream_b);
+        let (gw_contract, gw_state) =
+            get_contract(&mut client_api_b, contract_key, &preset_cfg_b.temp_dir).await?;
+        assert_eq!(gw_contract, contract);
+        assert_eq!(gw_state, wrapped_state);
+        client_api_b
+            .send(ClientRequest::Disconnect { cause: None })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        Ok::<_, anyhow::Error>(())
+    });
+
+    select! {
+        a = node_a => {
+            let Err(a) = a;
+            return Err(anyhow!(a).into());
+        }
+        c = node_c => {
+            let Err(c) = c;
+            return Err(anyhow!(c).into());
+        }
+        b = node_b => {
+            let Err(b) = b;
+            return Err(anyhow!(b).into());
+        }
+        r = test => {
+            r??;
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
