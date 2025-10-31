@@ -468,7 +468,6 @@ impl Ring {
                             );
                             error
                         })?;
-
                     if live_tx.is_none() {
                         let conns = self.connection_manager.get_open_connections();
                         tracing::warn!(

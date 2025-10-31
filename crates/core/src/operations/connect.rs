@@ -1106,32 +1106,38 @@ where
     // However, we still respect max_connections - this only applies when there's capacity.
     const EARLY_NETWORK_THRESHOLD: usize = 4;
     let has_capacity = num_connections + num_reserved < max_connections;
-    let is_early_network = is_gateway && accepted && num_connections < EARLY_NETWORK_THRESHOLD;
-
-    if num_connections == 0 || (is_early_network && has_capacity) {
-        if num_reserved == 1 && is_gateway && accepted {
-            tracing::info!(
-                tx = %id,
-                joiner = %joiner.peer,
-                connections = num_connections,
-                has_capacity = %has_capacity,
-                "Gateway early network: accepting connection directly (will register immediately)",
-            );
-            let connectivity_info = ConnectivityInfo::new_bootstrap(
-                joiner.clone(),
-                1, // Single check for direct connection
-            );
-            return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
-        } else if num_connections == 0 {
+    if is_gateway
+        && accepted
+        && (num_connections == 0 || (num_connections < EARLY_NETWORK_THRESHOLD && has_capacity))
+    {
+        if num_reserved != 1 {
             tracing::debug!(
                 tx = %id,
                 joiner = %joiner.peer,
-                is_gateway = %is_gateway,
-                num_reserved = %num_reserved,
-                "Cannot forward or accept: no existing connections, or reserved connections pending",
+                num_reserved,
+                "Gateway bootstrap registration proceeding despite reserved count"
             );
-            return Ok(None);
         }
+        tracing::info!(
+            tx = %id,
+            joiner = %joiner.peer,
+            connections = num_connections,
+            has_capacity = %has_capacity,
+            "Gateway early network: accepting connection directly (will register immediately)",
+        );
+        let connectivity_info = ConnectivityInfo::new_bootstrap(joiner.clone(), 1); // Single check for direct connection
+        return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
+    }
+
+    if num_connections == 0 {
+        tracing::debug!(
+            tx = %id,
+            joiner = %joiner.peer,
+            is_gateway = %is_gateway,
+            num_reserved = %num_reserved,
+            "Cannot forward or accept: no existing connections, or reserved connections pending",
+        );
+        return Ok(None);
     }
 
     // Try to forward the connection request to an existing peer
