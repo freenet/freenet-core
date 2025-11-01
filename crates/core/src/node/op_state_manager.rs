@@ -832,4 +832,358 @@ mod tests {
             "notification delivery should fail once receiver is dropped"
         );
     }
+
+    #[test]
+    fn sub_operation_tracker_registers_parent_child_relationship() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child = Transaction::ttl_transaction();
+
+        tracker.expect_and_register_sub_operation(parent, child);
+
+        // Verify parent-child relationship is registered
+        assert!(
+            tracker.is_sub_operation(child),
+            "child should be registered as sub-operation"
+        );
+        assert_eq!(
+            tracker.get_parent(child),
+            Some(parent),
+            "child should have correct parent"
+        );
+
+        // Verify expected count is incremented
+        assert_eq!(
+            tracker.expected_sub_operations.get(&parent).map(|v| *v),
+            Some(1),
+            "expected count should be 1"
+        );
+
+        // Verify sub_operations mapping contains the child
+        assert!(
+            tracker
+                .sub_operations
+                .get(&parent)
+                .map(|children| children.contains(&child))
+                .unwrap_or(false),
+            "parent should have child in sub_operations map"
+        );
+    }
+
+    #[test]
+    fn sub_operation_tracker_registers_multiple_children() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child1 = Transaction::ttl_transaction();
+        let child2 = Transaction::ttl_transaction();
+        let child3 = Transaction::ttl_transaction();
+
+        tracker.expect_and_register_sub_operation(parent, child1);
+        tracker.expect_and_register_sub_operation(parent, child2);
+        tracker.expect_and_register_sub_operation(parent, child3);
+
+        // Verify all children are registered
+        assert!(tracker.is_sub_operation(child1));
+        assert!(tracker.is_sub_operation(child2));
+        assert!(tracker.is_sub_operation(child3));
+
+        // Verify expected count is correct
+        assert_eq!(
+            tracker.expected_sub_operations.get(&parent).map(|v| *v),
+            Some(3),
+            "expected count should be 3"
+        );
+
+        // Verify all children are in the sub_operations map
+        let children = tracker.sub_operations.get(&parent).unwrap();
+        assert_eq!(children.len(), 3);
+        assert!(children.contains(&child1));
+        assert!(children.contains(&child2));
+        assert!(children.contains(&child3));
+    }
+
+    #[test]
+    fn sub_operation_tracker_counts_pending_operations() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child1 = Transaction::ttl_transaction();
+        let child2 = Transaction::ttl_transaction();
+        let child3 = Transaction::ttl_transaction();
+
+        tracker.expect_and_register_sub_operation(parent, child1);
+        tracker.expect_and_register_sub_operation(parent, child2);
+        tracker.expect_and_register_sub_operation(parent, child3);
+
+        let completed = DashSet::new();
+
+        // Initially, all 3 should be pending
+        assert_eq!(
+            tracker.count_pending_sub_operations(parent, &completed),
+            3,
+            "should have 3 pending operations"
+        );
+
+        // Mark first child as completed
+        completed.insert(child1);
+        assert_eq!(
+            tracker.count_pending_sub_operations(parent, &completed),
+            2,
+            "should have 2 pending operations after completing child1"
+        );
+
+        // Mark second child as completed
+        completed.insert(child2);
+        assert_eq!(
+            tracker.count_pending_sub_operations(parent, &completed),
+            1,
+            "should have 1 pending operation after completing child2"
+        );
+
+        // Mark third child as completed
+        completed.insert(child3);
+        assert_eq!(
+            tracker.count_pending_sub_operations(parent, &completed),
+            0,
+            "should have 0 pending operations after completing all children"
+        );
+    }
+
+    #[test]
+    fn sub_operation_tracker_all_sub_operations_completed() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child1 = Transaction::ttl_transaction();
+        let child2 = Transaction::ttl_transaction();
+
+        tracker.expect_and_register_sub_operation(parent, child1);
+        tracker.expect_and_register_sub_operation(parent, child2);
+
+        let completed = DashSet::new();
+
+        // Not all completed initially
+        assert!(
+            !tracker.all_sub_operations_completed(parent, &completed),
+            "should return false when no children completed"
+        );
+
+        // Complete first child
+        completed.insert(child1);
+        tracker.mark_sub_op_completed(parent);
+        assert!(
+            !tracker.all_sub_operations_completed(parent, &completed),
+            "should return false when only one child completed"
+        );
+
+        // Complete second child
+        completed.insert(child2);
+        tracker.mark_sub_op_completed(parent);
+        assert!(
+            tracker.all_sub_operations_completed(parent, &completed),
+            "should return true when all children completed"
+        );
+    }
+
+    #[test]
+    fn sub_operation_tracker_cleanup_parent_tracking() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child1 = Transaction::ttl_transaction();
+        let child2 = Transaction::ttl_transaction();
+
+        tracker.expect_and_register_sub_operation(parent, child1);
+        tracker.expect_and_register_sub_operation(parent, child2);
+
+        // Verify tracking is set up
+        assert!(tracker.expected_sub_operations.contains_key(&parent));
+        assert!(tracker.sub_operations.contains_key(&parent));
+
+        // Cleanup parent tracking
+        tracker.cleanup_parent_tracking(parent);
+
+        // Verify tracking is removed
+        assert!(
+            !tracker.expected_sub_operations.contains_key(&parent),
+            "expected_sub_operations should be cleaned up"
+        );
+        assert!(
+            !tracker.sub_operations.contains_key(&parent),
+            "sub_operations should be cleaned up"
+        );
+
+        // Note: parent_of mappings for children are NOT cleaned up by cleanup_parent_tracking
+        // They should be cleaned up by remove_child_link when each child completes
+    }
+
+    #[test]
+    fn sub_operation_tracker_remove_child_link() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child1 = Transaction::ttl_transaction();
+        let child2 = Transaction::ttl_transaction();
+
+        tracker.expect_and_register_sub_operation(parent, child1);
+        tracker.expect_and_register_sub_operation(parent, child2);
+
+        // Remove first child link
+        tracker.remove_child_link(parent, child1);
+
+        // Verify child1 is removed from parent mapping
+        assert!(
+            !tracker.parent_of.contains_key(&child1),
+            "child1 should be removed from parent_of"
+        );
+        assert!(
+            tracker
+                .sub_operations
+                .get(&parent)
+                .map(|children| !children.contains(&child1))
+                .unwrap_or(false),
+            "child1 should be removed from sub_operations"
+        );
+
+        // Verify child2 still exists
+        assert!(
+            tracker.parent_of.contains_key(&child2),
+            "child2 should still be in parent_of"
+        );
+        assert!(
+            tracker.sub_operations.contains_key(&parent),
+            "parent should still be in sub_operations"
+        );
+
+        // Remove second child link
+        tracker.remove_child_link(parent, child2);
+
+        // Verify parent is removed from sub_operations when last child is removed
+        assert!(
+            !tracker.sub_operations.contains_key(&parent),
+            "parent should be removed from sub_operations when all children removed"
+        );
+        assert!(
+            !tracker.parent_of.contains_key(&child2),
+            "child2 should be removed from parent_of"
+        );
+    }
+
+    #[test]
+    fn sub_operation_tracker_mark_sub_op_completed_decrements_counter() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child1 = Transaction::ttl_transaction();
+        let child2 = Transaction::ttl_transaction();
+        let child3 = Transaction::ttl_transaction();
+
+        tracker.expect_and_register_sub_operation(parent, child1);
+        tracker.expect_and_register_sub_operation(parent, child2);
+        tracker.expect_and_register_sub_operation(parent, child3);
+
+        // Initial count should be 3
+        assert_eq!(
+            tracker.expected_sub_operations.get(&parent).map(|v| *v),
+            Some(3)
+        );
+
+        // Mark one completed
+        tracker.mark_sub_op_completed(parent);
+        assert_eq!(
+            tracker.expected_sub_operations.get(&parent).map(|v| *v),
+            Some(2)
+        );
+
+        // Mark another completed
+        tracker.mark_sub_op_completed(parent);
+        assert_eq!(
+            tracker.expected_sub_operations.get(&parent).map(|v| *v),
+            Some(1)
+        );
+
+        // Mark last one completed
+        tracker.mark_sub_op_completed(parent);
+
+        // Should be removed when count reaches 0
+        assert!(
+            !tracker.expected_sub_operations.contains_key(&parent),
+            "expected_sub_operations entry should be removed when count reaches 0"
+        );
+    }
+
+    #[test]
+    fn sub_operation_tracker_bidirectional_mapping_consistency() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child1 = Transaction::ttl_transaction();
+        let child2 = Transaction::ttl_transaction();
+
+        tracker.expect_and_register_sub_operation(parent, child1);
+        tracker.expect_and_register_sub_operation(parent, child2);
+
+        // Verify bidirectional mapping: parent -> children
+        let children = tracker.sub_operations.get(&parent).unwrap();
+        assert_eq!(children.len(), 2);
+        assert!(children.contains(&child1));
+        assert!(children.contains(&child2));
+
+        // Verify bidirectional mapping: child -> parent
+        assert_eq!(tracker.get_parent(child1), Some(parent));
+        assert_eq!(tracker.get_parent(child2), Some(parent));
+    }
+
+    #[test]
+    fn sub_operation_tracker_prevents_race_condition_with_atomic_registration() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let child = Transaction::ttl_transaction();
+
+        // Atomically register both expected count and relationship
+        tracker.expect_and_register_sub_operation(parent, child);
+
+        // Both registrations should happen together
+        assert!(
+            tracker.expected_sub_operations.contains_key(&parent),
+            "expected count should be registered"
+        );
+        assert!(
+            tracker.is_sub_operation(child),
+            "child should be registered as sub-operation"
+        );
+        assert!(
+            tracker.sub_operations.contains_key(&parent),
+            "parent-child mapping should be registered"
+        );
+    }
+
+    #[test]
+    fn sub_operation_tracker_handles_no_children() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+        let completed = DashSet::new();
+
+        // Parent with no children should be considered complete
+        assert!(
+            tracker.all_sub_operations_completed(parent, &completed),
+            "parent with no children should be complete"
+        );
+
+        // Count should be 0 for parent with no children
+        assert_eq!(
+            tracker.count_pending_sub_operations(parent, &completed),
+            0,
+            "parent with no children should have 0 pending operations"
+        );
+    }
+
+    #[test]
+    fn sub_operation_tracker_does_not_decrement_below_zero() {
+        let tracker = SubOperationTracker::new();
+        let parent = Transaction::ttl_transaction();
+
+        // Try to mark completed without any registered children
+        tracker.mark_sub_op_completed(parent);
+
+        // Should not panic or create negative count
+        assert!(
+            !tracker.expected_sub_operations.contains_key(&parent),
+            "should not create entry for non-existent parent"
+        );
+    }
 }
