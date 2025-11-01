@@ -342,7 +342,7 @@ async fn notify_transaction_timeout(
     {
         Ok(()) => true,
         Err(err) => {
-            tracing::debug!(
+            tracing::warn!(
                 tx = %tx,
                 error = ?err,
                 "Failed to notify event loop about timed out transaction; receiver likely dropped"
