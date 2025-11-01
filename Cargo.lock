@@ -1828,6 +1828,7 @@ dependencies = [
  "chrono",
  "clap",
  "freenet",
+ "freenet-macros 0.1.0",
  "freenet-ping-types",
  "freenet-stdlib",
  "futures 0.3.31",

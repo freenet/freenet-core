@@ -58,7 +58,6 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
         async fn #test_fn_name() -> freenet::test_utils::TestResult {
             use freenet::test_utils::{TestContext, TestLogger, NodeInfo};
             use std::time::{Duration, Instant};
-            use tokio::select;
             use anyhow::anyhow;
 
             // 1. Setup TestLogger
@@ -81,21 +80,22 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             // 5. Build TestContext with flush handles
             #context_creation
 
-            // 6. Start node tasks (run already-built nodes)
-            #node_tasks
+            // 6-8. Run test inside a LocalSet to support !Send futures
+            let local = tokio::task::LocalSet::new();
+            local.run_until(async move {
+                // 6. Start node tasks (run already-built nodes)
+                #node_tasks
 
-            // 7. Run test with coordination
-            // Note: Catching panics in async code while maintaining Send bounds
-            // and avoiding ctx move issues is complex. For now, use Result-based
-            // errors (bail!, ensure!) for best diagnostics.
-            let test_result = {
-                #test_coordination
-            };
+                // 7. Run test with coordination
+                let test_result = {
+                    #test_coordination
+                };
 
-            // 8. Handle failure reporting
-            #failure_reporting
+                // 8. Handle failure reporting
+                #failure_reporting
 
-            test_result
+                test_result
+            }).await
         }
 
         // User's test body as inner function
@@ -403,20 +403,18 @@ fn generate_node_tasks(args: &FreenetTestArgs) -> TokenStream {
         let node_var = format_ident!("node_{}", idx);
 
         tasks.push(quote! {
-            let #task_var = {
+            let #task_var = tokio::task::spawn_local({
                 let node = #node_var;
                 async move {
                     tracing::info!("Node running: {}", #node_label);
                     node.run().await
                 }
                 .instrument(tracing::info_span!("test_peer", test_node = #node_label))
-                .boxed_local()
-            };
+            });
         });
     }
 
     quote! {
-        use futures::FutureExt;
         use tracing::Instrument;
 
         #(#tasks)*
@@ -482,45 +480,24 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
     }
 }
 
-/// Generate test coordination code with select!
+/// Generate test coordination code with spawned tasks
 fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident) -> TokenStream {
     let timeout_secs = args.timeout_secs;
     let startup_wait_secs = args.startup_wait_secs;
 
-    // Generate select! arms for each node
-    let mut select_arms = Vec::new();
-    for (idx, node_label) in args.nodes.iter().enumerate() {
-        let task_var = format_ident!("node_task_{}", idx);
-        select_arms.push(quote! {
-            result = #task_var => {
-                Err(anyhow!("Node '{}' exited unexpectedly: {:?}", #node_label, result))
-            }
-        });
-    }
-
-    // Add test arm
-    select_arms.push(quote! {
-        result = test_future => {
-            match result {
-                Ok(Ok(val)) => {
-                    // Give event loggers time to flush their batches
-                    // The EventRegister is cloned multiple times, so all senders need to be dropped
-                    // before the record_logs task will exit and flush remaining events
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    Ok(val)
-                },
-                Ok(Err(e)) => {
-                    // Also flush on error
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    Err(e)
-                },
-                Err(_) => Err(anyhow!("Test timed out after {} seconds", #timeout_secs)),
-            }
-        }
-    });
+    // Collect all node task variables
+    let task_vars: Vec<_> = (0..args.nodes.len())
+        .map(|idx| format_ident!("node_task_{}", idx))
+        .collect();
+    let node_labels = &args.nodes;
 
     quote! {
-        let test_future = tokio::time::timeout(
+        // Store node handles for monitoring (optional)
+        let _node_handles = vec![#(#task_vars),*];
+        let _node_labels = vec![#(#node_labels),*];
+
+        // Run test with timeout
+        let test_result = tokio::time::timeout(
             Duration::from_secs(#timeout_secs),
             async {
                 // Wait for nodes to start
@@ -531,10 +508,21 @@ fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident
                 // Run user's test
                 #inner_fn_name(&mut ctx).await
             }
-        );
+        ).await;
 
-        select! {
-            #(#select_arms),*
+        // Check test result
+        match test_result {
+            Ok(Ok(val)) => {
+                // Give event loggers time to flush their batches
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(val)
+            },
+            Ok(Err(e)) => {
+                // Also flush on error
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Err(e)
+            },
+            Err(_) => Err(anyhow!("Test timed out after {} seconds", #timeout_secs)),
         }
     }
 }

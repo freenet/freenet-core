@@ -3,7 +3,7 @@ mod common;
 use std::{net::TcpListener, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::TestContext};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{
@@ -12,7 +12,7 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::FutureExt;
 use rand::SeedableRng;
 use testresult::TestResult;
 use tokio::{select, time::sleep, time::timeout};
@@ -20,8 +20,8 @@ use tokio_tungstenite::connect_async;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
 use common::{
-    base_node_test_config, base_node_test_config_with_rng, gw_config_from_path,
-    gw_config_from_path_with_rng, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    base_node_test_config_with_rng, gw_config_from_path_with_rng, APP_TAG, PACKAGE_DIR,
+    PATH_TO_CONTRACT,
 };
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
@@ -1877,7 +1877,7 @@ async fn test_ping_partially_connected_network(
         .collect::<Vec<_>>();
 
     if updater_indices.is_empty() {
-        return Err(anyhow!("No subscribed nodes to send updates!"));
+        return Err(anyhow!("No subscribed nodes to send updates!").into());
     }
 
     let updater_idx = updater_indices[0];
