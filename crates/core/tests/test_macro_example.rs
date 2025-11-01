@@ -212,7 +212,6 @@ async fn test_multiple_gateways(ctx: &mut TestContext) -> TestResult {
 /// Test with auto_connect_peers enabled
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true,
     timeout_secs = 120,
     startup_wait_secs = 15
 )]
@@ -242,7 +241,6 @@ async fn test_auto_connect_peers(ctx: &mut TestContext) -> TestResult {
 #[freenet_test(
     nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
     gateways = ["gw-1", "gw-2"],
-    auto_connect_peers = true,
     timeout_secs = 120,
     startup_wait_secs = 15
 )]

@@ -1522,14 +1522,15 @@ async fn test_ping_application_loop() -> TestResult {
 #[freenet_macros::freenet_test(
     nodes = ["gw-0", "gw-1", "gw-2", "node-0", "node-1", "node-2", "node-3", "node-4", "node-5", "node-6"],
     gateways = ["gw-0", "gw-1", "gw-2"],
-    auto_connect_peers = true,
     peer_connectivity_ratio = 0.5,
     timeout_secs = 240,
     startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     aggregate_events = "on_failure"
 )]
-async fn test_ping_partially_connected_network(ctx: &mut freenet::test_utils::TestContext) -> TestResult {
+async fn test_ping_partially_connected_network(
+    ctx: &mut freenet::test_utils::TestContext,
+) -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
      *
@@ -1681,7 +1682,10 @@ async fn test_ping_partially_connected_network(ctx: &mut freenet::test_utils::Te
             let client = &mut node_clients[node_idx];
 
             match timeout(Duration::from_millis(500), client.recv()).await {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }))) => {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    ..
+                }))) => {
                     if key == contract_key {
                         tracing::info!("Node {} successfully got the contract", node_idx);
                         nodes_with_contract[node_idx] = true;
@@ -1689,7 +1693,7 @@ async fn test_ping_partially_connected_network(ctx: &mut freenet::test_utils::Te
                         continue;
                     }
                 }
-                Ok(Ok(_)) => {},
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     tracing::warn!("Error receiving from node {}: {}", node_idx, e);
                     get_requests.remove(i);
@@ -1707,7 +1711,10 @@ async fn test_ping_partially_connected_network(ctx: &mut freenet::test_utils::Te
             let client = &mut gateway_clients[gw_idx];
 
             match timeout(Duration::from_millis(500), client.recv()).await {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }))) => {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    ..
+                }))) => {
                     if key == contract_key {
                         tracing::info!("Gateway {} successfully got the contract", gw_idx);
                         gateways_with_contract[gw_idx] = true;
@@ -1715,7 +1722,7 @@ async fn test_ping_partially_connected_network(ctx: &mut freenet::test_utils::Te
                         continue;
                     }
                 }
-                Ok(Ok(_)) => {},
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
                     gw_get_requests.remove(i);
@@ -1731,357 +1738,413 @@ async fn test_ping_partially_connected_network(ctx: &mut freenet::test_utils::Te
 
     // Log initial contract distribution
     tracing::info!("Initial contract distribution:");
-    tracing::info!("Gateways with contract: {}/{}",
-                  gateways_with_contract.iter().filter(|&&x| x).count(),
-                  num_gateways);
-    tracing::info!("Regular nodes with contract: {}/{}",
-                  nodes_with_contract.iter().filter(|&&x| x).count(),
-                  num_regular_nodes);
+    tracing::info!(
+        "Gateways with contract: {}/{}",
+        gateways_with_contract.iter().filter(|&&x| x).count(),
+        num_gateways
+    );
+    tracing::info!(
+        "Regular nodes with contract: {}/{}",
+        nodes_with_contract.iter().filter(|&&x| x).count(),
+        num_regular_nodes
+    );
 
     // All nodes with the contract subscribe to it
     let mut subscribed_nodes = vec![false; num_regular_nodes];
     let mut subscription_requests = Vec::new();
 
-        for (i, has_contract) in nodes_with_contract.iter().enumerate() {
-            if *has_contract {
-                node_clients[i]
-                    .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                        key: contract_key,
-                        summary: None,
-                    }))
-                    .await?;
-                subscription_requests.push(i);
-            }
+    for (i, has_contract) in nodes_with_contract.iter().enumerate() {
+        if *has_contract {
+            node_clients[i]
+                .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+                    key: contract_key,
+                    summary: None,
+                }))
+                .await?;
+            subscription_requests.push(i);
+        }
+    }
+
+    // Also subscribe gateways
+    let mut subscribed_gateways = [false; NUM_GATEWAYS];
+    let mut gw_subscription_requests = Vec::new();
+
+    for (i, has_contract) in gateways_with_contract.iter().enumerate() {
+        if *has_contract {
+            gateway_clients[i]
+                .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+                    key: contract_key,
+                    summary: None,
+                }))
+                .await?;
+            gw_subscription_requests.push(i);
+        }
+    }
+
+    // Process subscription responses with a timeout
+    let start = std::time::Instant::now();
+    let total_timeout = Duration::from_secs(30);
+
+    while !subscription_requests.is_empty() || !gw_subscription_requests.is_empty() {
+        if start.elapsed() > total_timeout {
+            tracing::warn!("Timeout waiting for subscription responses, continuing with test");
+            break;
         }
 
-        // Also subscribe gateways
-        let mut subscribed_gateways = [false; NUM_GATEWAYS];
-        let mut gw_subscription_requests = Vec::new();
+        // Check regular nodes
+        let mut i = 0;
+        while i < subscription_requests.len() {
+            let node_idx = subscription_requests[i];
+            let client = &mut node_clients[node_idx];
 
-        for (i, has_contract) in gateways_with_contract.iter().enumerate() {
-            if *has_contract {
-                gateway_clients[i]
-                    .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                        key: contract_key,
-                        summary: None,
-                    }))
-                    .await?;
-                gw_subscription_requests.push(i);
-            }
-        }
-
-        // Process subscription responses with a timeout
-        let start = std::time::Instant::now();
-        let total_timeout = Duration::from_secs(30);
-
-        while !subscription_requests.is_empty() || !gw_subscription_requests.is_empty() {
-            if start.elapsed() > total_timeout {
-                tracing::warn!("Timeout waiting for subscription responses, continuing with test");
-                break;
-            }
-
-            // Check regular nodes
-            let mut i = 0;
-            while i < subscription_requests.len() {
-                let node_idx = subscription_requests[i];
-                let client = &mut node_clients[node_idx];
-
-                match timeout(Duration::from_millis(500), client.recv()).await {
-                    Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key, subscribed, .. }))) => {
-                        if key == contract_key {
-                            tracing::info!("Node {} subscription result: {}", node_idx, subscribed);
-                            subscribed_nodes[node_idx] = subscribed;
-                            subscription_requests.remove(i);
-                            continue;
-                        }
-                    }
-                    Ok(Ok(_)) => {},
-                    Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from node {}: {}", node_idx, e);
+            match timeout(Duration::from_millis(500), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                    key,
+                    subscribed,
+                    ..
+                }))) => {
+                    if key == contract_key {
+                        tracing::info!("Node {} subscription result: {}", node_idx, subscribed);
+                        subscribed_nodes[node_idx] = subscribed;
                         subscription_requests.remove(i);
                         continue;
                     }
-                    Err(_) => {}
                 }
-                i += 1;
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("Error receiving from node {}: {}", node_idx, e);
+                    subscription_requests.remove(i);
+                    continue;
+                }
+                Err(_) => {}
             }
+            i += 1;
+        }
 
-            // Check gateways
-            let mut i = 0;
-            while i < gw_subscription_requests.len() {
-                let gw_idx = gw_subscription_requests[i];
-                let client = &mut gateway_clients[gw_idx];
+        // Check gateways
+        let mut i = 0;
+        while i < gw_subscription_requests.len() {
+            let gw_idx = gw_subscription_requests[i];
+            let client = &mut gateway_clients[gw_idx];
 
-                match timeout(Duration::from_millis(500), client.recv()).await {
-                    Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key, subscribed, .. }))) => {
-                        if key == contract_key {
-                            tracing::info!("Gateway {} subscription result: {}", gw_idx, subscribed);
-                            subscribed_gateways[gw_idx] = subscribed;
-                            gw_subscription_requests.remove(i);
-                            continue;
-                        }
-                    }
-                    Ok(Ok(_)) => {},
-                    Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
+            match timeout(Duration::from_millis(500), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                    key,
+                    subscribed,
+                    ..
+                }))) => {
+                    if key == contract_key {
+                        tracing::info!("Gateway {} subscription result: {}", gw_idx, subscribed);
+                        subscribed_gateways[gw_idx] = subscribed;
                         gw_subscription_requests.remove(i);
                         continue;
                     }
-                    Err(_) => {}
                 }
-                i += 1;
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
+                    gw_subscription_requests.remove(i);
+                    continue;
+                }
+                Err(_) => {}
             }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            i += 1;
         }
 
-        // Log subscription results
-        tracing::info!("Initial subscription results:");
-        tracing::info!("Subscribed gateways: {}/{} (with contract: {})",
-                      subscribed_gateways.iter().filter(|&&x| x).count(),
-                      NUM_GATEWAYS,
-                      gateways_with_contract.iter().filter(|&&x| x).count());
-        tracing::info!("Subscribed regular nodes: {}/{} (with contract: {})",
-                      subscribed_nodes.iter().filter(|&&x| x).count(),
-                      NUM_REGULAR_NODES,
-                      nodes_with_contract.iter().filter(|&&x| x).count());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-        // Choose one subscribed node to send an update
-        let updater_indices = subscribed_nodes.iter()
-            .enumerate()
-            .filter_map(|(i, &subscribed)| if subscribed { Some(i) } else { None })
-            .collect::<Vec<_>>();
+    // Log subscription results
+    tracing::info!("Initial subscription results:");
+    tracing::info!(
+        "Subscribed gateways: {}/{} (with contract: {})",
+        subscribed_gateways.iter().filter(|&&x| x).count(),
+        NUM_GATEWAYS,
+        gateways_with_contract.iter().filter(|&&x| x).count()
+    );
+    tracing::info!(
+        "Subscribed regular nodes: {}/{} (with contract: {})",
+        subscribed_nodes.iter().filter(|&&x| x).count(),
+        NUM_REGULAR_NODES,
+        nodes_with_contract.iter().filter(|&&x| x).count()
+    );
 
-        if updater_indices.is_empty() {
-            return Err(anyhow!("No subscribed nodes to send updates!"));
+    // Choose one subscribed node to send an update
+    let updater_indices = subscribed_nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &subscribed)| if subscribed { Some(i) } else { None })
+        .collect::<Vec<_>>();
+
+    if updater_indices.is_empty() {
+        return Err(anyhow!("No subscribed nodes to send updates!"));
+    }
+
+    let updater_idx = updater_indices[0];
+    tracing::info!("Node {} will send an update", updater_idx);
+
+    // Create a unique tag for the updater
+    let update_tag = format!("ping-from-node-{updater_idx}");
+
+    // Send the update
+    let mut update_ping = Ping::default();
+    update_ping.insert(update_tag.clone());
+
+    tracing::info!(
+        "Node {} sending update with tag: {}",
+        updater_idx,
+        update_tag
+    );
+    node_clients[updater_idx]
+        .send(ClientRequest::ContractOp(ContractRequest::Update {
+            key: contract_key,
+            data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&update_ping).unwrap())),
+        }))
+        .await?;
+
+    // Wait for the update to propagate through the network
+    tracing::info!("Waiting for update to propagate...");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    // Check which nodes received the update
+    let mut nodes_received_update = [false; NUM_REGULAR_NODES];
+    let mut get_state_requests = Vec::new();
+
+    for (i, subscribed) in subscribed_nodes.iter().enumerate() {
+        if *subscribed {
+            node_clients[i]
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key: contract_key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+            get_state_requests.push(i);
+        }
+    }
+
+    // Also check gateways
+    let mut gateways_received_update = [false; NUM_GATEWAYS];
+    let mut gw_get_state_requests = Vec::new();
+
+    for (i, subscribed) in subscribed_gateways.iter().enumerate() {
+        if *subscribed {
+            gateway_clients[i]
+                .send(ClientRequest::ContractOp(ContractRequest::Get {
+                    key: contract_key,
+                    return_contract_code: false,
+                    subscribe: false,
+                }))
+                .await?;
+            gw_get_state_requests.push(i);
+        }
+    }
+
+    // Process get state responses with a timeout
+    let start = std::time::Instant::now();
+    let total_timeout = Duration::from_secs(30);
+
+    while !get_state_requests.is_empty() || !gw_get_state_requests.is_empty() {
+        if start.elapsed() > total_timeout {
+            tracing::warn!("Timeout waiting for get state responses, finalizing test");
+            break;
         }
 
-        let updater_idx = updater_indices[0];
-        tracing::info!("Node {} will send an update", updater_idx);
+        // Check regular nodes
+        let mut i = 0;
+        while i < get_state_requests.len() {
+            let node_idx = get_state_requests[i];
+            let client = &mut node_clients[node_idx];
 
-        // Create a unique tag for the updater
-        let update_tag = format!("ping-from-node-{updater_idx}");
+            match timeout(Duration::from_millis(500), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    state,
+                    ..
+                }))) => {
+                    if key == contract_key {
+                        // Deserialize state and check for the update tag
+                        match serde_json::from_slice::<Ping>(&state) {
+                            Ok(ping_state) => {
+                                let has_update = ping_state.get(&update_tag).is_some();
+                                tracing::info!("Node {} has update: {}", node_idx, has_update);
 
-        // Send the update
-        let mut update_ping = Ping::default();
-        update_ping.insert(update_tag.clone());
-
-        tracing::info!("Node {} sending update with tag: {}", updater_idx, update_tag);
-        node_clients[updater_idx]
-            .send(ClientRequest::ContractOp(ContractRequest::Update {
-                key: contract_key,
-                data: UpdateData::Delta(StateDelta::from(serde_json::to_vec(&update_ping).unwrap())),
-            }))
-            .await?;
-
-        // Wait for the update to propagate through the network
-        tracing::info!("Waiting for update to propagate...");
-        tokio::time::sleep(Duration::from_secs(20)).await;
-
-        // Check which nodes received the update
-        let mut nodes_received_update = [false; NUM_REGULAR_NODES];
-        let mut get_state_requests = Vec::new();
-
-        for (i, subscribed) in subscribed_nodes.iter().enumerate() {
-            if *subscribed {
-                node_clients[i]
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key: contract_key,
-                        return_contract_code: false,
-                        subscribe: false,
-                    }))
-                    .await?;
-                get_state_requests.push(i);
-            }
-        }
-
-        // Also check gateways
-        let mut gateways_received_update = [false; NUM_GATEWAYS];
-        let mut gw_get_state_requests = Vec::new();
-
-        for (i, subscribed) in subscribed_gateways.iter().enumerate() {
-            if *subscribed {
-                gateway_clients[i]
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key: contract_key,
-                        return_contract_code: false,
-                        subscribe: false,
-                    }))
-                    .await?;
-                gw_get_state_requests.push(i);
-            }
-        }
-
-        // Process get state responses with a timeout
-        let start = std::time::Instant::now();
-        let total_timeout = Duration::from_secs(30);
-
-        while !get_state_requests.is_empty() || !gw_get_state_requests.is_empty() {
-            if start.elapsed() > total_timeout {
-                tracing::warn!("Timeout waiting for get state responses, finalizing test");
-                break;
-            }
-
-            // Check regular nodes
-            let mut i = 0;
-            while i < get_state_requests.len() {
-                let node_idx = get_state_requests[i];
-                let client = &mut node_clients[node_idx];
-
-                match timeout(Duration::from_millis(500), client.recv()).await {
-                    Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }))) => {
-                        if key == contract_key {
-                            // Deserialize state and check for the update tag
-                            match serde_json::from_slice::<Ping>(&state) {
-                                Ok(ping_state) => {
-                                    let has_update = ping_state.get(&update_tag).is_some();
-                                    tracing::info!("Node {} has update: {}", node_idx, has_update);
-
-                                    if has_update {
-                                        let timestamps = ping_state.get(&update_tag).unwrap();
-                                        tracing::info!("Node {} has {} timestamps for tag {}",
-                                                      node_idx,
-                                                      timestamps.len(),
-                                                      update_tag);
-                                    }
-
-                                    nodes_received_update[node_idx] = has_update;
+                                if has_update {
+                                    let timestamps = ping_state.get(&update_tag).unwrap();
+                                    tracing::info!(
+                                        "Node {} has {} timestamps for tag {}",
+                                        node_idx,
+                                        timestamps.len(),
+                                        update_tag
+                                    );
                                 }
-                                Err(e) => {
-                                    tracing::warn!("Failed to deserialize state from node {}: {}", node_idx, e);
-                                }
+
+                                nodes_received_update[node_idx] = has_update;
                             }
-                            get_state_requests.remove(i);
-                            continue;
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to deserialize state from node {}: {}",
+                                    node_idx,
+                                    e
+                                );
+                            }
                         }
-                    }
-                    Ok(Ok(_)) => {},
-                    Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from node {}: {}", node_idx, e);
                         get_state_requests.remove(i);
                         continue;
                     }
-                    Err(_) => {}
                 }
-                i += 1;
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("Error receiving from node {}: {}", node_idx, e);
+                    get_state_requests.remove(i);
+                    continue;
+                }
+                Err(_) => {}
             }
+            i += 1;
+        }
 
-            // Check gateways
-            let mut i = 0;
-            while i < gw_get_state_requests.len() {
-                let gw_idx = gw_get_state_requests[i];
-                let client = &mut gateway_clients[gw_idx];
+        // Check gateways
+        let mut i = 0;
+        while i < gw_get_state_requests.len() {
+            let gw_idx = gw_get_state_requests[i];
+            let client = &mut gateway_clients[gw_idx];
 
-                match timeout(Duration::from_millis(500), client.recv()).await {
-                    Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }))) => {
-                        if key == contract_key {
-                            // Deserialize state and check for the update tag
-                            match serde_json::from_slice::<Ping>(&state) {
-                                Ok(ping_state) => {
-                                    let has_update = ping_state.get(&update_tag).is_some();
-                                    tracing::info!("Gateway {} has update: {}", gw_idx, has_update);
+            match timeout(Duration::from_millis(500), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    state,
+                    ..
+                }))) => {
+                    if key == contract_key {
+                        // Deserialize state and check for the update tag
+                        match serde_json::from_slice::<Ping>(&state) {
+                            Ok(ping_state) => {
+                                let has_update = ping_state.get(&update_tag).is_some();
+                                tracing::info!("Gateway {} has update: {}", gw_idx, has_update);
 
-                                    if has_update {
-                                        let timestamps = ping_state.get(&update_tag).unwrap();
-                                        tracing::info!("Gateway {} has {} timestamps for tag {}",
-                                                      gw_idx,
-                                                      timestamps.len(),
-                                                      update_tag);
-                                    }
-
-                                    gateways_received_update[gw_idx] = has_update;
+                                if has_update {
+                                    let timestamps = ping_state.get(&update_tag).unwrap();
+                                    tracing::info!(
+                                        "Gateway {} has {} timestamps for tag {}",
+                                        gw_idx,
+                                        timestamps.len(),
+                                        update_tag
+                                    );
                                 }
-                                Err(e) => {
-                                    tracing::warn!("Failed to deserialize state from gateway {}: {}", gw_idx, e);
-                                }
+
+                                gateways_received_update[gw_idx] = has_update;
                             }
-                            gw_get_state_requests.remove(i);
-                            continue;
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to deserialize state from gateway {}: {}",
+                                    gw_idx,
+                                    e
+                                );
+                            }
                         }
-                    }
-                    Ok(Ok(_)) => {},
-                    Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
                         gw_get_state_requests.remove(i);
                         continue;
                     }
-                    Err(_) => {}
                 }
-                i += 1;
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
+                    gw_get_state_requests.remove(i);
+                    continue;
+                }
+                Err(_) => {}
             }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            i += 1;
         }
 
-        // Analyze update propagation results
-        tracing::info!("Final update propagation results:");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-        // Summary for gateways
-        let subscribed_gw_count = subscribed_gateways.iter().filter(|&&x| x).count();
-        let updated_gw_count = gateways_received_update.iter().filter(|&&x| x).count();
+    // Analyze update propagation results
+    tracing::info!("Final update propagation results:");
 
-        tracing::info!("Gateways: {}/{} subscribed received the update ({:.1}%)",
-                      updated_gw_count,
-                      subscribed_gw_count,
-                      if subscribed_gw_count > 0 {
-                          (updated_gw_count as f64 / subscribed_gw_count as f64) * 100.0
-                      } else {
-                          0.0
-                      });
+    // Summary for gateways
+    let subscribed_gw_count = subscribed_gateways.iter().filter(|&&x| x).count();
+    let updated_gw_count = gateways_received_update.iter().filter(|&&x| x).count();
 
-        // Summary for regular nodes
-        let subscribed_node_count = subscribed_nodes.iter().filter(|&&x| x).count();
-        let updated_node_count = nodes_received_update.iter().filter(|&&x| x).count();
-
-        tracing::info!("Regular nodes: {}/{} subscribed received the update ({:.1}%)",
-                      updated_node_count,
-                      subscribed_node_count,
-                      if subscribed_node_count > 0 {
-                          (updated_node_count as f64 / subscribed_node_count as f64) * 100.0
-                      } else {
-                          0.0
-                      });
-
-        // Check nodes that didn't receive updates
-        for (node_idx, (subscribed, updated)) in subscribed_nodes.iter().zip(nodes_received_update.iter()).enumerate() {
-            if *subscribed && !updated {
-                tracing::warn!("Node {} was subscribed but did not receive the update!", node_idx);
-
-                // Get the node connectivity info
-                let connections = node_connections[node_idx];
-                tracing::warn!("Node {} is connected to {} other regular nodes", node_idx, connections);
-            }
-        }
-
-        // Verify that updates have propagated to at least some nodes
-        assert!(
-            updated_node_count > 0,
-            "No nodes received the update, subscription propagation failed"
-        );
-
-        // Verify that if we have multiple gateways, at least some received the update
-        if NUM_GATEWAYS > 1 && subscribed_gw_count > 1 {
-            assert!(
-                updated_gw_count > 0,
-                "No gateways received the update, gateway subscription propagation failed"
-            );
-        }
-
-        // Calculate and assert a minimum expected update propagation rate
-        let min_expected_rate = 0.5; // At least 50% of subscribed nodes should get updates
-
-        let actual_rate = if subscribed_node_count > 0 {
-            updated_node_count as f64 / subscribed_node_count as f64
+    tracing::info!(
+        "Gateways: {}/{} subscribed received the update ({:.1}%)",
+        updated_gw_count,
+        subscribed_gw_count,
+        if subscribed_gw_count > 0 {
+            (updated_gw_count as f64 / subscribed_gw_count as f64) * 100.0
         } else {
             0.0
-        };
+        }
+    );
 
+    // Summary for regular nodes
+    let subscribed_node_count = subscribed_nodes.iter().filter(|&&x| x).count();
+    let updated_node_count = nodes_received_update.iter().filter(|&&x| x).count();
+
+    tracing::info!(
+        "Regular nodes: {}/{} subscribed received the update ({:.1}%)",
+        updated_node_count,
+        subscribed_node_count,
+        if subscribed_node_count > 0 {
+            (updated_node_count as f64 / subscribed_node_count as f64) * 100.0
+        } else {
+            0.0
+        }
+    );
+
+    // Check nodes that didn't receive updates
+    for (node_idx, (subscribed, updated)) in subscribed_nodes
+        .iter()
+        .zip(nodes_received_update.iter())
+        .enumerate()
+    {
+        if *subscribed && !updated {
+            tracing::warn!(
+                "Node {} was subscribed but did not receive the update!",
+                node_idx
+            );
+
+            // Get the node connectivity info
+            let connections = node_connections[node_idx];
+            tracing::warn!(
+                "Node {} is connected to {} other regular nodes",
+                node_idx,
+                connections
+            );
+        }
+    }
+
+    // Verify that updates have propagated to at least some nodes
+    assert!(
+        updated_node_count > 0,
+        "No nodes received the update, subscription propagation failed"
+    );
+
+    // Verify that if we have multiple gateways, at least some received the update
+    if NUM_GATEWAYS > 1 && subscribed_gw_count > 1 {
         assert!(
-            actual_rate >= min_expected_rate,
-            "Update propagation rate too low: {:.1}% (expected at least {:.1}%)",
-            actual_rate * 100.0,
-            min_expected_rate * 100.0
+            updated_gw_count > 0,
+            "No gateways received the update, gateway subscription propagation failed"
         );
+    }
+
+    // Calculate and assert a minimum expected update propagation rate
+    let min_expected_rate = 0.5; // At least 50% of subscribed nodes should get updates
+
+    let actual_rate = if subscribed_node_count > 0 {
+        updated_node_count as f64 / subscribed_node_count as f64
+    } else {
+        0.0
+    };
+
+    assert!(
+        actual_rate >= min_expected_rate,
+        "Update propagation rate too low: {:.1}% (expected at least {:.1}%)",
+        actual_rate * 100.0,
+        min_expected_rate * 100.0
+    );
 
     tracing::info!("Subscription propagation test completed successfully!");
 

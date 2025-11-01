@@ -42,7 +42,7 @@ impl syn::parse::Parse for FreenetTestArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut nodes = None;
         let mut gateways = None;
-        let mut auto_connect_peers = false;
+        let mut auto_connect_peers = true;
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
         let mut aggregate_events = AggregateEventsMode::OnFailure;
@@ -233,6 +233,7 @@ mod tests {
 
         let args: FreenetTestArgs = syn::parse2(tokens).unwrap();
         assert_eq!(args.nodes, vec!["gateway", "peer-1"]);
+        assert_eq!(args.auto_connect_peers, true); // Verify default is true
         assert_eq!(args.timeout_secs, 180);
         assert_eq!(args.startup_wait_secs, 15);
         assert_eq!(args.aggregate_events, AggregateEventsMode::OnFailure);
@@ -275,5 +276,29 @@ mod tests {
 
         let result: Result<FreenetTestArgs, _> = syn::parse2(tokens);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auto_connect_peers_explicit_false() {
+        let tokens = quote! {
+            nodes = ["gateway", "peer-1"],
+            auto_connect_peers = false
+        };
+
+        let args: FreenetTestArgs = syn::parse2(tokens).unwrap();
+        assert_eq!(args.nodes, vec!["gateway", "peer-1"]);
+        assert_eq!(args.auto_connect_peers, false); // Verify explicit false works
+    }
+
+    #[test]
+    fn test_auto_connect_peers_explicit_true() {
+        let tokens = quote! {
+            nodes = ["gateway", "peer-1"],
+            auto_connect_peers = true
+        };
+
+        let args: FreenetTestArgs = syn::parse2(tokens).unwrap();
+        assert_eq!(args.nodes, vec!["gateway", "peer-1"]);
+        assert_eq!(args.auto_connect_peers, true);
     }
 }
