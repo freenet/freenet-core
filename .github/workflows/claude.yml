@@ -19,16 +19,18 @@ jobs:
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-      id-token: write
-      actions: read # Required for Claude to read CI results on PRs
+      contents: write       # Allows pushing commits, rebasing, creating branches
+      pull-requests: write  # Allows updating PRs, requesting reviews, merging
+      issues: write         # Allows commenting on issues, updating labels
+      id-token: write       # Required for GitHub App authentication
+      actions: read         # Required for Claude to read CI results on PRs
+      checks: read          # Allows reading check run status
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          fetch-depth: 1
+          fetch-depth: 0  # Full history needed for git operations like rebase
+          token: ${{ secrets.GITHUB_TOKEN }}  # Use workflow token for git operations
 
       - name: Run Claude Code
         id: claude
@@ -46,5 +48,17 @@ jobs:
           # Optional: Add claude_args to customize behavior and configuration
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://docs.claude.com/en/docs/claude-code/sdk#command-line for available options
-          # claude_args: '--model claude-opus-4-1-20250805 --allowed-tools Bash(gh pr:*)'
+          #
+          # Examples:
+          # Use Opus for complex tasks:
+          #   claude_args: '--model claude-opus-4-1-20250805'
+          #
+          # Allow specific git/gh operations:
+          #   claude_args: '--allowed-tools Bash(git rebase:*) Bash(git push:*) Bash(gh pr:*)'
+          #
+          # Note: With the permissions above, Claude can now:
+          #   - Rebase branches (git rebase)
+          #   - Push commits (git push, git push --force-with-lease)
+          #   - Update PRs (gh pr edit, gh pr review, gh pr merge)
+          #   - Comment on issues and PRs (gh issue comment, gh pr comment)
 
