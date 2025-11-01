@@ -888,12 +888,27 @@ impl P2pConnManager {
                         .await?;
                         Ok(EventResult::Continue)
                     }
-                    Err(handshake_error) => {
-                        tracing::error!(?handshake_error, "Handshake handler error");
-                        Ok(EventResult::Event(
-                            ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
-                        ))
-                    }
+                    Err(handshake_error) => match handshake_error {
+                        HandshakeError::ConnectionClosed(addr) => {
+                            tracing::warn!(
+                                %addr,
+                                "Handshake handler reported connection closed - continuing without shutdown"
+                            );
+                            Ok(EventResult::Continue)
+                        }
+                        HandshakeError::ChannelClosed => {
+                            tracing::warn!(
+                                    "Handshake channel reported as closed - treating as transient and continuing"
+                                );
+                            Ok(EventResult::Continue)
+                        }
+                        _ => {
+                            tracing::error!(?handshake_error, "Handshake handler error");
+                            Ok(EventResult::Event(
+                                ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
+                            ))
+                        }
+                    },
                 }
             }
             SelectResult::NodeController(msg) => {
@@ -1281,14 +1296,37 @@ impl P2pConnManager {
                 let key = (*self.bridge.op_manager.ring.connection_manager.pub_key).clone();
                 PeerId::new(self_addr, key)
             };
-            timeout(
+            let connection_peer_id = peer_id.clone();
+            match timeout(
                 Duration::from_secs(60),
-                cb.send_result(Ok((peer_id, remaining_checks))),
+                cb.send_result(Ok((connection_peer_id, remaining_checks))),
             )
             .await
-            .inspect_err(|error| {
-                tracing::error!("Failed to send connection result: {:?}", error);
-            })??;
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(HandshakeError::ChannelClosed)) => {
+                    tracing::debug!(
+                        %peer_id,
+                        "Connection result receiver dropped before completion; treating as benign"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        %peer_id,
+                        error = ?e,
+                        "Failed to deliver connection result to caller"
+                    );
+                    return Err(anyhow::Error::new(e));
+                }
+                Err(elapsed) => {
+                    tracing::error!(
+                        %peer_id,
+                        elapsed = ?elapsed,
+                        "Timed out delivering connection result to caller"
+                    );
+                    return Err(anyhow::Error::from(elapsed));
+                }
+            }
         } else {
             tracing::warn!(%peer_id, "No callback for connection established");
         }

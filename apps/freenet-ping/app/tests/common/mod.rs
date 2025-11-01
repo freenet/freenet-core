@@ -309,7 +309,7 @@ fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
         &BuildToolConfig {
             features: None,
             package_type: PackageType::Contract,
-            debug: true,
+            debug: false,
         },
         contract_path,
     )?;
