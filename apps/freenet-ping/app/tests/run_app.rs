@@ -1519,391 +1519,228 @@ async fn test_ping_application_loop() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_ping_partially_connected_network() -> TestResult {
+#[freenet_macros::freenet_test(
+    nodes = ["gw-0", "gw-1", "gw-2", "node-0", "node-1", "node-2", "node-3", "node-4", "node-5", "node-6"],
+    gateways = ["gw-0", "gw-1", "gw-2"],
+    auto_connect_peers = true,
+    peer_connectivity_ratio = 0.5,
+    timeout_secs = 240,
+    startup_wait_secs = 30,
+    tokio_flavor = "multi_thread",
+    aggregate_events = "on_failure"
+)]
+async fn test_ping_partially_connected_network(ctx: &mut freenet::test_utils::TestContext) -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
      *
-     * Parameters:
-     * - NUM_GATEWAYS: Number of gateway nodes to create (default: 3)
-     * - NUM_REGULAR_NODES: Number of regular nodes to create (default: 7)
-     * - CONNECTIVITY_RATIO: Percentage of connectivity between regular nodes (0.0-1.0)
-     *
-     * Network Topology:
-     * - Creates a network with specified number of gateway and regular nodes
-     * - ALL regular nodes connect to ALL gateways (full gateway connectivity)
-     * - Regular nodes have partial connectivity to other regular nodes based on CONNECTIVITY_RATIO
-     * - Uses a deterministic approach to create partial connectivity between regular nodes
+     * Network Topology (configured by macro):
+     * - 3 gateways (gw-0, gw-1, gw-2)
+     * - 7 regular nodes (node-0 through node-6)
+     * - ALL regular nodes connect to ALL gateways (auto_connect_peers = true)
+     * - Regular nodes have 50% connectivity to other regular nodes (peer_connectivity_ratio = 0.5)
+     * - Uses deterministic blocking pattern based on node indices
      *
      * Test procedure:
-     * 1. Configures and starts all nodes with the specified topology
-     * 2. One node publishes the ping contract
-     * 3. Tracks which nodes successfully access the contract
-     * 4. Subscribes available nodes to the contract
-     * 5. Sends an update from one node
-     * 6. Verifies update propagation across the network
-     * 7. Analyzes results to detect potential subscription propagation issues
+     * 1. Load and publish the ping contract
+     * 2. Track which nodes successfully access the contract
+     * 3. Subscribe available nodes to the contract
+     * 4. Send an update from one node
+     * 5. Verify update propagation across the network
+     * 6. Analyze results to detect potential subscription propagation issues
      */
 
-    // Network configuration parameters
-    const NUM_GATEWAYS: usize = 3;
-    const NUM_REGULAR_NODES: usize = 7;
-    const CONNECTIVITY_RATIO: f64 = 0.5; // Controls connectivity between regular nodes
+    use tokio_tungstenite::connect_async;
 
-    // Configure logging
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
+    let num_gateways = ctx.gateways().len();
+    let num_regular_nodes = ctx.peers().len();
+
     tracing::info!(
-        "Starting test with {} gateways and {} regular nodes (connectivity ratio: {})",
-        NUM_GATEWAYS,
-        NUM_REGULAR_NODES,
-        CONNECTIVITY_RATIO
+        "Test started with {} gateways and {} regular nodes (50% connectivity ratio)",
+        num_gateways,
+        num_regular_nodes
     );
 
-    // Setup network sockets for the gateways
-    let mut gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
-    let mut ws_api_gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
-
-    for _ in 0..NUM_GATEWAYS {
-        gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
-        ws_api_gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
-    }
-
-    // Setup API sockets for regular nodes
-    let mut ws_api_node_sockets = Vec::with_capacity(NUM_REGULAR_NODES);
-    let mut regular_node_addresses = Vec::with_capacity(NUM_REGULAR_NODES);
-
-    // First, bind all sockets to get addresses for later blocking
-    for _i in 0..NUM_REGULAR_NODES {
-        let socket = TcpListener::bind("127.0.0.1:0")?;
-        // Store the address for later use in blocked_addresses
-        regular_node_addresses.push(socket.local_addr()?);
-        ws_api_node_sockets.push(TcpListener::bind("127.0.0.1:0")?);
-    }
-
-    // Configure gateway nodes
-    let mut gateway_info = Vec::new();
-    let mut ws_api_ports_gw = Vec::new();
-
-    // Build configurations and keep temp directories alive
-    let mut gateway_configs = Vec::with_capacity(NUM_GATEWAYS);
-    let mut gateway_presets = Vec::with_capacity(NUM_GATEWAYS);
-
-    for i in 0..NUM_GATEWAYS {
-        let data_dir_suffix = format!("gw_{i}");
-
-        let (cfg, preset) = base_node_test_config(
-            true,
-            vec![],
-            Some(gateway_sockets[i].local_addr()?.port()),
-            ws_api_gateway_sockets[i].local_addr()?.port(),
-            &data_dir_suffix,
-            None, // base_tmp_dir
-            None, // No blocked addresses for gateways
-        )
-        .await?;
-
-        let public_port = cfg.network_api.public_port.unwrap();
-        let path = preset.temp_dir.path().to_path_buf();
-        let config_info = gw_config_from_path(public_port, &path)?;
-
-        tracing::info!("Gateway {} data dir: {:?}", i, preset.temp_dir.path());
-        ws_api_ports_gw.push(cfg.ws_api.ws_api_port.unwrap());
-        gateway_info.push(config_info);
-        gateway_configs.push(cfg);
-        gateway_presets.push(preset);
-    }
-
-    // Serialize gateway info for nodes to use
-    let serialized_gateways: Vec<String> = gateway_info
-        .iter()
-        .map(|info| serde_json::to_string(info).unwrap())
-        .collect();
-
-    // Configure regular nodes with partial connectivity to OTHER regular nodes
-    let mut ws_api_ports_nodes = Vec::new();
-    let mut node_connections = Vec::new();
-
-    // Build configurations and keep temp directories alive
-    let mut node_configs = Vec::with_capacity(NUM_REGULAR_NODES);
-    let mut node_presets = Vec::with_capacity(NUM_REGULAR_NODES);
-
-    for (i, _) in ws_api_node_sockets.iter().enumerate() {
-        // Determine which other regular nodes this node should block
-        let mut blocked_addresses = Vec::new();
-        for (j, &addr) in regular_node_addresses.iter().enumerate() {
-            if i == j {
-                continue; // Skip self
-            }
-
-            // Use a deterministic approach based on node indices
-            // If the result is >= than CONNECTIVITY_RATIO, block the connection
-            let should_block = (i * j) % 100 >= (CONNECTIVITY_RATIO * 100.0) as usize;
-            if should_block {
-                blocked_addresses.push(addr);
-            }
-        }
-
-        // Count effective connections to other regular nodes
-        let effective_connections = (NUM_REGULAR_NODES - 1) - blocked_addresses.len();
-        node_connections.push(effective_connections);
-
-        let data_dir_suffix = format!("node_{i}");
-
-        let (cfg, preset) = base_node_test_config(
-            false,
-            serialized_gateways.clone(), // All nodes connect to all gateways
-            None,
-            ws_api_node_sockets[i].local_addr()?.port(),
-            &data_dir_suffix,
-            None,
-            Some(blocked_addresses.clone()), // Use blocked_addresses for regular nodes
-        )
-        .await?;
-
-        tracing::info!(
-            "Node {} data dir: {:?} - Connected to {} other regular nodes (blocked: {})",
-            i,
-            preset.temp_dir.path(),
-            effective_connections,
-            blocked_addresses.len()
+    // Connect WebSocket clients to all gateway nodes
+    let mut gateway_clients = Vec::with_capacity(num_gateways);
+    for gw in ctx.gateways() {
+        let uri = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            gw.ws_port
         );
-
-        ws_api_ports_nodes.push(cfg.ws_api.ws_api_port.unwrap());
-        node_configs.push(cfg);
-        node_presets.push(preset);
+        let (stream, _) = connect_async(&uri).await?;
+        let client = WebApi::start(stream);
+        gateway_clients.push(client);
+        tracing::info!("Connected to gateway {}", gw.label);
     }
 
-    // Free ports to avoid binding errors
-    std::mem::drop(gateway_sockets);
-    std::mem::drop(ws_api_gateway_sockets);
-    std::mem::drop(ws_api_node_sockets);
-
-    // Start all gateway nodes
-    let gateway_futures = FuturesUnordered::new();
-    for config in gateway_configs.into_iter() {
-        let gateway_future = async move {
-            let config = config.build().await?;
-            let node = NodeConfig::new(config.clone())
-                .await?
-                .build(serve_gateway(config.ws_api).await)
-                .await?;
-            node.run().await
-        }
-        .boxed_local();
-        gateway_futures.push(gateway_future);
+    // Connect WebSocket clients to all peer nodes
+    let mut node_clients = Vec::with_capacity(num_regular_nodes);
+    for peer in ctx.peers() {
+        let uri = format!(
+            "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+            peer.ws_port
+        );
+        let (stream, _) = connect_async(&uri).await?;
+        let client = WebApi::start(stream);
+        node_clients.push(client);
+        tracing::info!("Connected to peer {}", peer.label);
     }
 
-    // Start all regular nodes
-    let regular_node_futures = FuturesUnordered::new();
-    for config in node_configs.into_iter() {
-        let regular_node_future = async move {
-            let config = config.build().await?;
-            let node = NodeConfig::new(config.clone())
-                .await?
-                .build(serve_gateway(config.ws_api).await)
-                .await?;
-            node.run().await
-        }
-        .boxed_local();
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        regular_node_futures.push(regular_node_future);
-    }
+    // Load the ping contract. Compile once to determine the code hash, then again with proper options.
+    let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
+    tracing::info!(path=%path_to_code.display(), "loading contract code");
+    let temp_options = PingContractOptions {
+        frequency: Duration::from_secs(3),
+        ttl: Duration::from_secs(60),
+        tag: APP_TAG.to_string(),
+        code_key: String::new(),
+    };
+    let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
+    let temp_container = common::load_contract(&path_to_code, temp_params)?;
+    let code_hash = CodeHash::from_code(temp_container.data());
+    let ping_options = PingContractOptions {
+        frequency: Duration::from_secs(3),
+        ttl: Duration::from_secs(60),
+        tag: APP_TAG.to_string(),
+        code_key: code_hash.to_string(),
+    };
 
-    // Create a future that will complete if any gateway fails
-    let mut gateway_monitor = gateway_futures.into_future();
-    let mut regular_node_monitor = regular_node_futures.into_future();
+    let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
+    let container = common::load_contract(&path_to_code, params)?;
+    let contract_key = container.key();
 
-    let test = tokio::time::timeout(Duration::from_secs(240), async {
-        // Wait for nodes to start up
-        tracing::info!("Waiting for nodes to start up...");
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        tracing::info!("Proceeding to connect to nodes...");
+    // Choose a node to publish the contract
+    let publisher_idx = 0;
+    tracing::info!("Node {} will publish the contract", publisher_idx);
 
-        // Connect to all nodes with retry logic
-        let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
-        for (i, port) in ws_api_ports_gw.iter().enumerate() {
-            let uri = format!(
-                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
-            );
-            let (stream, _) = connect_async(&uri).await?;
-            let client = WebApi::start(stream);
-            gateway_clients.push(client);
-            tracing::info!("Connected to gateway {}", i);
-        }
+    // Publisher node puts the contract
+    let ping = Ping::default();
+    let serialized = serde_json::to_vec(&ping)?;
+    let wrapped_state = WrappedState::new(serialized);
 
-        let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
-        for (i, port) in ws_api_ports_nodes.iter().enumerate() {
-            let uri = format!(
-                "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
-            );
-            let (stream, _) = connect_async(&uri).await?;
-            let client = WebApi::start(stream);
-            node_clients.push(client);
-            tracing::info!("Connected to regular node {}", i);
-        }
+    let publisher = &mut node_clients[publisher_idx];
+    publisher
+        .send(ClientRequest::ContractOp(ContractRequest::Put {
+            contract: container.clone(),
+            state: wrapped_state.clone(),
+            related_contracts: RelatedContracts::new(),
+            subscribe: false,
+        }))
+        .await?;
 
-        // Log the node connectivity
-        tracing::info!("Node connectivity setup:");
-        for (i, num_connections) in node_connections.iter().enumerate() {
-            tracing::info!("Node {} is connected to all {} gateways and {} other regular nodes",
-                          i, NUM_GATEWAYS, num_connections);
-        }
+    // Wait for put response on publisher
+    let key = wait_for_put_response(publisher, &contract_key)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    tracing::info!(key=%key, "Publisher node {} put ping contract successfully!", publisher_idx);
 
-        // Load the ping contract. Compile once to determine the code hash, then again with proper options.
-        let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
-        tracing::info!(path=%path_to_code.display(), "loading contract code");
-        let temp_options = PingContractOptions {
-            frequency: Duration::from_secs(3),
-            ttl: Duration::from_secs(60),
-            tag: APP_TAG.to_string(),
-            code_key: String::new(),
-        };
-        let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
-        let temp_container = common::load_contract(&path_to_code, temp_params)?;
-        let code_hash = CodeHash::from_code(temp_container.data());
-        let ping_options = PingContractOptions {
-            frequency: Duration::from_secs(3),
-            ttl: Duration::from_secs(60),
-            tag: APP_TAG.to_string(),
-            code_key: code_hash.to_string(),
-        };
+    // All nodes try to get the contract to see which have access
+    let mut nodes_with_contract = vec![false; num_regular_nodes];
+    let mut get_requests = Vec::with_capacity(num_regular_nodes);
 
-        let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = common::load_contract(&path_to_code, params)?;
-        let contract_key = container.key();
-
-        // Choose a node to publish the contract
-        let publisher_idx = 0;
-        tracing::info!("Node {} will publish the contract", publisher_idx);
-
-        // Publisher node puts the contract
-        let ping = Ping::default();
-        let serialized = serde_json::to_vec(&ping)?;
-        let wrapped_state = WrappedState::new(serialized);
-
-        let publisher = &mut node_clients[publisher_idx];
-        publisher
-            .send(ClientRequest::ContractOp(ContractRequest::Put {
-                contract: container.clone(),
-                state: wrapped_state.clone(),
-                related_contracts: RelatedContracts::new(),
+    for (i, client) in node_clients.iter_mut().enumerate() {
+        client
+            .send(ClientRequest::ContractOp(ContractRequest::Get {
+                key: contract_key,
+                return_contract_code: true,
                 subscribe: false,
             }))
             .await?;
+        get_requests.push(i);
+    }
 
-        // Wait for put response on publisher
-        let key = wait_for_put_response(publisher, &contract_key)
-            .await
-            .map_err(anyhow::Error::msg)?;
-        tracing::info!(key=%key, "Publisher node {} put ping contract successfully!", publisher_idx);
+    // Track gateways with the contract
+    let mut gateways_with_contract = vec![false; num_gateways];
+    let mut gw_get_requests = Vec::with_capacity(num_gateways);
 
-        // All nodes try to get the contract to see which have access
-        let mut nodes_with_contract = [false; NUM_REGULAR_NODES];
-        let mut get_requests = Vec::with_capacity(NUM_REGULAR_NODES);
+    for (i, client) in gateway_clients.iter_mut().enumerate() {
+        client
+            .send(ClientRequest::ContractOp(ContractRequest::Get {
+                key: contract_key,
+                return_contract_code: true,
+                subscribe: false,
+            }))
+            .await?;
+        gw_get_requests.push(i);
+    }
 
-        for (i, client) in node_clients.iter_mut().enumerate() {
-            client
-                .send(ClientRequest::ContractOp(ContractRequest::Get {
-                    key: contract_key,
-                    return_contract_code: true,
-                    subscribe: false,
-                }))
-                .await?;
-            get_requests.push(i);
+    // Process all get responses with a timeout
+    let total_timeout = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+
+    while !get_requests.is_empty() || !gw_get_requests.is_empty() {
+        if start.elapsed() > total_timeout {
+            tracing::warn!("Timeout waiting for get responses, continuing with test");
+            break;
         }
 
-        // Track gateways with the contract
-        let mut gateways_with_contract = [false; NUM_GATEWAYS];
-        let mut gw_get_requests = Vec::with_capacity(NUM_GATEWAYS);
+        // Check regular nodes
+        let mut i = 0;
+        while i < get_requests.len() {
+            let node_idx = get_requests[i];
+            let client = &mut node_clients[node_idx];
 
-        for (i, client) in gateway_clients.iter_mut().enumerate() {
-            client
-                .send(ClientRequest::ContractOp(ContractRequest::Get {
-                    key: contract_key,
-                    return_contract_code: true,
-                    subscribe: false,
-                }))
-                .await?;
-            gw_get_requests.push(i);
-        }
-
-        // Process all get responses with a timeout
-        let total_timeout = Duration::from_secs(30);
-        let start = std::time::Instant::now();
-
-        while !get_requests.is_empty() || !gw_get_requests.is_empty() {
-            if start.elapsed() > total_timeout {
-                tracing::warn!("Timeout waiting for get responses, continuing with test");
-                break;
-            }
-
-            // Check regular nodes
-            let mut i = 0;
-            while i < get_requests.len() {
-                let node_idx = get_requests[i];
-                let client = &mut node_clients[node_idx];
-
-                match timeout(Duration::from_millis(500), client.recv()).await {
-                    Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }))) => {
-                        if key == contract_key {
-                            tracing::info!("Node {} successfully got the contract", node_idx);
-                            nodes_with_contract[node_idx] = true;
-                            get_requests.remove(i);
-                            continue;
-                        }
-                    }
-                    Ok(Ok(_)) => {},
-                    Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from node {}: {}", node_idx, e);
+            match timeout(Duration::from_millis(500), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }))) => {
+                    if key == contract_key {
+                        tracing::info!("Node {} successfully got the contract", node_idx);
+                        nodes_with_contract[node_idx] = true;
                         get_requests.remove(i);
                         continue;
                     }
-                    Err(_) => {}
                 }
-                i += 1;
+                Ok(Ok(_)) => {},
+                Ok(Err(e)) => {
+                    tracing::warn!("Error receiving from node {}: {}", node_idx, e);
+                    get_requests.remove(i);
+                    continue;
+                }
+                Err(_) => {}
             }
+            i += 1;
+        }
 
-            // Check gateways
-            let mut i = 0;
-            while i < gw_get_requests.len() {
-                let gw_idx = gw_get_requests[i];
-                let client = &mut gateway_clients[gw_idx];
+        // Check gateways
+        let mut i = 0;
+        while i < gw_get_requests.len() {
+            let gw_idx = gw_get_requests[i];
+            let client = &mut gateway_clients[gw_idx];
 
-                match timeout(Duration::from_millis(500), client.recv()).await {
-                    Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }))) => {
-                        if key == contract_key {
-                            tracing::info!("Gateway {} successfully got the contract", gw_idx);
-                            gateways_with_contract[gw_idx] = true;
-                            gw_get_requests.remove(i);
-                            continue;
-                        }
-                    }
-                    Ok(Ok(_)) => {},
-                    Ok(Err(e)) => {
-                        tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
+            match timeout(Duration::from_millis(500), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }))) => {
+                    if key == contract_key {
+                        tracing::info!("Gateway {} successfully got the contract", gw_idx);
+                        gateways_with_contract[gw_idx] = true;
                         gw_get_requests.remove(i);
                         continue;
                     }
-                    Err(_) => {}
                 }
-                i += 1;
+                Ok(Ok(_)) => {},
+                Ok(Err(e)) => {
+                    tracing::warn!("Error receiving from gateway {}: {}", gw_idx, e);
+                    gw_get_requests.remove(i);
+                    continue;
+                }
+                Err(_) => {}
             }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            i += 1;
         }
 
-        // Log initial contract distribution
-        tracing::info!("Initial contract distribution:");
-        tracing::info!("Gateways with contract: {}/{}",
-                      gateways_with_contract.iter().filter(|&&x| x).count(),
-                      NUM_GATEWAYS);
-        tracing::info!("Regular nodes with contract: {}/{}",
-                      nodes_with_contract.iter().filter(|&&x| x).count(),
-                      NUM_REGULAR_NODES);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-        // All nodes with the contract subscribe to it
-        let mut subscribed_nodes = [false; NUM_REGULAR_NODES];
-        let mut subscription_requests = Vec::new();
+    // Log initial contract distribution
+    tracing::info!("Initial contract distribution:");
+    tracing::info!("Gateways with contract: {}/{}",
+                  gateways_with_contract.iter().filter(|&&x| x).count(),
+                  num_gateways);
+    tracing::info!("Regular nodes with contract: {}/{}",
+                  nodes_with_contract.iter().filter(|&&x| x).count(),
+                  num_regular_nodes);
+
+    // All nodes with the contract subscribe to it
+    let mut subscribed_nodes = vec![false; num_regular_nodes];
+    let mut subscription_requests = Vec::new();
 
         for (i, has_contract) in nodes_with_contract.iter().enumerate() {
             if *has_contract {
@@ -2246,41 +2083,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             min_expected_rate * 100.0
         );
 
-        tracing::info!("Subscription propagation test completed successfully!");
-
-        Ok::<_, anyhow::Error>(())
-    })
-    .instrument(span!(Level::INFO, "test_ping_partially_connected_network"));
-
-    // Wait for test completion or node failures
-    select! {
-        (r, _remaining) = &mut gateway_monitor => {
-            if let Some(r) = r {
-                match r {
-                    Err(err) => return Err(anyhow!("Gateway node failed: {}", err).into()),
-                    Ok(_) => panic!("Gateway node unexpectedly terminated successfully"),
-                }
-            }
-        }
-        (r, _remaining) = &mut regular_node_monitor => {
-            if let Some(r) = r {
-                match r {
-                    Err(err) => return Err(anyhow!("Regular node failed: {}", err).into()),
-                    Ok(_) => panic!("Regular node unexpectedly terminated successfully"),
-                }
-            }
-        }
-        r = test => {
-            r??;
-        }
-    }
-
-    // Keep presets alive until here
-    tracing::debug!(
-        "Test complete, dropping {} gateway presets and {} node presets",
-        gateway_presets.len(),
-        node_presets.len()
-    );
+    tracing::info!("Subscription propagation test completed successfully!");
 
     Ok(())
 }
