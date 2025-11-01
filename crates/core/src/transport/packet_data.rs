@@ -274,6 +274,7 @@ mod tests {
         rand::rng().fill(&mut key);
 
         // Create a key object for AES-GCM
+        #[allow(deprecated)]
         let key = GenericArray::from_slice(&key);
 
         // Create a new AES-128-GCM instance
@@ -295,6 +296,7 @@ mod tests {
         rand::rng().fill(&mut key);
 
         // Create a key object for AES-GCM
+        #[allow(deprecated)]
         let key = GenericArray::from_slice(&key);
 
         // Create a new AES-128-GCM instance
