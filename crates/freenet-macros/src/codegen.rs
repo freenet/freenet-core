@@ -190,6 +190,35 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
         }
     }
 
+    // Pre-compute peer network ports if we need partial connectivity
+    let peer_network_ports_setup = if args.peer_connectivity_ratio.is_some() {
+        let peer_indices: Vec<_> = args
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(idx, node_label)| !is_gateway(args, node_label, *idx))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let peer_port_vars: Vec<_> = peer_indices
+            .iter()
+            .map(|idx| format_ident!("peer_network_port_{}", idx))
+            .collect();
+
+        quote! {
+            // Pre-bind sockets for all peers to get their network ports
+            #(
+                let peer_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let #peer_port_vars = peer_socket.local_addr()?.port();
+                std::mem::drop(peer_socket);
+            )*
+        }
+    } else {
+        quote! {}
+    };
+
+    setup_code.push(peer_network_ports_setup);
+
     // Third pass: Generate peer configurations (non-gateway nodes)
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let config_var = format_ident!("config_{}", idx);
@@ -230,6 +259,34 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                 }
             };
 
+            // Compute blocked addresses for this peer if partial connectivity is enabled
+            let blocked_addresses_code = if let Some(ratio) = args.peer_connectivity_ratio {
+                let peer_checks: Vec<_> = args
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(other_idx, other_label)| !is_gateway(args, other_label, *other_idx) && *other_idx != idx)
+                    .map(|(other_idx, _)| {
+                        let port_var = format_ident!("peer_network_port_{}", other_idx);
+                        quote! {
+                            if (#idx * #other_idx) % 100 >= (#ratio * 100.0) as usize {
+                                blocked_addresses.push(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, #port_var)));
+                            }
+                        }
+                    })
+                    .collect();
+
+                quote! {
+                    let mut blocked_addresses = Vec::new();
+                    #(#peer_checks)*
+                    let blocked_addresses = Some(blocked_addresses);
+                }
+            } else {
+                quote! {
+                    let blocked_addresses = None;
+                }
+            };
+
             // Peer node configuration
             setup_code.push(quote! {
                 let (#config_var, #temp_var) = {
@@ -249,6 +306,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
                     let location: f64 = rand::Rng::random(&mut rand::rng());
 
+                    #blocked_addresses_code
+
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
@@ -267,7 +326,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
                             network_port: Some(network_port),
                             bandwidth_limit: None,
-                            blocked_addresses: None,
+                            blocked_addresses,
                         },
                         config_paths: freenet::config::ConfigPathsArgs {
                             config_dir: Some(temp_dir.path().to_path_buf()),
