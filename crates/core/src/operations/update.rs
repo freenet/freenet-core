@@ -2,6 +2,7 @@
 use either::Either;
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
+use std::collections::HashSet;
 
 pub(crate) use self::messages::UpdateMsg;
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
@@ -645,30 +646,48 @@ impl OpManager {
         key: &ContractKey,
         sender: &PeerId,
     ) -> Vec<PeerKeyLocation> {
-        let subscribers = self
+        // Collect subscribers into a set for deduplication
+        let mut unique_peers: HashSet<PeerId> = self
             .ring
             .subscribers_of(key)
             .map(|subs| {
                 subs.value()
                     .iter()
                     .filter(|pk| &pk.peer != sender)
-                    .cloned()
-                    .collect::<Vec<_>>()
+                    .map(|pk| pk.peer.clone())
+                    .collect()
             })
             .unwrap_or_default();
 
+        // Merge in proximity-based neighbors that are caching the contract
+        unique_peers.extend(
+            self.proximity_cache
+                .neighbors_with_contract(key)
+                .into_iter()
+                .filter(|peer| peer != sender),
+        );
+
+        // Convert the unique peer list into PeerKeyLocation entries
+        let targets: Vec<PeerKeyLocation> = unique_peers
+            .into_iter()
+            .map(|peer| PeerKeyLocation {
+                peer,
+                location: None,
+            })
+            .collect();
+
         // Trace update propagation for debugging
-        if !subscribers.is_empty() {
+        if !targets.is_empty() {
             tracing::info!(
                 "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={}",
                 key,
                 sender,
-                subscribers
+                targets
                     .iter()
                     .map(|s| format!("{:.8}", s.peer))
                     .collect::<Vec<_>>()
                     .join(","),
-                subscribers.len()
+                targets.len()
             );
         } else {
             tracing::warn!(
@@ -678,7 +697,7 @@ impl OpManager {
             );
         }
 
-        subscribers
+        targets
     }
 }
 
@@ -997,7 +1016,7 @@ pub(crate) async fn request_update(
                     false,
                     op_manager,
                     broadcast_state,
-                    (broadcast_to, sender.clone()),
+                    (broadcast_to.into_iter().collect(), sender.clone()),
                     key,
                     updated_value,
                     false,

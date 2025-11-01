@@ -394,7 +394,7 @@ impl ConnectionManager {
         total
     }
 
-    pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
+    pub(crate) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
         read.keys().cloned().collect::<Vec<_>>().into_iter()
     }

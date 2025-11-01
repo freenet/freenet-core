@@ -2585,3 +2585,300 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
 
     Ok(())
 }
+
+/// Test proximity-based update forwarding:
+/// Verifies that updates are forwarded to neighbors who have cached the contract.
+///
+/// Test scenario:
+/// 1. Set up 3 nodes: Gateway + 2 peers (peer1, peer2)
+/// 2. Peer1 PUTs a contract (caches it, announces to neighbors)
+/// 3. Peer2 GETs the same contract (caches it, announces to neighbors)
+/// 4. Peer1 sends an UPDATE
+/// 5. Verify peer2's cached state is updated (proving proximity forwarding worked)
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_proximity_based_update_forwarding() -> TestResult {
+    // Load test contract
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    // Create initial state with empty todo list
+    let initial_state = test_utils::create_empty_todo_list();
+    let initial_wrapped_state = WrappedState::from(initial_state);
+
+    // Create network sockets for 3 nodes
+    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_socket_peer1 = TcpListener::bind("127.0.0.1:0")?;
+    let ws_api_socket_peer2 = TcpListener::bind("127.0.0.1:0")?;
+
+    // Configure gateway node
+    let (config_gw, preset_cfg_gw, config_gw_info) = {
+        let (cfg, preset) = base_node_test_config(
+            true,
+            vec![],
+            Some(network_socket_gw.local_addr()?.port()),
+            ws_api_socket_gw.local_addr()?.port(),
+        )
+        .await?;
+        let public_port = cfg.network_api.public_port.unwrap();
+        let path = preset.temp_dir.path().to_path_buf();
+        (cfg, preset, gw_config(public_port, &path)?)
+    };
+
+    // Configure peer1 (will PUT and UPDATE)
+    let (config_peer1, preset_cfg_peer1) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&config_gw_info)?],
+        None,
+        ws_api_socket_peer1.local_addr()?.port(),
+    )
+    .await?;
+    let ws_api_port_peer1 = config_peer1.ws_api.ws_api_port.unwrap();
+
+    // Configure peer2 (will GET and receive UPDATE via proximity cache)
+    let (config_peer2, preset_cfg_peer2) = base_node_test_config(
+        false,
+        vec![serde_json::to_string(&config_gw_info)?],
+        None,
+        ws_api_socket_peer2.local_addr()?.port(),
+    )
+    .await?;
+    let ws_api_port_peer2 = config_peer2.ws_api.ws_api_port.unwrap();
+
+    // Log data directories for debugging
+    tracing::info!("Gateway data dir: {:?}", preset_cfg_gw.temp_dir.path());
+    tracing::info!("Peer1 data dir: {:?}", preset_cfg_peer1.temp_dir.path());
+    tracing::info!("Peer2 data dir: {:?}", preset_cfg_peer2.temp_dir.path());
+
+    // Free sockets before starting nodes
+    std::mem::drop(network_socket_gw);
+    std::mem::drop(ws_api_socket_gw);
+    std::mem::drop(ws_api_socket_peer1);
+    std::mem::drop(ws_api_socket_peer2);
+
+    // Start gateway node
+    let node_gw = async {
+        let config = config_gw.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        tracing::info!("Gateway node running");
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start peer1 node
+    let node_peer1 = async {
+        let config = config_peer1.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        tracing::info!("Peer1 node running");
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start peer2 node
+    let node_peer2 = async {
+        let config = config_peer2.build().await?;
+        let node = NodeConfig::new(config.clone())
+            .await?
+            .build(serve_gateway(config.ws_api).await)
+            .await?;
+        tracing::info!("Peer2 node running");
+        node.run().await
+    }
+    .boxed_local();
+
+    let test = tokio::time::timeout(Duration::from_secs(240), async {
+        // Wait for nodes to start up and establish connections
+        tracing::info!("Waiting for nodes to start up...");
+        tokio::time::sleep(Duration::from_secs(25)).await;
+
+        // Connect to peer1 websocket API
+        let uri_peer1 = format!(
+            "ws://127.0.0.1:{ws_api_port_peer1}/v1/contract/command?encodingProtocol=native"
+        );
+        let (stream_peer1, _) = connect_async(&uri_peer1).await?;
+        let mut client_api_peer1 = WebApi::start(stream_peer1);
+
+        // Connect to peer2 websocket API
+        let uri_peer2 = format!(
+            "ws://127.0.0.1:{ws_api_port_peer2}/v1/contract/command?encodingProtocol=native"
+        );
+        let (stream_peer2, _) = connect_async(&uri_peer2).await?;
+        let mut client_api_peer2 = WebApi::start(stream_peer2);
+
+        // Step 1: Peer1 PUTs the contract with initial state
+        tracing::info!("Peer1: Putting contract with initial state");
+        make_put(
+            &mut client_api_peer1,
+            initial_wrapped_state.clone(),
+            contract.clone(),
+            false,
+        )
+        .await?;
+
+        // Wait for PUT response from peer1
+        let resp = tokio::time::timeout(Duration::from_secs(60), client_api_peer1.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                tracing::info!("Peer1: PUT successful for contract: {}", key);
+                assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+            }
+            Ok(Ok(other)) => {
+                bail!(
+                    "Peer1: Unexpected response while waiting for PUT: {:?}",
+                    other
+                );
+            }
+            Ok(Err(e)) => {
+                bail!("Peer1: Error receiving PUT response: {}", e);
+            }
+            Err(_) => {
+                bail!("Peer1: Timeout waiting for PUT response");
+            }
+        }
+
+        // Allow time for cache announcement to propagate
+        tracing::info!("Waiting for cache announcement to propagate...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Step 2: Peer2 GETs the contract (this will cache it at peer2)
+        tracing::info!("Peer2: Getting contract (will be cached)");
+        let (response_contract, response_state) =
+            get_contract(&mut client_api_peer2, contract_key, &preset_cfg_gw.temp_dir).await?;
+
+        assert_eq!(
+            response_contract.key(),
+            contract_key,
+            "Peer2: Contract key mismatch in GET response"
+        );
+        assert_eq!(
+            response_contract, contract,
+            "Peer2: Contract content mismatch in GET response"
+        );
+
+        // Verify peer2 got the initial state
+        let peer2_initial_state: test_utils::TodoList =
+            serde_json::from_slice(response_state.as_ref())
+                .expect("Peer2: Failed to deserialize initial state");
+        tracing::info!("Peer2: Successfully cached contract with initial state");
+
+        // Allow time for peer2's cache announcement to propagate
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Step 3: Peer1 updates the contract
+        tracing::info!("Peer1: Creating updated state with a new task");
+        let mut updated_todo_list = peer2_initial_state.clone();
+        updated_todo_list.tasks.push(test_utils::Task {
+            id: 1,
+            title: "Test proximity forwarding".to_string(),
+            description: "Verify updates propagate via proximity cache".to_string(),
+            completed: false,
+            priority: 5,
+        });
+
+        let updated_state_bytes = serde_json::to_vec(&updated_todo_list)?;
+        let updated_state = WrappedState::from(updated_state_bytes);
+        let expected_version_after_update = updated_todo_list.version + 1;
+
+        tracing::info!("Peer1: Sending UPDATE");
+        make_update(&mut client_api_peer1, contract_key, updated_state.clone()).await?;
+
+        // Wait for UPDATE response from peer1
+        let resp = tokio::time::timeout(Duration::from_secs(30), client_api_peer1.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key,
+                summary: _,
+            }))) => {
+                tracing::info!("Peer1: UPDATE successful for contract: {}", key);
+                assert_eq!(
+                    key, contract_key,
+                    "Peer1: Contract key mismatch in UPDATE response"
+                );
+            }
+            Ok(Ok(other)) => {
+                bail!(
+                    "Peer1: Unexpected response while waiting for UPDATE: {:?}",
+                    other
+                );
+            }
+            Ok(Err(e)) => {
+                bail!("Peer1: Error receiving UPDATE response: {}", e);
+            }
+            Err(_) => {
+                bail!("Peer1: Timeout waiting for UPDATE response");
+            }
+        }
+
+        // Allow time for update to propagate via proximity cache
+        tracing::info!("Waiting for update to propagate via proximity cache...");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Step 4: Verify peer2 received the update by GETting the contract again
+        tracing::info!("Peer2: Getting contract again to verify update was received");
+        let (final_contract, final_state) =
+            get_contract(&mut client_api_peer2, contract_key, &preset_cfg_gw.temp_dir).await?;
+
+        assert_eq!(
+            final_contract.key(),
+            contract_key,
+            "Peer2: Contract key mismatch in final GET"
+        );
+
+        // Verify the state was updated
+        let peer2_final_state: test_utils::TodoList = serde_json::from_slice(final_state.as_ref())
+            .expect("Peer2: Failed to deserialize final state");
+
+        assert_eq!(
+            peer2_final_state.version, expected_version_after_update,
+            "Peer2: Version should be updated. Proximity forwarding may have failed!"
+        );
+
+        assert_eq!(
+            peer2_final_state.tasks.len(),
+            1,
+            "Peer2: Should have received the new task via proximity forwarding"
+        );
+
+        assert_eq!(
+            peer2_final_state.tasks[0].title, "Test proximity forwarding",
+            "Peer2: Task title should match the update"
+        );
+
+        tracing::info!(
+            "SUCCESS: Peer2 received update via proximity cache! Version: {}",
+            peer2_final_state.version
+        );
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // Wait for test completion or node failures
+    select! {
+        gw = node_gw => {
+            let Err(gw) = gw;
+            return Err(anyhow!("Gateway failed: {}", gw).into());
+        }
+        p1 = node_peer1 => {
+            let Err(p1) = p1;
+            return Err(anyhow!("Peer1 failed: {}", p1).into());
+        }
+        p2 = node_peer2 => {
+            let Err(p2) = p2;
+            return Err(anyhow!("Peer2 failed: {}", p2).into());
+        }
+        r = test => {
+            r??;
+            // Keep nodes alive for pending operations to complete
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    Ok(())
+}
