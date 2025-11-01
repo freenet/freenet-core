@@ -21,6 +21,8 @@ pub struct FreenetTestArgs {
     pub tokio_flavor: TokioFlavor,
     /// Tokio worker threads
     pub tokio_worker_threads: Option<usize>,
+    /// Connectivity ratio between peers (0.0-1.0), controlling partial connectivity
+    pub peer_connectivity_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,7 @@ impl syn::parse::Parse for FreenetTestArgs {
         let mut log_level = "freenet=debug,info".to_string();
         let mut tokio_flavor = TokioFlavor::CurrentThread;
         let mut tokio_worker_threads = None;
+        let mut peer_connectivity_ratio = None;
 
         // Parse key-value pairs
         while !input.is_empty() {
@@ -159,6 +162,17 @@ impl syn::parse::Parse for FreenetTestArgs {
                     let lit: syn::LitBool = input.parse()?;
                     auto_connect_peers = lit.value;
                 }
+                "peer_connectivity_ratio" => {
+                    let lit: syn::LitFloat = input.parse()?;
+                    let ratio: f64 = lit.base10_parse()?;
+                    if ratio < 0.0 || ratio > 1.0 {
+                        return Err(syn::Error::new(
+                            lit.span(),
+                            "peer_connectivity_ratio must be between 0.0 and 1.0",
+                        ));
+                    }
+                    peer_connectivity_ratio = Some(ratio);
+                }
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -201,6 +215,7 @@ impl syn::parse::Parse for FreenetTestArgs {
             log_level,
             tokio_flavor,
             tokio_worker_threads,
+            peer_connectivity_ratio,
         })
     }
 }
