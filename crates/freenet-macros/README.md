@@ -205,6 +205,32 @@ Logging level for the test.
 
 **Values:** `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`
 
+#### `peer_connectivity_ratio`
+Controls the connectivity ratio between peer nodes (0.0-1.0) for testing partially connected networks.
+
+```rust
+#[freenet_test(
+    nodes = ["gw-0", "gw-1", "node-0", "node-1", "node-2", "node-3"],
+    gateways = ["gw-0", "gw-1"],
+    auto_connect_peers = true,          // Peers connect to all gateways
+    peer_connectivity_ratio = 0.5       // 50% connectivity between peers
+)]
+```
+
+**How it works:**
+- A ratio of `1.0` means full connectivity between all peers
+- A ratio of `0.5` means approximately 50% of peer-to-peer connections are blocked
+- A ratio of `0.0` means no direct peer-to-peer connections (only via gateways)
+- The blocking pattern is deterministic based on node indices
+- Gateway connectivity is not affected - this only controls peer-to-peer connections
+
+**Use cases:**
+- Testing subscription propagation in partially connected networks
+- Simulating network partitions or unreliable peer connections
+- Verifying that updates propagate through gateways when direct peer routes are unavailable
+
+**Note:** When this is set, `auto_connect_peers` should typically be `true` to ensure peers can reach gateways.
+
 ## TestContext API
 
 The macro provides a `TestContext` parameter to your test function with these methods:
