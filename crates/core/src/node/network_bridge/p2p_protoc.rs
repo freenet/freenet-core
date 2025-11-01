@@ -397,7 +397,7 @@ impl P2pConnManager {
                                         .await?;
 
                                     // Wait for connection to be established (with timeout)
-                                    match timeout(Duration::from_secs(5), result.recv()).await {
+                                    match timeout(Duration::from_secs(20), result.recv()).await {
                                         Ok(Some(Ok(_))) => {
                                             // Connection established, try sending again
                                             // IMPORTANT: Use single get() call to avoid TOCTOU race
@@ -492,13 +492,15 @@ impl P2pConnManager {
                                         "Cleaning up in-progress connection reservations"
                                     );
 
-                                    for (addr, mut callback) in state.awaiting_connection.drain() {
-                                        tracing::debug!(%addr, "Notifying awaiting connection of shutdown");
+                                    for (addr, mut callbacks) in state.awaiting_connection.drain() {
+                                        tracing::debug!(%addr, callbacks = callbacks.len(), "Notifying awaiting connection of shutdown");
                                         // Best effort notification - ignore errors since we're shutting down anyway
                                         // The callback sender will handle cleanup on their side
-                                        let _ = callback
-                                            .send_result(Err(HandshakeError::ChannelClosed))
-                                            .await;
+                                        for mut callback in callbacks.drain(..) {
+                                            let _ = callback
+                                                .send_result(Err(HandshakeError::ChannelClosed))
+                                                .await;
+                                        }
                                     }
 
                                     tracing::info!("Cleanup complete, exiting event loop");
@@ -1020,24 +1022,107 @@ impl P2pConnManager {
             }
             tracing::debug!(tx = %tx, "Blocked addresses: {:?}, peer addr: {}", blocked_addrs, peer.addr);
         }
-        state.awaiting_connection.insert(peer.addr, callback);
+        match state.awaiting_connection.entry(peer.addr) {
+            std::collections::hash_map::Entry::Occupied(mut callbacks) => {
+                tracing::debug!(
+                    tx = %tx,
+                    remote = %peer.addr,
+                    pending = callbacks.get().len(),
+                    "Connection already pending, queuing additional requester"
+                );
+                callbacks.get_mut().push(callback);
+                return Ok(());
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(vec![callback]);
+            }
+        }
         let res = timeout(
             Duration::from_secs(10),
             handshake_handler_msg.establish_conn(peer.clone(), tx, is_gw),
         )
-        .await
-        .inspect_err(|error| {
-            tracing::error!(tx = %tx, "Failed to establish connection: {:?}", error);
-        })?;
+        .await;
         match res {
-            Ok(()) => {
-                tracing::debug!(tx = %tx,
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    tx = %tx,
                     "Successfully initiated connection process for peer: {:?}",
                     peer
                 );
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::msg(e)),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    tx = %tx,
+                    remote = %peer.addr,
+                    error = ?e,
+                    "Handshake establish_conn returned error"
+                );
+                if let Some(callbacks) = state.awaiting_connection.remove(&peer.addr) {
+                    let mut callbacks = callbacks.into_iter();
+                    if let Some(mut cb) = callbacks.next() {
+                        cb.send_result(Err(e))
+                            .await
+                            .inspect_err(|send_err| {
+                                tracing::debug!(
+                                    remote = %peer.addr,
+                                    error = ?send_err,
+                                    "Failed to deliver handshake error to awaiting callback"
+                                );
+                            })
+                            .ok();
+                    }
+                    for mut cb in callbacks {
+                        cb.send_result(Err(HandshakeError::ConnectionClosed(peer.addr)))
+                            .await
+                            .inspect_err(|send_err| {
+                                tracing::debug!(
+                                    remote = %peer.addr,
+                                    error = ?send_err,
+                                    "Failed to deliver fallback handshake error to awaiting callback"
+                                );
+                            })
+                            .ok();
+                    }
+                }
+                Ok(())
+            }
+            Err(elapsed) => {
+                tracing::warn!(
+                    tx = %tx,
+                    remote = %peer.addr,
+                    elapsed = ?elapsed,
+                    "Timeout while establishing connection"
+                );
+                if let Some(callbacks) = state.awaiting_connection.remove(&peer.addr) {
+                    let mut iter = callbacks.into_iter();
+                    if let Some(mut cb) = iter.next() {
+                        cb.send_result(Err(HandshakeError::ConnectionClosed(peer.addr)))
+                            .await
+                            .inspect_err(|send_err| {
+                                tracing::debug!(
+                                    remote = %peer.addr,
+                                    error = ?send_err,
+                                    "Failed to deliver connection timeout to awaiting callback"
+                                );
+                            })
+                            .ok();
+                    }
+                    for mut cb in iter {
+                        cb.send_result(Err(HandshakeError::ChannelClosed))
+                            .await
+                            .inspect_err(|send_err| {
+                                tracing::debug!(
+                                    remote = %peer.addr,
+                                    error = ?send_err,
+                                    "Failed to deliver fallback connection timeout to awaiting callback"
+                                );
+                            })
+                            .ok();
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1172,15 +1257,23 @@ impl P2pConnManager {
                         return Err(error.into());
                     }
                 }
-                if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
-                    // Don't propagate channel closed errors - just log and continue
-                    // The receiver may have timed out or been cancelled, which shouldn't crash the node
-                    r.send_result(Err(error))
-                        .await
-                        .inspect_err(|e| {
-                            tracing::warn!(%peer_id, "Failed to send connection error notification - receiver may have timed out: {:?}", e);
-                        })
-                        .ok();
+                if let Some(callbacks) = state.awaiting_connection.remove(&peer_id.addr) {
+                    let mut callbacks = callbacks.into_iter();
+                    if let Some(mut r) = callbacks.next() {
+                        // Don't propagate channel closed errors - just log and continue
+                        // The receiver may have timed out or been cancelled, which shouldn't crash the node
+                        r.send_result(Err(error))
+                            .await
+                            .inspect_err(|e| {
+                                tracing::warn!(%peer_id, "Failed to send connection error notification - receiver may have timed out: {:?}", e);
+                            })
+                            .ok();
+                    }
+                    for mut r in callbacks {
+                        if let Err(e) = r.send_result(Err(HandshakeError::ChannelClosed)).await {
+                            tracing::debug!(%peer_id, "Failed to send fallback connection error notification: {:?}", e);
+                        }
+                    }
                 }
             }
             HandshakeEvent::RemoveTransaction(tx) => {
@@ -1188,10 +1281,12 @@ impl P2pConnManager {
             }
             HandshakeEvent::OutboundGatewayConnectionRejected { peer_id } => {
                 tracing::info!(%peer_id, "Connection rejected by peer");
-                if let Some(mut r) = state.awaiting_connection.remove(&peer_id.addr) {
-                    // Don't propagate channel closed errors - just log and continue
-                    if let Err(e) = r.send_result(Err(HandshakeError::ChannelClosed)).await {
-                        tracing::debug!(%peer_id, "Failed to send rejection notification: {:?}", e);
+                if let Some(callbacks) = state.awaiting_connection.remove(&peer_id.addr) {
+                    for mut r in callbacks {
+                        // Don't propagate channel closed errors - just log and continue
+                        if let Err(e) = r.send_result(Err(HandshakeError::ChannelClosed)).await {
+                            tracing::debug!(%peer_id, "Failed to send rejection notification: {:?}", e);
+                        }
                     }
                 }
             }
@@ -1225,8 +1320,8 @@ impl P2pConnManager {
         select_stream: &mut priority_select::ProductionPrioritySelectStream,
         remaining_checks: Option<usize>,
     ) -> anyhow::Result<()> {
-        if let Some(mut cb) = state.awaiting_connection.remove(&peer_id.addr) {
-            let peer_id = if let Some(peer_id) = self
+        if let Some(callbacks) = state.awaiting_connection.remove(&peer_id.addr) {
+            let resolved_peer_id = if let Some(peer_id) = self
                 .bridge
                 .op_manager
                 .ring
@@ -1241,14 +1336,16 @@ impl P2pConnManager {
                 let key = (*self.bridge.op_manager.ring.connection_manager.pub_key).clone();
                 PeerId::new(self_addr, key)
             };
-            timeout(
-                Duration::from_secs(60),
-                cb.send_result(Ok((peer_id, remaining_checks))),
-            )
-            .await
-            .inspect_err(|error| {
-                tracing::error!("Failed to send connection result: {:?}", error);
-            })??;
+            for mut cb in callbacks {
+                timeout(
+                    Duration::from_secs(60),
+                    cb.send_result(Ok((resolved_peer_id.clone(), remaining_checks))),
+                )
+                .await
+                .inspect_err(|error| {
+                    tracing::error!("Failed to send connection result: {:?}", error);
+                })??;
+            }
         } else {
             tracing::warn!(%peer_id, "No callback for connection established");
         }
@@ -1527,7 +1624,7 @@ struct EventListenerState {
     tx_to_client: HashMap<Transaction, HashSet<ClientId>>,
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     transient_conn: HashMap<Transaction, SocketAddr>,
-    awaiting_connection: HashMap<SocketAddr, Box<dyn ConnectResultSender>>,
+    awaiting_connection: HashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     pending_op_results: HashMap<Transaction, Sender<NetMessage>>,
 }
 
