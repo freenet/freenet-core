@@ -371,25 +371,29 @@ impl ContractExecutor for Executor<Runtime> {
                 cipher,
                 nonce,
             } => {
-                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-                let key = delegate.key().clone();
-                let arr = GenericArray::from_slice(&cipher);
-                let cipher = XChaCha20Poly1305::new(arr);
-                let nonce = GenericArray::from_slice(&nonce).to_owned();
-                if let Some(contract) = attested_contract {
-                    self.delegate_attested_ids
-                        .entry(key.clone())
-                        .or_default()
-                        .push(*contract);
-                }
-                match self.runtime.register_delegate(delegate, cipher, nonce) {
-                    Ok(_) => Ok(DelegateResponse {
-                        key,
-                        values: Vec::new(),
-                    }),
-                    Err(err) => {
-                        tracing::warn!("failed registering delegate `{key}`: {err}");
-                        Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
+                #[allow(deprecated)]
+                {
+                    use aes_gcm::aead::generic_array::GenericArray;
+                    use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+                    let key = delegate.key().clone();
+                    let arr = GenericArray::from_slice(&cipher);
+                    let cipher = XChaCha20Poly1305::new(arr);
+                    let nonce = GenericArray::from_slice(&nonce).to_owned();
+                    if let Some(contract) = attested_contract {
+                        self.delegate_attested_ids
+                            .entry(key.clone())
+                            .or_default()
+                            .push(*contract);
+                    }
+                    match self.runtime.register_delegate(delegate, cipher, nonce) {
+                        Ok(_) => Ok(DelegateResponse {
+                            key,
+                            values: Vec::new(),
+                        }),
+                        Err(err) => {
+                            tracing::warn!("failed registering delegate `{key}`: {err}");
+                            Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
+                        }
                     }
                 }
             }
@@ -657,25 +661,29 @@ impl Executor<Runtime> {
                 cipher,
                 nonce,
             } => {
-                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-                let key = delegate.key().clone();
-                let arr = GenericArray::from_slice(&cipher);
-                let cipher = XChaCha20Poly1305::new(arr);
-                let nonce = GenericArray::from_slice(&nonce).to_owned();
-                if let Some(contract) = attested_contract {
-                    self.delegate_attested_ids
-                        .entry(key.clone())
-                        .or_default()
-                        .push(*contract);
-                }
-                match self.runtime.register_delegate(delegate, cipher, nonce) {
-                    Ok(_) => Ok(DelegateResponse {
-                        key,
-                        values: Vec::new(),
-                    }),
-                    Err(err) => {
-                        tracing::warn!("failed registering delegate `{key}`: {err}");
-                        Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
+                #[allow(deprecated)]
+                {
+                    use aes_gcm::aead::generic_array::GenericArray;
+                    use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+                    let key = delegate.key().clone();
+                    let arr = GenericArray::from_slice(&cipher);
+                    let cipher = XChaCha20Poly1305::new(arr);
+                    let nonce = GenericArray::from_slice(&nonce).to_owned();
+                    if let Some(contract) = attested_contract {
+                        self.delegate_attested_ids
+                            .entry(key.clone())
+                            .or_default()
+                            .push(*contract);
+                    }
+                    match self.runtime.register_delegate(delegate, cipher, nonce) {
+                        Ok(_) => Ok(DelegateResponse {
+                            key,
+                            values: Vec::new(),
+                        }),
+                        Err(err) => {
+                            tracing::warn!("failed registering delegate `{key}`: {err}");
+                            Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
+                        }
                     }
                 }
             }

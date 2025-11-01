@@ -46,6 +46,7 @@ use crate::{
     ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
+use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 
 type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
 
@@ -797,22 +798,22 @@ impl P2pConnManager {
                                 key,
                                 subscribed,
                             } => {
-                                tracing::info!("Received LocalSubscribeComplete event for transaction: {tx}, contract: {key}");
+                                tracing::debug!(%tx, %key, "local subscribe complete");
 
-                                // Deliver SubscribeResponse directly to result router
-                                tracing::info!("Sending SubscribeResponse to result router for transaction: {tx}");
-                                use freenet_stdlib::client_api::{ContractResponse, HostResponse};
-                                let response = Ok(HostResponse::ContractResponse(
-                                    ContractResponse::SubscribeResponse { key, subscribed },
-                                ));
+                                if !op_manager.is_sub_operation(tx) {
+                                    let response = Ok(HostResponse::ContractResponse(
+                                        ContractResponse::SubscribeResponse { key, subscribed },
+                                    ));
 
-                                match op_manager.result_router_tx.send((tx, response)).await {
-                                    Ok(()) => {
-                                        tracing::info!("Successfully sent SubscribeResponse to result router for transaction: {tx}");
-                                        // Clean up client subscription after successful delivery
-                                        state.tx_to_client.remove(&tx);
+                                    match op_manager.result_router_tx.send((tx, response)).await {
+                                        Ok(()) => {
+                                            tracing::debug!(%tx, "sent subscribe response to client");
+                                            state.tx_to_client.remove(&tx);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(%tx, error = %e, "failed to send subscribe response")
+                                        }
                                     }
-                                    Err(e) => tracing::error!("Failed to send local subscribe response to result router: {}", e),
                                 }
                             }
                             NodeEvent::Disconnect { cause } => {

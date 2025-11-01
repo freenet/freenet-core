@@ -101,8 +101,6 @@ pub(crate) async fn request_subscribe(
                         tracing::debug!(%key, tx = %id, subscriber = %subscriber.peer, "Successfully registered local subscriber");
                     }
 
-                    // Use notify_node_event to deliver SubscribeResponse directly to client
-                    // This avoids the problem with notify_op_change overwriting the operation
                     match op_manager
                         .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
                             tx: *id,
@@ -112,12 +110,15 @@ pub(crate) async fn request_subscribe(
                         .await
                     {
                         Ok(()) => {
-                            tracing::info!(%key, tx = %id, "Successfully sent LocalSubscribeComplete event")
+                            tracing::debug!(%key, tx = %id, "sent LocalSubscribeComplete event")
                         }
                         Err(e) => {
-                            tracing::error!(%key, tx = %id, error = %e, "Failed to send LocalSubscribeComplete event")
+                            tracing::error!(%key, tx = %id, error = %e, "failed to send LocalSubscribeComplete event")
                         }
                     }
+
+                    // Mark subscription as completed for atomicity tracking
+                    op_manager.completed(*id);
 
                     return Ok(());
                 } else {

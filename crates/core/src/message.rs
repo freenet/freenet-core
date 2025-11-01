@@ -35,16 +35,39 @@ use ulid::Ulid;
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Transaction {
     id: Ulid,
+    /// Parent transaction ID for child operations spawned by this transaction.
+    /// Enables atomicity tracking for composite operations (e.g., PUT with SUBSCRIBE).
+    parent: Option<Ulid>,
 }
 
 impl Transaction {
-    pub const NULL: &'static Transaction = &Transaction { id: Ulid(0) };
+    pub const NULL: &'static Transaction = &Transaction {
+        id: Ulid(0),
+        parent: None,
+    };
 
     pub(crate) fn new<T: TxType>() -> Self {
         let ty = <T as TxType>::tx_type_id();
         let id = Ulid::new();
-        Self::update(ty.0, id)
-        // Self { id }
+        Self::update(ty.0, id, None)
+    }
+
+    /// Creates a child transaction with the specified type, linked to the parent
+    /// for atomicity tracking in composite operations.
+    pub(crate) fn new_child_of<T: TxType>(parent: &Transaction) -> Self {
+        let ty = <T as TxType>::tx_type_id();
+        let id = Ulid::new();
+        Self::update(ty.0, id, Some(parent.id))
+    }
+
+    /// Returns the parent transaction ID for child operations.
+    pub fn parent_id(&self) -> Option<&Ulid> {
+        self.parent.as_ref()
+    }
+
+    /// Returns true if this transaction is a child operation.
+    pub fn is_sub_operation(&self) -> bool {
+        self.parent.is_some()
     }
 
     pub(crate) fn transaction_type(&self) -> TransactionType {
@@ -100,10 +123,13 @@ impl Transaction {
         // Clear the ts significant bits of the ULID and replace them with the new cutoff ts.
         const TIMESTAMP_MASK: u128 = 0x00000000000000000000FFFFFFFFFFFFFFFF;
         let new_ulid = (id.0 & TIMESTAMP_MASK) | ((ttl_epoch as u128) << 80);
-        Self { id: Ulid(new_ulid) }
+        Self {
+            id: Ulid(new_ulid),
+            parent: None,
+        }
     }
 
-    fn update(ty: TransactionType, id: Ulid) -> Self {
+    fn update(ty: TransactionType, id: Ulid, parent: Option<Ulid>) -> Self {
         const TYPE_MASK: u128 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00u128;
         // Clear the last byte
         let cleared = id.0 & TYPE_MASK;
@@ -111,7 +137,10 @@ impl Transaction {
         let updated = cleared | (ty as u8) as u128;
 
         // 2 words size for 64-bits platforms
-        Self { id: Ulid(updated) }
+        Self {
+            id: Ulid(updated),
+            parent,
+        }
     }
 }
 
@@ -120,7 +149,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Transaction {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let ty: TransactionTypeId = u.arbitrary()?;
         let bytes: u128 = Ulid::new().0;
-        Ok(Self::update(ty.0, Ulid(bytes)))
+        Ok(Self::update(ty.0, Ulid(bytes), None))
     }
 }
 
@@ -509,9 +538,9 @@ mod tests {
     fn pack_transaction_type() {
         let ts_0 = Ulid::new();
         std::thread::sleep(Duration::from_millis(1));
-        let tx = Transaction::update(TransactionType::Connect, Ulid::new());
+        let tx = Transaction::update(TransactionType::Connect, Ulid::new(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Connect);
-        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new());
+        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Subscribe);
         std::thread::sleep(Duration::from_millis(1));
         let ts_1 = Ulid::new();

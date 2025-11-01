@@ -181,6 +181,12 @@ impl Operation for PutOp {
                         target.peer
                     );
 
+                    let subscribe = match &self.state {
+                        Some(PutState::PrepareRequest { subscribe, .. }) => *subscribe,
+                        Some(PutState::AwaitingResponse { subscribe, .. }) => *subscribe,
+                        _ => false,
+                    };
+
                     // Check if we're the initiator of this PUT operation
                     // We only cache locally when either WE initiate the PUT, or when forwarding just of the peer should be seeding
                     let should_seed = match &self.state {
@@ -283,7 +289,7 @@ impl Operation for PutOp {
                             upstream: Some(sender.clone()),
                             contract: contract.clone(),
                             state: modified_value,
-                            subscribe: false,
+                            subscribe,
                         });
                     } else {
                         // No other peers to forward to - we're the final destination
@@ -384,7 +390,8 @@ impl Operation for PutOp {
                             skip_list.insert(target.peer.clone());
                         }
 
-                        super::start_subscription_request(op_manager, key).await;
+                        let child_tx = super::start_subscription_request(op_manager, *id, key);
+                        tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                         op_manager.ring.seed_contract(key);
 
                         true
@@ -571,6 +578,13 @@ impl Operation for PutOp {
                             state,
                             subscribe,
                         }) => {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                subscribe = subscribe,
+                                "Processing LocalPut with subscribe flag"
+                            );
+
                             // Check if already stored before any operations
                             let is_seeding_contract = op_manager.ring.is_seeding_contract(&key);
 
@@ -610,20 +624,6 @@ impl Operation for PutOp {
                                 );
                             }
 
-                            // Start subscription if the contract is already seeded and the user requested it
-                            if subscribe && is_seeding_contract {
-                                tracing::debug!(
-                                    tx = %id,
-                                    %key,
-                                    peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
-                                    "Starting subscription request"
-                                );
-                                // TODO: Make put operation atomic by linking it to the completion of this subscription request.
-                                // Currently we can't link one transaction to another transaction's result, which would be needed
-                                // to make this fully atomic. This should be addressed in a future refactoring.
-                                super::start_subscription_request(op_manager, key).await;
-                            }
-
                             tracing::info!(
                                 tx = %id,
                                 %key,
@@ -631,8 +631,26 @@ impl Operation for PutOp {
                                 "Peer completed contract value put",
                             );
 
-                            // Mark operation as finished
                             new_state = Some(PutState::Finished { key });
+
+                            if subscribe {
+                                // Check if this parent has already failed due to a previous child failure
+                                if !op_manager.failed_parents().contains(id) {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        %key,
+                                        "starting child subscription for PUT operation"
+                                    );
+                                    let child_tx =
+                                        super::start_subscription_request(op_manager, *id, key);
+                                    tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
+                                } else {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        "not starting subscription for failed parent operation"
+                                    );
+                                }
+                            }
 
                             // Forward success message upstream if needed
                             if let Some(upstream) = upstream {
@@ -738,7 +756,8 @@ impl Operation for PutOp {
 
                         // Start subscription and handle dropped contracts
                         let (dropped_contract, old_subscribers) = {
-                            super::start_subscription_request(op_manager, key).await;
+                            let child_tx = super::start_subscription_request(op_manager, *id, key);
+                            tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                             op_manager.ring.seed_contract(key)
                         };
 
@@ -845,6 +864,11 @@ async fn try_to_broadcast(
     let new_state;
     let return_msg;
 
+    let subscribe = match &state {
+        Some(PutState::AwaitingResponse { subscribe, .. }) => *subscribe,
+        _ => false,
+    };
+
     match state {
         // Handle initiating node that's also the target (single node or targeting self)
         Some(PutState::AwaitingResponse {
@@ -888,7 +912,7 @@ async fn try_to_broadcast(
                     upstream: Some(upstream),
                     contract: contract.clone(), // No longer optional
                     state: new_value.clone(),
-                    subscribe: false,
+                    subscribe,
                 });
                 return_msg = None;
             } else if !broadcast_to.is_empty() {
@@ -1075,7 +1099,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
                 upstream: None,
                 contract: contract.clone(),
                 state: updated_value.clone(),
-                subscribe: false,
+                subscribe,
             });
 
             // Create a SuccessfulPut message to trigger the completion handling

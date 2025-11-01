@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 use std::{cell::RefCell, sync::Arc};
 
+#[allow(deprecated)]
 use aes_gcm::{
     aead::{generic_array::GenericArray, AeadInPlace},
     Aes128Gcm,
@@ -73,6 +74,7 @@ impl Encryption for SymmetricAES {}
 impl Encryption for AssymetricRSA {}
 impl Encryption for UnknownEncryption {}
 
+#[allow(deprecated)]
 fn internal_sym_decryption<const N: usize>(
     data: &[u8],
     size: usize,
@@ -147,6 +149,7 @@ impl<const N: usize> PacketData<Plaintext, N> {
         }
     }
 
+    #[allow(deprecated)]
     pub(crate) fn encrypt_symmetric(&self, cipher: &Aes128Gcm) -> PacketData<SymmetricAES, N> {
         _check_valid_size::<N>();
         debug_assert!(self.size <= MAX_DATA_SIZE);
@@ -271,6 +274,7 @@ mod tests {
         rand::rng().fill(&mut key);
 
         // Create a key object for AES-GCM
+        #[allow(deprecated)]
         let key = GenericArray::from_slice(&key);
 
         // Create a new AES-128-GCM instance
@@ -292,6 +296,7 @@ mod tests {
         rand::rng().fill(&mut key);
 
         // Create a key object for AES-GCM
+        #[allow(deprecated)]
         let key = GenericArray::from_slice(&key);
 
         // Create a new AES-128-GCM instance
