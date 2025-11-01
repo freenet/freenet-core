@@ -1766,7 +1766,7 @@ async fn test_ping_partially_connected_network(
     }
 
     // Also subscribe gateways
-    let mut subscribed_gateways = [false; NUM_GATEWAYS];
+    let mut subscribed_gateways = vec![false; num_gateways];
     let mut gw_subscription_requests = Vec::new();
 
     for (i, has_contract) in gateways_with_contract.iter().enumerate() {
@@ -1859,13 +1859,13 @@ async fn test_ping_partially_connected_network(
     tracing::info!(
         "Subscribed gateways: {}/{} (with contract: {})",
         subscribed_gateways.iter().filter(|&&x| x).count(),
-        NUM_GATEWAYS,
+        num_gateways,
         gateways_with_contract.iter().filter(|&&x| x).count()
     );
     tracing::info!(
         "Subscribed regular nodes: {}/{} (with contract: {})",
         subscribed_nodes.iter().filter(|&&x| x).count(),
-        NUM_REGULAR_NODES,
+        num_regular_nodes,
         nodes_with_contract.iter().filter(|&&x| x).count()
     );
 
@@ -1907,7 +1907,7 @@ async fn test_ping_partially_connected_network(
     tokio::time::sleep(Duration::from_secs(20)).await;
 
     // Check which nodes received the update
-    let mut nodes_received_update = [false; NUM_REGULAR_NODES];
+    let mut nodes_received_update = vec![false; num_regular_nodes];
     let mut get_state_requests = Vec::new();
 
     for (i, subscribed) in subscribed_nodes.iter().enumerate() {
@@ -1924,7 +1924,7 @@ async fn test_ping_partially_connected_network(
     }
 
     // Also check gateways
-    let mut gateways_received_update = [false; NUM_GATEWAYS];
+    let mut gateways_received_update = vec![false; num_gateways];
     let mut gw_get_state_requests = Vec::new();
 
     for (i, subscribed) in subscribed_gateways.iter().enumerate() {
@@ -2105,14 +2105,6 @@ async fn test_ping_partially_connected_network(
                 "Node {} was subscribed but did not receive the update!",
                 node_idx
             );
-
-            // Get the node connectivity info
-            let connections = node_connections[node_idx];
-            tracing::warn!(
-                "Node {} is connected to {} other regular nodes",
-                node_idx,
-                connections
-            );
         }
     }
 
@@ -2123,7 +2115,7 @@ async fn test_ping_partially_connected_network(
     );
 
     // Verify that if we have multiple gateways, at least some received the update
-    if NUM_GATEWAYS > 1 && subscribed_gw_count > 1 {
+    if num_gateways > 1 && subscribed_gw_count > 1 {
         assert!(
             updated_gw_count > 0,
             "No gateways received the update, gateway subscription propagation failed"
