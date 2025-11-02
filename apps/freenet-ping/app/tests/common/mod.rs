@@ -313,7 +313,11 @@ fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
 
     compile_rust_wasm_lib(&build_config, contract_path)?;
 
-    let build_dir = if build_config.debug { "debug" } else { "release" };
+    let build_dir = if build_config.debug {
+        "debug"
+    } else {
+        "release"
+    };
     let output_file = Path::new(&target)
         .join(WASM_TARGET)
         .join(build_dir)

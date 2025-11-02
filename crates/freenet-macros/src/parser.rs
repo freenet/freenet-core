@@ -165,7 +165,7 @@ impl syn::parse::Parse for FreenetTestArgs {
                 "peer_connectivity_ratio" => {
                     let lit: syn::LitFloat = input.parse()?;
                     let ratio: f64 = lit.base10_parse()?;
-                    if ratio < 0.0 || ratio > 1.0 {
+                    if !(0.0..=1.0).contains(&ratio) {
                         return Err(syn::Error::new(
                             lit.span(),
                             "peer_connectivity_ratio must be between 0.0 and 1.0",

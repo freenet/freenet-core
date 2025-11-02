@@ -272,7 +272,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     .collect();
 
                 // Find this peer's relative index
-                let this_peer_idx = peer_indices.iter()
+                let this_peer_idx = peer_indices
+                    .iter()
                     .find(|(node_idx, _)| *node_idx == idx)
                     .map(|(_, peer_idx)| *peer_idx)
                     .expect("Current node must be in peer list");
