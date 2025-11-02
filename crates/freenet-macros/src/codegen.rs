@@ -430,14 +430,13 @@ fn generate_node_tasks(args: &FreenetTestArgs) -> TokenStream {
         let node_var = format_ident!("node_{}", idx);
 
         tasks.push(quote! {
-            let #task_var = tokio::task::spawn_local({
-                let node = #node_var;
-                async move {
-                    let span = tracing::info_span!("test_peer", test_node = #node_label);
-                    let _enter = span.enter();
-                    tracing::info!("Node running: {}", #node_label);
-                    node.run().await
-                }
+            let #task_var = tokio::task::spawn_local(async move {
+                // Note: Using span.enter() instead of .instrument() to avoid cross-thread
+                // span lifecycle issues in multi-threaded runtime. This means the span
+                // won't be active during await points, but prevents tracing-subscriber panics.
+                let span = tracing::info_span!("test_peer", test_node = #node_label);
+                let _enter = span.enter();
+                #node_var.run().await
             });
         });
     }
