@@ -1158,24 +1158,14 @@ async fn process_open_request(
                                 "Starting direct SUBSCRIBE operation (legacy mode)",
                             );
 
-                            // Legacy mode: direct operation without deduplication
-                            let op_id =
-                                crate::node::subscribe(op_manager.clone(), key, Some(client_id))
-                                    .await
-                                    .inspect_err(|err| {
-                                        tracing::error!("Subscribe error: {}", err);
-                                    })?;
-
-                            tracing::debug!(
-                                request_id = %request_id,
-                                transaction_id = %op_id,
-                                operation = "subscribe",
-                                "Request-Transaction correlation"
-                            );
+                            // Legacy mode: generate transaction, register first, then run op
+                            let tx = crate::message::Transaction::new::<
+                                crate::operations::subscribe::SubscribeMsg,
+                            >();
 
                             op_manager
                                 .ch_outbound
-                                .waiting_for_transaction_result(op_id, client_id, request_id)
+                                .waiting_for_transaction_result(tx, client_id, request_id)
                                 .await
                                 .inspect_err(|err| {
                                     tracing::error!(
@@ -1183,6 +1173,19 @@ async fn process_open_request(
                                         err
                                     );
                                 })?;
+
+                            crate::node::subscribe_with_id(op_manager.clone(), key, None, Some(tx))
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!("Subscribe error: {}", err);
+                                })?;
+
+                            tracing::debug!(
+                                request_id = %request_id,
+                                transaction_id = %tx,
+                                operation = "subscribe",
+                                "Request-Transaction correlation"
+                            );
                         }
                     }
                     _ => {

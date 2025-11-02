@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
+use std::collections::btree_map::Entry;
 
 use crate::topology::{Limits, TopologyManager};
 
@@ -16,6 +17,7 @@ pub(crate) struct ConnectionManager {
     /// Is important to keep track of this so no more connections are accepted prematurely.
     own_location: Arc<AtomicU64>,
     peer_key: Arc<Mutex<Option<PeerId>>>,
+    is_gateway: bool,
     pub min_connections: usize,
     pub max_connections: usize,
     pub rnd_if_htl_above: usize,
@@ -44,6 +46,7 @@ impl ConnectionManager {
                     Location::random().as_f64().to_le_bytes(),
                 )),
             ),
+            false,
         )
     }
 }
@@ -102,6 +105,7 @@ impl ConnectionManager {
                 config.peer_id.clone(),
                 own_location,
             ),
+            config.is_gateway,
         )
     }
 
@@ -112,6 +116,7 @@ impl ConnectionManager {
         max_connections: usize,
         rnd_if_htl_above: usize,
         (pub_key, peer_id, own_location): (TransportPublicKey, Option<PeerId>, AtomicU64),
+        is_gateway: bool,
     ) -> Self {
         let topology_manager = Arc::new(RwLock::new(TopologyManager::new(Limits {
             max_upstream_bandwidth,
@@ -128,6 +133,7 @@ impl ConnectionManager {
             topology_manager,
             own_location: own_location.into(),
             peer_key: Arc::new(Mutex::new(peer_id)),
+            is_gateway,
             min_connections,
             max_connections,
             rnd_if_htl_above,
@@ -141,10 +147,31 @@ impl ConnectionManager {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: Location, peer_id: &PeerId) -> bool {
-        tracing::debug!("Checking if should accept connection");
+        tracing::info!("Checking if should accept connection");
         let open = self
             .open_connections
             .load(std::sync::atomic::Ordering::SeqCst);
+        let reserved_before = self
+            .reserved_connections
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        tracing::info!(
+            %peer_id,
+            open,
+            reserved_before,
+            is_gateway = self.is_gateway,
+            "should_accept: evaluating direct acceptance guard"
+        );
+
+        if self.is_gateway && (open > 0 || reserved_before > 0) {
+            tracing::info!(
+                %peer_id,
+                open,
+                reserved_before,
+                "Gateway evaluating additional direct connection (post-bootstrap)"
+            );
+        }
+
         let total_conn = self
             .reserved_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -153,6 +180,23 @@ impl ConnectionManager {
         if open == 0 {
             // if this is the first connection, then accept it
             return true;
+        }
+
+        const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 2;
+        if self.is_gateway {
+            let direct_total = open + reserved_before;
+            if direct_total >= GATEWAY_DIRECT_ACCEPT_LIMIT {
+                tracing::info!(
+                    %peer_id,
+                    open,
+                    reserved_before,
+                    limit = GATEWAY_DIRECT_ACCEPT_LIMIT,
+                    "Gateway reached direct-accept limit; forwarding join request instead"
+                );
+                self.reserved_connections
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return false;
+            }
         }
 
         if self.location_for_peer.read().get(peer_id).is_some() {
@@ -164,10 +208,10 @@ impl ConnectionManager {
         }
 
         let accepted = if total_conn < self.min_connections {
-            tracing::debug!(%peer_id, "Accepted connection, below min connections");
+            tracing::info!(%peer_id, "Accepted connection, below min connections");
             true
         } else if total_conn >= self.max_connections {
-            tracing::debug!(%peer_id, "Rejected connection, max connections reached");
+            tracing::info!(%peer_id, "Rejected connection, max connections reached");
             false
         } else {
             let accepted = self
@@ -177,9 +221,9 @@ impl ConnectionManager {
                 .unwrap_or(true);
 
             if accepted {
-                tracing::debug!(%peer_id, "Accepted connection, topology manager");
+                tracing::info!(%peer_id, "Accepted connection, topology manager");
             } else {
-                tracing::debug!(%peer_id, "Rejected connection, topology manager");
+                tracing::info!(%peer_id, "Rejected connection, topology manager");
             }
             accepted
         };
@@ -187,9 +231,37 @@ impl ConnectionManager {
             self.reserved_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         } else {
-            tracing::debug!(%peer_id, "Accepted connection, reserving spot");
+            tracing::info!(%peer_id, "Accepted connection, reserving spot");
+            self.record_pending_location(peer_id, location);
         }
         accepted
+    }
+
+    /// Record the advertised location for a peer that we have decided to accept.
+    ///
+    /// This makes the peer discoverable to the routing layer even before the connection
+    /// is fully established. The entry is removed automatically if the handshake fails
+    /// via `prune_in_transit_connection`.
+    pub fn record_pending_location(&self, peer_id: &PeerId, location: Location) {
+        let mut locations = self.location_for_peer.write();
+        let entry = locations.entry(peer_id.clone());
+        match entry {
+            Entry::Occupied(_) => {
+                tracing::info!(
+                    %peer_id,
+                    %location,
+                    "record_pending_location: location already known"
+                );
+            }
+            Entry::Vacant(v) => {
+                tracing::info!(
+                    %peer_id,
+                    %location,
+                    "record_pending_location: registering advertised location for peer"
+                );
+                v.insert(location);
+            }
+        }
     }
 
     /// Update this node location.
@@ -251,7 +323,7 @@ impl ConnectionManager {
     }
 
     pub fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
-        tracing::debug!(%peer, "Adding connection");
+        tracing::info!(%peer, %loc, %was_reserved, "Adding connection to topology");
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
         if was_reserved {
             let old = self
@@ -330,6 +402,10 @@ impl ConnectionManager {
 
     pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
         self.connections_by_location.read().clone()
+    }
+
+    pub(super) fn get_known_locations(&self) -> BTreeMap<PeerId, Location> {
+        self.location_for_peer.read().clone()
     }
 
     /// Get a random peer from the known ring connections.

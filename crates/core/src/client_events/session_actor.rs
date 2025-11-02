@@ -3,9 +3,10 @@
 //! This module provides a simplified session actor that manages client sessions
 //! and handles efficient 1→N result delivery to multiple clients.
 
-use crate::client_events::{ClientId, HostResult, RequestId};
+use crate::client_events::{ClientId, HostResponse, HostResult, RequestId};
 use crate::contract::{ClientResponsesSender, SessionMessage};
 use crate::message::Transaction;
+use freenet_stdlib::client_api::ContractResponse;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -16,7 +17,23 @@ pub struct SessionActor {
     client_transactions: HashMap<Transaction, HashSet<ClientId>>,
     // Track RequestId correlation for each (Transaction, ClientId) pair
     client_request_ids: HashMap<(Transaction, ClientId), RequestId>,
+    pending_results: HashMap<Transaction, PendingResult>,
     client_responses: ClientResponsesSender,
+}
+
+#[derive(Clone)]
+struct PendingResult {
+    result: std::sync::Arc<HostResult>,
+    delivered_clients: HashSet<ClientId>,
+}
+
+impl PendingResult {
+    fn new(result: std::sync::Arc<HostResult>) -> Self {
+        Self {
+            result,
+            delivered_clients: HashSet::new(),
+        }
+    }
 }
 
 impl SessionActor {
@@ -29,6 +46,7 @@ impl SessionActor {
             message_rx,
             client_transactions: HashMap::new(),
             client_request_ids: HashMap::new(),
+            pending_results: HashMap::new(),
             client_responses,
         }
     }
@@ -74,6 +92,18 @@ impl SessionActor {
                     request_id,
                     self.client_transactions.get(&tx).map_or(0, |s| s.len())
                 );
+
+                if let Some(result_arc) = self.pending_results.get_mut(&tx).and_then(|pending| {
+                    if pending.delivered_clients.insert(client_id) {
+                        Some(pending.result.clone())
+                    } else {
+                        None
+                    }
+                }) {
+                    let mut recipients = HashSet::new();
+                    recipients.insert(client_id);
+                    self.deliver_result_to_clients(tx, recipients, result_arc);
+                }
             }
             SessionMessage::ClientDisconnect { client_id } => {
                 self.cleanup_client_transactions(client_id);
@@ -96,6 +126,76 @@ impl SessionActor {
         }
     }
 
+    fn deliver_result_to_clients(
+        &mut self,
+        tx: Transaction,
+        waiting_clients: HashSet<ClientId>,
+        result: std::sync::Arc<HostResult>,
+    ) {
+        let client_count = waiting_clients.len();
+        tracing::info!(
+            "Delivering result for transaction {} to {} clients",
+            tx,
+            client_count
+        );
+
+        if let Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key,
+            state,
+            ..
+        })) = result.as_ref()
+        {
+            tracing::info!(
+                "Contract GET response ready for delivery: contract={} bytes={}",
+                key,
+                state.as_ref().len()
+            );
+        }
+
+        // Optimized 1→N delivery with RequestId correlation
+        for client_id in waiting_clients {
+            // Look up the RequestId for this (transaction, client) pair
+            let request_id = self
+                .client_request_ids
+                .remove(&(tx, client_id))
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "No RequestId found for transaction {} and client {}, using default",
+                        tx,
+                        client_id
+                    );
+                    RequestId::new()
+                });
+
+            if let Err(e) = self
+                .client_responses
+                .send((client_id, request_id, (*result).clone()))
+            {
+                tracing::warn!(
+                    "Failed to deliver result to client {} (request {}): {}",
+                    client_id,
+                    request_id,
+                    e
+                );
+            } else {
+                tracing::debug!(
+                    "Delivered result for transaction {} to client {} with request correlation {}",
+                    tx,
+                    client_id,
+                    request_id
+                );
+            }
+        }
+
+        if client_count > 1 {
+            tracing::debug!(
+                "Successfully delivered result for transaction {} to {} clients via optimized 1→N fanout with RequestId correlation",
+                tx,
+                client_count
+            );
+        }
+    }
+
     /// CORE: 1→N Result Delivery with RequestId correlation
     /// Optimized with Arc<HostResult> to minimize cloning overhead in 1→N delivery
     async fn handle_result_delivery(
@@ -103,55 +203,38 @@ impl SessionActor {
         tx: Transaction,
         result: std::sync::Arc<crate::client_events::HostResult>,
     ) {
-        tracing::info!("Session actor attempting to deliver result for transaction {}, registered transactions: {}", tx, self.client_transactions.len());
-        if let Some(waiting_clients) = self.client_transactions.remove(&tx) {
-            let client_count = waiting_clients.len();
-            tracing::info!(
-                "Delivering result for transaction {} to {} clients",
-                tx,
-                client_count
-            );
+        tracing::info!(
+            "Session actor attempting to deliver result for transaction {}, registered transactions: {}",
+            tx,
+            self.client_transactions.len()
+        );
 
-            // Optimized 1→N delivery with RequestId correlation
-            for client_id in waiting_clients {
-                // Look up the RequestId for this (transaction, client) pair
-                let request_id =
-                    self.client_request_ids
-                        .remove(&(tx, client_id))
-                        .unwrap_or_else(|| {
-                            tracing::warn!(
-                            "No RequestId found for transaction {} and client {}, using default", 
-                            tx, client_id
-                        );
-                            RequestId::new()
-                        });
+        let mut recipients = HashSet::new();
+        let result_to_deliver = {
+            let entry = self
+                .pending_results
+                .entry(tx)
+                .or_insert_with(|| PendingResult::new(result.clone()));
+            entry.result = result.clone();
 
-                if let Err(e) =
-                    self.client_responses
-                        .send((client_id, request_id, (*result).clone()))
-                {
-                    tracing::warn!(
-                        "Failed to deliver result to client {} (request {}): {}",
-                        client_id,
-                        request_id,
-                        e
-                    );
-                } else {
-                    tracing::debug!(
-                        "Delivered result for transaction {} to client {} with request correlation {}",
-                        tx, client_id, request_id
-                    );
+            if let Some(waiting_clients) = self.client_transactions.remove(&tx) {
+                for client_id in waiting_clients {
+                    if entry.delivered_clients.insert(client_id) {
+                        recipients.insert(client_id);
+                    }
                 }
             }
 
-            if client_count > 1 {
-                tracing::debug!(
-                    "Successfully delivered result for transaction {} to {} clients via optimized 1→N fanout with RequestId correlation",
-                    tx, client_count
-                );
-            }
+            entry.result.clone()
+        };
+
+        if !recipients.is_empty() {
+            self.deliver_result_to_clients(tx, recipients, result_to_deliver);
         } else {
-            tracing::debug!("No clients waiting for transaction result: {}", tx);
+            tracing::debug!(
+                "No clients waiting for transaction result: {}, caching response for deferred delivery",
+                tx
+            );
         }
     }
 
@@ -199,6 +282,13 @@ impl SessionActor {
                     e
                 );
             } else {
+                let entry = self
+                    .pending_results
+                    .entry(tx)
+                    .or_insert_with(|| PendingResult::new(result.clone()));
+                entry.delivered_clients.insert(client_id);
+                entry.result = result.clone();
+
                 tracing::debug!(
                     "Delivered result for transaction {} to specific client {} with request correlation {}",
                     tx, client_id, request_id
@@ -354,6 +444,172 @@ mod tests {
         );
 
         // Clean up
+        drop(session_tx);
+        actor_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pending_result_reaches_late_registered_clients() {
+        use crate::contract::client_responses_channel;
+        use crate::operations::subscribe::SubscribeMsg;
+        use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+        use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+
+        let (session_tx, session_rx) = mpsc::channel(100);
+        let (mut client_responses_rx, client_responses_tx) = client_responses_channel();
+        let actor = SessionActor::new(session_rx, client_responses_tx);
+
+        let actor_handle = tokio::spawn(async move {
+            actor.run().await;
+        });
+
+        let tx = Transaction::new::<SubscribeMsg>();
+        let contract_key = ContractKey::from(ContractInstanceId::new([7u8; 32]));
+        let host_result = Ok(HostResponse::ContractResponse(
+            ContractResponse::SubscribeResponse {
+                key: contract_key,
+                subscribed: true,
+            },
+        ));
+
+        // Deliver result before any clients register; this models LocalSubscribeComplete firing
+        // before the session actor processes the pending subscription registration.
+        session_tx
+            .send(SessionMessage::DeliverHostResponse {
+                tx,
+                response: std::sync::Arc::new(host_result.clone()),
+            })
+            .await
+            .unwrap();
+
+        // First client registers and should receive the cached result.
+        let client_one = ClientId::FIRST;
+        let request_one = RequestId::new();
+        session_tx
+            .send(SessionMessage::RegisterTransaction {
+                tx,
+                client_id: client_one,
+                request_id: request_one,
+            })
+            .await
+            .unwrap();
+
+        let (delivered_client_one, delivered_request_one, delivered_result_one) =
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                client_responses_rx.recv(),
+            )
+            .await
+            .expect("session actor failed to deliver cached result to first client")
+            .expect("client response channel closed unexpectedly");
+        assert_eq!(delivered_client_one, client_one);
+        assert_eq!(delivered_request_one, request_one);
+        match delivered_result_one {
+            Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            })) => {
+                assert_eq!(key, contract_key);
+                assert!(subscribed);
+            }
+            other => panic!("unexpected result delivered to first client: {:?}", other),
+        }
+
+        // Second client registers later; we expect the cached result to still be available.
+        let client_two = ClientId::next();
+        let request_two = RequestId::new();
+        session_tx
+            .send(SessionMessage::RegisterTransaction {
+                tx,
+                client_id: client_two,
+                request_id: request_two,
+            })
+            .await
+            .unwrap();
+
+        let (delivered_client_two, delivered_request_two, delivered_result_two) =
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                client_responses_rx.recv(),
+            )
+            .await
+            .expect("pending result was not delivered to late-registered client")
+            .expect("client response channel closed unexpectedly for late registrant");
+        assert_eq!(delivered_client_two, client_two);
+        assert_eq!(delivered_request_two, request_two);
+        match delivered_result_two {
+            Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            })) => {
+                assert_eq!(key, contract_key);
+                assert!(subscribed);
+            }
+            other => panic!(
+                "unexpected result delivered to late-registered client: {:?}",
+                other
+            ),
+        }
+
+        actor_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pending_result_delivered_after_registration() {
+        use crate::contract::client_responses_channel;
+
+        let (session_tx, session_rx) = mpsc::channel(100);
+        let (mut client_responses_rx, client_responses_tx) = client_responses_channel();
+        let actor = SessionActor::new(session_rx, client_responses_tx);
+
+        let actor_handle = tokio::spawn(async move {
+            actor.run().await;
+        });
+
+        let tx = Transaction::new::<PutMsg>();
+        let client_id = ClientId::FIRST;
+        let request_id = RequestId::new();
+        let host_result = Arc::new(Ok(HostResponse::Ok));
+
+        session_tx
+            .send(SessionMessage::DeliverHostResponse {
+                tx,
+                response: host_result.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Ensure the actor processes the pending result before registration.
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        session_tx
+            .send(SessionMessage::RegisterTransaction {
+                tx,
+                client_id,
+                request_id,
+            })
+            .await
+            .unwrap();
+
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_millis(200),
+            client_responses_rx.recv(),
+        )
+        .await
+        .expect("Timed out waiting for pending result delivery")
+        .expect("Client response channel closed unexpectedly");
+
+        let (returned_client, returned_request, returned_result) = delivered;
+        assert_eq!(returned_client, client_id);
+        assert_eq!(returned_request, request_id);
+        match returned_result {
+            Ok(HostResponse::Ok) => {}
+            other => panic!(
+                "Unexpected result delivered. got={:?}, expected=Ok(HostResponse::Ok)",
+                other
+            ),
+        }
+
         drop(session_tx);
         actor_handle.await.unwrap();
     }

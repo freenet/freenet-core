@@ -37,10 +37,7 @@ use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::{Address, GatewayConfig, WebsocketApiConfig},
-    contract::{
-        Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler,
-        WaitingTransaction,
-    },
+    contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     operations::{
@@ -1105,6 +1102,7 @@ async fn handle_pure_network_result(
 }
 
 /// Attempts to subscribe to a contract
+#[allow(dead_code)]
 pub async fn subscribe(
     op_manager: Arc<OpManager>,
     key: ContractKey,
@@ -1131,13 +1129,7 @@ pub async fn subscribe_with_id(
         let request_id = RequestId::new();
         let _ = op_manager
             .ch_outbound
-            .waiting_for_transaction_result(
-                WaitingTransaction::Subscription {
-                    contract_key: *key.id(),
-                },
-                client_id,
-                request_id,
-            )
+            .waiting_for_subscription_result(id, *key.id(), client_id, request_id)
             .await;
     }
     // Initialize a subscribe op.

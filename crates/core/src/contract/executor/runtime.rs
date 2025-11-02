@@ -879,6 +879,11 @@ impl Executor<Runtime> {
             .await
             .map_err(ExecutorError::other)?;
 
+        tracing::info!(
+            "Contract state updated for {key}, new_size_bytes={}",
+            new_state.as_ref().len()
+        );
+
         if let Err(err) = self
             .send_update_notification(key, parameters, &new_state)
             .await

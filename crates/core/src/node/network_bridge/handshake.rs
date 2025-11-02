@@ -669,6 +669,7 @@ fn handle_outbound_result(
         }
         Err((peer_id, error)) => {
             tracing::debug!(from=%peer_id.addr, "Outbound connection failed: {error}");
+            tracing::info!(from=%peer_id.addr, error = ?error, "Outbound connection failed");
             handler.connecting.remove(&peer_id.addr);
             handler.outbound_messages.remove(&peer_id.addr);
             handler.connection_manager.prune_alive_connection(&peer_id);

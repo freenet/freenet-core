@@ -22,7 +22,7 @@ use either::Either;
 use freenet_stdlib::prelude::ContractKey;
 use itertools::Itertools;
 use parking_lot::RwLock;
-use rand::{prelude::IndexedRandom, Rng};
+use rand::Rng;
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -270,14 +270,36 @@ impl Ring {
         let router = self.router.read();
         let target_location = Location::from(contract_key);
 
-        // Get all connected peers through the connection manager (never includes self)
-        let connections = self.connection_manager.get_connections_by_location();
-        let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::rng())?;
-            (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
-        });
+        let mut candidates: BTreeMap<PeerId, PeerKeyLocation> = BTreeMap::new();
 
-        // Pass peers directly to select_k_best_peers since we never include self
+        let connections = self.connection_manager.get_connections_by_location();
+        for conns in connections.values() {
+            for conn in conns {
+                let peer = conn.location.peer.clone();
+                if skip_list.has_element(peer.clone()) {
+                    continue;
+                }
+                candidates
+                    .entry(peer)
+                    .or_insert_with(|| conn.location.clone());
+            }
+        }
+
+        let known_locations = self.connection_manager.get_known_locations();
+        for (peer, location) in known_locations {
+            if skip_list.has_element(peer.clone()) {
+                continue;
+            }
+            candidates
+                .entry(peer.clone())
+                .or_insert_with(|| PeerKeyLocation {
+                    peer,
+                    location: Some(location),
+                });
+        }
+
+        let peers = candidates.values();
+
         router
             .select_k_best_peers(peers, target_location, k)
             .into_iter()

@@ -170,6 +170,11 @@ impl Operation for ConnectOp {
                     id,
                     ..
                 } => {
+                    let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
+                    let mut max_hops = (*max_hops_to_live).min(ring_max_htl);
+                    if max_hops == 0 {
+                        max_hops = 1;
+                    }
                     let own_loc = op_manager.ring.connection_manager.own_location();
                     let PeerKeyLocation {
                         peer: this_peer,
@@ -213,8 +218,8 @@ impl Operation for ConnectOp {
                                 &own_loc,
                                 joiner,
                                 &desirable_peer,
-                                *max_hops_to_live,
-                                *max_hops_to_live,
+                                max_hops,
+                                max_hops,
                                 skip_connections,
                                 skip_forwards,
                             );
@@ -253,7 +258,7 @@ impl Operation for ConnectOp {
                         );
                         debug_assert_eq!(this_peer, &joiner.peer);
                         new_state = Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
-                            remaining_connections: *max_hops_to_live,
+                            remaining_connections: max_hops,
                         }));
                         let msg = ConnectMsg::Request {
                             id: *id,
@@ -262,7 +267,7 @@ impl Operation for ConnectOp {
                                 query_target: query_target.clone(),
                                 ideal_location: *ideal_location,
                                 joiner: joiner.clone(),
-                                max_hops_to_live: *max_hops_to_live,
+                                max_hops_to_live: max_hops,
                                 skip_connections,
                                 skip_forwards,
                             },
@@ -286,6 +291,21 @@ impl Operation for ConnectOp {
                     ..
                 } => {
                     let this_peer = op_manager.ring.connection_manager.own_location();
+                    let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
+                    let mut max_htl = (*max_hops_to_live).min(ring_max_htl);
+                    if max_htl == 0 {
+                        max_htl = 1;
+                    }
+                    let mut hops_left = (*hops_to_live).min(max_htl);
+                    if hops_left == 0 {
+                        tracing::warn!(
+                            tx = %id,
+                            sender = %sender.peer,
+                            joiner = %joiner.peer,
+                            "Received CheckConnectivity with zero hops to live; clamping to 1"
+                        );
+                        hops_left = 1;
+                    }
                     if sender.peer == joiner.peer {
                         tracing::error!(
                             tx = %id,
@@ -313,7 +333,7 @@ impl Operation for ConnectOp {
                     tracing::debug!(
                         tx = %id,
                         at = %this_peer.peer,
-                        hops_to_live = %hops_to_live,
+                        hops_to_live = %hops_left,
                         joiner = %joiner,
                         "Checking connectivity request received"
                     );
@@ -334,29 +354,37 @@ impl Operation for ConnectOp {
                                 is_gw: false,
                             })
                             .await?;
-                        if result
-                            .recv()
-                            .await
-                            .ok_or(OpError::NotificationError)?
-                            .is_ok()
-                        {
-                            let was_reserved = {
-                                // reserved just above in call to should_accept
+                        match result.recv().await.ok_or(OpError::NotificationError)? {
+                            Ok((peer_id, remaining_checks)) => {
+                                tracing::info!(
+                                    tx = %id,
+                                    joiner = %joiner.peer,
+                                    connected_peer = %peer_id,
+                                    remaining_checks,
+                                    "ConnectPeer completed successfully"
+                                );
+                                let was_reserved = {
+                                    // reserved just above in call to should_accept
+                                    true
+                                };
+                                op_manager
+                                    .ring
+                                    .add_connection(joiner_loc, joiner.peer.clone(), was_reserved)
+                                    .await;
                                 true
-                            };
-                            // Add the connection to the ring
-                            op_manager
-                                .ring
-                                .add_connection(joiner_loc, joiner.peer.clone(), was_reserved)
-                                .await;
-                            true
-                        } else {
-                            // If the connection was not completed, prune the reserved connection
-                            op_manager
-                                .ring
-                                .connection_manager
-                                .prune_in_transit_connection(&joiner.peer);
-                            false
+                            }
+                            Err(()) => {
+                                tracing::info!(
+                                    tx = %id,
+                                    joiner = %joiner.peer,
+                                    "ConnectPeer failed to establish connection"
+                                );
+                                op_manager
+                                    .ring
+                                    .connection_manager
+                                    .prune_in_transit_connection(&joiner.peer);
+                                false
+                            }
                         }
                     } else {
                         tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner, "Rejecting connection");
@@ -372,8 +400,8 @@ impl Operation for ConnectOp {
                             op_manager.ring.router.clone(),
                             network_bridge,
                             ForwardParams {
-                                left_htl: *hops_to_live,
-                                max_htl: *max_hops_to_live,
+                                left_htl: hops_left,
+                                max_htl,
                                 accepted: should_accept,
                                 skip_connections: skip_connections.clone(),
                                 skip_forwards: skip_forwards.clone(),
@@ -441,6 +469,13 @@ impl Operation for ConnectOp {
                                     connected_to = %acceptor.peer,
                                     "Open connection acknowledged at requesting joiner peer",
                                 );
+                                tracing::info!(
+                                    tx = %id,
+                                    joiner = %this_peer_id,
+                                    acceptor = %acceptor.peer,
+                                    location = ?acceptor.location,
+                                    "Connect response accepted; registering connection"
+                                );
                                 info.accepted_by.insert(acceptor.clone());
                                 op_manager
                                     .ring
@@ -458,6 +493,12 @@ impl Operation for ConnectOp {
                                     rejected_peer = %acceptor.peer,
                                     "Connection rejected",
                                 );
+                                tracing::info!(
+                                    tx = %id,
+                                    joiner = %this_peer_id,
+                                    rejector = %acceptor.peer,
+                                    "Connect response rejected by peer"
+                                );
                             }
 
                             let your_location: Location =
@@ -472,6 +513,12 @@ impl Operation for ConnectOp {
                                 .ring
                                 .connection_manager
                                 .update_location(target.location);
+                            tracing::info!(
+                                tx = %id,
+                                at = %this_peer_id,
+                                new_location = ?target.location,
+                                "Updated joiner location from connect response"
+                            );
 
                             if remaining_connections == 0 {
                                 tracing::debug!(
@@ -1073,7 +1120,7 @@ where
     let num_reserved = connection_manager.get_reserved_connections();
     let max_connections = connection_manager.max_connections;
 
-    tracing::debug!(
+    tracing::info!(
         tx = %id,
         joiner = %joiner.peer,
         num_connections = %num_connections,
@@ -1098,10 +1145,9 @@ where
     //
     // See PR #1871 discussion with @iduartgomez for context.
     //
-    // IMPORTANT (issue #1908): Extended to cover early network formation (first few peers)
-    // During early network formation, the gateway should accept connections directly to ensure
-    // bidirectional connections are established. Without this, peers 2+ only get unidirectional
-    // connections (peer → gateway) but not the reverse (gateway → peer).
+    // IMPORTANT (issue #1908): Extended to cover early network formation (only the very first peer).
+    // During bootstrap we keep the first connection direct to guarantee bidirectional connectivity;
+    // subsequent peers should be forwarded through existing nodes.
     //
     // However, we still respect max_connections - this only applies when there's capacity.
     const EARLY_NETWORK_THRESHOLD: usize = 4;
@@ -1160,6 +1206,13 @@ where
 
         match target_peer {
             Some(target_peer) => {
+                tracing::info!(
+                    tx = %id,
+                    joiner = %joiner.peer,
+                    next_hop = %target_peer.peer,
+                    htl = left_htl,
+                    "forward_conn: forwarding connection request to peer candidate"
+                );
                 // Successfully found a peer to forward to
                 let forward_msg = create_forward_message(
                     id,
@@ -1182,11 +1235,13 @@ where
             }
             None => {
                 // Couldn't find suitable peer to forward to
-                tracing::debug!(
+                tracing::info!(
                     tx = %id,
                     joiner = %joiner.peer,
-                    "No suitable peer found for forwarding despite having {} connections",
-                    num_connections
+                    skip_count = skip_forwards.len(),
+                    connections = num_connections,
+                    accepted_flag = %accepted,
+                    "forward_conn: no suitable peer found for forwarding despite available connections"
                 );
                 return Ok(None);
             }
@@ -1209,6 +1264,9 @@ fn select_forward_target(
     // Create an extended skip list that includes the joiner to prevent forwarding to the joiner
     let mut extended_skip = skip_forwards.clone();
     extended_skip.insert(joiner.peer.clone());
+    if let Some(self_peer) = connection_manager.get_peer_key() {
+        extended_skip.insert(self_peer);
+    }
 
     if left_htl >= connection_manager.rnd_if_htl_above {
         tracing::debug!(
@@ -1216,21 +1274,53 @@ fn select_forward_target(
             joiner = %joiner.peer,
             "Randomly selecting peer to forward connect request",
         );
-        connection_manager.random_peer(|p| !extended_skip.contains(p))
+        let candidate = connection_manager.random_peer(|p| !extended_skip.contains(p));
+        if candidate.is_none() {
+            tracing::info!(
+                tx = %id,
+                joiner = %joiner.peer,
+                skip = ?extended_skip,
+                "select_forward_target: random selection found no candidate"
+            );
+        } else if let Some(ref c) = candidate {
+            tracing::info!(
+                tx = %id,
+                joiner = %joiner.peer,
+                next_hop = %c.peer,
+                "select_forward_target: random candidate selected"
+            );
+        }
+        candidate
     } else {
         tracing::debug!(
             tx = %id,
             joiner = %joiner.peer,
             "Selecting close peer to forward request",
         );
-        connection_manager
+        let candidate = connection_manager
             .routing(
                 joiner.location.unwrap(),
                 Some(&request_peer.peer),
                 &extended_skip,
                 router,
             )
-            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl))
+            .and_then(|pkl| (pkl.peer != joiner.peer).then_some(pkl));
+        if candidate.is_none() {
+            tracing::info!(
+                tx = %id,
+                joiner = %joiner.peer,
+                skip = ?extended_skip,
+                "select_forward_target: router returned no candidate"
+            );
+        } else if let Some(ref c) = candidate {
+            tracing::info!(
+                tx = %id,
+                joiner = %joiner.peer,
+                next_hop = %c.peer,
+                "select_forward_target: routing candidate selected"
+            );
+        }
+        candidate
     }
 }
 
