@@ -433,17 +433,16 @@ fn generate_node_tasks(args: &FreenetTestArgs) -> TokenStream {
             let #task_var = tokio::task::spawn_local({
                 let node = #node_var;
                 async move {
+                    let span = tracing::info_span!("test_peer", test_node = #node_label);
+                    let _enter = span.enter();
                     tracing::info!("Node running: {}", #node_label);
                     node.run().await
                 }
-                .instrument(tracing::info_span!("test_peer", test_node = #node_label))
             });
         });
     }
 
     quote! {
-        use tracing::Instrument;
-
         #(#tasks)*
     }
 }
