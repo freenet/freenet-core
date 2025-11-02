@@ -305,8 +305,9 @@ mod tests {
         let unencrypted_packet = PacketData::<_, 1000>::from_buf_plain(data);
         let mut encrypted_packet = unencrypted_packet.encrypt_symmetric(&cipher);
 
-        // Corrupt the packet data
-        encrypted_packet.data[encrypted_packet.size / 2] = 0;
+        // Corrupt the packet data by flipping bits at a deterministic position.
+        let mid = encrypted_packet.size / 2;
+        encrypted_packet.data[mid] ^= 0xFF;
 
         // Ensure decryption fails
         match encrypted_packet.decrypt(&cipher) {
