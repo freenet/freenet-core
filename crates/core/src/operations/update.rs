@@ -249,8 +249,8 @@ impl Operation for UpdateOp {
                                 return_msg = None;
                             } else {
                                 // Get broadcast targets for propagating UPDATE to subscribers
-                                let mut broadcast_to =
-                                    op_manager.get_broadcast_targets_update(key, &request_sender.peer);
+                                let mut broadcast_to = op_manager
+                                    .get_broadcast_targets_update(key, &request_sender.peer);
 
                                 if broadcast_to.is_empty() {
                                     broadcast_to = op_manager
@@ -264,17 +264,16 @@ impl Operation for UpdateOp {
                                         "No broadcast targets, completing UPDATE locally"
                                     );
 
-                                    let raw_state = State::from(updated_value.clone());
-                                    let summary = StateSummary::from(raw_state.into_bytes());
+                                    if upstream.is_none() {
+                                        new_state = Some(UpdateState::Finished {
+                                            key: *key,
+                                            summary: summary.clone(),
+                                        });
+                                    } else {
+                                        new_state = None;
+                                    }
 
-                                    return_msg = Some(UpdateMsg::SuccessfulUpdate {
-                                        id: *id,
-                                        target: request_sender.clone(),
-                                        summary: summary.clone(),
-                                        key: *key,
-                                        sender: self_location.clone(),
-                                    });
-                                    new_state = Some(UpdateState::Finished { key: *key, summary });
+                                    return_msg = None;
                                 } else {
                                     // Broadcast to other peers
                                     match try_to_broadcast(
@@ -439,18 +438,10 @@ impl Operation for UpdateOp {
                                 tracing::debug!(
                                     tx = %id,
                                     %key,
-                                    "No broadcast targets for SeekNode - completing with SuccessfulUpdate"
+                                    "No broadcast targets for SeekNode - completing locally"
                                 );
-                                let raw_state = State::from(updated_value.clone());
-                                let summary = StateSummary::from(raw_state.into_bytes());
-                                return_msg = Some(UpdateMsg::SuccessfulUpdate {
-                                    id: *id,
-                                    target: sender.clone(),
-                                    summary,
-                                    key: *key,
-                                    sender: op_manager.ring.connection_manager.own_location(),
-                                });
                                 new_state = None;
+                                return_msg = None;
                             } else {
                                 // Have peers to broadcast to - use try_to_broadcast
                                 match try_to_broadcast(
@@ -528,7 +519,11 @@ impl Operation for UpdateOp {
                                     %key,
                                     "Successfully fetched contract locally, applying UPDATE"
                                 );
-                                let updated_value = update_contract(
+                                let UpdateExecution {
+                                    value: updated_value,
+                                    summary: _summary,
+                                    changed,
+                                } = update_contract(
                                     op_manager,
                                     *key,
                                     value.clone(),
@@ -536,44 +531,50 @@ impl Operation for UpdateOp {
                                 )
                                 .await?;
 
-                                let mut broadcast_to =
-                                    op_manager.get_broadcast_targets_update(key, &sender.peer);
-
-                                if broadcast_to.is_empty() {
-                                    broadcast_to = op_manager
-                                        .compute_update_fallback_targets(key, &sender.peer);
-                                }
-
-                                if broadcast_to.is_empty() {
-                                    let raw_state = State::from(updated_value);
-                                    let summary = StateSummary::from(raw_state.into_bytes());
-
-                                    return_msg = Some(UpdateMsg::SuccessfulUpdate {
-                                        id: *id,
-                                        target: sender.clone(),
-                                        summary,
-                                        key: *key,
-                                        sender: op_manager.ring.connection_manager.own_location(),
-                                    });
+                                if !changed {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        %key,
+                                        "Fetched contract apply produced no change during SeekNode fallback"
+                                    );
                                     new_state = None;
+                                    return_msg = None;
                                 } else {
-                                    match try_to_broadcast(
-                                        *id,
-                                        true,
-                                        op_manager,
-                                        self.state,
-                                        (broadcast_to, sender.clone()),
-                                        *key,
-                                        value.clone(),
-                                        false,
-                                    )
-                                    .await
-                                    {
-                                        Ok((state, msg)) => {
-                                            new_state = state;
-                                            return_msg = msg;
+                                    let mut broadcast_to =
+                                        op_manager.get_broadcast_targets_update(key, &sender.peer);
+
+                                    if broadcast_to.is_empty() {
+                                        broadcast_to = op_manager
+                                            .compute_update_fallback_targets(key, &sender.peer);
+                                    }
+
+                                    if broadcast_to.is_empty() {
+                                        tracing::debug!(
+                                            tx = %id,
+                                            %key,
+                                            "No broadcast targets after SeekNode fallback apply; finishing locally"
+                                        );
+                                        new_state = None;
+                                        return_msg = None;
+                                    } else {
+                                        match try_to_broadcast(
+                                            *id,
+                                            true,
+                                            op_manager,
+                                            self.state,
+                                            (broadcast_to, sender.clone()),
+                                            *key,
+                                            updated_value.clone(),
+                                            false,
+                                        )
+                                        .await
+                                        {
+                                            Ok((state, msg)) => {
+                                                new_state = state;
+                                                return_msg = msg;
+                                            }
+                                            Err(err) => return Err(err),
                                         }
-                                        Err(err) => return Err(err),
                                     }
                                 }
                             } else {

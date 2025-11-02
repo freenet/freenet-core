@@ -841,13 +841,14 @@ impl P2pConnManager {
                                                 .client_waiting_transaction
                                                 .iter()
                                                 .position(|(waiting, _)| match waiting {
-                                                    WaitingTransaction::Subscription { contract_key } => {
-                                                        contract_key == key.id()
-                                                    }
+                                                    WaitingTransaction::Subscription {
+                                                        contract_key,
+                                                    } => contract_key == key.id(),
                                                     _ => false,
                                                 })
                                             {
-                                                let (_, clients) = state.client_waiting_transaction.remove(pos);
+                                                let (_, clients) =
+                                                    state.client_waiting_transaction.remove(pos);
                                                 tracing::debug!(
                                                     "LocalSubscribeComplete for {} matched {} subscription waiters via contract {}",
                                                     tx,
