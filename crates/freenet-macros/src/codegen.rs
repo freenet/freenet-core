@@ -124,13 +124,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    let ws_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    let network_port = network_socket.local_addr()?.port();
-                    let ws_port = ws_socket.local_addr()?.port();
-
-                    std::mem::drop(network_socket);
-                    std::mem::drop(ws_socket);
+                    let network_port = freenet::test_utils::reserve_local_port()?;
+                    let ws_port = freenet::test_utils::reserve_local_port()?;
 
                     let location: f64 = rand::Rng::random(&mut rand::rng());
 
@@ -239,13 +234,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    let network_port = network_socket.local_addr()?.port();
-                    std::mem::drop(network_socket);
-
-                    let ws_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    let ws_port = ws_socket.local_addr()?.port();
-                    std::mem::drop(ws_socket);
+                    let network_port = freenet::test_utils::reserve_local_port()?;
+                    let ws_port = freenet::test_utils::reserve_local_port()?;
 
                     let location: f64 = rand::Rng::random(&mut rand::rng());
 

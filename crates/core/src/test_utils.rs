@@ -8,10 +8,12 @@ use std::{
 };
 
 use clap::ValueEnum;
+use dashmap::DashSet;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, WebApi},
     prelude::*,
 };
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 use crate::util::workspace::get_workspace_target_dir;
@@ -810,6 +812,41 @@ mod test {
     }
 }
 
+// Port reservation utilities for integration tests
+static RESERVED_PORTS: Lazy<DashSet<u16>> = Lazy::new(DashSet::new);
+
+/// Reserve a unique localhost TCP port for tests.
+///
+/// Ports are allocated by binding to an ephemeral listener to ensure the port
+/// is currently free, then tracked in a global set so concurrent tests do not
+/// reuse the same value. Ports remain reserved until released via
+/// [`release_local_port`].
+pub fn reserve_local_port() -> anyhow::Result<u16> {
+    const MAX_ATTEMPTS: usize = 128;
+    for _ in 0..MAX_ATTEMPTS {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| anyhow::anyhow!("failed to bind ephemeral port: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| anyhow::anyhow!("failed to read ephemeral port address: {e}"))?
+            .port();
+        drop(listener);
+
+        if RESERVED_PORTS.insert(port) {
+            return Ok(port);
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to reserve a unique local port after {MAX_ATTEMPTS} attempts"
+    ))
+}
+
+/// Release a previously reserved port so future tests may reuse it.
+pub fn release_local_port(port: u16) {
+    RESERVED_PORTS.remove(&port);
+}
+
 // Test context for integration tests
 use std::collections::HashMap;
 
@@ -1315,6 +1352,17 @@ impl TestContext {
 
         writeln!(&mut report, "\n{}", "=".repeat(80)).unwrap();
         report
+    }
+}
+
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        for node in self.nodes.values() {
+            release_local_port(node.ws_port);
+            if let Some(port) = node.network_port {
+                release_local_port(port);
+            }
+        }
     }
 }
 

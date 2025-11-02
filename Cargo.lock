@@ -1770,6 +1770,7 @@ dependencies = [
  "httptest",
  "itertools 0.14.0",
  "notify",
+ "once_cell",
  "opentelemetry 0.31.0",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
