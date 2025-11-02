@@ -1522,7 +1522,7 @@ async fn test_ping_application_loop() -> TestResult {
 #[freenet_macros::freenet_test(
     nodes = ["gw-0", "gw-1", "gw-2", "node-0", "node-1", "node-2", "node-3", "node-4", "node-5", "node-6"],
     gateways = ["gw-0", "gw-1", "gw-2"],
-    peer_connectivity_ratio = 0.5,
+    peer_connectivity_ratio = 0.3,
     timeout_secs = 240,
     startup_wait_secs = 30,
     tokio_flavor = "multi_thread",

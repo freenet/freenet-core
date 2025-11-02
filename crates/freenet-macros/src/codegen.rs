@@ -261,15 +261,41 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
             // Compute blocked addresses for this peer if partial connectivity is enabled
             let blocked_addresses_code = if let Some(ratio) = args.peer_connectivity_ratio {
+                // Build mapping from node index to peer index (for deterministic blocking)
+                let peer_indices: Vec<(usize, usize)> = args
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(node_idx, label)| !is_gateway(args, label, *node_idx))
+                    .enumerate()
+                    .map(|(peer_idx, (node_idx, _))| (node_idx, peer_idx))
+                    .collect();
+
+                // Find this peer's relative index
+                let this_peer_idx = peer_indices.iter()
+                    .find(|(node_idx, _)| *node_idx == idx)
+                    .map(|(_, peer_idx)| *peer_idx)
+                    .expect("Current node must be in peer list");
+
                 let peer_checks: Vec<_> = args
                     .nodes
                     .iter()
                     .enumerate()
                     .filter(|(other_idx, other_label)| !is_gateway(args, other_label, *other_idx) && *other_idx != idx)
                     .map(|(other_idx, _)| {
+                        // Find the other peer's relative index
+                        let other_peer_idx = peer_indices.iter()
+                            .find(|(node_idx, _)| *node_idx == other_idx)
+                            .map(|(_, peer_idx)| *peer_idx)
+                            .expect("Other node must be in peer list");
+
                         let port_var = format_ident!("peer_network_port_{}", other_idx);
                         quote! {
-                            if (#idx * #other_idx) % 100 >= (#ratio * 100.0) as usize {
+                            // Use ordered pair and better hash distribution for deterministic connectivity
+                            // Use relative peer indices (not absolute node indices) for consistent blocking
+                            let (a, b) = if #this_peer_idx < #other_peer_idx { (#this_peer_idx, #other_peer_idx) } else { (#other_peer_idx, #this_peer_idx) };
+                            let hash_value = (a * 17 + b * 31 + a * b * 7) % 100;
+                            if hash_value >= (#ratio * 100.0) as usize {
                                 blocked_addresses.push(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, #port_var)));
                             }
                         }
