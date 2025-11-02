@@ -46,7 +46,11 @@ impl syn::parse::Parse for FreenetTestArgs {
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
         let mut aggregate_events = AggregateEventsMode::OnFailure;
-        let mut log_level = "freenet=debug,info".to_string();
+        // Default log level: freenet=debug for general debugging,
+        // transport=warn to reduce keep-alive/connection noise,
+        // p2p_protoc=info to reduce connection timeout spam,
+        // info as global default
+        let mut log_level = "freenet=debug,freenet_core::transport=warn,freenet::node::network_bridge::p2p_protoc=info,info".to_string();
         let mut tokio_flavor = TokioFlavor::CurrentThread;
         let mut tokio_worker_threads = None;
         let mut peer_connectivity_ratio = None;
@@ -237,6 +241,7 @@ mod tests {
         assert_eq!(args.timeout_secs, 180);
         assert_eq!(args.startup_wait_secs, 15);
         assert_eq!(args.aggregate_events, AggregateEventsMode::OnFailure);
+        assert_eq!(args.log_level, "freenet=debug,freenet_core::transport=warn,freenet::node::network_bridge::p2p_protoc=info,info");
     }
 
     #[test]
