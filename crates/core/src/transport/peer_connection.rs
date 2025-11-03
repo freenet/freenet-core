@@ -335,7 +335,7 @@ impl PeerConnection {
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_millis(10)));
 
-        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(30);
+        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(120);
         let mut last_received = std::time::Instant::now();
 
         // Check for timeout periodically

@@ -1155,10 +1155,10 @@ async fn process_open_request(
                             tracing::debug!(
                                 peer_id = %peer_id,
                                 key = %key,
-                                "Starting direct SUBSCRIBE operation (legacy mode)",
+                                "Starting direct SUBSCRIBE operation",
                             );
 
-                            // Legacy mode: generate transaction, register first, then run op
+                            // Generate transaction, register first, then run op
                             let tx = crate::message::Transaction::new::<
                                 crate::operations::subscribe::SubscribeMsg,
                             >();

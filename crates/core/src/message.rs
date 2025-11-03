@@ -363,6 +363,10 @@ pub(crate) enum NodeEvent {
         key: ContractKey,
         subscribed: bool,
     },
+    /// Register expectation for an inbound connection from the given peer.
+    ExpectPeerConnection {
+        peer: PeerId,
+    },
     /// Send a message to a peer over the network
     SendMessage {
         target: PeerId,
@@ -443,6 +447,9 @@ impl Display for NodeEvent {
                     f,
                     "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
                 )
+            }
+            NodeEvent::ExpectPeerConnection { peer } => {
+                write!(f, "ExpectPeerConnection (from {peer})")
             }
             NodeEvent::SendMessage { target, msg } => {
                 write!(f, "SendMessage (to {target}, tx: {})", msg.id())

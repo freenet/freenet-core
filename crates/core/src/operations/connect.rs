@@ -338,12 +338,36 @@ impl Operation for ConnectOp {
                         "Checking connectivity request received"
                     );
 
-                    let should_accept = if op_manager
+                    let requested_accept = op_manager
                         .ring
                         .connection_manager
-                        .should_accept(joiner_loc, &joiner.peer)
-                    {
+                        .should_accept(joiner_loc, &joiner.peer);
+                    let acceptance_status = if requested_accept {
                         tracing::info!(tx = %id, %joiner, "CheckConnectivity: Accepting connection from, will trigger ConnectPeer");
+                        // Ensure the transport layer is ready for the incoming handshake before we notify upstream.
+                        op_manager
+                            .notify_node_event(NodeEvent::ExpectPeerConnection {
+                                peer: joiner.peer.clone(),
+                            })
+                            .await?;
+                        if sender.peer != this_peer.peer {
+                            let accept_msg = ConnectMsg::Response {
+                                id: *id,
+                                sender: this_peer.clone(),
+                                target: sender.clone(),
+                                msg: ConnectResponse::AcceptedBy {
+                                    accepted: true,
+                                    acceptor: this_peer.clone(),
+                                    joiner: joiner.peer.clone(),
+                                },
+                            };
+                            op_manager
+                                .notify_node_event(NodeEvent::SendMessage {
+                                    target: sender.peer.clone(),
+                                    msg: Box::new(NetMessage::from(accept_msg)),
+                                })
+                                .await?;
+                        }
                         let (callback, mut result) = tokio::sync::mpsc::channel(10);
                         // Attempt to connect to the joiner
                         op_manager
@@ -354,6 +378,7 @@ impl Operation for ConnectOp {
                                 is_gw: false,
                             })
                             .await?;
+                        let mut status = true;
                         match result.recv().await.ok_or(OpError::NotificationError)? {
                             Ok((peer_id, remaining_checks)) => {
                                 tracing::info!(
@@ -363,15 +388,11 @@ impl Operation for ConnectOp {
                                     remaining_checks,
                                     "ConnectPeer completed successfully"
                                 );
-                                let was_reserved = {
-                                    // reserved just above in call to should_accept
-                                    true
-                                };
+                                let was_reserved = true; // reserved just above in call to should_accept
                                 op_manager
                                     .ring
                                     .add_connection(joiner_loc, joiner.peer.clone(), was_reserved)
                                     .await;
-                                true
                             }
                             Err(()) => {
                                 tracing::info!(
@@ -383,11 +404,48 @@ impl Operation for ConnectOp {
                                     .ring
                                     .connection_manager
                                     .prune_in_transit_connection(&joiner.peer);
-                                false
+                                status = false;
+                                if sender.peer != this_peer.peer {
+                                    let decline_msg = ConnectMsg::Response {
+                                        id: *id,
+                                        sender: this_peer.clone(),
+                                        target: sender.clone(),
+                                        msg: ConnectResponse::AcceptedBy {
+                                            accepted: false,
+                                            acceptor: this_peer.clone(),
+                                            joiner: joiner.peer.clone(),
+                                        },
+                                    };
+                                    op_manager
+                                        .notify_node_event(NodeEvent::SendMessage {
+                                            target: sender.peer.clone(),
+                                            msg: Box::new(NetMessage::from(decline_msg)),
+                                        })
+                                        .await?;
+                                }
                             }
                         }
+                        status
                     } else {
                         tracing::debug!(tx = %id, at = %this_peer.peer, from = %joiner, "Rejecting connection");
+                        if sender.peer != this_peer.peer {
+                            let decline_msg = ConnectMsg::Response {
+                                id: *id,
+                                sender: this_peer.clone(),
+                                target: sender.clone(),
+                                msg: ConnectResponse::AcceptedBy {
+                                    accepted: false,
+                                    acceptor: this_peer.clone(),
+                                    joiner: joiner.peer.clone(),
+                                },
+                            };
+                            op_manager
+                                .notify_node_event(NodeEvent::SendMessage {
+                                    target: sender.peer.clone(),
+                                    msg: Box::new(NetMessage::from(decline_msg)),
+                                })
+                                .await?;
+                        }
                         false
                     };
 
@@ -402,7 +460,7 @@ impl Operation for ConnectOp {
                             ForwardParams {
                                 left_htl: hops_left,
                                 max_htl,
-                                accepted: should_accept,
+                                accepted: requested_accept,
                                 skip_connections: skip_connections.clone(),
                                 skip_forwards: skip_forwards.clone(),
                                 req_peer: sender.clone(),
@@ -418,18 +476,17 @@ impl Operation for ConnectOp {
                         }
                     }
 
-                    let response = ConnectResponse::AcceptedBy {
-                        accepted: should_accept,
-                        acceptor: this_peer.clone(),
-                        joiner: joiner.peer.clone(),
-                    };
-
-                    return_msg = Some(ConnectMsg::Response {
+                    let response_msg = ConnectMsg::Response {
                         id: *id,
                         sender: this_peer.clone(),
-                        msg: response,
                         target: sender.clone(),
-                    });
+                        msg: ConnectResponse::AcceptedBy {
+                            accepted: acceptance_status,
+                            acceptor: this_peer.clone(),
+                            joiner: joiner.peer.clone(),
+                        },
+                    };
+                    return_msg = Some(response_msg);
                 }
                 ConnectMsg::Response {
                     id,
@@ -469,6 +526,14 @@ impl Operation for ConnectOp {
                                     connected_to = %acceptor.peer,
                                     "Open connection acknowledged at requesting joiner peer",
                                 );
+                                if acceptor.peer != this_peer_id {
+                                    // Ensure inbound handshake packets from the acceptor aren't dropped.
+                                    op_manager
+                                        .notify_node_event(NodeEvent::ExpectPeerConnection {
+                                            peer: acceptor.peer.clone(),
+                                        })
+                                        .await?;
+                                }
                                 tracing::info!(
                                     tx = %id,
                                     joiner = %this_peer_id,
@@ -482,7 +547,7 @@ impl Operation for ConnectOp {
                                     .add_connection(
                                         acceptor.location.expect("location not found"),
                                         acceptor.peer.clone(),
-                                        true, // we reserved the connection to this peer before asking to join
+                                        true,
                                     )
                                     .await;
                             } else {
@@ -589,6 +654,21 @@ impl Operation for ConnectOp {
                             assert!(info.remaining_connections > 0);
                             let remaining_connections =
                                 info.remaining_connections.saturating_sub(1);
+
+                            if *accepted && *joiner == this_peer_id && acceptor.peer != this_peer_id
+                            {
+                                tracing::debug!(
+                                    tx = %id,
+                                    at = %this_peer_id,
+                                    acceptor = %acceptor.peer,
+                                    "Forward path accepted connection; registering inbound expectation"
+                                );
+                                op_manager
+                                    .notify_node_event(NodeEvent::ExpectPeerConnection {
+                                        peer: acceptor.peer.clone(),
+                                    })
+                                    .await?;
+                            }
 
                             if remaining_connections == 0 {
                                 tracing::debug!(
@@ -1118,8 +1198,6 @@ where
 
     let num_connections = connection_manager.num_connections();
     let num_reserved = connection_manager.get_reserved_connections();
-    let max_connections = connection_manager.max_connections;
-
     tracing::info!(
         tx = %id,
         joiner = %joiner.peer,
@@ -1127,35 +1205,13 @@ where
         num_reserved = %num_reserved,
         is_gateway = %is_gateway,
         accepted = %accepted,
+        skip_connections_count = %skip_connections.len(),
+        skip_forwards_count = %skip_forwards.len(),
         "forward_conn: checking connection forwarding",
     );
 
-    // Special case: Gateway bootstrap when starting with zero connections AND only one reserved
-    // Note: num_reserved will be 1 (not 0) because should_accept() already reserved a slot
-    // for this connection. This ensures only the very first connection is accepted directly,
-    // avoiding race conditions where multiple concurrent join attempts would all be accepted directly.
-    //
-    // IMPORTANT: Bootstrap acceptances are marked with is_bootstrap_acceptance=true so that
-    // the handshake handler (see handshake.rs forward_or_accept_join) can immediately register
-    // the connection in the ring. This bypasses the normal CheckConnectivity flow which doesn't
-    // apply to bootstrap since:
-    // 1. There are no other peers to forward to
-    // 2. The "already connected" bug doesn't apply (this is the first connection)
-    // 3. We need the connection registered so the gateway can respond to FindOptimalPeer requests
-    //
-    // See PR #1871 discussion with @iduartgomez for context.
-    //
-    // IMPORTANT (issue #1908): Extended to cover early network formation (only the very first peer).
-    // During bootstrap we keep the first connection direct to guarantee bidirectional connectivity;
-    // subsequent peers should be forwarded through existing nodes.
-    //
-    // However, we still respect max_connections - this only applies when there's capacity.
-    const EARLY_NETWORK_THRESHOLD: usize = 4;
-    let has_capacity = num_connections + num_reserved < max_connections;
-    if is_gateway
-        && accepted
-        && (num_connections == 0 || (num_connections < EARLY_NETWORK_THRESHOLD && has_capacity))
-    {
+    // Bootstrap: gateway has no neighbours yet, so we keep the courtesy link and stop here.
+    if is_gateway && accepted && num_connections == 0 {
         if num_reserved != 1 {
             tracing::debug!(
                 tx = %id,
@@ -1167,11 +1223,9 @@ where
         tracing::info!(
             tx = %id,
             joiner = %joiner.peer,
-            connections = num_connections,
-            has_capacity = %has_capacity,
-            "Gateway early network: accepting connection directly (will register immediately)",
+            "Gateway bootstrap: accepting first neighbour directly"
         );
-        let connectivity_info = ConnectivityInfo::new_bootstrap(joiner.clone(), 1); // Single check for direct connection
+        let connectivity_info = ConnectivityInfo::new_bootstrap(joiner.clone(), 1);
         return Ok(Some(ConnectState::AwaitingConnectivity(connectivity_info)));
     }
 
@@ -1231,7 +1285,8 @@ where
                     target_peer
                 );
                 network_bridge.send(&target_peer.peer, forward_msg).await?;
-                return update_state_with_forward_info(&req_peer, left_htl);
+                let forwarded_state = update_state_with_forward_info(&req_peer, left_htl)?;
+                return Ok(forwarded_state);
             }
             None => {
                 // Couldn't find suitable peer to forward to

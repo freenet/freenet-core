@@ -160,6 +160,8 @@ impl ConnectionManager {
             open,
             reserved_before,
             is_gateway = self.is_gateway,
+            min = self.min_connections,
+            max = self.max_connections,
             "should_accept: evaluating direct acceptance guard"
         );
 
@@ -178,7 +180,7 @@ impl ConnectionManager {
             + open;
 
         if open == 0 {
-            // if this is the first connection, then accept it
+            tracing::debug!(%peer_id, "should_accept: first connection -> accepting");
             return true;
         }
 
@@ -195,23 +197,22 @@ impl ConnectionManager {
                 );
                 self.reserved_connections
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!(%peer_id, "should_accept: gateway direct-accept limit hit, forwarding instead");
                 return false;
             }
         }
 
         if self.location_for_peer.read().get(peer_id).is_some() {
-            // avoid connecting more than once to the same peer
-            self.reserved_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            tracing::debug!(%peer_id, "Peer already connected");
-            return false;
+            // We've already accepted this peer (pending or active); treat as a no-op acceptance.
+            tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
+            return true;
         }
 
         let accepted = if total_conn < self.min_connections {
-            tracing::info!(%peer_id, "Accepted connection, below min connections");
+            tracing::info!(%peer_id, total_conn, "should_accept: accepted (below min connections)");
             true
         } else if total_conn >= self.max_connections {
-            tracing::info!(%peer_id, "Rejected connection, max connections reached");
+            tracing::info!(%peer_id, total_conn, "should_accept: rejected (max connections reached)");
             false
         } else {
             let accepted = self
@@ -220,18 +221,19 @@ impl ConnectionManager {
                 .evaluate_new_connection(location, Instant::now())
                 .unwrap_or(true);
 
-            if accepted {
-                tracing::info!(%peer_id, "Accepted connection, topology manager");
-            } else {
-                tracing::info!(%peer_id, "Rejected connection, topology manager");
-            }
+            tracing::info!(
+                %peer_id,
+                total_conn,
+                accepted,
+                "should_accept: topology manager decision"
+            );
             accepted
         };
         if !accepted {
             self.reserved_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         } else {
-            tracing::info!(%peer_id, "Accepted connection, reserving spot");
+            tracing::info!(%peer_id, total_conn, "should_accept: accepted (reserving spot)");
             self.record_pending_location(peer_id, location);
         }
         accepted

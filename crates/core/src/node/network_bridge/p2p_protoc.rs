@@ -32,7 +32,8 @@ use crate::node::{MessageProcessor, PeerId};
 use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
 use crate::ring::Location;
 use crate::transport::{
-    create_connection_handler, PeerConnection, TransportError, TransportKeypair,
+    create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
+    TransportKeypair,
 };
 use crate::{
     client_events::ClientId,
@@ -193,6 +194,16 @@ impl P2pConnManager {
             message_processor,
         } = self;
 
+        let (outbound_conn_handler, inbound_conn_handler) = create_connection_handler::<UdpSocket>(
+            key_pair.clone(),
+            listening_ip,
+            listening_port,
+            is_gateway,
+            bandwidth_limit,
+            if is_gateway { &[] } else { &gateways },
+        )
+        .await?;
+
         tracing::info!(
             %listening_port,
             %listening_ip,
@@ -201,21 +212,12 @@ impl P2pConnManager {
             "Opening network listener - will receive from channel"
         );
 
-        let mut state = EventListenerState::new();
+        let mut state = EventListenerState::new(outbound_conn_handler.clone());
 
         // Separate peer_connections to allow independent borrowing by the stream
         let peer_connections: FuturesUnordered<
             BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
         > = FuturesUnordered::new();
-
-        let (outbound_conn_handler, inbound_conn_handler) = create_connection_handler::<UdpSocket>(
-            key_pair.clone(),
-            listening_ip,
-            listening_port,
-            is_gateway,
-            bandwidth_limit,
-        )
-        .await?;
 
         // For non-gateway peers, pass the peer_ready flag so it can be set after first handshake
         // For gateways, pass None (they're always ready)
@@ -565,6 +567,10 @@ impl P2pConnManager {
                                     is_gw,
                                 )
                                 .await?;
+                            }
+                            NodeEvent::ExpectPeerConnection { peer } => {
+                                tracing::debug!(%peer, "ExpectPeerConnection event received; registering inbound expectation");
+                                state.outbound_handler.expect_incoming(peer.addr);
                             }
                             NodeEvent::SendMessage { target, msg } => {
                                 // Send the message to the target peer over the network
@@ -1113,6 +1119,7 @@ impl P2pConnManager {
                     pending_txs = ?txs_entry,
                     "connect_peer: registered new pending connection"
                 );
+                state.outbound_handler.expect_incoming(peer_addr);
             }
         }
         tracing::debug!(
@@ -1909,6 +1916,7 @@ impl ConnectResultSender for mpsc::Sender<Result<(PeerId, Option<usize>), ()>> {
 }
 
 struct EventListenerState {
+    outbound_handler: OutboundConnectionHandler,
     // Note: peer_connections has been moved out to allow separate borrowing by the stream
     pending_from_executor: HashSet<Transaction>,
     // FIXME: we are potentially leaving trash here when transacrions are completed
@@ -1921,8 +1929,9 @@ struct EventListenerState {
 }
 
 impl EventListenerState {
-    fn new() -> Self {
+    fn new(outbound_handler: OutboundConnectionHandler) -> Self {
         Self {
+            outbound_handler,
             pending_from_executor: HashSet::new(),
             tx_to_client: HashMap::new(),
             client_waiting_transaction: Vec::new(),

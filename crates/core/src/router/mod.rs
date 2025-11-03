@@ -205,12 +205,11 @@ impl Router {
 
             let mut peer_distances: Vec<_> = peers
                 .into_iter()
-                .map(|peer| {
-                    let distance = peer
-                        .location
-                        .map(|loc| target_location.distance(loc))
-                        .unwrap_or_else(|| Distance::new(0.5));
-                    (peer, distance)
+                .filter_map(|peer| {
+                    peer.location.map(|loc| {
+                        let distance = target_location.distance(loc);
+                        (peer, distance)
+                    })
                 })
                 .collect();
 

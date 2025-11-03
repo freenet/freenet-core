@@ -62,9 +62,9 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             use anyhow::anyhow;
 
             // 1. Setup TestLogger
-            let mut __test_logger = TestLogger::new().with_level(#log_level);
-            if std::env::var_os("FREENET_TEST_LOG_JSON").is_some() {
-                __test_logger = __test_logger.with_json();
+            let mut __test_logger = TestLogger::new().with_json().with_level(#log_level);
+            if std::env::var_os("FREENET_TEST_LOG_DISABLE_JSON").is_some() {
+                __test_logger = __test_logger.with_pretty();
             }
             let _logger = __test_logger.init();
 

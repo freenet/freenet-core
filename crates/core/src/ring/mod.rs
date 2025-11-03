@@ -270,38 +270,38 @@ impl Ring {
         let router = self.router.read();
         let target_location = Location::from(contract_key);
 
-        let mut candidates: BTreeMap<PeerId, PeerKeyLocation> = BTreeMap::new();
+        let mut seen = HashSet::new();
+        let mut candidates: Vec<PeerKeyLocation> = Vec::new();
 
         let connections = self.connection_manager.get_connections_by_location();
         for conns in connections.values() {
             for conn in conns {
                 let peer = conn.location.peer.clone();
-                if skip_list.has_element(peer.clone()) {
+                if skip_list.has_element(peer.clone()) || !seen.insert(peer) {
                     continue;
                 }
-                candidates
-                    .entry(peer)
-                    .or_insert_with(|| conn.location.clone());
+                candidates.push(conn.location.clone());
             }
         }
 
-        let known_locations = self.connection_manager.get_known_locations();
-        for (peer, location) in known_locations {
-            if skip_list.has_element(peer.clone()) {
-                continue;
-            }
-            candidates
-                .entry(peer.clone())
-                .or_insert_with(|| PeerKeyLocation {
+        if candidates.len() < k {
+            let known_locations = self.connection_manager.get_known_locations();
+            for (peer, location) in known_locations {
+                if skip_list.has_element(peer.clone()) || !seen.insert(peer.clone()) {
+                    continue;
+                }
+                candidates.push(PeerKeyLocation {
                     peer,
                     location: Some(location),
                 });
+                if candidates.len() >= k {
+                    break;
+                }
+            }
         }
 
-        let peers = candidates.values();
-
         router
-            .select_k_best_peers(peers, target_location, k)
+            .select_k_best_peers(candidates.iter(), target_location, k)
             .into_iter()
             .cloned()
             .collect()
