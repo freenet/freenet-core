@@ -465,8 +465,7 @@ impl P2pConnManager {
                         }
                         ConnEvent::ClosedChannel(reason) => {
                             match reason {
-                                ChannelCloseReason::Handshake
-                                | ChannelCloseReason::Bridge
+                                ChannelCloseReason::Bridge
                                 | ChannelCloseReason::Controller
                                 | ChannelCloseReason::Notification
                                 | ChannelCloseReason::OpExecution => {
@@ -942,10 +941,13 @@ impl P2pConnManager {
                         Ok(EventResult::Continue)
                     }
                     Err(handshake_error) => {
-                        tracing::error!(?handshake_error, "Handshake handler error");
-                        Ok(EventResult::Event(
-                            ConnEvent::ClosedChannel(ChannelCloseReason::Handshake).into(),
-                        ))
+                        tracing::warn!(
+                            ?handshake_error,
+                            "Handshake handler yielded error; cleaning up pending connections"
+                        );
+                        self.handle_handshake_failure(handshake_error, state)
+                            .await?;
+                        Ok(EventResult::Continue)
                     }
                 }
             }
@@ -1462,6 +1464,102 @@ impl P2pConnManager {
         Ok(())
     }
 
+    async fn handle_handshake_failure(
+        &mut self,
+        handshake_error: HandshakeError,
+        state: &mut EventListenerState,
+    ) -> anyhow::Result<()> {
+        match handshake_error {
+            HandshakeError::ConnectionClosed(addr) => {
+                let pending_txs = state
+                    .awaiting_connection_txs
+                    .remove(&addr)
+                    .unwrap_or_default();
+                if let Some(callbacks) = state.awaiting_connection.remove(&addr) {
+                    tracing::info!(
+                        remote = %addr,
+                        callbacks = callbacks.len(),
+                        pending_txs = ?pending_txs,
+                        "Notifying callbacks after handshake connection closed"
+                    );
+
+                    let mut callbacks = callbacks.into_iter();
+                    if let Some(mut cb) = callbacks.next() {
+                        cb.send_result(Err(HandshakeError::ConnectionClosed(addr)))
+                            .await
+                            .inspect_err(|err| {
+                                tracing::debug!(
+                                    remote = %addr,
+                                    error = ?err,
+                                    "Failed to notify primary handshake callback"
+                                );
+                            })
+                            .ok();
+                    }
+
+                    for mut cb in callbacks {
+                        cb.send_result(Err(HandshakeError::ChannelClosed))
+                            .await
+                            .inspect_err(|err| {
+                                tracing::debug!(
+                                    remote = %addr,
+                                    error = ?err,
+                                    "Failed to notify fallback handshake callback"
+                                );
+                            })
+                            .ok();
+                    }
+                }
+
+                // Drop any pending transient transactions bound to this address
+                state
+                    .transient_conn
+                    .retain(|_, socket_addr| socket_addr != &addr);
+            }
+            HandshakeError::ChannelClosed => {
+                if !state.awaiting_connection.is_empty() {
+                    tracing::warn!(
+                        awaiting = state.awaiting_connection.len(),
+                        "Handshake channel closed; notifying all pending callbacks"
+                    );
+                }
+
+                let awaiting = std::mem::take(&mut state.awaiting_connection);
+                let awaiting_txs = std::mem::take(&mut state.awaiting_connection_txs);
+
+                for (addr, callbacks) in awaiting {
+                    let pending_txs = awaiting_txs.get(&addr).cloned().unwrap_or_default();
+                    tracing::debug!(
+                        remote = %addr,
+                        callbacks = callbacks.len(),
+                        pending_txs = ?pending_txs,
+                        "Delivering channel-closed notification to pending callbacks"
+                    );
+                    for mut cb in callbacks {
+                        cb.send_result(Err(HandshakeError::ChannelClosed))
+                            .await
+                            .inspect_err(|err| {
+                                tracing::debug!(
+                                    remote = %addr,
+                                    error = ?err,
+                                    "Failed to deliver channel-closed handshake notification"
+                                );
+                            })
+                            .ok();
+                    }
+                }
+            }
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "Unhandled handshake error without socket association"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn try_to_forward(&mut self, forward_to: &PeerId, msg: NetMessage) -> anyhow::Result<()> {
         if let Some(peer) = self.connections.get(forward_to) {
             tracing::debug!(%forward_to, %msg, "Forwarding message to peer");
@@ -1851,8 +1949,6 @@ pub(super) enum ConnEvent {
 
 #[derive(Debug)]
 pub(super) enum ChannelCloseReason {
-    /// Handshake channel closed - potentially transient, continue operation
-    Handshake,
     /// Internal bridge channel closed - critical, must shutdown gracefully
     Bridge,
     /// Node controller channel closed - critical, must shutdown gracefully
