@@ -425,21 +425,18 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
 fn generate_node_tasks(args: &FreenetTestArgs) -> TokenStream {
     let mut tasks = Vec::new();
 
-    for (idx, node_label) in args.nodes.iter().enumerate() {
+    for (idx, _node_label) in args.nodes.iter().enumerate() {
         let task_var = format_ident!("node_task_{}", idx);
         let node_var = format_ident!("node_{}", idx);
 
         tasks.push(quote! {
-            let #task_var = tokio::task::spawn_local(
-                #node_var
-                    .run()
-                    .instrument(tracing::info_span!("test_peer", test_node = #node_label))
-            );
+            let #task_var = tokio::task::spawn_local(#node_var.run());
+            // Small delay to ensure proper task startup ordering
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         });
     }
 
     quote! {
-        use tracing::Instrument;
         #(#tasks)*
     }
 }
