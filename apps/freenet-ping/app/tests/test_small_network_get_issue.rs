@@ -1,10 +1,3 @@
-/// Test to reproduce the get operation failure in small, poorly connected networks
-/// This simulates the real network conditions where contracts can't be retrieved
-///
-/// Recent fixes that should resolve the issues:
-/// - a283e23: Fixed gateway crashes during timeout notifications
-/// - 615f02d: Fixed PUT response routing through forwarding peers
-/// - 5734a33: Fixed local caching before forwarding PUTs
 mod common;
 
 use std::{net::TcpListener, path::PathBuf, time::Duration};
@@ -28,20 +21,8 @@ use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, P
 async fn test_small_network_get_failure() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
-    /*
-     * This test simulates the real network issue where:
-     * 1. A small number of peers (matching production)
-     * 2. Poor connectivity between peers
-     * 3. Gateway publishes a contract (central topology position)
-     * 4. Node2 tries to GET the contract through the gateway
-     *
-     * Without backtracking, the GET would fail.
-     * With backtracking, it should succeed.
-     */
-
-    // Small network like production
     const NUM_GATEWAYS: usize = 1;
-    const NUM_NODES: usize = 3; // Total 4 peers like in production
+    const NUM_NODES: usize = 3;
 
     println!("🔧 Testing get operation in small, poorly connected network");
     println!(
@@ -49,15 +30,10 @@ async fn test_small_network_get_failure() -> TestResult {
         NUM_GATEWAYS + NUM_NODES
     );
 
-    // Setup network sockets for the gateway
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-
-    // Setup API sockets for nodes
     let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
-
-    // Configure gateway node
     let (config_gw, preset_cfg_gw) = base_node_test_config(
         true,
         vec![],
@@ -74,7 +50,6 @@ async fn test_small_network_get_failure() -> TestResult {
     let serialized_gateway = serde_json::to_string(&config_info)?;
     let _ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
-    // Configure Node 1 (connects to gateway)
     let (config_node1, preset_cfg_node1) = base_node_test_config(
         false,
         vec![serialized_gateway.clone()],
@@ -87,7 +62,6 @@ async fn test_small_network_get_failure() -> TestResult {
     .await?;
     let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
 
-    // Configure Node 2 (connects to gateway)
     let (config_node2, preset_cfg_node2) = base_node_test_config(
         false,
         vec![serialized_gateway],
@@ -100,7 +74,6 @@ async fn test_small_network_get_failure() -> TestResult {
     .await?;
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
 
-    // Free the sockets
     std::mem::drop(network_socket_gw);
     std::mem::drop(ws_api_port_socket_gw);
     std::mem::drop(ws_api_port_socket_node1);
@@ -113,11 +86,9 @@ async fn test_small_network_get_failure() -> TestResult {
     println!();
     println!("Note: Nodes are only connected through the gateway");
 
-    // Start all nodes
     let gateway_future = async {
         let config = config_gw.build().await?;
         let mut node_config = NodeConfig::new(config.clone()).await?;
-        // Set reasonable connection limits for small test network
         node_config.min_number_of_connections(2);
         node_config.max_number_of_connections(10);
         let node = node_config
@@ -131,7 +102,6 @@ async fn test_small_network_get_failure() -> TestResult {
     let node1_future = async {
         let config = config_node1.build().await?;
         let mut node_config = NodeConfig::new(config.clone()).await?;
-        // Set reasonable connection limits for small test network
         node_config.min_number_of_connections(2);
         node_config.max_number_of_connections(10);
         let node = node_config
@@ -145,7 +115,6 @@ async fn test_small_network_get_failure() -> TestResult {
     let node2_future = async {
         let config = config_node2.build().await?;
         let mut node_config = NodeConfig::new(config.clone()).await?;
-        // Set reasonable connection limits for small test network
         node_config.min_number_of_connections(2);
         node_config.max_number_of_connections(10);
         let node = node_config
@@ -156,12 +125,7 @@ async fn test_small_network_get_failure() -> TestResult {
     .instrument(span!(Level::INFO, "node2"))
     .boxed_local();
 
-    // Increased overall test timeout to 180s (3 minutes) to accommodate:
-    // - 15s startup wait
-    // - 90s PUT operation timeout
-    // - Additional time for GET operations and propagation
     let test = timeout(Duration::from_secs(180), async {
-        // Wait for nodes to start up
         println!("Waiting for nodes to start up...");
         tokio::time::sleep(Duration::from_secs(15)).await;
         println!("✓ Nodes should be up and have basic connectivity");
@@ -173,13 +137,11 @@ async fn test_small_network_get_failure() -> TestResult {
         // Proper fix: Make connection acquisition more aggressive during startup,
         // or make the maintenance interval configurable for tests.
 
-        // Connect to gateway first
         let uri_gw =
             format!("ws://127.0.0.1:{_ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
         let (stream_gw, _) = connect_async(&uri_gw).await?;
         let mut client_gw = WebApi::start(stream_gw);
 
-        // Connect to nodes
         let uri_node1 = format!(
             "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
@@ -192,11 +154,9 @@ async fn test_small_network_get_failure() -> TestResult {
         let (stream_node2, _) = connect_async(&uri_node2).await?;
         let mut client_node2 = WebApi::start(stream_node2);
 
-        // Load the ping contract
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
         println!("Loading contract code from {}", path_to_code.display());
 
-        // Create ping contract options
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(2),
             ttl: Duration::from_secs(60),
@@ -208,7 +168,6 @@ async fn test_small_network_get_failure() -> TestResult {
         let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
-        // Node1 publishes the contract (more typical scenario)
         println!("📤 Node1 publishing ping contract...");
 
         let ping = Ping::default();
@@ -224,11 +183,6 @@ async fn test_small_network_get_failure() -> TestResult {
             }))
             .await?;
 
-        // Wait for put response
-        // Increased timeout from 30s to 90s to account for:
-        // - Connection establishment (15+ seconds)
-        // - WASM compilation overhead
-        // - Network propagation in constrained topology
         println!("Waiting for put response...");
         match timeout(Duration::from_secs(90), client_node1.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key })))
@@ -254,13 +208,10 @@ async fn test_small_network_get_failure() -> TestResult {
             }
         }
 
-        // Give time for any propagation
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Debug: Check if contract is cached on each node
         println!("🔍 Checking which nodes have the contract cached...");
 
-        // Try GET from Gateway
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key: contract_key,
@@ -278,7 +229,6 @@ async fn test_small_network_get_failure() -> TestResult {
             }
         }
 
-        // First, let's do a second GET from Gateway to see if it's faster
         println!("🔍 Testing second GET from Gateway (should be fast if WASM is the issue)...");
         let gw_get2_start = std::time::Instant::now();
         client_gw
@@ -301,7 +251,6 @@ async fn test_small_network_get_failure() -> TestResult {
             }
         }
 
-        // Now Node2 tries to GET the contract
         let get_start = std::time::Instant::now();
         println!("📥 Node2 attempting to GET the contract...");
         println!("   Contract key: {contract_key}");
@@ -318,7 +267,6 @@ async fn test_small_network_get_failure() -> TestResult {
             get_start.elapsed().as_millis()
         );
 
-        // Wait for get response with longer timeout
         let start = std::time::Instant::now();
         match timeout(Duration::from_secs(45), client_node2.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(response))) => {
@@ -355,7 +303,6 @@ async fn test_small_network_get_failure() -> TestResult {
             }
         }
 
-        // Test second GET after connections are established
         println!("\n🔍 Testing second GET from Node2 after connections are established...");
         tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -367,7 +314,6 @@ async fn test_small_network_get_failure() -> TestResult {
                 subscribe: false,
             }))
             .await?;
-        println!("   Second GET request sent");
 
         match timeout(Duration::from_secs(10), client_node2.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -401,7 +347,6 @@ async fn test_small_network_get_failure() -> TestResult {
     })
     .instrument(span!(Level::INFO, "test_small_network_get_failure"));
 
-    // Wait for test completion or node failures
     select! {
         r = gateway_future => {
             match r {
@@ -426,7 +371,6 @@ async fn test_small_network_get_failure() -> TestResult {
                 Err(e) => return Err(anyhow!("Test timed out: {}", e).into()),
                 Ok(Ok(_)) => {
                     println!("Test completed successfully!");
-                    // Give nodes time to process remaining operations before shutdown
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 },
                 Ok(Err(e)) => return Err(anyhow!("Test failed: {}", e).into()),
@@ -434,7 +378,6 @@ async fn test_small_network_get_failure() -> TestResult {
         }
     }
 
-    // Clean up
     drop(preset_cfg_gw);
     drop(preset_cfg_node1);
     drop(preset_cfg_node2);
