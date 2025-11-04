@@ -1,5 +1,10 @@
 /// Test to reproduce the get operation failure in small, poorly connected networks
 /// This simulates the real network conditions where contracts can't be retrieved
+///
+/// Recent fixes that should resolve the issues:
+/// - a283e23: Fixed gateway crashes during timeout notifications
+/// - 615f02d: Fixed PUT response routing through forwarding peers
+/// - 5734a33: Fixed local caching before forwarding PUTs
 mod common;
 
 use std::{net::TcpListener, path::PathBuf, time::Duration};
@@ -20,9 +25,8 @@ use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Test has reliability issues in CI - PUT operations timeout and gateway crashes"]
 async fn test_small_network_get_failure() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
+    freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
     /*
      * This test simulates the real network issue where:
@@ -152,7 +156,11 @@ async fn test_small_network_get_failure() -> TestResult {
     .instrument(span!(Level::INFO, "node2"))
     .boxed_local();
 
-    let test = timeout(Duration::from_secs(120), async {
+    // Increased overall test timeout to 180s (3 minutes) to accommodate:
+    // - 15s startup wait
+    // - 90s PUT operation timeout
+    // - Additional time for GET operations and propagation
+    let test = timeout(Duration::from_secs(180), async {
         // Wait for nodes to start up
         println!("Waiting for nodes to start up...");
         tokio::time::sleep(Duration::from_secs(15)).await;
@@ -217,8 +225,12 @@ async fn test_small_network_get_failure() -> TestResult {
             .await?;
 
         // Wait for put response
+        // Increased timeout from 30s to 90s to account for:
+        // - Connection establishment (15+ seconds)
+        // - WASM compilation overhead
+        // - Network propagation in constrained topology
         println!("Waiting for put response...");
-        match timeout(Duration::from_secs(30), client_node1.recv()).await {
+        match timeout(Duration::from_secs(90), client_node1.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key })))
                 if key == contract_key =>
             {
@@ -233,8 +245,12 @@ async fn test_small_network_get_failure() -> TestResult {
                 return Err(anyhow!("Failed to get put response - error: {}", e));
             }
             Err(_) => {
-                println!("Timeout waiting for put response");
-                // Continue anyway - maybe the contract is already there
+                println!("⚠️  Timeout waiting for put response after 90s");
+                println!("   This may indicate issues with:");
+                println!("   - Network connectivity in small network topology");
+                println!("   - PUT operation propagation delays");
+                println!("   - Gateway stability under timeout conditions");
+                return Err(anyhow!("PUT operation timed out after 90 seconds"));
             }
         }
 
