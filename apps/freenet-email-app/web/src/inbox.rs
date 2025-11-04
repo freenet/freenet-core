@@ -4,7 +4,6 @@ use std::{
     io::{Cursor, Read},
 };
 
-use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, OsRng},
     XChaCha20Poly1305,
@@ -214,9 +213,9 @@ impl DecryptedMessage {
             .unwrap();
 
         use chacha20poly1305::aead::KeyInit;
-        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&chacha_key));
+        let cipher = XChaCha20Poly1305::new((&chacha_key).into());
         let decrypted_content = cipher
-            .decrypt(GenericArray::from_slice(nonce.as_ref()), content.as_ref())
+            .decrypt(nonce.as_ref().into(), content.as_ref())
             .map_err(|e| format!("{e}"))
             .unwrap();
         let content: DecryptedMessage = serde_json::from_slice(&decrypted_content).unwrap();
