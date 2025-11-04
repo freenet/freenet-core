@@ -1,10 +1,7 @@
 use std::marker::PhantomData;
 use std::{cell::RefCell, sync::Arc};
 
-use aes_gcm::{
-    aead::AeadInPlace,
-    Aes128Gcm,
-};
+use aes_gcm::{aead::AeadInPlace, Aes128Gcm};
 use rand::{prelude::SmallRng, rng, Rng, SeedableRng};
 
 use crate::transport::crypto::TransportPublicKey;
