@@ -17,7 +17,7 @@ use rand::SeedableRng;
 use testresult::TestResult;
 use tokio::{select, time::sleep, time::timeout};
 use tokio_tungstenite::connect_async;
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::{span, Instrument, Level};
 
 use common::{
     base_node_test_config, base_node_test_config_with_rng, gw_config_from_path,
@@ -171,10 +171,8 @@ async fn collect_node_diagnostics(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_node_diagnostics_query() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-
     // Setup network sockets for the gateway and client node
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
@@ -463,10 +461,8 @@ async fn test_node_diagnostics_query() -> TestResult {
 }
 
 #[ignore = "this test currently fails and we are workign on fixing it"]
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_multi_node() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-
     // Setup network sockets for the gateway
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
 
@@ -1092,10 +1088,8 @@ async fn test_ping_multi_node() -> TestResult {
 }
 
 #[ignore = "this test currently fails and we are workign on fixing it"]
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_application_loop() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-
     // Setup network sockets for the gateway
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
 
@@ -1520,7 +1514,7 @@ async fn test_ping_application_loop() -> TestResult {
 }
 
 #[cfg(feature = "manual-tests")]
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
@@ -1551,8 +1545,6 @@ async fn test_ping_partially_connected_network() -> TestResult {
     const NUM_REGULAR_NODES: usize = 7;
     const CONNECTIVITY_RATIO: f64 = 0.5; // Controls connectivity between regular nodes
 
-    // Configure logging
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     tracing::info!(
         "Starting test with {} gateways and {} regular nodes (connectivity ratio: {})",
         NUM_GATEWAYS,
