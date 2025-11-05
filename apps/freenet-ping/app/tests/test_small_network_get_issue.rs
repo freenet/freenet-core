@@ -19,7 +19,6 @@ use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, P
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_small_network_get_failure() -> TestResult {
-
     const NUM_GATEWAYS: usize = 1;
     const NUM_NODES: usize = 3;
 
