@@ -13,13 +13,12 @@ use futures::FutureExt;
 use testresult::TestResult;
 use tokio::{select, time::timeout};
 use tokio_tungstenite::connect_async;
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::{span, Instrument, Level};
 
 use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
 
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_small_network_get_failure() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
 
     const NUM_GATEWAYS: usize = 1;
     const NUM_NODES: usize = 3;
