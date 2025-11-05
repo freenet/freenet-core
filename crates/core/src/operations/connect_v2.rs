@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::dev_tool::Location;
 use crate::message::Transaction;
+use crate::node::{OpManager, PeerId};
 use crate::ring::PeerKeyLocation;
-use crate::util::Backoff;
+use crate::util::{Backoff, Contains};
 
 /// Top-level message envelope used by the new connect handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +176,54 @@ impl RelayState {
     }
 }
 
+pub(crate) struct RelayEnv<'a> {
+    pub op_manager: &'a OpManager,
+    self_location: PeerKeyLocation,
+}
+
+impl<'a> RelayEnv<'a> {
+    pub fn new(op_manager: &'a OpManager) -> Self {
+        let self_location = op_manager.ring.connection_manager.own_location();
+        Self {
+            op_manager,
+            self_location,
+        }
+    }
+}
+
+impl RelayContext for RelayEnv<'_> {
+    fn self_location(&self) -> &PeerKeyLocation {
+        &self.self_location
+    }
+
+    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool {
+        let location = joiner
+            .location
+            .unwrap_or_else(|| Location::from_address(&joiner.peer.addr));
+        self.op_manager
+            .ring
+            .connection_manager
+            .should_accept(location, &joiner.peer)
+    }
+
+    fn select_next_hop(
+        &self,
+        desired_location: Location,
+        visited: &[PeerKeyLocation],
+    ) -> Option<PeerKeyLocation> {
+        let skip = VisitedPeerIds { peers: visited };
+        let router = self.op_manager.ring.router.read();
+        self.op_manager
+            .ring
+            .connection_manager
+            .routing(desired_location, None, skip, &router)
+    }
+
+    fn courtesy_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
+        self.op_manager.ring.open_connections() == 0
+    }
+}
+
 #[derive(Debug)]
 pub struct AcceptedPeer {
     pub peer: PeerKeyLocation,
@@ -322,6 +371,22 @@ impl ConnectOpV2 {
             }
             _ => RelayActions::default(),
         }
+    }
+}
+
+struct VisitedPeerIds<'a> {
+    peers: &'a [PeerKeyLocation],
+}
+
+impl Contains<PeerId> for VisitedPeerIds<'_> {
+    fn has_element(&self, target: PeerId) -> bool {
+        self.peers.iter().any(|p| p.peer == target)
+    }
+}
+
+impl Contains<&PeerId> for VisitedPeerIds<'_> {
+    fn has_element(&self, target: &PeerId) -> bool {
+        self.peers.iter().any(|p| &p.peer == target)
     }
 }
 
