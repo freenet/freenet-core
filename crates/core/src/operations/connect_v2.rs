@@ -396,3 +396,158 @@ fn push_unique_peer(list: &mut Vec<PeerKeyLocation>, peer: PeerKeyLocation) {
         list.push(peer);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::PeerId;
+    use crate::transport::TransportKeypair;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Instant;
+
+    struct TestRelayContext {
+        self_loc: PeerKeyLocation,
+        accept: bool,
+        next_hop: Option<PeerKeyLocation>,
+        courtesy: bool,
+    }
+
+    impl TestRelayContext {
+        fn new(self_loc: PeerKeyLocation) -> Self {
+            Self {
+                self_loc,
+                accept: true,
+                next_hop: None,
+                courtesy: false,
+            }
+        }
+
+        fn accept(mut self, accept: bool) -> Self {
+            self.accept = accept;
+            self
+        }
+
+        fn next_hop(mut self, hop: Option<PeerKeyLocation>) -> Self {
+            self.next_hop = hop;
+            self
+        }
+
+        fn courtesy(mut self, courtesy: bool) -> Self {
+            self.courtesy = courtesy;
+            self
+        }
+    }
+
+    impl RelayContext for TestRelayContext {
+        fn self_location(&self) -> &PeerKeyLocation {
+            &self.self_loc
+        }
+
+        fn should_accept(&self, _joiner: &PeerKeyLocation) -> bool {
+            self.accept
+        }
+
+        fn select_next_hop(
+            &self,
+            _desired_location: Location,
+            _visited: &[PeerKeyLocation],
+        ) -> Option<PeerKeyLocation> {
+            self.next_hop.clone()
+        }
+
+        fn courtesy_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
+            self.courtesy
+        }
+    }
+
+    fn make_peer(port: u16) -> PeerKeyLocation {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        let keypair = TransportKeypair::new();
+        PeerKeyLocation {
+            peer: PeerId::new(addr, keypair.public().clone()),
+            location: Some(Location::random()),
+        }
+    }
+
+    #[test]
+    fn relay_accepts_when_policy_allows() {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let mut state = RelayState {
+            upstream: joiner.clone(),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                origin: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            courtesy_hint: false,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc.clone()).courtesy(true);
+        let observed_addr = joiner.peer.addr;
+        let actions = state.handle_request(&ctx, &joiner, observed_addr);
+
+        let response = actions.accept_response.expect("expected acceptance");
+        assert_eq!(response.acceptor.peer, self_loc.peer);
+        assert!(response.courtesy);
+        assert_eq!(actions.expect_connection_from.unwrap().peer, joiner.peer);
+        assert!(actions.forward.is_none());
+    }
+
+    #[test]
+    fn relay_forwards_when_not_accepting() {
+        let self_loc = make_peer(4100);
+        let joiner = make_peer(5100);
+        let next_hop = make_peer(6100);
+        let mut state = RelayState {
+            upstream: joiner.clone(),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                origin: joiner.clone(),
+                ttl: 2,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            courtesy_hint: false,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .next_hop(Some(next_hop.clone()));
+        let actions = state.handle_request(&ctx, &joiner, joiner.peer.addr);
+
+        assert!(actions.accept_response.is_none());
+        let (forward_to, request) = actions.forward.expect("expected forward");
+        assert_eq!(forward_to.peer, next_hop.peer);
+        assert_eq!(request.ttl, 1);
+        assert!(request.visited.iter().any(|pkl| pkl.peer == joiner.peer));
+    }
+
+    #[test]
+    fn joiner_tracks_acceptance() {
+        let acceptor = make_peer(7000);
+        let mut state = JoinerState {
+            desired_location: Location::random(),
+            target_connections: 1,
+            observed_address: None,
+            accepted: HashSet::new(),
+            last_progress: Instant::now(),
+        };
+
+        let response = ConnectResponse {
+            acceptor: acceptor.clone(),
+            courtesy: false,
+        };
+        let result = state.register_acceptance(&response, Instant::now());
+        assert!(result.satisfied);
+        let new = result.new_acceptor.expect("expected new acceptor");
+        assert_eq!(new.peer.peer, acceptor.peer);
+        assert!(!new.courtesy);
+    }
+}
