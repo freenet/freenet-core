@@ -48,7 +48,7 @@ use common::{
     base_node_test_config, get_all_ping_states, gw_config_from_path, ping_states_equal, APP_TAG,
     PACKAGE_DIR, PATH_TO_CONTRACT,
 };
-use freenet::{config::set_logger, local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_gateway};
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
@@ -61,7 +61,7 @@ use futures::FutureExt;
 use testresult::TestResult;
 use tokio::{select, time::sleep};
 use tokio_tungstenite::connect_async;
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::{span, Instrument, Level};
 
 /// Configuration for blocked peers test variants
 #[derive(Debug, Clone)]
@@ -98,7 +98,6 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
             "debug,freenet::operations::subscribe=trace,freenet::contract=trace",
         );
     }
-    set_logger(Some(LevelFilter::DEBUG), None);
 
     tracing::info!("Starting {} blocked peers test...", config.test_name);
 
@@ -782,7 +781,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 }
 
 /// Standard blocked peers test (baseline)
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore]
 async fn test_ping_blocked_peers() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
@@ -802,7 +801,7 @@ async fn test_ping_blocked_peers() -> TestResult {
 }
 
 /// Simple blocked peers test
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore]
 async fn test_ping_blocked_peers_simple() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
@@ -825,7 +824,7 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
 // as they only varied in non-functional aspects like timeouts and logging
 
 /// Solution/reference implementation for blocked peers
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "fix me"]
 async fn test_ping_blocked_peers_solution() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
