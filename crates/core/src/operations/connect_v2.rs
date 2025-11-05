@@ -6,13 +6,14 @@
 //! and delete the legacy code.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::dev_tool::Location;
-use crate::message::Transaction;
+use crate::message::{InnerMessage, Transaction};
 use crate::node::{OpManager, PeerId};
 use crate::ring::PeerKeyLocation;
 use crate::util::{Backoff, Contains};
@@ -40,6 +41,55 @@ pub(crate) enum ConnectMsgV2 {
         target: PeerKeyLocation,
         address: SocketAddr,
     },
+}
+
+impl InnerMessage for ConnectMsgV2 {
+    fn id(&self) -> &Transaction {
+        match self {
+            ConnectMsgV2::Request { id, .. }
+            | ConnectMsgV2::Response { id, .. }
+            | ConnectMsgV2::ObservedAddress { id, .. } => id,
+        }
+    }
+
+    #[allow(refining_impl_trait)]
+    fn target(&self) -> Option<&PeerKeyLocation> {
+        match self {
+            ConnectMsgV2::Request { target, .. }
+            | ConnectMsgV2::Response { target, .. }
+            | ConnectMsgV2::ObservedAddress { target, .. } => Some(target),
+        }
+    }
+
+    fn requested_location(&self) -> Option<Location> {
+        match self {
+            ConnectMsgV2::Request { payload, .. } => Some(payload.desired_location),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ConnectMsgV2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectMsgV2::Request { target, payload, .. } => write!(
+                f,
+                "ConnectRequest {{ target: {target}, desired: {}, ttl: {}, origin: {} }}",
+                payload.desired_location,
+                payload.ttl,
+                payload.origin
+            ),
+            ConnectMsgV2::Response { sender, target, payload, .. } => write!(
+                f,
+                "ConnectResponse {{ sender: {sender}, target: {target}, acceptor: {}, courtesy: {} }}",
+                payload.acceptor,
+                payload.courtesy
+            ),
+            ConnectMsgV2::ObservedAddress { target, address, .. } => {
+                write!(f, "ObservedAddress {{ target: {target}, address: {address} }}")
+            }
+        }
+    }
 }
 
 /// Two-message request payload.
