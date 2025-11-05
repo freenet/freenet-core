@@ -41,14 +41,24 @@ Run these in any worktree before pushing a branch or opening a PR.
 - The repository uses the special `TODO-` `MUST-FIX` marker to block commits that temporarily disable tests. If a test must be skipped, leave a `// TODO-` `MUST-FIX:` comment explaining why and create a follow-up issue.
 - Never remove or ignore failing tests without understanding the root cause.
 
-### Gateway Test Framework
-Integration testing is performed with the `freenet-testing-tools` repository (specifically `gateway-testing/`):
-```bash
-python gateway_test_framework.py --local             # Smoke test against local build
-python gateway_test_framework.py --version v0.1.19   # Regression against a release
-python gateway_test_framework.py --version pr:123    # Validate a pull request
-```
-Results land in `gateway-testing/results/<user>/<date>/` and include markdown summaries and compressed logs. Use the `--extended-stability`, `--multi-room`, or `--debug-locations` flags for deeper investigations.
+### Integration Testing with `freenet-test-network`
+- Use the `freenet-test-network` crate located at `~/code/freenet/freenet-test-network` to spin up gateways and peers for integration tests.
+- Add it as a dev-dependency in your worktree (`freenet-test-network = { path = "../freenet-test-network" }`) and construct networks with the builder API.
+- Sample pattern:
+  ```rust
+  use freenet_test_network::TestNetwork;
+  use std::sync::LazyLock;
+
+  static NETWORK: LazyLock<TestNetwork> = LazyLock::new(|| {
+      TestNetwork::builder()
+          .gateways(1)
+          .peers(5)
+          .build_sync()
+          .expect("start test network")
+  });
+  ```
+- Tests can share the static network and access `NETWORK.gateway(0).ws_url()` to communicate via `freenet_stdlib::client_api::WebApi`.
+- Run the crate’s suite with `cargo test -p freenet-test-network`. When `preserve_temp_dirs_on_failure(true)` is set, failing startups keep logs under `/tmp/freenet-test-network-<timestamp>/` for inspection.
 
 ## Pull Requests & Reviews
 - All PR titles must follow Conventional Commits (`feat:`, `fix:`, `docs:`, etc.). CI fails non-conforming titles.
