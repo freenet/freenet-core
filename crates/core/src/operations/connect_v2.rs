@@ -5,8 +5,6 @@
 //! intact. Once fully implemented we will switch the node to use this module
 //! and delete the legacy code.
 
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -71,7 +69,7 @@ pub(crate) enum ConnectState {
     /// Joiner waiting for acceptances.
     WaitingForResponses(JoinerState),
     /// Intermediate peer evaluating and forwarding requests.
-    Relaying(RelayState),
+    Relaying(Box<RelayState>),
     /// Joiner obtained the required neighbours.
     Completed,
 }
@@ -93,6 +91,124 @@ pub(crate) struct RelayState {
     pub courtesy_hint: bool,
     pub observed_sent: bool,
     pub accepted_locally: bool,
+}
+
+/// Abstractions required to evaluate an inbound connect request at an
+/// intermediate peer.
+pub(crate) trait RelayContext {
+    /// Location of the current peer.
+    fn self_location(&self) -> &PeerKeyLocation;
+
+    /// Determine whether we should accept the joiner immediately.
+    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool;
+
+    /// Choose the next hop for the request, avoiding peers already visited.
+    fn select_next_hop(
+        &self,
+        desired_location: Location,
+        visited: &[PeerKeyLocation],
+    ) -> Option<PeerKeyLocation>;
+
+    /// Whether the acceptance should be treated as a short-lived courtesy link.
+    fn courtesy_hint(&self, acceptor: &PeerKeyLocation, joiner: &PeerKeyLocation) -> bool;
+}
+
+/// Result of processing a request at a relay.
+#[derive(Debug, Default)]
+pub(crate) struct RelayActions {
+    pub accept_response: Option<ConnectResponse>,
+    pub expect_connection_from: Option<PeerKeyLocation>,
+    pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
+    pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
+}
+
+impl RelayState {
+    pub(crate) fn handle_request<C: RelayContext>(
+        &mut self,
+        ctx: &C,
+        observed_remote: &PeerKeyLocation,
+        observed_addr: SocketAddr,
+    ) -> RelayActions {
+        let mut actions = RelayActions::default();
+        push_unique_peer(&mut self.request.visited, observed_remote.clone());
+        push_unique_peer(&mut self.request.visited, ctx.self_location().clone());
+
+        if self.request.origin.peer.addr.ip().is_unspecified()
+            && !self.observed_sent
+            && observed_remote.peer.pub_key == self.request.origin.peer.pub_key
+        {
+            self.request.origin.peer.addr = observed_addr;
+            if self.request.origin.location.is_none() {
+                self.request.origin.location = Some(Location::from_address(&observed_addr));
+            }
+            self.observed_sent = true;
+            actions.observed_address = Some((self.request.origin.clone(), observed_addr));
+        }
+
+        if !self.accepted_locally && ctx.should_accept(&self.request.origin) {
+            self.accepted_locally = true;
+            let acceptor = ctx.self_location().clone();
+            let courtesy = ctx.courtesy_hint(&acceptor, &self.request.origin);
+            self.courtesy_hint = courtesy;
+            actions.accept_response = Some(ConnectResponse {
+                acceptor: acceptor.clone(),
+                courtesy,
+            });
+            actions.expect_connection_from = Some(self.request.origin.clone());
+        }
+
+        if self.forwarded_to.is_none() && self.request.ttl > 0 {
+            if let Some(next) =
+                ctx.select_next_hop(self.request.desired_location, &self.request.visited)
+            {
+                let mut forward_req = self.request.clone();
+                forward_req.ttl = forward_req.ttl.saturating_sub(1);
+                push_unique_peer(&mut forward_req.visited, ctx.self_location().clone());
+                let forward_snapshot = forward_req.clone();
+                self.forwarded_to = Some(next.clone());
+                self.request = forward_req;
+                actions.forward = Some((next, forward_snapshot));
+            }
+        }
+
+        actions
+    }
+}
+
+#[derive(Debug)]
+pub struct AcceptedPeer {
+    pub peer: PeerKeyLocation,
+    pub courtesy: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct JoinerAcceptance {
+    pub new_acceptor: Option<AcceptedPeer>,
+    pub satisfied: bool,
+}
+
+impl JoinerState {
+    pub(crate) fn register_acceptance(
+        &mut self,
+        response: &ConnectResponse,
+        now: Instant,
+    ) -> JoinerAcceptance {
+        let mut acceptance = JoinerAcceptance::default();
+        if self.accepted.insert(response.acceptor.clone()) {
+            self.last_progress = now;
+            acceptance.new_acceptor = Some(AcceptedPeer {
+                peer: response.acceptor.clone(),
+                courtesy: response.courtesy,
+            });
+        }
+        acceptance.satisfied = self.accepted.len() >= self.target_connections;
+        acceptance
+    }
+
+    pub(crate) fn update_observed_address(&mut self, address: SocketAddr, now: Instant) {
+        self.observed_address = Some(address);
+        self.last_progress = now;
+    }
 }
 
 /// Placeholder operation wrapper so we can exercise the logic in isolation in
@@ -136,14 +252,14 @@ impl ConnectOpV2 {
         upstream: PeerKeyLocation,
         request: ConnectRequest,
     ) -> Self {
-        let state = ConnectState::Relaying(RelayState {
+        let state = ConnectState::Relaying(Box::new(RelayState {
             upstream,
             request,
             forwarded_to: None,
             courtesy_hint: false,
             observed_sent: false,
             accepted_locally: false,
-        });
+        }));
         Self {
             id,
             state: Some(state),
@@ -154,5 +270,12 @@ impl ConnectOpV2 {
 
     pub(crate) fn is_completed(&self) -> bool {
         matches!(self.state, Some(ConnectState::Completed))
+    }
+}
+
+fn push_unique_peer(list: &mut Vec<PeerKeyLocation>, peer: PeerKeyLocation) {
+    let already_present = list.iter().any(|p| p.peer == peer.peer);
+    if !already_present {
+        list.push(peer);
     }
 }
