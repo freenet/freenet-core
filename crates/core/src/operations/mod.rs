@@ -15,6 +15,8 @@ use crate::{
 };
 
 pub(crate) mod connect;
+#[allow(dead_code)]
+pub(crate) mod connect_v2;
 pub(crate) mod get;
 pub(crate) mod put;
 pub(crate) mod subscribe;
