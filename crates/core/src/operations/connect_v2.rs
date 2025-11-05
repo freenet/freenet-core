@@ -271,6 +271,58 @@ impl ConnectOpV2 {
     pub(crate) fn is_completed(&self) -> bool {
         matches!(self.state, Some(ConnectState::Completed))
     }
+
+    pub(crate) fn handle_response(
+        &mut self,
+        response: &ConnectResponse,
+        now: Instant,
+    ) -> Option<JoinerAcceptance> {
+        match self.state.as_mut() {
+            Some(ConnectState::WaitingForResponses(state)) => {
+                let result = state.register_acceptance(response, now);
+                if result.satisfied {
+                    self.state = Some(ConnectState::Completed);
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn handle_observed_address(&mut self, address: SocketAddr, now: Instant) {
+        if let Some(ConnectState::WaitingForResponses(state)) = self.state.as_mut() {
+            state.update_observed_address(address, now);
+        }
+    }
+
+    pub(crate) fn handle_request<C: RelayContext>(
+        &mut self,
+        ctx: &C,
+        upstream: PeerKeyLocation,
+        request: ConnectRequest,
+        observed_addr: SocketAddr,
+    ) -> RelayActions {
+        if !matches!(self.state, Some(ConnectState::Relaying(_))) {
+            self.state = Some(ConnectState::Relaying(Box::new(RelayState {
+                upstream: upstream.clone(),
+                request: request.clone(),
+                forwarded_to: None,
+                courtesy_hint: false,
+                observed_sent: false,
+                accepted_locally: false,
+            })));
+        }
+
+        match self.state.as_mut() {
+            Some(ConnectState::Relaying(state)) => {
+                state.upstream = upstream;
+                state.request = request;
+                let upstream_snapshot = state.upstream.clone();
+                state.handle_request(ctx, &upstream_snapshot, observed_addr)
+            }
+            _ => RelayActions::default(),
+        }
+    }
 }
 
 fn push_unique_peer(list: &mut Vec<PeerKeyLocation>, peer: PeerKeyLocation) {
