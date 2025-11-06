@@ -217,6 +217,7 @@ impl Adjustment {
 mod tests {
 
     use super::*;
+    use tracing::debug;
 
     // This test `test_peer_time_estimator` checks the accuracy of the `RoutingOutcomeEstimator` struct's
     // `estimate_retrieval_time()` method. It generates a list of 100 random events, where each event
@@ -239,7 +240,7 @@ mod tests {
         for _ in 0..100 {
             let peer = PeerKeyLocation::random();
             if peer.location.is_none() {
-                println!("Peer location is none for {peer:?}");
+                debug!("Peer location is none for {peer:?}");
             }
             let contract_location = Location::random();
             events.push(simulate_positive_request(peer, contract_location));
@@ -265,7 +266,7 @@ mod tests {
 
         // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
-        println!("Average error: {average_error}");
+        debug!("Average error: {average_error}");
         assert!(average_error < 0.01);
     }
 
@@ -276,7 +277,7 @@ mod tests {
         for _ in 0..100 {
             let peer = PeerKeyLocation::random();
             if peer.location.is_none() {
-                println!("Peer location is none for {peer:?}");
+                debug!("Peer location is none for {peer:?}");
             }
             let contract_location = Location::random();
             events.push(simulate_negative_request(peer, contract_location));
@@ -302,7 +303,7 @@ mod tests {
 
         // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
-        println!("Average error: {average_error}");
+        debug!("Average error: {average_error}");
         assert!(average_error < 0.01);
     }
 

@@ -8,10 +8,13 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::task;
 
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
@@ -19,7 +22,7 @@ use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transact
 use crate::node::{IsOperationCompleted, NetworkBridge, OpManager, PeerId};
 use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::ring::PeerKeyLocation;
-use crate::util::{Backoff, Contains};
+use crate::util::{Backoff, Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
 
 /// Top-level message envelope used by the new connect handshake.
@@ -694,6 +697,186 @@ fn store_operation_state_with_msg(
             }))
         }),
     }
+}
+
+#[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
+pub(crate) async fn join_ring_request(
+    backoff: Option<Backoff>,
+    gateway: &PeerKeyLocation,
+    op_manager: &OpManager,
+) -> Result<(), OpError> {
+    use crate::node::ConnectionError;
+    let location = gateway.location.ok_or_else(|| {
+        tracing::error!("Gateway location not found, this should not be possible, report an error");
+        OpError::ConnError(ConnectionError::LocationUnknown)
+    })?;
+
+    if !op_manager
+        .ring
+        .connection_manager
+        .should_accept(location, &gateway.peer)
+    {
+        return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
+    }
+
+    let mut backoff = backoff;
+    if let Some(backoff_state) = backoff.as_mut() {
+        tracing::warn!(
+            "Performing a new join, attempt {}",
+            backoff_state.retries() + 1
+        );
+        if backoff_state.sleep().await.is_none() {
+            tracing::error!("Max number of retries reached");
+            if op_manager.ring.open_connections() == 0 {
+                let tx = Transaction::new::<ConnectMsgV2>();
+                return Err(OpError::MaxRetriesExceeded(tx, tx.transaction_type()));
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    let own = op_manager.ring.connection_manager.own_location();
+    let ttl = op_manager
+        .ring
+        .max_hops_to_live
+        .max(1)
+        .min(u8::MAX as usize) as u8;
+    let target_connections = op_manager.ring.connection_manager.min_connections;
+
+    let (tx, mut op, msg) = ConnectOpV2::initiate_join_request(
+        own.clone(),
+        gateway.clone(),
+        location,
+        ttl,
+        target_connections,
+    );
+
+    op.gateway = Some(Box::new(gateway.clone()));
+    if let Some(backoff) = backoff {
+        op.backoff = Some(backoff);
+    }
+
+    tracing::info!(%gateway.peer, tx = %tx, "Attempting network join using connect_v2");
+
+    op_manager
+        .notify_op_change(
+            NetMessage::V1(NetMessageV1::ConnectV2(msg)),
+            OpEnum::ConnectV2(Box::new(op)),
+        )
+        .await?;
+
+    Ok(())
+}
+
+pub(crate) async fn initial_join_procedure(
+    op_manager: Arc<OpManager>,
+    gateways: &[PeerKeyLocation],
+) -> Result<(), OpError> {
+    let number_of_parallel_connections = {
+        let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
+        let needed_to_cover_max =
+            op_manager.ring.connection_manager.max_connections / max_potential_conns_per_gw;
+        gateways.iter().take(needed_to_cover_max).count().max(2)
+    };
+    let gateways = gateways.to_vec();
+    task::spawn(async move {
+        if gateways.is_empty() {
+            tracing::warn!("No gateways available, aborting join procedure");
+            return;
+        }
+
+        const WAIT_TIME: u64 = 1;
+        const LONG_WAIT_TIME: u64 = 30;
+        const BOOTSTRAP_THRESHOLD: usize = 4;
+
+        tracing::info!(
+            "Starting initial join procedure with {} gateways",
+            gateways.len()
+        );
+
+        loop {
+            let open_conns = op_manager.ring.open_connections();
+            let unconnected_gateways: Vec<_> =
+                op_manager.ring.is_not_connected(gateways.iter()).collect();
+
+            tracing::debug!(
+                "Connection status: open_connections = {}, unconnected_gateways = {}",
+                open_conns,
+                unconnected_gateways.len()
+            );
+
+            let unconnected_count = unconnected_gateways.len();
+
+            if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count > 0 {
+                tracing::info!(
+                    "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways",
+                    open_conns,
+                    BOOTSTRAP_THRESHOLD,
+                    number_of_parallel_connections.min(unconnected_count)
+                );
+                let select_all = FuturesUnordered::new();
+                for gateway in unconnected_gateways
+                    .into_iter()
+                    .shuffle()
+                    .take(number_of_parallel_connections)
+                {
+                    tracing::info!(%gateway, "Attempting connection to gateway");
+                    let op_manager = op_manager.clone();
+                    select_all.push(async move {
+                        (join_ring_request(None, gateway, &op_manager).await, gateway)
+                    });
+                }
+                select_all
+                    .for_each(|(res, gateway)| async move {
+                        if let Err(error) = res {
+                            if !matches!(
+                                error,
+                                OpError::ConnError(
+                                    crate::node::ConnectionError::UnwantedConnection
+                                )
+                            ) {
+                                tracing::error!(
+                                    %gateway,
+                                    %error,
+                                    "Failed while attempting connection to gateway"
+                                );
+                            }
+                        }
+                    })
+                    .await;
+            } else if open_conns >= BOOTSTRAP_THRESHOLD {
+                tracing::trace!(
+                    "Have {} connections (>= threshold of {}), not attempting gateway connections",
+                    open_conns,
+                    BOOTSTRAP_THRESHOLD
+                );
+            }
+
+            let wait_time = if open_conns == 0 {
+                tracing::debug!("No connections yet, waiting {}s before retry", WAIT_TIME);
+                WAIT_TIME
+            } else if open_conns < BOOTSTRAP_THRESHOLD {
+                tracing::debug!(
+                    "Have {} connections (below threshold of {}), waiting {}s",
+                    open_conns,
+                    BOOTSTRAP_THRESHOLD,
+                    WAIT_TIME * 3
+                );
+                WAIT_TIME * 3
+            } else {
+                tracing::trace!(
+                    "Connection pool healthy ({} connections), waiting {}s",
+                    open_conns,
+                    LONG_WAIT_TIME
+                );
+                LONG_WAIT_TIME
+            };
+
+            tokio::time::sleep(Duration::from_secs(wait_time)).await;
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]

@@ -88,12 +88,12 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
                 contract_key
             );
             if recv_state != wrapped_state {
-                eprintln!("State mismatch!");
-                eprintln!(
+                tracing::error!("State mismatch!");
+                tracing::error!(
                     "Expected state: {:?}",
                     String::from_utf8_lossy(wrapped_state.as_ref())
                 );
-                eprintln!(
+                tracing::error!(
                     "Received state: {:?}",
                     String::from_utf8_lossy(recv_state.as_ref())
                 );

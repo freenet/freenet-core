@@ -42,7 +42,7 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
-        connect_v2::ConnectOpV2,
+        connect_v2::{self, ConnectOpV2},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
@@ -1224,7 +1224,7 @@ async fn handle_aborted_op(
                 } = *op;
                 if let Some(gateway) = gateway {
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    connect::join_ring_request(backoff, &gateway, op_manager).await?;
+                    connect_v2::join_ring_request(backoff, &gateway, op_manager).await?;
                 }
             }
             Ok(Some(OpEnum::ConnectV2(op)))
@@ -1235,7 +1235,7 @@ async fn handle_aborted_op(
                 let gateway = op.gateway().cloned();
                 if let Some(gateway) = gateway {
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    connect::join_ring_request(None, &gateway, op_manager).await?;
+                    connect_v2::join_ring_request(None, &gateway, op_manager).await?;
                 }
             }
             Ok(Some(OpEnum::Connect(_))) => {
@@ -1243,7 +1243,7 @@ async fn handle_aborted_op(
                 if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                     tracing::warn!("Retrying joining the ring with an other gateway");
                     if let Some(gateway) = gateways.iter().shuffle().next() {
-                        connect::join_ring_request(None, gateway, op_manager).await?
+                        connect_v2::join_ring_request(None, gateway, op_manager).await?
                     }
                 }
             }
@@ -1251,7 +1251,7 @@ async fn handle_aborted_op(
                 if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                     tracing::warn!("Retrying joining the ring with an other gateway");
                     if let Some(gateway) = gateways.iter().shuffle().next() {
-                        connect::join_ring_request(None, gateway, op_manager).await?
+                        connect_v2::join_ring_request(None, gateway, op_manager).await?
                     }
                 }
             }

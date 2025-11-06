@@ -5,6 +5,7 @@ use crate::wasm_runtime::tests::TestSetup;
 use crate::wasm_runtime::{ContractExecError, RuntimeInnerError};
 use freenet_stdlib::prelude::*;
 use std::time::Instant;
+use tracing::info;
 
 const TEST_CONTRACT_METERING: &str = "test_contract_metering";
 
@@ -52,7 +53,7 @@ fn validate_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let duration = time.elapsed().as_secs_f64();
-    println!("Duration: {duration:.2}s");
+    info!("Duration: {duration:.2}s");
 
     assert!(duration < 5.0, "Should not timeout");
     assert!(
@@ -103,7 +104,7 @@ fn test_update_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let duration = time.elapsed().as_secs_f64();
-    println!("Duration: {duration:.2}s");
+    info!("Duration: {duration:.2}s");
 
     assert!(duration < 5.0, "Should not timeout");
     assert!(
@@ -150,7 +151,7 @@ fn test_summarize_state_metering() -> Result<(), Box<dyn std::error::Error>> {
     let result = runtime.summarize_state(&contract_key, &Parameters::from([].as_ref()), &state);
 
     let duration = time.elapsed().as_secs_f64();
-    println!("Duration: {duration:.2}s");
+    info!("Duration: {duration:.2}s");
 
     assert!(duration < 5.0, "Should not timeout");
     assert!(
@@ -202,7 +203,7 @@ fn test_get_state_delta_metering() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let duration = time.elapsed().as_secs_f64();
-    println!("Duration: {duration:.2}s");
+    info!("Duration: {duration:.2}s");
 
     assert!(duration < 5.0, "Should not timeout");
     assert!(

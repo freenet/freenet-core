@@ -22,7 +22,10 @@ use crate::{
     },
     message::{NetMessage, NetMessageV1, NodeEvent},
     node::NodeConfig,
-    operations::{connect, connect_v2::ConnectOpV2, OpEnum},
+    operations::{
+        connect_v2::{self, ConnectOpV2},
+        OpEnum,
+    },
 };
 
 use super::OpManager;
@@ -180,8 +183,11 @@ impl NodeP2P {
     }
     pub(super) async fn run_node(self) -> anyhow::Result<Infallible> {
         if self.should_try_connect {
-            connect::initial_join_procedure(self.op_manager.clone(), &self.conn_manager.gateways)
-                .await?;
+            connect_v2::initial_join_procedure(
+                self.op_manager.clone(),
+                &self.conn_manager.gateways,
+            )
+            .await?;
 
             // After connecting to gateways, aggressively try to reach min_connections
             // This is important for fast startup and avoiding on-demand connection delays

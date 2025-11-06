@@ -15,6 +15,7 @@ use freenet_stdlib::{
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use tracing::{error, info};
 
 use crate::util::workspace::get_workspace_target_dir;
 
@@ -390,9 +391,9 @@ fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
         contracts.join(name)
     };
 
-    println!("module path: {contract_path:?}");
+    info!("module path: {contract_path:?}");
     let target = get_workspace_target_dir();
-    println!(
+    info!(
         "trying to compile the test contract, target: {}",
         target.display()
     );
@@ -411,7 +412,7 @@ fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
         .join("release")
         .join(name.replace('-', "_"))
         .with_extension("wasm");
-    println!("output file: {output_file:?}");
+    info!("output file: {output_file:?}");
     Ok(std::fs::read(output_file)?)
 }
 
@@ -422,7 +423,7 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
         delegates.join(name)
     };
 
-    println!("delegate path: {delegate_path:?}");
+    info!("delegate path: {delegate_path:?}");
 
     // Check if the delegate directory exists
     if !delegate_path.exists() {
@@ -432,7 +433,7 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
     }
 
     let target = get_workspace_target_dir();
-    println!(
+    info!(
         "trying to compile the test delegate, target: {}",
         target.display()
     );
@@ -451,7 +452,7 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
         .join("release")
         .join(name.replace('-', "_"))
         .with_extension("wasm");
-    println!("output file: {output_file:?}");
+    info!("output file: {output_file:?}");
 
     // Check if output file exists before reading
     if !output_file.exists() {
@@ -462,7 +463,7 @@ fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
 
     let wasm_data = std::fs::read(&output_file)
         .map_err(|e| anyhow::anyhow!("Failed to read output file {output_file:?}: {e}"))?;
-    println!("WASM size: {} bytes", wasm_data.len());
+    info!("WASM size: {} bytes", wasm_data.len());
 
     Ok(wasm_data)
 }
@@ -513,7 +514,7 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyho
     };
 
     let package_type = cli_config.package_type;
-    println!("Compiling {package_type} with rust");
+    info!("Compiling {package_type} with rust");
 
     // Set CARGO_TARGET_DIR if not already set to ensure consistent output location
     let mut command = Command::new("cargo");
@@ -528,7 +529,7 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyho
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
-            eprintln!("Error while executing cargo command: {e}");
+            error!("Error while executing cargo command: {e}");
             anyhow::anyhow!("Error while executing cargo command: {e}")
         })?;
     pipe_std_streams(child)?;

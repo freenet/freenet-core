@@ -1353,7 +1353,7 @@ pub(crate) mod tracer {
         {
             if std::env::var("TOKIO_CONSOLE").is_ok() {
                 console_subscriber::init();
-                println!(
+                tracing::info!(
                     "Tokio console subscriber initialized. Connect with 'tokio-console' command."
                 );
                 return Ok(());
@@ -1449,7 +1449,7 @@ pub(crate) mod tracer {
                 } else {
                     "freenet-core".to_string()
                 };
-                println!("setting OT collector with identifier: {identifier}");
+                tracing::info!("setting OT collector with identifier: {identifier}");
                 // TODO: Fix OpenTelemetry version conflicts and API changes
                 // The code below needs to be updated to work with the new OpenTelemetry API
                 // For now, we'll just use the fmt_layer without OpenTelemetry tracing

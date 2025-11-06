@@ -134,6 +134,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::Instant;
     use tests::packet_data::MAX_PACKET_SIZE;
+    use tracing::debug;
 
     use super::{
         symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
@@ -265,10 +266,10 @@ mod tests {
         // For 10KB at 100KB/s, should take at least 100ms theoretically
         // But with 8 packets and 1 packet per 10ms batch, actual time is ~70-80ms
         // Allow margin for processing overhead and timing precision
-        println!(
+        debug!(
             "Transfer took: {elapsed:?}, packets sent: {packet_count}, expected: {expected_packets}"
         );
-        println!("Bytes per packet: ~{MAX_DATA_SIZE}");
+        debug!("Bytes per packet: ~{MAX_DATA_SIZE}");
         assert!(
             elapsed.as_millis() >= 60,
             "Transfer completed too quickly: {elapsed:?}"

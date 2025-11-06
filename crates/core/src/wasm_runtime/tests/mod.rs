@@ -6,6 +6,7 @@ use freenet_stdlib::prelude::{
 
 use crate::util::tests::get_temp_dir;
 use crate::util::workspace::get_workspace_target_dir;
+use tracing::info;
 
 use super::{ContractStore, DelegateStore, SecretsStore};
 
@@ -22,7 +23,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         path.join("tests").join(name.replace('_', "-"))
     };
     let target = get_workspace_target_dir();
-    println!(
+    info!(
         "trying to compile the test contract, target: {}",
         target.display()
     );
@@ -45,7 +46,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         .join("debug")
         .join(name)
         .with_extension("wasm");
-    println!("output file: {output_file:?}");
+    info!("output file: {output_file:?}");
     Ok(std::fs::read(output_file)?)
 }
 

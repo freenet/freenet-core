@@ -1785,7 +1785,7 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
                 key, delegate_key,
                 "Delegate key mismatch in register response"
             );
-            println!("Successfully registered delegate with key: {key}");
+            tracing::info!("Successfully registered delegate with key: {key}");
         }
         other => {
             bail!(
@@ -1857,7 +1857,7 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
                         "Response data doesn't match expected value"
                     );
 
-                    println!("Successfully received and verified delegate response");
+                    tracing::info!("Successfully received and verified delegate response");
                 }
             }
         }
