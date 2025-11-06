@@ -371,6 +371,42 @@ impl ConnectOpV2 {
         matches!(self.state, Some(ConnectState::Completed))
     }
 
+    pub(crate) fn initiate_join_request(
+        op_manager: &OpManager,
+        target: PeerKeyLocation,
+        desired_location: Location,
+        ttl: u8,
+    ) -> (Transaction, Self, ConnectMsgV2) {
+        let own = op_manager.ring.connection_manager.own_location();
+        let mut visited = vec![own.clone()];
+        push_unique_peer(&mut visited, target.clone());
+        let request = ConnectRequest {
+            desired_location,
+            origin: own.clone(),
+            ttl,
+            visited,
+        };
+
+        let tx = Transaction::new::<ConnectMsgV2>();
+        let op = ConnectOpV2::new_joiner(
+            tx,
+            desired_location,
+            op_manager.ring.connection_manager.min_connections,
+            Some(own.peer.addr),
+            Some(target.clone()),
+            None,
+        );
+
+        let msg = ConnectMsgV2::Request {
+            id: tx,
+            from: own,
+            target,
+            payload: request,
+        };
+
+        (tx, op, msg)
+    }
+
     pub(crate) fn handle_response(
         &mut self,
         response: &ConnectResponse,
