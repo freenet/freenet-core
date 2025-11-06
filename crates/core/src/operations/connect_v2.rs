@@ -11,12 +11,16 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
+use crate::client_events::HostResult;
 use crate::dev_tool::Location;
-use crate::message::{InnerMessage, Transaction};
-use crate::node::{OpManager, PeerId};
+use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transaction};
+use crate::node::{IsOperationCompleted, NetworkBridge, OpManager, PeerId};
+use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::ring::PeerKeyLocation;
 use crate::util::{Backoff, Contains};
+use freenet_stdlib::client_api::HostResponse;
 
 /// Top-level message envelope used by the new connect handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +96,15 @@ impl fmt::Display for ConnectMsgV2 {
     }
 }
 
+impl ConnectMsgV2 {
+    pub fn sender(&self) -> Option<&PeerId> {
+        match self {
+            ConnectMsgV2::Response { sender, .. } => Some(&sender.peer),
+            _ => None,
+        }
+    }
+}
+
 /// Two-message request payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ConnectRequest {
@@ -115,7 +128,7 @@ pub(crate) struct ConnectResponse {
 }
 
 /// New minimal state machine the joiner tracks.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ConnectState {
     /// Joiner waiting for acceptances.
     WaitingForResponses(JoinerState),
@@ -125,7 +138,7 @@ pub(crate) enum ConnectState {
     Completed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct JoinerState {
     pub desired_location: Location,
     pub target_connections: usize,
@@ -134,7 +147,7 @@ pub(crate) struct JoinerState {
     pub last_progress: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RelayState {
     pub upstream: PeerKeyLocation,
     pub request: ConnectRequest,
@@ -313,7 +326,7 @@ impl JoinerState {
 /// Placeholder operation wrapper so we can exercise the logic in isolation in
 /// forthcoming commits. For now this simply captures the shared state we will
 /// migrate to.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ConnectOpV2 {
     pub(crate) id: Transaction,
     pub(crate) state: Option<ConnectState>,
@@ -369,6 +382,30 @@ impl ConnectOpV2 {
 
     pub(crate) fn is_completed(&self) -> bool {
         matches!(self.state, Some(ConnectState::Completed))
+    }
+
+    pub(crate) fn id(&self) -> &Transaction {
+        &self.id
+    }
+
+    pub(crate) fn outcome(&self) -> OpOutcome<'_> {
+        OpOutcome::Irrelevant
+    }
+
+    pub(crate) fn finalized(&self) -> bool {
+        self.is_completed()
+    }
+
+    pub(crate) fn to_host_result(&self) -> HostResult {
+        Ok(HostResponse::Ok)
+    }
+
+    pub(crate) fn has_backoff(&self) -> bool {
+        self.backoff.is_some()
+    }
+
+    pub(crate) fn gateway(&self) -> Option<&PeerKeyLocation> {
+        self.gateway.as_deref()
     }
 
     pub(crate) fn initiate_join_request(
@@ -460,6 +497,160 @@ impl ConnectOpV2 {
     }
 }
 
+impl IsOperationCompleted for ConnectOpV2 {
+    fn is_completed(&self) -> bool {
+        self.is_completed()
+    }
+}
+
+impl Operation for ConnectOpV2 {
+    type Message = ConnectMsgV2;
+    type Result = ();
+
+    fn id(&self) -> &Transaction {
+        &self.id
+    }
+
+    async fn load_or_init<'a>(
+        op_manager: &'a OpManager,
+        msg: &'a Self::Message,
+    ) -> Result<OpInitialization<Self>, OpError> {
+        let tx = *msg.id();
+        match op_manager.pop(msg.id()) {
+            Ok(Some(OpEnum::ConnectV2(op))) => Ok(OpInitialization {
+                op: *op,
+                sender: msg.sender().cloned(),
+            }),
+            Ok(Some(other)) => {
+                op_manager.push(tx, other).await?;
+                Err(OpError::OpNotPresent(tx))
+            }
+            Ok(None) => {
+                let op = match msg {
+                    ConnectMsgV2::Request { from, payload, .. } => {
+                        ConnectOpV2::new_relay(tx, from.clone(), payload.clone())
+                    }
+                    _ => {
+                        tracing::debug!(%tx, "connect_v2 received message without existing state");
+                        return Err(OpError::OpNotPresent(tx));
+                    }
+                };
+                Ok(OpInitialization { op, sender: None })
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn process_message<'a, NB: NetworkBridge>(
+        mut self,
+        network_bridge: &'a mut NB,
+        op_manager: &'a OpManager,
+        msg: &'a Self::Message,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match msg {
+                ConnectMsgV2::Request { from, payload, .. } => {
+                    let env = RelayEnv::new(op_manager);
+                    let actions =
+                        self.handle_request(&env, from.clone(), payload.clone(), from.peer.addr);
+
+                    if let Some((target, address)) = actions.observed_address {
+                        let msg = ConnectMsgV2::ObservedAddress {
+                            id: self.id,
+                            target: target.clone(),
+                            address,
+                        };
+                        network_bridge
+                            .send(&target.peer, NetMessage::V1(NetMessageV1::ConnectV2(msg)))
+                            .await?;
+                    }
+
+                    if let Some(peer) = actions.expect_connection_from {
+                        op_manager
+                            .notify_node_event(NodeEvent::ExpectPeerConnection {
+                                peer: peer.peer.clone(),
+                            })
+                            .await?;
+                    }
+
+                    if let Some((next, request)) = actions.forward {
+                        let forward_msg = ConnectMsgV2::Request {
+                            id: self.id,
+                            from: env.self_location().clone(),
+                            target: next.clone(),
+                            payload: request,
+                        };
+                        network_bridge
+                            .send(
+                                &next.peer,
+                                NetMessage::V1(NetMessageV1::ConnectV2(forward_msg)),
+                            )
+                            .await?;
+                    }
+
+                    if let Some(response) = actions.accept_response {
+                        let response_msg = ConnectMsgV2::Response {
+                            id: self.id,
+                            sender: env.self_location().clone(),
+                            target: from.clone(),
+                            payload: response,
+                        };
+                        return Ok(store_operation_state_with_msg(
+                            &mut self,
+                            Some(response_msg),
+                        ));
+                    }
+
+                    Ok(store_operation_state(&mut self))
+                }
+                ConnectMsgV2::Response { payload, .. } => {
+                    if let Some(acceptance) = self.handle_response(payload, Instant::now()) {
+                        if let Some(new_acceptor) = acceptance.new_acceptor {
+                            op_manager
+                                .notify_node_event(
+                                    crate::message::NodeEvent::ExpectPeerConnection {
+                                        peer: new_acceptor.peer.peer.clone(),
+                                    },
+                                )
+                                .await?;
+
+                            let (callback, mut rx) = mpsc::channel(1);
+                            op_manager
+                                .notify_node_event(NodeEvent::ConnectPeer {
+                                    peer: new_acceptor.peer.peer.clone(),
+                                    tx: self.id,
+                                    callback,
+                                    is_gw: new_acceptor.courtesy,
+                                })
+                                .await?;
+
+                            if let Some(result) = rx.recv().await {
+                                if let Ok((peer_id, _remaining)) = result {
+                                    tracing::info!(%peer_id, tx=%self.id, "connect_v2 joined peer");
+                                } else {
+                                    tracing::warn!(tx=%self.id, "connect_v2 ConnectPeer failed");
+                                }
+                            }
+                        }
+
+                        if acceptance.satisfied {
+                            self.state = Some(ConnectState::Completed);
+                        }
+                    }
+
+                    Ok(store_operation_state(&mut self))
+                }
+                ConnectMsgV2::ObservedAddress { address, .. } => {
+                    self.handle_observed_address(*address, Instant::now());
+                    Ok(store_operation_state(&mut self))
+                }
+            }
+        })
+    }
+}
+
 struct VisitedPeerIds<'a> {
     peers: &'a [PeerKeyLocation],
 }
@@ -480,6 +671,28 @@ fn push_unique_peer(list: &mut Vec<PeerKeyLocation>, peer: PeerKeyLocation) {
     let already_present = list.iter().any(|p| p.peer == peer.peer);
     if !already_present {
         list.push(peer);
+    }
+}
+
+fn store_operation_state(op: &mut ConnectOpV2) -> OperationResult {
+    store_operation_state_with_msg(op, None)
+}
+
+fn store_operation_state_with_msg(
+    op: &mut ConnectOpV2,
+    msg: Option<ConnectMsgV2>,
+) -> OperationResult {
+    let state_clone = op.state.clone();
+    OperationResult {
+        return_msg: msg.map(|m| NetMessage::V1(NetMessageV1::ConnectV2(m))),
+        state: state_clone.map(|state| {
+            OpEnum::ConnectV2(Box::new(ConnectOpV2 {
+                id: op.id,
+                state: Some(state),
+                gateway: op.gateway.clone(),
+                backoff: op.backoff.clone(),
+            }))
+        }),
     }
 }
 
@@ -643,16 +856,16 @@ mod tests {
         let desired = Location::random();
         let ttl = 5;
         let own = make_peer(7300);
-        let (_tx, op, msg) = ConnectOpV2::initiate_join_request(
-            own.clone(),
-            target.clone(),
-            desired,
-            ttl,
-            2,
-        );
+        let (_tx, op, msg) =
+            ConnectOpV2::initiate_join_request(own.clone(), target.clone(), desired, ttl, 2);
 
         match msg {
-            ConnectMsgV2::Request { from, target: msg_target, payload, .. } => {
+            ConnectMsgV2::Request {
+                from,
+                target: msg_target,
+                payload,
+                ..
+            } => {
                 assert_eq!(msg_target.peer, target.peer);
                 assert_eq!(payload.desired_location, desired);
                 assert_eq!(payload.ttl, ttl);
@@ -662,6 +875,9 @@ mod tests {
             other => panic!("unexpected message: {other:?}"),
         }
 
-        assert!(matches!(op.state, Some(ConnectState::WaitingForResponses(_))));
+        assert!(matches!(
+            op.state,
+            Some(ConnectState::WaitingForResponses(_))
+        ));
     }
 }

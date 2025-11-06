@@ -187,6 +187,7 @@ impl SubOperationTracker {
 #[derive(Default)]
 struct Ops {
     connect: DashMap<Transaction, ConnectOp>,
+    connect_v2: DashMap<Transaction, crate::operations::connect_v2::ConnectOpV2>,
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
@@ -434,6 +435,11 @@ impl OpManager {
                 check_id_op!(id.transaction_type(), TransactionType::Connect);
                 self.ops.connect.insert(id, *op);
             }
+            OpEnum::ConnectV2(op) => {
+                #[cfg(debug_assertions)]
+                check_id_op!(id.transaction_type(), TransactionType::Connect);
+                self.ops.connect_v2.insert(id, *op);
+            }
             OpEnum::Put(op) => {
                 #[cfg(debug_assertions)]
                 check_id_op!(id.transaction_type(), TransactionType::Put);
@@ -472,10 +478,17 @@ impl OpManager {
         let op = match id.transaction_type() {
             TransactionType::Connect => self
                 .ops
-                .connect
+                .connect_v2
                 .remove(id)
                 .map(|(_k, v)| v)
-                .map(|op| OpEnum::Connect(Box::new(op))),
+                .map(|op| OpEnum::ConnectV2(Box::new(op)))
+                .or_else(|| {
+                    self.ops
+                        .connect
+                        .remove(id)
+                        .map(|(_k, v)| v)
+                        .map(|op| OpEnum::Connect(Box::new(op)))
+                }),
             TransactionType::Put => self.ops.put.remove(id).map(|(_k, v)| v).map(OpEnum::Put),
             TransactionType::Get => self.ops.get.remove(id).map(|(_k, v)| v).map(OpEnum::Get),
             TransactionType::Subscribe => self

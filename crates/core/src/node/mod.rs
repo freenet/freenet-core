@@ -1167,8 +1167,27 @@ async fn handle_aborted_op(
                     connect::join_ring_request(backoff, &gateway, op_manager).await?;
                 }
             }
+            Ok(Some(OpEnum::ConnectV2(op)))
+                if op.has_backoff()
+                    && op_manager.ring.open_connections()
+                        < op_manager.ring.connection_manager.min_connections =>
+            {
+                let gateway = op.gateway().cloned();
+                if let Some(gateway) = gateway {
+                    tracing::warn!("Retry connecting to gateway {}", gateway.peer);
+                    connect::join_ring_request(None, &gateway, op_manager).await?;
+                }
+            }
             Ok(Some(OpEnum::Connect(_))) => {
                 // if no connections were achieved just fail
+                if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
+                    tracing::warn!("Retrying joining the ring with an other gateway");
+                    if let Some(gateway) = gateways.iter().shuffle().next() {
+                        connect::join_ring_request(None, gateway, op_manager).await?
+                    }
+                }
+            }
+            Ok(Some(OpEnum::ConnectV2(_))) => {
                 if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                     tracing::warn!("Retrying joining the ring with an other gateway");
                     if let Some(gateway) = gateways.iter().shuffle().next() {
@@ -1461,6 +1480,7 @@ impl IsOperationCompleted for OpEnum {
     fn is_completed(&self) -> bool {
         match self {
             OpEnum::Connect(op) => op.is_completed(),
+            OpEnum::ConnectV2(op) => op.is_completed(),
             OpEnum::Put(op) => op.is_completed(),
             OpEnum::Get(op) => op.is_completed(),
             OpEnum::Subscribe(op) => op.is_completed(),
