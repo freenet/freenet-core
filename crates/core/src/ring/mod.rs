@@ -191,22 +191,28 @@ impl Ring {
 
     /// Return if a contract is within appropiate seeding distance.
     pub fn should_seed(&self, key: &ContractKey) -> bool {
-        let own_loc = self
-            .connection_manager
-            .own_location()
-            .location
-            .expect("should be set");
-        self.seeding_manager.should_seed(key, own_loc)
+        match self.connection_manager.own_location().location {
+            Some(own_loc) => self.seeding_manager.should_seed(key, own_loc),
+            None => {
+                tracing::debug!(
+                    "should_seed: own location not yet available; deferring seeding decision"
+                );
+                false
+            }
+        }
     }
 
     /// Add a new subscription for this peer.
     pub fn seed_contract(&self, key: ContractKey) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
-        let own_loc = self
-            .connection_manager
-            .own_location()
-            .location
-            .expect("should be set");
-        self.seeding_manager.seed_contract(key, own_loc)
+        match self.connection_manager.own_location().location {
+            Some(own_loc) => self.seeding_manager.seed_contract(key, own_loc),
+            None => {
+                tracing::debug!(
+                    "seed_contract: own location not yet available; skipping seeding for now"
+                );
+                (None, Vec::new())
+            }
+        }
     }
 
     /// Whether this node already is seeding to this contract or not.
@@ -235,6 +241,15 @@ impl Ring {
             .register_events(Either::Left(NetEventLog::connected(self, peer, loc)))
             .await;
         self.refresh_density_request_cache()
+    }
+
+    pub fn update_connection_identity(&self, old_peer: &PeerId, new_peer: PeerId) {
+        if self
+            .connection_manager
+            .update_peer_identity(old_peer, new_peer)
+        {
+            self.refresh_density_request_cache();
+        }
     }
 
     fn refresh_density_request_cache(&self) {

@@ -482,7 +482,7 @@ impl Operation for GetOp {
                             })
                             .await;
 
-                        match get_result {
+                        let local_value = match get_result {
                             Ok(ContractHandlerEvent::GetResponse {
                                 response:
                                     Ok(StoreResponse {
@@ -491,68 +491,86 @@ impl Operation for GetOp {
                                     }),
                                 ..
                             }) => {
-                                // Contract found locally!
-                                tracing::info!(
-                                    tx = %id,
-                                    %key,
-                                    fetch_contract = *fetch_contract,
-                                    "GET: contract found locally in RequestGet handler"
-                                );
-
-                                // Check if this is a forwarded request or a local request
-                                match &self.state {
-                                    Some(GetState::ReceivedRequest { requester })
-                                        if requester.is_some() =>
-                                    {
-                                        // This is a forwarded request - send result back to requester
-                                        let requester = requester.clone().unwrap();
-                                        tracing::debug!(tx = %id, "Returning contract {} to requester {}", key, requester.peer);
-                                        new_state = None;
-                                        return_msg = Some(GetMsg::ReturnGet {
-                                            id: *id,
-                                            key: *key,
-                                            value: StoreResponse {
-                                                state: Some(state),
-                                                contract,
-                                            },
-                                            sender: target.clone(),
-                                            target: requester,
-                                            skip_list: skip_list.clone(),
-                                        });
-                                    }
-                                    _ => {
-                                        // This is the original requester (locally initiated request)
-                                        new_state = Some(GetState::Finished { key: *key });
-                                        return_msg = None;
-                                        result = Some(GetResult {
-                                            key: *key,
-                                            state,
-                                            contract,
-                                        });
-                                    }
+                                if *fetch_contract && contract.is_none() {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        %key,
+                                    "GET: state available locally but contract code missing; continuing search"
+                                    );
+                                    None
+                                } else {
+                                    Some((state, contract))
                                 }
                             }
-                            _ => {
-                                // Contract not found locally, proceed with forwarding
-                                tracing::debug!(tx = %id, %key, "Contract not found locally, forwarding to {}", target.peer);
+                            _ => None,
+                        };
 
-                                // Prepare skip list with own peer ID
-                                let own_loc = op_manager.ring.connection_manager.own_location();
-                                let mut new_skip_list = skip_list.clone();
-                                new_skip_list.insert(own_loc.peer.clone());
+                        if let Some((state, contract)) = local_value {
+                            // Contract found locally!
+                            tracing::info!(
+                                tx = %id,
+                                %key,
+                                fetch_contract = *fetch_contract,
+                                "GET: contract found locally in RequestGet handler"
+                            );
 
-                                // Forward using standard routing helper
-                                return try_forward_or_return(
-                                    *id,
-                                    *key,
-                                    (op_manager.ring.max_hops_to_live.max(1), *fetch_contract),
-                                    (target.clone(), sender.clone()),
-                                    new_skip_list,
-                                    op_manager,
-                                    stats,
-                                )
-                                .await;
+                            // Check if this is a forwarded request or a local request
+                            match &self.state {
+                                Some(GetState::ReceivedRequest { requester })
+                                    if requester.is_some() =>
+                                {
+                                    // This is a forwarded request - send result back to requester
+                                    let requester = requester.clone().unwrap();
+                                    tracing::debug!(tx = %id, "Returning contract {} to requester {}", key, requester.peer);
+                                    new_state = None;
+                                    return_msg = Some(GetMsg::ReturnGet {
+                                        id: *id,
+                                        key: *key,
+                                        value: StoreResponse {
+                                            state: Some(state),
+                                            contract,
+                                        },
+                                        sender: target.clone(),
+                                        target: requester,
+                                        skip_list: skip_list.clone(),
+                                    });
+                                }
+                                _ => {
+                                    // This is the original requester (locally initiated request)
+                                    new_state = Some(GetState::Finished { key: *key });
+                                    return_msg = None;
+                                    result = Some(GetResult {
+                                        key: *key,
+                                        state,
+                                        contract,
+                                    });
+                                }
                             }
+                        } else {
+                            // Contract not found locally (or missing code), proceed with forwarding
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                "Contract not found locally (or missing code), forwarding to {}",
+                                target.peer
+                            );
+
+                            // Prepare skip list with own peer ID
+                            let own_loc = op_manager.ring.connection_manager.own_location();
+                            let mut new_skip_list = skip_list.clone();
+                            new_skip_list.insert(own_loc.peer.clone());
+
+                            // Forward using standard routing helper
+                            return try_forward_or_return(
+                                *id,
+                                *key,
+                                (op_manager.ring.max_hops_to_live.max(1), *fetch_contract),
+                                (target.clone(), sender.clone()),
+                                new_skip_list,
+                                op_manager,
+                                stats,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -616,46 +634,38 @@ impl Operation for GetOp {
                         .await;
 
                     // Process get result
-                    match get_result {
+                    let local_value = match get_result {
                         Ok(ContractHandlerEvent::GetResponse {
-                            key,
                             response:
                                 Ok(StoreResponse {
                                     state: Some(state),
                                     contract,
                                 }),
+                            ..
                         }) => {
-                            tracing::debug!(tx = %id, "Contract {key} found @ peer {}", target.peer);
+                            if fetch_contract && contract.is_none() {
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    %this_peer,
+                                    "Contract state available but code missing @ peer {}, retrying",
+                                    sender.peer
+                                );
+                                None
+                            } else {
+                                Some((state, contract))
+                            }
+                        }
+                        _ => None,
+                    };
 
-                            match self.state {
-                                Some(GetState::AwaitingResponse { requester, .. }) => {
-                                    if let Some(requester) = requester {
-                                        // Forward contract to requester
-                                        new_state = None;
-                                        tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
-                                        return_msg = Some(GetMsg::ReturnGet {
-                                            id,
-                                            key,
-                                            value: StoreResponse {
-                                                state: Some(state),
-                                                contract,
-                                            },
-                                            sender: target.clone(),
-                                            target: requester,
-                                            skip_list: skip_list.clone(),
-                                        });
-                                    } else {
-                                        // Operation completed for original requester
-                                        tracing::debug!(
-                                            tx = %id,
-                                            "Completed operation, get response received for contract {key}"
-                                        );
-                                        new_state = None;
-                                        return_msg = None;
-                                    }
-                                }
-                                Some(GetState::ReceivedRequest { .. }) => {
-                                    // Return contract to sender
+                    if let Some((state, contract)) = local_value {
+                        tracing::debug!(tx = %id, "Contract {key} found @ peer {}", target.peer);
+
+                        match self.state {
+                            Some(GetState::AwaitingResponse { requester, .. }) => {
+                                if let Some(requester) = requester {
+                                    // Forward contract to requester
                                     new_state = None;
                                     tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
                                     return_msg = Some(GetMsg::ReturnGet {
@@ -666,33 +676,56 @@ impl Operation for GetOp {
                                             contract,
                                         },
                                         sender: target.clone(),
-                                        target: sender.clone(),
+                                        target: requester,
                                         skip_list: skip_list.clone(),
                                     });
+                                } else {
+                                    // Operation completed for original requester
+                                    tracing::debug!(
+                                        tx = %id,
+                                        "Completed operation, get response received for contract {key}"
+                                    );
+                                    new_state = None;
+                                    return_msg = None;
                                 }
-                                _ => return Err(OpError::invalid_transition(self.id)),
                             }
+                            Some(GetState::ReceivedRequest { .. }) => {
+                                // Return contract to sender
+                                new_state = None;
+                                tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
+                                return_msg = Some(GetMsg::ReturnGet {
+                                    id,
+                                    key,
+                                    value: StoreResponse {
+                                        state: Some(state),
+                                        contract,
+                                    },
+                                    sender: target.clone(),
+                                    target: sender.clone(),
+                                    skip_list: skip_list.clone(),
+                                });
+                            }
+                            _ => return Err(OpError::invalid_transition(self.id)),
                         }
-                        _ => {
-                            // Contract not found locally, try forwarding to other peers
-                            tracing::debug!(
-                                tx = %id,
-                                %key,
-                                %this_peer,
-                                "Contract not found @ peer {}, retrying with other peers",
-                                sender.peer
-                            );
-                            return try_forward_or_return(
-                                id,
-                                key,
-                                (htl, fetch_contract),
-                                (this_peer, sender.clone()),
-                                new_skip_list,
-                                op_manager,
-                                stats,
-                            )
-                            .await;
-                        }
+                    } else {
+                        // Contract not found locally, try forwarding to other peers
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            %this_peer,
+                            "Contract not found @ peer {}, retrying with other peers",
+                            sender.peer
+                        );
+                        return try_forward_or_return(
+                            id,
+                            key,
+                            (htl, fetch_contract),
+                            (this_peer, sender.clone()),
+                            new_skip_list,
+                            op_manager,
+                            stats,
+                        )
+                        .await;
                     }
                 }
                 GetMsg::ReturnGet {

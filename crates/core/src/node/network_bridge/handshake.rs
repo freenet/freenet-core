@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Handles initial connection handshake.
 use parking_lot::RwLock;
 use std::{

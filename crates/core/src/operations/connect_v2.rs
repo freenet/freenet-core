@@ -225,16 +225,30 @@ impl RelayState {
         }
 
         if self.forwarded_to.is_none() && self.request.ttl > 0 {
-            if let Some(next) =
-                ctx.select_next_hop(self.request.desired_location, &self.request.visited)
-            {
-                let mut forward_req = self.request.clone();
-                forward_req.ttl = forward_req.ttl.saturating_sub(1);
-                push_unique_peer(&mut forward_req.visited, ctx.self_location().clone());
-                let forward_snapshot = forward_req.clone();
-                self.forwarded_to = Some(next.clone());
-                self.request = forward_req;
-                actions.forward = Some((next, forward_snapshot));
+            match ctx.select_next_hop(self.request.desired_location, &self.request.visited) {
+                Some(next) => {
+                    tracing::debug!(
+                        target = %self.request.desired_location,
+                        ttl = self.request.ttl,
+                        next_peer = %next.peer,
+                        "connect_v2: forwarding join request to next hop"
+                    );
+                    let mut forward_req = self.request.clone();
+                    forward_req.ttl = forward_req.ttl.saturating_sub(1);
+                    push_unique_peer(&mut forward_req.visited, ctx.self_location().clone());
+                    let forward_snapshot = forward_req.clone();
+                    self.forwarded_to = Some(next.clone());
+                    self.request = forward_req;
+                    actions.forward = Some((next, forward_snapshot));
+                }
+                None => {
+                    tracing::debug!(
+                        target = %self.request.desired_location,
+                        ttl = self.request.ttl,
+                        visited = ?self.request.visited,
+                        "connect_v2: no next hop candidates available"
+                    );
+                }
             }
         }
 
@@ -300,6 +314,7 @@ pub struct AcceptedPeer {
 pub struct JoinerAcceptance {
     pub new_acceptor: Option<AcceptedPeer>,
     pub satisfied: bool,
+    pub assigned_location: bool,
 }
 
 impl JoinerState {
@@ -315,6 +330,7 @@ impl JoinerState {
                 peer: response.acceptor.clone(),
                 courtesy: response.courtesy,
             });
+            acceptance.assigned_location = self.accepted.len() == 1;
         }
         acceptance.satisfied = self.accepted.len() >= self.target_connections;
         acceptance
@@ -335,6 +351,7 @@ pub(crate) struct ConnectOpV2 {
     pub(crate) state: Option<ConnectState>,
     pub(crate) gateway: Option<Box<PeerKeyLocation>>,
     pub(crate) backoff: Option<Backoff>,
+    pub(crate) desired_location: Option<Location>,
 }
 
 impl ConnectOpV2 {
@@ -359,6 +376,7 @@ impl ConnectOpV2 {
             state: Some(state),
             gateway: gateway.map(Box::new),
             backoff,
+            desired_location: Some(desired_location),
         }
     }
 
@@ -380,6 +398,7 @@ impl ConnectOpV2 {
             state: Some(state),
             gateway: None,
             backoff: None,
+            desired_location: None,
         }
     }
 
@@ -409,6 +428,10 @@ impl ConnectOpV2 {
 
     pub(crate) fn gateway(&self) -> Option<&PeerKeyLocation> {
         self.gateway.as_deref()
+    }
+
+    fn take_desired_location(&mut self) -> Option<Location> {
+        self.desired_location.take()
     }
 
     pub(crate) fn initiate_join_request(
@@ -608,42 +631,89 @@ impl Operation for ConnectOpV2 {
 
                     Ok(store_operation_state(&mut self))
                 }
-                ConnectMsgV2::Response { payload, .. } => {
-                    if let Some(acceptance) = self.handle_response(payload, Instant::now()) {
-                        if let Some(new_acceptor) = acceptance.new_acceptor {
-                            op_manager
-                                .notify_node_event(
-                                    crate::message::NodeEvent::ExpectPeerConnection {
-                                        peer: new_acceptor.peer.peer.clone(),
-                                    },
-                                )
-                                .await?;
-
-                            let (callback, mut rx) = mpsc::channel(1);
-                            op_manager
-                                .notify_node_event(NodeEvent::ConnectPeer {
-                                    peer: new_acceptor.peer.peer.clone(),
-                                    tx: self.id,
-                                    callback,
-                                    is_gw: new_acceptor.courtesy,
-                                })
-                                .await?;
-
-                            if let Some(result) = rx.recv().await {
-                                if let Ok((peer_id, _remaining)) = result {
-                                    tracing::info!(%peer_id, tx=%self.id, "connect_v2 joined peer");
-                                } else {
-                                    tracing::warn!(tx=%self.id, "connect_v2 ConnectPeer failed");
+                ConnectMsgV2::Response {
+                    sender, payload, ..
+                } => {
+                    if self.gateway.is_some() {
+                        if let Some(acceptance) = self.handle_response(payload, Instant::now()) {
+                            if acceptance.assigned_location {
+                                if let Some(location) = self.take_desired_location() {
+                                    tracing::info!(
+                                        tx=%self.id,
+                                        assigned_location = %location.0,
+                                        "connect_v2: assigning joiner location"
+                                    );
+                                    op_manager
+                                        .ring
+                                        .connection_manager
+                                        .update_location(Some(location));
                                 }
+                            }
+
+                            if let Some(new_acceptor) = acceptance.new_acceptor {
+                                op_manager
+                                    .notify_node_event(
+                                        crate::message::NodeEvent::ExpectPeerConnection {
+                                            peer: new_acceptor.peer.peer.clone(),
+                                        },
+                                    )
+                                    .await?;
+
+                                let (callback, mut rx) = mpsc::channel(1);
+                                op_manager
+                                    .notify_node_event(NodeEvent::ConnectPeer {
+                                        peer: new_acceptor.peer.peer.clone(),
+                                        tx: self.id,
+                                        callback,
+                                        is_gw: new_acceptor.courtesy,
+                                    })
+                                    .await?;
+
+                                if let Some(result) = rx.recv().await {
+                                    if let Ok((peer_id, _remaining)) = result {
+                                        tracing::info!(
+                                            %peer_id,
+                                            tx=%self.id,
+                                            "connect_v2 joined peer"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            tx=%self.id,
+                                            "connect_v2 ConnectPeer failed"
+                                        );
+                                    }
+                                }
+                            }
+
+                            if acceptance.satisfied {
+                                self.state = Some(ConnectState::Completed);
                             }
                         }
 
-                        if acceptance.satisfied {
-                            self.state = Some(ConnectState::Completed);
-                        }
+                        Ok(store_operation_state(&mut self))
+                    } else if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                        let upstream = state.upstream.clone();
+                        tracing::debug!(
+                            %upstream.peer,
+                            acceptor = %sender.peer,
+                            "connect_v2: forwarding response towards joiner"
+                        );
+                        let forward_msg = ConnectMsgV2::Response {
+                            id: self.id,
+                            sender: sender.clone(),
+                            target: upstream.clone(),
+                            payload: payload.clone(),
+                        };
+                        network_bridge
+                            .send(
+                                &upstream.peer,
+                                NetMessage::V1(NetMessageV1::ConnectV2(forward_msg)),
+                            )
+                            .await?;
+                        Ok(store_operation_state(&mut self))
+                    } else {
+                        Ok(store_operation_state(&mut self))
                     }
-
-                    Ok(store_operation_state(&mut self))
                 }
                 ConnectMsgV2::ObservedAddress { address, .. } => {
                     self.handle_observed_address(*address, Instant::now());
@@ -694,6 +764,7 @@ fn store_operation_state_with_msg(
                 state: Some(state),
                 gateway: op.gateway.clone(),
                 backoff: op.backoff.clone(),
+                desired_location: op.desired_location.clone(),
             }))
         }),
     }

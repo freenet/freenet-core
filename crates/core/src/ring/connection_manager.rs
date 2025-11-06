@@ -229,6 +229,16 @@ impl ConnectionManager {
             );
             accepted
         };
+        tracing::info!(
+            %peer_id,
+            accepted,
+            total_conn,
+            open_connections = open,
+            reserved_connections = self
+                .reserved_connections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "should_accept: final decision"
+        );
         if !accepted {
             self.reserved_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -355,6 +365,50 @@ impl ConnectionManager {
         self.open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::mem::drop(lop);
+    }
+
+    pub fn update_peer_identity(&self, old_peer: &PeerId, new_peer: PeerId) -> bool {
+        if old_peer == &new_peer {
+            tracing::debug!(%old_peer, "update_peer_identity: identical peers; skipping");
+            return false;
+        }
+
+        let mut loc_for_peer = self.location_for_peer.write();
+        let Some(loc) = loc_for_peer.remove(old_peer) else {
+            tracing::debug!(
+                %old_peer,
+                %new_peer,
+                "update_peer_identity: old peer entry not found"
+            );
+            return false;
+        };
+
+        tracing::info!(%old_peer, %new_peer, %loc, "Updating peer identity for active connection");
+        loc_for_peer.insert(new_peer.clone(), loc);
+        drop(loc_for_peer);
+
+        let mut cbl = self.connections_by_location.write();
+        let entry = cbl.entry(loc).or_default();
+        if let Some(conn) = entry
+            .iter_mut()
+            .find(|conn| conn.location.peer == *old_peer)
+        {
+            conn.location.peer = new_peer;
+        } else {
+            tracing::warn!(
+                %old_peer,
+                "update_peer_identity: connection entry missing; creating placeholder"
+            );
+            entry.push(Connection {
+                location: PeerKeyLocation {
+                    peer: new_peer,
+                    location: Some(loc),
+                },
+                open_at: Instant::now(),
+            });
+        }
+
+        true
     }
 
     fn prune_connection(&self, peer: &PeerId, is_alive: bool) -> Option<Location> {

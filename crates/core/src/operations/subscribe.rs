@@ -16,8 +16,11 @@ use freenet_stdlib::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
+use tokio::time::{sleep, Duration};
 
 const MAX_RETRIES: usize = 10;
+const LOCAL_FETCH_TIMEOUT_MS: u64 = 1_500;
+const LOCAL_FETCH_POLL_INTERVAL_MS: u64 = 25;
 
 fn subscribers_snapshot(op_manager: &OpManager, key: &ContractKey) -> Vec<String> {
     op_manager
@@ -29,6 +32,22 @@ fn subscribers_snapshot(op_manager: &OpManager, key: &ContractKey) -> Vec<String
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// Poll local storage for a short period until the fetched contract becomes available.
+async fn wait_for_local_contract(
+    op_manager: &OpManager,
+    key: ContractKey,
+) -> Result<bool, OpError> {
+    let mut elapsed = 0;
+    while elapsed < LOCAL_FETCH_TIMEOUT_MS {
+        if super::has_contract(op_manager, key).await? {
+            return Ok(true);
+        }
+        sleep(Duration::from_millis(LOCAL_FETCH_POLL_INTERVAL_MS)).await;
+        elapsed += LOCAL_FETCH_POLL_INTERVAL_MS;
+    }
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -520,7 +539,13 @@ impl Operation for SubscribeOp {
                                 return Ok(return_not_subbed());
                             }
 
-                            if !super::has_contract(op_manager, *key).await? {
+                            if wait_for_local_contract(op_manager, *key).await? {
+                                tracing::info!(
+                                    tx = %id,
+                                    %key,
+                                    "Fetched contract locally while handling subscribe"
+                                );
+                            } else {
                                 tracing::warn!(
                                     tx = %id,
                                     %key,
