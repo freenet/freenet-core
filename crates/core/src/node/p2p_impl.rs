@@ -259,6 +259,7 @@ impl NodeP2P {
             connection_manager,
             result_router_tx,
         )?);
+        op_manager.ring.attach_op_manager(&op_manager);
         let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
             .await

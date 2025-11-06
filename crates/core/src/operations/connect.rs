@@ -9,7 +9,11 @@ use freenet_stdlib::client_api::HostResponse;
 use futures::{Future, StreamExt};
 
 pub(crate) use self::messages::{ConnectMsg, ConnectRequest, ConnectResponse};
-use super::{connect, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{
+    connect,
+    connect_v2::{ConnectMsgV2, ConnectOpV2},
+    OpError, OpInitialization, OpOutcome, Operation, OperationResult,
+};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
 use crate::message::{NetMessageV1, NodeEvent};
@@ -773,6 +777,7 @@ type Requester = PeerKeyLocation;
 #[derive(Debug)]
 pub enum ConnectState {
     Initializing,
+    #[allow(dead_code)]
     ConnectingToNode(ConnectionInfo),
     AwaitingConnectivity(ConnectivityInfo),
     AwaitingConnectionAcquisition,
@@ -826,6 +831,7 @@ pub(crate) struct NewConnectionInfo {
 }
 
 impl ConnectState {
+    #[allow(dead_code)]
     fn try_unwrap_connecting(self) -> Result<ConnectionInfo, OpError> {
         if let Self::ConnectingToNode(conn_info) = self {
             Ok(conn_info)
@@ -958,199 +964,67 @@ pub(crate) async fn join_ring_request(
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
     use crate::node::ConnectionError;
-    if !op_manager.ring.connection_manager.should_accept(
-        gateway.location.ok_or_else(|| {
-            tracing::error!(
-                "Gateway location not found, this should not be possible, report an error"
-            );
-            OpError::ConnError(ConnectionError::LocationUnknown)
-        })?,
-        &gateway.peer,
-    ) {
-        // ensure that we still want to connect AND reserve an spot implicitly
+    let location = gateway.location.ok_or_else(|| {
+        tracing::error!("Gateway location not found, this should not be possible, report an error");
+        OpError::ConnError(ConnectionError::LocationUnknown)
+    })?;
+
+    if !op_manager
+        .ring
+        .connection_manager
+        .should_accept(location, &gateway.peer)
+    {
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
     }
 
-    let tx_id = Transaction::new::<ConnectMsg>();
-    tracing::info!(%gateway.peer, "Attempting network join");
-    let mut op = initial_request(gateway.clone(), op_manager.ring.max_hops_to_live, tx_id);
-    if let Some(mut backoff) = backoff {
-        // backoff to retry later in case it failed
-        tracing::warn!("Performing a new join, attempt {}", backoff.retries() + 1);
-        if backoff.sleep().await.is_none() {
+    let mut backoff = backoff;
+    if let Some(backoff_state) = backoff.as_mut() {
+        tracing::warn!(
+            "Performing a new join, attempt {}",
+            backoff_state.retries() + 1
+        );
+        if backoff_state.sleep().await.is_none() {
             tracing::error!("Max number of retries reached");
             if op_manager.ring.open_connections() == 0 {
-                // only consider this a complete failure if no connections were established at all
-                // if connections where established the peer should incrementally acquire more over time
-                return Err(OpError::MaxRetriesExceeded(tx_id, tx_id.transaction_type()));
+                let tx = Transaction::new::<ConnectMsgV2>();
+                return Err(OpError::MaxRetriesExceeded(tx, tx.transaction_type()));
             } else {
                 return Ok(());
             }
         }
-        // on first run the backoff will be initialized at the `initial_request` function
-        // if the op was to fail and retried this function will be called with the previous backoff
-        // passed as an argument and advanced
-        op.backoff = Some(backoff);
     }
-    connect_request(tx_id, op_manager, op).await?;
-    Ok(())
-}
 
-fn initial_request(
-    gateway: PeerKeyLocation,
-    max_hops_to_live: usize,
-    id: Transaction,
-) -> ConnectOp {
-    const MAX_JOIN_RETRIES: usize = usize::MAX;
-    let state = ConnectState::ConnectingToNode(ConnectionInfo {
-        gateway: gateway.clone(),
-        accepted_by: HashSet::new(),
-        remaining_connections: max_hops_to_live,
-    });
-    let ceiling = if cfg!(test) {
-        Duration::from_secs(1)
-    } else {
-        Duration::from_secs(120)
-    };
-    ConnectOp {
-        id,
-        state: Some(state),
-        gateway: Some(Box::new(gateway)),
-        backoff: Some(Backoff::new(
-            Duration::from_secs(1),
-            ceiling,
-            MAX_JOIN_RETRIES,
-        )),
-    }
-}
+    let own = op_manager.ring.connection_manager.own_location();
+    let ttl = op_manager
+        .ring
+        .max_hops_to_live
+        .max(1)
+        .min(u8::MAX as usize) as u8;
+    let target_connections = op_manager.ring.connection_manager.min_connections;
 
-/// Join ring routine, called upon performing a join operation for this node.
-async fn connect_request(
-    tx: Transaction,
-    op_manager: &OpManager,
-    join_op: ConnectOp,
-) -> Result<(), OpError> {
-    let ConnectOp {
-        id, state, backoff, ..
-    } = join_op;
-    let ConnectionInfo { gateway, .. } = state.expect("infallible").try_unwrap_connecting()?;
-
-    tracing::info!(
-        tx = %id,
-        gateway = %gateway,
-        "Connecting to gateway",
+    let (tx, mut op, msg) = ConnectOpV2::initiate_join_request(
+        own.clone(),
+        gateway.clone(),
+        location,
+        ttl,
+        target_connections,
     );
 
-    let (callback, mut result) = tokio::sync::mpsc::channel(10);
-    op_manager
-        .notify_node_event(NodeEvent::ConnectPeer {
-            peer: gateway.peer.clone(),
-            tx,
-            callback,
-            is_gw: true,
-        })
-        .await?;
-    match result.recv().await.ok_or(OpError::NotificationError)? {
-        Ok((joiner, remaining_checks)) => {
-            op_manager
-                .ring
-                .add_connection(
-                    gateway.location.expect("location not found"),
-                    gateway.peer.clone(),
-                    true,
-                )
-                .await;
-            let Some(remaining_connections) = remaining_checks else {
-                tracing::error!(tx = %id, "Failed to connect to gateway, missing remaining checks");
-                return Err(OpError::ConnError(
-                    crate::node::ConnectionError::FailedConnectOp,
-                ));
-            };
-            tracing::debug!(
-                tx = %id,
-                gateway = %gateway,
-                joiner = %joiner,
-                "Sending connection request to gateway",
-            );
-
-            // Update state to indicate we're waiting for new connections
-            op_manager
-                .push(
-                    tx,
-                    OpEnum::Connect(Box::new(ConnectOp {
-                        id,
-                        state: Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
-                            remaining_connections,
-                        })),
-                        gateway: Some(Box::new(gateway.clone())),
-                        backoff,
-                    })),
-                )
-                .await?;
-
-            // After connecting to gateway, immediately request to find more peers
-            // We'll create a new transaction for this follow-up request
-            let new_tx_id = Transaction::new::<ConnectMsg>();
-            let ideal_location = Location::random();
-            let joiner_location = op_manager.ring.connection_manager.own_location();
-
-            // Track this transaction so connection maintenance knows about it
-            op_manager
-                .ring
-                .live_tx_tracker
-                .add_transaction(gateway.peer.clone(), new_tx_id);
-
-            let msg = ConnectMsg::Request {
-                id: new_tx_id,
-                target: gateway.clone(),
-                msg: ConnectRequest::FindOptimalPeer {
-                    query_target: gateway.clone(),
-                    ideal_location,
-                    joiner: joiner_location,
-                    max_hops_to_live: op_manager.ring.max_hops_to_live,
-                    skip_connections: HashSet::from([joiner.clone()]),
-                    skip_forwards: HashSet::new(),
-                },
-            };
-
-            tracing::info!(
-                tx = %new_tx_id,
-                gateway = %gateway.peer,
-                ideal_location = %ideal_location,
-                "Immediately requesting more peer connections from gateway"
-            );
-
-            // Send the message through the op_manager's notification system
-            // We need to create a new ConnectOp for this new transaction
-            let new_op = ConnectOp::new(
-                new_tx_id,
-                Some(ConnectState::AwaitingNewConnection(NewConnectionInfo {
-                    remaining_connections: op_manager.ring.max_hops_to_live,
-                })),
-                Some(Box::new(gateway.clone())),
-                None,
-            );
-
-            // Push the new operation
-            op_manager
-                .push(new_tx_id, OpEnum::Connect(Box::new(new_op)))
-                .await?;
-
-            // Send the FindOptimalPeer message to the gateway over the network
-            // We use notify_node_event with a SendMessage event to ensure it goes through
-            // the proper network channel, not just local processing
-            op_manager
-                .notify_node_event(NodeEvent::SendMessage {
-                    target: gateway.peer.clone(),
-                    msg: Box::new(NetMessage::from(msg)),
-                })
-                .await?;
-            Ok(())
-        }
-        Err(_) => Err(OpError::ConnError(
-            crate::node::ConnectionError::FailedConnectOp,
-        )),
+    op.gateway = Some(Box::new(gateway.clone()));
+    if let Some(backoff) = backoff {
+        op.backoff = Some(backoff);
     }
+
+    tracing::info!(%gateway.peer, tx = %tx, "Attempting network join using connect_v2");
+
+    op_manager
+        .notify_op_change(
+            NetMessage::V1(NetMessageV1::ConnectV2(msg)),
+            OpEnum::ConnectV2(Box::new(op)),
+        )
+        .await?;
+
+    Ok(())
 }
 
 pub(crate) struct ForwardParams {

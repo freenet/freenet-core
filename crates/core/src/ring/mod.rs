@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, AtomicUsize},
-        Arc,
+        Arc, Weak,
     },
     time::{Duration, Instant},
 };
@@ -33,9 +33,9 @@ use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
-    message::Transaction,
-    node::{self, EventLoopNotificationsSender, NodeConfig, PeerId},
-    operations::connect,
+    message::{NetMessage, NetMessageV1, Transaction},
+    node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
+    operations::{connect_v2::ConnectOpV2, OpEnum},
     router::Router,
 };
 
@@ -68,6 +68,7 @@ pub(crate) struct Ring {
     pub live_tx_tracker: LiveTransactionTracker,
     seeding_manager: seeding::SeedingManager,
     event_register: Box<dyn NetEventRegister>,
+    op_manager: RwLock<Option<Weak<OpManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
     pub(crate) is_gateway: bool,
@@ -122,6 +123,7 @@ impl Ring {
             seeding_manager: seeding::SeedingManager::new(),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
+            op_manager: RwLock::new(None),
             is_gateway,
         };
 
@@ -145,8 +147,18 @@ impl Ring {
                 .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
                 .instrument(span),
         );
-
         Ok(ring)
+    }
+
+    pub fn attach_op_manager(&self, op_manager: &Arc<OpManager>) {
+        self.op_manager.write().replace(Arc::downgrade(op_manager));
+    }
+
+    fn upgrade_op_manager(&self) -> Option<Arc<OpManager>> {
+        self.op_manager
+            .read()
+            .as_ref()
+            .and_then(|weak| weak.clone().upgrade())
     }
 
     pub fn is_gateway(&self) -> bool {
@@ -435,6 +447,13 @@ impl Ring {
         let mut pending_conn_adds = BTreeSet::new();
         let mut this_peer = None;
         loop {
+            let op_manager = match self.upgrade_op_manager() {
+                Some(op_manager) => op_manager,
+                None => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let Some(this_peer) = &this_peer else {
                 let Some(peer) = self.connection_manager.get_peer_key() else {
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -481,7 +500,13 @@ impl Ring {
                         ideal_location
                     );
                     live_tx = self
-                        .acquire_new(ideal_location, &skip_list, &notifier, &live_tx_tracker)
+                        .acquire_new(
+                            ideal_location,
+                            &skip_list,
+                            &notifier,
+                            &live_tx_tracker,
+                            &op_manager,
+                        )
                         .await
                         .map_err(|error| {
                             tracing::error!(
@@ -611,13 +636,14 @@ impl Ring {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, notifier, live_tx_tracker), fields(peer = %self.connection_manager.pub_key))]
+    #[tracing::instrument(level = "debug", skip(self, notifier, live_tx_tracker, op_manager), fields(peer = %self.connection_manager.pub_key))]
     async fn acquire_new(
         &self,
         ideal_location: Location,
         skip_list: &HashSet<&PeerId>,
         notifier: &EventLoopNotificationsSender,
         live_tx_tracker: &LiveTransactionTracker,
+        op_manager: &Arc<OpManager>,
     ) -> anyhow::Result<Option<Transaction>> {
         let current_connections = self.connection_manager.get_open_connections();
         let is_gateway = self.is_gateway;
@@ -628,29 +654,6 @@ impl Ring {
             "acquire_new: attempting to find peer to query"
         );
 
-        // CRITICAL: Use separate skip lists for routing vs. connection requests
-        //
-        // The routing skip list determines who we can ASK for peer recommendations.
-        // The connection skip list determines who we DON'T want to connect to.
-        //
-        // For peers with few connections (e.g., only gateway), we MUST be able to
-        // route through existing connections to discover new peers. If we filter out
-        // existing connections from routing, peers get stuck unable to find anyone to ask.
-        //
-        // Example scenario:
-        // - Peer has 1 connection (gateway)
-        // - Topology manager suggests random location for diversity
-        // - Old code: adds gateway to routing skip list → routing() returns None → no request sent
-        // - New code: routes through gateway → gateway helps discover other peers → mesh forms
-        //
-        // The skip list for routing should only exclude:
-        // - This peer itself
-        // - Peers we've already tried and failed with (missing candidates)
-        //
-        // The skip list for the FindOptimalPeer request should also exclude:
-        // - Already connected peers (to avoid reconnecting)
-
-        // Find a peer to query (allow routing through existing connections)
         let query_target = {
             let router = self.router.read();
             let num_connections = self.connection_manager.num_connections();
@@ -660,62 +663,51 @@ impl Ring {
                 skip_list_size = skip_list.len(),
                 "Looking for peer to route through"
             );
-            if let Some(t) = self.connection_manager.routing(
-                ideal_location,
-                None,
-                skip_list, // Use just the input skip list (missing candidates + self)
-                &router,
-            ) {
-                tracing::debug!(query_target = %t, "Found routing target");
-                t
+            if let Some(target) =
+                self.connection_manager
+                    .routing(ideal_location, None, skip_list, &router)
+            {
+                tracing::debug!(query_target = %target, "Found routing target");
+                target
             } else {
                 tracing::warn!(
                     "acquire_new: routing() returned None - cannot find peer to query (connections: {}, is_gateway: {})",
                     current_connections,
                     is_gateway
                 );
-
                 return Ok(None);
             }
         };
-
-        // Create skip list for the FindOptimalPeer request (includes already connected peers)
-        let connection_skip_list: HashSet<PeerId> = skip_list
-            .iter()
-            .copied()
-            .cloned()
-            .chain(self.connection_manager.connected_peers())
-            .collect();
 
         let joiner = self.connection_manager.own_location();
         tracing::info!(
             this_peer = %joiner,
             query_target_peer = %query_target.peer,
             %ideal_location,
-            skip_connections_count = connection_skip_list.len(),
-            "Sending FindOptimalPeer request via connection_maintenance"
+            "Sending ConnectV2 request via connection_maintenance"
         );
-        let missing_connections = self.connection_manager.max_connections - self.open_connections();
-        let id = Transaction::new::<connect::ConnectMsg>();
-        live_tx_tracker.add_transaction(query_target.peer.clone(), id);
-        let msg = connect::ConnectMsg::Request {
-            id,
-            target: query_target.clone(),
-            msg: connect::ConnectRequest::FindOptimalPeer {
-                query_target,
-                ideal_location,
-                joiner,
-                max_hops_to_live: missing_connections,
-                skip_connections: connection_skip_list,
-                skip_forwards: HashSet::new(),
-            },
-        };
+        let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
+        let target_connections = self.connection_manager.min_connections;
+
+        let (tx, op, msg) = ConnectOpV2::initiate_join_request(
+            joiner,
+            query_target.clone(),
+            ideal_location,
+            ttl,
+            target_connections,
+        );
+
+        live_tx_tracker.add_transaction(query_target.peer.clone(), tx);
+        op_manager
+            .push(tx, OpEnum::ConnectV2(Box::new(op)))
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
         notifier
             .notifications_sender
-            .send(Either::Left(msg.into()))
+            .send(Either::Left(NetMessage::V1(NetMessageV1::ConnectV2(msg))))
             .await?;
-        tracing::info!(tx = %id, "FindOptimalPeer request sent");
-        Ok(Some(id))
+        tracing::info!(tx = %tx, "ConnectV2 request sent");
+        Ok(Some(tx))
     }
 }
 
