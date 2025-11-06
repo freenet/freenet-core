@@ -20,9 +20,9 @@ use crate::{
         self, ContractHandler, ContractHandlerChannel, ExecutorToEventLoopChannel,
         NetworkEventListenerHalve, WaitingResolution,
     },
-    message::{NetMessage, NodeEvent, Transaction},
+    message::{NetMessage, NetMessageV1, NodeEvent},
     node::NodeConfig,
-    operations::{connect, OpEnum},
+    operations::{connect, connect_v2::ConnectOpV2, OpEnum},
 };
 
 use super::OpManager;
@@ -131,10 +131,7 @@ impl NodeP2P {
 
     /// Trigger the connection maintenance task to actively look for more peers
     async fn trigger_connection_maintenance(&self) -> anyhow::Result<()> {
-        // Send a connect request to find more peers
-        use crate::operations::connect;
         let ideal_location = Location::random();
-        let tx = Transaction::new::<connect::ConnectMsg>();
 
         // Find a connected peer to query
         let query_target = {
@@ -149,23 +146,32 @@ impl NodeP2P {
 
         if let Some(query_target) = query_target {
             let joiner = self.op_manager.ring.connection_manager.own_location();
-            let msg = connect::ConnectMsg::Request {
-                id: tx,
-                target: query_target.clone(),
-                msg: connect::ConnectRequest::FindOptimalPeer {
-                    query_target,
-                    ideal_location,
-                    joiner,
-                    max_hops_to_live: self.op_manager.ring.max_hops_to_live,
-                    skip_connections: HashSet::new(),
-                    skip_forwards: HashSet::new(),
-                },
-            };
+            let ttl = self
+                .op_manager
+                .ring
+                .max_hops_to_live
+                .max(1)
+                .min(u8::MAX as usize) as u8;
+            let target_connections = self.op_manager.ring.connection_manager.min_connections;
 
+            let (tx, op, msg) = ConnectOpV2::initiate_join_request(
+                joiner,
+                query_target.clone(),
+                ideal_location,
+                ttl,
+                target_connections,
+            );
+
+            tracing::debug!(
+                %tx,
+                query_peer = %query_target.peer,
+                %ideal_location,
+                "Triggering connection maintenance connect_v2 request"
+            );
             self.op_manager
                 .notify_op_change(
-                    NetMessage::from(msg),
-                    OpEnum::Connect(Box::new(connect::ConnectOp::new(tx, None, None, None))),
+                    NetMessage::V1(NetMessageV1::ConnectV2(msg)),
+                    OpEnum::ConnectV2(Box::new(op)),
                 )
                 .await?;
         }
