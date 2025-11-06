@@ -29,7 +29,9 @@ use crate::node::network_bridge::handshake::{
 use crate::node::network_bridge::priority_select;
 use crate::node::subscribe::SubscribeMsg;
 use crate::node::{MessageProcessor, PeerId};
-use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
+use crate::operations::{
+    connect::ConnectMsg, connect_v2::ConnectMsgV2, get::GetMsg, put::PutMsg, update::UpdateMsg,
+};
 use crate::ring::Location;
 use crate::transport::{
     create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
@@ -2043,6 +2045,11 @@ fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
                 ConnectMsg::Response { sender, .. } => Some(sender.clone()),
                 ConnectMsg::Request { target, .. } => Some(target.clone()),
                 _ => None,
+            },
+            NetMessageV1::ConnectV2(connect_msg) => match connect_msg {
+                ConnectMsgV2::Response { sender, .. } => Some(sender.clone()),
+                ConnectMsgV2::Request { from, .. } => Some(from.clone()),
+                ConnectMsgV2::ObservedAddress { target, .. } => Some(target.clone()),
             },
             // Get messages have sender in some variants
             NetMessageV1::Get(get_msg) => match get_msg {

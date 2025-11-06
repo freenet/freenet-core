@@ -42,6 +42,7 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
+        connect_v2::ConnectOpV2,
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
@@ -715,6 +716,29 @@ async fn process_message_v1<CB>(
                 )
                 .await;
             }
+            NetMessageV1::ConnectV2(ref op) => {
+                let parent_span = tracing::Span::current();
+                let span = tracing::info_span!(
+                    parent: parent_span,
+                    "handle_connect_v2_op_request",
+                    transaction = %msg.id(),
+                    tx_type = %msg.id().transaction_type()
+                );
+                let op_result =
+                    handle_op_request::<ConnectOpV2, _>(&op_manager, &mut conn_manager, op)
+                        .instrument(span)
+                        .await;
+
+                handle_op_not_available!(op_result);
+                return report_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    &mut *event_listener,
+                )
+                .await;
+            }
             NetMessageV1::Put(ref op) => {
                 let op_result =
                     handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
@@ -880,6 +904,42 @@ where
                 }
 
                 // Pure network result processing - no client handling
+                return handle_pure_network_result(
+                    tx,
+                    op_result,
+                    &op_manager,
+                    executor_callback,
+                    &mut *event_listener,
+                )
+                .await;
+            }
+            NetMessageV1::ConnectV2(ref op) => {
+                let parent_span = tracing::Span::current();
+                let span = tracing::info_span!(
+                    parent: parent_span,
+                    "handle_connect_v2_op_request",
+                    transaction = %msg.id(),
+                    tx_type = %msg.id().transaction_type()
+                );
+                let op_result =
+                    handle_op_request::<ConnectOpV2, _>(&op_manager, &mut conn_manager, op)
+                        .instrument(span)
+                        .await;
+
+                if let Err(OpError::OpNotAvailable(state)) = &op_result {
+                    match state {
+                        OpNotAvailable::Running => {
+                            tracing::debug!("Pure network: Operation still running");
+                            tokio::time::sleep(Duration::from_micros(1_000)).await;
+                            continue;
+                        }
+                        OpNotAvailable::Completed => {
+                            tracing::debug!("Pure network: Operation already completed");
+                            return Ok(None);
+                        }
+                    }
+                }
+
                 return handle_pure_network_result(
                     tx,
                     op_result,
