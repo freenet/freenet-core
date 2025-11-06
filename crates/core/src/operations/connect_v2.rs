@@ -372,12 +372,12 @@ impl ConnectOpV2 {
     }
 
     pub(crate) fn initiate_join_request(
-        op_manager: &OpManager,
+        own: PeerKeyLocation,
         target: PeerKeyLocation,
         desired_location: Location,
         ttl: u8,
+        target_connections: usize,
     ) -> (Transaction, Self, ConnectMsgV2) {
-        let own = op_manager.ring.connection_manager.own_location();
         let mut visited = vec![own.clone()];
         push_unique_peer(&mut visited, target.clone());
         let request = ConnectRequest {
@@ -391,7 +391,7 @@ impl ConnectOpV2 {
         let op = ConnectOpV2::new_joiner(
             tx,
             desired_location,
-            op_manager.ring.connection_manager.min_connections,
+            target_connections,
             Some(own.peer.addr),
             Some(target.clone()),
             None,
@@ -635,5 +635,33 @@ mod tests {
         let new = result.new_acceptor.expect("expected new acceptor");
         assert_eq!(new.peer.peer, acceptor.peer);
         assert!(!new.courtesy);
+    }
+
+    #[test]
+    fn init_join_request_initializes_state() {
+        let target = make_peer(7200);
+        let desired = Location::random();
+        let ttl = 5;
+        let own = make_peer(7300);
+        let (_tx, op, msg) = ConnectOpV2::initiate_join_request(
+            own.clone(),
+            target.clone(),
+            desired,
+            ttl,
+            2,
+        );
+
+        match msg {
+            ConnectMsgV2::Request { from, target: msg_target, payload, .. } => {
+                assert_eq!(msg_target.peer, target.peer);
+                assert_eq!(payload.desired_location, desired);
+                assert_eq!(payload.ttl, ttl);
+                assert!(payload.visited.iter().any(|p| p.peer == from.peer));
+                assert!(payload.visited.iter().any(|p| p.peer == target.peer));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        assert!(matches!(op.state, Some(ConnectState::WaitingForResponses(_))));
     }
 }
