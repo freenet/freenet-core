@@ -764,7 +764,7 @@ fn store_operation_state_with_msg(
                 state: Some(state),
                 gateway: op.gateway.clone(),
                 backoff: op.backoff.clone(),
-                desired_location: op.desired_location.clone(),
+                desired_location: op.desired_location,
             }))
         }),
     }

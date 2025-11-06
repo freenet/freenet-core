@@ -6,23 +6,18 @@
 use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::{
-    cmp::Reverse,
-    collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, AtomicUsize},
         Arc, Weak,
     },
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc::{self, error::TryRecvError};
 use tracing::Instrument;
 
 use dashmap::mapref::one::Ref as DmRef;
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
-use itertools::Itertools;
 use parking_lot::RwLock;
-use rand::Rng;
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -104,7 +99,7 @@ impl Ring {
         is_gateway: bool,
         connection_manager: ConnectionManager,
     ) -> anyhow::Result<Arc<Self>> {
-        let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
+        let live_tx_tracker = LiveTransactionTracker::new();
 
         let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
             v
@@ -144,7 +139,7 @@ impl Ring {
 
         GlobalExecutor::spawn(
             ring.clone()
-                .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
+                .connection_maintenance(event_loop_notifier, live_tx_tracker)
                 .instrument(span),
         );
         Ok(ring)
@@ -384,47 +379,10 @@ impl Ring {
             .await;
     }
 
-    pub fn closest_to_location(
-        &self,
-        location: Location,
-        skip_list: HashSet<PeerId>,
-    ) -> Option<PeerKeyLocation> {
-        let connections = self.connection_manager.get_connections_by_location();
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let total_peers: usize = connections.values().map(|v| v.len()).sum();
-            tracing::debug!(
-                unique_locations = connections.len(),
-                total_peers = total_peers,
-                skip_list_size = skip_list.len(),
-                target_location = %location,
-                "Looking for closest peer to location"
-            );
-            for (loc, peers) in &connections {
-                tracing::debug!(location = %loc, peer_count = peers.len(), "Location has peers");
-            }
-        }
-        connections
-            .iter()
-            .sorted_by(|(loc_a, _), (loc_b, _)| {
-                loc_a.distance(location).cmp(&loc_b.distance(location))
-            })
-            .find_map(|(_, conns)| {
-                // Try all peers at this location, not just random sampling
-                for conn in conns {
-                    if !skip_list.contains(&conn.location.peer) {
-                        tracing::debug!(selected_peer = %conn.location.peer, "Found closest peer");
-                        return Some(conn.location.clone());
-                    }
-                }
-                None
-            })
-    }
-
     async fn connection_maintenance(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
         live_tx_tracker: LiveTransactionTracker,
-        mut missing_candidates: mpsc::Receiver<PeerId>,
     ) -> anyhow::Result<()> {
         tracing::info!("Initializing connection maintenance task");
         let is_gateway = self.is_gateway;
@@ -445,13 +403,6 @@ impl Ring {
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut refresh_density_map = tokio::time::interval(REGENERATE_DENSITY_MAP_INTERVAL);
         refresh_density_map.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        let mut missing = BTreeMap::new();
-
-        #[cfg(not(test))]
-        let retry_peers_missing_candidates_interval = Duration::from_secs(60 * 5) * 2;
-        #[cfg(test)]
-        let retry_peers_missing_candidates_interval = Duration::from_secs(5);
 
         // if the peer is just starting wait a bit before
         // we even attempt acquiring more connections
@@ -477,28 +428,8 @@ impl Ring {
                 this_peer = Some(peer);
                 continue;
             };
-            loop {
-                match missing_candidates.try_recv() {
-                    Ok(missing_candidate) => {
-                        missing.insert(Reverse(Instant::now()), missing_candidate);
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        tracing::debug!("Shutting down connection maintenance");
-                        anyhow::bail!("finished");
-                    }
-                }
-            }
-
-            // eventually peers which failed to return candidates should be retried when enough time has passed
-            let retry_missing_candidates_until =
-                Instant::now() - retry_peers_missing_candidates_interval;
-
-            // remove all missing candidates which have been retried
-            missing.split_off(&Reverse(retry_missing_candidates_until));
-
             // avoid connecting to the same peer multiple times
-            let mut skip_list: HashSet<_> = missing.values().collect();
+            let mut skip_list = HashSet::new();
             skip_list.insert(this_peer);
 
             // if there are no open connections, we need to acquire more
@@ -789,6 +720,4 @@ pub(crate) enum RingError {
     EmptyRing,
     #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
     NoCachingPeers(ContractKey),
-    #[error("No location assigned to this peer")]
-    NoLocation,
 }

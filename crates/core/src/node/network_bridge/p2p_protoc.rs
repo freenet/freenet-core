@@ -647,15 +647,6 @@ impl P2pConnManager {
                                     );
                                 }
                             }
-                            NodeEvent::SendMessage { target, msg } => {
-                                // Send the message to the target peer over the network
-                                tracing::debug!(
-                                    tx = %msg.id(),
-                                    %target,
-                                    "SendMessage event: sending message to peer via network bridge"
-                                );
-                                ctx.bridge.send(&target, *msg).await?;
-                            }
                             NodeEvent::QueryConnections { callback } => {
                                 let connections = ctx.connections.keys().cloned().collect();
                                 match timeout(

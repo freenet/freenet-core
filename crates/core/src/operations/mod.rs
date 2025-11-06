@@ -201,7 +201,6 @@ where
 }
 
 pub(crate) enum OpEnum {
-    Connect(Box<connect::ConnectOp>),
     ConnectV2(Box<connect_v2::ConnectOpV2>),
     Put(put::PutOp),
     Get(get::GetOp),
@@ -212,7 +211,6 @@ pub(crate) enum OpEnum {
 impl OpEnum {
     delegate::delegate! {
         to match self {
-            OpEnum::Connect(op) => op,
             OpEnum::ConnectV2(op) => op,
             OpEnum::Put(op) => op,
             OpEnum::Get(op) => op,

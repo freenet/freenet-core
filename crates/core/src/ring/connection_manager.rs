@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
-use std::collections::btree_map::Entry;
+use std::collections::{btree_map::Entry, BTreeMap};
 
 use crate::topology::{Limits, TopologyManager};
 
@@ -22,33 +22,6 @@ pub(crate) struct ConnectionManager {
     pub max_connections: usize,
     pub rnd_if_htl_above: usize,
     pub pub_key: Arc<TransportPublicKey>,
-}
-
-#[cfg(test)]
-impl ConnectionManager {
-    pub fn default_with_key(pub_key: TransportPublicKey) -> Self {
-        let min_connections = Ring::DEFAULT_MIN_CONNECTIONS;
-        let max_connections = Ring::DEFAULT_MAX_CONNECTIONS;
-        let max_upstream_bandwidth = Ring::DEFAULT_MAX_UPSTREAM_BANDWIDTH;
-        let max_downstream_bandwidth = Ring::DEFAULT_MAX_DOWNSTREAM_BANDWIDTH;
-        let rnd_if_htl_above = Ring::DEFAULT_RAND_WALK_ABOVE_HTL;
-
-        Self::init(
-            max_upstream_bandwidth,
-            max_downstream_bandwidth,
-            min_connections,
-            max_connections,
-            rnd_if_htl_above,
-            (
-                pub_key,
-                None,
-                AtomicU64::new(u64::from_le_bytes(
-                    Location::random().as_f64().to_le_bytes(),
-                )),
-            ),
-            false,
-        )
-    }
 }
 
 impl ConnectionManager {
@@ -162,6 +135,7 @@ impl ConnectionManager {
             is_gateway = self.is_gateway,
             min = self.min_connections,
             max = self.max_connections,
+            rnd_if_htl_above = self.rnd_if_htl_above,
             "should_accept: evaluating direct acceptance guard"
         );
 
@@ -451,47 +425,12 @@ impl ConnectionManager {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) fn get_reserved_connections(&self) -> usize {
-        self.reserved_connections
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
     pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
         self.connections_by_location.read().clone()
     }
 
     pub(super) fn get_known_locations(&self) -> BTreeMap<PeerId, Location> {
         self.location_for_peer.read().clone()
-    }
-
-    /// Get a random peer from the known ring connections.
-    pub fn random_peer<F>(&self, filter_fn: F) -> Option<PeerKeyLocation>
-    where
-        F: Fn(&PeerId) -> bool,
-    {
-        let peers = &*self.location_for_peer.read();
-        let amount = peers.len();
-        if amount == 0 {
-            return None;
-        }
-        let mut rng = rand::rng();
-        let mut attempts = 0;
-        loop {
-            if attempts >= amount * 2 {
-                return None;
-            }
-            let selected = rng.random_range(0..amount);
-            let (peer, loc) = peers.iter().nth(selected).expect("infallible");
-            if !filter_fn(peer) {
-                attempts += 1;
-                continue;
-            } else {
-                return Some(PeerKeyLocation {
-                    peer: peer.clone(),
-                    location: Some(*loc),
-                });
-            }
-        }
     }
 
     /// Route an op to the most optimal target.

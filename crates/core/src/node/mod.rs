@@ -1472,7 +1472,6 @@ pub trait IsOperationCompleted {
 impl IsOperationCompleted for OpEnum {
     fn is_completed(&self) -> bool {
         match self {
-            OpEnum::Connect(op) => op.is_completed(),
             OpEnum::ConnectV2(op) => op.is_completed(),
             OpEnum::Put(op) => op.is_completed(),
             OpEnum::Get(op) => op.is_completed(),

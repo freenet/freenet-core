@@ -383,11 +383,6 @@ pub(crate) enum NodeEvent {
     ExpectPeerConnection {
         peer: PeerId,
     },
-    /// Send a message to a peer over the network
-    SendMessage {
-        target: PeerId,
-        msg: Box<NetMessage>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -466,9 +461,6 @@ impl Display for NodeEvent {
             }
             NodeEvent::ExpectPeerConnection { peer } => {
                 write!(f, "ExpectPeerConnection (from {peer})")
-            }
-            NodeEvent::SendMessage { target, msg } => {
-                write!(f, "SendMessage (to {target}, tx: {})", msg.id())
             }
         }
     }

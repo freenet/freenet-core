@@ -122,20 +122,6 @@ impl Drop for PeerConnection {
     }
 }
 
-#[cfg(test)]
-type PeerConnectionMock = (
-    PeerConnection,
-    mpsc::Sender<PacketData<UnknownEncryption>>,
-    mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
-);
-
-#[cfg(test)]
-type RemoteConnectionMock = (
-    RemoteConnection,
-    mpsc::Sender<PacketData<UnknownEncryption>>,
-    mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
-);
-
 impl PeerConnection {
     pub(super) fn new(remote_conn: RemoteConnection) -> Self {
         const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -247,69 +233,6 @@ impl PeerConnection {
             last_packet_report_time: Instant::now(),
             keep_alive_handle: Some(keep_alive_handle),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_test(
-        remote_addr: SocketAddr,
-        my_address: SocketAddr,
-        outbound_symmetric_key: Aes128Gcm,
-        inbound_symmetric_key: Aes128Gcm,
-    ) -> PeerConnectionMock {
-        use crate::transport::crypto::TransportKeypair;
-        use parking_lot::Mutex;
-        let (outbound_packets, outbound_packets_recv) = mpsc::channel(100);
-        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(100);
-        let keypair = TransportKeypair::new();
-        let remote = RemoteConnection {
-            outbound_packets,
-            outbound_symmetric_key,
-            remote_addr,
-            sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
-            last_packet_id: Arc::new(AtomicU32::new(0)),
-            inbound_packet_recv,
-            inbound_symmetric_key,
-            inbound_symmetric_key_bytes: [1; 16],
-            my_address: Some(my_address),
-            transport_secret_key: keypair.secret,
-            bandwidth_limit: None,
-        };
-        (
-            Self::new(remote),
-            inbound_packet_sender,
-            outbound_packets_recv,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_remote_test(
-        remote_addr: SocketAddr,
-        my_address: SocketAddr,
-        outbound_symmetric_key: Aes128Gcm,
-        inbound_symmetric_key: Aes128Gcm,
-    ) -> RemoteConnectionMock {
-        use crate::transport::crypto::TransportKeypair;
-        use parking_lot::Mutex;
-        let (outbound_packets, outbound_packets_recv) = mpsc::channel(100);
-        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(100);
-        let keypair = TransportKeypair::new();
-        (
-            RemoteConnection {
-                outbound_packets,
-                outbound_symmetric_key,
-                remote_addr,
-                sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
-                last_packet_id: Arc::new(AtomicU32::new(0)),
-                inbound_packet_recv,
-                inbound_symmetric_key,
-                inbound_symmetric_key_bytes: [1; 16],
-                my_address: Some(my_address),
-                transport_secret_key: keypair.secret,
-                bandwidth_limit: None,
-            },
-            inbound_packet_sender,
-            outbound_packets_recv,
-        )
     }
 
     #[instrument(name = "peer_connection", skip_all)]

@@ -182,17 +182,6 @@ impl<const N: usize> PacketData<Plaintext, N> {
     }
 }
 
-#[cfg(test)]
-impl<const N: usize> PacketData<SymmetricAES, N> {
-    pub fn into_unknown(self) -> PacketData<UnknownEncryption, N> {
-        PacketData {
-            data: self.data,
-            size: self.size,
-            data_type: PhantomData,
-        }
-    }
-}
-
 impl<const N: usize> PacketData<UnknownEncryption, N> {
     pub fn from_buf(buf: impl AsRef<[u8]>) -> Self {
         let mut data = [0; N];
