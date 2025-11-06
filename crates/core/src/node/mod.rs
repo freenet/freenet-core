@@ -41,7 +41,6 @@ use crate::{
     local_node::Executor,
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     operations::{
-        connect::{self, ConnectOp},
         connect_v2::{self, ConnectOpV2},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
@@ -693,28 +692,12 @@ async fn process_message_v1<CB>(
     for i in 0..MAX_RETRIES {
         tracing::debug!(?tx, "Processing operation, iteration: {i}");
         match msg {
-            NetMessageV1::Connect(ref op) => {
-                let parent_span = tracing::Span::current();
-                let span = tracing::info_span!(
-                    parent: parent_span,
-                    "handle_connect_op_request",
+            NetMessageV1::Connect(ref _op) => {
+                tracing::warn!(
                     transaction = %msg.id(),
-                    tx_type = %msg.id().transaction_type()
+                    "Ignoring legacy NetMessageV1::Connect message during ConnectV2 migration"
                 );
-                let op_result =
-                    handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
-                        .instrument(span)
-                        .await;
-
-                handle_op_not_available!(op_result);
-                return report_result(
-                    tx,
-                    op_result,
-                    &op_manager,
-                    executor_callback,
-                    &mut *event_listener,
-                )
-                .await;
+                return;
             }
             NetMessageV1::ConnectV2(ref op) => {
                 let parent_span = tracing::Span::current();
@@ -876,42 +859,12 @@ where
         tracing::debug!(?tx, "Processing pure network operation, iteration: {i}");
 
         match msg {
-            NetMessageV1::Connect(ref op) => {
-                let parent_span = tracing::Span::current();
-                let span = tracing::info_span!(
-                    parent: parent_span,
-                    "handle_connect_op_request",
+            NetMessageV1::Connect(ref _op) => {
+                tracing::warn!(
                     transaction = %msg.id(),
-                    tx_type = %msg.id().transaction_type()
+                    "Ignoring legacy NetMessageV1::Connect message during ConnectV2 migration"
                 );
-                let op_result =
-                    handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
-                        .instrument(span)
-                        .await;
-
-                if let Err(OpError::OpNotAvailable(state)) = &op_result {
-                    match state {
-                        OpNotAvailable::Running => {
-                            tracing::debug!("Pure network: Operation still running");
-                            tokio::time::sleep(Duration::from_micros(1_000)).await;
-                            continue;
-                        }
-                        OpNotAvailable::Completed => {
-                            tracing::debug!("Pure network: Operation already completed");
-                            return Ok(None);
-                        }
-                    }
-                }
-
-                // Pure network result processing - no client handling
-                return handle_pure_network_result(
-                    tx,
-                    op_result,
-                    &op_manager,
-                    executor_callback,
-                    &mut *event_listener,
-                )
-                .await;
+                return Ok(None);
             }
             NetMessageV1::ConnectV2(ref op) => {
                 let parent_span = tracing::Span::current();
@@ -1213,20 +1166,6 @@ async fn handle_aborted_op(
         // is useless without connecting to the network, we will retry with exponential backoff
         // if necessary
         match op_manager.pop(&tx) {
-            // only keep attempting to connect if the node hasn't got enough connections yet
-            Ok(Some(OpEnum::Connect(op)))
-                if op.has_backoff()
-                    && op_manager.ring.open_connections()
-                        < op_manager.ring.connection_manager.min_connections =>
-            {
-                let ConnectOp {
-                    gateway, backoff, ..
-                } = *op;
-                if let Some(gateway) = gateway {
-                    tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    connect_v2::join_ring_request(backoff, &gateway, op_manager).await?;
-                }
-            }
             Ok(Some(OpEnum::ConnectV2(op)))
                 if op.has_backoff()
                     && op_manager.ring.open_connections()
@@ -1238,15 +1177,6 @@ async fn handle_aborted_op(
                     connect_v2::join_ring_request(None, &gateway, op_manager).await?;
                 }
             }
-            Ok(Some(OpEnum::Connect(_))) => {
-                // if no connections were achieved just fail
-                if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
-                    tracing::warn!("Retrying joining the ring with an other gateway");
-                    if let Some(gateway) = gateways.iter().shuffle().next() {
-                        connect_v2::join_ring_request(None, gateway, op_manager).await?
-                    }
-                }
-            }
             Ok(Some(OpEnum::ConnectV2(_))) => {
                 if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                     tracing::warn!("Retrying joining the ring with an other gateway");
@@ -1254,6 +1184,9 @@ async fn handle_aborted_op(
                         connect_v2::join_ring_request(None, gateway, op_manager).await?
                     }
                 }
+            }
+            Ok(Some(other)) => {
+                op_manager.push(tx, other).await?;
             }
             _ => {}
         }

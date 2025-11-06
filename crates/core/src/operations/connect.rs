@@ -48,6 +48,7 @@ impl ConnectOp {
         }
     }
 
+    #[allow(dead_code)]
     pub fn has_backoff(&self) -> bool {
         self.backoff.is_some()
     }
