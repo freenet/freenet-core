@@ -595,6 +595,9 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
 // but the PUT caching refactor (commits 2cd337b5-0d432347) changed the subscription semantics.
 // Re-enabled after recent fixes to subscription logic - previously exhibited race conditions.
 // If this test becomes flaky again, see issue #1798 for historical context.
+// Ignored again due to recurring flakiness - fails intermittently with timeout waiting for
+// cross-node subscription notifications (Client 3 timeout). See issue #1798.
+#[ignore]
 #[freenet_test(
     nodes = ["gateway", "node-a", "node-b"],
     auto_connect_peers = true,
