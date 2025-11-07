@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
+use tokio::sync::mpsc;
 
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
