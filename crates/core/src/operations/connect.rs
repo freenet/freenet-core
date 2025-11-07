@@ -309,10 +309,7 @@ impl RelayContext for RelayEnv<'_> {
     }
 
     fn courtesy_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
-        // Courtesy slots still piggyback on regular connections. Flag the first acceptance so the
-        // joiner can prioritise it, and keep the logic simple until dedicated courtesy tracking
-        // is wired in (see courtesy-connection-budget branch).
-        self.op_manager.ring.open_connections() == 0
+        self.op_manager.ring.is_gateway()
     }
 }
 
