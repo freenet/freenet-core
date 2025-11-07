@@ -15,9 +15,8 @@ use crate::{
 };
 
 pub(crate) mod connect;
-#[allow(dead_code)]
-pub(crate) mod connect_v2;
 pub(crate) mod get;
+pub(crate) mod legacy_connect;
 pub(crate) mod put;
 pub(crate) mod subscribe;
 pub(crate) mod update;
@@ -201,7 +200,7 @@ where
 }
 
 pub(crate) enum OpEnum {
-    ConnectV2(Box<connect_v2::ConnectOpV2>),
+    Connect(Box<connect::ConnectOp>),
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
@@ -211,7 +210,7 @@ pub(crate) enum OpEnum {
 impl OpEnum {
     delegate::delegate! {
         to match self {
-            OpEnum::ConnectV2(op) => op,
+            OpEnum::Connect(op) => op,
             OpEnum::Put(op) => op,
             OpEnum::Get(op) => op,
             OpEnum::Subscribe(op) => op,

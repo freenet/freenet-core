@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use super::PeerId;
 use crate::message::{NetMessage, NodeEvent};
 
-mod handshake_v2;
+mod handshake;
 pub(crate) mod in_memory;
 pub(crate) mod p2p_protoc;
 pub(crate) mod priority_select;

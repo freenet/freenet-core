@@ -30,7 +30,7 @@ use crate::{
     config::GlobalExecutor,
     message::{NetMessage, NetMessageV1, Transaction},
     node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
-    operations::{connect_v2::ConnectOpV2, OpEnum},
+    operations::{connect::ConnectOp, OpEnum},
     router::Router,
 };
 
@@ -630,12 +630,12 @@ impl Ring {
             this_peer = %joiner,
             query_target_peer = %query_target.peer,
             %ideal_location,
-            "Sending ConnectV2 request via connection_maintenance"
+            "Sending connect request via connection_maintenance"
         );
         let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
         let target_connections = self.connection_manager.min_connections;
 
-        let (tx, op, msg) = ConnectOpV2::initiate_join_request(
+        let (tx, op, msg) = ConnectOp::initiate_join_request(
             joiner,
             query_target.clone(),
             ideal_location,
@@ -645,14 +645,14 @@ impl Ring {
 
         live_tx_tracker.add_transaction(query_target.peer.clone(), tx);
         op_manager
-            .push(tx, OpEnum::ConnectV2(Box::new(op)))
+            .push(tx, OpEnum::Connect(Box::new(op)))
             .await
             .map_err(|err| anyhow::anyhow!(err))?;
         notifier
             .notifications_sender
-            .send(Either::Left(NetMessage::V1(NetMessageV1::ConnectV2(msg))))
+            .send(Either::Left(NetMessage::V1(NetMessageV1::Connect(msg))))
             .await?;
-        tracing::info!(tx = %tx, "ConnectV2 request sent");
+        tracing::info!(tx = %tx, "Connect request sent");
         Ok(Some(tx))
     }
 }

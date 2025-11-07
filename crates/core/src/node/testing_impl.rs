@@ -28,7 +28,7 @@ use crate::{
     dev_tool::TransportKeypair,
     message::{MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction},
     node::{InitPeerNode, NetEventRegister, NodeConfig},
-    operations::connect_v2,
+    operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
     tracing::TestEventListener,
     transport::TransportPublicKey,
@@ -780,7 +780,7 @@ where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
-    connect_v2::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
+    connect::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
     let (client_responses, _cli_response_sender) = contract::client_responses_channel();
     let span = {
         config

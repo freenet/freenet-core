@@ -23,7 +23,7 @@ use crate::{
     message::{NetMessage, NetMessageV1, NodeEvent},
     node::NodeConfig,
     operations::{
-        connect_v2::{self, ConnectOpV2},
+        connect::{self, ConnectOp},
         OpEnum,
     },
 };
@@ -157,7 +157,7 @@ impl NodeP2P {
                 .min(u8::MAX as usize) as u8;
             let target_connections = self.op_manager.ring.connection_manager.min_connections;
 
-            let (tx, op, msg) = ConnectOpV2::initiate_join_request(
+            let (tx, op, msg) = ConnectOp::initiate_join_request(
                 joiner,
                 query_target.clone(),
                 ideal_location,
@@ -169,12 +169,12 @@ impl NodeP2P {
                 %tx,
                 query_peer = %query_target.peer,
                 %ideal_location,
-                "Triggering connection maintenance connect_v2 request"
+                "Triggering connection maintenance connect request"
             );
             self.op_manager
                 .notify_op_change(
-                    NetMessage::V1(NetMessageV1::ConnectV2(msg)),
-                    OpEnum::ConnectV2(Box::new(op)),
+                    NetMessage::V1(NetMessageV1::Connect(msg)),
+                    OpEnum::Connect(Box::new(op)),
                 )
                 .await?;
         }
@@ -183,11 +183,8 @@ impl NodeP2P {
     }
     pub(super) async fn run_node(self) -> anyhow::Result<Infallible> {
         if self.should_try_connect {
-            connect_v2::initial_join_procedure(
-                self.op_manager.clone(),
-                &self.conn_manager.gateways,
-            )
-            .await?;
+            connect::initial_join_procedure(self.op_manager.clone(), &self.conn_manager.gateways)
+                .await?;
 
             // After connecting to gateways, aggressively try to reach min_connections
             // This is important for fast startup and avoiding on-demand connection delays

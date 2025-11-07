@@ -12,7 +12,7 @@ use crate::{
     client_events::{ClientId, HostResult},
     node::PeerId,
     operations::{
-        connect::ConnectMsg, connect_v2::ConnectMsgV2, get::GetMsg, put::PutMsg,
+        connect::ConnectMsg, get::GetMsg, legacy_connect::LegacyConnectMsg, put::PutMsg,
         subscribe::SubscribeMsg, update::UpdateMsg,
     },
     ring::{Location, PeerKeyLocation},
@@ -194,13 +194,13 @@ where
 
 mod sealed_msg_type {
     use super::*;
-    use crate::operations::connect_v2::ConnectMsgV2;
+    use crate::operations::connect::ConnectMsg;
 
     pub trait SealedTxType {
         fn tx_type_id() -> TransactionTypeId;
     }
 
-    impl SealedTxType for ConnectMsgV2 {
+    impl SealedTxType for LegacyConnectMsg {
         fn tx_type_id() -> TransactionTypeId {
             TransactionTypeId(TransactionType::Connect)
         }
@@ -266,9 +266,9 @@ mod sealed_msg_type {
     });
 }
 
-impl From<ConnectMsgV2> for NetMessage {
-    fn from(msg: ConnectMsgV2) -> Self {
-        NetMessage::V1(NetMessageV1::ConnectV2(msg))
+impl From<LegacyConnectMsg> for NetMessage {
+    fn from(msg: LegacyConnectMsg) -> Self {
+        NetMessage::V1(NetMessageV1::LegacyConnect(msg))
     }
 }
 
@@ -287,8 +287,10 @@ pub(crate) enum NetMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NetMessageV1 {
+    #[serde(rename = "Connect")]
+    LegacyConnect(LegacyConnectMsg),
+    #[serde(rename = "ConnectV2")]
     Connect(ConnectMsg),
-    ConnectV2(ConnectMsgV2),
     Put(PutMsg),
     Get(GetMsg),
     Subscribe(SubscribeMsg),
@@ -316,8 +318,8 @@ impl Versioned for NetMessage {
 impl Versioned for NetMessageV1 {
     fn version(&self) -> semver::Version {
         match self {
-            NetMessageV1::Connect(_) => semver::Version::new(1, 0, 0),
-            NetMessageV1::ConnectV2(_) => semver::Version::new(1, 1, 0),
+            NetMessageV1::LegacyConnect(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::Connect(_) => semver::Version::new(1, 1, 0),
             NetMessageV1::Put(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Get(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Subscribe(_) => semver::Version::new(1, 0, 0),
@@ -489,8 +491,8 @@ impl MessageStats for NetMessage {
 impl MessageStats for NetMessageV1 {
     fn id(&self) -> &Transaction {
         match self {
+            NetMessageV1::LegacyConnect(op) => op.id(),
             NetMessageV1::Connect(op) => op.id(),
-            NetMessageV1::ConnectV2(op) => op.id(),
             NetMessageV1::Put(op) => op.id(),
             NetMessageV1::Get(op) => op.id(),
             NetMessageV1::Subscribe(op) => op.id(),
@@ -502,8 +504,8 @@ impl MessageStats for NetMessageV1 {
 
     fn target(&self) -> Option<PeerKeyLocation> {
         match self {
-            NetMessageV1::Connect(op) => op.target().as_ref().map(|b| b.borrow().clone()),
-            NetMessageV1::ConnectV2(op) => op.target().cloned(),
+            NetMessageV1::LegacyConnect(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Connect(op) => op.target().cloned(),
             NetMessageV1::Put(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Get(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Subscribe(op) => op.target().as_ref().map(|b| b.borrow().clone()),
@@ -515,8 +517,8 @@ impl MessageStats for NetMessageV1 {
 
     fn requested_location(&self) -> Option<Location> {
         match self {
+            NetMessageV1::LegacyConnect(op) => op.requested_location(),
             NetMessageV1::Connect(op) => op.requested_location(),
-            NetMessageV1::ConnectV2(op) => op.requested_location(),
             NetMessageV1::Put(op) => op.requested_location(),
             NetMessageV1::Get(op) => op.requested_location(),
             NetMessageV1::Subscribe(op) => op.requested_location(),
@@ -533,8 +535,8 @@ impl Display for NetMessage {
         write!(f, "Message {{")?;
         match self {
             NetMessage::V1(msg) => match msg {
+                LegacyConnect(msg) => msg.fmt(f)?,
                 Connect(msg) => msg.fmt(f)?,
-                ConnectV2(msg) => msg.fmt(f)?,
                 Put(msg) => msg.fmt(f)?,
                 Get(msg) => msg.fmt(f)?,
                 Subscribe(msg) => msg.fmt(f)?,

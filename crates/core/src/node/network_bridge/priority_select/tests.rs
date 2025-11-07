@@ -7,7 +7,7 @@ use tokio::time::{sleep, timeout, Duration};
 struct MockHandshakeStream;
 
 impl Stream for MockHandshakeStream {
-    type Item = crate::node::network_bridge::handshake_v2::Event;
+    type Item = crate::node::network_bridge::handshake::Event;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Pending

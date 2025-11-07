@@ -1,9 +1,9 @@
-//! Minimal handshake driver for the ConnectV2 pipeline.
+//! Minimal handshake driver for the streamlined connect pipeline.
 //!
 //! The legacy handshake logic orchestrated the multi-stage `Connect` operation. With the
-//! streamlined ConnectV2 state machine we only need a lightweight adapter that wires transport
+//! simplified state machine we only need a lightweight adapter that wires transport
 //! connection attempts to/from the event loop. Higher-level routing decisions now live inside
-//! `ConnectOpV2`.
+//! `ConnectOp`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -72,7 +72,7 @@ pub(crate) struct CommandSender(mpsc::Sender<Command>);
 
 impl CommandSender {
     pub async fn send(&self, cmd: Command) -> Result<(), mpsc::error::SendError<Command>> {
-        tracing::info!(?cmd, "handshake_v2: sending command");
+        tracing::info!(?cmd, "handshake: sending command");
         self.0.send(cmd).await
     }
 }

@@ -21,14 +21,14 @@ use tracing::Instrument;
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::contract::{ContractHandlerEvent, WaitingTransaction};
 use crate::message::{NetMessageV1, QueryResult};
-use crate::node::network_bridge::handshake_v2::{
+use crate::node::network_bridge::handshake::{
     Command as HandshakeCommand, CommandSender as HandshakeCommandSender, Event as HandshakeEvent,
     HandshakeHandler,
 };
 use crate::node::network_bridge::priority_select;
 use crate::node::subscribe::SubscribeMsg;
 use crate::node::{MessageProcessor, PeerId};
-use crate::operations::{connect_v2::ConnectMsgV2, get::GetMsg, put::PutMsg, update::UpdateMsg};
+use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
 use crate::ring::Location;
 use crate::transport::{
     create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
@@ -1657,7 +1657,7 @@ impl P2pConnManager {
                             sender_peer.peer
                         );
 
-                        let tx = Transaction::new::<crate::operations::connect_v2::ConnectMsgV2>();
+                        let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
                         let (callback, _rx) = tokio::sync::mpsc::channel(10);
 
                         // Don't await - let it happen in the background
@@ -2007,10 +2007,10 @@ fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
 fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
     match msg {
         NetMessage::V1(msg_v1) => match msg_v1 {
-            NetMessageV1::ConnectV2(connect_msg) => match connect_msg {
-                ConnectMsgV2::Response { sender, .. } => Some(sender.clone()),
-                ConnectMsgV2::Request { from, .. } => Some(from.clone()),
-                ConnectMsgV2::ObservedAddress { target, .. } => Some(target.clone()),
+            NetMessageV1::Connect(connect_msg) => match connect_msg {
+                ConnectMsg::Response { sender, .. } => Some(sender.clone()),
+                ConnectMsg::Request { from, .. } => Some(from.clone()),
+                ConnectMsg::ObservedAddress { target, .. } => Some(target.clone()),
             },
             // Get messages have sender in some variants
             NetMessageV1::Get(get_msg) => match get_msg {
@@ -2047,10 +2047,10 @@ fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
 fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyLocation> {
     match msg {
         NetMessage::V1(msg_v1) => match msg_v1 {
-            NetMessageV1::ConnectV2(connect_msg) => match connect_msg {
-                ConnectMsgV2::Response { sender, .. } => Some(sender),
-                ConnectMsgV2::Request { from, .. } => Some(from),
-                ConnectMsgV2::ObservedAddress { target, .. } => Some(target),
+            NetMessageV1::Connect(connect_msg) => match connect_msg {
+                ConnectMsg::Response { sender, .. } => Some(sender),
+                ConnectMsg::Request { from, .. } => Some(from),
+                ConnectMsg::ObservedAddress { target, .. } => Some(target),
             },
             NetMessageV1::Get(get_msg) => match get_msg {
                 GetMsg::SeekNode { sender, .. } => Some(sender),

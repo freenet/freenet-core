@@ -41,7 +41,7 @@ use crate::{
     local_node::Executor,
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     operations::{
-        connect_v2::{self, ConnectOpV2},
+        connect::{self, ConnectOp},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
     ring::{Location, PeerKeyLocation},
@@ -692,23 +692,23 @@ async fn process_message_v1<CB>(
     for i in 0..MAX_RETRIES {
         tracing::debug!(?tx, "Processing operation, iteration: {i}");
         match msg {
-            NetMessageV1::Connect(ref _op) => {
+            NetMessageV1::LegacyConnect(ref _op) => {
                 tracing::warn!(
                     transaction = %msg.id(),
-                    "Ignoring legacy NetMessageV1::Connect message during ConnectV2 migration"
+                    "Ignoring legacy NetMessageV1::Connect message during connect migration"
                 );
                 return;
             }
-            NetMessageV1::ConnectV2(ref op) => {
+            NetMessageV1::Connect(ref op) => {
                 let parent_span = tracing::Span::current();
                 let span = tracing::info_span!(
                     parent: parent_span,
-                    "handle_connect_v2_op_request",
+                    "handle_connect_op_request",
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
                 let op_result =
-                    handle_op_request::<ConnectOpV2, _>(&op_manager, &mut conn_manager, op)
+                    handle_op_request::<ConnectOp, _>(&op_manager, &mut conn_manager, op)
                         .instrument(span)
                         .await;
 
@@ -859,23 +859,23 @@ where
         tracing::debug!(?tx, "Processing pure network operation, iteration: {i}");
 
         match msg {
-            NetMessageV1::Connect(ref _op) => {
+            NetMessageV1::LegacyConnect(ref _op) => {
                 tracing::warn!(
                     transaction = %msg.id(),
-                    "Ignoring legacy NetMessageV1::Connect message during ConnectV2 migration"
+                    "Ignoring legacy NetMessageV1::Connect message during connect migration"
                 );
                 return Ok(None);
             }
-            NetMessageV1::ConnectV2(ref op) => {
+            NetMessageV1::Connect(ref op) => {
                 let parent_span = tracing::Span::current();
                 let span = tracing::info_span!(
                     parent: parent_span,
-                    "handle_connect_v2_op_request",
+                    "handle_connect_op_request",
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
                 let op_result =
-                    handle_op_request::<ConnectOpV2, _>(&op_manager, &mut conn_manager, op)
+                    handle_op_request::<ConnectOp, _>(&op_manager, &mut conn_manager, op)
                         .instrument(span)
                         .await;
 
@@ -1166,7 +1166,7 @@ async fn handle_aborted_op(
         // is useless without connecting to the network, we will retry with exponential backoff
         // if necessary
         match op_manager.pop(&tx) {
-            Ok(Some(OpEnum::ConnectV2(op)))
+            Ok(Some(OpEnum::Connect(op)))
                 if op.has_backoff()
                     && op_manager.ring.open_connections()
                         < op_manager.ring.connection_manager.min_connections =>
@@ -1174,14 +1174,14 @@ async fn handle_aborted_op(
                 let gateway = op.gateway().cloned();
                 if let Some(gateway) = gateway {
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    connect_v2::join_ring_request(None, &gateway, op_manager).await?;
+                    connect::join_ring_request(None, &gateway, op_manager).await?;
                 }
             }
-            Ok(Some(OpEnum::ConnectV2(_))) => {
+            Ok(Some(OpEnum::Connect(_))) => {
                 if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                     tracing::warn!("Retrying joining the ring with an other gateway");
                     if let Some(gateway) = gateways.iter().shuffle().next() {
-                        connect_v2::join_ring_request(None, gateway, op_manager).await?
+                        connect::join_ring_request(None, gateway, op_manager).await?
                     }
                 }
             }
@@ -1472,7 +1472,7 @@ pub trait IsOperationCompleted {
 impl IsOperationCompleted for OpEnum {
     fn is_completed(&self) -> bool {
         match self {
-            OpEnum::ConnectV2(op) => op.is_completed(),
+            OpEnum::Connect(op) => op.is_completed(),
             OpEnum::Put(op) => op.is_completed(),
             OpEnum::Get(op) => op.is_completed(),
             OpEnum::Subscribe(op) => op.is_completed(),

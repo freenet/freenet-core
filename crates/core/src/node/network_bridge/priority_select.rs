@@ -27,7 +27,7 @@ pub(super) enum SelectResult {
     OpExecution(Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>),
     PeerConnection(Option<Result<PeerConnectionInbound, TransportError>>),
     ConnBridge(Option<P2pBridgeEvent>),
-    Handshake(Option<crate::node::network_bridge::handshake_v2::Event>),
+    Handshake(Option<crate::node::network_bridge::handshake::Event>),
     NodeController(Option<NodeEvent>),
     ClientTransaction(
         Result<
@@ -89,7 +89,7 @@ impl ExecutorTransactionReceiver for ExecutorToEventLoopChannel<NetworkEventList
 
 /// Type alias for the production PrioritySelectStream with concrete types
 pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
-    super::handshake_v2::HandshakeHandler,
+    super::handshake::HandshakeHandler,
     ContractHandlerChannel<WaitingResolution>,
     ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
 >;
@@ -100,7 +100,7 @@ pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
 /// alive across loop iterations, maintaining waker registration.
 pub(super) struct PrioritySelectStream<H, C, E>
 where
-    H: Stream<Item = crate::node::network_bridge::handshake_v2::Event> + Unpin,
+    H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
     C: ClientTransactionRelay,
     E: ExecutorTransactionReceiver,
 {
@@ -133,7 +133,7 @@ where
 
 impl<H, C, E> PrioritySelectStream<H, C, E>
 where
-    H: Stream<Item = crate::node::network_bridge::handshake_v2::Event> + Unpin,
+    H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
     C: ClientTransactionRelay,
     E: ExecutorTransactionReceiver,
 {
@@ -179,7 +179,7 @@ where
 
 impl<H, C, E> Stream for PrioritySelectStream<H, C, E>
 where
-    H: Stream<Item = crate::node::network_bridge::handshake_v2::Event> + Unpin,
+    H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
     C: ClientTransactionRelay,
     E: ExecutorTransactionReceiver,
 {

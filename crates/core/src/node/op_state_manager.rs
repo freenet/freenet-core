@@ -185,7 +185,7 @@ impl SubOperationTracker {
 
 #[derive(Default)]
 struct Ops {
-    connect_v2: DashMap<Transaction, crate::operations::connect_v2::ConnectOpV2>,
+    connect: DashMap<Transaction, crate::operations::connect::ConnectOp>,
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
@@ -429,10 +429,10 @@ impl OpManager {
         }
         self.new_transactions.send(id).await?;
         match op {
-            OpEnum::ConnectV2(op) => {
+            OpEnum::Connect(op) => {
                 #[cfg(debug_assertions)]
                 check_id_op!(id.transaction_type(), TransactionType::Connect);
-                self.ops.connect_v2.insert(id, *op);
+                self.ops.connect.insert(id, *op);
             }
             OpEnum::Put(op) => {
                 #[cfg(debug_assertions)]
@@ -472,10 +472,10 @@ impl OpManager {
         let op = match id.transaction_type() {
             TransactionType::Connect => self
                 .ops
-                .connect_v2
+                .connect
                 .remove(id)
                 .map(|(_k, v)| v)
-                .map(|op| OpEnum::ConnectV2(Box::new(op))),
+                .map(|op| OpEnum::Connect(Box::new(op))),
             TransactionType::Put => self.ops.put.remove(id).map(|(_k, v)| v).map(OpEnum::Put),
             TransactionType::Get => self.ops.get.remove(id).map(|(_k, v)| v).map(OpEnum::Get),
             TransactionType::Subscribe => self
@@ -700,7 +700,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         continue;
                     }
                     let still_waiting = match tx.transaction_type() {
-                        TransactionType::Connect => ops.connect_v2.remove(&tx).is_none(),
+                        TransactionType::Connect => ops.connect.remove(&tx).is_none(),
                         TransactionType::Put => ops.put.remove(&tx).is_none(),
                         TransactionType::Get => ops.get.remove(&tx).is_none(),
                         TransactionType::Subscribe => ops.subscribe.remove(&tx).is_none(),
@@ -749,7 +749,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         }
                     }
                     let removed = match tx.transaction_type() {
-                        TransactionType::Connect => ops.connect_v2.remove(&tx).is_some(),
+                        TransactionType::Connect => ops.connect.remove(&tx).is_some(),
                         TransactionType::Put => ops.put.remove(&tx).is_some(),
                         TransactionType::Get => ops.get.remove(&tx).is_some(),
                         TransactionType::Subscribe => ops.subscribe.remove(&tx).is_some(),
