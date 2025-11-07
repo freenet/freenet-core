@@ -33,6 +33,10 @@ jobs:
           ref: main
           path: river-src
 
+      - name: Link sibling dependencies
+        run: |
+          ln -sfn "${{ github.workspace }}/freenet-test-network" "${{ github.workspace }}/../freenet-test-network"
+
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
