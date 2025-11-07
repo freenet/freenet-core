@@ -148,10 +148,52 @@ impl ConnectionManager {
             );
         }
 
-        let total_conn = self
-            .reserved_connections
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + open;
+        let reserved_before = loop {
+            let current = self
+                .reserved_connections
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if current == usize::MAX {
+                tracing::error!(
+                    %peer_id,
+                    "reserved connection counter overflowed; rejecting new connection"
+                );
+                return false;
+            }
+            match self.reserved_connections.compare_exchange(
+                current,
+                current + 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => break current,
+                Err(actual) => {
+                    tracing::debug!(
+                        %peer_id,
+                        expected = current,
+                        actual,
+                        "reserved connection counter changed concurrently; retrying"
+                    );
+                }
+            }
+        };
+
+        let total_conn = match reserved_before
+            .checked_add(1)
+            .and_then(|val| val.checked_add(open))
+        {
+            Some(val) => val,
+            None => {
+                tracing::error!(
+                    %peer_id,
+                    reserved_before,
+                    open,
+                    "connection counters would overflow; rejecting connection"
+                );
+                self.reserved_connections
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return false;
+            }
+        };
 
         if open == 0 {
             tracing::debug!(%peer_id, "should_accept: first connection -> accepting");
