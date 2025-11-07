@@ -166,7 +166,7 @@ pub(crate) trait RelayContext {
     fn self_location(&self) -> &PeerKeyLocation;
 
     /// Determine whether we should accept the joiner immediately.
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool;
+    fn should_accept(&self, joiner: &PeerKeyLocation, courtesy: bool) -> bool;
 
     /// Choose the next hop for the request, avoiding peers already visited.
     fn select_next_hop(
@@ -218,10 +218,11 @@ impl RelayState {
             }
         }
 
-        if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
+        let acceptor = ctx.self_location().clone();
+        let courtesy = ctx.courtesy_hint(&acceptor, &self.request.origin);
+
+        if !self.accepted_locally && ctx.should_accept(&self.request.origin, courtesy) {
             self.accepted_locally = true;
-            let acceptor = ctx.self_location().clone();
-            let courtesy = ctx.courtesy_hint(&acceptor, &self.request.joiner);
             self.courtesy_hint = courtesy;
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
@@ -285,14 +286,14 @@ impl RelayContext for RelayEnv<'_> {
         &self.self_location
     }
 
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool {
+    fn should_accept(&self, joiner: &PeerKeyLocation, courtesy: bool) -> bool {
         let location = joiner
             .location
             .unwrap_or_else(|| Location::from_address(&joiner.peer.addr));
         self.op_manager
             .ring
             .connection_manager
-            .should_accept(location, &joiner.peer)
+            .should_accept(location, &joiner.peer, courtesy)
     }
 
     fn select_next_hop(
@@ -791,7 +792,7 @@ pub(crate) async fn join_ring_request(
     if !op_manager
         .ring
         .connection_manager
-        .should_accept(location, &gateway.peer)
+        .should_accept(location, &gateway.peer, false)
     {
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
     }
@@ -1002,7 +1003,7 @@ mod tests {
             &self.self_loc
         }
 
-        fn should_accept(&self, _joiner: &PeerKeyLocation) -> bool {
+        fn should_accept(&self, _joiner: &PeerKeyLocation, _courtesy: bool) -> bool {
             self.accept
         }
 
