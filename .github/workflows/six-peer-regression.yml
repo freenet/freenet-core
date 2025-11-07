@@ -20,22 +20,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout freenet-test-network
-        uses: actions/checkout@v4
-        with:
-          repository: freenet/freenet-test-network
-          path: freenet-test-network
-
       - name: Checkout river
         uses: actions/checkout@v4
         with:
           repository: freenet/river
           ref: main
           path: river-src
-
-      - name: Link sibling dependencies
-        run: |
-          ln -sfn "${{ github.workspace }}/freenet-test-network" "${{ github.workspace }}/../freenet-test-network"
 
       - name: Install Rust
         uses: actions-rs/toolchain@v1
