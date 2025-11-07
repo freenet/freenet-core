@@ -8,8 +8,12 @@ use crate::contract::{ClientResponsesSender, SessionMessage};
 use crate::message::Transaction;
 use freenet_stdlib::client_api::ContractResponse;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::debug;
+
+const PENDING_RESULT_TTL: Duration = Duration::from_secs(60);
+const MAX_PENDING_RESULTS: usize = 2048;
 
 /// Simple session actor for client connection refactor
 pub struct SessionActor {
@@ -25,6 +29,7 @@ pub struct SessionActor {
 struct PendingResult {
     result: std::sync::Arc<HostResult>,
     delivered_clients: HashSet<ClientId>,
+    last_accessed: Instant,
 }
 
 impl PendingResult {
@@ -32,7 +37,12 @@ impl PendingResult {
         Self {
             result,
             delivered_clients: HashSet::new(),
+            last_accessed: Instant::now(),
         }
+    }
+
+    fn touch(&mut self) {
+        self.last_accessed = Instant::now();
     }
 }
 
@@ -60,6 +70,7 @@ impl SessionActor {
 
     /// Process a single message
     async fn process_message(&mut self, msg: SessionMessage) {
+        self.prune_pending_results();
         match msg {
             SessionMessage::DeliverHostResponse { tx, response } => {
                 self.handle_result_delivery(tx, response).await;
@@ -94,6 +105,7 @@ impl SessionActor {
                 );
 
                 if let Some(result_arc) = self.pending_results.get_mut(&tx).and_then(|pending| {
+                    pending.touch();
                     if pending.delivered_clients.insert(client_id) {
                         Some(pending.result.clone())
                     } else {
@@ -103,6 +115,7 @@ impl SessionActor {
                     let mut recipients = HashSet::new();
                     recipients.insert(client_id);
                     self.deliver_result_to_clients(tx, recipients, result_arc);
+                    self.cleanup_transaction_entry(tx, client_id);
                 }
             }
             SessionMessage::ClientDisconnect { client_id } => {
@@ -211,11 +224,18 @@ impl SessionActor {
 
         let mut recipients = HashSet::new();
         let result_to_deliver = {
+            if !self.pending_results.contains_key(&tx)
+                && self.pending_results.len() >= MAX_PENDING_RESULTS
+            {
+                self.enforce_pending_capacity();
+            }
+
             let entry = self
                 .pending_results
                 .entry(tx)
                 .or_insert_with(|| PendingResult::new(result.clone()));
             entry.result = result.clone();
+            entry.touch();
 
             if let Some(waiting_clients) = self.client_transactions.remove(&tx) {
                 for client_id in waiting_clients {
@@ -282,12 +302,19 @@ impl SessionActor {
                     e
                 );
             } else {
+                if !self.pending_results.contains_key(&tx)
+                    && self.pending_results.len() >= MAX_PENDING_RESULTS
+                {
+                    self.enforce_pending_capacity();
+                }
+
                 let entry = self
                     .pending_results
                     .entry(tx)
                     .or_insert_with(|| PendingResult::new(result.clone()));
                 entry.delivered_clients.insert(client_id);
                 entry.result = result.clone();
+                entry.touch();
 
                 tracing::debug!(
                     "Delivered result for transaction {} to specific client {} with request correlation {}",
@@ -318,6 +345,64 @@ impl SessionActor {
 
         // Clean up RequestId mappings for this client across all transactions
         self.client_request_ids.retain(|(_, c), _| *c != client_id);
+    }
+
+    fn prune_pending_results(&mut self) {
+        if self.pending_results.is_empty() {
+            return;
+        }
+
+        let mut active_txs: HashSet<Transaction> =
+            self.client_transactions.keys().copied().collect();
+        active_txs.extend(self.client_request_ids.keys().map(|(tx, _)| *tx));
+
+        let now = Instant::now();
+        let stale: Vec<Transaction> = self
+            .pending_results
+            .iter()
+            .filter_map(|(tx, pending)| {
+                if active_txs.contains(tx) {
+                    return None;
+                }
+                if now.duration_since(pending.last_accessed) > PENDING_RESULT_TTL {
+                    Some(*tx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for tx in stale {
+            self.pending_results.remove(&tx);
+        }
+
+        if self.pending_results.len() >= MAX_PENDING_RESULTS {
+            self.enforce_pending_capacity();
+        }
+    }
+
+    fn cleanup_transaction_entry(&mut self, tx: Transaction, client_id: ClientId) {
+        if let Some(waiting_clients) = self.client_transactions.get_mut(&tx) {
+            waiting_clients.remove(&client_id);
+            if waiting_clients.is_empty() {
+                self.client_transactions.remove(&tx);
+            }
+        }
+    }
+
+    fn enforce_pending_capacity(&mut self) {
+        if self.pending_results.len() < MAX_PENDING_RESULTS {
+            return;
+        }
+
+        if let Some(oldest_tx) = self
+            .pending_results
+            .iter()
+            .min_by_key(|(_, pending)| pending.last_accessed)
+            .map(|(tx, _)| *tx)
+        {
+            self.pending_results.remove(&oldest_tx);
+        }
     }
 }
 
