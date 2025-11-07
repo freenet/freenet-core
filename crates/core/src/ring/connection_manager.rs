@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
-use std::collections::{btree_map::Entry, BTreeMap, VecDeque};
+use std::collections::{btree_map::Entry, BTreeMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use crate::topology::{Limits, TopologyManager};
@@ -25,6 +25,7 @@ pub(crate) struct ConnectionManager {
     pub pub_key: Arc<TransportPublicKey>,
     courtesy_links: Arc<Mutex<VecDeque<CourtesyLink>>>,
     max_courtesy_links: usize,
+    pending_courtesy: Arc<Mutex<HashSet<PeerId>>>,
 }
 
 #[derive(Clone)]
@@ -123,7 +124,37 @@ impl ConnectionManager {
             pub_key: Arc::new(pub_key),
             courtesy_links: Arc::new(Mutex::new(VecDeque::new())),
             max_courtesy_links: if is_gateway { MAX_COURTESY_LINKS } else { 0 },
+            pending_courtesy: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    fn remember_courtesy_intent(&self, peer: &PeerId) {
+        if !self.is_gateway {
+            return;
+        }
+        let mut pending = self.pending_courtesy.lock();
+        pending.insert(peer.clone());
+        tracing::debug!(
+            %peer,
+            pending = pending.len(),
+            "remember_courtesy_intent: recorded pending courtesy join"
+        );
+    }
+
+    fn take_pending_courtesy(&self, peer: &PeerId) -> bool {
+        if !self.is_gateway {
+            return false;
+        }
+        let mut pending = self.pending_courtesy.lock();
+        let removed = pending.remove(peer);
+        if removed {
+            tracing::debug!(
+                %peer,
+                pending = pending.len(),
+                "take_pending_courtesy: consuming pending courtesy flag"
+            );
+        }
+        removed
     }
 
     fn register_courtesy_connection(&self, peer: &PeerId) -> Option<PeerId> {
@@ -295,6 +326,7 @@ impl ConnectionManager {
         }
 
         if courtesy_join {
+            self.remember_courtesy_intent(peer_id);
             tracing::debug!(
                 %peer_id,
                 open,
@@ -473,6 +505,8 @@ impl ConnectionManager {
         self.open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::mem::drop(lop);
+
+        let courtesy = courtesy || self.take_pending_courtesy(&peer);
 
         if courtesy {
             self.register_courtesy_connection(&peer)
