@@ -25,7 +25,7 @@ jobs:
         with:
           repository: freenet/river
           ref: main
-          path: river-src
+          path: river
 
       - name: Install Rust
         uses: actions-rs/toolchain@v1
@@ -34,13 +34,8 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Show workspace layout
-        run: |
-          pwd
-          ls -R . | head -n 200
-
       - name: Run six-peer regression
-        working-directory: ${{ github.workspace }}/river-src/main
+        working-directory: river/main
         env:
           FREENET_CORE_PATH: ${{ github.workspace }}
           RUST_LOG: info
