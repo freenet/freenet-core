@@ -1,7 +1,6 @@
 use std::path::Path;
 
-#[allow(deprecated)]
-use aes_gcm::{aead::generic_array::GenericArray, KeyInit};
+use aes_gcm::KeyInit;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::client_api::DelegateRequest;
 use rsa::pkcs8::DecodePrivateKey;
@@ -148,16 +147,15 @@ impl Default for Secrets {
     }
 }
 
-#[allow(deprecated)]
 impl Secrets {
     #[inline]
     pub fn nonce(&self) -> XNonce {
-        *XNonce::from_slice(&self.nonce)
+        self.nonce.into()
     }
 
     #[inline]
     pub fn cipher(&self) -> XChaCha20Poly1305 {
-        XChaCha20Poly1305::new(GenericArray::from_slice(&self.cipher))
+        XChaCha20Poly1305::new((&self.cipher).into())
     }
 
     #[inline]
