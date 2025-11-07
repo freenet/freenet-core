@@ -34,6 +34,11 @@ jobs:
           toolchain: stable
           override: true
 
+      - name: Show workspace layout
+        run: |
+          pwd
+          ls -R . | head -n 200
+
       - name: Run six-peer regression
         working-directory: ${{ github.workspace }}/river/main
         env:
