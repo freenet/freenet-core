@@ -7,6 +7,7 @@ use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, Operat
 use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
+    contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
@@ -50,6 +51,46 @@ async fn wait_for_local_contract(
     Ok(false)
 }
 
+async fn fetch_contract_if_missing(
+    op_manager: &OpManager,
+    key: ContractKey,
+) -> Result<(), OpError> {
+    if has_contract_with_code(op_manager, key).await? {
+        return Ok(());
+    }
+
+    let get_op = get::start_op(key, true, false);
+    get::request_get(op_manager, get_op, HashSet::new()).await?;
+
+    if wait_for_local_contract(op_manager, key).await? && has_contract_with_code(op_manager, key).await? {
+        Ok(())
+    } else {
+        Err(RingError::NoCachingPeers(key).into())
+    }
+}
+
+async fn has_contract_with_code(
+    op_manager: &OpManager,
+    key: ContractKey,
+) -> Result<bool, OpError> {
+    match op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            key,
+            return_contract_code: true,
+        })
+        .await?
+    {
+        ContractHandlerEvent::GetResponse {
+            response:
+                Ok(StoreResponse {
+                    state: Some(_),
+                    contract: Some(_),
+                }),
+            ..
+        } => Ok(true),
+        _ => Ok(false),
+    }
+}
 #[derive(Debug)]
 enum SubscribeState {
     /// Prepare the request to subscribe.
@@ -728,6 +769,8 @@ impl Operation for SubscribeOp {
                         upstream_subscriber,
                         ..
                     }) => {
+                        fetch_contract_if_missing(op_manager, *key).await?;
+
                         tracing::info!(
                             tx = %id,
                             %key,
