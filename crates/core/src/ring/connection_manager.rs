@@ -163,8 +163,12 @@ impl ConnectionManager {
     ///
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
-    pub fn should_accept(&self, location: Location, peer_id: &PeerId) -> bool {
-        tracing::info!("Checking if should accept connection");
+    pub fn should_accept(&self, location: Location, peer_id: &PeerId, courtesy: bool) -> bool {
+        let courtesy_join = courtesy && self.is_gateway;
+        tracing::info!(
+            courtesy = courtesy_join,
+            "Checking if should accept connection"
+        );
         let open = self
             .open_connections
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -245,7 +249,7 @@ impl ConnectionManager {
         }
 
         const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 10;
-        if self.is_gateway {
+        if self.is_gateway && !courtesy_join {
             let direct_total = open + reserved_before;
             if direct_total >= GATEWAY_DIRECT_ACCEPT_LIMIT {
                 tracing::info!(
@@ -265,6 +269,16 @@ impl ConnectionManager {
         if self.location_for_peer.read().get(peer_id).is_some() {
             // We've already accepted this peer (pending or active); treat as a no-op acceptance.
             tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
+            return true;
+        }
+
+        if courtesy_join {
+            tracing::debug!(
+                %peer_id,
+                open,
+                reserved = reserved_before,
+                "should_accept: accepting courtesy connection despite topology limits"
+            );
             return true;
         }
 
