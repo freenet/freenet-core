@@ -228,14 +228,28 @@ impl Ring {
             .record_request(recipient, target, request_type);
     }
 
-    pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
-        tracing::info!(%peer, this = ?self.connection_manager.get_peer_key(), %was_reserved, "Adding connection to peer");
-        self.connection_manager
-            .add_connection(loc, peer.clone(), was_reserved);
+    pub async fn add_connection(
+        &self,
+        loc: Location,
+        peer: PeerId,
+        was_reserved: bool,
+        courtesy: bool,
+    ) -> Option<PeerId> {
+        tracing::info!(
+            %peer,
+            this = ?self.connection_manager.get_peer_key(),
+            %was_reserved,
+            courtesy,
+            "Adding connection to peer"
+        );
+        let eviction_candidate =
+            self.connection_manager
+                .add_connection(loc, peer.clone(), was_reserved, courtesy);
         self.event_register
             .register_events(Either::Left(NetEventLog::connected(self, peer, loc)))
             .await;
-        self.refresh_density_request_cache()
+        self.refresh_density_request_cache();
+        eviction_candidate
     }
 
     pub fn update_connection_identity(&self, old_peer: &PeerId, new_peer: PeerId) {

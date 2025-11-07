@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{btree_map::Entry, BTreeMap, VecDeque};
+use std::time::Instant;
 
 use crate::topology::{Limits, TopologyManager};
 
@@ -22,7 +23,16 @@ pub(crate) struct ConnectionManager {
     pub max_connections: usize,
     pub rnd_if_htl_above: usize,
     pub pub_key: Arc<TransportPublicKey>,
+    courtesy_links: Arc<Mutex<VecDeque<CourtesyLink>>>,
+    max_courtesy_links: usize,
 }
+
+#[derive(Clone)]
+struct CourtesyLink {
+    peer: PeerId,
+}
+
+const MAX_COURTESY_LINKS: usize = 10;
 
 impl ConnectionManager {
     pub fn new(config: &NodeConfig) -> Self {
@@ -111,7 +121,41 @@ impl ConnectionManager {
             max_connections,
             rnd_if_htl_above,
             pub_key: Arc::new(pub_key),
+            courtesy_links: Arc::new(Mutex::new(VecDeque::new())),
+            max_courtesy_links: if is_gateway { MAX_COURTESY_LINKS } else { 0 },
         }
+    }
+
+    fn register_courtesy_connection(&self, peer: &PeerId) -> Option<PeerId> {
+        if !self.is_gateway || self.max_courtesy_links == 0 {
+            return None;
+        }
+        let mut links = self.courtesy_links.lock();
+        if links.len() == self.max_courtesy_links && links.iter().all(|entry| entry.peer != *peer) {
+            tracing::debug!(
+                %peer,
+                max = self.max_courtesy_links,
+                "register_courtesy_connection: budget full before inserting"
+            );
+        }
+        links.retain(|entry| entry.peer != *peer);
+        links.push_back(CourtesyLink { peer: peer.clone() });
+        if links.len() > self.max_courtesy_links {
+            links.pop_front().map(|entry| entry.peer)
+        } else {
+            None
+        }
+    }
+
+    fn unregister_courtesy_connection(&self, peer: &PeerId) {
+        if !self.is_gateway {
+            return;
+        }
+        let mut links = self.courtesy_links.lock();
+        if links.is_empty() {
+            return;
+        }
+        links.retain(|entry| entry.peer != *peer);
     }
 
     /// Whether a node should accept a new node connection or not based
@@ -200,7 +244,7 @@ impl ConnectionManager {
             return true;
         }
 
-        const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 2;
+        const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 10;
         if self.is_gateway {
             let direct_total = open + reserved_before;
             if direct_total >= GATEWAY_DIRECT_ACCEPT_LIMIT {
@@ -350,8 +394,20 @@ impl ConnectionManager {
         self.prune_connection(peer, false)
     }
 
-    pub fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
-        tracing::info!(%peer, %loc, %was_reserved, "Adding connection to topology");
+    pub fn add_connection(
+        &self,
+        loc: Location,
+        peer: PeerId,
+        was_reserved: bool,
+        courtesy: bool,
+    ) -> Option<PeerId> {
+        tracing::info!(
+            %peer,
+            %loc,
+            %was_reserved,
+            courtesy,
+            "Adding connection to topology"
+        );
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
         if was_reserved {
             let old = self
@@ -381,6 +437,13 @@ impl ConnectionManager {
         self.open_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::mem::drop(lop);
+
+        if courtesy {
+            self.register_courtesy_connection(&peer)
+        } else {
+            self.unregister_courtesy_connection(&peer);
+            None
+        }
     }
 
     pub fn update_peer_identity(&self, old_peer: &PeerId, new_peer: PeerId) -> bool {
@@ -452,6 +515,7 @@ impl ConnectionManager {
         }
 
         if is_alive {
+            self.unregister_courtesy_connection(peer);
             self.open_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         } else {

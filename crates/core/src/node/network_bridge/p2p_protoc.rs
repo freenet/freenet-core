@@ -1625,11 +1625,34 @@ impl P2pConnManager {
                 .connection_manager
                 .prune_in_transit_connection(&peer_id);
             let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
-            self.bridge
+            let eviction_candidate = self
+                .bridge
                 .op_manager
                 .ring
-                .add_connection(loc, peer_id.clone(), false)
+                .add_connection(loc, peer_id.clone(), false, courtesy)
                 .await;
+            if let Some(victim) = eviction_candidate {
+                if victim == peer_id {
+                    tracing::debug!(
+                        %peer_id,
+                        "Courtesy eviction candidate matched current connection; skipping drop"
+                    );
+                } else {
+                    tracing::info!(
+                        %victim,
+                        %peer_id,
+                        courtesy_limit = true,
+                        "Courtesy connection budget exceeded; dropping oldest courtesy peer"
+                    );
+                    if let Err(error) = self.bridge.drop_connection(&victim).await {
+                        tracing::warn!(
+                            %victim,
+                            ?error,
+                            "Failed to drop courtesy connection after hitting budget"
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
