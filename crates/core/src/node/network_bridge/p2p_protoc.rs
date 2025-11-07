@@ -14,7 +14,8 @@ use std::{
     sync::Arc,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::timeout;
 use tracing::Instrument;
 
@@ -1611,6 +1612,46 @@ impl P2pConnManager {
                 // Get the remote address from the connection
                 let remote_addr = peer_conn.conn.remote_addr();
                 let tx = *peer_conn.msg.id();
+                if let Some(sender_peer) = extract_sender_from_message(&peer_conn.msg) {
+                    if sender_peer.peer.addr == remote_addr
+                        || sender_peer.peer.addr.ip().is_unspecified()
+                    {
+                        let mut new_peer_id = sender_peer.peer.clone();
+                        if new_peer_id.addr.ip().is_unspecified() {
+                            new_peer_id.addr = remote_addr;
+                            if let Some(sender_mut) =
+                                extract_sender_from_message_mut(&mut peer_conn.msg)
+                            {
+                                if sender_mut.peer.addr.ip().is_unspecified() {
+                                    sender_mut.peer.addr = remote_addr;
+                                }
+                            }
+                        }
+                        if let Some(existing_key) = self
+                            .connections
+                            .keys()
+                            .find(|peer| {
+                                peer.addr == remote_addr && peer.pub_key != new_peer_id.pub_key
+                            })
+                            .cloned()
+                        {
+                            if let Some(channel) = self.connections.remove(&existing_key) {
+                                tracing::info!(
+                                    remote = %remote_addr,
+                                    old_peer = %existing_key,
+                                    new_peer = %new_peer_id,
+                                    "Updating provisional peer identity after inbound message"
+                                );
+                                self.bridge
+                                    .op_manager
+                                    .ring
+                                    .update_connection_identity(&existing_key, new_peer_id.clone());
+                                self.connections.insert(new_peer_id, channel);
+                            }
+                        }
+                    }
+                }
+
                 if let Some(sender_peer) = extract_sender_from_message(&peer_conn.msg) {
                     if sender_peer.peer.addr == remote_addr
                         || sender_peer.peer.addr.ip().is_unspecified()
