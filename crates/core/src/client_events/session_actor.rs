@@ -289,7 +289,6 @@ impl SessionActor {
                 .or_insert_with(|| PendingResult::new(result.clone()));
             entry.result = result.clone();
             entry.touch();
-
             if let Some(waiting_clients) = self.client_transactions.remove(&tx) {
                 for client_id in waiting_clients {
                     if entry.delivered_clients.insert(client_id) {
