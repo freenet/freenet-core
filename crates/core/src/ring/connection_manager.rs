@@ -140,8 +140,22 @@ impl ConnectionManager {
         }
         links.retain(|entry| entry.peer != *peer);
         links.push_back(CourtesyLink { peer: peer.clone() });
+        tracing::info!(
+            %peer,
+            len = links.len(),
+            max = self.max_courtesy_links,
+            "register_courtesy_connection: tracked courtesy link"
+        );
         if links.len() > self.max_courtesy_links {
-            links.pop_front().map(|entry| entry.peer)
+            let evicted = links.pop_front().map(|entry| entry.peer);
+            if let Some(ref victim) = evicted {
+                tracing::info!(
+                    %victim,
+                    %peer,
+                    "register_courtesy_connection: evicting oldest courtesy link to stay under budget"
+                );
+            }
+            evicted
         } else {
             None
         }
@@ -155,7 +169,15 @@ impl ConnectionManager {
         if links.is_empty() {
             return;
         }
+        let before = links.len();
         links.retain(|entry| entry.peer != *peer);
+        if links.len() != before {
+            tracing::debug!(
+                %peer,
+                remaining = links.len(),
+                "unregister_courtesy_connection: removed courtesy tracking entry"
+            );
+        }
     }
 
     /// Whether a node should accept a new node connection or not based
