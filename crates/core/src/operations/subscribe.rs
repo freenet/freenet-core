@@ -62,17 +62,16 @@ async fn fetch_contract_if_missing(
     let get_op = get::start_op(key, true, false);
     get::request_get(op_manager, get_op, HashSet::new()).await?;
 
-    if wait_for_local_contract(op_manager, key).await? && has_contract_with_code(op_manager, key).await? {
+    if wait_for_local_contract(op_manager, key).await?
+        && has_contract_with_code(op_manager, key).await?
+    {
         Ok(())
     } else {
         Err(RingError::NoCachingPeers(key).into())
     }
 }
 
-async fn has_contract_with_code(
-    op_manager: &OpManager,
-    key: ContractKey,
-) -> Result<bool, OpError> {
+async fn has_contract_with_code(op_manager: &OpManager, key: ContractKey) -> Result<bool, OpError> {
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::GetQuery {
             key,
