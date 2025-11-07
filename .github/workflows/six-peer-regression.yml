@@ -35,7 +35,7 @@ jobs:
           override: true
 
       - name: Run six-peer regression
-        working-directory: river-src/main
+        working-directory: river-src
         env:
           FREENET_CORE_PATH: ${{ github.workspace }}
           RUST_LOG: info
