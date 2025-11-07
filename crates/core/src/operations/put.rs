@@ -885,6 +885,14 @@ async fn try_to_broadcast(
         _ => false,
     };
 
+    let preserved_upstream = match &state {
+        Some(PutState::AwaitingResponse {
+            upstream: Some(existing),
+            ..
+        }) => Some(existing.clone()),
+        _ => None,
+    };
+
     match state {
         // Handle initiating node that's also the target (single node or targeting self)
         Some(PutState::AwaitingResponse {
@@ -923,9 +931,12 @@ async fn try_to_broadcast(
                     key
                 );
                 // means the whole tx finished so can return early
+                let upstream_for_completion = preserved_upstream
+                    .clone()
+                    .or_else(|| Some(upstream.clone()));
                 new_state = Some(PutState::AwaitingResponse {
                     key,
-                    upstream: Some(upstream),
+                    upstream: upstream_for_completion,
                     contract: contract.clone(), // No longer optional
                     state: new_value.clone(),
                     subscribe,
