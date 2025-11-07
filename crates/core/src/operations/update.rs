@@ -4,7 +4,7 @@ use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 pub(crate) use self::messages::UpdateMsg;
-use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
 use crate::node::IsOperationCompleted;
@@ -13,6 +13,7 @@ use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
 };
+use std::collections::HashSet;
 
 pub(crate) struct UpdateOp {
     pub id: Transaction,
@@ -248,8 +249,13 @@ impl Operation for UpdateOp {
                                 return_msg = None;
                             } else {
                                 // Get broadcast targets for propagating UPDATE to subscribers
-                                let broadcast_to = op_manager
+                                let mut broadcast_to = op_manager
                                     .get_broadcast_targets_update(key, &request_sender.peer);
+
+                                if broadcast_to.is_empty() {
+                                    broadcast_to = op_manager
+                                        .compute_update_fallback_targets(key, &request_sender.peer);
+                                }
 
                                 if broadcast_to.is_empty() {
                                     tracing::debug!(
@@ -292,10 +298,21 @@ impl Operation for UpdateOp {
                             }
                         } else {
                             // Contract not found locally - forward to another peer
-                            let next_target = op_manager.ring.closest_potentially_caching(
-                                key,
-                                [&self_location.peer, &request_sender.peer].as_slice(),
-                            );
+                            let skip_peers = [&self_location.peer, &request_sender.peer];
+                            let next_target = op_manager
+                                .ring
+                                .closest_potentially_caching(key, skip_peers.as_slice())
+                                .or_else(|| {
+                                    op_manager
+                                        .ring
+                                        .k_closest_potentially_caching(
+                                            key,
+                                            skip_peers.as_slice(),
+                                            5,
+                                        )
+                                        .into_iter()
+                                        .next()
+                                });
 
                             if let Some(forward_target) = next_target {
                                 tracing::debug!(
@@ -316,10 +333,33 @@ impl Operation for UpdateOp {
                                 });
                                 new_state = None;
                             } else {
+                                let skip_list = [&self_location.peer, &request_sender.peer];
+                                let subscribers = op_manager
+                                    .ring
+                                    .subscribers_of(key)
+                                    .map(|subs| {
+                                        subs.value()
+                                            .iter()
+                                            .map(|loc| format!("{:.8}", loc.peer))
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                let candidates = op_manager
+                                    .ring
+                                    .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
+                                    .into_iter()
+                                    .map(|loc| format!("{:.8}", loc.peer))
+                                    .collect::<Vec<_>>();
+                                let connection_count =
+                                    op_manager.ring.connection_manager.num_connections();
                                 // No peers available and we don't have the contract - error
                                 tracing::error!(
                                     tx = %id,
                                     %key,
+                                    subscribers = ?subscribers,
+                                    candidates = ?candidates,
+                                    connection_count,
+                                    request_sender = %request_sender.peer,
                                     "Cannot handle UPDATE: contract not found locally and no peers to forward to"
                                 );
                                 return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
@@ -386,10 +426,14 @@ impl Operation for UpdateOp {
                             return_msg = None;
                         } else {
                             // Get broadcast targets
-                            let broadcast_to =
+                            let mut broadcast_to =
                                 op_manager.get_broadcast_targets_update(key, &sender.peer);
 
-                            // If no peers to broadcast to, nothing else to do
+                            if broadcast_to.is_empty() {
+                                broadcast_to =
+                                    op_manager.compute_update_fallback_targets(key, &sender.peer);
+                            }
+
                             if broadcast_to.is_empty() {
                                 tracing::debug!(
                                     tx = %id,
@@ -447,13 +491,100 @@ impl Operation for UpdateOp {
                             });
                             new_state = None;
                         } else {
-                            // No more peers to try - error
-                            tracing::error!(
+                            tracing::warn!(
                                 tx = %id,
                                 %key,
-                                "Cannot handle UPDATE SeekNode: contract not found and no peers to forward to"
+                                "No forwarding targets for UPDATE SeekNode - attempting local fetch"
                             );
-                            return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
+
+                            let mut fetch_skip = HashSet::new();
+                            fetch_skip.insert(sender.peer.clone());
+
+                            let get_op = get::start_op(*key, true, false);
+                            if let Err(fetch_err) =
+                                get::request_get(op_manager, get_op, fetch_skip).await
+                            {
+                                tracing::warn!(
+                                    tx = %id,
+                                    %key,
+                                    error = %fetch_err,
+                                    "Failed to fetch contract while handling UPDATE SeekNode"
+                                );
+                                return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
+                            }
+
+                            if super::has_contract(op_manager, *key).await? {
+                                tracing::info!(
+                                    tx = %id,
+                                    %key,
+                                    "Successfully fetched contract locally, applying UPDATE"
+                                );
+                                let UpdateExecution {
+                                    value: updated_value,
+                                    summary: _summary,
+                                    changed,
+                                } = update_contract(
+                                    op_manager,
+                                    *key,
+                                    value.clone(),
+                                    related_contracts.clone(),
+                                )
+                                .await?;
+
+                                if !changed {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        %key,
+                                        "Fetched contract apply produced no change during SeekNode fallback"
+                                    );
+                                    new_state = None;
+                                    return_msg = None;
+                                } else {
+                                    let mut broadcast_to =
+                                        op_manager.get_broadcast_targets_update(key, &sender.peer);
+
+                                    if broadcast_to.is_empty() {
+                                        broadcast_to = op_manager
+                                            .compute_update_fallback_targets(key, &sender.peer);
+                                    }
+
+                                    if broadcast_to.is_empty() {
+                                        tracing::debug!(
+                                            tx = %id,
+                                            %key,
+                                            "No broadcast targets after SeekNode fallback apply; finishing locally"
+                                        );
+                                        new_state = None;
+                                        return_msg = None;
+                                    } else {
+                                        match try_to_broadcast(
+                                            *id,
+                                            true,
+                                            op_manager,
+                                            self.state,
+                                            (broadcast_to, sender.clone()),
+                                            *key,
+                                            updated_value.clone(),
+                                            false,
+                                        )
+                                        .await
+                                        {
+                                            Ok((state, msg)) => {
+                                                new_state = state;
+                                                return_msg = msg;
+                                            }
+                                            Err(err) => return Err(err),
+                                        }
+                                    }
+                                }
+                            } else {
+                                tracing::error!(
+                                    tx = %id,
+                                    %key,
+                                    "Contract still unavailable after fetch attempt during UPDATE SeekNode"
+                                );
+                                return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
+                            }
                         }
                     }
                 }
@@ -487,8 +618,13 @@ impl Operation for UpdateOp {
                         new_state = None;
                         return_msg = None;
                     } else {
-                        let broadcast_to =
+                        let mut broadcast_to =
                             op_manager.get_broadcast_targets_update(key, &sender.peer);
+
+                        if broadcast_to.is_empty() {
+                            broadcast_to =
+                                op_manager.compute_update_fallback_targets(key, &sender.peer);
+                        }
 
                         tracing::debug!(
                             "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
@@ -649,9 +785,11 @@ impl OpManager {
             .ring
             .subscribers_of(key)
             .map(|subs| {
+                let self_peer = self.ring.connection_manager.get_peer_key();
                 subs.value()
                     .iter()
                     .filter(|pk| &pk.peer != sender)
+                    .filter(|pk| self_peer.as_ref().map(|me| &pk.peer != me).unwrap_or(true))
                     .cloned()
                     .collect::<Vec<_>>()
             })
@@ -671,14 +809,59 @@ impl OpManager {
                 subscribers.len()
             );
         } else {
+            let own_peer = self.ring.connection_manager.get_peer_key();
+            let skip_slice = std::slice::from_ref(sender);
+            let fallback_candidates = self
+                .ring
+                .k_closest_potentially_caching(key, skip_slice, 5)
+                .into_iter()
+                .map(|candidate| format!("{:.8}", candidate.peer))
+                .collect::<Vec<_>>();
+
             tracing::warn!(
-                "UPDATE_PROPAGATION: contract={:.8} from={} NO_TARGETS - update will not propagate",
+                "UPDATE_PROPAGATION: contract={:.8} from={} NO_TARGETS - update will not propagate (self={:?}, fallback_candidates={:?})",
                 key,
-                sender
+                sender,
+                own_peer.map(|p| format!("{:.8}", p)),
+                fallback_candidates
             );
         }
 
         subscribers
+    }
+
+    fn compute_update_fallback_targets(
+        &self,
+        key: &ContractKey,
+        sender: &PeerId,
+    ) -> Vec<PeerKeyLocation> {
+        let mut skip: HashSet<PeerId> = HashSet::new();
+        skip.insert(sender.clone());
+        if let Some(self_peer) = self.ring.connection_manager.get_peer_key() {
+            skip.insert(self_peer);
+        }
+
+        let candidates = self
+            .ring
+            .k_closest_potentially_caching(key, &skip, 3)
+            .into_iter()
+            .filter(|candidate| &candidate.peer != sender)
+            .collect::<Vec<_>>();
+
+        if !candidates.is_empty() {
+            tracing::info!(
+                "UPDATE_PROPAGATION: contract={:.8} from={} using fallback targets={}",
+                key,
+                sender,
+                candidates
+                    .iter()
+                    .map(|c| format!("{:.8}", c.peer))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+
+        candidates
     }
 }
 
