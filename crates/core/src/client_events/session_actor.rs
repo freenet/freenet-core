@@ -48,17 +48,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-/// Time-to-live for cached pending results. Entries older than this duration are
-/// eligible for removal during pruning (triggered on message processing).
-///
-/// Note: Due to lazy evaluation, stale entries may persist beyond TTL during idle periods.
 const PENDING_RESULT_TTL: Duration = Duration::from_secs(60);
-
-/// Maximum number of cached pending results. When this limit is reached, LRU eviction
-/// removes the oldest entry to make room for new ones.
-///
-/// Note: Cache may temporarily exceed this limit between messages since enforcement
-/// is lazy (triggered only during message processing).
 const MAX_PENDING_RESULTS: usize = 2048;
 
 /// Simple session actor for client connection refactor
@@ -399,23 +389,6 @@ impl SessionActor {
         self.client_request_ids.retain(|(_, c), _| *c != client_id);
     }
 
-    /// Prune stale pending results based on TTL and enforce capacity limits.
-    ///
-    /// This is the **only** cache cleanup mechanism - there is no background task.
-    /// Called on every message in `process_message()`.
-    ///
-    /// # Cleanup Strategy (Lazy Evaluation)
-    ///
-    /// 1. **Skip if empty**: Early return if no cached results
-    /// 2. **Identify active transactions**: Collect all transactions that still have waiting clients
-    /// 3. **TTL-based removal**: Remove inactive entries older than `PENDING_RESULT_TTL`
-    /// 4. **Capacity enforcement**: If still at/over `MAX_PENDING_RESULTS`, trigger LRU eviction
-    ///
-    /// # Lazy Evaluation Implications
-    ///
-    /// - During idle periods (no messages), stale entries persist in memory
-    /// - Cache cleanup happens only when actor receives messages
-    /// - Stale entries may remain beyond TTL until next message arrives
     fn prune_pending_results(&mut self) {
         if self.pending_results.is_empty() {
             return;
@@ -459,18 +432,6 @@ impl SessionActor {
         }
     }
 
-    /// Enforce capacity limits using LRU (Least Recently Used) eviction.
-    ///
-    /// Removes the entry with the oldest `last_accessed` timestamp when the cache
-    /// reaches or exceeds `MAX_PENDING_RESULTS`.
-    ///
-    /// # Lazy Evaluation Note
-    ///
-    /// This is only called:
-    /// 1. At the end of `prune_pending_results()` if still at capacity
-    /// 2. Before inserting new entries when already at capacity
-    ///
-    /// Between messages, cache size may temporarily exceed the limit.
     fn enforce_pending_capacity(&mut self) {
         if self.pending_results.len() < MAX_PENDING_RESULTS {
             return;
