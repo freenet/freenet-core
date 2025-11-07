@@ -630,14 +630,14 @@ impl P2pConnManager {
                                 )
                                 .await?;
                             }
-                            NodeEvent::ExpectPeerConnection { peer } => {
-                                tracing::debug!(%peer, "ExpectPeerConnection event received; registering inbound expectation via handshake driver");
+                            NodeEvent::ExpectPeerConnection { peer, courtesy } => {
+                                tracing::debug!(%peer, courtesy, "ExpectPeerConnection event received; registering inbound expectation via handshake driver");
                                 state.outbound_handler.expect_incoming(peer.addr);
                                 if let Err(error) = handshake_cmd_sender
                                     .send(HandshakeCommand::ExpectInbound {
                                         peer: peer.clone(),
                                         transaction: None,
-                                        courtesy: false,
+                                        courtesy,
                                     })
                                     .await
                                 {
@@ -1377,8 +1377,15 @@ impl P2pConnManager {
                     "Inbound connection established"
                 );
 
-                self.handle_successful_connection(peer_id, connection, state, select_stream, None)
-                    .await?;
+                self.handle_successful_connection(
+                    peer_id,
+                    connection,
+                    state,
+                    select_stream,
+                    None,
+                    courtesy,
+                )
+                .await?;
             }
             HandshakeEvent::OutboundEstablished {
                 transaction,
@@ -1392,8 +1399,15 @@ impl P2pConnManager {
                     transaction = %transaction,
                     "Outbound connection established"
                 );
-                self.handle_successful_connection(peer, connection, state, select_stream, None)
-                    .await?;
+                self.handle_successful_connection(
+                    peer,
+                    connection,
+                    state,
+                    select_stream,
+                    None,
+                    courtesy,
+                )
+                .await?;
             }
             HandshakeEvent::OutboundFailed {
                 transaction,
@@ -1508,6 +1522,7 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         select_stream: &mut priority_select::ProductionPrioritySelectStream,
         remaining_checks: Option<usize>,
+        courtesy: bool,
     ) -> anyhow::Result<()> {
         let pending_txs = state
             .awaiting_connection_txs

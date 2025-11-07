@@ -178,10 +178,16 @@ pub(crate) trait RelayContext {
 }
 
 /// Result of processing a request at a relay.
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedConnection {
+    pub peer: PeerKeyLocation,
+    pub courtesy: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct RelayActions {
     pub accept_response: Option<ConnectResponse>,
-    pub expect_connection_from: Option<PeerKeyLocation>,
+    pub expect_connection_from: Option<ExpectedConnection>,
     pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
     pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
 }
@@ -218,7 +224,10 @@ impl RelayState {
                 acceptor: acceptor.clone(),
                 courtesy,
             });
-            actions.expect_connection_from = Some(self.request.origin.clone());
+            actions.expect_connection_from = Some(ExpectedConnection {
+                peer: self.request.origin.clone(),
+                courtesy,
+            });
         }
 
         if self.forwarded_to.is_none() && self.request.ttl > 0 {
@@ -592,10 +601,11 @@ impl Operation for ConnectOp {
                             .await?;
                     }
 
-                    if let Some(peer) = actions.expect_connection_from {
+                    if let Some(expected) = actions.expect_connection_from {
                         op_manager
                             .notify_node_event(NodeEvent::ExpectPeerConnection {
-                                peer: peer.peer.clone(),
+                                peer: expected.peer.peer.clone(),
+                                courtesy: expected.courtesy,
                             })
                             .await?;
                     }
@@ -654,6 +664,7 @@ impl Operation for ConnectOp {
                                     .notify_node_event(
                                         crate::message::NodeEvent::ExpectPeerConnection {
                                             peer: new_acceptor.peer.peer.clone(),
+                                            courtesy: new_acceptor.courtesy,
                                         },
                                     )
                                     .await?;
@@ -1043,7 +1054,10 @@ mod tests {
         let response = actions.accept_response.expect("expected acceptance");
         assert_eq!(response.acceptor.peer, self_loc.peer);
         assert!(response.courtesy);
-        assert_eq!(actions.expect_connection_from.unwrap().peer, joiner.peer);
+        assert_eq!(
+            actions.expect_connection_from.unwrap().peer.peer,
+            joiner.peer
+        );
         assert!(actions.forward.is_none());
     }
 

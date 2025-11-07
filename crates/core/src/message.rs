@@ -367,6 +367,7 @@ pub(crate) enum NodeEvent {
     /// Register expectation for an inbound connection from the given peer.
     ExpectPeerConnection {
         peer: PeerId,
+        courtesy: bool,
     },
 }
 
@@ -444,8 +445,11 @@ impl Display for NodeEvent {
                     "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
                 )
             }
-            NodeEvent::ExpectPeerConnection { peer } => {
-                write!(f, "ExpectPeerConnection (from {peer})")
+            NodeEvent::ExpectPeerConnection { peer, courtesy } => {
+                write!(
+                    f,
+                    "ExpectPeerConnection (from {peer}, courtesy: {courtesy})"
+                )
             }
         }
     }
