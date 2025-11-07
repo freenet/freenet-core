@@ -935,9 +935,8 @@ where
                 NodeEvent::QueryNodeDiagnostics { .. } => {
                     unimplemented!()
                 }
-                NodeEvent::SendMessage { target, msg } => {
-                    tracing::debug!(tx = %msg.id(), %target, "SendMessage event in testing_impl");
-                    conn_manager.send(&target, *msg).await?;
+                NodeEvent::ExpectPeerConnection { peer } => {
+                    tracing::debug!(%peer, "ExpectPeerConnection ignored in testing impl");
                     continue;
                 }
             },

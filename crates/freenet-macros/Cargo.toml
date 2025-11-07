@@ -13,7 +13,7 @@ proc-macro = true
 syn = { version = "2.0", features = ["full", "extra-traits", "parsing"] }
 quote = "1.0"
 proc-macro2 = "1.0"
-darling = "0.21"  # For easier attribute parsing
+darling = "0.20"  # For easier attribute parsing
 
 [dev-dependencies]
 trybuild = "1.0"  # For testing macro expansions

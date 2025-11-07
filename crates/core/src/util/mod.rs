@@ -68,7 +68,7 @@ pub fn set_cleanup_on_exit(config: Arc<ConfigPaths>) -> Result<(), ctrlc::Error>
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Backoff {
     attempt: usize,
     max_attempts: usize,
@@ -77,7 +77,7 @@ pub struct Backoff {
     strategy: BackoffStrategy,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BackoffStrategy {
     Exponential,
     Logarithmic { interval_reduction_factor: f64 },

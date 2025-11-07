@@ -6,23 +6,18 @@
 use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::{
-    cmp::Reverse,
-    collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, AtomicUsize},
-        Arc,
+        Arc, Weak,
     },
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc::{self, error::TryRecvError};
 use tracing::Instrument;
 
 use dashmap::mapref::one::Ref as DmRef;
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
-use itertools::Itertools;
 use parking_lot::RwLock;
-use rand::{prelude::IndexedRandom, Rng};
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -33,9 +28,9 @@ use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
-    message::Transaction,
-    node::{self, EventLoopNotificationsSender, NodeConfig, PeerId},
-    operations::connect,
+    message::{NetMessage, NetMessageV1, Transaction},
+    node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
+    operations::{connect::ConnectOp, OpEnum},
     router::Router,
 };
 
@@ -68,6 +63,7 @@ pub(crate) struct Ring {
     pub live_tx_tracker: LiveTransactionTracker,
     seeding_manager: seeding::SeedingManager,
     event_register: Box<dyn NetEventRegister>,
+    op_manager: RwLock<Option<Weak<OpManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
     pub(crate) is_gateway: bool,
@@ -103,7 +99,7 @@ impl Ring {
         is_gateway: bool,
         connection_manager: ConnectionManager,
     ) -> anyhow::Result<Arc<Self>> {
-        let (live_tx_tracker, missing_candidate_rx) = LiveTransactionTracker::new();
+        let live_tx_tracker = LiveTransactionTracker::new();
 
         let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
             v
@@ -122,6 +118,7 @@ impl Ring {
             seeding_manager: seeding::SeedingManager::new(),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
+            op_manager: RwLock::new(None),
             is_gateway,
         };
 
@@ -142,11 +139,21 @@ impl Ring {
 
         GlobalExecutor::spawn(
             ring.clone()
-                .connection_maintenance(event_loop_notifier, live_tx_tracker, missing_candidate_rx)
+                .connection_maintenance(event_loop_notifier, live_tx_tracker)
                 .instrument(span),
         );
-
         Ok(ring)
+    }
+
+    pub fn attach_op_manager(&self, op_manager: &Arc<OpManager>) {
+        self.op_manager.write().replace(Arc::downgrade(op_manager));
+    }
+
+    fn upgrade_op_manager(&self) -> Option<Arc<OpManager>> {
+        self.op_manager
+            .read()
+            .as_ref()
+            .and_then(|weak| weak.clone().upgrade())
     }
 
     pub fn is_gateway(&self) -> bool {
@@ -179,22 +186,28 @@ impl Ring {
 
     /// Return if a contract is within appropiate seeding distance.
     pub fn should_seed(&self, key: &ContractKey) -> bool {
-        let own_loc = self
-            .connection_manager
-            .own_location()
-            .location
-            .expect("should be set");
-        self.seeding_manager.should_seed(key, own_loc)
+        match self.connection_manager.own_location().location {
+            Some(own_loc) => self.seeding_manager.should_seed(key, own_loc),
+            None => {
+                tracing::debug!(
+                    "should_seed: own location not yet available; deferring seeding decision"
+                );
+                false
+            }
+        }
     }
 
     /// Add a new subscription for this peer.
     pub fn seed_contract(&self, key: ContractKey) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
-        let own_loc = self
-            .connection_manager
-            .own_location()
-            .location
-            .expect("should be set");
-        self.seeding_manager.seed_contract(key, own_loc)
+        match self.connection_manager.own_location().location {
+            Some(own_loc) => self.seeding_manager.seed_contract(key, own_loc),
+            None => {
+                tracing::debug!(
+                    "seed_contract: own location not yet available; skipping seeding for now"
+                );
+                (None, Vec::new())
+            }
+        }
     }
 
     /// Whether this node already is seeding to this contract or not.
@@ -223,6 +236,15 @@ impl Ring {
             .register_events(Either::Left(NetEventLog::connected(self, peer, loc)))
             .await;
         self.refresh_density_request_cache()
+    }
+
+    pub fn update_connection_identity(&self, old_peer: &PeerId, new_peer: PeerId) {
+        if self
+            .connection_manager
+            .update_peer_identity(old_peer, new_peer)
+        {
+            self.refresh_density_request_cache();
+        }
     }
 
     fn refresh_density_request_cache(&self) {
@@ -270,16 +292,38 @@ impl Ring {
         let router = self.router.read();
         let target_location = Location::from(contract_key);
 
-        // Get all connected peers through the connection manager (never includes self)
-        let connections = self.connection_manager.get_connections_by_location();
-        let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::rng())?;
-            (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
-        });
+        let mut seen = HashSet::new();
+        let mut candidates: Vec<PeerKeyLocation> = Vec::new();
 
-        // Pass peers directly to select_k_best_peers since we never include self
+        let connections = self.connection_manager.get_connections_by_location();
+        for conns in connections.values() {
+            for conn in conns {
+                let peer = conn.location.peer.clone();
+                if skip_list.has_element(peer.clone()) || !seen.insert(peer) {
+                    continue;
+                }
+                candidates.push(conn.location.clone());
+            }
+        }
+
+        if candidates.len() < k {
+            let known_locations = self.connection_manager.get_known_locations();
+            for (peer, location) in known_locations {
+                if skip_list.has_element(peer.clone()) || !seen.insert(peer.clone()) {
+                    continue;
+                }
+                candidates.push(PeerKeyLocation {
+                    peer,
+                    location: Some(location),
+                });
+                if candidates.len() >= k {
+                    break;
+                }
+            }
+        }
+
         router
-            .select_k_best_peers(peers, target_location, k)
+            .select_k_best_peers(candidates.iter(), target_location, k)
             .into_iter()
             .cloned()
             .collect()
@@ -335,47 +379,10 @@ impl Ring {
             .await;
     }
 
-    pub fn closest_to_location(
-        &self,
-        location: Location,
-        skip_list: HashSet<PeerId>,
-    ) -> Option<PeerKeyLocation> {
-        let connections = self.connection_manager.get_connections_by_location();
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let total_peers: usize = connections.values().map(|v| v.len()).sum();
-            tracing::debug!(
-                unique_locations = connections.len(),
-                total_peers = total_peers,
-                skip_list_size = skip_list.len(),
-                target_location = %location,
-                "Looking for closest peer to location"
-            );
-            for (loc, peers) in &connections {
-                tracing::debug!(location = %loc, peer_count = peers.len(), "Location has peers");
-            }
-        }
-        connections
-            .iter()
-            .sorted_by(|(loc_a, _), (loc_b, _)| {
-                loc_a.distance(location).cmp(&loc_b.distance(location))
-            })
-            .find_map(|(_, conns)| {
-                // Try all peers at this location, not just random sampling
-                for conn in conns {
-                    if !skip_list.contains(&conn.location.peer) {
-                        tracing::debug!(selected_peer = %conn.location.peer, "Found closest peer");
-                        return Some(conn.location.clone());
-                    }
-                }
-                None
-            })
-    }
-
     async fn connection_maintenance(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
         live_tx_tracker: LiveTransactionTracker,
-        mut missing_candidates: mpsc::Receiver<PeerId>,
     ) -> anyhow::Result<()> {
         tracing::info!("Initializing connection maintenance task");
         let is_gateway = self.is_gateway;
@@ -397,13 +404,6 @@ impl Ring {
         let mut refresh_density_map = tokio::time::interval(REGENERATE_DENSITY_MAP_INTERVAL);
         refresh_density_map.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut missing = BTreeMap::new();
-
-        #[cfg(not(test))]
-        let retry_peers_missing_candidates_interval = Duration::from_secs(60 * 5) * 2;
-        #[cfg(test)]
-        let retry_peers_missing_candidates_interval = Duration::from_secs(5);
-
         // if the peer is just starting wait a bit before
         // we even attempt acquiring more connections
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -413,6 +413,13 @@ impl Ring {
         let mut pending_conn_adds = BTreeSet::new();
         let mut this_peer = None;
         loop {
+            let op_manager = match self.upgrade_op_manager() {
+                Some(op_manager) => op_manager,
+                None => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let Some(this_peer) = &this_peer else {
                 let Some(peer) = self.connection_manager.get_peer_key() else {
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -421,28 +428,8 @@ impl Ring {
                 this_peer = Some(peer);
                 continue;
             };
-            loop {
-                match missing_candidates.try_recv() {
-                    Ok(missing_candidate) => {
-                        missing.insert(Reverse(Instant::now()), missing_candidate);
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        tracing::debug!("Shutting down connection maintenance");
-                        anyhow::bail!("finished");
-                    }
-                }
-            }
-
-            // eventually peers which failed to return candidates should be retried when enough time has passed
-            let retry_missing_candidates_until =
-                Instant::now() - retry_peers_missing_candidates_interval;
-
-            // remove all missing candidates which have been retried
-            missing.split_off(&Reverse(retry_missing_candidates_until));
-
             // avoid connecting to the same peer multiple times
-            let mut skip_list: HashSet<_> = missing.values().collect();
+            let mut skip_list = HashSet::new();
             skip_list.insert(this_peer);
 
             // if there are no open connections, we need to acquire more
@@ -459,7 +446,13 @@ impl Ring {
                         ideal_location
                     );
                     live_tx = self
-                        .acquire_new(ideal_location, &skip_list, &notifier, &live_tx_tracker)
+                        .acquire_new(
+                            ideal_location,
+                            &skip_list,
+                            &notifier,
+                            &live_tx_tracker,
+                            &op_manager,
+                        )
                         .await
                         .map_err(|error| {
                             tracing::error!(
@@ -589,13 +582,14 @@ impl Ring {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, notifier, live_tx_tracker), fields(peer = %self.connection_manager.pub_key))]
+    #[tracing::instrument(level = "debug", skip(self, notifier, live_tx_tracker, op_manager), fields(peer = %self.connection_manager.pub_key))]
     async fn acquire_new(
         &self,
         ideal_location: Location,
         skip_list: &HashSet<&PeerId>,
         notifier: &EventLoopNotificationsSender,
         live_tx_tracker: &LiveTransactionTracker,
+        op_manager: &Arc<OpManager>,
     ) -> anyhow::Result<Option<Transaction>> {
         let current_connections = self.connection_manager.get_open_connections();
         let is_gateway = self.is_gateway;
@@ -606,29 +600,6 @@ impl Ring {
             "acquire_new: attempting to find peer to query"
         );
 
-        // CRITICAL: Use separate skip lists for routing vs. connection requests
-        //
-        // The routing skip list determines who we can ASK for peer recommendations.
-        // The connection skip list determines who we DON'T want to connect to.
-        //
-        // For peers with few connections (e.g., only gateway), we MUST be able to
-        // route through existing connections to discover new peers. If we filter out
-        // existing connections from routing, peers get stuck unable to find anyone to ask.
-        //
-        // Example scenario:
-        // - Peer has 1 connection (gateway)
-        // - Topology manager suggests random location for diversity
-        // - Old code: adds gateway to routing skip list → routing() returns None → no request sent
-        // - New code: routes through gateway → gateway helps discover other peers → mesh forms
-        //
-        // The skip list for routing should only exclude:
-        // - This peer itself
-        // - Peers we've already tried and failed with (missing candidates)
-        //
-        // The skip list for the FindOptimalPeer request should also exclude:
-        // - Already connected peers (to avoid reconnecting)
-
-        // Find a peer to query (allow routing through existing connections)
         let query_target = {
             let router = self.router.read();
             let num_connections = self.connection_manager.num_connections();
@@ -638,62 +609,51 @@ impl Ring {
                 skip_list_size = skip_list.len(),
                 "Looking for peer to route through"
             );
-            if let Some(t) = self.connection_manager.routing(
-                ideal_location,
-                None,
-                skip_list, // Use just the input skip list (missing candidates + self)
-                &router,
-            ) {
-                tracing::debug!(query_target = %t, "Found routing target");
-                t
+            if let Some(target) =
+                self.connection_manager
+                    .routing(ideal_location, None, skip_list, &router)
+            {
+                tracing::debug!(query_target = %target, "Found routing target");
+                target
             } else {
                 tracing::warn!(
                     "acquire_new: routing() returned None - cannot find peer to query (connections: {}, is_gateway: {})",
                     current_connections,
                     is_gateway
                 );
-
                 return Ok(None);
             }
         };
-
-        // Create skip list for the FindOptimalPeer request (includes already connected peers)
-        let connection_skip_list: HashSet<PeerId> = skip_list
-            .iter()
-            .copied()
-            .cloned()
-            .chain(self.connection_manager.connected_peers())
-            .collect();
 
         let joiner = self.connection_manager.own_location();
         tracing::info!(
             this_peer = %joiner,
             query_target_peer = %query_target.peer,
             %ideal_location,
-            skip_connections_count = connection_skip_list.len(),
-            "Sending FindOptimalPeer request via connection_maintenance"
+            "Sending connect request via connection_maintenance"
         );
-        let missing_connections = self.connection_manager.max_connections - self.open_connections();
-        let id = Transaction::new::<connect::ConnectMsg>();
-        live_tx_tracker.add_transaction(query_target.peer.clone(), id);
-        let msg = connect::ConnectMsg::Request {
-            id,
-            target: query_target.clone(),
-            msg: connect::ConnectRequest::FindOptimalPeer {
-                query_target,
-                ideal_location,
-                joiner,
-                max_hops_to_live: missing_connections,
-                skip_connections: connection_skip_list,
-                skip_forwards: HashSet::new(),
-            },
-        };
+        let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
+        let target_connections = self.connection_manager.min_connections;
+
+        let (tx, op, msg) = ConnectOp::initiate_join_request(
+            joiner,
+            query_target.clone(),
+            ideal_location,
+            ttl,
+            target_connections,
+        );
+
+        live_tx_tracker.add_transaction(query_target.peer.clone(), tx);
+        op_manager
+            .push(tx, OpEnum::Connect(Box::new(op)))
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
         notifier
             .notifications_sender
-            .send(Either::Left(msg.into()))
+            .send(Either::Left(NetMessage::V1(NetMessageV1::Connect(msg))))
             .await?;
-        tracing::info!(tx = %id, "FindOptimalPeer request sent");
-        Ok(Some(id))
+        tracing::info!(tx = %tx, "Connect request sent");
+        Ok(Some(tx))
     }
 }
 
@@ -760,6 +720,4 @@ pub(crate) enum RingError {
     EmptyRing,
     #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
     NoCachingPeers(ContractKey),
-    #[error("No location assigned to this peer")]
-    NoLocation,
 }

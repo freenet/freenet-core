@@ -174,6 +174,7 @@ impl Operation for PutOp {
                     // Get the contract key and own location
                     let key = contract.key();
                     let own_location = op_manager.ring.connection_manager.own_location();
+                    let prev_sender = sender.clone();
 
                     tracing::info!(
                         "Requesting put for contract {} from {} to {}",
@@ -209,7 +210,7 @@ impl Operation for PutOp {
                         tracing::debug!(
                             tx = %id,
                             %key,
-                            peer = %sender.peer,
+                            peer = %prev_sender.peer,
                             is_already_seeding,
                             "Processing local PUT in initiating node"
                         );
@@ -242,7 +243,7 @@ impl Operation for PutOp {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                peer = %sender.peer,
+                                peer = %prev_sender.peer,
                                 "Marked contract as seeding locally"
                             );
                         }
@@ -250,7 +251,7 @@ impl Operation for PutOp {
                         tracing::debug!(
                             tx = %id,
                             %key,
-                            peer = %sender.peer,
+                            peer = %prev_sender.peer,
                             was_already_seeding = is_already_seeding,
                             "Successfully processed contract locally with merge"
                         );
@@ -268,9 +269,18 @@ impl Operation for PutOp {
 
                     // Determine next forwarding target - find peers closer to the contract location
                     // Don't reuse the target from RequestPut as that's US (the current processing peer)
+                    let skip = [&prev_sender.peer];
                     let next_target = op_manager
                         .ring
-                        .closest_potentially_caching(&key, [&sender.peer].as_slice());
+                        .closest_potentially_caching(&key, skip.as_slice());
+
+                    tracing::info!(
+                        tx = %id,
+                        %key,
+                        next_target = ?next_target,
+                        skip = ?skip,
+                        "PUT seek evaluating next forwarding target"
+                    );
 
                     if let Some(forward_target) = next_target {
                         // Create a SeekNode message to forward to the next hop
@@ -288,7 +298,7 @@ impl Operation for PutOp {
                         // Transition to AwaitingResponse state to handle future SuccessfulPut messages
                         new_state = Some(PutState::AwaitingResponse {
                             key,
-                            upstream: Some(sender.clone()),
+                            upstream: Some(prev_sender.clone()),
                             contract: contract.clone(),
                             state: modified_value,
                             subscribe,
@@ -296,16 +306,17 @@ impl Operation for PutOp {
                         });
                     } else {
                         // No other peers to forward to - we're the final destination
-                        tracing::debug!(
+                        tracing::warn!(
                             tx = %id,
                             %key,
-                            "No peers to forward to - handling PUT completion locally, sending SuccessfulPut back to sender"
+                            skip = ?skip,
+                            "No peers to forward to after local processing - completing PUT locally"
                         );
 
                         // Send SuccessfulPut back to the sender (upstream node)
                         return_msg = Some(PutMsg::SuccessfulPut {
                             id: *id,
-                            target: sender.clone(),
+                            target: prev_sender.clone(),
                             key,
                             sender: own_location.clone(),
                             origin: origin.clone(),
@@ -819,6 +830,20 @@ impl Operation for PutOp {
                     origin,
                     ..
                 } => {
+                    let max_htl = op_manager.ring.max_hops_to_live.max(1);
+                    let htl_value = (*htl).min(max_htl);
+                    if htl_value == 0 {
+                        tracing::warn!(
+                            tx = %id,
+                            %contract,
+                            sender = %sender.peer,
+                            "Discarding PutForward with zero HTL"
+                        );
+                        return Ok(OperationResult {
+                            return_msg: None,
+                            state: None,
+                        });
+                    }
                     // Get contract key and own location
                     let key = contract.key();
                     let peer_loc = op_manager.ring.connection_manager.own_location();
@@ -850,7 +875,7 @@ impl Operation for PutOp {
                     };
 
                     // Determine if this is the last hop and handle forwarding
-                    let last_hop = if let Some(new_htl) = htl.checked_sub(1) {
+                    let last_hop = if let Some(new_htl) = htl_value.checked_sub(1) {
                         // Create updated skip list
                         let mut new_skip_list = skip_list.clone();
                         new_skip_list.insert(sender.peer.clone());
@@ -1429,18 +1454,29 @@ where
 {
     let key = contract.key();
     let contract_loc = Location::from(&key);
+    let max_htl = op_manager.ring.max_hops_to_live.max(1);
+    let capped_htl = htl.min(max_htl);
+    if capped_htl == 0 {
+        tracing::warn!(
+            tx = %id,
+            %key,
+            skip = ?skip_list,
+            "Discarding PutForward with zero HTL after sanitization"
+        );
+        return true;
+    }
     let target_peer = op_manager
         .ring
         .closest_potentially_caching(&key, &skip_list);
     let own_pkloc = op_manager.ring.connection_manager.own_location();
     let own_loc = own_pkloc.location.expect("infallible");
 
-    tracing::debug!(
+    tracing::info!(
         tx = %id,
         %key,
         contract_location = %contract_loc.0,
         own_location = %own_loc.0,
-        skip_list_size = skip_list.len(),
+        skip_list = ?skip_list,
         "Evaluating PUT forwarding decision"
     );
 
@@ -1449,19 +1485,41 @@ where
         let other_distance = contract_loc.distance(other_loc);
         let self_distance = contract_loc.distance(own_loc);
 
-        tracing::debug!(
+        tracing::info!(
             tx = %id,
             %key,
             target_peer = %peer.peer,
             target_location = %other_loc.0,
             target_distance = ?other_distance,
             self_distance = ?self_distance,
+            skip_list = ?skip_list,
             "Found potential forward target"
         );
 
+        if peer.peer == own_pkloc.peer {
+            tracing::info!(
+                tx = %id,
+                %key,
+                skip_list = ?skip_list,
+                "Not forwarding - candidate peer resolves to self"
+            );
+            return true;
+        }
+
+        if htl == 0 {
+            tracing::info!(
+                tx = %id,
+                %key,
+                target_peer = %peer.peer,
+                "HTL exhausted - storing locally"
+            );
+            return true;
+        }
+
+        let mut updated_skip_list = skip_list.clone();
+        updated_skip_list.insert(own_pkloc.peer.clone());
+
         if other_distance < self_distance {
-            // forward the contract towards this node since it is indeed closer to the contract location
-            // and forget about it, no need to keep track of this op or wait for response
             tracing::info!(
                 tx = %id,
                 %key,
@@ -1470,37 +1528,45 @@ where
                 contract_location = %contract_loc.0,
                 from_location = %own_loc.0,
                 to_location = %other_loc.0,
+                skip_list = ?updated_skip_list,
                 "Forwarding PUT to closer peer"
             );
-
-            let _ = conn_manager
-                .send(
-                    &peer.peer,
-                    (PutMsg::PutForward {
-                        id,
-                        sender: own_pkloc,
-                        target: peer.clone(),
-                        origin,
-                        contract: contract.clone(),
-                        new_value: new_value.clone(),
-                        htl,
-                        skip_list,
-                    })
-                    .into(),
-                )
-                .await;
-            return false;
         } else {
-            tracing::debug!(
+            tracing::info!(
                 tx = %id,
                 %key,
-                "Not forwarding - this peer is closest"
+                from_peer = %own_pkloc.peer,
+                to_peer = %peer.peer,
+                contract_location = %contract_loc.0,
+                from_location = %own_loc.0,
+                to_location = %other_loc.0,
+                skip_list = ?updated_skip_list,
+                "Forwarding PUT to peer despite non-improving distance (avoiding local minimum)"
             );
         }
+
+        let _ = conn_manager
+            .send(
+                &peer.peer,
+                (PutMsg::PutForward {
+                    id,
+                    sender: own_pkloc,
+                    target: peer.clone(),
+                    origin,
+                    contract: contract.clone(),
+                    new_value: new_value.clone(),
+                    htl: capped_htl,
+                    skip_list: updated_skip_list,
+                })
+                .into(),
+            )
+            .await;
+        return false;
     } else {
-        tracing::debug!(
+        tracing::info!(
             tx = %id,
             %key,
+            skip_list = ?skip_list,
             "No peers available for forwarding - caching locally"
         );
     }

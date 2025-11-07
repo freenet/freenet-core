@@ -62,10 +62,11 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             use anyhow::anyhow;
 
             // 1. Setup TestLogger
-            let _logger = TestLogger::new()
-                .with_json()
-                .with_level(#log_level)
-                .init();
+            let mut __test_logger = TestLogger::new().with_json().with_level(#log_level);
+            if std::env::var_os("FREENET_TEST_LOG_DISABLE_JSON").is_some() {
+                __test_logger = __test_logger.with_pretty();
+            }
+            let _logger = __test_logger.init();
 
             tracing::info!("Starting test: {}", stringify!(#test_fn_name));
 
@@ -124,13 +125,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    let ws_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    let network_port = network_socket.local_addr()?.port();
-                    let ws_port = ws_socket.local_addr()?.port();
-
-                    std::mem::drop(network_socket);
-                    std::mem::drop(ws_socket);
+                    let network_port = freenet::test_utils::reserve_local_port()?;
+                    let ws_port = freenet::test_utils::reserve_local_port()?;
 
                     let location: f64 = rand::Rng::random(&mut rand::rng());
 
@@ -239,13 +235,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    let network_port = network_socket.local_addr()?.port();
-                    std::mem::drop(network_socket);
-
-                    let ws_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
-                    let ws_port = ws_socket.local_addr()?.port();
-                    std::mem::drop(ws_socket);
+                    let network_port = freenet::test_utils::reserve_local_port()?;
+                    let ws_port = freenet::test_utils::reserve_local_port()?;
 
                     let location: f64 = rand::Rng::random(&mut rand::rng());
 

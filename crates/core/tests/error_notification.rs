@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::{select, time::timeout};
 use tokio_tungstenite::connect_async;
-use tracing::error;
+use tracing::{error, info};
 
 static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
     use rand::SeedableRng;
@@ -59,7 +59,7 @@ async fn test_get_error_notification(ctx: &mut TestContext) -> TestResult {
     let (ws_stream, _) = connect_async(&url).await?;
     let mut client = WebApi::start(ws_stream);
 
-    println!("Testing GET operation for non-existent contract (should fail with error)");
+    info!("Testing GET operation for non-existent contract (should fail with error)");
 
     // Create a contract to get its key, but we won't PUT it - so GET will fail
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -76,12 +76,12 @@ async fn test_get_error_notification(ctx: &mut TestContext) -> TestResult {
     match get_result {
         Ok(Ok(response)) => {
             // Any response is good - means we're not hanging
-            println!("✓ Received response (not timing out): {:?}", response);
-            println!("✓ Client properly notified instead of hanging");
+            info!("✓ Received response (not timing out): {:?}", response);
+            info!("✓ Client properly notified instead of hanging");
         }
         Ok(Err(e)) => {
             // WebSocket error could indicate error was delivered
-            println!("✓ Received error notification: {}", e);
+            info!("✓ Received error notification: {}", e);
         }
         Err(_) => {
             panic!(
@@ -92,7 +92,7 @@ async fn test_get_error_notification(ctx: &mut TestContext) -> TestResult {
         }
     }
 
-    println!("Error notification test passed - client did not hang on operation failure");
+    info!("Error notification test passed - client did not hang on operation failure");
 
     // Properly close the client
     client
@@ -126,7 +126,7 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
     let (ws_stream, _) = connect_async(&url).await?;
     let mut client = WebApi::start(ws_stream);
 
-    println!("Testing PUT operation with invalid contract (should fail with error)");
+    info!("Testing PUT operation with invalid contract (should fail with error)");
 
     // Try to PUT with malformed contract data - this should fail
     // We'll use make_put with invalid state to trigger an error
@@ -151,12 +151,12 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
     match put_result {
         Ok(Ok(response)) => {
             // Any response is good - means we're not hanging
-            println!("✓ Received response (not timing out): {:?}", response);
-            println!("✓ Client properly notified instead of hanging");
+            info!("✓ Received response (not timing out): {:?}", response);
+            info!("✓ Client properly notified instead of hanging");
         }
         Ok(Err(e)) => {
             // WebSocket error could indicate error was delivered
-            println!("✓ Received error notification: {}", e);
+            info!("✓ Received error notification: {}", e);
         }
         Err(_) => {
             panic!(
@@ -167,7 +167,7 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
         }
     }
 
-    println!("PUT error notification test passed - client did not hang on operation failure");
+    info!("PUT error notification test passed - client did not hang on operation failure");
 
     // Properly close the client
     client
@@ -201,7 +201,7 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
     let (ws_stream, _) = connect_async(&url).await?;
     let mut client = WebApi::start(ws_stream);
 
-    println!("Testing UPDATE operation for non-existent contract (should fail with error)");
+    info!("Testing UPDATE operation for non-existent contract (should fail with error)");
 
     // Create a contract key for a contract that doesn't exist
     const TEST_CONTRACT: &str = "test-contract-integration";
@@ -223,12 +223,12 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
     match update_result {
         Ok(Ok(response)) => {
             // Any response is good - means we're not hanging
-            println!("✓ Received response (not timing out): {:?}", response);
-            println!("✓ Client properly notified instead of hanging");
+            info!("✓ Received response (not timing out): {:?}", response);
+            info!("✓ Client properly notified instead of hanging");
         }
         Ok(Err(e)) => {
             // WebSocket error could indicate error was delivered
-            println!("✓ Received error notification: {}", e);
+            info!("✓ Received error notification: {}", e);
         }
         Err(_) => {
             panic!(
@@ -239,7 +239,7 @@ async fn test_update_error_notification(ctx: &mut TestContext) -> TestResult {
         }
     }
 
-    println!("UPDATE error notification test passed - client did not hang on operation failure");
+    info!("UPDATE error notification test passed - client did not hang on operation failure");
 
     // Properly close the client
     client
@@ -390,7 +390,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         tokio::select! {
             result = node.run() => result,
             _ = peer_shutdown_rx.recv() => {
-                println!("Peer received shutdown signal - simulating connection drop");
+                info!("Peer received shutdown signal - simulating connection drop");
                 // We can't construct Infallible, so return an error to exit cleanly
                 Err(anyhow::anyhow!("Peer shutdown requested"))
             }
@@ -401,7 +401,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
     // Main test logic
     let test = tokio::time::timeout(Duration::from_secs(90), async move {
         // Wait for nodes to start and connect
-        println!("Waiting for nodes to start up and connect...");
+        info!("Waiting for nodes to start up and connect...");
         tokio::time::sleep(Duration::from_secs(15)).await;
 
         // Connect a client to the gateway
@@ -412,7 +412,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         let (ws_stream, _) = connect_async(&url).await?;
         let mut client = WebApi::start(ws_stream);
 
-        println!("Client connected to gateway");
+        info!("Client connected to gateway");
 
         // Try to PUT a contract (this should work initially)
         const TEST_CONTRACT: &str = "test-contract-integration";
@@ -434,7 +434,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Now forcibly drop the peer connection
-        println!("Dropping peer connection to simulate network failure...");
+        info!("Dropping peer connection to simulate network failure...");
         peer_shutdown_tx.send(()).await?;
 
         // Give time for the drop to be detected
@@ -442,17 +442,17 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
 
         // The PUT may or may not succeed depending on timing, but we should get SOME response
         // The key is that we don't hang indefinitely
-        println!("Waiting for response after connection drop...");
+        info!("Waiting for response after connection drop...");
         let response_result = timeout(Duration::from_secs(30), client.recv()).await;
 
         match response_result {
             Ok(Ok(response)) => {
-                println!("✓ Received response after connection drop: {:?}", response);
-                println!("✓ Client properly handled connection drop scenario");
+                info!("✓ Received response after connection drop: {:?}", response);
+                info!("✓ Client properly handled connection drop scenario");
             }
             Ok(Err(e)) => {
-                println!("✓ Received error notification after connection drop: {}", e);
-                println!("✓ Client properly notified of connection issues");
+                info!("✓ Received error notification after connection drop: {}", e);
+                info!("✓ Client properly notified of connection issues");
             }
             Err(_) => {
                 panic!(
@@ -463,7 +463,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
             }
         }
 
-        println!("Connection drop error notification test passed");
+        info!("Connection drop error notification test passed");
 
         // Try to disconnect cleanly (may fail if connection is already gone)
         let _ = client.send(ClientRequest::Disconnect { cause: None }).await;

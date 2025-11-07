@@ -13,13 +13,15 @@ use std::collections::HashSet;
 struct TestRing {
     pub k_closest_calls: std::sync::Arc<tokio::sync::Mutex<Vec<(ContractKey, Vec<PeerId>, usize)>>>,
     pub candidates: Vec<PeerKeyLocation>,
+    pub own_peer: PeerId,
 }
 
 impl TestRing {
-    fn new(candidates: Vec<PeerKeyLocation>, _own_location: PeerKeyLocation) -> Self {
+    fn new(candidates: Vec<PeerKeyLocation>, own_location: PeerKeyLocation) -> Self {
         Self {
             k_closest_calls: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
             candidates,
+            own_peer: own_location.peer,
         }
     }
 
@@ -30,12 +32,18 @@ impl TestRing {
         k: usize,
     ) -> Vec<PeerKeyLocation> {
         // Record the call - use async lock
-        let skip_vec: Vec<PeerId> = self
+        let mut skip_vec: Vec<PeerId> = self
             .candidates
             .iter()
             .filter(|peer| skip_list.has_element(peer.peer.clone()))
             .map(|peer| peer.peer.clone())
             .collect();
+        if skip_list.has_element(self.own_peer.clone())
+        // avoid duplicates if own peer also in candidates
+            && !skip_vec.iter().any(|p| p == &self.own_peer)
+        {
+            skip_vec.push(self.own_peer.clone());
+        }
 
         // Use async lock
         self.k_closest_calls.lock().await.push((*key, skip_vec, k));
@@ -87,10 +95,11 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
         Some(SubscribeState::PrepareRequest { .. })
     ));
 
-    // 2. Test k_closest_potentially_caching with empty skip list (simulates request_subscribe call)
-    const EMPTY: &[PeerId] = &[];
+    // 2. Test k_closest_potentially_caching with initial skip list containing self (simulates request_subscribe call)
+    let mut initial_skip = HashSet::new();
+    initial_skip.insert(own_location.peer.clone());
     let initial_candidates = test_ring
-        .k_closest_potentially_caching(&contract_key, EMPTY, 3)
+        .k_closest_potentially_caching(&contract_key, &initial_skip, 3)
         .await;
 
     // 3. Verify initial call was recorded
@@ -106,8 +115,12 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     );
     assert_eq!(
         k_closest_calls[0].1.len(),
-        0,
-        "Initial call should have empty skip list"
+        1,
+        "Initial call should only skip own peer"
+    );
+    assert_eq!(
+        k_closest_calls[0].1[0], own_location.peer,
+        "Initial skip list should contain own peer"
     );
     assert_eq!(k_closest_calls[0].2, 3, "Should request 3 candidates");
     drop(k_closest_calls);
@@ -206,7 +219,7 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
 
     // This test validates the TestRing behavior that supports subscription routing:
     // 1. start_op always works (no early return bug)
-    // 2. k_closest_potentially_caching is called with empty skip list initially
+    // 2. k_closest_potentially_caching is called with a skip list that already excludes the local peer
     // 3. k_closest_potentially_caching is called with proper skip list after failures
     // 4. Skip list correctly excludes failed peers
     // 5. Alternative peers are found after failures
@@ -254,10 +267,11 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     ));
 
     // Test 2: Simulate the k_closest_potentially_caching call made in request_subscribe
-    // (Line 72 in subscribe.rs: op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3))
-    const EMPTY: &[PeerId] = &[];
+    // (Line 72 in subscribe.rs: op_manager.ring.k_closest_potentially_caching(key, skip_list, 3))
+    let mut initial_skip = HashSet::new();
+    initial_skip.insert(own_location.peer.clone());
     let initial_candidates = test_ring
-        .k_closest_potentially_caching(&contract_key, EMPTY, 3)
+        .k_closest_potentially_caching(&contract_key, &initial_skip, 3)
         .await;
 
     // Verify the call was recorded (this proves our test setup works)
@@ -273,8 +287,12 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     );
     assert_eq!(
         k_closest_calls[0].1.len(),
-        0,
-        "Should use empty skip list initially"
+        1,
+        "Should skip own peer initially"
+    );
+    assert_eq!(
+        k_closest_calls[0].1[0], own_location.peer,
+        "Skip list should contain own peer"
     );
     assert_eq!(k_closest_calls[0].2, 3, "Should request 3 candidates");
     drop(k_closest_calls);
@@ -388,7 +406,7 @@ async fn test_subscription_production_code_paths_use_k_closest() {
 #[tokio::test]
 async fn test_subscription_validates_k_closest_usage() {
     // This test validates that the subscription operation correctly:
-    // 1. Calls k_closest_potentially_caching with an empty skip list on first attempt
+    // 1. Calls k_closest_potentially_caching with a skip list containing the local peer on first attempt
     // 2. Accumulates failed peers in the skip list
     // 3. Calls k_closest_potentially_caching with the skip list on retry
 
@@ -419,16 +437,25 @@ async fn test_subscription_validates_k_closest_usage() {
 
     // Test 1: Validate the exact call pattern from request_subscribe (line 72)
     {
-        const EMPTY: &[PeerId] = &[];
+        let mut initial_skip = HashSet::new();
+        initial_skip.insert(test_ring.own_peer.clone());
         let _candidates = test_ring
-            .k_closest_potentially_caching(&contract_key, EMPTY, 3)
+            .k_closest_potentially_caching(&contract_key, &initial_skip, 3)
             .await;
 
         let calls = test_ring.k_closest_calls.lock().await;
         assert_eq!(calls.len(), 1, "Should record the call");
         let (key, skip_list, k) = &calls[0];
         assert_eq!(*key, contract_key);
-        assert!(skip_list.is_empty(), "First attempt has empty skip list");
+        assert_eq!(
+            skip_list.len(),
+            1,
+            "First attempt should only skip own peer"
+        );
+        assert_eq!(
+            skip_list[0], test_ring.own_peer,
+            "Skip list should contain own peer"
+        );
         assert_eq!(*k, 3, "Uses k=3 as per fix");
     }
 
