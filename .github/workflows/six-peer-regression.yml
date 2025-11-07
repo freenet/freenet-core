@@ -1,0 +1,44 @@
+name: six-peer-regression
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - stack/connect-transport-rewrite
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  river-six-peer:
+    runs-on: freenet-128gb
+    timeout-minutes: 120
+    steps:
+      - name: Checkout freenet-core
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: freenet-core
+
+      - name: Checkout river
+        uses: actions/checkout@v4
+        with:
+          repository: freenet/river
+          ref: main
+          path: river
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Run six-peer regression
+        working-directory: river/main
+        env:
+          FREENET_CORE_PATH: ${{ github.workspace }}/freenet-core
+          RUST_LOG: info
+        run: |
+          cargo test --test message_flow river_message_flow_over_freenet_six_peers_five_rounds -- --ignored --exact
