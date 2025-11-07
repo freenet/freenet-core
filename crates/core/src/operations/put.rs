@@ -1469,7 +1469,15 @@ where
         .ring
         .closest_potentially_caching(&key, &skip_list);
     let own_pkloc = op_manager.ring.connection_manager.own_location();
-    let own_loc = own_pkloc.location.expect("infallible");
+    let Some(own_loc) = own_pkloc.location else {
+        tracing::warn!(
+            tx = %id,
+            %key,
+            skip = ?skip_list,
+            "Not forwarding PUT – own ring location not assigned yet; caching locally"
+        );
+        return true;
+    };
 
     tracing::info!(
         tx = %id,
