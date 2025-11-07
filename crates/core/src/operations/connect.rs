@@ -1,8 +1,7 @@
 //! Implementation of the simplified two-message connect flow.
 //!
-//! The legacy multi-stage connect operation still exists under `legacy_connect` purely for
-//! backwards compatibility and defensive logging, but this module now powers the node’s
-//! connection and maintenance paths.
+//! The legacy multi-stage connect operation has been removed; this module now powers the node’s
+//! connection and maintenance paths end-to-end.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -142,7 +141,6 @@ pub(crate) enum ConnectState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct JoinerState {
-    pub desired_location: Location,
     pub target_connections: usize,
     pub observed_address: Option<SocketAddr>,
     pub accepted: HashSet<PeerKeyLocation>,
@@ -364,7 +362,6 @@ impl ConnectOp {
         backoff: Option<Backoff>,
     ) -> Self {
         let state = ConnectState::WaitingForResponses(JoinerState {
-            desired_location,
             target_connections,
             observed_address,
             accepted: HashSet::new(),
@@ -1082,7 +1079,6 @@ mod tests {
     fn joiner_tracks_acceptance() {
         let acceptor = make_peer(7000);
         let mut state = JoinerState {
-            desired_location: Location::random(),
             target_connections: 1,
             observed_address: None,
             accepted: HashSet::new(),

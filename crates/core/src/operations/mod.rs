@@ -16,7 +16,6 @@ use crate::{
 
 pub(crate) mod connect;
 pub(crate) mod get;
-pub(crate) mod legacy_connect;
 pub(crate) mod put;
 pub(crate) mod subscribe;
 pub(crate) mod update;

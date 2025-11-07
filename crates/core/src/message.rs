@@ -12,8 +12,7 @@ use crate::{
     client_events::{ClientId, HostResult},
     node::PeerId,
     operations::{
-        connect::ConnectMsg, get::GetMsg, legacy_connect::LegacyConnectMsg, put::PutMsg,
-        subscribe::SubscribeMsg, update::UpdateMsg,
+        connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
     ring::{Location, PeerKeyLocation},
 };
@@ -200,12 +199,6 @@ mod sealed_msg_type {
         fn tx_type_id() -> TransactionTypeId;
     }
 
-    impl SealedTxType for LegacyConnectMsg {
-        fn tx_type_id() -> TransactionTypeId {
-            TransactionTypeId(TransactionType::Connect)
-        }
-    }
-
     #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
     #[cfg_attr(test, derive(arbitrary::Arbitrary))]
     pub struct TransactionTypeId(pub(super) TransactionType);
@@ -266,12 +259,6 @@ mod sealed_msg_type {
     });
 }
 
-impl From<LegacyConnectMsg> for NetMessage {
-    fn from(msg: LegacyConnectMsg) -> Self {
-        NetMessage::V1(NetMessageV1::LegacyConnect(msg))
-    }
-}
-
 pub(crate) trait MessageStats {
     fn id(&self) -> &Transaction;
 
@@ -287,9 +274,6 @@ pub(crate) enum NetMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NetMessageV1 {
-    #[serde(rename = "Connect")]
-    LegacyConnect(LegacyConnectMsg),
-    #[serde(rename = "ConnectV2")]
     Connect(ConnectMsg),
     Put(PutMsg),
     Get(GetMsg),
@@ -318,7 +302,6 @@ impl Versioned for NetMessage {
 impl Versioned for NetMessageV1 {
     fn version(&self) -> semver::Version {
         match self {
-            NetMessageV1::LegacyConnect(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Connect(_) => semver::Version::new(1, 1, 0),
             NetMessageV1::Put(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Get(_) => semver::Version::new(1, 0, 0),
@@ -491,7 +474,6 @@ impl MessageStats for NetMessage {
 impl MessageStats for NetMessageV1 {
     fn id(&self) -> &Transaction {
         match self {
-            NetMessageV1::LegacyConnect(op) => op.id(),
             NetMessageV1::Connect(op) => op.id(),
             NetMessageV1::Put(op) => op.id(),
             NetMessageV1::Get(op) => op.id(),
@@ -504,7 +486,6 @@ impl MessageStats for NetMessageV1 {
 
     fn target(&self) -> Option<PeerKeyLocation> {
         match self {
-            NetMessageV1::LegacyConnect(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Connect(op) => op.target().cloned(),
             NetMessageV1::Put(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Get(op) => op.target().as_ref().map(|b| b.borrow().clone()),
@@ -517,7 +498,6 @@ impl MessageStats for NetMessageV1 {
 
     fn requested_location(&self) -> Option<Location> {
         match self {
-            NetMessageV1::LegacyConnect(op) => op.requested_location(),
             NetMessageV1::Connect(op) => op.requested_location(),
             NetMessageV1::Put(op) => op.requested_location(),
             NetMessageV1::Get(op) => op.requested_location(),
@@ -535,7 +515,6 @@ impl Display for NetMessage {
         write!(f, "Message {{")?;
         match self {
             NetMessage::V1(msg) => match msg {
-                LegacyConnect(msg) => msg.fmt(f)?,
                 Connect(msg) => msg.fmt(f)?,
                 Put(msg) => msg.fmt(f)?,
                 Get(msg) => msg.fmt(f)?,

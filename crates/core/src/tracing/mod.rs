@@ -14,9 +14,7 @@ use crate::{
     generated::ContractChange,
     message::{MessageStats, NetMessage, NetMessageV1, Transaction},
     node::PeerId,
-    operations::{
-        get::GetMsg, legacy_connect, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
-    },
+    operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg},
     ring::{Location, PeerKeyLocation, Ring},
     router::RouteEvent,
 };
@@ -164,27 +162,14 @@ impl<'a> NetEventLog<'a> {
             return Either::Right(vec![]);
         };
         let kind = match msg {
-            NetMessage::V1(NetMessageV1::LegacyConnect(
-                legacy_connect::LegacyConnectMsg::Response {
-                    msg:
-                        legacy_connect::LegacyConnectResponse::AcceptedBy {
-                            accepted, acceptor, ..
-                        },
-                    ..
-                },
-            )) => {
+            NetMessage::V1(NetMessageV1::Connect(connect::ConnectMsg::Response {
+                target, ..
+            })) => {
                 let this_peer = ring.connection_manager.own_location();
-                if *accepted {
-                    EventKind::Connect(ConnectEvent::Connected {
-                        this: this_peer,
-                        connected: PeerKeyLocation {
-                            peer: acceptor.peer.clone(),
-                            location: acceptor.location,
-                        },
-                    })
-                } else {
-                    EventKind::Ignored
-                }
+                EventKind::Connect(ConnectEvent::Connected {
+                    this: this_peer,
+                    connected: target.clone(),
+                })
             }
             _ => EventKind::Ignored,
         };
@@ -200,28 +185,28 @@ impl<'a> NetEventLog<'a> {
         op_manager: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            NetMessageV1::LegacyConnect(legacy_connect::LegacyConnectMsg::Response {
-                msg:
-                    legacy_connect::LegacyConnectResponse::AcceptedBy {
-                        acceptor,
-                        accepted,
-                        joiner,
-                        ..
-                    },
-                ..
+            NetMessageV1::Connect(connect::ConnectMsg::Response {
+                target, payload, ..
             }) => {
-                let this_peer = &op_manager.ring.connection_manager.get_peer_key().unwrap();
-                let mut events = vec![];
-                if *accepted {
-                    events.push(NetEventLog {
+                let acceptor = payload.acceptor.clone();
+                let events = vec![
+                    NetEventLog {
                         tx: msg.id(),
-                        peer_id: this_peer.clone(),
-                        kind: EventKind::Connect(ConnectEvent::Finished {
-                            initiator: joiner.clone(),
-                            location: acceptor.location.unwrap(),
+                        peer_id: acceptor.peer.clone(),
+                        kind: EventKind::Connect(ConnectEvent::Connected {
+                            this: acceptor.clone(),
+                            connected: target.clone(),
                         }),
-                    });
-                }
+                    },
+                    NetEventLog {
+                        tx: msg.id(),
+                        peer_id: target.peer.clone(),
+                        kind: EventKind::Connect(ConnectEvent::Connected {
+                            this: target.clone(),
+                            connected: acceptor,
+                        }),
+                    },
+                ];
                 return Either::Right(events);
             }
             NetMessageV1::Put(PutMsg::RequestPut {
@@ -1646,7 +1631,7 @@ pub(super) mod test {
         use crate::ring::Location;
         let peer_id = PeerId::random();
         let loc = Location::try_from(0.5)?;
-        let tx = Transaction::new::<legacy_connect::LegacyConnectMsg>();
+        let tx = Transaction::new::<connect::ConnectMsg>();
         let locations = [
             (PeerId::random(), Location::try_from(0.5)?),
             (PeerId::random(), Location::try_from(0.75)?),

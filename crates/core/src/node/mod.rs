@@ -692,13 +692,6 @@ async fn process_message_v1<CB>(
     for i in 0..MAX_RETRIES {
         tracing::debug!(?tx, "Processing operation, iteration: {i}");
         match msg {
-            NetMessageV1::LegacyConnect(ref _op) => {
-                tracing::warn!(
-                    transaction = %msg.id(),
-                    "Ignoring legacy NetMessageV1::Connect message during connect migration"
-                );
-                return;
-            }
             NetMessageV1::Connect(ref op) => {
                 let parent_span = tracing::Span::current();
                 let span = tracing::info_span!(
@@ -859,13 +852,6 @@ where
         tracing::debug!(?tx, "Processing pure network operation, iteration: {i}");
 
         match msg {
-            NetMessageV1::LegacyConnect(ref _op) => {
-                tracing::warn!(
-                    transaction = %msg.id(),
-                    "Ignoring legacy NetMessageV1::Connect message during connect migration"
-                );
-                return Ok(None);
-            }
             NetMessageV1::Connect(ref op) => {
                 let parent_span = tracing::Span::current();
                 let span = tracing::info_span!(
