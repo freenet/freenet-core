@@ -12,7 +12,9 @@ on:
 
 jobs:
   river-six-peer:
-    runs-on: freenet-128gb
+    runs-on:
+      - self-hosted
+      - freenet-128gb
     timeout-minutes: 120
     steps:
       - name: Checkout freenet-core
