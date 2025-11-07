@@ -249,7 +249,8 @@ start_service() {
 
     case "$SERVICE_MANAGER" in
         systemd)
-            if systemctl list-unit-files | grep -q "^$service_arg.service" 2>/dev/null; then
+            # Check if unit file exists by querying systemctl directly
+            if systemctl list-unit-files "$service_arg.service" 2>/dev/null | grep -q "$service_arg.service"; then
                 echo -n "  Starting systemd service ($service_arg)... "
                 if [[ "$DRY_RUN" == "true" ]]; then
                     echo "[DRY RUN]"
@@ -294,7 +295,8 @@ verify_service() {
 
     case "$SERVICE_MANAGER" in
         systemd)
-            if systemctl list-unit-files | grep -q "^$service_arg.service" 2>/dev/null; then
+            # Check if unit file exists by querying systemctl directly
+            if systemctl list-unit-files "$service_arg.service" 2>/dev/null | grep -q "$service_arg.service"; then
                 echo -n "  Verifying service status ($service_arg)... "
                 sleep 2  # Give service time to start
                 if systemctl is-active --quiet "$service_arg.service"; then
