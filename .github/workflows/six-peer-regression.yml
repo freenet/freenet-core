@@ -19,6 +19,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          path: freenet-core
 
       - name: Checkout river
         uses: actions/checkout@v4
@@ -37,7 +38,7 @@ jobs:
       - name: Run six-peer regression
         working-directory: river/main
         env:
-          FREENET_CORE_PATH: ${{ github.workspace }}
+          FREENET_CORE_PATH: ${{ github.workspace }}/freenet-core
           RUST_LOG: info
         run: |
           cargo test --test message_flow river_message_flow_over_freenet_six_peers_five_rounds -- --ignored --exact
