@@ -786,10 +786,29 @@ impl OpManager {
             .subscribers_of(key)
             .map(|subs| {
                 let self_peer = self.ring.connection_manager.get_peer_key();
+                let allow_self = self_peer.as_ref().map(|me| me == sender).unwrap_or(false);
                 subs.value()
                     .iter()
-                    .filter(|pk| &pk.peer != sender)
-                    .filter(|pk| self_peer.as_ref().map(|me| &pk.peer != me).unwrap_or(true))
+                    .filter(|pk| {
+                        // Allow the sender to remain in the broadcast list when we're the sender,
+                        // so local auto-subscribe via GET/PUT still receives notifications.
+                        if &pk.peer == sender {
+                            allow_self
+                        } else {
+                            true
+                        }
+                    })
+                    .filter(|pk| {
+                        if let Some(self_peer) = &self_peer {
+                            if &pk.peer == self_peer {
+                                allow_self
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    })
                     .cloned()
                     .collect::<Vec<_>>()
             })
