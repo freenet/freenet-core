@@ -20,6 +20,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout freenet-test-network
+        uses: actions/checkout@v4
+        with:
+          repository: freenet/freenet-test-network
+          path: freenet-test-network
+
       - name: Checkout river
         uses: actions/checkout@v4
         with:
