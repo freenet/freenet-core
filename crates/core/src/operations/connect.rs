@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::task;
+use tokio::task::{self, JoinHandle};
 
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
@@ -297,6 +297,9 @@ impl RelayContext for RelayEnv<'_> {
     }
 
     fn courtesy_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
+        // Courtesy slots still piggyback on regular connections. Flag the first acceptance so the
+        // joiner can prioritise it, and keep the logic simple until dedicated courtesy tracking
+        // is wired in (see courtesy-connection-budget branch).
         self.op_manager.ring.open_connections() == 0
     }
 }
@@ -836,7 +839,7 @@ pub(crate) async fn join_ring_request(
 pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
     gateways: &[PeerKeyLocation],
-) -> Result<(), OpError> {
+) -> Result<JoinHandle<()>, OpError> {
     let number_of_parallel_connections = {
         let max_potential_conns_per_gw = op_manager.ring.max_hops_to_live;
         let needed_to_cover_max =
@@ -844,7 +847,7 @@ pub(crate) async fn initial_join_procedure(
         gateways.iter().take(needed_to_cover_max).count().max(2)
     };
     let gateways = gateways.to_vec();
-    task::spawn(async move {
+    let handle = task::spawn(async move {
         if gateways.is_empty() {
             tracing::warn!("No gateways available, aborting join procedure");
             return;
@@ -940,7 +943,7 @@ pub(crate) async fn initial_join_procedure(
             tokio::time::sleep(Duration::from_secs(wait_time)).await;
         }
     });
-    Ok(())
+    Ok(handle)
 }
 
 #[cfg(test)]

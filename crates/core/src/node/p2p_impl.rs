@@ -1,6 +1,7 @@
 use std::{collections::HashSet, convert::Infallible, sync::Arc, time::Duration};
 
 use futures::{future::BoxFuture, FutureExt};
+use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use super::{
@@ -44,6 +45,7 @@ pub(crate) struct NodeP2P {
     should_try_connect: bool,
     client_events_task: BoxFuture<'static, anyhow::Error>,
     contract_executor_task: BoxFuture<'static, anyhow::Error>,
+    initial_join_task: Option<JoinHandle<()>>,
 }
 
 impl NodeP2P {
@@ -181,10 +183,14 @@ impl NodeP2P {
 
         Ok(())
     }
-    pub(super) async fn run_node(self) -> anyhow::Result<Infallible> {
+    pub(super) async fn run_node(mut self) -> anyhow::Result<Infallible> {
         if self.should_try_connect {
-            connect::initial_join_procedure(self.op_manager.clone(), &self.conn_manager.gateways)
-                .await?;
+            let join_handle = connect::initial_join_procedure(
+                self.op_manager.clone(),
+                &self.conn_manager.gateways,
+            )
+            .await?;
+            self.initial_join_task = Some(join_handle);
 
             // After connecting to gateways, aggressively try to reach min_connections
             // This is important for fast startup and avoiding on-demand connection delays
@@ -199,7 +205,8 @@ impl NodeP2P {
             self.node_controller,
         );
 
-        tokio::select!(
+        let join_task = self.initial_join_task.take();
+        let result = tokio::select!(
             r = f => {
                let Err(e) = r;
                tracing::error!("Network event listener exited: {}", e);
@@ -213,7 +220,13 @@ impl NodeP2P {
                 tracing::error!("Contract executor task exited: {:?}", e);
                 Err(e)
             }
-        )
+        );
+
+        if let Some(handle) = join_task {
+            handle.abort();
+        }
+
+        result
     }
 
     pub(crate) async fn build<CH, const CLIENTS: usize, ER>(
@@ -343,6 +356,7 @@ impl NodeP2P {
             location: config.location,
             client_events_task,
             contract_executor_task,
+            initial_join_task: None,
         })
     }
 }
