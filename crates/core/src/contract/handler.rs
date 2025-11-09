@@ -343,6 +343,33 @@ impl ContractHandlerChannel<SenderHalve> {
 
         Ok(())
     }
+
+    pub async fn waiting_for_subscription_result(
+        &self,
+        tx: Transaction,
+        contract_key: ContractInstanceId,
+        client_id: ClientId,
+        request_id: RequestId,
+    ) -> Result<(), ContractError> {
+        self.end
+            .wait_for_res_tx
+            .send((client_id, WaitingTransaction::Subscription { contract_key }))
+            .await
+            .map_err(|_| ContractError::NoEvHandlerResponse)?;
+
+        if let Some(session_tx) = &self.session_adapter_tx {
+            let msg = SessionMessage::RegisterTransaction {
+                tx,
+                client_id,
+                request_id,
+            };
+            if let Err(e) = session_tx.try_send(msg) {
+                tracing::warn!("Failed to notify session actor: {}", e);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl ContractHandlerChannel<ContractHandlerHalve> {
