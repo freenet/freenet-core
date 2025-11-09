@@ -2,6 +2,42 @@
 //!
 //! This module provides a simplified session actor that manages client sessions
 //! and handles efficient 1→N result delivery to multiple clients.
+//!
+//! # Cache Eviction Strategy
+//!
+//! The `pending_results` cache uses **lazy evaluation** for cleanup - there is no
+//! background task or periodic timer. Eviction happens **only** as a side effect of
+//! processing incoming messages.
+//!
+//! ## How It Works
+//!
+//! 1. **On every message** (`process_message`): `prune_pending_results()` is called
+//! 2. **TTL-based pruning**: Removes entries older than `PENDING_RESULT_TTL` (60s)
+//! 3. **Capacity enforcement**: When cache reaches `MAX_PENDING_RESULTS` (2048),
+//!    uses LRU eviction to remove the oldest entry
+//!
+//! ## Tradeoffs
+//!
+//! **Advantages:**
+//! - Simpler implementation - no separate task management required
+//! - Cleanup cost is amortized across normal message processing
+//! - No overhead when actor is idle
+//!
+//! **Limitations:**
+//! - **Idle memory retention**: During idle periods (no incoming messages), stale
+//!   entries remain in memory indefinitely until the next message arrives
+//! - **Temporary overflow**: Cache size can temporarily exceed limits between messages
+//! - **Burst accumulation**: After a burst of activity, cache may sit at max capacity
+//!   until next message triggers pruning
+//! - **Memory pressure**: With large `HostResult` payloads, 2048 entries could consume
+//!   significant memory during idle periods
+//!
+//! ## Future Considerations
+//!
+//! If idle memory retention becomes problematic in production:
+//! - Add a background tokio task with periodic cleanup (e.g., every 30s)
+//! - Implement memory-based limits in addition to count-based limits
+//! - Add metrics/monitoring for cache size to detect accumulation patterns
 
 use crate::client_events::{ClientId, HostResponse, HostResult, RequestId};
 use crate::contract::{ClientResponsesSender, SessionMessage};
@@ -12,7 +48,17 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::debug;
 
+/// Time-to-live for cached pending results. Entries older than this duration are
+/// eligible for removal during pruning (triggered on message processing).
+///
+/// Note: Due to lazy evaluation, stale entries may persist beyond TTL during idle periods.
 const PENDING_RESULT_TTL: Duration = Duration::from_secs(60);
+
+/// Maximum number of cached pending results. When this limit is reached, LRU eviction
+/// removes the oldest entry to make room for new ones.
+///
+/// Note: Cache may temporarily exceed this limit between messages since enforcement
+/// is lazy (triggered only during message processing).
 const MAX_PENDING_RESULTS: usize = 2048;
 
 /// Simple session actor for client connection refactor
@@ -21,6 +67,10 @@ pub struct SessionActor {
     client_transactions: HashMap<Transaction, HashSet<ClientId>>,
     // Track RequestId correlation for each (Transaction, ClientId) pair
     client_request_ids: HashMap<(Transaction, ClientId), RequestId>,
+    /// Cache of pending results for late-arriving subscribers.
+    ///
+    /// Uses lazy evaluation for cleanup - entries are pruned only during message processing.
+    /// See module-level documentation for detailed cache eviction strategy and limitations.
     pending_results: HashMap<Transaction, PendingResult>,
     client_responses: ClientResponsesSender,
 }
@@ -68,7 +118,10 @@ impl SessionActor {
         }
     }
 
-    /// Process a single message
+    /// Process a single message.
+    ///
+    /// Note: This method triggers cache pruning on EVERY message via `prune_pending_results()`.
+    /// This is the only mechanism for cache cleanup (lazy evaluation - no background task).
     async fn process_message(&mut self, msg: SessionMessage) {
         self.prune_pending_results();
         match msg {
@@ -347,6 +400,23 @@ impl SessionActor {
         self.client_request_ids.retain(|(_, c), _| *c != client_id);
     }
 
+    /// Prune stale pending results based on TTL and enforce capacity limits.
+    ///
+    /// This is the **only** cache cleanup mechanism - there is no background task.
+    /// Called on every message in `process_message()`.
+    ///
+    /// # Cleanup Strategy (Lazy Evaluation)
+    ///
+    /// 1. **Skip if empty**: Early return if no cached results
+    /// 2. **Identify active transactions**: Collect all transactions that still have waiting clients
+    /// 3. **TTL-based removal**: Remove inactive entries older than `PENDING_RESULT_TTL`
+    /// 4. **Capacity enforcement**: If still at/over `MAX_PENDING_RESULTS`, trigger LRU eviction
+    ///
+    /// # Lazy Evaluation Implications
+    ///
+    /// - During idle periods (no messages), stale entries persist in memory
+    /// - Cache cleanup happens only when actor receives messages
+    /// - Stale entries may remain beyond TTL until next message arrives
     fn prune_pending_results(&mut self) {
         if self.pending_results.is_empty() {
             return;
@@ -390,6 +460,18 @@ impl SessionActor {
         }
     }
 
+    /// Enforce capacity limits using LRU (Least Recently Used) eviction.
+    ///
+    /// Removes the entry with the oldest `last_accessed` timestamp when the cache
+    /// reaches or exceeds `MAX_PENDING_RESULTS`.
+    ///
+    /// # Lazy Evaluation Note
+    ///
+    /// This is only called:
+    /// 1. At the end of `prune_pending_results()` if still at capacity
+    /// 2. Before inserting new entries when already at capacity
+    ///
+    /// Between messages, cache size may temporarily exceed the limit.
     fn enforce_pending_capacity(&mut self) {
         if self.pending_results.len() < MAX_PENDING_RESULTS {
             return;
