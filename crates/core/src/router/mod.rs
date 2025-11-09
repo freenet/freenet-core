@@ -1,7 +1,7 @@
 mod isotonic_estimator;
 mod util;
 
-use crate::ring::{Distance, Location, PeerKeyLocation};
+use crate::ring::{Location, PeerKeyLocation};
 use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -162,12 +162,9 @@ impl Router {
 
         let mut peer_distances: Vec<_> = peers
             .into_iter()
-            .map(|peer| {
-                let distance = peer
-                    .location
-                    .map(|loc| target_location.distance(loc))
-                    .unwrap_or_else(|| Distance::new(0.5));
-                (peer, distance)
+            .filter_map(|peer| {
+                peer.location
+                    .map(|loc| (peer, target_location.distance(loc)))
             })
             .collect();
 
@@ -206,10 +203,8 @@ impl Router {
             let mut peer_distances: Vec<_> = peers
                 .into_iter()
                 .filter_map(|peer| {
-                    peer.location.map(|loc| {
-                        let distance = target_location.distance(loc);
-                        (peer, distance)
-                    })
+                    peer.location
+                        .map(|loc| (peer, target_location.distance(loc)))
                 })
                 .collect();
 

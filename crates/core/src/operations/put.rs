@@ -1077,9 +1077,7 @@ async fn try_to_broadcast(
                     key
                 );
                 // means the whole tx finished so can return early
-                let upstream_for_completion = preserved_upstream
-                    .clone()
-                    .or_else(|| Some(upstream.clone()));
+                let upstream_for_completion = preserved_upstream.clone().or(Some(upstream.clone()));
                 new_state = Some(PutState::AwaitingResponse {
                     key,
                     upstream: upstream_for_completion,
