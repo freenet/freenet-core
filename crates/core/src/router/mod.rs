@@ -1,7 +1,7 @@
 mod isotonic_estimator;
 mod util;
 
-use crate::ring::{Location, PeerKeyLocation};
+use crate::ring::{Distance, Location, PeerKeyLocation};
 use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -20,6 +20,19 @@ pub(crate) struct Router {
 }
 
 impl Router {
+    /// Some code paths (bootstrap, tests) hand Router peer entries before the
+    /// remote has published a location. Treat them as midway around the ring so
+    /// we still consider them instead of dropping the candidate set entirely.
+    #[inline]
+    fn peer_distance_or_default(
+        peer: &PeerKeyLocation,
+        target_location: &Location,
+    ) -> Distance {
+        peer.location
+            .map(|loc| target_location.distance(loc))
+            .unwrap_or_else(|| Distance::new(0.5))
+    }
+
     pub fn new(history: &[RouteEvent]) -> Self {
         let failure_outcomes: Vec<IsotonicEvent> = history
             .iter()
@@ -162,9 +175,9 @@ impl Router {
 
         let mut peer_distances: Vec<_> = peers
             .into_iter()
-            .filter_map(|peer| {
-                peer.location
-                    .map(|loc| (peer, target_location.distance(loc)))
+            .map(|peer| {
+                let distance = Self::peer_distance_or_default(peer, target_location);
+                (peer, distance)
             })
             .collect();
 
@@ -202,9 +215,9 @@ impl Router {
 
             let mut peer_distances: Vec<_> = peers
                 .into_iter()
-                .filter_map(|peer| {
-                    peer.location
-                        .map(|loc| (peer, target_location.distance(loc)))
+                .map(|peer| {
+                    let distance = Self::peer_distance_or_default(peer, &target_location);
+                    (peer, distance)
                 })
                 .collect();
 
