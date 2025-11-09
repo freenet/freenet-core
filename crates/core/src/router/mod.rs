@@ -24,10 +24,7 @@ impl Router {
     /// remote has published a location. Treat them as midway around the ring so
     /// we still consider them instead of dropping the candidate set entirely.
     #[inline]
-    fn peer_distance_or_default(
-        peer: &PeerKeyLocation,
-        target_location: &Location,
-    ) -> Distance {
+    fn peer_distance_or_default(peer: &PeerKeyLocation, target_location: &Location) -> Distance {
         peer.location
             .map(|loc| target_location.distance(loc))
             .unwrap_or_else(|| Distance::new(0.5))
