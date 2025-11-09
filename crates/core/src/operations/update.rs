@@ -703,7 +703,7 @@ impl OpManager {
                         // Allow the sender (or ourselves) to stay in the broadcast list when we're
                         // originating the UPDATE so local auto-subscribes still receive events.
                         let is_sender = &pk.peer == sender;
-                        let is_self = self_peer.as_ref().map_or(false, |me| &pk.peer == me);
+                        let is_self = self_peer.as_ref() == Some(&pk.peer);
                         if is_sender || is_self {
                             allow_self
                         } else {
