@@ -570,6 +570,11 @@ impl Operation for PutOp {
                     return_msg = None;
                 }
                 PutMsg::SuccessfulPut { id, .. } => {
+                    tracing::debug!(
+                        tx = %id,
+                        current_state = ?self.state,
+                        "PutOp::process_message: handling SuccessfulPut"
+                    );
                     match self.state {
                         Some(PutState::AwaitingResponse {
                             key,
@@ -654,6 +659,12 @@ impl Operation for PutOp {
 
                             // Forward success message upstream if needed
                             if let Some(upstream) = upstream {
+                                tracing::trace!(
+                                    tx = %id,
+                                    %key,
+                                    upstream = %upstream.peer,
+                                    "PutOp::process_message: Forwarding SuccessfulPut upstream"
+                                );
                                 return_msg = Some(PutMsg::SuccessfulPut {
                                     id: *id,
                                     target: upstream,
@@ -661,6 +672,11 @@ impl Operation for PutOp {
                                     sender: op_manager.ring.connection_manager.own_location(),
                                 });
                             } else {
+                                tracing::trace!(
+                                    tx = %id,
+                                    %key,
+                                    "PutOp::process_message: SuccessfulPut originated locally; no upstream"
+                                );
                                 return_msg = None;
                             }
                         }

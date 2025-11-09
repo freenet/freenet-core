@@ -7,6 +7,7 @@ use std::io::{self, BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{fs::File, io::Read};
+use tracing::error;
 
 const INTERNAL_KEY: usize = 32;
 const TOMBSTONE_MARKER: usize = 1;
@@ -325,7 +326,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
     let mut original_reader = BufReader::new(original_file);
     let mut temp_writer = SafeWriter::<S>::new(&temp_file_path, true).inspect_err(|_| {
         if let Err(e) = fs::remove_file(&lock_file_path) {
-            eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+            error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
         }
     })?;
 
@@ -340,7 +341,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
                 };
                 if let Err(err) = temp_writer.insert_record(store_key, value) {
                     if let Err(e) = fs::remove_file(&lock_file_path) {
-                        eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+                        error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
                     }
                     return Err(err);
                 }
@@ -356,7 +357,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
             Err(other) => {
                 // Handle other errors gracefully
                 if let Err(e) = fs::remove_file(&lock_file_path) {
-                    eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+                    error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
                 }
                 return Err(other);
             }
@@ -366,7 +367,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
     // Check if any deleted records were found; if not, skip compaction
     if !any_deleted {
         if let Err(e) = fs::remove_file(&lock_file_path) {
-            eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+            error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
         }
         return Ok(());
     }
@@ -374,7 +375,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
     // Clean up and finalize the compaction process
     if let Err(e) = temp_writer.flush() {
         if let Err(e) = fs::remove_file(&lock_file_path) {
-            eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+            error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
         }
         return Err(e);
     }
@@ -382,14 +383,14 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
     // Replace the original file with the temporary file
     if let Err(e) = fs::rename(&temp_file_path, key_file_path) {
         if let Err(e) = fs::remove_file(&lock_file_path) {
-            eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+            error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
         }
         return Err(e);
     }
 
     // Remove the lock file
     fs::remove_file(&lock_file_path).map_err(|e| {
-        eprintln!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+        error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
         e
     })?;
 
@@ -589,13 +590,13 @@ mod tests {
                         create_test_data(&mut file, &key_file_path, shared_data, i);
                     } else if let Err(err) = super::compact_index_file::<TestStore1>(&key_file_path)
                     {
-                        eprintln!("Thread encountered an error during compaction: {err}");
+                        error!("Thread encountered an error during compaction: {err}");
                         return Err(err);
                     }
                     barrier.wait();
                     // compact a last time so we know what data to compare against
                     super::compact_index_file::<TestStore1>(&key_file_path).map_err(|err| {
-                        eprintln!("Thread encountered an error during compaction: {err}");
+                        error!("Thread encountered an error during compaction: {err}");
                         err
                     })
                 })

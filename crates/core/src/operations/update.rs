@@ -316,10 +316,33 @@ impl Operation for UpdateOp {
                                 });
                                 new_state = None;
                             } else {
-                                // No peers available and we don't have the contract - error
+                                // No peers available and we don't have the contract - capture context
+                                let skip_list = [&self_location.peer, &request_sender.peer];
+                                let subscribers = op_manager
+                                    .ring
+                                    .subscribers_of(key)
+                                    .map(|subs| {
+                                        subs.value()
+                                            .iter()
+                                            .map(|loc| format!("{:.8}", loc.peer))
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                let candidates = op_manager
+                                    .ring
+                                    .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
+                                    .into_iter()
+                                    .map(|loc| format!("{:.8}", loc.peer))
+                                    .collect::<Vec<_>>();
+                                let connection_count =
+                                    op_manager.ring.connection_manager.num_connections();
                                 tracing::error!(
                                     tx = %id,
                                     %key,
+                                    subscribers = ?subscribers,
+                                    candidates = ?candidates,
+                                    connection_count,
+                                    request_sender = %request_sender.peer,
                                     "Cannot handle UPDATE: contract not found locally and no peers to forward to"
                                 );
                                 return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
@@ -447,10 +470,33 @@ impl Operation for UpdateOp {
                             });
                             new_state = None;
                         } else {
-                            // No more peers to try - error
+                            // No more peers to try - capture context for diagnostics
+                            let skip_list = [&sender.peer, &self_location.peer];
+                            let subscribers = op_manager
+                                .ring
+                                .subscribers_of(key)
+                                .map(|subs| {
+                                    subs.value()
+                                        .iter()
+                                        .map(|loc| format!("{:.8}", loc.peer))
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let candidates = op_manager
+                                .ring
+                                .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
+                                .into_iter()
+                                .map(|loc| format!("{:.8}", loc.peer))
+                                .collect::<Vec<_>>();
+                            let connection_count =
+                                op_manager.ring.connection_manager.num_connections();
                             tracing::error!(
                                 tx = %id,
                                 %key,
+                                subscribers = ?subscribers,
+                                candidates = ?candidates,
+                                connection_count,
+                                sender = %sender.peer,
                                 "Cannot handle UPDATE SeekNode: contract not found and no peers to forward to"
                             );
                             return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
@@ -649,9 +695,21 @@ impl OpManager {
             .ring
             .subscribers_of(key)
             .map(|subs| {
+                let self_peer = self.ring.connection_manager.get_peer_key();
+                let allow_self = self_peer.as_ref().map(|me| me == sender).unwrap_or(false);
                 subs.value()
                     .iter()
-                    .filter(|pk| &pk.peer != sender)
+                    .filter(|pk| {
+                        // Allow the sender (or ourselves) to stay in the broadcast list when we're
+                        // originating the UPDATE so local auto-subscribes still receive events.
+                        let is_sender = &pk.peer == sender;
+                        let is_self = self_peer.as_ref() == Some(&pk.peer);
+                        if is_sender || is_self {
+                            allow_self
+                        } else {
+                            true
+                        }
+                    })
                     .cloned()
                     .collect::<Vec<_>>()
             })
@@ -671,10 +729,21 @@ impl OpManager {
                 subscribers.len()
             );
         } else {
+            let own_peer = self.ring.connection_manager.get_peer_key();
+            let skip_slice = std::slice::from_ref(sender);
+            let fallback_candidates = self
+                .ring
+                .k_closest_potentially_caching(key, skip_slice, 5)
+                .into_iter()
+                .map(|candidate| format!("{:.8}", candidate.peer))
+                .collect::<Vec<_>>();
+
             tracing::warn!(
-                "UPDATE_PROPAGATION: contract={:.8} from={} NO_TARGETS - update will not propagate",
+                "UPDATE_PROPAGATION: contract={:.8} from={} NO_TARGETS - update will not propagate (self={:?}, fallback_candidates={:?})",
                 key,
-                sender
+                sender,
+                own_peer.map(|p| format!("{:.8}", p)),
+                fallback_candidates
             );
         }
 
