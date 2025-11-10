@@ -770,8 +770,12 @@ impl P2pConnManager {
 
                                 // Collect node information
                                 if config.include_node_info {
-                                    // Calculate location and adress if is set
-                                    let (addr, location) = if let Some(peer_id) =
+                                    // Prefer the runtime's current ring location; fall back to derivation from the peer's
+                                    // advertised address if we don't have one yet.
+                                    let current_location =
+                                        op_manager.ring.connection_manager.own_location().location;
+
+                                    let (addr, fallback_location) = if let Some(peer_id) =
                                         op_manager.ring.connection_manager.get_peer_key()
                                     {
                                         let location = Location::from_address(&peer_id.addr);
@@ -780,11 +784,15 @@ impl P2pConnManager {
                                         (None, None)
                                     };
 
+                                    let location_str = current_location
+                                        .or(fallback_location)
+                                        .map(|loc| format!("{:.6}", loc.as_f64()));
+
                                     // Always include basic node info, but only include address/location if available
                                     response.node_info = Some(NodeInfo {
                                         peer_id: ctx.key_pair.public().to_string(),
                                         is_gateway: self.is_gateway,
-                                        location: location.map(|loc| format!("{:.6}", loc.0)),
+                                        location: location_str,
                                         listening_address: addr
                                             .map(|peer_addr| peer_addr.to_string()),
                                         uptime_seconds: 0, // TODO: implement actual uptime tracking
@@ -1276,6 +1284,12 @@ impl P2pConnManager {
                     "connect_peer: registered new pending connection"
                 );
                 state.outbound_handler.expect_incoming(peer_addr);
+                let loc_hint = Location::from_address(&peer.addr);
+                self.bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .register_outbound_pending(&peer, Some(loc_hint));
             }
         }
 
@@ -1367,6 +1381,7 @@ impl P2pConnManager {
                     }
                 }
 
+                let mut derived_courtesy = courtesy;
                 let peer_id = peer.unwrap_or_else(|| {
                     tracing::info!(
                         remote = %remote_addr,
@@ -1386,9 +1401,18 @@ impl P2pConnManager {
                     )
                 });
 
+                if !derived_courtesy {
+                    derived_courtesy = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .take_pending_courtesy_by_addr(&remote_addr);
+                }
+
                 tracing::info!(
                     remote = %peer_id.addr,
-                    courtesy,
+                    courtesy = derived_courtesy,
                     transaction = ?transaction,
                     "Inbound connection established"
                 );
@@ -1399,7 +1423,7 @@ impl P2pConnManager {
                     state,
                     select_stream,
                     None,
-                    courtesy,
+                    derived_courtesy,
                 )
                 .await?;
             }
@@ -1618,13 +1642,13 @@ impl P2pConnManager {
         }
 
         if newly_inserted {
-            let pending_loc = self
+            let loc = self
                 .bridge
                 .op_manager
                 .ring
                 .connection_manager
-                .prune_in_transit_connection(&peer_id);
-            let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
+                .pending_location_hint(&peer_id)
+                .unwrap_or_else(|| Location::from_address(&peer_id.addr));
             let eviction_candidate = self
                 .bridge
                 .op_manager

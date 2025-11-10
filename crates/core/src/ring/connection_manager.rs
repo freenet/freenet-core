@@ -1,7 +1,9 @@
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
-use std::collections::{btree_map::Entry, BTreeMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::collections::{btree_map::Entry, BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use crate::topology::{Limits, TopologyManager};
 
@@ -26,6 +28,8 @@ pub(crate) struct ConnectionManager {
     courtesy_links: Arc<Mutex<VecDeque<CourtesyLink>>>,
     max_courtesy_links: usize,
     pending_courtesy: Arc<Mutex<HashSet<PeerId>>>,
+    pending_courtesy_addr: Arc<Mutex<HashSet<SocketAddr>>>,
+    pending_connections: DashMap<PeerId, PendingConnection>,
 }
 
 #[derive(Clone)]
@@ -34,8 +38,123 @@ struct CourtesyLink {
 }
 
 const MAX_COURTESY_LINKS: usize = 10;
+const PENDING_CONNECTION_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct PendingConnection {
+    inserted_at: Instant,
+    reserved: bool,
+}
 
 impl ConnectionManager {
+    fn cleanup_stale_pending(&self) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        for entry in self.pending_connections.iter() {
+            if now.duration_since(entry.value().inserted_at) > PENDING_CONNECTION_TTL {
+                expired.push(entry.key().clone());
+            }
+        }
+        if expired.is_empty() {
+            return;
+        }
+        let mut locations = self.location_for_peer.write();
+        for peer in expired {
+            if let Some((peer_id, meta)) = self.pending_connections.remove(&peer) {
+                tracing::warn!(%peer_id, "pending connection timed out; releasing slot");
+                if meta.reserved {
+                    self.release_reserved_slot(Some(&peer_id), "pending_gc");
+                }
+                locations.remove(&peer_id);
+            }
+        }
+    }
+
+    fn register_pending_connection(&self, peer: &PeerId, reserved: bool) {
+        self.cleanup_stale_pending();
+        let previous = self.pending_connections.insert(
+            peer.clone(),
+            PendingConnection {
+                inserted_at: Instant::now(),
+                reserved,
+            },
+        );
+        if let Some(prev) = previous {
+            tracing::debug!(%peer, reserved_previous = prev.reserved, reserved_new = reserved, "Replacing existing pending connection entry");
+            if prev.reserved && !reserved {
+                self.release_reserved_slot(Some(peer), "pending_replaced");
+            }
+        }
+    }
+
+    fn take_pending_connection(&self, peer: &PeerId) -> Option<PendingConnection> {
+        self.pending_connections.remove(peer).map(|(_, meta)| meta)
+    }
+
+    fn release_reserved_slot(&self, peer: Option<&PeerId>, context: &'static str) {
+        let mut current = self
+            .reserved_connections
+            .load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                tracing::warn!(
+                    ?peer,
+                    context,
+                    "release_reserved_slot: counter already at zero"
+                );
+                return;
+            }
+            match self.reserved_connections.compare_exchange(
+                current,
+                current - 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    tracing::debug!(
+                        ?peer,
+                        previous = current,
+                        context,
+                        "release_reserved_slot: decremented reserved counter"
+                    );
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn reserve_connection_slot(&self, peer_id: &PeerId) -> Option<usize> {
+        loop {
+            let current = self
+                .reserved_connections
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if current == usize::MAX {
+                tracing::error!(
+                    %peer_id,
+                    "reserved connection counter overflowed; rejecting new connection"
+                );
+                return None;
+            }
+            match self.reserved_connections.compare_exchange(
+                current,
+                current + 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(current),
+                Err(actual) => {
+                    tracing::debug!(
+                        %peer_id,
+                        expected = current,
+                        actual,
+                        "reserved connection counter changed concurrently; retrying"
+                    );
+                }
+            }
+        }
+    }
+
     pub fn new(config: &NodeConfig) -> Self {
         let min_connections = if let Some(v) = config.min_number_conn {
             v
@@ -125,6 +244,8 @@ impl ConnectionManager {
             courtesy_links: Arc::new(Mutex::new(VecDeque::new())),
             max_courtesy_links: if is_gateway { MAX_COURTESY_LINKS } else { 0 },
             pending_courtesy: Arc::new(Mutex::new(HashSet::new())),
+            pending_courtesy_addr: Arc::new(Mutex::new(HashSet::new())),
+            pending_connections: DashMap::new(),
         }
     }
 
@@ -134,11 +255,21 @@ impl ConnectionManager {
         }
         let mut pending = self.pending_courtesy.lock();
         pending.insert(peer.clone());
-        tracing::debug!(
+        tracing::info!(
             %peer,
             pending = pending.len(),
             "remember_courtesy_intent: recorded pending courtesy join"
         );
+        if !peer.addr.ip().is_unspecified() {
+            let mut addr_set = self.pending_courtesy_addr.lock();
+            addr_set.insert(peer.addr);
+            tracing::info!(
+                %peer,
+                addr = %peer.addr,
+                pending = addr_set.len(),
+                "remember_courtesy_intent: tracking courtesy addr"
+            );
+        }
     }
 
     fn take_pending_courtesy(&self, peer: &PeerId) -> bool {
@@ -153,8 +284,36 @@ impl ConnectionManager {
                 pending = pending.len(),
                 "take_pending_courtesy: consuming pending courtesy flag"
             );
+            if !peer.addr.ip().is_unspecified() {
+                let mut addr_set = self.pending_courtesy_addr.lock();
+                if addr_set.remove(&peer.addr) {
+                    tracing::debug!(
+                        %peer,
+                        addr = %peer.addr,
+                        remaining = addr_set.len(),
+                        "take_pending_courtesy: removed pending courtesy addr"
+                    );
+                }
+            }
         }
         removed
+    }
+
+    pub(crate) fn take_pending_courtesy_by_addr(&self, addr: &SocketAddr) -> bool {
+        if !self.is_gateway {
+            return false;
+        }
+        let mut addr_set = self.pending_courtesy_addr.lock();
+        if addr_set.remove(addr) {
+            tracing::info!(
+                addr = %addr,
+                remaining = addr_set.len(),
+                "take_pending_courtesy_by_addr: consuming pending courtesy flag"
+            );
+            true
+        } else {
+            false
+        }
     }
 
     fn register_courtesy_connection(&self, peer: &PeerId) -> Option<PeerId> {
@@ -225,9 +384,19 @@ impl ConnectionManager {
         let open = self
             .open_connections
             .load(std::sync::atomic::Ordering::SeqCst);
-        let reserved_before = self
-            .reserved_connections
-            .load(std::sync::atomic::Ordering::SeqCst);
+
+        if self.location_for_peer.read().contains_key(peer_id) {
+            if courtesy_join {
+                self.remember_courtesy_intent(peer_id);
+            }
+            tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
+            return true;
+        }
+
+        let reserved_before = match self.reserve_connection_slot(peer_id) {
+            Some(val) => val,
+            None => return false,
+        };
 
         tracing::info!(
             %peer_id,
@@ -249,35 +418,6 @@ impl ConnectionManager {
             );
         }
 
-        let reserved_before = loop {
-            let current = self
-                .reserved_connections
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if current == usize::MAX {
-                tracing::error!(
-                    %peer_id,
-                    "reserved connection counter overflowed; rejecting new connection"
-                );
-                return false;
-            }
-            match self.reserved_connections.compare_exchange(
-                current,
-                current + 1,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            ) {
-                Ok(_) => break current,
-                Err(actual) => {
-                    tracing::debug!(
-                        %peer_id,
-                        expected = current,
-                        actual,
-                        "reserved connection counter changed concurrently; retrying"
-                    );
-                }
-            }
-        };
-
         let total_conn = match reserved_before
             .checked_add(1)
             .and_then(|val| val.checked_add(open))
@@ -290,13 +430,17 @@ impl ConnectionManager {
                     open,
                     "connection counters would overflow; rejecting connection"
                 );
-                self.reserved_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.release_reserved_slot(Some(peer_id), "should_accept_overflow_guard");
                 return false;
             }
         };
 
         if open == 0 {
+            if courtesy_join {
+                self.remember_courtesy_intent(peer_id);
+            }
+            self.record_pending_location(peer_id, location);
+            self.register_pending_connection(peer_id, true);
             tracing::debug!(%peer_id, "should_accept: first connection -> accepting");
             return true;
         }
@@ -312,20 +456,23 @@ impl ConnectionManager {
                     limit = GATEWAY_DIRECT_ACCEPT_LIMIT,
                     "Gateway reached direct-accept limit; forwarding join request instead"
                 );
-                self.reserved_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.release_reserved_slot(Some(peer_id), "gateway_direct_accept_limit");
                 tracing::info!(%peer_id, "should_accept: gateway direct-accept limit hit, forwarding instead");
                 return false;
             }
         }
 
         if self.location_for_peer.read().get(peer_id).is_some() {
+            if courtesy_join {
+                self.remember_courtesy_intent(peer_id);
+            }
             // We've already accepted this peer (pending or active); treat as a no-op acceptance.
             tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
             return true;
         }
 
         if courtesy_join {
+            tracing::info!(%peer_id, "should_accept: marking courtesy intent");
             self.remember_courtesy_intent(peer_id);
             tracing::debug!(
                 %peer_id,
@@ -333,6 +480,8 @@ impl ConnectionManager {
                 reserved = reserved_before,
                 "should_accept: accepting courtesy connection despite topology limits"
             );
+            self.record_pending_location(peer_id, location);
+            self.register_pending_connection(peer_id, true);
             return true;
         }
 
@@ -368,11 +517,11 @@ impl ConnectionManager {
             "should_accept: final decision"
         );
         if !accepted {
-            self.reserved_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.release_reserved_slot(Some(peer_id), "should_accept_rejected");
         } else {
             tracing::info!(%peer_id, total_conn, "should_accept: accepted (reserving spot)");
             self.record_pending_location(peer_id, location);
+            self.register_pending_connection(peer_id, true);
         }
         accepted
     }
@@ -477,18 +626,18 @@ impl ConnectionManager {
             "Adding connection to topology"
         );
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
-        if was_reserved {
-            let old = self
-                .reserved_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            #[cfg(debug_assertions)]
-            {
-                tracing::debug!(old, "Decremented reserved connections");
-                if old == 0 {
-                    panic!("Underflow of reserved connections");
-                }
-            }
-            let _ = old;
+        let pending_meta = self.take_pending_connection(&peer);
+        let reserved_slot = pending_meta
+            .as_ref()
+            .map(|meta| meta.reserved)
+            .unwrap_or(was_reserved);
+        if reserved_slot {
+            self.release_reserved_slot(Some(&peer), "add_connection");
+        } else if was_reserved {
+            tracing::warn!(
+                %peer,
+                "add_connection: expected reserved slot but pending entry missing"
+            );
         }
         let mut lop = self.location_for_peer.write();
         lop.insert(peer.clone(), loc);
@@ -506,7 +655,13 @@ impl ConnectionManager {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::mem::drop(lop);
 
-        let courtesy = courtesy || self.take_pending_courtesy(&peer);
+        let courtesy = if courtesy {
+            // Clear any pending markers so they don't leak.
+            let _ = self.take_pending_courtesy(&peer);
+            true
+        } else {
+            self.take_pending_courtesy(&peer)
+        };
 
         if courtesy {
             self.register_courtesy_connection(&peer)
@@ -514,6 +669,17 @@ impl ConnectionManager {
             self.unregister_courtesy_connection(&peer);
             None
         }
+    }
+
+    pub fn register_outbound_pending(&self, peer: &PeerId, location: Option<Location>) {
+        if let Some(loc) = location {
+            self.record_pending_location(peer, loc);
+        }
+        self.register_pending_connection(peer, false);
+    }
+
+    pub fn pending_location_hint(&self, peer: &PeerId) -> Option<Location> {
+        self.location_for_peer.read().get(peer).copied()
     }
 
     pub fn update_peer_identity(&self, old_peer: &PeerId, new_peer: PeerId) -> bool {
@@ -565,14 +731,24 @@ impl ConnectionManager {
         tracing::debug!(%peer, "Pruning {} connection", connection_type);
 
         let mut locations_for_peer = self.location_for_peer.write();
+        let pending_meta = if is_alive {
+            None
+        } else {
+            self.take_pending_connection(peer)
+        };
 
         let Some(loc) = locations_for_peer.remove(peer) else {
             if is_alive {
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
             } else {
-                self.reserved_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(meta) = pending_meta {
+                    if meta.reserved {
+                        self.release_reserved_slot(Some(peer), "prune_missing_in_transit");
+                    }
+                } else {
+                    tracing::warn!(%peer, "prune_missing_in_transit: no pending entry found while releasing");
+                }
             }
             return None;
         };
@@ -588,9 +764,12 @@ impl ConnectionManager {
             self.unregister_courtesy_connection(peer);
             self.open_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        } else if let Some(meta) = pending_meta {
+            if meta.reserved {
+                self.release_reserved_slot(Some(peer), "prune_in_transit");
+            }
         } else {
-            self.reserved_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            tracing::warn!(%peer, "prune_in_transit: missing pending entry while releasing");
         }
 
         Some(loc)
