@@ -575,6 +575,29 @@ impl Operation for PutOp {
                             .send(&upstream.peer, NetMessage::from(ack))
                             .await?;
 
+                        // Also ack the original requester so they don't depend on upstream propagation.
+                        if origin.peer != sender.peer && origin.peer != upstream.peer {
+                            let direct_ack = PutMsg::SuccessfulPut {
+                                id: *id,
+                                target: origin.clone(),
+                                key: *key,
+                                sender: sender.clone(),
+                                origin: origin.clone(),
+                            };
+
+                            if let Err(err) = conn_manager
+                                .send(&origin.peer, NetMessage::from(direct_ack))
+                                .await
+                            {
+                                tracing::warn!(
+                                    tx = %id,
+                                    %key,
+                                    origin_peer = %origin.peer,
+                                    "Failed to send direct SuccessfulPut to origin from broadcast start: {err}"
+                                );
+                            }
+                        }
+
                         new_state = None;
                     }
 
