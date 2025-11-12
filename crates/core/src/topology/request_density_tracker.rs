@@ -248,6 +248,7 @@ pub(crate) enum DensityMapError {
 mod tests {
     use super::*;
     use std::sync::RwLock;
+    use tracing::debug;
 
     #[test]
     fn test_create_density_map() {
@@ -327,12 +328,12 @@ mod tests {
         let result = result.unwrap();
 
         // Scan and dumb densities 0.0 to 1.0 at 0.01 intervals
-        println!("Location\tDensity");
+        debug!("Location\tDensity");
         for i in 0..100 {
             let location = Location::new(i as f64 / 100.0);
             let density = result.get_density_at(location).unwrap();
             // Print and round density to 2 decimals
-            println!(
+            debug!(
                 "{}\t{}",
                 location.as_f64(),
                 (density * 100.0).round() / 100.0

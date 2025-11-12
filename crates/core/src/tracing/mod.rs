@@ -241,6 +241,7 @@ impl<'a> NetEventLog<'a> {
                 target,
                 key,
                 sender,
+                ..
             }) => EventKind::Put(PutEvent::PutSuccess {
                 id: *id,
                 requester: sender.clone(),
