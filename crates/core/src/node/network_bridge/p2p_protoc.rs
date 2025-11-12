@@ -1611,7 +1611,6 @@ impl P2pConnManager {
                 // Get the remote address from the connection
                 let remote_addr = peer_conn.conn.remote_addr();
                 let tx = *peer_conn.msg.id();
-
                 if let Some(sender_peer) = extract_sender_from_message(&peer_conn.msg) {
                     if sender_peer.peer.addr == remote_addr
                         || sender_peer.peer.addr.ip().is_unspecified()
