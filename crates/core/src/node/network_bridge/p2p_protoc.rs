@@ -1655,11 +1655,17 @@ async fn peer_connection_listener(
     mut rx: PeerConnChannelRecv,
     mut conn: PeerConnection,
 ) -> Result<PeerConnectionInbound, TransportError> {
+    const MAX_IMMEDIATE_SENDS: usize = 32;
     loop {
+        let mut drained = 0;
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
                     handle_peer_channel_message(&mut conn, msg).await?;
+                    drained += 1;
+                    if drained >= MAX_IMMEDIATE_SENDS {
+                        break;
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
