@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
+use tokio::sync::mpsc;
 
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
@@ -164,7 +164,7 @@ pub(crate) trait RelayContext {
     fn self_location(&self) -> &PeerKeyLocation;
 
     /// Determine whether we should accept the joiner immediately.
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool;
+    fn should_accept(&self, joiner: &PeerKeyLocation, courtesy: bool) -> bool;
 
     /// Choose the next hop for the request, avoiding peers already visited.
     fn select_next_hop(
@@ -178,10 +178,16 @@ pub(crate) trait RelayContext {
 }
 
 /// Result of processing a request at a relay.
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedConnection {
+    pub peer: PeerKeyLocation,
+    pub courtesy: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct RelayActions {
     pub accept_response: Option<ConnectResponse>,
-    pub expect_connection_from: Option<PeerKeyLocation>,
+    pub expect_connection_from: Option<ExpectedConnection>,
     pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
     pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
 }
@@ -209,16 +215,20 @@ impl RelayState {
             actions.observed_address = Some((self.request.origin.clone(), observed_addr));
         }
 
-        if !self.accepted_locally && ctx.should_accept(&self.request.origin) {
+        let acceptor = ctx.self_location().clone();
+        let courtesy = ctx.courtesy_hint(&acceptor, &self.request.origin);
+
+        if !self.accepted_locally && ctx.should_accept(&self.request.origin, courtesy) {
             self.accepted_locally = true;
-            let acceptor = ctx.self_location().clone();
-            let courtesy = ctx.courtesy_hint(&acceptor, &self.request.origin);
             self.courtesy_hint = courtesy;
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
                 courtesy,
             });
-            actions.expect_connection_from = Some(self.request.origin.clone());
+            actions.expect_connection_from = Some(ExpectedConnection {
+                peer: self.request.origin.clone(),
+                courtesy,
+            });
         }
 
         if self.forwarded_to.is_none() && self.request.ttl > 0 {
@@ -273,14 +283,14 @@ impl RelayContext for RelayEnv<'_> {
         &self.self_location
     }
 
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool {
+    fn should_accept(&self, joiner: &PeerKeyLocation, courtesy: bool) -> bool {
         let location = joiner
             .location
             .unwrap_or_else(|| Location::from_address(&joiner.peer.addr));
         self.op_manager
             .ring
             .connection_manager
-            .should_accept(location, &joiner.peer)
+            .should_accept(location, &joiner.peer, courtesy)
     }
 
     fn select_next_hop(
@@ -297,10 +307,7 @@ impl RelayContext for RelayEnv<'_> {
     }
 
     fn courtesy_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
-        // Courtesy slots still piggyback on regular connections. Flag the first acceptance so the
-        // joiner can prioritise it, and keep the logic simple until dedicated courtesy tracking
-        // is wired in (see courtesy-connection-budget branch).
-        self.op_manager.ring.open_connections() == 0
+        self.op_manager.ring.is_gateway()
     }
 }
 
@@ -592,10 +599,11 @@ impl Operation for ConnectOp {
                             .await?;
                     }
 
-                    if let Some(peer) = actions.expect_connection_from {
+                    if let Some(expected) = actions.expect_connection_from {
                         op_manager
                             .notify_node_event(NodeEvent::ExpectPeerConnection {
-                                peer: peer.peer.clone(),
+                                peer: expected.peer.peer.clone(),
+                                courtesy: expected.courtesy,
                             })
                             .await?;
                     }
@@ -654,6 +662,7 @@ impl Operation for ConnectOp {
                                     .notify_node_event(
                                         crate::message::NodeEvent::ExpectPeerConnection {
                                             peer: new_acceptor.peer.peer.clone(),
+                                            courtesy: new_acceptor.courtesy,
                                         },
                                     )
                                     .await?;
@@ -781,7 +790,7 @@ pub(crate) async fn join_ring_request(
     if !op_manager
         .ring
         .connection_manager
-        .should_accept(location, &gateway.peer)
+        .should_accept(location, &gateway.peer, false)
     {
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
     }
@@ -992,7 +1001,7 @@ mod tests {
             &self.self_loc
         }
 
-        fn should_accept(&self, _joiner: &PeerKeyLocation) -> bool {
+        fn should_accept(&self, _joiner: &PeerKeyLocation, _courtesy: bool) -> bool {
             self.accept
         }
 
@@ -1043,7 +1052,10 @@ mod tests {
         let response = actions.accept_response.expect("expected acceptance");
         assert_eq!(response.acceptor.peer, self_loc.peer);
         assert!(response.courtesy);
-        assert_eq!(actions.expect_connection_from.unwrap().peer, joiner.peer);
+        assert_eq!(
+            actions.expect_connection_from.unwrap().peer.peer,
+            joiner.peer
+        );
         assert!(actions.forward.is_none());
     }
 

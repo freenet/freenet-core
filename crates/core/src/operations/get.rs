@@ -82,6 +82,16 @@ pub(crate) async fn request_get(
     get_op: GetOp,
     skip_list: HashSet<PeerId>,
 ) -> Result<(), OpError> {
+    let mut skip_list = skip_list;
+    // Always avoid bouncing straight back to ourselves.
+    skip_list.insert(
+        op_manager
+            .ring
+            .connection_manager
+            .own_location()
+            .peer
+            .clone(),
+    );
     let (mut candidates, id, key_val, _fetch_contract) = if let Some(GetState::PrepareRequest {
         key,
         id,
@@ -1271,6 +1281,7 @@ async fn try_forward_or_return(
 
     let mut new_skip_list = skip_list.clone();
     new_skip_list.insert(this_peer.peer.clone());
+    new_skip_list.insert(sender.peer.clone());
 
     let new_htl = htl.saturating_sub(1);
 

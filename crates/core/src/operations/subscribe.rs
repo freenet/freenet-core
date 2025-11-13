@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration};
 
 const MAX_RETRIES: usize = 10;
+/// Maximum time in milliseconds to wait for a locally fetched contract to become available.
 const LOCAL_FETCH_TIMEOUT_MS: u64 = 1_500;
+/// Polling interval in milliseconds while waiting for a fetched contract to be stored locally.
 const LOCAL_FETCH_POLL_INTERVAL_MS: u64 = 25;
 
 fn subscribers_snapshot(op_manager: &OpManager, key: &ContractKey) -> Vec<String> {
@@ -33,6 +35,50 @@ fn subscribers_snapshot(op_manager: &OpManager, key: &ContractKey) -> Vec<String
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn register_subscriber_with_logging(
+    tx: &Transaction,
+    op_manager: &OpManager,
+    key: &ContractKey,
+    subscriber: &PeerKeyLocation,
+    stage: &'static str,
+) -> Result<(), ()> {
+    let before = subscribers_snapshot(op_manager, key);
+    tracing::debug!(
+        tx = %tx,
+        %key,
+        subscriber = %subscriber.peer,
+        stage,
+        subscribers_before = ?before,
+        "subscribe: attempting to register subscriber"
+    );
+
+    match op_manager.ring.add_subscriber(key, subscriber.clone()) {
+        Ok(()) => {
+            let after = subscribers_snapshot(op_manager, key);
+            tracing::debug!(
+                tx = %tx,
+                %key,
+                subscriber = %subscriber.peer,
+                stage,
+                subscribers_after = ?after,
+                "subscribe: registered subscriber"
+            );
+            Ok(())
+        }
+        Err(_) => {
+            tracing::warn!(
+                tx = %tx,
+                %key,
+                subscriber = %subscriber.peer,
+                stage,
+                subscribers_before = ?before,
+                "subscribe: subscriber registration failed (max subscribers reached)"
+            );
+            Err(())
+        }
+    }
 }
 
 /// Poll local storage for a short period until the fetched contract becomes available.
@@ -646,37 +692,18 @@ impl Operation for SubscribeOp {
                         // After fetch attempt we should now have the contract locally.
                     }
 
-                    let before_direct = subscribers_snapshot(op_manager, key);
-                    tracing::info!(
-                        tx = %id,
-                        %key,
-                        subscriber = %subscriber.peer,
-                        subscribers_before = ?before_direct,
-                        "subscribe: attempting to register direct subscriber"
-                    );
-                    if op_manager
-                        .ring
-                        .add_subscriber(key, subscriber.clone())
-                        .is_err()
+                    if register_subscriber_with_logging(
+                        id,
+                        op_manager,
+                        key,
+                        subscriber,
+                        "direct subscriber",
+                    )
+                    .is_err()
                     {
-                        tracing::warn!(
-                            tx = %id,
-                            %key,
-                            subscriber = %subscriber.peer,
-                            subscribers_before = ?before_direct,
-                            "subscribe: direct registration failed (max subscribers reached)"
-                        );
                         // max number of subscribers for this contract reached
                         return Ok(return_not_subbed());
                     }
-                    let after_direct = subscribers_snapshot(op_manager, key);
-                    tracing::info!(
-                        tx = %id,
-                        %key,
-                        subscriber = %subscriber.peer,
-                        subscribers_after = ?after_direct,
-                        "subscribe: registered direct subscriber"
-                    );
 
                     match self.state {
                         Some(SubscribeState::ReceivedRequest) => {
@@ -768,7 +795,15 @@ impl Operation for SubscribeOp {
                         upstream_subscriber,
                         ..
                     }) => {
-                        fetch_contract_if_missing(op_manager, *key).await?;
+                        if let Err(err) = fetch_contract_if_missing(op_manager, *key).await {
+                            tracing::warn!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "Failed to fetch contract code after successful subscription"
+                            );
+                            return Err(err);
+                        }
 
                         tracing::info!(
                             tx = %id,
@@ -787,63 +822,26 @@ impl Operation for SubscribeOp {
                             "Handling ReturnSub (subscribed=true)"
                         );
                         if let Some(upstream_subscriber) = upstream_subscriber.as_ref() {
-                            let before_upstream = subscribers_snapshot(op_manager, key);
-                            tracing::info!(
-                                tx = %id,
-                                %key,
-                                upstream = %upstream_subscriber.peer,
-                                subscribers_before = ?before_upstream,
-                                "subscribe: attempting to register upstream link"
+                            let _ = register_subscriber_with_logging(
+                                id,
+                                op_manager,
+                                key,
+                                upstream_subscriber,
+                                "upstream link",
                             );
-                            if op_manager
-                                .ring
-                                .add_subscriber(key, upstream_subscriber.clone())
-                                .is_err()
-                            {
-                                tracing::warn!(
-                                    tx = %id,
-                                    %key,
-                                    upstream = %upstream_subscriber.peer,
-                                    subscribers_before = ?before_upstream,
-                                    "subscribe: upstream registration failed (max subscribers reached)"
-                                );
-                            } else {
-                                let after_upstream = subscribers_snapshot(op_manager, key);
-                                tracing::info!(
-                                    tx = %id,
-                                    %key,
-                                    upstream = %upstream_subscriber.peer,
-                                    subscribers_after = ?after_upstream,
-                                    "subscribe: registered upstream link"
-                                );
-                            }
                         }
 
-                        let before_provider = subscribers_snapshot(op_manager, key);
-                        tracing::info!(
-                            tx = %id,
-                            %key,
-                            provider = %sender.peer,
-                            subscribers_before = ?before_provider,
-                            "subscribe: registering provider/subscription source"
-                        );
-                        if op_manager.ring.add_subscriber(key, sender.clone()).is_err() {
-                            // concurrently it reached max number of subscribers for this contract
-                            tracing::debug!(
-                                tx = %id,
-                                %key,
-                                "Max number of subscribers reached for contract"
-                            );
+                        if register_subscriber_with_logging(
+                            id,
+                            op_manager,
+                            key,
+                            sender,
+                            "provider link",
+                        )
+                        .is_err()
+                        {
                             return Err(OpError::UnexpectedOpState);
                         }
-                        let after_provider = subscribers_snapshot(op_manager, key);
-                        tracing::info!(
-                            tx = %id,
-                            %key,
-                            provider = %sender.peer,
-                            subscribers_after = ?after_provider,
-                            "subscribe: registered provider/subscription source"
-                        );
 
                         new_state = Some(SubscribeState::Completed { key: *key });
                         if let Some(upstream_subscriber) = upstream_subscriber {

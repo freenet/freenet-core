@@ -940,8 +940,8 @@ where
                 NodeEvent::QueryNodeDiagnostics { .. } => {
                     unimplemented!()
                 }
-                NodeEvent::ExpectPeerConnection { peer } => {
-                    tracing::debug!(%peer, "ExpectPeerConnection ignored in testing impl");
+                NodeEvent::ExpectPeerConnection { peer, courtesy } => {
+                    tracing::debug!(%peer, courtesy, "ExpectPeerConnection ignored in testing impl");
                     continue;
                 }
             },

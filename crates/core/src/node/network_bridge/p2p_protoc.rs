@@ -14,7 +14,8 @@ use std::{
     sync::Arc,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::timeout;
 use tracing::Instrument;
 
@@ -629,14 +630,14 @@ impl P2pConnManager {
                                 )
                                 .await?;
                             }
-                            NodeEvent::ExpectPeerConnection { peer } => {
-                                tracing::debug!(%peer, "ExpectPeerConnection event received; registering inbound expectation via handshake driver");
+                            NodeEvent::ExpectPeerConnection { peer, courtesy } => {
+                                tracing::debug!(%peer, courtesy, "ExpectPeerConnection event received; registering inbound expectation via handshake driver");
                                 state.outbound_handler.expect_incoming(peer.addr);
                                 if let Err(error) = handshake_cmd_sender
                                     .send(HandshakeCommand::ExpectInbound {
                                         peer: peer.clone(),
                                         transaction: None,
-                                        courtesy: false,
+                                        courtesy,
                                     })
                                     .await
                                 {
@@ -750,8 +751,12 @@ impl P2pConnManager {
 
                                 // Collect node information
                                 if config.include_node_info {
-                                    // Calculate location and adress if is set
-                                    let (addr, location) = if let Some(peer_id) =
+                                    // Prefer the runtime's current ring location; fall back to derivation from the peer's
+                                    // advertised address if we don't have one yet.
+                                    let current_location =
+                                        op_manager.ring.connection_manager.own_location().location;
+
+                                    let (addr, fallback_location) = if let Some(peer_id) =
                                         op_manager.ring.connection_manager.get_peer_key()
                                     {
                                         let location = Location::from_address(&peer_id.addr);
@@ -760,11 +765,15 @@ impl P2pConnManager {
                                         (None, None)
                                     };
 
+                                    let location_str = current_location
+                                        .or(fallback_location)
+                                        .map(|loc| format!("{:.6}", loc.as_f64()));
+
                                     // Always include basic node info, but only include address/location if available
                                     response.node_info = Some(NodeInfo {
                                         peer_id: ctx.key_pair.public().to_string(),
                                         is_gateway: self.is_gateway,
-                                        location: location.map(|loc| format!("{:.6}", loc.0)),
+                                        location: location_str,
                                         listening_address: addr
                                             .map(|peer_addr| peer_addr.to_string()),
                                         uptime_seconds: 0, // TODO: implement actual uptime tracking
@@ -1258,6 +1267,12 @@ impl P2pConnManager {
                     "connect_peer: registered new pending connection"
                 );
                 state.outbound_handler.expect_incoming(peer_addr);
+                let loc_hint = Location::from_address(&peer.addr);
+                self.bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .register_outbound_pending(&peer, Some(loc_hint));
             }
         }
 
@@ -1350,6 +1365,7 @@ impl P2pConnManager {
                     }
                 }
 
+                let mut derived_courtesy = courtesy;
                 let peer_id = peer.unwrap_or_else(|| {
                     tracing::info!(
                         remote = %remote_addr,
@@ -1369,15 +1385,31 @@ impl P2pConnManager {
                     )
                 });
 
+                if !derived_courtesy {
+                    derived_courtesy = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .take_pending_courtesy_by_addr(&remote_addr);
+                }
+
                 tracing::info!(
                     remote = %peer_id.addr,
-                    courtesy,
+                    courtesy = derived_courtesy,
                     transaction = ?transaction,
                     "Inbound connection established"
                 );
 
-                self.handle_successful_connection(peer_id, connection, state, select_stream, None)
-                    .await?;
+                self.handle_successful_connection(
+                    peer_id,
+                    connection,
+                    state,
+                    select_stream,
+                    None,
+                    derived_courtesy,
+                )
+                .await?;
             }
             HandshakeEvent::OutboundEstablished {
                 transaction,
@@ -1391,8 +1423,15 @@ impl P2pConnManager {
                     transaction = %transaction,
                     "Outbound connection established"
                 );
-                self.handle_successful_connection(peer, connection, state, select_stream, None)
-                    .await?;
+                self.handle_successful_connection(
+                    peer,
+                    connection,
+                    state,
+                    select_stream,
+                    None,
+                    courtesy,
+                )
+                .await?;
             }
             HandshakeEvent::OutboundFailed {
                 transaction,
@@ -1507,6 +1546,7 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         select_stream: &mut priority_select::ProductionPrioritySelectStream,
         remaining_checks: Option<usize>,
+        courtesy: bool,
     ) -> anyhow::Result<()> {
         let pending_txs = state
             .awaiting_connection_txs
@@ -1582,18 +1622,41 @@ impl P2pConnManager {
         }
 
         if newly_inserted {
-            let pending_loc = self
+            let loc = self
                 .bridge
                 .op_manager
                 .ring
                 .connection_manager
-                .prune_in_transit_connection(&peer_id);
-            let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
-            self.bridge
+                .pending_location_hint(&peer_id)
+                .unwrap_or_else(|| Location::from_address(&peer_id.addr));
+            let eviction_candidate = self
+                .bridge
                 .op_manager
                 .ring
-                .add_connection(loc, peer_id.clone(), false)
+                .add_connection(loc, peer_id.clone(), false, courtesy)
                 .await;
+            if let Some(victim) = eviction_candidate {
+                if victim == peer_id {
+                    tracing::debug!(
+                        %peer_id,
+                        "Courtesy eviction candidate matched current connection; skipping drop"
+                    );
+                } else {
+                    tracing::info!(
+                        %victim,
+                        %peer_id,
+                        courtesy_limit = true,
+                        "Courtesy connection budget exceeded; dropping oldest courtesy peer"
+                    );
+                    if let Err(error) = self.bridge.drop_connection(&victim).await {
+                        tracing::warn!(
+                            %victim,
+                            ?error,
+                            "Failed to drop courtesy connection after hitting budget"
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1611,6 +1674,46 @@ impl P2pConnManager {
                 // Get the remote address from the connection
                 let remote_addr = peer_conn.conn.remote_addr();
                 let tx = *peer_conn.msg.id();
+                if let Some(sender_peer) = extract_sender_from_message(&peer_conn.msg) {
+                    if sender_peer.peer.addr == remote_addr
+                        || sender_peer.peer.addr.ip().is_unspecified()
+                    {
+                        let mut new_peer_id = sender_peer.peer.clone();
+                        if new_peer_id.addr.ip().is_unspecified() {
+                            new_peer_id.addr = remote_addr;
+                            if let Some(sender_mut) =
+                                extract_sender_from_message_mut(&mut peer_conn.msg)
+                            {
+                                if sender_mut.peer.addr.ip().is_unspecified() {
+                                    sender_mut.peer.addr = remote_addr;
+                                }
+                            }
+                        }
+                        if let Some(existing_key) = self
+                            .connections
+                            .keys()
+                            .find(|peer| {
+                                peer.addr == remote_addr && peer.pub_key != new_peer_id.pub_key
+                            })
+                            .cloned()
+                        {
+                            if let Some(channel) = self.connections.remove(&existing_key) {
+                                tracing::info!(
+                                    remote = %remote_addr,
+                                    old_peer = %existing_key,
+                                    new_peer = %new_peer_id,
+                                    "Updating provisional peer identity after inbound message"
+                                );
+                                self.bridge
+                                    .op_manager
+                                    .ring
+                                    .update_connection_identity(&existing_key, new_peer_id.clone());
+                                self.connections.insert(new_peer_id, channel);
+                            }
+                        }
+                    }
+                }
+
                 if let Some(sender_peer) = extract_sender_from_message(&peer_conn.msg) {
                     if sender_peer.peer.addr == remote_addr
                         || sender_peer.peer.addr.ip().is_unspecified()
