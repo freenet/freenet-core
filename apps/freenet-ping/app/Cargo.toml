@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 testing = ["freenet-stdlib/testing", "freenet/testing"]
+manual-tests = []
 
 [dependencies]
 anyhow = "1.0"
