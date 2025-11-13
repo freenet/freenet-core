@@ -5,7 +5,6 @@
 //! connection attempts to/from the event loop. Higher-level routing decisions now live inside
 //! `ConnectOp`.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,6 +19,8 @@ use crate::dev_tool::{Location, PeerId, Transaction};
 use crate::node::network_bridge::ConnectionError;
 use crate::ring::ConnectionManager;
 use crate::router::Router;
+use std::collections::HashMap;
+
 use crate::transport::{InboundConnectionHandler, OutboundConnectionHandler, PeerConnection};
 
 /// Events emitted by the handshake driver.
@@ -124,6 +125,37 @@ struct ExpectedInbound {
     courtesy: bool,
 }
 
+#[derive(Default)]
+struct ExpectedInboundTracker {
+    entries: HashMap<SocketAddr, ExpectedInbound>,
+}
+
+impl ExpectedInboundTracker {
+    fn register(&mut self, peer: PeerId, transaction: Option<Transaction>, courtesy: bool) {
+        self.entries.insert(
+            peer.addr,
+            ExpectedInbound {
+                peer,
+                transaction,
+                courtesy,
+            },
+        );
+    }
+
+    fn drop_peer(&mut self, peer: &PeerId) {
+        self.entries.remove(&peer.addr);
+    }
+
+    fn consume(&mut self, addr: SocketAddr) -> Option<ExpectedInbound> {
+        self.entries.remove(&addr)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, addr: SocketAddr) -> bool {
+        self.entries.contains_key(&addr)
+    }
+}
+
 async fn run_driver(
     mut inbound: InboundConnectionHandler,
     outbound: OutboundConnectionHandler,
@@ -133,7 +165,7 @@ async fn run_driver(
 ) {
     use tokio::select;
 
-    let mut expected_inbound: HashMap<SocketAddr, ExpectedInbound> = HashMap::new();
+    let mut expected_inbound = ExpectedInboundTracker::default();
 
     loop {
         select! {
@@ -142,10 +174,10 @@ async fn run_driver(
                     spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, courtesy, peer_ready.clone());
                 }
                 Some(Command::ExpectInbound { peer, transaction, courtesy }) => {
-                    expected_inbound.insert(peer.addr, ExpectedInbound { peer, transaction, courtesy });
+                    expected_inbound.register(peer, transaction, courtesy);
                 }
                 Some(Command::DropConnection { peer }) => {
-                    expected_inbound.remove(&peer.addr);
+                    expected_inbound.drop_peer(&peer);
                 }
                 None => break,
             },
@@ -157,7 +189,7 @@ async fn run_driver(
                         }
 
                         let remote_addr = conn.remote_addr();
-                        let entry = expected_inbound.remove(&remote_addr);
+                        let entry = expected_inbound.consume(remote_addr);
                         let (peer, transaction, courtesy) = if let Some(entry) = entry {
                             (Some(entry.peer), entry.transaction, entry.courtesy)
                         } else {
@@ -221,4 +253,61 @@ fn spawn_outbound(
 
         let _ = events_tx.send(event).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::connect::ConnectMsg;
+    use crate::transport::TransportKeypair;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn make_peer(port: u16) -> PeerId {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let keypair = TransportKeypair::new();
+        PeerId::new(addr, keypair.public().clone())
+    }
+
+    #[test]
+    fn tracker_returns_registered_entry_exactly_once() {
+        let mut tracker = ExpectedInboundTracker::default();
+        let peer = make_peer(4100);
+        let tx = Transaction::new::<ConnectMsg>();
+        tracker.register(peer.clone(), Some(tx), true);
+
+        let entry = tracker
+            .consume(peer.addr)
+            .expect("expected registered inbound entry");
+        assert_eq!(entry.peer, peer);
+        assert_eq!(entry.transaction, Some(tx));
+        assert!(entry.courtesy);
+        assert!(tracker.consume(peer.addr).is_none());
+    }
+
+    #[test]
+    fn tracker_drop_removes_entry() {
+        let mut tracker = ExpectedInboundTracker::default();
+        let peer = make_peer(4200);
+        tracker.register(peer.clone(), None, false);
+        assert!(tracker.contains(peer.addr));
+
+        tracker.drop_peer(&peer);
+        assert!(!tracker.contains(peer.addr));
+        assert!(tracker.consume(peer.addr).is_none());
+    }
+
+    #[test]
+    fn tracker_overwrites_existing_expectation() {
+        let mut tracker = ExpectedInboundTracker::default();
+        let peer = make_peer(4300);
+        tracker.register(peer.clone(), None, false);
+        let new_tx = Transaction::new::<ConnectMsg>();
+        tracker.register(peer.clone(), Some(new_tx), true);
+
+        let entry = tracker
+            .consume(peer.addr)
+            .expect("entry should be present after overwrite");
+        assert_eq!(entry.transaction, Some(new_tx));
+        assert!(entry.courtesy);
+    }
 }

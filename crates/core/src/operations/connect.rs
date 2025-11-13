@@ -1129,4 +1129,59 @@ mod tests {
             Some(ConnectState::WaitingForResponses(_))
         ));
     }
+
+    #[test]
+    fn multi_hop_forward_path_tracks_ttl_and_visited_peers() {
+        let joiner = make_peer(8100);
+        let relay_a = make_peer(8200);
+        let relay_b = make_peer(8300);
+
+        let request = ConnectRequest {
+            desired_location: Location::random(),
+            origin: joiner.clone(),
+            ttl: 3,
+            visited: vec![joiner.clone()],
+        };
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut relay_op = ConnectOp::new_relay(tx, joiner.clone(), request.clone());
+        let ctx = TestRelayContext::new(relay_a.clone())
+            .accept(false)
+            .next_hop(Some(relay_b.clone()));
+        let actions =
+            relay_op.handle_request(&ctx, joiner.clone(), request.clone(), joiner.peer.addr);
+
+        let (forward_target, forward_request) = actions
+            .forward
+            .expect("relay should forward when it declines to accept");
+        assert_eq!(forward_target.peer, relay_b.peer);
+        assert_eq!(forward_request.ttl, 2);
+        assert!(
+            forward_request
+                .visited
+                .iter()
+                .any(|p| p.peer == relay_a.peer),
+            "forwarded request should record intermediate relay"
+        );
+
+        // Second hop should accept and notify the joiner.
+        let mut accepting_relay =
+            ConnectOp::new_relay(tx, relay_a.clone(), forward_request.clone());
+        let ctx_accept = TestRelayContext::new(relay_b.clone());
+        let accept_actions = accepting_relay.handle_request(
+            &ctx_accept,
+            relay_a.clone(),
+            forward_request,
+            relay_a.peer.addr,
+        );
+
+        let response = accept_actions
+            .accept_response
+            .expect("second relay should accept when policy allows");
+        assert_eq!(response.acceptor.peer, relay_b.peer);
+        let expect_conn = accept_actions
+            .expect_connection_from
+            .expect("acceptance should request inbound connection from joiner");
+        assert_eq!(expect_conn.peer, joiner.peer);
+    }
 }

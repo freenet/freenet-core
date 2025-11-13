@@ -84,6 +84,52 @@ jobs:
         run: cargo test --test ubertest --no-default-features --features trace,websocket,redb
         working-directory: crates/core
 
+  six_peer_regression:
+    name: six-peer-regression
+    needs: test_all
+    runs-on: freenet-default-runner
+    timeout-minutes: 120
+
+    env:
+      FREENET_LOG: error
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Checkout river
+        uses: actions/checkout@v5
+        with:
+          repository: freenet/river
+          ref: main
+          path: river-src
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            river-src
+
+      - name: Run six-peer regression
+        working-directory: river-src
+        env:
+          FREENET_CORE_PATH: ${{ github.workspace }}
+          RUST_LOG: info
+        run: >
+          cargo test --test message_flow
+          river_message_flow_over_freenet_six_peers_five_rounds
+          -- --ignored --exact
+
   clippy_check:
     name: Clippy
 
