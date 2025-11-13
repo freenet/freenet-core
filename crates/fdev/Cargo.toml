@@ -10,7 +10,7 @@ repository = "https://github.com/freenet/freenet-core"
 readme = "README.md"
 
 [dependencies]
-bytesize = "2.0"
+bytesize = "2.2"
 anyhow = "1"
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
 bincode = "1"
