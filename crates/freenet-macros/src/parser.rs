@@ -21,6 +21,8 @@ pub struct FreenetTestArgs {
     pub tokio_flavor: TokioFlavor,
     /// Tokio worker threads
     pub tokio_worker_threads: Option<usize>,
+    /// Connectivity ratio between peers (0.0-1.0), controlling partial connectivity
+    pub peer_connectivity_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,13 +42,18 @@ impl syn::parse::Parse for FreenetTestArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut nodes = None;
         let mut gateways = None;
-        let mut auto_connect_peers = false;
+        let mut auto_connect_peers = true;
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
         let mut aggregate_events = AggregateEventsMode::OnFailure;
-        let mut log_level = "freenet=debug,info".to_string();
+        // Default log level: freenet=debug for general debugging,
+        // transport=warn to reduce keep-alive/connection noise,
+        // p2p_protoc=info to reduce connection timeout spam,
+        // info as global default
+        let mut log_level = "freenet=debug,freenet_core::transport=warn,freenet::node::network_bridge::p2p_protoc=info,info".to_string();
         let mut tokio_flavor = TokioFlavor::CurrentThread;
         let mut tokio_worker_threads = None;
+        let mut peer_connectivity_ratio = None;
 
         // Parse key-value pairs
         while !input.is_empty() {
@@ -159,6 +166,17 @@ impl syn::parse::Parse for FreenetTestArgs {
                     let lit: syn::LitBool = input.parse()?;
                     auto_connect_peers = lit.value;
                 }
+                "peer_connectivity_ratio" => {
+                    let lit: syn::LitFloat = input.parse()?;
+                    let ratio: f64 = lit.base10_parse()?;
+                    if !(0.0..=1.0).contains(&ratio) {
+                        return Err(syn::Error::new(
+                            lit.span(),
+                            "peer_connectivity_ratio must be between 0.0 and 1.0",
+                        ));
+                    }
+                    peer_connectivity_ratio = Some(ratio);
+                }
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -201,6 +219,7 @@ impl syn::parse::Parse for FreenetTestArgs {
             log_level,
             tokio_flavor,
             tokio_worker_threads,
+            peer_connectivity_ratio,
         })
     }
 }
@@ -218,9 +237,11 @@ mod tests {
 
         let args: FreenetTestArgs = syn::parse2(tokens).unwrap();
         assert_eq!(args.nodes, vec!["gateway", "peer-1"]);
+        assert_eq!(args.auto_connect_peers, true); // Verify default is true
         assert_eq!(args.timeout_secs, 180);
         assert_eq!(args.startup_wait_secs, 15);
         assert_eq!(args.aggregate_events, AggregateEventsMode::OnFailure);
+        assert_eq!(args.log_level, "freenet=debug,freenet_core::transport=warn,freenet::node::network_bridge::p2p_protoc=info,info");
     }
 
     #[test]
@@ -260,5 +281,29 @@ mod tests {
 
         let result: Result<FreenetTestArgs, _> = syn::parse2(tokens);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auto_connect_peers_explicit_false() {
+        let tokens = quote! {
+            nodes = ["gateway", "peer-1"],
+            auto_connect_peers = false
+        };
+
+        let args: FreenetTestArgs = syn::parse2(tokens).unwrap();
+        assert_eq!(args.nodes, vec!["gateway", "peer-1"]);
+        assert_eq!(args.auto_connect_peers, false); // Verify explicit false works
+    }
+
+    #[test]
+    fn test_auto_connect_peers_explicit_true() {
+        let tokens = quote! {
+            nodes = ["gateway", "peer-1"],
+            auto_connect_peers = true
+        };
+
+        let args: FreenetTestArgs = syn::parse2(tokens).unwrap();
+        assert_eq!(args.nodes, vec!["gateway", "peer-1"]);
+        assert_eq!(args.auto_connect_peers, true);
     }
 }

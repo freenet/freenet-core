@@ -1343,6 +1343,16 @@ dependencies = [
 
 [[package]]
 name = "freenet-macros"
+version = "0.1.0"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
+
+[[package]]
+name = "freenet-macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
@@ -1360,6 +1370,7 @@ dependencies = [
  "chrono",
  "clap",
  "freenet",
+ "freenet-macros 0.1.0",
  "freenet-ping-types",
  "freenet-stdlib",
  "futures",
@@ -1409,7 +1420,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers 24.12.23",
- "freenet-macros",
+ "freenet-macros 0.1.1",
  "futures",
  "js-sys",
  "once_cell",

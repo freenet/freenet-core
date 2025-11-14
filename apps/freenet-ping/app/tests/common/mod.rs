@@ -208,11 +208,21 @@ pub(crate) enum PackageType {
     Delegate,
 }
 
+const CONTRACT_EXTRA_FEATURES: [&str; 1] = ["contract"];
+const NO_EXTRA_FEATURES: [&str; 0] = [];
+
 impl PackageType {
     pub fn feature(&self) -> &'static str {
         match self {
             PackageType::Contract => "freenet-main-contract",
             PackageType::Delegate => "freenet-main-delegate",
+        }
+    }
+
+    pub fn extra_features(&self) -> &'static [&'static str] {
+        match self {
+            PackageType::Contract => &CONTRACT_EXTRA_FEATURES,
+            PackageType::Delegate => &NO_EXTRA_FEATURES,
         }
     }
 }
@@ -250,9 +260,10 @@ fn compile_options(cli_config: &BuildToolConfig) -> impl Iterator<Item = String>
         .iter()
         .flat_map(|s| {
             s.split(',')
-                .filter(|p| *p != cli_config.package_type.feature())
+                .filter(|p| *p != cli_config.package_type.feature() && *p != "contract")
         })
-        .chain([cli_config.package_type.feature()]);
+        .chain([cli_config.package_type.feature()])
+        .chain(cli_config.package_type.extra_features().iter().copied());
     let features = [
         "--features".to_string(),
         feature_list.collect::<Vec<_>>().join(","),
@@ -262,24 +273,54 @@ fn compile_options(cli_config: &BuildToolConfig) -> impl Iterator<Item = String>
         .chain(release.iter().map(|s| s.to_string()))
 }
 // TODO: refactor so we share the implementation with fdev (need to extract to )
+fn ensure_target_dir_env() {
+    if std::env::var(TARGET_DIR_VAR).is_err() {
+        let workspace_dir = std::env::var("CARGO_WORKSPACE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| find_workspace_root());
+        let target_dir = workspace_dir.join("target");
+        std::env::set_var(TARGET_DIR_VAR, &target_dir);
+    }
+}
+
+fn find_workspace_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .ancestors()
+        .find(|dir| {
+            let cargo_toml = dir.join("Cargo.toml");
+            cargo_toml.exists()
+                && std::fs::read_to_string(&cargo_toml)
+                    .map(|contents| contents.contains("[workspace]"))
+                    .unwrap_or(false)
+        })
+        .expect("Could not determine workspace root from manifest directory")
+        .to_path_buf()
+}
+
 fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
+    ensure_target_dir_env();
     println!("module path: {contract_path:?}");
     let target = std::env::var(TARGET_DIR_VAR)
         .map_err(|_| anyhow::anyhow!("CARGO_TARGET_DIR should be set"))?;
     println!("trying to compile the test contract, target: {target}");
 
-    compile_rust_wasm_lib(
-        &BuildToolConfig {
-            features: None,
-            package_type: PackageType::Contract,
-            debug: true,
-        },
-        contract_path,
-    )?;
+    let build_config = BuildToolConfig {
+        features: None,
+        package_type: PackageType::Contract,
+        debug: false,
+    };
 
+    compile_rust_wasm_lib(&build_config, contract_path)?;
+
+    let build_dir = if build_config.debug {
+        "debug"
+    } else {
+        "release"
+    };
     let output_file = Path::new(&target)
         .join(WASM_TARGET)
-        .join("debug")
+        .join(build_dir)
         .join(WASM_FILE_NAME.replace('-', "_"))
         .with_extension("wasm");
     println!("output file: {output_file:?}");
