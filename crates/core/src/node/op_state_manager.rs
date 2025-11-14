@@ -26,8 +26,7 @@ use crate::{
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     node::PeerId,
     operations::{
-        connect::ConnectOp, get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp,
-        OpEnum, OpError,
+        get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp, OpEnum, OpError,
     },
     ring::{ConnectionManager, LiveTransactionTracker, Ring},
 };
@@ -186,7 +185,7 @@ impl SubOperationTracker {
 
 #[derive(Default)]
 struct Ops {
-    connect: DashMap<Transaction, ConnectOp>,
+    connect: DashMap<Transaction, crate::operations::connect::ConnectOp>,
     put: DashMap<Transaction, PutOp>,
     get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
@@ -365,6 +364,7 @@ impl OpManager {
     // Useful when we want to notify connection attempts, or other events that do not require any
     // network communication with other nodes.
     pub async fn notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
+        tracing::info!(event = %msg, "notify_node_event: queuing node event");
         self.to_event_listener
             .notifications_sender
             .send(Either::Right(msg))

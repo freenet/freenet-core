@@ -1,6 +1,7 @@
 use super::{Location, PeerKeyLocation, Score};
 use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use freenet_stdlib::prelude::ContractKey;
+use tracing::{info, warn};
 
 pub(crate) struct SeedingManager {
     /// The container for subscriber is a vec instead of something like a hashset
@@ -110,18 +111,61 @@ impl SeedingManager {
             .subscribers
             .entry(*contract)
             .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS));
+        let before = subs
+            .iter()
+            .map(|loc| format!("{:.8}", loc.peer))
+            .collect::<Vec<_>>();
+        info!(
+            %contract,
+            subscriber = %subscriber.peer,
+            subscribers_before = ?before,
+            current_len = subs.len(),
+            "seeding_manager: attempting to add subscriber"
+        );
         if subs.len() >= Self::MAX_SUBSCRIBERS {
+            warn!(
+                %contract,
+                subscriber = %subscriber.peer,
+                subscribers_before = ?before,
+                "seeding_manager: max subscribers reached"
+            );
             return Err(());
         }
-        if let Err(next_idx) = subs.value_mut().binary_search(&subscriber) {
-            let subs = subs.value_mut();
-            if subs.len() == Self::MAX_SUBSCRIBERS {
-                return Err(());
-            } else {
-                subs.insert(next_idx, subscriber);
+        let subs_vec = subs.value_mut();
+        match subs_vec.binary_search(&subscriber) {
+            Ok(_) => {
+                info!(
+                    %contract,
+                    subscriber = %subscriber.peer,
+                    subscribers_before = ?before,
+                    "seeding_manager: subscriber already registered"
+                );
+                Ok(())
+            }
+            Err(next_idx) => {
+                if subs_vec.len() == Self::MAX_SUBSCRIBERS {
+                    warn!(
+                        %contract,
+                        subscriber = %subscriber.peer,
+                        subscribers_before = ?before,
+                        "seeding_manager: max subscribers reached during insert"
+                    );
+                    Err(())
+                } else {
+                    subs_vec.insert(next_idx, subscriber);
+                    let after = subs_vec
+                        .iter()
+                        .map(|loc| format!("{:.8}", loc.peer))
+                        .collect::<Vec<_>>();
+                    info!(
+                        %contract,
+                        subscribers_after = ?after,
+                        "seeding_manager: subscriber added"
+                    );
+                    Ok(())
+                }
             }
         }
-        Ok(())
     }
 
     pub fn subscribers_of(
@@ -132,8 +176,15 @@ impl SeedingManager {
     }
 
     pub fn prune_subscriber(&self, loc: Location) {
-        self.subscribers.alter_all(|_, mut subs| {
+        self.subscribers.alter_all(|contract_key, mut subs| {
             if let Some(pos) = subs.iter().position(|l| l.location == Some(loc)) {
+                let removed = subs[pos].clone();
+                tracing::debug!(
+                    %contract_key,
+                    removed_peer = %removed.peer,
+                    removed_location = ?removed.location,
+                    "seeding_manager: pruning subscriber due to location match"
+                );
                 subs.swap_remove(pos);
             }
             subs

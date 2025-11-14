@@ -46,6 +46,7 @@ impl<ER> Builder<ER> {
             connection_manager.clone(),
             result_router_tx,
         )?);
+        op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
         let (executor_listener, executor_sender) = executor_channel(op_manager.clone());
         let contract_handler =

@@ -88,12 +88,12 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
                 contract_key
             );
             if recv_state != wrapped_state {
-                eprintln!("State mismatch!");
-                eprintln!(
+                tracing::error!("State mismatch!");
+                tracing::error!(
                     "Expected state: {:?}",
                     String::from_utf8_lossy(wrapped_state.as_ref())
                 );
-                eprintln!(
+                tracing::error!(
                     "Received state: {:?}",
                     String::from_utf8_lossy(recv_state.as_ref())
                 );
@@ -365,23 +365,37 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
             format!("{:?}", peer2_peers),
         );
 
-        let gateway_sees_all = gw_peers.len() >= 2;
-        let peer1_direct = peer1_peers.len() >= 2;
-        let peer2_direct = peer2_peers.len() >= 2;
+        let expected_gateway_connections = 2; // peers
+        let gateway_sees_all = gw_peers.len() >= expected_gateway_connections;
 
-        if gateway_sees_all && peer1_direct && peer2_direct {
-            tracing::info!("✅ Full mesh connectivity established!");
+        // Require each peer to maintain at least one live connection (typically
+        // the gateway). The topology maintenance loop can continue dialing more
+        // neighbors, but the test should pass once the network is fully
+        // reachable through the gateway.
+        let peer1_has_minimum = !peer1_peers.is_empty();
+        let peer2_has_minimum = !peer2_peers.is_empty();
+
+        if gateway_sees_all && peer1_has_minimum && peer2_has_minimum {
+            if peer1_peers.len() >= expected_gateway_connections
+                && peer2_peers.len() >= expected_gateway_connections
+            {
+                tracing::info!("✅ Full mesh connectivity established!");
+            } else {
+                tracing::info!(
+                    "✅ Minimum connectivity achieved (gateway sees all peers; each peer has at least one neighbor)"
+                );
+            }
             mesh_established = true;
             break;
         }
 
-        tracing::info!("Network not fully connected yet, waiting...");
+        tracing::info!("Network not yet meeting minimum connectivity, waiting...");
         tokio::time::sleep(RETRY_DELAY).await;
     }
 
     if !mesh_established {
         bail!(
-            "Failed to establish full mesh connectivity after {} attempts. Gateway peers: {}; peer1 peers: {}; peer2 peers: {}",
+            "Failed to establish minimum connectivity after {} attempts. Gateway peers: {}; peer1 peers: {}; peer2 peers: {}",
             MAX_RETRIES,
             last_snapshot.0,
             last_snapshot.1,

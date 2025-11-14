@@ -18,6 +18,7 @@ use freenet_stdlib::{
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
+use tracing::info;
 
 /// Test complete PUT-then-GET workflow on isolated node
 ///
@@ -50,7 +51,7 @@ async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResul
     let (ws_stream, _) = connect_async(&url).await?;
     let mut client = WebApi::start(ws_stream);
 
-    println!("Step 1: Performing PUT operation to cache contract locally");
+    info!("Step 1: Performing PUT operation to cache contract locally");
 
     // Perform PUT operation - this should cache the contract locally
     let put_start = std::time::Instant::now();
@@ -63,7 +64,7 @@ async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResul
     match put_result {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
             assert_eq!(key, contract_key);
-            println!("PUT operation successful in {:?}", put_elapsed);
+            info!("PUT operation successful in {:?}", put_elapsed);
         }
         Ok(Ok(other)) => {
             panic!("Unexpected PUT response: {:?}", other);
@@ -76,9 +77,9 @@ async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResul
         }
     }
 
-    println!("Contract verified in local cache");
+    info!("Contract verified in local cache");
 
-    println!("Step 2: Performing GET operation using local cache");
+    info!("Step 2: Performing GET operation using local cache");
 
     // Now perform GET operation - should use local cache without self-routing
     let get_start = std::time::Instant::now();
@@ -110,7 +111,7 @@ async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResul
                 contract_key
             );
             assert_eq!(recv_state, wrapped_state);
-            println!(
+            info!(
                 "GET operation successful from local cache in {:?}",
                 get_elapsed
             );
@@ -126,7 +127,7 @@ async fn test_isolated_node_put_get_workflow(ctx: &mut TestContext) -> TestResul
         }
     }
 
-    println!("PUT-then-GET workflow completed successfully without self-routing");
+    info!("PUT-then-GET workflow completed successfully without self-routing");
 
     // Properly close the client
     client
@@ -177,7 +178,7 @@ async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestRe
     let (ws_stream3, _) = connect_async(&url).await?;
     let mut client3 = WebApi::start(ws_stream3);
 
-    println!("Step 1: PUT contract to cache it locally");
+    info!("Step 1: PUT contract to cache it locally");
 
     // Cache the contract locally using client1
     make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
@@ -186,15 +187,15 @@ async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestRe
     match put_result {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
             assert_eq!(key, contract_key);
-            println!("Contract cached successfully");
+            info!("Contract cached successfully");
         }
         other => {
             panic!("PUT failed: {:?}", other);
         }
     }
 
-    println!("Step 2: Concurrent GET requests from multiple clients");
-    println!("This tests the deduplication race condition from issue #1886");
+    info!("Step 2: Concurrent GET requests from multiple clients");
+    info!("This tests the deduplication race condition from issue #1886");
 
     // Send GET requests concurrently from all clients
     // The contract is cached, so these will complete instantly
@@ -234,26 +235,26 @@ async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestRe
                 )) => {
                     assert_eq!(key, contract_key);
                     assert_eq!(state, wrapped_state);
-                    println!("Client {}: Received GET response", client_num);
+                    info!("Client {}: Received GET response", client_num);
                     true
                 }
                 Ok((_, Ok(Ok(other)))) => {
-                    println!("Client {}: Unexpected response: {:?}", client_num, other);
+                    info!("Client {}: Unexpected response: {:?}", client_num, other);
                     false
                 }
                 Ok((_, Ok(Err(e)))) => {
-                    println!("Client {}: Error: {}", client_num, e);
+                    info!("Client {}: Error: {}", client_num, e);
                     false
                 }
                 Ok((_, Err(_))) => {
-                    println!(
+                    info!(
                         "Client {}: TIMEOUT - This is the bug from issue #1886!",
                         client_num
                     );
                     false
                 }
                 Err(e) => {
-                    println!("Client {}: Failed to send request: {}", client_num, e);
+                    info!("Client {}: Failed to send request: {}", client_num, e);
                     false
                 }
             }
@@ -270,7 +271,7 @@ async fn test_concurrent_get_deduplication_race(ctx: &mut TestContext) -> TestRe
         "All clients should receive GET responses. Failures indicate issue #1886 race condition."
     );
 
-    println!("All clients received responses - no race condition detected");
+    info!("All clients received responses - no race condition detected");
 
     // Cleanup
     client1
@@ -322,7 +323,7 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
     let (ws_stream2, _) = connect_async(&url).await?;
     let mut client2 = WebApi::start(ws_stream2);
 
-    println!("Step 1: Performing PUT operation to cache contract locally");
+    info!("Step 1: Performing PUT operation to cache contract locally");
 
     // Perform PUT operation - this should cache the contract locally
     make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
@@ -333,7 +334,7 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
     match put_result {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
             assert_eq!(key, contract_key);
-            println!("PUT operation successful");
+            info!("PUT operation successful");
         }
         Ok(Ok(other)) => {
             panic!("Unexpected PUT response: {:?}", other);
@@ -346,7 +347,7 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
         }
     }
 
-    println!("Step 2: Testing SUBSCRIBE operation on locally cached contract");
+    info!("Step 2: Testing SUBSCRIBE operation on locally cached contract");
 
     // Subscribe first client to the contract - should work with local contract
     let subscribe_start = std::time::Instant::now();
@@ -363,7 +364,7 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
             subscribed,
         }))) => {
             assert_eq!(key, contract_key);
-            println!(
+            info!(
                 "Client 1: SUBSCRIBE operation successful in {:?}",
                 subscribe_elapsed
             );
@@ -388,7 +389,7 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
         }
     }
 
-    println!("Step 3: Testing second client subscription");
+    info!("Step 3: Testing second client subscription");
 
     // Subscribe second client - verifies multiple clients can subscribe locally
     make_subscribe(&mut client2, contract_key).await?;
@@ -401,7 +402,7 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
             subscribed,
         }))) => {
             assert_eq!(key, contract_key);
-            println!("Client 2: SUBSCRIBE operation successful");
+            info!("Client 2: SUBSCRIBE operation successful");
             assert!(subscribed);
         }
         _ => {
@@ -414,7 +415,7 @@ async fn test_isolated_node_local_subscription(ctx: &mut TestContext) -> TestRes
     // has been validated - both clients successfully receive SubscribeResponse.
     // Update notification delivery can be tested once UPDATE is fixed for isolated nodes.
 
-    println!(
+    info!(
         "Local subscription test completed successfully - both clients received SubscribeResponse"
     );
 
@@ -462,7 +463,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
     let (ws_stream, _) = connect_async(&url).await?;
     let mut client = WebApi::start(ws_stream);
 
-    println!("Step 1: Performing PUT operation to cache contract locally");
+    info!("Step 1: Performing PUT operation to cache contract locally");
 
     // Perform PUT operation - this caches the contract locally
     let put_start = std::time::Instant::now();
@@ -481,7 +482,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
     match put_result {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
             assert_eq!(key, contract_key);
-            println!("PUT operation successful in {:?}", put_elapsed);
+            info!("PUT operation successful in {:?}", put_elapsed);
         }
         Ok(Ok(other)) => {
             panic!("Unexpected PUT response: {:?}", other);
@@ -494,7 +495,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
         }
     }
 
-    println!("Step 2: Performing UPDATE operation with new state");
+    info!("Step 2: Performing UPDATE operation with new state");
 
     // Create updated state (add a todo item)
     let updated_state = freenet::test_utils::create_todo_list_with_item("Test task");
@@ -522,7 +523,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
             key, ..
         }))) => {
             assert_eq!(key, contract_key);
-            println!("UPDATE operation successful in {:?}", update_elapsed);
+            info!("UPDATE operation successful in {:?}", update_elapsed);
         }
         Ok(Ok(other)) => {
             panic!("Unexpected UPDATE response: {:?}", other);
@@ -535,7 +536,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
         }
     }
 
-    println!("Step 3: Performing GET operation to verify updated state");
+    info!("Step 3: Performing GET operation to verify updated state");
 
     // Verify the state was updated by performing a GET
     let get_start = std::time::Instant::now();
@@ -552,7 +553,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
             // Parse both states to verify the tasks were updated correctly
             // Note: UPDATE operations may modify the version number, so we check the tasks array
             let recv_str = String::from_utf8_lossy(recv_state.as_ref());
-            println!("Received state after UPDATE: {}", recv_str);
+            info!("Received state after UPDATE: {}", recv_str);
 
             // Verify the state contains the expected task
             assert!(
@@ -570,7 +571,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
                 "Tasks array should not be empty after update"
             );
 
-            println!(
+            info!(
                 "GET operation successful, state correctly updated in {:?}",
                 get_elapsed
             );
@@ -586,7 +587,7 @@ async fn test_isolated_node_update_operation(ctx: &mut TestContext) -> TestResul
         }
     }
 
-    println!("PUT-UPDATE-GET workflow completed successfully on isolated node");
+    info!("PUT-UPDATE-GET workflow completed successfully on isolated node");
 
     // Properly close the client
     client

@@ -176,17 +176,6 @@ impl<const N: usize> PacketData<Plaintext, N> {
     }
 }
 
-#[cfg(test)]
-impl<const N: usize> PacketData<SymmetricAES, N> {
-    pub fn into_unknown(self) -> PacketData<UnknownEncryption, N> {
-        PacketData {
-            data: self.data,
-            size: self.size,
-            data_type: PhantomData,
-        }
-    }
-}
-
 impl<const N: usize> PacketData<UnknownEncryption, N> {
     pub fn from_buf(buf: impl AsRef<[u8]>) -> Self {
         let mut data = [0; N];
@@ -297,8 +286,9 @@ mod tests {
         let unencrypted_packet = PacketData::<_, 1000>::from_buf_plain(data);
         let mut encrypted_packet = unencrypted_packet.encrypt_symmetric(&cipher);
 
-        // Corrupt the packet data
-        encrypted_packet.data[encrypted_packet.size / 2] = 0;
+        // Corrupt the packet data by flipping bits at a deterministic position.
+        let mid = encrypted_packet.size / 2;
+        encrypted_packet.data[mid] ^= 0xFF;
 
         // Ensure decryption fails
         match encrypted_packet.decrypt(&cipher) {

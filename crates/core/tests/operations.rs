@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, ensure};
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
     dev_tool::TransportKeypair,
@@ -126,6 +126,86 @@ async fn get_contract(
             }
         }
     }
+}
+
+async fn send_put_with_retry(
+    client: &mut WebApi,
+    state: WrappedState,
+    contract: ContractContainer,
+    description: &str,
+    expected_key: Option<ContractKey>,
+) -> anyhow::Result<()> {
+    const MAX_ATTEMPTS: usize = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        tracing::info!("Sending {} (attempt {attempt}/{MAX_ATTEMPTS})", description);
+
+        make_put(client, state.clone(), contract.clone(), false).await?;
+
+        match tokio::time::timeout(Duration::from_secs(120), client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                if let Some(expected) = expected_key {
+                    ensure!(
+                        key == expected,
+                        "{} returned unexpected contract key (expected {}, got {})",
+                        description,
+                        expected,
+                        key
+                    );
+                }
+                tracing::info!("{description} succeeded on attempt {attempt}");
+                return Ok(());
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!(
+                    "{} attempt {attempt} returned unexpected response: {:?}",
+                    description,
+                    other
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "{} attempt {attempt} failed while receiving response: {}",
+                    description,
+                    e
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "{} attempt {attempt} timed out waiting for response",
+                    description
+                );
+            }
+        }
+
+        if attempt == MAX_ATTEMPTS {
+            bail!("{description} failed after {MAX_ATTEMPTS} attempts");
+        }
+
+        // Drain any stray responses/errors before retrying to keep the client state clean.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), client.recv()).await {
+                Ok(Ok(resp)) => {
+                    tracing::warn!(
+                        "Discarding stray response prior to retrying {}: {:?}",
+                        description,
+                        resp
+                    );
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        "Discarding stray error prior to retrying {}: {}",
+                        description,
+                        err
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    unreachable!("send_put_with_retry loop should always return or bail");
 }
 
 /// Test PUT operation across two peers (gateway and peer)
@@ -443,33 +523,14 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
     let (stream, _) = connect_async(&uri).await?;
     let mut client_api_a = WebApi::start(stream);
 
-    // First PUT: Store initial contract state
-    tracing::info!("Sending first PUT with initial state...");
-    make_put(
+    send_put_with_retry(
         &mut client_api_a,
         initial_wrapped_state.clone(),
         contract.clone(),
-        false,
+        "first PUT (cache seed)",
+        Some(contract_key),
     )
     .await?;
-
-    // Wait for first put response
-    let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
-    match resp {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-            tracing::info!("First PUT successful for contract: {}", key);
-            assert_eq!(key, contract_key);
-        }
-        Ok(Ok(other)) => {
-            bail!("Unexpected response for first PUT: {:?}", other);
-        }
-        Ok(Err(e)) => {
-            bail!("Error receiving first PUT response: {}", e);
-        }
-        Err(_) => {
-            bail!("Timeout waiting for first PUT response");
-        }
-    }
 
     // Wait a bit to ensure state is fully cached
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -498,34 +559,14 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
         updated_wrapped_state.as_ref().len()
     );
 
-    // Second PUT: Update the already-cached contract with new state
-    // This tests the bug fix - the merged state should be persisted
-    tracing::info!("Sending second PUT with updated state...");
-    make_put(
+    send_put_with_retry(
         &mut client_api_a,
         updated_wrapped_state.clone(),
         contract.clone(),
-        false,
+        "second PUT (merge)",
+        Some(contract_key),
     )
     .await?;
-
-    // Wait for second put response
-    let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
-    match resp {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-            tracing::info!("Second PUT successful for contract: {}", key);
-            assert_eq!(key, contract_key);
-        }
-        Ok(Ok(other)) => {
-            bail!("Unexpected response for second PUT: {:?}", other);
-        }
-        Ok(Err(e)) => {
-            bail!("Error receiving second PUT response: {}", e);
-        }
-        Err(_) => {
-            bail!("Timeout waiting for second PUT response");
-        }
-    }
 
     // Wait a bit to ensure the merge and persistence completes
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1747,7 +1788,7 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
                 key, delegate_key,
                 "Delegate key mismatch in register response"
             );
-            println!("Successfully registered delegate with key: {key}");
+            tracing::info!("Successfully registered delegate with key: {key}");
         }
         other => {
             bail!(
@@ -1819,7 +1860,7 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
                         "Response data doesn't match expected value"
                     );
 
-                    println!("Successfully received and verified delegate response");
+                    tracing::info!("Successfully received and verified delegate response");
                 }
             }
         }

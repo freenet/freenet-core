@@ -15,7 +15,6 @@ use crate::contract::{
 };
 use crate::dev_tool::{PeerId, Transaction};
 use crate::message::{NetMessage, NodeEvent};
-use crate::node::network_bridge::handshake::HandshakeError;
 use crate::transport::TransportError;
 
 // P2pBridgeEvent type alias for the event bridge channel
@@ -28,7 +27,7 @@ pub(super) enum SelectResult {
     OpExecution(Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>),
     PeerConnection(Option<Result<PeerConnectionInbound, TransportError>>),
     ConnBridge(Option<P2pBridgeEvent>),
-    Handshake(Result<crate::node::network_bridge::handshake::Event, HandshakeError>),
+    Handshake(Option<crate::node::network_bridge::handshake::Event>),
     NodeController(Option<NodeEvent>),
     ClientTransaction(
         Result<
@@ -90,7 +89,7 @@ impl ExecutorTransactionReceiver for ExecutorToEventLoopChannel<NetworkEventList
 
 /// Type alias for the production PrioritySelectStream with concrete types
 pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
-    super::handshake::HandshakeEventStream,
+    super::handshake::HandshakeHandler,
     ContractHandlerChannel<WaitingResolution>,
     ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
 >;
@@ -101,7 +100,7 @@ pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
 /// alive across loop iterations, maintaining waker registration.
 pub(super) struct PrioritySelectStream<H, C, E>
 where
-    H: Stream<Item = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Unpin,
+    H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
     C: ClientTransactionRelay,
     E: ExecutorTransactionReceiver,
 {
@@ -134,7 +133,7 @@ where
 
 impl<H, C, E> PrioritySelectStream<H, C, E>
 where
-    H: Stream<Item = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Unpin,
+    H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
     C: ClientTransactionRelay,
     E: ExecutorTransactionReceiver,
 {
@@ -180,7 +179,7 @@ where
 
 impl<H, C, E> Stream for PrioritySelectStream<H, C, E>
 where
-    H: Stream<Item = Result<crate::node::network_bridge::handshake::Event, HandshakeError>> + Unpin,
+    H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
     C: ClientTransactionRelay,
     E: ExecutorTransactionReceiver,
 {
@@ -254,8 +253,14 @@ where
         // Priority 5: Handshake handler (now implements Stream)
         // Poll the handshake handler stream - it maintains state across polls
         match Pin::new(&mut this.handshake_handler).poll_next(cx) {
-            Poll::Ready(Some(result)) => return Poll::Ready(Some(SelectResult::Handshake(result))),
-            Poll::Ready(None) => {} // Stream ended (shouldn't happen in practice)
+            Poll::Ready(Some(event)) => {
+                return Poll::Ready(Some(SelectResult::Handshake(Some(event))))
+            }
+            Poll::Ready(None) => {
+                if first_closed_channel.is_none() {
+                    first_closed_channel = Some(SelectResult::Handshake(None));
+                }
+            }
             Poll::Pending => {}
         }
 
