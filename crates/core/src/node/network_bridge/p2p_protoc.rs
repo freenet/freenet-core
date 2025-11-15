@@ -1651,6 +1651,15 @@ impl P2pConnManager {
                     }
                 }
 
+                if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                    payload, ..
+                })) = &mut peer_conn.msg
+                {
+                    if payload.observed_addr.is_none() {
+                        payload.observed_addr = Some(remote_addr);
+                    }
+                }
+
                 // Check if we need to establish a connection back to the sender
                 let should_connect = !self.connections.keys().any(|peer| peer.addr == remote_addr)
                     && !state.awaiting_connection.contains_key(&remote_addr);
