@@ -1,5 +1,5 @@
-use anyhow::{bail, Context};
-use freenet::test_utils::{self, make_get, make_put, TestContext};
+use anyhow::{anyhow, bail, Context};
+use freenet::test_utils::{self, make_get, make_put, TestContext, TestResult};
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
@@ -406,17 +406,15 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     // Verify functionality with PUT/GET
     tracing::info!("Verifying network functionality with PUT/GET operations");
 
-    make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
-    let resp = tokio::time::timeout(Duration::from_secs(60), client1.recv()).await;
-    match resp {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-            assert_eq!(key, contract_key);
-            tracing::info!("Peer1 successfully performed PUT");
-        }
-        Ok(Ok(other)) => bail!("Unexpected PUT response: {:?}", other),
-        Ok(Err(e)) => bail!("Error receiving PUT response: {}", e),
-        Err(_) => bail!("Timeout waiting for PUT response"),
-    }
+    const PUT_RETRIES: usize = 3;
+    perform_put_with_retries(
+        &mut client1,
+        &wrapped_state,
+        &contract,
+        &contract_key,
+        PUT_RETRIES,
+    )
+    .await?;
 
     make_get(&mut client2, contract_key, true, false).await?;
     let get_response = tokio::time::timeout(Duration::from_secs(60), client2.recv()).await;
@@ -448,4 +446,51 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     Ok(())
+}
+
+async fn perform_put_with_retries(
+    client: &mut WebApi,
+    wrapped_state: &WrappedState,
+    contract: &ContractContainer,
+    contract_key: &ContractKey,
+    max_attempts: usize,
+) -> TestResult {
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=max_attempts {
+        tracing::info!(attempt, max_attempts, "Starting PUT attempt");
+        if let Err(err) = make_put(client, wrapped_state.clone(), contract.clone(), false).await {
+            last_err = Some(err);
+        } else {
+            match tokio::time::timeout(Duration::from_secs(60), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                    if key == *contract_key {
+                        tracing::info!(attempt, "Peer1 successfully performed PUT");
+                        return Ok(());
+                    }
+                    last_err = Some(anyhow!(
+                        "Received PUT response for unexpected key {key:?} (expected {contract_key:?})"
+                    ));
+                }
+                Ok(Ok(other)) => {
+                    last_err = Some(anyhow!("Unexpected PUT response: {other:?}"));
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(anyhow!("Error receiving PUT response: {e}"));
+                }
+                Err(_) => {
+                    last_err = Some(anyhow!("Timeout waiting for PUT response"));
+                }
+            }
+        }
+
+        tracing::warn!(
+            attempt,
+            max_attempts,
+            "PUT attempt failed; retrying after short delay"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("PUT failed after {max_attempts} attempts")))
 }

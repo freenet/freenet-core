@@ -47,7 +47,7 @@ pub async fn wait_for_put_response(
     expected_key: &ContractKey,
 ) -> Result<ContractKey, Box<dyn std::error::Error + Send + Sync + 'static>> {
     loop {
-        let resp = timeout(Duration::from_secs(30), client.recv()).await;
+        let resp = timeout(Duration::from_secs(60), client.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 if &key == expected_key {
@@ -91,7 +91,7 @@ pub async fn wait_for_get_response(
     expected_key: &ContractKey,
 ) -> Result<Ping, Box<dyn std::error::Error + Send + Sync + 'static>> {
     loop {
-        let resp = timeout(Duration::from_secs(30), client.recv()).await;
+        let resp = timeout(Duration::from_secs(60), client.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
@@ -134,7 +134,7 @@ pub async fn wait_for_subscribe_response(
     expected_key: &ContractKey,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     loop {
-        let resp = timeout(Duration::from_secs(30), client.recv()).await;
+        let resp = timeout(Duration::from_secs(60), client.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
