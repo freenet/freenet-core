@@ -322,29 +322,6 @@ impl Operation for PutOp {
                             origin: origin.clone(),
                         });
 
-                        // Best-effort: notify the original requester directly when we are the final hop.
-                        if origin.peer != sender.peer {
-                            let direct_ack = PutMsg::SuccessfulPut {
-                                id: *id,
-                                target: origin.clone(),
-                                key,
-                                sender: own_location.clone(),
-                                origin: origin.clone(),
-                            };
-
-                            if let Err(err) = conn_manager
-                                .send(&origin.peer, NetMessage::from(direct_ack))
-                                .await
-                            {
-                                tracing::warn!(
-                                    tx = %id,
-                                    %key,
-                                    origin_peer = %origin.peer,
-                                    "Failed to send direct SuccessfulPut to origin from final hop: {err}"
-                                );
-                            }
-                        }
-
                         // Mark operation as finished
                         new_state = Some(PutState::Finished { key });
                     }
@@ -441,7 +418,6 @@ impl Operation for PutOp {
 
                     // Broadcast changes to subscribers
                     let broadcast_to = op_manager.get_broadcast_targets(&key, &sender.peer);
-                    let broadcast_was_empty = broadcast_to.is_empty();
                     match try_to_broadcast(
                         *id,
                         last_hop,
@@ -459,31 +435,6 @@ impl Operation for PutOp {
                             return_msg = msg;
                         }
                         Err(err) => return Err(err),
-                    }
-
-                    // When we are the last hop and have no additional broadcast targets, notify the
-                    // original requester directly to avoid relying solely on intermediate hops.
-                    if last_hop && broadcast_was_empty && origin.peer != sender.peer {
-                        let sender_loc = op_manager.ring.connection_manager.own_location();
-                        let direct_ack = PutMsg::SuccessfulPut {
-                            id: *id,
-                            target: origin.clone(),
-                            key,
-                            sender: sender_loc.clone(),
-                            origin: origin.clone(),
-                        };
-
-                        if let Err(err) = conn_manager
-                            .send(&origin.peer, NetMessage::from(direct_ack))
-                            .await
-                        {
-                            tracing::warn!(
-                                tx = %id,
-                                %key,
-                                origin_peer = %origin.peer,
-                                "Failed to send direct SuccessfulPut to origin from SeekNode final hop: {err}"
-                            );
-                        }
                     }
                 }
                 PutMsg::BroadcastTo {
@@ -585,30 +536,6 @@ impl Operation for PutOp {
                         conn_manager
                             .send(&upstream.peer, NetMessage::from(ack))
                             .await?;
-
-                        // Also ack the original requester so they don't depend on upstream propagation.
-                        if origin.peer != sender.peer && origin.peer != upstream.peer {
-                            let direct_ack = PutMsg::SuccessfulPut {
-                                id: *id,
-                                target: origin.clone(),
-                                key: *key,
-                                sender: sender.clone(),
-                                origin: origin.clone(),
-                            };
-
-                            if let Err(err) = conn_manager
-                                .send(&origin.peer, NetMessage::from(direct_ack))
-                                .await
-                            {
-                                tracing::warn!(
-                                    tx = %id,
-                                    %key,
-                                    origin_peer = %origin.peer,
-                                    "Failed to send direct SuccessfulPut to origin from broadcast start: {err}"
-                                );
-                            }
-                        }
-
                         new_state = None;
                     }
 
@@ -777,34 +704,6 @@ impl Operation for PutOp {
                                     "PutOp::process_message: SuccessfulPut originated locally; no upstream"
                                 );
                                 return_msg = None;
-                            }
-
-                            // Send a direct acknowledgement to the original requester if we are not it
-                            if state_origin.peer != local_peer.peer
-                                && !upstream
-                                    .as_ref()
-                                    .map(|u| u.peer == state_origin.peer)
-                                    .unwrap_or(false)
-                            {
-                                let direct_ack = PutMsg::SuccessfulPut {
-                                    id: *id,
-                                    target: state_origin.clone(),
-                                    key,
-                                    sender: local_peer,
-                                    origin: state_origin.clone(),
-                                };
-
-                                if let Err(err) = conn_manager
-                                    .send(&state_origin.peer, NetMessage::from(direct_ack))
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        tx = %id,
-                                        %key,
-                                        origin_peer = %state_origin.peer,
-                                        "Failed to send direct SuccessfulPut to origin: {err}"
-                                    );
-                                }
                             }
                         }
                         Some(PutState::Finished { .. }) => {

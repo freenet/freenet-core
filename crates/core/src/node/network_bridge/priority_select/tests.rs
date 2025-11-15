@@ -49,7 +49,7 @@ async fn test_priority_select_future_wakeup() {
 
     let (notif_tx, notif_rx) = mpsc::channel(10);
     let (_op_tx, op_rx) = mpsc::channel(10);
-    let peers = FuturesUnordered::new();
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (_bridge_tx, bridge_rx) = mpsc::channel(10);
     let (_node_tx, node_rx) = mpsc::channel(10);
 
@@ -72,7 +72,7 @@ async fn test_priority_select_future_wakeup() {
         node_rx,
         MockClient,
         MockExecutor,
-        peers,
+        conn_event_rx,
     );
     tokio::pin!(stream);
 
@@ -128,7 +128,7 @@ async fn test_priority_select_future_priority_ordering() {
 
     let (notif_tx, notif_rx) = mpsc::channel(10);
     let (op_tx, op_rx) = mpsc::channel(10);
-    let peers = FuturesUnordered::new();
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (bridge_tx, bridge_rx) = mpsc::channel(10);
     let (_, node_rx) = mpsc::channel(10);
 
@@ -157,7 +157,7 @@ async fn test_priority_select_future_priority_ordering() {
         node_rx,
         MockClient,
         MockExecutor,
-        peers,
+        conn_event_rx,
     );
     tokio::pin!(stream);
 
@@ -199,7 +199,7 @@ async fn test_priority_select_future_concurrent_messages() {
     }
 
     let (notif_tx, notif_rx) = mpsc::channel(100);
-    let peers = FuturesUnordered::new();
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
 
     // Send all 15 messages
     for _ in 0..15 {
@@ -222,7 +222,7 @@ async fn test_priority_select_future_concurrent_messages() {
         node_rx,
         MockClient,
         MockExecutor,
-        peers,
+        conn_event_rx,
     );
     tokio::pin!(stream);
 
@@ -263,7 +263,7 @@ async fn test_priority_select_future_buffered_messages() {
     }
 
     let (notif_tx, notif_rx) = mpsc::channel(10);
-    let peers = FuturesUnordered::new();
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
 
     // Send message BEFORE creating stream
     let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
@@ -284,7 +284,7 @@ async fn test_priority_select_future_buffered_messages() {
         node_rx,
         MockClient,
         MockExecutor,
-        peers,
+        conn_event_rx,
     );
     tokio::pin!(stream);
 
@@ -331,7 +331,7 @@ async fn test_priority_select_future_rapid_cancellations() {
     }
 
     let (notif_tx, notif_rx) = mpsc::channel(100);
-    let peers = FuturesUnordered::new();
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
 
     // Send 10 messages
     for _ in 0..10 {
@@ -354,7 +354,7 @@ async fn test_priority_select_future_rapid_cancellations() {
         node_rx,
         MockClient,
         MockExecutor,
-        peers,
+        conn_event_rx,
     );
     tokio::pin!(stream);
 
@@ -415,7 +415,7 @@ async fn test_priority_select_event_loop_simulation() {
     // Create channels once (like in wait_for_event)
     let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
     let (op_tx, op_rx) = mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(10);
-    let peers = FuturesUnordered::new();
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(10);
     let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(10);
 
@@ -472,7 +472,7 @@ async fn test_priority_select_event_loop_simulation() {
         node_rx,
         MockClient,
         MockExecutor,
-        peers,
+        conn_event_rx,
     );
     tokio::pin!(stream);
 
@@ -660,7 +660,7 @@ async fn test_with_seed(seed: u64) {
     // Create channels once (like in wait_for_event)
     let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(100);
     let (op_tx, op_rx) = mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(100);
-    let peers = FuturesUnordered::new();
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(100);
     let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(100);
     let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(100);
     let (client_tx, client_rx) = mpsc::channel::<
@@ -862,7 +862,7 @@ async fn test_with_seed(seed: u64) {
             rx: executor_rx,
             closed: false,
         },
-        peers,
+        conn_event_rx,
     );
     tokio::pin!(stream);
 
@@ -1166,7 +1166,7 @@ async fn test_priority_select_all_pending_waker_registration() {
     // Create all 8 channels
     let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
     let (op_tx, op_rx) = mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(10);
-    let peers = FuturesUnordered::new();
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(10);
     let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(10);
     let (client_tx, client_rx) = mpsc::channel::<
@@ -1242,7 +1242,7 @@ async fn test_priority_select_all_pending_waker_registration() {
             rx: executor_rx,
             closed: false,
         },
-        peers,
+        conn_event_rx,
     );
     tokio::pin!(stream);
 
@@ -1320,7 +1320,7 @@ async fn test_sparse_messages_reproduce_race() {
 
     let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
     let (_, op_rx) = mpsc::channel(1);
-    let peers = FuturesUnordered::new();
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (_, bridge_rx) = mpsc::channel(1);
     let (_, node_rx) = mpsc::channel(1);
 
@@ -1356,7 +1356,7 @@ async fn test_sparse_messages_reproduce_race() {
         node_rx,
         MockClient,
         MockExecutor,
-        peers,
+        conn_event_rx,
     );
     tokio::pin!(stream);
 
