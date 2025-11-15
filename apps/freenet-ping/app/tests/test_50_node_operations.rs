@@ -20,7 +20,6 @@ use std::{net::TcpListener, path::PathBuf, time::Duration};
 use testresult::TestResult;
 use tokio::{select, time::timeout};
 use tokio_tungstenite::connect_async;
-use tracing::level_filters::LevelFilter;
 
 use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
 
@@ -28,11 +27,9 @@ const NUM_GATEWAYS: usize = 3; // Multiple gateways to distribute load
 const NUM_REGULAR_NODES: usize = 47; // 3 + 47 = 50 total
 const CONNECTIVITY_RATIO: f64 = 0.1; // 10% connectivity to reduce network load
 
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "large scale test - run manually"]
 async fn test_50_node_operations() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::INFO), None);
-
     println!("🚀 Starting 50-node operations test");
     println!("   Gateway nodes: {NUM_GATEWAYS}");
     println!("   Regular nodes: {NUM_REGULAR_NODES}");

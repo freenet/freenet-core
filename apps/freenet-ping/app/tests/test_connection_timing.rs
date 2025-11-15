@@ -12,18 +12,12 @@ use futures::FutureExt;
 use testresult::TestResult;
 use tokio::{select, time::timeout};
 use tokio_tungstenite::connect_async;
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::{span, Instrument, Level};
 
 use common::{base_node_test_config, gw_config_from_path};
 
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_connection_timing() -> TestResult {
-    // Minimal logging to reduce noise
-    freenet::config::set_logger(
-        Some(LevelFilter::WARN),
-        Some("freenet::transport=info,freenet_core::transport=info".to_string()),
-    );
-
     println!("🔧 Testing connection timing with 2 nodes");
 
     // Setup only 2 nodes to minimize complexity
