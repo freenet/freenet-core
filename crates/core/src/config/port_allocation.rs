@@ -44,13 +44,10 @@ fn pick_port_from_safe_windows_ranges() -> Option<u16> {
     }
 
     candidates.shuffle(&mut rng());
-    for port in candidates.into_iter().take(MAX_SAFE_PORT_ATTEMPTS) {
-        if port_is_free(port) {
-            return Some(port);
-        }
-    }
-
-    None
+    candidates
+        .into_iter()
+        .take(MAX_SAFE_PORT_ATTEMPTS)
+        .find(|port| port_is_free(*port))
 }
 
 fn port_is_free(port: u16) -> bool {
