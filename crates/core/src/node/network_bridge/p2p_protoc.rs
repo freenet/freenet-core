@@ -1611,41 +1611,49 @@ impl P2pConnManager {
                 // Get the remote address from the connection
                 let remote_addr = peer_conn.conn.remote_addr();
                 let tx = *peer_conn.msg.id();
-                if let Some(sender_peer) = extract_sender_from_message(&peer_conn.msg) {
-                    if sender_peer.peer.addr == remote_addr
-                        || sender_peer.peer.addr.ip().is_unspecified()
-                    {
+                // ObservedAddress uses the joiner as the "sender", so skip address rewrites there.
+                let can_normalize_sender = !matches!(
+                    peer_conn.msg,
+                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::ObservedAddress { .. }))
+                );
+
+                if can_normalize_sender {
+                    if let Some(sender_peer) = extract_sender_from_message(&peer_conn.msg) {
                         let mut new_peer_id = sender_peer.peer.clone();
-                        if new_peer_id.addr.ip().is_unspecified() {
-                            new_peer_id.addr = remote_addr;
-                            if let Some(sender_mut) =
-                                extract_sender_from_message_mut(&mut peer_conn.msg)
-                            {
-                                if sender_mut.peer.addr.ip().is_unspecified() {
+                        let sender_ip = new_peer_id.addr.ip();
+                        let addr_needs_correction = !is_publicly_routable(sender_ip);
+
+                        if addr_needs_correction || new_peer_id.addr == remote_addr {
+                            if addr_needs_correction && new_peer_id.addr != remote_addr {
+                                new_peer_id.addr = remote_addr;
+                                if let Some(sender_mut) =
+                                    extract_sender_from_message_mut(&mut peer_conn.msg)
+                                {
                                     sender_mut.peer.addr = remote_addr;
                                 }
                             }
-                        }
-                        if let Some(existing_key) = self
-                            .connections
-                            .keys()
-                            .find(|peer| {
-                                peer.addr == remote_addr && peer.pub_key != new_peer_id.pub_key
-                            })
-                            .cloned()
-                        {
-                            if let Some(channel) = self.connections.remove(&existing_key) {
-                                tracing::info!(
-                                    remote = %remote_addr,
-                                    old_peer = %existing_key,
-                                    new_peer = %new_peer_id,
-                                    "Updating provisional peer identity after inbound message"
-                                );
-                                self.bridge
-                                    .op_manager
-                                    .ring
-                                    .update_connection_identity(&existing_key, new_peer_id.clone());
-                                self.connections.insert(new_peer_id, channel);
+
+                            if let Some(existing_key) = self
+                                .connections
+                                .keys()
+                                .find(|peer| {
+                                    peer.addr == remote_addr && peer.pub_key != new_peer_id.pub_key
+                                })
+                                .cloned()
+                            {
+                                if let Some(channel) = self.connections.remove(&existing_key) {
+                                    tracing::info!(
+                                        remote = %remote_addr,
+                                        old_peer = %existing_key,
+                                        new_peer = %new_peer_id,
+                                        "Updating provisional peer identity after inbound message"
+                                    );
+                                    self.bridge.op_manager.ring.update_connection_identity(
+                                        &existing_key,
+                                        new_peer_id.clone(),
+                                    );
+                                    self.connections.insert(new_peer_id, channel);
+                                }
                             }
                         }
                     }
@@ -2084,6 +2092,23 @@ async fn peer_connection_listener(
 #[inline(always)]
 fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
     bincode::deserialize(data).map_err(|err| ConnectionError::Serialization(Some(err)))
+}
+
+fn is_publicly_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => {
+            !(addr.is_private()
+                || addr.is_loopback()
+                || addr.is_link_local()
+                || addr.is_unspecified())
+        }
+        IpAddr::V6(addr) => {
+            !(addr.is_loopback()
+                || addr.is_unspecified()
+                || addr.is_unique_local()
+                || addr.is_unicast_link_local())
+        }
+    }
 }
 
 /// Extract sender information from various message types

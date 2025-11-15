@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,23 @@ impl InnerMessage for ConnectMsg {
         match self {
             ConnectMsg::Request { payload, .. } => Some(payload.desired_location),
             _ => None,
+        }
+    }
+}
+
+fn is_publicly_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => {
+            !(addr.is_private()
+                || addr.is_loopback()
+                || addr.is_link_local()
+                || addr.is_unspecified())
+        }
+        IpAddr::V6(addr) => {
+            !(addr.is_loopback()
+                || addr.is_unspecified()
+                || addr.is_unique_local()
+                || addr.is_unicast_link_local())
         }
     }
 }
@@ -197,7 +214,10 @@ impl RelayState {
         push_unique_peer(&mut self.request.visited, observed_remote.clone());
         push_unique_peer(&mut self.request.visited, ctx.self_location().clone());
 
-        if self.request.origin.peer.addr.ip().is_unspecified()
+        let origin_ip = self.request.origin.peer.addr.ip();
+        let should_replace_origin = !is_publicly_routable(origin_ip);
+
+        if should_replace_origin
             && !self.observed_sent
             && observed_remote.peer.pub_key == self.request.origin.peer.pub_key
         {
@@ -1076,6 +1096,39 @@ mod tests {
         assert_eq!(forward_to.peer, next_hop.peer);
         assert_eq!(request.ttl, 1);
         assert!(request.visited.iter().any(|pkl| pkl.peer == joiner.peer));
+    }
+
+    #[test]
+    fn relay_emits_observed_address_for_private_joiner() {
+        let self_loc = make_peer(4050);
+        let joiner = make_peer(5050);
+        let mut state = RelayState {
+            upstream: joiner.clone(),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                origin: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            courtesy_hint: false,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc);
+        let observed_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            joiner.peer.addr.port(),
+        );
+        let actions = state.handle_request(&ctx, &joiner, observed_addr);
+
+        let (target, addr) = actions
+            .observed_address
+            .expect("non-global joiners should emit observed address updates");
+        assert_eq!(addr, observed_addr);
+        assert_eq!(target.peer.addr, observed_addr);
+        assert_eq!(state.request.origin.peer.addr, observed_addr);
     }
 
     #[test]
