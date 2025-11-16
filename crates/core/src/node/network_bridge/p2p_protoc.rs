@@ -319,8 +319,13 @@ impl P2pConnManager {
                                 peer = %ctx.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap(),
                                 "Received inbound message from peer - processing"
                             );
-                            if let (Some(remote_addr), NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { payload, .. }))) =
-                                (remote, &mut msg)
+                            if let (
+                                Some(remote_addr),
+                                NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                                    payload,
+                                    ..
+                                })),
+                            ) = (remote, &mut msg)
                             {
                                 if payload.observed_addr.is_none() {
                                     payload.observed_addr = Some(remote_addr);
