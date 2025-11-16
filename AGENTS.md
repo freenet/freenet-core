@@ -61,9 +61,65 @@ Run these in any worktree before pushing a branch or opening a PR.
 - Run the crate’s suite with `cargo test -p freenet-test-network`. When `preserve_temp_dirs_on_failure(true)` is set, failing startups keep logs under `/tmp/freenet-test-network-<timestamp>/` for inspection.
 
 ## Pull Requests & Reviews
+
+### PR Title Format
 - All PR titles must follow Conventional Commits (`feat:`, `fix:`, `docs:`, etc.). CI fails non-conforming titles.
 - Substantial changes require review from another developer before merging.
 - Prefer stacked PRs for large efforts; rebase dependent branches after feedback.
+
+### PR Description Requirements
+
+**CRITICAL:** PR descriptions must explain **WHY**, not just **WHAT**.
+
+**Bad PR description (too terse):**
+```markdown
+## Summary
+- Add observed_addr field to ConnectRequest
+- Update relay to fill in socket
+- Add regression test
+```
+This lists changes but gives reviewers no context about the problem being solved or the reasoning behind the approach.
+
+**Good PR description (explains context and reasoning):**
+```markdown
+## Problem
+[Describe the bug/issue and its user-visible impact]
+[Explain why existing tests didn't catch it]
+
+## Previous Approaches (if applicable)
+[Mention rejected approaches and why they were inadequate]
+
+## This Solution
+[Explain the key insight or design decision]
+[For each major change, explain WHY it's needed, not just what it does]
+
+## Testing
+[New tests added and what scenarios they validate]
+[Local validation steps you performed]
+
+## Fixes
+Closes #XXXX
+```
+
+**Key principles for reviewable PRs:**
+1. **Start with the problem** – What's broken? What's the user impact? Why does it matter?
+2. **Explain the approach** – Why this solution over alternatives? What's the key insight?
+3. **Connect changes to reasoning** – Don't just list what changed, explain why each change solves part of the problem
+4. **Call out lessons learned** – "Why CI didn't catch this", "Why approach X was rejected", "What assumption was wrong"
+5. **Make it self-contained** – Reviewer should understand your thinking without having to read the entire issue thread
+
+**Example of good reasoning:**
+> "The joiner can't know its public address until someone observes it from the outside. Previous approach (PR #2088) tried rewriting addresses at transport boundary, but that's a hack—we shouldn't need generic address mutation. This PR lets the gateway fill in the observed socket naturally since it already sees the real UDP source."
+
+This explains the constraint (joiner doesn't know its address), the rejected approach (and why), and the insight that makes the new approach clean.
+
+**When writing PRs:**
+- Imagine the reviewer knows the codebase but hasn't followed this issue
+- Explain your reasoning process, not just your conclusions
+- If you debugged for hours before finding the root cause, share that journey briefly
+- Link to related issues/PRs and explain the relationship
+
+After creating a PR with `gh pr create`, **immediately review the description** and ask yourself: "Could someone understand why these changes are necessary without reading the issue or digging through code?" If not, use `gh pr edit <number> --body "..."` to improve it before requesting review.
 
 ## Additional Resources
 - `PRE_COMMIT_HOOK_GUIDE.md` – configures local linting hooks.

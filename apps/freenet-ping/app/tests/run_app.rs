@@ -1519,8 +1519,8 @@ async fn test_ping_application_loop() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "manual-tests")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Test has never worked - gateway nodes fail on startup with channel closed errors"]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
@@ -1750,15 +1750,18 @@ async fn test_ping_partially_connected_network() -> TestResult {
                           i, NUM_GATEWAYS, num_connections);
         }
 
-        // Load the ping contract
+        // Load the ping contract. Compile once to determine the code hash, then again with proper options.
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
         tracing::info!(path=%path_to_code.display(), "loading contract code");
-        let code = std::fs::read(path_to_code)
-            .ok()
-            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
-        let code_hash = CodeHash::from_code(&code);
-
-        // Create ping contract options
+        let temp_options = PingContractOptions {
+            frequency: Duration::from_secs(3),
+            ttl: Duration::from_secs(60),
+            tag: APP_TAG.to_string(),
+            code_key: String::new(),
+        };
+        let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
+        let temp_container = common::load_contract(&path_to_code, temp_params)?;
+        let code_hash = CodeHash::from_code(temp_container.data());
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(60),
@@ -1767,7 +1770,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         };
 
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = ContractContainer::try_from((code, &params))?;
+        let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
         // Choose a node to publish the contract
