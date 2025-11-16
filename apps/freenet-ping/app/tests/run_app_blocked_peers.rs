@@ -244,23 +244,21 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         let (stream_node2, _) = connect_async(&uri_node2).await?;
         let mut client_node2 = WebApi::start(stream_node2);
 
-        // Load contract code
+        // Load and compile contract code
         let path_to_code = std::path::PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
         tracing::info!(path=%path_to_code.display(), "Loading contract code");
-        let code = std::fs::read(path_to_code)
-            .ok()
-            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
-        let code_hash = CodeHash::from_code(&code);
 
-        // Define contract options
+        // Define contract options (code_key is not needed for basic tests)
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(30),
             tag: APP_TAG.to_string(),
-            code_key: code_hash.to_string(),
+            code_key: String::new(),
         };
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = ContractContainer::try_from((code, &params))?;
+
+        // Load and compile contract
+        let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
         // Gateway puts the contract
@@ -803,7 +801,7 @@ async fn test_ping_blocked_peers() -> TestResult {
 
 /// Simple blocked peers test
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "Functional issue: WebSocket connection reset"]
 async fn test_ping_blocked_peers_simple() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "simple",
@@ -826,7 +824,7 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
 
 /// Solution/reference implementation for blocked peers
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "fix me"]
+#[ignore = "Functional issue: WebSocket connection reset"]
 async fn test_ping_blocked_peers_solution() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "solution",

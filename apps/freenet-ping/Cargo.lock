@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.36"
+version = "0.1.37"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1309,6 +1309,7 @@ dependencies = [
  "hickory-resolver",
  "itertools 0.14.0",
  "notify",
+ "once_cell",
  "opentelemetry",
  "parking_lot",
  "pav_regression",
@@ -1398,9 +1399,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.23"
+version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66c64fa03f4a083918c7e347be47122c223d8156f4c012a0fe8e89a643350f2d"
+checksum = "f39e2953b4b0d82dd02458653b57166ba8c967c6b3fcec146102a27e05a7081a"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -3717,9 +3718,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "slab"
-version = "0.4.11"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
+checksum = "04dc19736151f35336d325007ac991178d504a119863a2fcb3758cdb5e52c50d"
 
 [[package]]
 name = "slice-group-by"

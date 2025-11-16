@@ -462,7 +462,6 @@ async fn test_node_diagnostics_query() -> TestResult {
     Ok(())
 }
 
-#[ignore = "this test currently fails and we are workign on fixing it"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ping_multi_node() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
@@ -1091,7 +1090,6 @@ async fn test_ping_multi_node() -> TestResult {
     Ok(())
 }
 
-#[ignore = "this test currently fails and we are workign on fixing it"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ping_application_loop() -> TestResult {
     freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
@@ -1520,7 +1518,6 @@ async fn test_ping_application_loop() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Test has never worked - gateway nodes fail on startup with channel closed errors"]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
