@@ -199,13 +199,9 @@ impl RelayState {
         push_unique_peer(&mut self.request.visited, ctx.self_location().clone());
 
         if let Some(joiner_addr) = self.request.observed_addr {
-            // Always overwrite with observed socket rather than checking routability, with one
-            // exception: if the observed socket is loopback, keep the advertised address. Loopback
-            // shows up in localhost test topologies; in production the observed socket will be a
-            // real external address and is the only ground truth we have.
-            if joiner_addr.ip().is_loopback() {
-                return actions;
-            }
+            // Always overwrite with observed socket rather than checking routability. If the
+            // observed socket is loopback, this guard is skipped only in local/unit tests where
+            // peers share 127.0.0.1, so keep a one-shot overwrite and avoid early returns.
             if !self.observed_sent {
                 self.request.joiner.peer.addr = joiner_addr;
                 if self.request.joiner.location.is_none() {
