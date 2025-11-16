@@ -199,6 +199,11 @@ impl RelayState {
         push_unique_peer(&mut self.request.visited, ctx.self_location().clone());
 
         if let Some(joiner_addr) = self.request.observed_addr {
+            // Always overwrite with observed socket rather than checking is_publicly_routable.
+            // The observed UDP source address is ground truth - it's the address that actually
+            // delivered the packet to the relay. If the joiner advertised a different address,
+            // we have no way to verify it's reachable. Even multi-homed, dual-stack, or NAT
+            // scenarios benefit from using the provably-working observed address.
             if !self.observed_sent {
                 self.request.joiner.peer.addr = joiner_addr;
                 if self.request.joiner.location.is_none() {
