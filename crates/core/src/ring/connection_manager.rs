@@ -427,13 +427,28 @@ impl ConnectionManager {
         const PENDING_TTL: Duration = Duration::from_secs(60);
         let now = Instant::now();
         let mut pending = self.pending_connections.lock();
+        let mut expired_peers = Vec::new();
+
         pending.retain(|peer, since| {
             let keep = now.duration_since(*since) < PENDING_TTL;
             if !keep {
                 tracing::info!(%peer, elapsed_secs = now.duration_since(*since).as_secs_f64(), "Expiring stale pending connection reservation");
+                expired_peers.push(peer.clone());
             }
             keep
         });
+
+        drop(pending);
+
+        // Remove expired peers from location_for_peer to maintain consistency
+        if !expired_peers.is_empty() {
+            let mut locations = self.location_for_peer.write();
+            for peer in &expired_peers {
+                if locations.remove(peer).is_some() {
+                    tracing::debug!(%peer, "Removed expired peer from location_for_peer");
+                }
+            }
+        }
     }
 
     pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
