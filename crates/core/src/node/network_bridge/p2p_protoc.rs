@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use dashmap::DashSet;
 use either::{Either, Left, Right};
 use futures::FutureExt;
@@ -2160,10 +2161,13 @@ async fn peer_connection_listener(
                                     ?error,
                                     "[CONN_LIFECYCLE] Failed to deserialize inbound message; closing connection"
                                 );
+                                let transport_error = TransportError::Other(anyhow!(
+                                    "Failed to deserialize inbound message from {remote_addr}: {error:?}"
+                                ));
                                 notify_transport_closed(
                                     &conn_events,
                                     remote_addr,
-                                    TransportError::ConnectionClosed(remote_addr),
+                                    transport_error,
                                 )
                                 .await;
                                 return;
