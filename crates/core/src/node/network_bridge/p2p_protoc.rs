@@ -1622,6 +1622,7 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         handshake_commands: &HandshakeCommandSender,
     ) -> anyhow::Result<EventResult> {
+        let _ = state;
         match event {
             Some(ConnEvent::InboundMessage(mut inbound)) => {
                 let tx = *inbound.msg.id();
@@ -1664,33 +1665,6 @@ impl P2pConnManager {
                                     self.connections.insert(new_peer_id, channel);
                                 }
                             }
-                        }
-                    }
-
-                    let should_connect =
-                        !self.connections.keys().any(|peer| peer.addr == remote_addr)
-                            && !state.awaiting_connection.contains_key(&remote_addr);
-
-                    if should_connect {
-                        if let Some(sender_peer) = extract_sender_from_message(&inbound.msg) {
-                            tracing::info!(
-                                "Received message from unconnected peer {}, establishing connection proactively",
-                                sender_peer.peer
-                            );
-
-                            let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
-                            let (callback, _rx) = tokio::sync::mpsc::channel(10);
-
-                            let _ = self
-                                .handle_connect_peer(
-                                    sender_peer.peer.clone(),
-                                    Box::new(callback),
-                                    tx,
-                                    handshake_commands,
-                                    state,
-                                    false,
-                                )
-                                .await;
                         }
                     }
                 }
