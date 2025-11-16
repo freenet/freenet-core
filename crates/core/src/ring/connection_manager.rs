@@ -1,7 +1,8 @@
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
 use std::{
-    collections::{btree_map::Entry, BTreeMap, HashMap},
+    collections::{btree_map::Entry, BTreeMap},
     time::{Duration, Instant},
 };
 
@@ -12,7 +13,7 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
     open_connections: Arc<AtomicUsize>,
-    pending_connections: Arc<Mutex<HashMap<PeerId, Instant>>>,
+    pending_connections: Arc<DashMap<PeerId, Instant>>,
     pub(super) location_for_peer: Arc<RwLock<BTreeMap<PeerId, Location>>>,
     pub(super) topology_manager: Arc<RwLock<TopologyManager>>,
     connections_by_location: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
@@ -105,7 +106,7 @@ impl ConnectionManager {
             connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
             location_for_peer: Arc::new(RwLock::new(BTreeMap::new())),
             open_connections: Arc::new(AtomicUsize::new(0)),
-            pending_connections: Arc::new(Mutex::new(HashMap::new())),
+            pending_connections: Arc::new(DashMap::new()),
             topology_manager,
             own_location: own_location.into(),
             peer_key: Arc::new(Mutex::new(peer_id)),
@@ -128,10 +129,8 @@ impl ConnectionManager {
             .open_connections
             .load(std::sync::atomic::Ordering::SeqCst);
         self.expire_stale_pending();
-        let (reserved_before, already_pending) = {
-            let pending = self.pending_connections.lock();
-            (pending.len(), pending.contains_key(peer_id))
-        };
+        let reserved_before = self.pending_connections.len();
+        let already_pending = self.pending_connections.contains_key(peer_id);
 
         tracing::info!(
             %peer_id,
@@ -318,7 +317,7 @@ impl ConnectionManager {
         tracing::info!(%peer, %loc, %was_reserved, "Adding connection to topology");
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
         if was_reserved {
-            self.pending_connections.lock().remove(&peer);
+            self.pending_connections.remove(&peer);
         }
         let mut lop = self.location_for_peer.write();
         lop.insert(peer.clone(), loc);
@@ -392,7 +391,7 @@ impl ConnectionManager {
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
             } else {
-                self.pending_connections.lock().remove(peer);
+                self.pending_connections.remove(peer);
             }
             return None;
         };
@@ -408,7 +407,7 @@ impl ConnectionManager {
             self.open_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         } else {
-            self.pending_connections.lock().remove(peer);
+            self.pending_connections.remove(peer);
         }
 
         Some(loc)
@@ -420,16 +419,15 @@ impl ConnectionManager {
     }
 
     fn register_pending(&self, peer: PeerId) {
-        self.pending_connections.lock().insert(peer, Instant::now());
+        self.pending_connections.insert(peer, Instant::now());
     }
 
     fn expire_stale_pending(&self) {
         const PENDING_TTL: Duration = Duration::from_secs(60);
         let now = Instant::now();
-        let mut pending = self.pending_connections.lock();
         let mut expired_peers = Vec::new();
 
-        pending.retain(|peer, since| {
+        self.pending_connections.retain(|peer, since| {
             let keep = now.duration_since(*since) < PENDING_TTL;
             if !keep {
                 tracing::info!(%peer, elapsed_secs = now.duration_since(*since).as_secs_f64(), "Expiring stale pending connection reservation");
@@ -437,8 +435,6 @@ impl ConnectionManager {
             }
             keep
         });
-
-        drop(pending);
 
         // Remove expired peers from location_for_peer to maintain consistency
         if !expired_peers.is_empty() {
@@ -533,13 +529,13 @@ mod tests {
         let peer = make_peer(40000);
         let loc = Location::from_address(&peer.addr);
         assert!(cm.should_accept(loc, &peer));
-        assert_eq!(cm.pending_connections.lock().len(), 1);
+        assert_eq!(cm.pending_connections.len(), 1);
 
         // Remove the pending reservation normally, then ensure an extra prune is safe.
         cm.prune_in_transit_connection(&peer);
-        assert_eq!(cm.pending_connections.lock().len(), 0);
+        assert_eq!(cm.pending_connections.len(), 0);
         cm.prune_in_transit_connection(&peer);
-        assert_eq!(cm.pending_connections.lock().len(), 0);
+        assert_eq!(cm.pending_connections.len(), 0);
     }
 
     #[test]
@@ -547,12 +543,10 @@ mod tests {
         let cm = make_connection_manager(false);
         let peer = make_peer(40001);
         cm.register_pending(peer.clone());
-        {
-            let mut pending = cm.pending_connections.lock();
-            let stale = Instant::now() - Duration::from_secs(120);
-            pending.insert(peer.clone(), stale);
-        }
+        // Set the timestamp to be stale
+        let stale = Instant::now() - Duration::from_secs(120);
+        cm.pending_connections.insert(peer.clone(), stale);
         cm.expire_stale_pending();
-        assert_eq!(cm.pending_connections.lock().len(), 0);
+        assert_eq!(cm.pending_connections.len(), 0);
     }
 }
