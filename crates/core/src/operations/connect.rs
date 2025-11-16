@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -106,29 +106,6 @@ impl ConnectMsg {
     }
 }
 
-fn is_publicly_routable(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(addr) => {
-            let octets = addr.octets();
-            let is_loopback = octets[0] == 127;
-            let is_link_local = octets[0] == 169 && octets[1] == 254;
-            let is_private = octets[0] == 10
-                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 168);
-            let is_unspecified = addr.octets() == [0, 0, 0, 0];
-            !(is_loopback || is_link_local || is_private || is_unspecified)
-        }
-        IpAddr::V6(addr) => {
-            let segments = addr.segments();
-            let is_loopback = addr == std::net::Ipv6Addr::LOCALHOST;
-            let is_unspecified = addr == std::net::Ipv6Addr::UNSPECIFIED;
-            let is_unique_local = (segments[0] & 0xfe00) == 0xfc00;
-            let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
-            !(is_loopback || is_unspecified || is_unique_local || is_link_local)
-        }
-    }
-}
-
 /// Two-message request payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ConnectRequest {
@@ -222,7 +199,7 @@ impl RelayState {
         push_unique_peer(&mut self.request.visited, ctx.self_location().clone());
 
         if let Some(joiner_addr) = self.request.observed_addr {
-            if !self.observed_sent && !is_publicly_routable(self.request.joiner.peer.addr.ip()) {
+            if !self.observed_sent {
                 self.request.joiner.peer.addr = joiner_addr;
                 if self.request.joiner.location.is_none() {
                     self.request.joiner.location = Some(Location::from_address(&joiner_addr));
