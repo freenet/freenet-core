@@ -2,20 +2,19 @@
 //! This avoids waker registration issues that can occur with nested tokio::select! macros.
 
 use either::Either;
-use futures::{future::BoxFuture, stream::FuturesUnordered, Stream};
+use futures::Stream;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
 
-use super::p2p_protoc::PeerConnectionInbound;
+use super::p2p_protoc::ConnEvent;
 use crate::contract::{
     ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
     WaitingResolution,
 };
 use crate::dev_tool::{PeerId, Transaction};
 use crate::message::{NetMessage, NodeEvent};
-use crate::transport::TransportError;
 
 // P2pBridgeEvent type alias for the event bridge channel
 pub type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
@@ -25,7 +24,7 @@ pub type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
 pub(super) enum SelectResult {
     Notification(Option<Either<NetMessage, NodeEvent>>),
     OpExecution(Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>),
-    PeerConnection(Option<Result<PeerConnectionInbound, TransportError>>),
+    PeerConnection(Option<ConnEvent>),
     ConnBridge(Option<P2pBridgeEvent>),
     Handshake(Option<crate::node::network_bridge::handshake::Event>),
     NodeController(Option<NodeEvent>),
@@ -110,10 +109,7 @@ where
         tokio_stream::wrappers::ReceiverStream<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
     conn_bridge: tokio_stream::wrappers::ReceiverStream<P2pBridgeEvent>,
     node_controller: tokio_stream::wrappers::ReceiverStream<NodeEvent>,
-
-    // FuturesUnordered already implements Stream (owned)
-    peer_connections:
-        FuturesUnordered<BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>>,
+    conn_events: tokio_stream::wrappers::ReceiverStream<ConnEvent>,
 
     // HandshakeHandler now implements Stream directly - maintains state across polls
     // Generic to allow testing with mocks
@@ -129,6 +125,7 @@ where
     op_execution_closed: bool,
     conn_bridge_closed: bool,
     node_controller_closed: bool,
+    conn_events_closed: bool,
 }
 
 impl<H, C, E> PrioritySelectStream<H, C, E>
@@ -146,9 +143,7 @@ where
         node_controller: Receiver<NodeEvent>,
         client_wait_for_transaction: C,
         executor_listener: E,
-        peer_connections: FuturesUnordered<
-            BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
-        >,
+        conn_events: Receiver<ConnEvent>,
     ) -> Self {
         use tokio_stream::wrappers::ReceiverStream;
 
@@ -157,7 +152,7 @@ where
             op_execution: ReceiverStream::new(op_execution_rx),
             conn_bridge: ReceiverStream::new(conn_bridge_rx),
             node_controller: ReceiverStream::new(node_controller),
-            peer_connections,
+            conn_events: ReceiverStream::new(conn_events),
             handshake_handler,
             client_wait_for_transaction,
             executor_listener,
@@ -165,15 +160,8 @@ where
             op_execution_closed: false,
             conn_bridge_closed: false,
             node_controller_closed: false,
+            conn_events_closed: false,
         }
-    }
-
-    /// Add a new peer connection task to the stream
-    pub fn push_peer_connection(
-        &mut self,
-        task: BoxFuture<'static, Result<PeerConnectionInbound, TransportError>>,
-    ) {
-        self.peer_connections.push(task);
     }
 }
 
@@ -225,10 +213,18 @@ where
             }
         }
 
-        // Priority 3: Peer connections (only if not empty)
-        if !this.peer_connections.is_empty() {
-            match Pin::new(&mut this.peer_connections).poll_next(cx) {
-                Poll::Ready(msg) => return Poll::Ready(Some(SelectResult::PeerConnection(msg))),
+        // Priority 3: Peer connection events
+        if !this.conn_events_closed {
+            match Pin::new(&mut this.conn_events).poll_next(cx) {
+                Poll::Ready(Some(event)) => {
+                    return Poll::Ready(Some(SelectResult::PeerConnection(Some(event))))
+                }
+                Poll::Ready(None) => {
+                    this.conn_events_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::PeerConnection(None));
+                    }
+                }
                 Poll::Pending => {}
             }
         }
