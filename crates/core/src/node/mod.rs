@@ -701,7 +701,7 @@ async fn process_message_v1<CB>(
                     tx_type = %msg.id().transaction_type()
                 );
                 let op_result =
-                    handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
+                    handle_op_request::<ConnectOp, _>(&op_manager, &mut conn_manager, op)
                         .instrument(span)
                         .await;
 
@@ -861,7 +861,7 @@ where
                     tx_type = %msg.id().transaction_type()
                 );
                 let op_result =
-                    handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
+                    handle_op_request::<ConnectOp, _>(&op_manager, &mut conn_manager, op)
                         .instrument(span)
                         .await;
 
@@ -879,7 +879,6 @@ where
                     }
                 }
 
-                // Pure network result processing - no client handling
                 return handle_pure_network_result(
                     tx,
                     op_result,
@@ -1153,28 +1152,27 @@ async fn handle_aborted_op(
         // is useless without connecting to the network, we will retry with exponential backoff
         // if necessary
         match op_manager.pop(&tx) {
-            // only keep attempting to connect if the node hasn't got enough connections yet
             Ok(Some(OpEnum::Connect(op)))
                 if op.has_backoff()
                     && op_manager.ring.open_connections()
                         < op_manager.ring.connection_manager.min_connections =>
             {
-                let ConnectOp {
-                    gateway, backoff, ..
-                } = *op;
+                let gateway = op.gateway().cloned();
                 if let Some(gateway) = gateway {
                     tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    connect::join_ring_request(backoff, &gateway, op_manager).await?;
+                    connect::join_ring_request(None, &gateway, op_manager).await?;
                 }
             }
             Ok(Some(OpEnum::Connect(_))) => {
-                // if no connections were achieved just fail
                 if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                     tracing::warn!("Retrying joining the ring with an other gateway");
                     if let Some(gateway) = gateways.iter().shuffle().next() {
                         connect::join_ring_request(None, gateway, op_manager).await?
                     }
                 }
+            }
+            Ok(Some(other)) => {
+                op_manager.push(tx, other).await?;
             }
             _ => {}
         }

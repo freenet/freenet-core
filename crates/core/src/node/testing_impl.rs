@@ -780,7 +780,8 @@ where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
-    connect::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
+    let join_task =
+        connect::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
     let (client_responses, _cli_response_sender) = contract::client_responses_channel();
     let span = {
         config
@@ -811,9 +812,13 @@ where
         .parent_span
         .clone()
         .unwrap_or_else(|| tracing::info_span!("event_listener", peer = %config.peer_key));
-    run_event_listener(node_controller_rx, config)
+    let result = run_event_listener(node_controller_rx, config)
         .instrument(parent_span)
-        .await
+        .await;
+
+    join_task.abort();
+    let _ = join_task.await;
+    result
 }
 
 /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
@@ -935,9 +940,8 @@ where
                 NodeEvent::QueryNodeDiagnostics { .. } => {
                     unimplemented!()
                 }
-                NodeEvent::SendMessage { target, msg } => {
-                    tracing::debug!(tx = %msg.id(), %target, "SendMessage event in testing_impl");
-                    conn_manager.send(&target, *msg).await?;
+                NodeEvent::ExpectPeerConnection { peer } => {
+                    tracing::debug!(%peer, "ExpectPeerConnection ignored in testing impl");
                     continue;
                 }
             },

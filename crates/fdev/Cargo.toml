@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.3.14"
+version = "0.3.15"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -10,7 +10,7 @@ repository = "https://github.com/freenet/freenet-core"
 readme = "README.md"
 
 [dependencies]
-bytesize = "2.0"
+bytesize = "2.2"
 anyhow = "1"
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
 bincode = "1"
@@ -39,7 +39,7 @@ reqwest = { version = "0.12", features = ["json"] }
 http = "1.2"
 
 # internal
-freenet = { path = "../core", version = "0.1.36" }
+freenet = { path = "../core", version = "0.1.37" }
 freenet-stdlib = { workspace = true }
 
 [features]

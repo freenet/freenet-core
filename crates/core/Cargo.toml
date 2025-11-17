@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.36"
+version = "0.1.37"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -44,6 +44,7 @@ pav_regression = "0.6.1"
 parking_lot = "0.12"
 pin-project = "1"
 rand = { features = ["small_rng"], workspace = true }
+once_cell = "1"
 redb = { optional = true, version = "3" }
 serde = { features = ["derive", "rc"], workspace = true }
 serde_json = { workspace = true }
@@ -76,12 +77,12 @@ opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"]
 
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
-console-subscriber = { version = "0.5.0", optional = true }
+console-subscriber = { version = "0.4.1", optional = true }
 tokio-stream = "0.1.17"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["sysinfoapi"] }
-wmi = "0.18.0"
+wmi = "0.17.3"
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
@@ -89,6 +90,7 @@ arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
+freenet-test-network = "0.1.1"
 httptest = "0.16"
 statrs = "0.18"
 tempfile = "3"

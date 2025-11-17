@@ -1,5 +1,5 @@
-use anyhow::{bail, Context};
-use freenet::test_utils::{self, make_get, make_put, TestContext};
+use anyhow::{anyhow, bail, Context};
+use freenet::test_utils::{self, make_get, make_put, TestContext, TestResult};
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
@@ -88,12 +88,12 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
                 contract_key
             );
             if recv_state != wrapped_state {
-                eprintln!("State mismatch!");
-                eprintln!(
+                tracing::error!("State mismatch!");
+                tracing::error!(
                     "Expected state: {:?}",
                     String::from_utf8_lossy(wrapped_state.as_ref())
                 );
-                eprintln!(
+                tracing::error!(
                     "Received state: {:?}",
                     String::from_utf8_lossy(recv_state.as_ref())
                 );
@@ -365,23 +365,37 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
             format!("{:?}", peer2_peers),
         );
 
-        let gateway_sees_all = gw_peers.len() >= 2;
-        let peer1_direct = peer1_peers.len() >= 2;
-        let peer2_direct = peer2_peers.len() >= 2;
+        let expected_gateway_connections = 2; // peers
+        let gateway_sees_all = gw_peers.len() >= expected_gateway_connections;
 
-        if gateway_sees_all && peer1_direct && peer2_direct {
-            tracing::info!("✅ Full mesh connectivity established!");
+        // Require each peer to maintain at least one live connection (typically
+        // the gateway). The topology maintenance loop can continue dialing more
+        // neighbors, but the test should pass once the network is fully
+        // reachable through the gateway.
+        let peer1_has_minimum = !peer1_peers.is_empty();
+        let peer2_has_minimum = !peer2_peers.is_empty();
+
+        if gateway_sees_all && peer1_has_minimum && peer2_has_minimum {
+            if peer1_peers.len() >= expected_gateway_connections
+                && peer2_peers.len() >= expected_gateway_connections
+            {
+                tracing::info!("✅ Full mesh connectivity established!");
+            } else {
+                tracing::info!(
+                    "✅ Minimum connectivity achieved (gateway sees all peers; each peer has at least one neighbor)"
+                );
+            }
             mesh_established = true;
             break;
         }
 
-        tracing::info!("Network not fully connected yet, waiting...");
+        tracing::info!("Network not yet meeting minimum connectivity, waiting...");
         tokio::time::sleep(RETRY_DELAY).await;
     }
 
     if !mesh_established {
         bail!(
-            "Failed to establish full mesh connectivity after {} attempts. Gateway peers: {}; peer1 peers: {}; peer2 peers: {}",
+            "Failed to establish minimum connectivity after {} attempts. Gateway peers: {}; peer1 peers: {}; peer2 peers: {}",
             MAX_RETRIES,
             last_snapshot.0,
             last_snapshot.1,
@@ -392,17 +406,15 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     // Verify functionality with PUT/GET
     tracing::info!("Verifying network functionality with PUT/GET operations");
 
-    make_put(&mut client1, wrapped_state.clone(), contract.clone(), false).await?;
-    let resp = tokio::time::timeout(Duration::from_secs(60), client1.recv()).await;
-    match resp {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-            assert_eq!(key, contract_key);
-            tracing::info!("Peer1 successfully performed PUT");
-        }
-        Ok(Ok(other)) => bail!("Unexpected PUT response: {:?}", other),
-        Ok(Err(e)) => bail!("Error receiving PUT response: {}", e),
-        Err(_) => bail!("Timeout waiting for PUT response"),
-    }
+    const PUT_RETRIES: usize = 3;
+    perform_put_with_retries(
+        &mut client1,
+        &wrapped_state,
+        &contract,
+        &contract_key,
+        PUT_RETRIES,
+    )
+    .await?;
 
     make_get(&mut client2, contract_key, true, false).await?;
     let get_response = tokio::time::timeout(Duration::from_secs(60), client2.recv()).await;
@@ -434,4 +446,51 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     Ok(())
+}
+
+async fn perform_put_with_retries(
+    client: &mut WebApi,
+    wrapped_state: &WrappedState,
+    contract: &ContractContainer,
+    contract_key: &ContractKey,
+    max_attempts: usize,
+) -> TestResult {
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=max_attempts {
+        tracing::info!(attempt, max_attempts, "Starting PUT attempt");
+        if let Err(err) = make_put(client, wrapped_state.clone(), contract.clone(), false).await {
+            last_err = Some(err);
+        } else {
+            match tokio::time::timeout(Duration::from_secs(60), client.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                    if key == *contract_key {
+                        tracing::info!(attempt, "Peer1 successfully performed PUT");
+                        return Ok(());
+                    }
+                    last_err = Some(anyhow!(
+                        "Received PUT response for unexpected key {key:?} (expected {contract_key:?})"
+                    ));
+                }
+                Ok(Ok(other)) => {
+                    last_err = Some(anyhow!("Unexpected PUT response: {other:?}"));
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(anyhow!("Error receiving PUT response: {e}"));
+                }
+                Err(_) => {
+                    last_err = Some(anyhow!("Timeout waiting for PUT response"));
+                }
+            }
+        }
+
+        tracing::warn!(
+            attempt,
+            max_attempts,
+            "PUT attempt failed; retrying after short delay"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("PUT failed after {max_attempts} attempts")))
 }

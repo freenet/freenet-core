@@ -193,6 +193,7 @@ where
 
 mod sealed_msg_type {
     use super::*;
+    use crate::operations::connect::ConnectMsg;
 
     pub trait SealedTxType {
         fn tx_type_id() -> TransactionTypeId;
@@ -301,7 +302,7 @@ impl Versioned for NetMessage {
 impl Versioned for NetMessageV1 {
     fn version(&self) -> semver::Version {
         match self {
-            NetMessageV1::Connect(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::Connect(_) => semver::Version::new(1, 1, 0),
             NetMessageV1::Put(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Get(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Subscribe(_) => semver::Version::new(1, 0, 0),
@@ -363,10 +364,9 @@ pub(crate) enum NodeEvent {
         key: ContractKey,
         subscribed: bool,
     },
-    /// Send a message to a peer over the network
-    SendMessage {
-        target: PeerId,
-        msg: Box<NetMessage>,
+    /// Register expectation for an inbound connection from the given peer.
+    ExpectPeerConnection {
+        peer: PeerId,
     },
 }
 
@@ -444,8 +444,8 @@ impl Display for NodeEvent {
                     "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
                 )
             }
-            NodeEvent::SendMessage { target, msg } => {
-                write!(f, "SendMessage (to {target}, tx: {})", msg.id())
+            NodeEvent::ExpectPeerConnection { peer } => {
+                write!(f, "ExpectPeerConnection (from {peer})")
             }
         }
     }
@@ -486,7 +486,7 @@ impl MessageStats for NetMessageV1 {
 
     fn target(&self) -> Option<PeerKeyLocation> {
         match self {
-            NetMessageV1::Connect(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Connect(op) => op.target().cloned(),
             NetMessageV1::Put(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Get(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Subscribe(op) => op.target().as_ref().map(|b| b.borrow().clone()),

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
@@ -7,10 +7,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::PCK_VERSION;
+use crate::ring::PeerKeyLocation;
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
 use aes_gcm::{Aes128Gcm, KeyInit};
+use dashmap::DashSet;
 use futures::{
     future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
@@ -36,9 +38,7 @@ use super::{
 };
 
 // Constants for interval increase
-const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
-const INTERVAL_INCREASE_FACTOR: u64 = 2;
-const MAX_INTERVAL: Duration = Duration::from_millis(5000); // Maximum interval limit
+const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
 
 const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 
@@ -65,6 +65,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     listen_port: u16,
     is_gateway: bool,
     bandwidth_limit: Option<usize>,
+    known_gateways: &[PeerKeyLocation],
 ) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
     // Bind the UDP socket to the specified port
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
@@ -81,12 +82,23 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         is_gateway,
         "UDP socket bound successfully"
     );
+    let gateway_addrs: Option<Arc<HashSet<SocketAddr>>> = if is_gateway {
+        None
+    } else {
+        Some(Arc::new(
+            known_gateways
+                .iter()
+                .map(|g| g.peer.addr)
+                .collect::<HashSet<_>>(),
+        ))
+    };
     let (och, new_connection_notifier) = OutboundConnectionHandler::config_listener(
         Arc::new(socket),
         keypair,
         is_gateway,
         (listen_host, listen_port).into(),
         bandwidth_limit,
+        gateway_addrs.clone(),
     )?;
     Ok((
         och,
@@ -101,15 +113,6 @@ pub(crate) struct InboundConnectionHandler {
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
 }
 
-#[cfg(test)]
-impl InboundConnectionHandler {
-    pub fn new(new_connection_notifier: mpsc::Receiver<PeerConnection>) -> Self {
-        InboundConnectionHandler {
-            new_connection_notifier,
-        }
-    }
-}
-
 impl InboundConnectionHandler {
     pub async fn next_connection(&mut self) -> Option<PeerConnection> {
         self.new_connection_notifier.recv().await
@@ -120,13 +123,7 @@ impl InboundConnectionHandler {
 #[derive(Clone)]
 pub(crate) struct OutboundConnectionHandler {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
-}
-
-#[cfg(test)]
-impl OutboundConnectionHandler {
-    pub fn new(send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>) -> Self {
-        OutboundConnectionHandler { send_queue }
-    }
+    expected_non_gateway: Arc<DashSet<IpAddr>>,
 }
 
 impl OutboundConnectionHandler {
@@ -136,6 +133,7 @@ impl OutboundConnectionHandler {
         is_gateway: bool,
         socket_addr: SocketAddr,
         bandwidth_limit: Option<usize>,
+        known_gateway_addrs: Option<Arc<HashSet<SocketAddr>>>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
@@ -143,6 +141,8 @@ impl OutboundConnectionHandler {
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (outbound_sender, outbound_recv) = mpsc::channel(100);
+        let expected_non_gateway = Arc::new(DashSet::new());
+
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket.clone(),
@@ -155,6 +155,8 @@ impl OutboundConnectionHandler {
             dropped_packets: HashMap::new(),
             last_drop_warning: Instant::now(),
             bandwidth_limit,
+            expected_non_gateway: expected_non_gateway.clone(),
+            known_gateway_addrs: known_gateway_addrs.clone(),
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
@@ -162,6 +164,7 @@ impl OutboundConnectionHandler {
         );
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
+            expected_non_gateway,
         };
 
         // IMPORTANT: The general packet rate limiter is disabled (passing None) due to reliability issues.
@@ -189,7 +192,7 @@ impl OutboundConnectionHandler {
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
-        Self::config_listener(socket, keypair, is_gateway, socket_addr, None)
+        Self::config_listener(socket, keypair, is_gateway, socket_addr, None, None)
     }
 
     pub async fn connect(
@@ -197,6 +200,9 @@ impl OutboundConnectionHandler {
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<PeerConnection, TransportError>> + Send>> {
+        if self.expected_non_gateway.insert(remote_addr.ip()) {
+            tracing::debug!(%remote_addr, "awaiting outbound handshake response from remote IP");
+        }
         let (open_connection, recv_connection) = oneshot::channel();
         if self
             .send_queue
@@ -222,6 +228,12 @@ impl OutboundConnectionHandler {
             })
             .boxed()
     }
+
+    pub fn expect_incoming(&self, remote_addr: SocketAddr) {
+        if self.expected_non_gateway.insert(remote_addr.ip()) {
+            tracing::debug!(%remote_addr, "registered expected inbound handshake from remote IP");
+        }
+    }
 }
 
 /// Handles UDP transport internally.
@@ -237,6 +249,8 @@ struct UdpPacketsListener<S = UdpSocket> {
     dropped_packets: HashMap<SocketAddr, u64>,
     last_drop_warning: Instant,
     bandwidth_limit: Option<usize>,
+    expected_non_gateway: Arc<DashSet<IpAddr>>,
+    known_gateway_addrs: Option<Arc<HashSet<SocketAddr>>>,
 }
 
 type OngoingConnection = (
@@ -403,12 +417,27 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if !self.is_gateway {
-                                tracing::debug!(
-                                    %remote_addr,
-                                    %size,
-                                    "unexpected packet from non-gateway node"
-                                );
-                                continue;
+                                let allow = self.expected_non_gateway.contains(&remote_addr.ip());
+                                let gateway_allow = self
+                                    .known_gateway_addrs
+                                    .as_ref()
+                                    .map(|set| set.contains(&remote_addr))
+                                    .unwrap_or(false);
+                                if !allow && gateway_allow {
+                                    tracing::debug!(
+                                        %remote_addr,
+                                        "allowing inbound handshake from known gateway without prior expectation"
+                                    );
+                                }
+                                if !allow && !gateway_allow {
+                                    tracing::warn!(
+                                        %remote_addr,
+                                        %size,
+                                        "unexpected packet from non-gateway node; dropping intro packet"
+                                    );
+                                    self.expected_non_gateway.insert(remote_addr.ip());
+                                    continue;
+                                }
                             }
 
                             // Check if we already have a gateway connection in progress
@@ -477,6 +506,16 @@ impl<S: Socket> UdpPacketsListener<S> {
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection)) => {
                             if let Some((_, result_sender)) = ongoing_connections.remove(&outbound_remote_conn.remote_addr) {
+                                if self
+                                    .expected_non_gateway
+                                    .remove(&outbound_remote_conn.remote_addr.ip())
+                                    .is_some()
+                                {
+                                    tracing::debug!(
+                                        remote_addr = %outbound_remote_conn.remote_addr,
+                                        "cleared expected handshake flag after successful connection"
+                                    );
+                                }
                                 tracing::debug!(remote_addr = %outbound_remote_conn.remote_addr, "connection established");
                                 self.remote_connections.insert(outbound_remote_conn.remote_addr, inbound_remote_connection);
                                 let _ = result_sender.send(Ok(outbound_remote_conn)).map_err(|_| {
@@ -498,6 +537,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 }
                             }
                             if let Some((_, result_sender)) = ongoing_connections.remove(&remote_addr) {
+                                if self
+                                    .expected_non_gateway
+                                    .remove(&remote_addr.ip())
+                                    .is_some()
+                                {
+                                    tracing::debug!(%remote_addr, "cleared expected handshake flag after failed connection");
+                                }
                                 let _ = result_sender.send(Err(error));
                             }
                         }
@@ -541,8 +587,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                     }
                     tracing::info!(%remote_addr, "attempting to establish connection");
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
-                        remote_addr,  remote_public_key,
+                        remote_addr,
+                        remote_public_key.clone(),
                     );
+                    self.expected_non_gateway.insert(remote_addr.ip());
                     let task = tokio::spawn(ongoing_connection
                         .map_err(move |err| (err, remote_addr))
                         .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
@@ -683,14 +731,6 @@ impl<S: Socket> UdpPacketsListener<S> {
             %remote_addr,
             "Starting NAT traversal"
         );
-        // Constants for exponential backoff
-        const INITIAL_TIMEOUT: Duration = Duration::from_millis(600);
-        const TIMEOUT_MULTIPLIER: f64 = 1.2;
-        #[cfg(not(test))]
-        const MAX_TIMEOUT: Duration = Duration::from_secs(60); // Maximum timeout limit
-        #[cfg(test)]
-        const MAX_TIMEOUT: Duration = Duration::from_secs(10); // Maximum timeout limit
-
         #[allow(clippy::large_enum_variant)]
         enum ConnectionState {
             /// Initial state of the joiner
@@ -738,13 +778,13 @@ impl<S: Socket> UdpPacketsListener<S> {
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
         let f = async move {
+            tracing::info!(%remote_addr, "Starting outbound handshake (NAT traversal)");
             let mut state = ConnectionState::StartOutbound {};
-            // Initialize timeout and interval
-            let mut timeout = INITIAL_TIMEOUT;
-            let mut interval_duration = INITIAL_INTERVAL;
-            let mut tick = tokio::time::interval(interval_duration);
-
-            let mut failures = 0;
+            let mut attempts = 0usize;
+            let start_time = Instant::now();
+            let overall_deadline = Duration::from_secs(3);
+            let mut resend_tick = tokio::time::interval(INITIAL_INTERVAL);
+            resend_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
             let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
@@ -759,7 +799,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let mut sent_tracker = SentPacketTracker::new();
 
-            while failures < NAT_TRAVERSAL_MAX_ATTEMPTS {
+            while attempts < NAT_TRAVERSAL_MAX_ATTEMPTS && start_time.elapsed() < overall_deadline {
                 match state {
                     ConnectionState::StartOutbound => {
                         tracing::debug!(%remote_addr, "sending protocol version and inbound key");
@@ -767,6 +807,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             .send((remote_addr, outbound_intro_packet.data().into()))
                             .await
                             .map_err(|_| TransportError::ChannelClosed)?;
+                        attempts += 1;
                     }
                     ConnectionState::RemoteInbound { .. } => {
                         tracing::debug!(%remote_addr, "sending back protocol version and inbound key to remote");
@@ -785,7 +826,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                         );
                     }
                 }
-                let next_inbound = tokio::time::timeout(timeout, next_inbound.recv());
+                let next_inbound =
+                    tokio::time::timeout(Duration::from_millis(200), next_inbound.recv());
                 match next_inbound.await {
                     Ok(Some(packet)) => {
                         tracing::debug!(%remote_addr, "received packet after sending it");
@@ -840,6 +882,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) = mpsc::channel(100);
                                             tracing::debug!(%remote_addr, "connection established");
+                                            tracing::info!(%remote_addr, attempts = attempts, "Outbound handshake completed (ack path)");
                                             return Ok((
                                                 RemoteConnection {
                                                     outbound_packets: outbound_packets.clone(),
@@ -870,7 +913,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         }
                                         _ => {
                                             tracing::debug!(%remote_addr, "unexpected packet from remote");
-                                            failures += 1;
                                             continue;
                                         }
                                     }
@@ -889,7 +931,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
 
-                                failures += 1;
                                 tracing::debug!("Failed to decrypt packet");
                                 continue;
                             }
@@ -902,12 +943,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // intro packet so we need to handle that
                                 if packet.is_intro_packet(intro_packet) {
                                     tracing::debug!(%remote_addr, "received intro packet");
-                                    // we add to the number of failures so we are not stuck in a loop retrying
-                                    failures += 1;
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
                                 let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                tracing::info!(%remote_addr, attempts = attempts, "Outbound handshake completed (inbound ack path)");
                                 return Ok((
                                     RemoteConnection {
                                         outbound_packets: outbound_packets.clone(),
@@ -937,39 +977,19 @@ impl<S: Socket> UdpPacketsListener<S> {
                         return Err(TransportError::ConnectionClosed(remote_addr));
                     }
                     Err(_) => {
-                        failures += 1;
                         tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response in time, retrying");
                     }
                 }
 
-                // We have retried for a while, so return an error
-                if timeout >= MAX_TIMEOUT {
-                    tracing::error!(%this_addr, %remote_addr, "failed to establish connection after multiple attempts, max timeout reached");
-                    break;
-                }
-
-                // Update timeout using exponential backoff, capped at MAX_TIMEOUT
-                timeout = std::cmp::min(
-                    Duration::from_millis(
-                        ((timeout.as_millis()) as f64 * TIMEOUT_MULTIPLIER) as u64,
-                    ),
-                    MAX_TIMEOUT,
-                );
-
-                // Update interval, capped at MAX_INTERVAL
-                if interval_duration < MAX_INTERVAL {
-                    interval_duration = std::cmp::min(
-                        Duration::from_millis(
-                            interval_duration.as_millis() as u64 * INTERVAL_INCREASE_FACTOR,
-                        ),
-                        MAX_INTERVAL,
-                    );
-                    tick = tokio::time::interval(interval_duration);
-                }
-
-                tick.tick().await;
+                resend_tick.tick().await;
             }
 
+            tracing::warn!(
+                %remote_addr,
+                attempts,
+                elapsed_ms = start_time.elapsed().as_millis(),
+                "Outbound handshake failed: max connection attempts reached"
+            );
             Err(TransportError::ConnectionEstablishmentFailure {
                 cause: "max connection attempts reached".into(),
             })

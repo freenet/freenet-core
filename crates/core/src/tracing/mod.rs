@@ -163,24 +163,13 @@ impl<'a> NetEventLog<'a> {
         };
         let kind = match msg {
             NetMessage::V1(NetMessageV1::Connect(connect::ConnectMsg::Response {
-                msg:
-                    connect::ConnectResponse::AcceptedBy {
-                        accepted, acceptor, ..
-                    },
-                ..
+                target, ..
             })) => {
                 let this_peer = ring.connection_manager.own_location();
-                if *accepted {
-                    EventKind::Connect(ConnectEvent::Connected {
-                        this: this_peer,
-                        connected: PeerKeyLocation {
-                            peer: acceptor.peer.clone(),
-                            location: acceptor.location,
-                        },
-                    })
-                } else {
-                    EventKind::Ignored
-                }
+                EventKind::Connect(ConnectEvent::Connected {
+                    this: this_peer,
+                    connected: target.clone(),
+                })
             }
             _ => EventKind::Ignored,
         };
@@ -197,27 +186,27 @@ impl<'a> NetEventLog<'a> {
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
             NetMessageV1::Connect(connect::ConnectMsg::Response {
-                msg:
-                    connect::ConnectResponse::AcceptedBy {
-                        acceptor,
-                        accepted,
-                        joiner,
-                        ..
-                    },
-                ..
+                target, payload, ..
             }) => {
-                let this_peer = &op_manager.ring.connection_manager.get_peer_key().unwrap();
-                let mut events = vec![];
-                if *accepted {
-                    events.push(NetEventLog {
+                let acceptor = payload.acceptor.clone();
+                let events = vec![
+                    NetEventLog {
                         tx: msg.id(),
-                        peer_id: this_peer.clone(),
-                        kind: EventKind::Connect(ConnectEvent::Finished {
-                            initiator: joiner.clone(),
-                            location: acceptor.location.unwrap(),
+                        peer_id: acceptor.peer.clone(),
+                        kind: EventKind::Connect(ConnectEvent::Connected {
+                            this: acceptor.clone(),
+                            connected: target.clone(),
                         }),
-                    });
-                }
+                    },
+                    NetEventLog {
+                        tx: msg.id(),
+                        peer_id: target.peer.clone(),
+                        kind: EventKind::Connect(ConnectEvent::Connected {
+                            this: target.clone(),
+                            connected: acceptor,
+                        }),
+                    },
+                ];
                 return Either::Right(events);
             }
             NetMessageV1::Put(PutMsg::RequestPut {
@@ -1354,7 +1343,7 @@ pub(crate) mod tracer {
         {
             if std::env::var("TOKIO_CONSOLE").is_ok() {
                 console_subscriber::init();
-                println!(
+                tracing::info!(
                     "Tokio console subscriber initialized. Connect with 'tokio-console' command."
                 );
                 return Ok(());
@@ -1450,7 +1439,7 @@ pub(crate) mod tracer {
                 } else {
                     "freenet-core".to_string()
                 };
-                println!("setting OT collector with identifier: {identifier}");
+                tracing::info!("setting OT collector with identifier: {identifier}");
                 // TODO: Fix OpenTelemetry version conflicts and API changes
                 // The code below needs to be updated to work with the new OpenTelemetry API
                 // For now, we'll just use the fmt_layer without OpenTelemetry tracing

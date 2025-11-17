@@ -1,27 +1,13 @@
 use crate::{message::Transaction, node::PeerId};
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync;
 
 #[derive(Clone)]
 pub struct LiveTransactionTracker {
     tx_per_peer: Arc<DashMap<PeerId, Vec<Transaction>>>,
-    missing_candidate_sender: sync::mpsc::Sender<PeerId>,
 }
 
 impl LiveTransactionTracker {
-    /// The given peer does not have (good) candidates for acquiring new connections.
-    pub async fn missing_candidate_peers(&self, peer: PeerId) {
-        let _ = self
-            .missing_candidate_sender
-            .send(peer)
-            .await
-            .map_err(|error| {
-                tracing::debug!(%error, "live transaction tracker channel closed");
-                error
-            });
-    }
-
     pub fn add_transaction(&self, peer: PeerId, tx: Transaction) {
         self.tx_per_peer.entry(peer).or_default().push(tx);
     }
@@ -42,15 +28,10 @@ impl LiveTransactionTracker {
         }
     }
 
-    pub(crate) fn new() -> (Self, sync::mpsc::Receiver<PeerId>) {
-        let (missing_peer, rx) = sync::mpsc::channel(10);
-        (
-            Self {
-                tx_per_peer: Arc::new(DashMap::default()),
-                missing_candidate_sender: missing_peer,
-            },
-            rx,
-        )
+    pub(crate) fn new() -> Self {
+        Self {
+            tx_per_peer: Arc::new(DashMap::default()),
+        }
     }
 
     pub(crate) fn prune_transactions_from_peer(&self, peer: &PeerId) {
