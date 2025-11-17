@@ -28,6 +28,27 @@ use tokio::select;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 
+async fn log_recent_events(ctx: &TestContext, label: &str) {
+    if let Ok(aggregator) = ctx.aggregate_events().await {
+        if let Ok(events) = aggregator.get_all_events().await {
+            tracing::error!(
+                label,
+                total_events = events.len(),
+                "Aggregated events at failure"
+            );
+            for event in events.iter().rev().take(10).rev() {
+                tracing::error!(
+                    label,
+                    ?event.kind,
+                    peer = %event.peer_id,
+                    ts = %event.datetime,
+                    "Recent event"
+                );
+            }
+        }
+    }
+}
+
 static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
     Mutex::new(rand::rngs::StdRng::from_seed(
         *b"0102030405060708090a0b0c0d0e0f10",
@@ -1950,12 +1971,15 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
             assert_eq!(key, contract_key);
         }
         Ok(Ok(other)) => {
+            log_recent_events(ctx, "put-unexpected").await;
             bail!("Unexpected response while waiting for put: {:?}", other);
         }
         Ok(Err(e)) => {
+            log_recent_events(ctx, "put-error").await;
             bail!("Error receiving put response: {}", e);
         }
         Err(_) => {
+            log_recent_events(ctx, "put-timeout").await;
             bail!("Timeout waiting for put response after 120 seconds");
         }
     }
