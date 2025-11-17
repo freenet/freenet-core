@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
-use std::collections::{btree_map::Entry, BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{btree_map::Entry, BTreeMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -744,14 +744,12 @@ impl ConnectionManager {
             if is_alive {
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
-            } else {
-                if let Some(meta) = pending_meta {
-                    if meta.reserved {
-                        self.release_reserved_slot(Some(peer), "prune_missing_in_transit");
-                    }
-                } else {
-                    tracing::warn!(%peer, "prune_missing_in_transit: no pending entry found while releasing");
+            } else if let Some(meta) = pending_meta {
+                if meta.reserved {
+                    self.release_reserved_slot(Some(peer), "prune_missing_in_transit");
                 }
+            } else {
+                tracing::warn!(%peer, "prune_missing_in_transit: no pending entry found while releasing");
             }
             return None;
         };

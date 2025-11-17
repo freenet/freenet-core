@@ -219,9 +219,9 @@ impl RelayState {
         }
 
         let acceptor = ctx.self_location().clone();
-        let courtesy = ctx.courtesy_hint(&acceptor, &self.request.origin);
+        let courtesy = ctx.courtesy_hint(&acceptor, &self.request.joiner);
 
-        if !self.accepted_locally && ctx.should_accept(&self.request.origin, courtesy) {
+        if !self.accepted_locally && ctx.should_accept(&self.request.joiner, courtesy) {
             self.accepted_locally = true;
             self.courtesy_hint = courtesy;
             actions.accept_response = Some(ConnectResponse {
@@ -229,7 +229,7 @@ impl RelayState {
                 courtesy,
             });
             actions.expect_connection_from = Some(ExpectedConnection {
-                peer: self.request.origin.clone(),
+                peer: self.request.joiner.clone(),
                 courtesy,
             });
         }
@@ -1227,6 +1227,6 @@ mod tests {
         let expect_conn = accept_actions
             .expect_connection_from
             .expect("acceptance should request inbound connection from joiner");
-        assert_eq!(expect_conn.peer, joiner.peer);
+        assert_eq!(expect_conn.peer, joiner);
     }
 }

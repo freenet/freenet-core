@@ -1407,7 +1407,7 @@ impl P2pConnManager {
                     courtesy,
                     transaction = %transaction,
                     ?error,
-                    open_connections = self.bridge.op_manager.ring.open_connection_count(),
+                    open_connections = self.bridge.op_manager.ring.open_connections(),
                     "Outbound connection failed"
                 );
 
@@ -1699,7 +1699,7 @@ impl P2pConnManager {
                 tracing::warn!(
                     remote = %remote_addr,
                     ?error,
-                    open_connections = self.bridge.op_manager.ring.open_connection_count(),
+                    open_connections = self.bridge.op_manager.ring.open_connections(),
                     "peer_connection_listener reported transport closure"
                 );
                 if let Some(peer) = self
