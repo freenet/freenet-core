@@ -311,7 +311,7 @@ impl P2pConnManager {
                     match *event {
                         ConnEvent::InboundMessage(inbound) => {
                             let remote = inbound.remote_addr;
-                            let msg = inbound.msg;
+                            let mut msg = inbound.msg;
                             tracing::info!(
                                 tx = %msg.id(),
                                 msg_type = %msg,
@@ -319,6 +319,21 @@ impl P2pConnManager {
                                 peer = %ctx.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap(),
                                 "Received inbound message from peer - processing"
                             );
+                            // Only the hop that owns the transport socket (gateway/first hop in
+                            // practice) knows the UDP source address; tag the connect request here
+                            // so downstream relays don't guess at the joiner's address.
+                            if let (
+                                Some(remote_addr),
+                                NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                                    payload,
+                                    ..
+                                })),
+                            ) = (remote, &mut msg)
+                            {
+                                if payload.observed_addr.is_none() {
+                                    payload.observed_addr = Some(remote_addr);
+                                }
+                            }
                             ctx.handle_inbound_message(msg, &op_manager, &mut state)
                                 .await?;
                         }
@@ -1610,6 +1625,7 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         handshake_commands: &HandshakeCommandSender,
     ) -> anyhow::Result<EventResult> {
+        let _ = state;
         match event {
             Some(ConnEvent::InboundMessage(mut inbound)) => {
                 let tx = *inbound.msg.id();
@@ -1652,33 +1668,6 @@ impl P2pConnManager {
                                     self.connections.insert(new_peer_id, channel);
                                 }
                             }
-                        }
-                    }
-
-                    let should_connect =
-                        !self.connections.keys().any(|peer| peer.addr == remote_addr)
-                            && !state.awaiting_connection.contains_key(&remote_addr);
-
-                    if should_connect {
-                        if let Some(sender_peer) = extract_sender_from_message(&inbound.msg) {
-                            tracing::info!(
-                                "Received message from unconnected peer {}, establishing connection proactively",
-                                sender_peer.peer
-                            );
-
-                            let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
-                            let (callback, _rx) = tokio::sync::mpsc::channel(10);
-
-                            let _ = self
-                                .handle_connect_peer(
-                                    sender_peer.peer.clone(),
-                                    Box::new(callback),
-                                    tx,
-                                    handshake_commands,
-                                    state,
-                                    false,
-                                )
-                                .await;
                         }
                     }
                 }
