@@ -299,6 +299,7 @@ impl ConnectionManager {
         removed
     }
 
+    #[allow(dead_code)]
     pub(crate) fn take_pending_courtesy_by_addr(&self, addr: &SocketAddr) -> bool {
         if !self.is_gateway {
             return false;
@@ -671,6 +672,7 @@ impl ConnectionManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn register_outbound_pending(&self, peer: &PeerId, location: Option<Location>) {
         if let Some(loc) = location {
             self.record_pending_location(peer, loc);
@@ -678,6 +680,7 @@ impl ConnectionManager {
         self.register_pending_connection(peer, false);
     }
 
+    #[allow(dead_code)]
     pub fn pending_location_hint(&self, peer: &PeerId) -> Option<Location> {
         self.location_for_peer.read().get(peer).copied()
     }
