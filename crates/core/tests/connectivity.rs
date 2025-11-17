@@ -394,6 +394,22 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     }
 
     if !mesh_established {
+        tracing::error!(
+            gateway_peers = %last_snapshot.0,
+            peer1_peers = %last_snapshot.1,
+            peer2_peers = %last_snapshot.2,
+            "Connectivity check failed; dumping last snapshot"
+        );
+
+        if let Ok(aggregator) = ctx.aggregate_events().await {
+            if let Ok(events) = aggregator.get_all_events().await {
+                tracing::error!(total_events = events.len(), "Aggregated events at timeout");
+                for event in events.iter().rev().take(10).rev() {
+                    tracing::error!(?event.kind, peer=%event.peer_id, ts=%event.datetime, "Recent event");
+                }
+            }
+        }
+
         bail!(
             "Failed to establish minimum connectivity after {} attempts. Gateway peers: {}; peer1 peers: {}; peer2 peers: {}",
             MAX_RETRIES,
