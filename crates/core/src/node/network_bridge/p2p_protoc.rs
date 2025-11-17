@@ -319,9 +319,9 @@ impl P2pConnManager {
                                 peer = %ctx.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap(),
                                 "Received inbound message from peer - processing"
                             );
-                            // Only the hop that owns the transport socket knows the UDP source
-                            // address; tag the connect request here so downstream relays don't
-                            // guess at the joiner's address.
+                            // Only the hop that owns the transport socket (gateway/first hop in
+                            // practice) knows the UDP source address; tag the connect request here
+                            // so downstream relays don't guess at the joiner's address.
                             if let (
                                 Some(remote_addr),
                                 NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
