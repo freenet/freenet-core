@@ -393,6 +393,14 @@ impl ConnectionManager {
         true
     }
 
+    /// Registers (or updates) a transient connection without performing budget checks.
+    /// Used when the caller already reserved budget via `try_register_transient`.
+    pub fn register_transient(&self, peer: PeerId, location: Option<Location>) {
+        if !self.try_register_transient(peer.clone(), location) {
+            tracing::warn!(%peer, "register_transient: budget exhausted while updating");
+        }
+    }
+
     /// Drops a transient connection and returns its metadata, if it existed.
     /// Also decrements the transient budget counter.
     pub fn drop_transient(&self, peer: &PeerId) -> Option<TransientEntry> {
@@ -406,8 +414,16 @@ impl ConnectionManager {
         removed
     }
 
+    pub fn deregister_transient(&self, peer: &PeerId) -> Option<TransientEntry> {
+        self.drop_transient(peer)
+    }
+
     pub fn is_transient(&self, peer: &PeerId) -> bool {
         self.transient_connections.contains_key(peer)
+    }
+
+    pub fn is_transient_peer(&self, peer: &PeerId) -> bool {
+        self.is_transient(peer)
     }
 
     pub fn transient_count(&self) -> usize {
