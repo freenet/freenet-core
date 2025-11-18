@@ -1289,9 +1289,8 @@ impl P2pConnManager {
                 tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
             }
 
-            let resolved_peer_id = connection_manager
-                .get_peer_key()
-                .expect("peer key should be set");
+            // Return the remote peer we are connected to (not our own peer key).
+            let resolved_peer_id = peer.clone();
             callback
                 .send_result(Ok((resolved_peer_id, None)))
                 .await
@@ -1612,7 +1611,14 @@ impl P2pConnManager {
                 current = connection_manager.transient_count(),
                 "Transient connection budget exhausted; dropping inbound connection"
             );
+            if let Some(callbacks) = state.awaiting_connection.remove(&peer_id.addr) {
+                for mut cb in callbacks {
+                    let _ = cb.send_result(Err(())).await;
+                }
+            }
+            state.awaiting_connection_txs.remove(&peer_id.addr);
             return Ok(());
+        }
         }
 
         let pending_txs = state
