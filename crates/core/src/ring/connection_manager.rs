@@ -343,7 +343,7 @@ impl ConnectionManager {
         true
     }
 
-    /// Registers (or updates) a transient connection without performing budget checks.
+    /// Record a transient connection for bookkeeping (kept out of routing/topology counts).
     /// Used when the caller already reserved budget via `try_register_transient`.
     pub fn register_transient(&self, peer: PeerId, location: Option<Location>) {
         if !self.try_register_transient(peer.clone(), location) {
