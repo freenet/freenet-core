@@ -14,6 +14,7 @@ use super::*;
 pub(crate) struct TransientEntry {
     #[allow(dead_code)]
     pub opened_at: Instant,
+    /// Advertised location for the transient peer, if known at admission time.
     pub location: Option<Location>,
 }
 
@@ -393,7 +394,7 @@ impl ConnectionManager {
         true
     }
 
-    /// Registers (or updates) a transient connection without performing budget checks.
+    /// Record a transient connection for bookkeeping (kept out of routing/topology counts).
     /// Used when the caller already reserved budget via `try_register_transient`.
     pub fn register_transient(&self, peer: PeerId, location: Option<Location>) {
         if !self.try_register_transient(peer.clone(), location) {
@@ -414,10 +415,12 @@ impl ConnectionManager {
         removed
     }
 
+    /// Remove transient tracking for a peer, returning any stored metadata.
     pub fn deregister_transient(&self, peer: &PeerId) -> Option<TransientEntry> {
         self.drop_transient(peer)
     }
 
+    /// Check whether a peer is currently tracked as transient.
     pub fn is_transient(&self, peer: &PeerId) -> bool {
         self.transient_connections.contains_key(peer)
     }
@@ -426,14 +429,17 @@ impl ConnectionManager {
         self.is_transient(peer)
     }
 
+    /// Current number of tracked transient connections.
     pub fn transient_count(&self) -> usize {
         self.transient_in_use.load(Ordering::Acquire)
     }
 
+    /// Maximum transient slots allowed.
     pub fn transient_budget(&self) -> usize {
         self.transient_budget
     }
 
+    /// Time-to-live for transients before automatic drop.
     pub fn transient_ttl(&self) -> Duration {
         self.transient_ttl
     }
