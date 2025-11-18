@@ -126,9 +126,11 @@ where
                     "root operation awaiting child completion"
                 );
 
+                // Track the root op so child completions can finish it later.
                 op_manager
                     .root_ops_awaiting_sub_ops()
                     .insert(tx_id, final_state);
+                tracing::info!(%tx_id, "root operation registered as awaiting sub-ops");
 
                 return Ok(None);
             }
