@@ -3,6 +3,53 @@
 ## Project Overview
 Freenet Core is the peer-to-peer runtime that underpins applications in the Freenet ecosystem. The crates in this workspace implement the networking stack, contract execution environment, and developer tooling used by higher-level projects such as River.
 
+## ⚠️ CRITICAL: Git Worktree Requirement
+
+**BEFORE STARTING ANY WORK, verify your working directory:**
+
+```bash
+pwd  # Must be ~/code/freenet/freenet-core/<branch-name>
+     # NOT ~/code/freenet/freenet-core/main
+git branch --show-current  # Should be your feature branch, NOT 'main'
+```
+
+### ❌ DO NOT work in ~/code/freenet/freenet-core/main
+
+The main worktree should **always** remain on the `main` branch. Multiple agents working in main will conflict and corrupt branches.
+
+### ✅ Creating a Worktree for Your Branch
+
+1. Create a worktree as a sibling directory:
+   ```bash
+   cd ~/code/freenet/freenet-core/main
+   git worktree add ../fix-<issue-number> <your-branch-name>
+   cd ../fix-<issue-number>
+   ```
+
+2. Verify you're in the correct location:
+   ```bash
+   pwd  # Should show .../freenet-core/fix-<issue-number>
+   git branch --show-current  # Should show your branch
+   ```
+
+3. Now you can safely commit and push from this worktree.
+
+### Worktree Naming Convention
+
+Include the issue or PR number for clarity:
+- `fix-2107` for PR #2107
+- `issue-2092` for issue #2092
+- `fix-i2021-blocked-peers` for issue #2021 with descriptive name
+
+### Managing Worktrees
+
+```bash
+git worktree list  # See all active worktrees
+git worktree remove ../fix-2107  # Remove when branch merges
+```
+
+**After a PR merges, remove the worktree** to free disk space (each worktree has its own `target/` directory consuming 10-50GB).
+
 ## Repository Layout
 - `crates/` – core libraries, binaries, and developer tooling (`core`, `gateway`, `fdev`, etc.)
 - `apps/` – integration binaries (benchmarks, diagnostic tools)
@@ -11,14 +58,6 @@ Freenet Core is the peer-to-peer runtime that underpins applications in the Free
 - `tests/` – end-to-end and integration test suites
 
 Refer to `README.md` for a more detailed component map.
-
-## Working with Git Worktrees
-- Keep a checkout on the `main` branch (for example, this directory) and create per-branch worktrees as siblings:  
-  ```bash
-  git worktree add ../my-feature-branch feature/my-feature-branch
-  ```
-- Run `git worktree list` to see active worktrees and `git worktree remove ../my-feature-branch` when a branch merges.
-- Avoid committing from the `main` checkout; perform branch work inside the corresponding worktree directory to prevent conflicts between contributors.
 
 ## Bootstrapping & Tooling
 ```bash
