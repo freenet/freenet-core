@@ -2,12 +2,13 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
 use std::collections::{btree_map::Entry, BTreeMap};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::topology::{Limits, TopologyManager};
 
 use super::*;
-use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub(crate) struct TransientEntry {
@@ -405,7 +406,6 @@ impl ConnectionManager {
         removed
     }
 
-    #[allow(dead_code)]
     pub fn is_transient(&self, peer: &PeerId) -> bool {
         self.transient_connections.contains_key(peer)
     }
@@ -577,6 +577,9 @@ impl ConnectionManager {
         let connections = self.connections_by_location.read();
         let peers = connections.values().filter_map(|conns| {
             let conn = conns.choose(&mut rand::rng())?;
+            if self.is_transient(&conn.location.peer) {
+                return None;
+            }
             if let Some(requester) = requesting {
                 if requester == &conn.location.peer {
                     return None;
