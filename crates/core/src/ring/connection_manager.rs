@@ -343,8 +343,8 @@ impl ConnectionManager {
         true
     }
 
-    /// Record a transient connection for bookkeeping (kept out of routing/topology counts).
-    /// Used when the caller already reserved budget via `try_register_transient`.
+    /// Registers a new transient connection that is not yet part of the ring topology.
+    /// Transient connections are tracked separately and subject to budget and TTL limits.
     pub fn register_transient(&self, peer: PeerId, location: Option<Location>) {
         if !self.try_register_transient(peer.clone(), location) {
             tracing::warn!(%peer, "register_transient: budget exhausted while updating");
