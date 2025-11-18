@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
@@ -1275,14 +1275,13 @@ impl P2pConnManager {
             );
         }
 
-        // If we already have a transport channel, reuse it instead of dialing again. This covers
-        // transient->normal promotion without tripping duplicate connection errors.
+        // If a transient transport already exists, promote it without dialing anew.
         if self.connections.contains_key(&peer) {
             tracing::info!(
                 tx = %tx,
                 remote = %peer,
                 courtesy,
-                "connect_peer: reusing existing transport"
+                "connect_peer: reusing existing transport / promoting transient if present"
             );
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             if let Some(entry) = connection_manager.drop_transient(&peer) {
@@ -1297,8 +1296,11 @@ impl P2pConnManager {
                 tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
             }
 
+            let resolved_peer_id = connection_manager
+                .get_peer_key()
+                .expect("peer key should be set");
             callback
-                .send_result(Ok((peer.clone(), None)))
+                .send_result(Ok((resolved_peer_id, None)))
                 .await
                 .inspect_err(|err| {
                     tracing::debug!(
@@ -1718,14 +1720,18 @@ impl P2pConnManager {
                 let cm = connection_manager.clone();
                 let peer = peer_id.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(ttl).await;
+                    sleep(ttl).await;
                     if cm.drop_transient(&peer).is_some() {
                         tracing::info!(%peer, "Transient connection expired; dropping");
                         if let Err(err) = drop_tx
                             .send(Right(NodeEvent::DropConnection(peer.clone())))
                             .await
                         {
-                            tracing::warn!(%peer, ?err, "Failed to dispatch DropConnection for expired transient");
+                            tracing::warn!(
+                                %peer,
+                                ?err,
+                                "Failed to dispatch DropConnection for expired transient"
+                            );
                         }
                     }
                 });

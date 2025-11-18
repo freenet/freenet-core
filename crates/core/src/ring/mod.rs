@@ -4,7 +4,6 @@
 //! and routes requests to the optimal peers.
 
 use std::collections::{BTreeSet, HashSet};
-use std::net::SocketAddr;
 use std::{
     sync::{atomic::AtomicU64, Arc, Weak},
     time::{Duration, Instant},
