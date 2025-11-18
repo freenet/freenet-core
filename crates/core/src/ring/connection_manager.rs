@@ -410,6 +410,13 @@ impl ConnectionManager {
         self.transient_connections.contains_key(peer)
     }
 
+    #[allow(dead_code)]
+    pub fn is_transient_addr(&self, addr: &SocketAddr) -> bool {
+        self.transient_connections
+            .iter()
+            .any(|entry| entry.key().addr == *addr)
+    }
+
     pub fn transient_count(&self) -> usize {
         self.transient_in_use.load(Ordering::Acquire)
     }
