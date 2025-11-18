@@ -162,6 +162,16 @@ impl ConnectionManager {
             "should_accept: evaluating direct acceptance guard"
         );
 
+        if self.location_for_peer.read().get(peer_id).is_some() {
+            tracing::debug!(
+                %peer_id,
+                open,
+                reserved_before,
+                "Peer already pending/connected; skipping duplicate reservation"
+            );
+            return true;
+        }
+
         if self.is_gateway && (open > 0 || reserved_before > 0) {
             tracing::info!(
                 %peer_id,
@@ -218,11 +228,6 @@ impl ConnectionManager {
             }
         };
 
-        if open == 0 {
-            tracing::debug!(%peer_id, "should_accept: first connection -> accepting");
-            return true;
-        }
-
         const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 2;
         if self.is_gateway {
             let direct_total = open + reserved_before;
@@ -243,11 +248,19 @@ impl ConnectionManager {
 
         if self.location_for_peer.read().get(peer_id).is_some() {
             // We've already accepted this peer (pending or active); treat as a no-op acceptance.
-            tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
+            tracing::debug!(
+                %peer_id,
+                "Peer already pending/connected after reservation; reverting reservation"
+            );
+            self.reserved_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return true;
         }
 
-        let accepted = if total_conn < self.min_connections {
+        let accepted = if open == 0 {
+            tracing::debug!(%peer_id, "should_accept: first connection -> accepting");
+            true
+        } else if total_conn < self.min_connections {
             tracing::info!(%peer_id, total_conn, "should_accept: accepted (below min connections)");
             true
         } else if total_conn >= self.max_connections {
@@ -558,8 +571,17 @@ impl ConnectionManager {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn get_reserved_connections(&self) -> usize {
+        self.reserved_connections
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
         self.connections_by_location.read().clone()
+    }
+
+    pub(crate) fn has_known_peer(&self, peer: &PeerId) -> bool {
+        self.location_for_peer.read().contains_key(peer)
     }
 
     pub(super) fn get_known_locations(&self) -> BTreeMap<PeerId, Location> {
@@ -602,5 +624,48 @@ impl ConnectionManager {
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
         read.keys().cloned().collect::<Vec<_>>().into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::transport::TransportKeypair;
+
+    #[test]
+    fn should_accept_does_not_leak_reservations_for_duplicate_peer() {
+        let keypair = TransportKeypair::new();
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20_000);
+        let peer_id = PeerId::new(peer_addr, keypair.public().clone());
+        let location = Location::from_address(&peer_addr);
+
+        let manager = ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            Ring::DEFAULT_MIN_CONNECTIONS,
+            Ring::DEFAULT_MAX_CONNECTIONS,
+            Ring::DEFAULT_RAND_WALK_ABOVE_HTL,
+            (keypair.public().clone(), None, AtomicU64::new(0)),
+            false,
+        );
+
+        assert!(manager.should_accept(location, &peer_id));
+        let after_first = manager.reserved_connections.load(Ordering::SeqCst);
+        assert_eq!(after_first, 1);
+        assert!(
+            manager.has_known_peer(&peer_id),
+            "pending connection should be registered after initial acceptance"
+        );
+
+        // Second attempt for the same peer should not create another reservation.
+        assert!(manager.should_accept(location, &peer_id));
+        assert_eq!(
+            manager.reserved_connections.load(Ordering::SeqCst),
+            after_first,
+            "repeat should_accept calls should not leak reservations for an existing peer"
+        );
     }
 }

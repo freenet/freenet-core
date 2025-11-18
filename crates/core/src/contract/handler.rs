@@ -337,8 +337,21 @@ impl ContractHandlerChannel<SenderHalve> {
                 };
                 if let Err(e) = session_tx.try_send(msg) {
                     tracing::warn!("Failed to notify session actor: {}", e);
+                } else {
+                    tracing::debug!(
+                        %tx,
+                        %client_id,
+                        %request_id,
+                        "Session adapter registered transaction with session actor"
+                    );
                 }
             }
+        } else {
+            tracing::warn!(
+                %client_id,
+                %request_id,
+                "Session adapter not installed; session actor will not track transaction"
+            );
         }
 
         Ok(())
@@ -365,7 +378,22 @@ impl ContractHandlerChannel<SenderHalve> {
             };
             if let Err(e) = session_tx.try_send(msg) {
                 tracing::warn!("Failed to notify session actor: {}", e);
+            } else {
+                tracing::debug!(
+                    %tx,
+                    %client_id,
+                    %request_id,
+                    contract = %contract_key,
+                    "Session adapter registered subscription transaction with session actor"
+                );
             }
+        } else {
+            tracing::warn!(
+                %client_id,
+                %request_id,
+                contract = %contract_key,
+                "Session adapter not installed; subscription transaction not registered with session actor"
+            );
         }
 
         Ok(())

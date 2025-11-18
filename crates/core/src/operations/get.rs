@@ -1170,7 +1170,7 @@ impl Operation for GetOp {
                                 tracing::debug!(tx = %id, %key, "Marking contract as seeded");
                                 op_manager.ring.seed_contract(key);
                                 let child_tx =
-                                    super::start_subscription_request(op_manager, id, key);
+                                    super::start_subscription_request(op_manager, id, key, true);
                                 tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                             }
                         } else {
@@ -1195,8 +1195,9 @@ impl Operation for GetOp {
                                         tracing::debug!(tx = %id, %key, peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(), "Contract not cached @ peer, caching");
                                         op_manager.ring.seed_contract(key);
 
-                                        let child_tx =
-                                            super::start_subscription_request(op_manager, id, key);
+                                        let child_tx = super::start_subscription_request(
+                                            op_manager, id, key, true,
+                                        );
                                         tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                                     }
                                 }
