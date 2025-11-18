@@ -358,6 +358,10 @@ impl GetOp {
             ..
         }) = &self.state
         {
+            // We synthesize an empty ReturnGet back to ourselves to reuse the existing
+            // fallback path that tries the next candidate. The state stays
+            // AwaitingResponse so the retry logic can pick up from the stored
+            // alternatives/skip list.
             let return_msg = GetMsg::ReturnGet {
                 id: self.id,
                 key: *key,
@@ -377,6 +381,7 @@ impl GetOp {
         }
 
         // If we weren't awaiting a response, just put the op back.
+        // No retry needed; another handler may pick it up later.
         op_manager.push(self.id, OpEnum::Get(self)).await?;
         Ok(())
     }
