@@ -1672,8 +1672,6 @@ impl P2pConnManager {
             state.awaiting_connection_txs.remove(&peer_id.addr);
             return Ok(());
         }
-        }
-
         let pending_txs = state
             .awaiting_connection_txs
             .remove(&peer_id.addr)
@@ -1736,6 +1734,19 @@ impl P2pConnManager {
         // Only insert if connection doesn't already exist to avoid dropping existing channel
         let mut newly_inserted = false;
         if !self.connections.contains_key(&peer_id) {
+            if is_transient {
+                let cm = &self.bridge.op_manager.ring.connection_manager;
+                let current = cm.transient_count();
+                if current >= cm.transient_budget() {
+                    tracing::warn!(
+                        remote = %peer_id.addr,
+                        budget = cm.transient_budget(),
+                        current,
+                        "Transient connection budget exhausted; dropping inbound connection before insert"
+                    );
+                    return Ok(());
+                }
+            }
             let (tx, rx) = mpsc::channel(10);
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] INSERT: OutboundConnectionSuccessful - adding to connections HashMap");
             self.connections.insert(peer_id.clone(), tx);
