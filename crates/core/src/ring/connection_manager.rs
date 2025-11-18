@@ -1,10 +1,18 @@
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 
 use crate::topology::{Limits, TopologyManager};
 
 use super::*;
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+pub(crate) struct TransientEntry {
+    #[allow(dead_code)]
+    pub opened_at: Instant,
+    pub location: Option<Location>,
+}
 
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
@@ -18,6 +26,9 @@ pub(crate) struct ConnectionManager {
     own_location: Arc<AtomicU64>,
     peer_key: Arc<Mutex<Option<PeerId>>>,
     is_gateway: bool,
+    transient_connections: Arc<RwLock<HashMap<PeerId, TransientEntry>>>,
+    transient_budget: usize,
+    transient_ttl: Duration,
     pub min_connections: usize,
     pub max_connections: usize,
     pub rnd_if_htl_above: usize,
@@ -79,9 +90,12 @@ impl ConnectionManager {
                 own_location,
             ),
             config.is_gateway,
+            config.transient_budget,
+            config.transient_ttl,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn init(
         max_upstream_bandwidth: Rate,
         max_downstream_bandwidth: Rate,
@@ -90,6 +104,8 @@ impl ConnectionManager {
         rnd_if_htl_above: usize,
         (pub_key, peer_id, own_location): (TransportPublicKey, Option<PeerId>, AtomicU64),
         is_gateway: bool,
+        transient_budget: usize,
+        transient_ttl: Duration,
     ) -> Self {
         let topology_manager = Arc::new(RwLock::new(TopologyManager::new(Limits {
             max_upstream_bandwidth,
@@ -107,6 +123,9 @@ impl ConnectionManager {
             own_location: own_location.into(),
             peer_key: Arc::new(Mutex::new(peer_id)),
             is_gateway,
+            transient_connections: Arc::new(RwLock::new(HashMap::new())),
+            transient_budget,
+            transient_ttl,
             min_connections,
             max_connections,
             rnd_if_htl_above,
@@ -329,6 +348,41 @@ impl ConnectionManager {
 
     pub fn get_peer_key(&self) -> Option<PeerId> {
         self.peer_key.lock().clone()
+    }
+
+    pub fn is_gateway(&self) -> bool {
+        self.is_gateway
+    }
+
+    pub fn register_transient(&self, peer: PeerId, location: Option<Location>) {
+        self.transient_connections.write().insert(
+            peer,
+            TransientEntry {
+                opened_at: Instant::now(),
+                location,
+            },
+        );
+    }
+
+    pub fn drop_transient(&self, peer: &PeerId) -> Option<TransientEntry> {
+        self.transient_connections.write().remove(peer)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_transient(&self, peer: &PeerId) -> bool {
+        self.transient_connections.read().contains_key(peer)
+    }
+
+    pub fn transient_count(&self) -> usize {
+        self.transient_connections.read().len()
+    }
+
+    pub fn transient_budget(&self) -> usize {
+        self.transient_budget
+    }
+
+    pub fn transient_ttl(&self) -> Duration {
+        self.transient_ttl
     }
 
     /// Sets the peer id if is not already set, or returns the current peer id.

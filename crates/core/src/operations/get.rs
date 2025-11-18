@@ -173,14 +173,17 @@ pub(crate) async fn request_get(
             tried_peers.insert(target.peer.clone());
 
             let new_state = Some(GetState::AwaitingResponse {
+                key: key_val,
                 retries: 0,
                 fetch_contract,
                 requester: None,
                 current_hop: op_manager.ring.max_hops_to_live,
                 subscribe,
+                current_target: target.clone(),
                 tried_peers,
                 alternatives: candidates,
                 attempts_at_hop: 1,
+                skip_list: skip_list.clone(),
             });
 
             let msg = GetMsg::RequestGet {
@@ -212,6 +215,7 @@ pub(crate) async fn request_get(
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum GetState {
     /// A new petition for a get op received from another peer.
     /// The requester field stores who sent us this request, so we can send the result back.
@@ -225,18 +229,24 @@ enum GetState {
     },
     /// Awaiting response from petition.
     AwaitingResponse {
+        /// Contract being fetched
+        key: ContractKey,
         /// If specified the peer waiting for the response upstream
         requester: Option<PeerKeyLocation>,
         fetch_contract: bool,
         retries: usize,
         current_hop: usize,
         subscribe: bool,
+        /// Peer we are currently trying to reach
+        current_target: PeerKeyLocation,
         /// Peers we've already tried at this hop level
         tried_peers: HashSet<PeerId>,
         /// Alternative peers we could still try at this hop
         alternatives: Vec<PeerKeyLocation>,
         /// How many peers we've tried at this hop
         attempts_at_hop: usize,
+        /// Skip list used for the current hop
+        skip_list: HashSet<PeerId>,
     },
     /// Operation completed successfully
     Finished { key: ContractKey },
@@ -263,9 +273,7 @@ impl Display for GetState {
                 retries,
                 current_hop,
                 subscribe,
-                tried_peers: _,
-                alternatives: _,
-                attempts_at_hop: _,
+                ..
             } => {
                 write!(f, "AwaitingResponse(requester: {requester:?}, fetch_contract: {fetch_contract}, retries: {retries}, current_hop: {current_hop}, subscribe: {subscribe})")
             }
@@ -339,6 +347,38 @@ impl GetOp {
         } else {
             OpOutcome::Incomplete
         }
+    }
+
+    /// Handle aborted outbound connections by reusing the existing retry logic.
+    pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
+        if let Some(GetState::AwaitingResponse {
+            key,
+            current_target,
+            skip_list,
+            ..
+        }) = &self.state
+        {
+            let return_msg = GetMsg::ReturnGet {
+                id: self.id,
+                key: *key,
+                value: StoreResponse {
+                    state: None,
+                    contract: None,
+                },
+                sender: current_target.clone(),
+                target: op_manager.ring.connection_manager.own_location(),
+                skip_list: skip_list.clone(),
+            };
+
+            op_manager
+                .notify_op_change(NetMessage::from(return_msg), OpEnum::Get(self))
+                .await?;
+            return Err(OpError::StatePushed);
+        }
+
+        // If we weren't awaiting a response, just put the op back.
+        op_manager.push(self.id, OpEnum::Get(self)).await?;
+        Ok(())
     }
 
     pub(super) fn finalized(&self) -> bool {
@@ -736,6 +776,8 @@ impl Operation for GetOp {
                     target,
                     skip_list,
                 } => {
+                    let id = *id;
+                    let key = *key;
                     tracing::info!(
                         tx = %id,
                         %key,
@@ -765,6 +807,9 @@ impl Operation for GetOp {
                             mut tried_peers,
                             mut alternatives,
                             attempts_at_hop,
+                            current_target: _,
+                            skip_list,
+                            ..
                         }) => {
                             // todo: register in the stats for the outcome of the op that failed to get a response from this peer
 
@@ -789,8 +834,8 @@ impl Operation for GetOp {
                                 );
 
                                 return_msg = Some(GetMsg::SeekNode {
-                                    id: *id,
-                                    key: *key,
+                                    id,
+                                    key,
                                     target: next_target.clone(),
                                     sender: this_peer.clone(),
                                     fetch_contract,
@@ -800,15 +845,19 @@ impl Operation for GetOp {
 
                                 // Update state with the new alternative being tried
                                 tried_peers.insert(next_target.peer.clone());
+                                let updated_tried_peers = tried_peers.clone();
                                 new_state = Some(GetState::AwaitingResponse {
                                     retries,
                                     fetch_contract,
                                     requester: requester.clone(),
                                     current_hop,
                                     subscribe,
-                                    tried_peers,
+                                    tried_peers: updated_tried_peers.clone(),
                                     alternatives,
                                     attempts_at_hop: attempts_at_hop + 1,
+                                    key,
+                                    current_target: next_target,
+                                    skip_list: updated_tried_peers,
                                 });
                             } else if retries < MAX_RETRIES {
                                 // No more alternatives at this hop, try finding new peers
@@ -818,27 +867,27 @@ impl Operation for GetOp {
                                 // Get new candidates excluding all tried peers
                                 let mut new_candidates =
                                     op_manager.ring.k_closest_potentially_caching(
-                                        key,
+                                        &key,
                                         &new_skip_list,
                                         DEFAULT_MAX_BREADTH,
                                     );
 
                                 tracing::info!(
-                                    tx = %id,
-                                    %key,
-                                    new_candidates = ?new_candidates,
-                                    skip = ?new_skip_list,
-                                    hop = current_hop,
-                                    retries = retries + 1,
-                                    "GET seeking new candidates after exhausted alternatives"
+                                tx = %id,
+                                %key,
+                                new_candidates = ?new_candidates,
+                                skip = ?new_skip_list,
+                                hop = current_hop,
+                                retries = retries + 1,
+                                "GET seeking new candidates after exhausted alternatives"
                                 );
 
                                 if !new_candidates.is_empty() {
                                     // Try with the best new peer
                                     let target = new_candidates.remove(0);
                                     return_msg = Some(GetMsg::SeekNode {
-                                        id: *id,
-                                        key: *key,
+                                        id,
+                                        key,
                                         target: target.clone(),
                                         sender: this_peer.clone(),
                                         fetch_contract,
@@ -859,6 +908,9 @@ impl Operation for GetOp {
                                         tried_peers: new_tried_peers,
                                         alternatives: new_candidates,
                                         attempts_at_hop: 1,
+                                        key,
+                                        current_target: target,
+                                        skip_list: new_skip_list.clone(),
                                     });
                                 } else if let Some(requester_peer) = requester.clone() {
                                     // No more peers to try, return failure to requester
@@ -872,8 +924,8 @@ impl Operation for GetOp {
                                         "No other peers found while trying to get the contract, returning response to requester"
                                     );
                                     return_msg = Some(GetMsg::ReturnGet {
-                                        id: *id,
-                                        key: *key,
+                                        id,
+                                        key,
                                         value: StoreResponse {
                                             state: None,
                                             contract: None,
@@ -895,7 +947,7 @@ impl Operation for GetOp {
                                     return_msg = None;
                                     new_state = None;
                                     result = Some(GetResult {
-                                        key: *key,
+                                        key,
                                         state: WrappedState::new(vec![]),
                                         contract: None,
                                     });
@@ -920,8 +972,8 @@ impl Operation for GetOp {
                                         "No other peers found while trying to get the contract, returning response to requester"
                                     );
                                     return_msg = Some(GetMsg::ReturnGet {
-                                        id: *id,
-                                        key: *key,
+                                        id,
+                                        key,
                                         value: StoreResponse {
                                             state: None,
                                             contract: None,
@@ -941,7 +993,7 @@ impl Operation for GetOp {
                                     return_msg = None;
                                     new_state = None;
                                     result = Some(GetResult {
-                                        key: *key,
+                                        key,
                                         state: WrappedState::new(vec![]),
                                         contract: None,
                                     });
@@ -953,8 +1005,8 @@ impl Operation for GetOp {
                             tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender.peer);
                             new_state = None;
                             return_msg = Some(GetMsg::ReturnGet {
-                                id: *id,
-                                key: *key,
+                                id,
+                                key,
                                 value: StoreResponse {
                                     state: None,
                                     contract: None,
@@ -1314,14 +1366,17 @@ async fn try_forward_or_return(
         build_op_result(
             id,
             Some(GetState::AwaitingResponse {
+                key,
                 requester: Some(sender),
                 retries: 0,
                 fetch_contract,
                 current_hop: new_htl,
                 subscribe: false,
+                current_target: target.clone(),
                 tried_peers,
                 alternatives,
                 attempts_at_hop: 1,
+                skip_list: new_skip_list.clone(),
             }),
             Some(GetMsg::SeekNode {
                 id,

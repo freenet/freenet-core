@@ -128,6 +128,8 @@ pub struct NodeConfig {
     pub(crate) max_upstream_bandwidth: Option<Rate>,
     pub(crate) max_downstream_bandwidth: Option<Rate>,
     pub(crate) blocked_addresses: Option<HashSet<SocketAddr>>,
+    pub(crate) transient_budget: usize,
+    pub(crate) transient_ttl: Duration,
 }
 
 impl NodeConfig {
@@ -195,6 +197,8 @@ impl NodeConfig {
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
             blocked_addresses: config.network_api.blocked_addresses.clone(),
+            transient_budget: config.network_api.transient_budget,
+            transient_ttl: Duration::from_secs(config.network_api.transient_ttl_secs),
         })
     }
 
@@ -1147,27 +1151,42 @@ async fn handle_aborted_op(
     gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError> {
     use crate::util::IterExt;
-    if let TransactionType::Connect = tx.transaction_type() {
-        // attempt to establish a connection failed, this could be a fatal error since the node
-        // is useless without connecting to the network, we will retry with exponential backoff
-        // if necessary
-        match op_manager.pop(&tx) {
-            Ok(Some(OpEnum::Connect(op)))
-                if op.has_backoff()
-                    && op_manager.ring.open_connections()
-                        < op_manager.ring.connection_manager.min_connections =>
-            {
-                let gateway = op.gateway().cloned();
-                if let Some(gateway) = gateway {
-                    tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    connect::join_ring_request(None, &gateway, op_manager).await?;
+    match tx.transaction_type() {
+        TransactionType::Connect => {
+            // attempt to establish a connection failed, this could be a fatal error since the node
+            // is useless without connecting to the network, we will retry with exponential backoff
+            // if necessary
+            match op_manager.pop(&tx) {
+                Ok(Some(OpEnum::Connect(op)))
+                    if op.has_backoff()
+                        && op_manager.ring.open_connections()
+                            < op_manager.ring.connection_manager.min_connections =>
+                {
+                    let gateway = op.gateway().cloned();
+                    if let Some(gateway) = gateway {
+                        tracing::warn!("Retry connecting to gateway {}", gateway.peer);
+                        connect::join_ring_request(None, &gateway, op_manager).await?;
+                    }
                 }
+                Ok(Some(OpEnum::Connect(_))) => {
+                    if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
+                        tracing::warn!("Retrying joining the ring with an other gateway");
+                        if let Some(gateway) = gateways.iter().shuffle().next() {
+                            connect::join_ring_request(None, gateway, op_manager).await?
+                        }
+                    }
+                }
+                Ok(Some(other)) => {
+                    op_manager.push(tx, other).await?;
+                }
+                _ => {}
             }
-            Ok(Some(OpEnum::Connect(_))) => {
-                if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
-                    tracing::warn!("Retrying joining the ring with an other gateway");
-                    if let Some(gateway) = gateways.iter().shuffle().next() {
-                        connect::join_ring_request(None, gateway, op_manager).await?
+        }
+        TransactionType::Get => match op_manager.pop(&tx) {
+            Ok(Some(OpEnum::Get(op))) => {
+                if let Err(err) = op.handle_abort(op_manager).await {
+                    if !matches!(err, OpError::StatePushed) {
+                        return Err(err);
                     }
                 }
             }
@@ -1175,7 +1194,8 @@ async fn handle_aborted_op(
                 op_manager.push(tx, other).await?;
             }
             _ => {}
-        }
+        },
+        _ => {}
     }
     Ok(())
 }

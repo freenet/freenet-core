@@ -244,15 +244,21 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         let (stream_node2, _) = connect_async(&uri_node2).await?;
         let mut client_node2 = WebApi::start(stream_node2);
 
-        // Load contract code
+        // Compile/load contract code (same helper used by other app tests)
         let path_to_code = std::path::PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
-        tracing::info!(path=%path_to_code.display(), "Loading contract code");
-        let code = std::fs::read(path_to_code)
-            .ok()
-            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
-        let code_hash = CodeHash::from_code(&code);
+        tracing::info!(path = %path_to_code.display(), "Loading contract code");
 
-        // Define contract options
+        // First compile to compute the code hash, then rebuild options with the correct code_key
+        let temp_options = PingContractOptions {
+            frequency: Duration::from_secs(3),
+            ttl: Duration::from_secs(30),
+            tag: APP_TAG.to_string(),
+            code_key: String::new(),
+        };
+        let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
+        let temp_container = common::load_contract(&path_to_code, temp_params)?;
+        let code_hash = CodeHash::from_code(temp_container.data());
+
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(30),
@@ -260,7 +266,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
             code_key: code_hash.to_string(),
         };
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = ContractContainer::try_from((code, &params))?;
+        let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
         // Gateway puts the contract
