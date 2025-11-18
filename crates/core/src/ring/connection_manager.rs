@@ -12,6 +12,8 @@ use super::*;
 
 #[derive(Clone)]
 pub(crate) struct TransientEntry {
+    /// Entry tracking a transient connection that hasn't been added to the ring topology yet.
+    /// Transient connections are typically unsolicited inbound connections to gateways.
     #[allow(dead_code)]
     pub opened_at: Instant,
     /// Advertised location for the transient peer, if known at admission time.
@@ -401,8 +403,8 @@ impl ConnectionManager {
         true
     }
 
-    /// Record a transient connection for bookkeeping (kept out of routing/topology counts).
-    /// Used when the caller already reserved budget via `try_register_transient`.
+    /// Registers a new transient connection that is not yet part of the ring topology.
+    /// Transient connections are tracked separately and subject to budget and TTL limits.
     pub fn register_transient(&self, peer: PeerId, location: Option<Location>) {
         if !self.try_register_transient(peer.clone(), location) {
             tracing::warn!(%peer, "register_transient: budget exhausted while updating");
@@ -422,7 +424,9 @@ impl ConnectionManager {
         removed
     }
 
-    /// Remove transient tracking for a peer, returning any stored metadata.
+    /// Deregisters a transient connection, removing it from tracking.
+    ///
+    /// Returns the removed entry if it existed.
     pub fn deregister_transient(&self, peer: &PeerId) -> Option<TransientEntry> {
         self.drop_transient(peer)
     }
