@@ -358,10 +358,6 @@ impl GetOp {
             ..
         }) = &self.state
         {
-            // We synthesize an empty ReturnGet back to ourselves to reuse the existing
-            // fallback path that tries the next candidate. The state stays
-            // AwaitingResponse so the retry logic can pick up from the stored
-            // alternatives/skip list.
             let return_msg = GetMsg::ReturnGet {
                 id: self.id,
                 key: *key,
@@ -381,7 +377,6 @@ impl GetOp {
         }
 
         // If we weren't awaiting a response, just put the op back.
-        // No retry needed; another handler may pick it up later.
         op_manager.push(self.id, OpEnum::Get(self)).await?;
         Ok(())
     }
@@ -862,10 +857,7 @@ impl Operation for GetOp {
                                     attempts_at_hop: attempts_at_hop + 1,
                                     key,
                                     current_target: next_target,
-                                    // Preserve the accumulated skip_list so future candidate
-                                    // selection still avoids already-specified peers; tried_peers
-                                    // tracks attempts at this hop.
-                                    skip_list: skip_list.clone(),
+                                    skip_list: updated_tried_peers,
                                 });
                             } else if retries < MAX_RETRIES {
                                 // No more alternatives at this hop, try finding new peers
