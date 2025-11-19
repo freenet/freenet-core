@@ -403,14 +403,6 @@ impl ConnectionManager {
         true
     }
 
-    /// Registers a new transient connection that is not yet part of the ring topology.
-    /// Transient connections are tracked separately and subject to budget and TTL limits.
-    pub fn register_transient(&self, peer: PeerId, location: Option<Location>) {
-        if !self.try_register_transient(peer.clone(), location) {
-            tracing::warn!(%peer, "register_transient: budget exhausted while updating");
-        }
-    }
-
     /// Drops a transient connection and returns its metadata, if it existed.
     /// Also decrements the transient budget counter.
     pub fn drop_transient(&self, peer: &PeerId) -> Option<TransientEntry> {
@@ -424,20 +416,9 @@ impl ConnectionManager {
         removed
     }
 
-    /// Deregisters a transient connection, removing it from tracking.
-    ///
-    /// Returns the removed entry if it existed.
-    pub fn deregister_transient(&self, peer: &PeerId) -> Option<TransientEntry> {
-        self.drop_transient(peer)
-    }
-
     /// Check whether a peer is currently tracked as transient.
     pub fn is_transient(&self, peer: &PeerId) -> bool {
         self.transient_connections.contains_key(peer)
-    }
-
-    pub fn is_transient_peer(&self, peer: &PeerId) -> bool {
-        self.is_transient(peer)
     }
 
     /// Current number of tracked transient connections.
