@@ -4,7 +4,7 @@ members = ["contracts/ping", "app", "types"]
 
 [workspace.dependencies]
 # freenet-stdlib = { path = "./../../stdlib/rust", features = ["contract"] }
-freenet-stdlib = { version = "0.1.14" } 
+freenet-stdlib = { version = "0.1.24" } 
 freenet-ping-types = { path = "types", default-features = false }
 chrono = { version = "0.4", default-features = false }
 testresult = "0.4"
@@ -19,4 +19,3 @@ debug = false
 codegen-units = 1
 panic = 'abort'
 strip = true
-
