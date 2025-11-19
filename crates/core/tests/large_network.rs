@@ -37,10 +37,7 @@ use which::which;
 const DEFAULT_PEER_COUNT: usize = 38;
 const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_SNAPSHOT_ITERATIONS: usize = 5;
-const DEFAULT_SNAPSHOT_WARMUP: Duration = Duration::from_secs(60);
 const DEFAULT_CONNECTIVITY_TARGET: f64 = 0.75;
-const DEFAULT_MIN_CONNECTIONS: usize = 5;
-const DEFAULT_MAX_CONNECTIONS: usize = 7;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "Large soak test - run manually (see file header for instructions)"]
@@ -62,25 +59,10 @@ async fn large_network_soak() -> anyhow::Result<()> {
         .ok()
         .and_then(|val| val.parse::<f64>().ok())
         .unwrap_or(DEFAULT_CONNECTIVITY_TARGET);
-    let snapshot_warmup = env::var("SOAK_SNAPSHOT_WARMUP_SECS")
-        .ok()
-        .and_then(|val| val.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_SNAPSHOT_WARMUP);
-    let min_connections = env::var("SOAK_MIN_CONNECTIONS")
-        .ok()
-        .and_then(|val| val.parse().ok())
-        .unwrap_or(DEFAULT_MIN_CONNECTIONS);
-    let max_connections = env::var("SOAK_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|val| val.parse().ok())
-        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
 
     let network = TestNetwork::builder()
         .gateways(2)
         .peers(peer_count)
-        .min_connections(min_connections)
-        .max_connections(max_connections)
         .require_connectivity(connectivity_target)
         .connectivity_timeout(Duration::from_secs(120))
         .preserve_temp_dirs_on_failure(true)
@@ -96,10 +78,6 @@ async fn large_network_soak() -> anyhow::Result<()> {
         peer_count,
         network.run_root().display()
     );
-    println!(
-        "Min connections: {}, max connections: {} (override via SOAK_MIN_CONNECTIONS / SOAK_MAX_CONNECTIONS)",
-        min_connections, max_connections
-    );
 
     let riverctl_path = which("riverctl")
         .context("riverctl not found in PATH; install via `cargo install riverctl`")?;
@@ -111,13 +89,6 @@ async fn large_network_soak() -> anyhow::Result<()> {
     let snapshots_dir = network.run_root().join("large-soak");
     fs::create_dir_all(&snapshots_dir)?;
 
-    // Allow topology maintenance to run before the first snapshot.
-    println!(
-        "Waiting {:?} before first snapshot to allow topology maintenance to converge",
-        snapshot_warmup
-    );
-    sleep(snapshot_warmup).await;
-
     let mut iteration = 0usize;
     let mut next_tick = Instant::now();
     while iteration < snapshot_iterations {
@@ -125,11 +96,6 @@ async fn large_network_soak() -> anyhow::Result<()> {
         let snapshot = network.collect_diagnostics().await?;
         let snapshot_path = snapshots_dir.join(format!("snapshot-{iteration:02}.json"));
         fs::write(&snapshot_path, to_string_pretty(&snapshot)?)?;
-
-        // Also capture ring topology for visualizing evolution over time.
-        let ring_snapshot = network.ring_snapshot().await?;
-        let ring_path = snapshots_dir.join(format!("ring-{iteration:02}.json"));
-        fs::write(&ring_path, to_string_pretty(&ring_snapshot)?)?;
 
         let healthy = snapshot
             .peers
@@ -281,47 +247,29 @@ impl RiverSession {
             .map(|_| ())
     }
 
-    async fn run_riverctl(&self, user: RiverUser, args: &[&str]) -> anyhow::Result<String> {
+    async fn run_riverctl<'a>(&self, user: RiverUser, args: &[&'a str]) -> anyhow::Result<String> {
         let (url, config_dir) = match user {
             RiverUser::Alice => (&self.alice_url, self.alice_dir.path()),
             RiverUser::Bob => (&self.bob_url, self.bob_dir.path()),
         };
 
-        const MAX_RETRIES: usize = 3;
-        const RETRY_DELAY: Duration = Duration::from_secs(5);
+        let mut cmd = tokio::process::Command::new(&self.riverctl);
+        cmd.arg("--node-url").arg(url);
+        cmd.args(args);
+        cmd.env("RIVER_CONFIG_DIR", config_dir);
 
-        for attempt in 1..=MAX_RETRIES {
-            let mut cmd = tokio::process::Command::new(&self.riverctl);
-            cmd.arg("--node-url").arg(url);
-            cmd.args(args);
-            cmd.env("RIVER_CONFIG_DIR", config_dir);
-
-            let output = cmd
-                .output()
-                .await
-                .context("failed to execute riverctl command")?;
-            if output.status.success() {
-                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-            }
-
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let retriable = stderr.contains("Timeout waiting for")
-                || stderr.contains("connection refused")
-                || stderr.contains("HTTP request failed");
-            if attempt == MAX_RETRIES || !retriable {
-                bail!("riverctl failed (user {:?}): {}", user, stderr);
-            }
-            println!(
-                "riverctl attempt {}/{} failed for {:?}: {}; retrying in {}s",
-                attempt,
-                MAX_RETRIES,
+        let output = cmd
+            .output()
+            .await
+            .context("failed to execute riverctl command")?;
+        if !output.status.success() {
+            bail!(
+                "riverctl failed (user {:?}): {}",
                 user,
-                stderr.trim(),
-                RETRY_DELAY.as_secs()
+                String::from_utf8_lossy(&output.stderr)
             );
-            sleep(RETRY_DELAY).await;
         }
 
-        unreachable!("riverctl retry loop should always return or bail")
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 }
