@@ -1290,11 +1290,8 @@ impl P2pConnManager {
                 tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
             }
 
-            let resolved_peer_id = connection_manager
-                .get_peer_key()
-                .expect("peer key should be set when connection exists");
             callback
-                .send_result(Ok((resolved_peer_id, None)))
+                .send_result(Ok((peer.clone(), None)))
                 .await
                 .inspect_err(|err| {
                     tracing::debug!(
@@ -1605,18 +1602,15 @@ impl P2pConnManager {
         remaining_checks: Option<usize>,
         is_transient: bool,
     ) -> anyhow::Result<()> {
-        if is_transient {
-            let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            let current = connection_manager.transient_count();
-            if current >= connection_manager.transient_budget() {
-                tracing::warn!(
-                    remote = %peer_id.addr,
-                    budget = connection_manager.transient_budget(),
-                    current,
-                    "Transient connection budget exhausted; dropping inbound connection"
-                );
-                return Ok(());
-            }
+        let connection_manager = &self.bridge.op_manager.ring.connection_manager;
+        if is_transient && !connection_manager.try_register_transient(peer_id.clone(), None) {
+            tracing::warn!(
+                remote = %peer_id.addr,
+                budget = connection_manager.transient_budget(),
+                current = connection_manager.transient_count(),
+                "Transient connection budget exhausted; dropping inbound connection"
+            );
+            return Ok(());
         }
 
         let pending_txs = state
@@ -1624,7 +1618,6 @@ impl P2pConnManager {
             .remove(&peer_id.addr)
             .unwrap_or_default();
         if let Some(callbacks) = state.awaiting_connection.remove(&peer_id.addr) {
-            let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             let resolved_peer_id = if let Some(peer_id) = connection_manager.get_peer_key() {
                 peer_id
             } else {
@@ -1698,7 +1691,6 @@ impl P2pConnManager {
         }
 
         if newly_inserted {
-            let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             let pending_loc = connection_manager.prune_in_transit_connection(&peer_id);
             if !is_transient {
                 let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
@@ -1708,7 +1700,8 @@ impl P2pConnManager {
                     .add_connection(loc, peer_id.clone(), false)
                     .await;
             } else {
-                connection_manager.register_transient(peer_id.clone(), pending_loc);
+                // Update location now that we know it; budget was reserved before any work.
+                connection_manager.try_register_transient(peer_id.clone(), pending_loc);
                 tracing::info!(
                     peer = %peer_id,
                     "Registered transient connection (not added to ring topology)"
@@ -1730,6 +1723,9 @@ impl P2pConnManager {
                     }
                 });
             }
+        } else if is_transient {
+            // We reserved budget earlier, but didn't take ownership of the connection.
+            connection_manager.drop_transient(&peer_id);
         }
         Ok(())
     }

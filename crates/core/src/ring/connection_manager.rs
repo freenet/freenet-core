@@ -1,6 +1,8 @@
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
-use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::collections::{btree_map::Entry, BTreeMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::topology::{Limits, TopologyManager};
 
@@ -26,7 +28,8 @@ pub(crate) struct ConnectionManager {
     own_location: Arc<AtomicU64>,
     peer_key: Arc<Mutex<Option<PeerId>>>,
     is_gateway: bool,
-    transient_connections: Arc<RwLock<HashMap<PeerId, TransientEntry>>>,
+    transient_connections: Arc<DashMap<PeerId, TransientEntry>>,
+    transient_in_use: Arc<AtomicUsize>,
     transient_budget: usize,
     transient_ttl: Duration,
     pub min_connections: usize,
@@ -123,7 +126,8 @@ impl ConnectionManager {
             own_location: own_location.into(),
             peer_key: Arc::new(Mutex::new(peer_id)),
             is_gateway,
-            transient_connections: Arc::new(RwLock::new(HashMap::new())),
+            transient_connections: Arc::new(DashMap::new()),
+            transient_in_use: Arc::new(AtomicUsize::new(0)),
             transient_budget,
             transient_ttl,
             min_connections,
@@ -354,27 +358,60 @@ impl ConnectionManager {
         self.is_gateway
     }
 
-    pub fn register_transient(&self, peer: PeerId, location: Option<Location>) {
-        self.transient_connections.write().insert(
+    /// Attempts to register a transient connection, enforcing the configured budget.
+    /// Returns `false` when the budget is exhausted, leaving the map unchanged.
+    pub fn try_register_transient(&self, peer: PeerId, location: Option<Location>) -> bool {
+        if self.transient_connections.contains_key(&peer) {
+            if let Some(mut entry) = self.transient_connections.get_mut(&peer) {
+                entry.location = location;
+            }
+            return true;
+        }
+
+        let current = self.transient_in_use.load(Ordering::Acquire);
+        if current >= self.transient_budget {
+            return false;
+        }
+
+        let key = peer.clone();
+        self.transient_connections.insert(
             peer,
             TransientEntry {
                 opened_at: Instant::now(),
                 location,
             },
         );
+        let prev = self.transient_in_use.fetch_add(1, Ordering::SeqCst);
+        if prev >= self.transient_budget {
+            // Undo if we raced past the budget.
+            self.transient_connections.remove(&key);
+            self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+
+        true
     }
 
+    /// Drops a transient connection and returns its metadata, if it existed.
+    /// Also decrements the transient budget counter.
     pub fn drop_transient(&self, peer: &PeerId) -> Option<TransientEntry> {
-        self.transient_connections.write().remove(peer)
+        let removed = self
+            .transient_connections
+            .remove(peer)
+            .map(|(_, entry)| entry);
+        if removed.is_some() {
+            self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
+        }
+        removed
     }
 
     #[allow(dead_code)]
     pub fn is_transient(&self, peer: &PeerId) -> bool {
-        self.transient_connections.read().contains_key(peer)
+        self.transient_connections.contains_key(peer)
     }
 
     pub fn transient_count(&self) -> usize {
-        self.transient_connections.read().len()
+        self.transient_in_use.load(Ordering::Acquire)
     }
 
     pub fn transient_budget(&self) -> usize {
