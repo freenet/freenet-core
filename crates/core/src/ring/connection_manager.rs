@@ -624,7 +624,7 @@ impl ConnectionManager {
     }
 
     #[allow(dead_code)]
-pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
+    pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
         read.keys().cloned().collect::<Vec<_>>().into_iter()
     }
@@ -648,7 +648,8 @@ mod tests {
     use crate::topology::rate::Rate;
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     fn make_connection_manager() -> ConnectionManager {
         let keypair = TransportKeypair::new();
@@ -702,16 +703,6 @@ mod tests {
         let known = manager.get_known_locations();
         assert_eq!(known.get(&peer), Some(&location));
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
-
-    use crate::transport::TransportKeypair;
 
     #[test]
     fn should_accept_does_not_leak_reservations_for_duplicate_peer() {
@@ -736,10 +727,9 @@ mod tests {
         let after_first = manager.reserved_connections.load(Ordering::SeqCst);
         assert_eq!(after_first, 1);
         {
-            let known = manager.location_for_peer.read().contains_key(&peer_id);
             assert!(
-                known,
-                "pending connection should be registered after initial acceptance"
+                manager.is_pending_connection(&peer_id),
+                "pending connection should be tracked separately after initial acceptance"
             );
         }
 
