@@ -662,8 +662,11 @@ mod tests {
             );
         }
 
-        // Second attempt for the same peer should not create another reservation.
-        assert!(manager.should_accept(location, &peer_id));
+        // Second attempt for the same peer should be rejected immediately.
+        assert!(
+            !manager.should_accept(location, &peer_id),
+            "duplicate peer should be rejected by should_accept"
+        );
         assert_eq!(
             manager.reserved_connections.load(Ordering::SeqCst),
             after_first,
