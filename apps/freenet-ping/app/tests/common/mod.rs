@@ -127,6 +127,8 @@ pub async fn base_node_test_config_with_rng(
             network_port: public_port, // if None, node will pick a free one or use default
             bandwidth_limit: None,
             blocked_addresses,
+            transient_budget: None,
+            transient_ttl_secs: None,
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),

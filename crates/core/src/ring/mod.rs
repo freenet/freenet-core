@@ -6,10 +6,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::{
-    sync::{
-        atomic::{AtomicU64, AtomicUsize},
-        Arc, Weak,
-    },
+    sync::{atomic::AtomicU64, Arc, Weak},
     time::{Duration, Instant},
 };
 use tracing::Instrument;

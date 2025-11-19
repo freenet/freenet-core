@@ -95,6 +95,8 @@ async fn base_node_test_config(
             network_port: public_port,
             bandwidth_limit: None,
             blocked_addresses: None,
+            transient_budget: None,
+            transient_ttl_secs: None,
         },
         config_paths: {
             freenet::config::ConfigPathsArgs {
