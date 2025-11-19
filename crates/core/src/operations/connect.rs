@@ -892,10 +892,6 @@ pub(crate) async fn initial_join_procedure(
 
         loop {
             let open_conns = op_manager.ring.open_connections();
-            let reserved_conns = op_manager
-                .ring
-                .connection_manager
-                .get_reserved_connections();
             let unconnected_gateways: Vec<_> =
                 op_manager.ring.is_not_connected(gateways.iter()).collect();
             let available_gateways: Vec<_> = unconnected_gateways
@@ -905,23 +901,14 @@ pub(crate) async fn initial_join_procedure(
 
             tracing::debug!(
                 open_connections = open_conns,
-                reserved_connections = reserved_conns,
                 inflight_gateway_dials = in_flight_gateways.len(),
                 available_gateways = available_gateways.len(),
                 "Connection status before join attempt"
             );
 
-            if reserved_conns > 0 {
-                tracing::debug!(
-                    open_connections = open_conns,
-                    reserved_connections = reserved_conns,
-                    "Skipping gateway dial while another outbound handshake is reserved"
-                );
-            }
-
             let available_count = available_gateways.len();
 
-            if open_conns < BOOTSTRAP_THRESHOLD && reserved_conns == 0 && available_count > 0 {
+            if open_conns < BOOTSTRAP_THRESHOLD && available_count > 0 {
                 tracing::info!(
                     "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways",
                     open_conns,
