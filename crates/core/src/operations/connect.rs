@@ -780,29 +780,14 @@ pub(crate) async fn join_ring_request(
         OpError::ConnError(ConnectionError::LocationUnknown)
     })?;
 
-    let reserved_snapshot = op_manager
-        .ring
-        .connection_manager
-        .get_reserved_connections();
-    let known_peer = op_manager
-        .ring
-        .connection_manager
-        .has_known_peer(&gateway.peer);
-
     tracing::debug!(
         peer = %gateway.peer,
-        known_peer,
-        reserved_connections = reserved_snapshot,
+        reserved_connections = op_manager
+            .ring
+            .connection_manager
+            .get_reserved_connections(),
         "join_ring_request: evaluating gateway connection attempt"
     );
-
-    if known_peer {
-        tracing::debug!(
-            %gateway.peer,
-            "join_ring_request: gateway already pending/connected; skipping duplicate attempt"
-        );
-        return Ok(());
-    }
 
     if !op_manager
         .ring

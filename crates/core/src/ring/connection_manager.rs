@@ -167,9 +167,9 @@ impl ConnectionManager {
                 %peer_id,
                 open,
                 reserved_before,
-                "Peer already pending/connected; skipping duplicate reservation"
+                "Peer already pending/connected; rejecting duplicate reservation"
             );
-            return true;
+            return false;
         }
 
         if self.is_gateway && (open > 0 || reserved_before > 0) {
@@ -580,6 +580,7 @@ impl ConnectionManager {
         self.connections_by_location.read().clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn has_known_peer(&self, peer: &PeerId) -> bool {
         self.location_for_peer.read().contains_key(peer)
     }
