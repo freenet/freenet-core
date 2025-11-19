@@ -253,23 +253,41 @@ impl RiverSession {
             RiverUser::Bob => (&self.bob_url, self.bob_dir.path()),
         };
 
-        let mut cmd = tokio::process::Command::new(&self.riverctl);
-        cmd.arg("--node-url").arg(url);
-        cmd.args(args);
-        cmd.env("RIVER_CONFIG_DIR", config_dir);
+        const MAX_RETRIES: usize = 3;
+        const RETRY_DELAY: Duration = Duration::from_secs(5);
 
-        let output = cmd
-            .output()
-            .await
-            .context("failed to execute riverctl command")?;
-        if !output.status.success() {
-            bail!(
-                "riverctl failed (user {:?}): {}",
+        for attempt in 1..=MAX_RETRIES {
+            let mut cmd = tokio::process::Command::new(&self.riverctl);
+            cmd.arg("--node-url").arg(url);
+            cmd.args(args);
+            cmd.env("RIVER_CONFIG_DIR", config_dir);
+
+            let output = cmd
+                .output()
+                .await
+                .context("failed to execute riverctl command")?;
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let retriable = stderr.contains("Timeout waiting for")
+                || stderr.contains("connection refused")
+                || stderr.contains("HTTP request failed");
+            if attempt == MAX_RETRIES || !retriable {
+                bail!("riverctl failed (user {:?}): {}", user, stderr);
+            }
+            println!(
+                "riverctl attempt {}/{} failed for {:?}: {}; retrying in {}s",
+                attempt,
+                MAX_RETRIES,
                 user,
-                String::from_utf8_lossy(&output.stderr)
+                stderr.trim(),
+                RETRY_DELAY.as_secs()
             );
+            sleep(RETRY_DELAY).await;
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        unreachable!("riverctl retry loop should always return or bail")
     }
 }
