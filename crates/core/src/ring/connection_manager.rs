@@ -580,11 +580,6 @@ impl ConnectionManager {
         self.connections_by_location.read().clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_known_peer(&self, peer: &PeerId) -> bool {
-        self.location_for_peer.read().contains_key(peer)
-    }
-
     pub(super) fn get_known_locations(&self) -> BTreeMap<PeerId, Location> {
         self.location_for_peer.read().clone()
     }
@@ -633,6 +628,7 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use crate::transport::TransportKeypair;
 
@@ -651,15 +647,20 @@ mod tests {
             Ring::DEFAULT_RAND_WALK_ABOVE_HTL,
             (keypair.public().clone(), None, AtomicU64::new(0)),
             false,
+            32,
+            Duration::from_secs(30),
         );
 
         assert!(manager.should_accept(location, &peer_id));
         let after_first = manager.reserved_connections.load(Ordering::SeqCst);
         assert_eq!(after_first, 1);
-        assert!(
-            manager.has_known_peer(&peer_id),
-            "pending connection should be registered after initial acceptance"
-        );
+        {
+            let known = manager.location_for_peer.read().contains_key(&peer_id);
+            assert!(
+                known,
+                "pending connection should be registered after initial acceptance"
+            );
+        }
 
         // Second attempt for the same peer should not create another reservation.
         assert!(manager.should_accept(location, &peer_id));
