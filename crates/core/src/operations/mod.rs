@@ -356,6 +356,15 @@ fn start_subscription_request(
     op_manager: &OpManager,
     parent_tx: Transaction,
     key: ContractKey,
+) -> Transaction {
+    start_subscription_request_internal(op_manager, parent_tx, key, true)
+}
+
+/// Starts a subscription request while allowing callers to opt out of parent tracking.
+fn start_subscription_request_internal(
+    op_manager: &OpManager,
+    parent_tx: Transaction,
+    key: ContractKey,
     track_parent: bool,
 ) -> Transaction {
     let child_tx = Transaction::new_child_of::<subscribe::SubscribeMsg>(&parent_tx);
