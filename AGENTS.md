@@ -50,6 +50,65 @@ git worktree remove ../fix-2107  # Remove when branch merges
 
 **After a PR merges, remove the worktree** to free disk space (each worktree has its own `target/` directory consuming 10-50GB).
 
+## ⚠️ SPAWNING SUB-AGENTS (Claude/Codex)
+
+When Claude Code needs to spawn Codex or Claude sub-agents for parallel work, follow this checklist:
+
+### Pre-Flight Checklist
+
+**BEFORE spawning any agent:**
+
+1. ✅ **Verify/create worktree** for the agent's work
+2. ✅ **Use correct CLI parameters** (see below)
+3. ✅ **Don't use `--layout compact`** when creating tabs (causes UI inconsistency)
+4. ✅ **Verify disk space** (needs ~10-50GB for builds)
+
+### Correct Agent Launch Commands
+
+```bash
+# Codex (for tough bugs and deep debugging)
+codex -s danger-full-access -a never
+
+# Claude Code (for human communication and planning)
+claude --permission-mode bypassPermissions
+```
+
+**CRITICAL:** Always use these exact parameters. Without them, agents run in restrictive mode and can't execute commands.
+
+### Agent Spawning Template
+
+```bash
+# 1. Create/verify worktree
+cd ~/code/freenet/freenet-core/main
+git worktree add ../fix-ISSUE-NUMBER branch-name
+
+# 2. Create zellij tab (NO --layout flag!)
+zellij action new-tab --name codex-iISSUE-description
+
+# 3. Switch to mcp tab to avoid input corruption
+zellij action go-to-tab-name mcp
+
+# 4. Start agent with correct params
+~/code/mcp/skills/zellij-agent-manager/scripts/send-to-agent.sh \
+  codex-iISSUE-description \
+  "cd ~/code/freenet/freenet-core/fix-ISSUE-NUMBER && codex -s danger-full-access -a never"
+
+# 5. Wait for agent to start, then send task
+sleep 3
+~/code/mcp/skills/zellij-agent-manager/scripts/send-to-agent.sh \
+  codex-iISSUE-description \
+  "Your task description here [AI-assisted - Claude]"
+```
+
+### Common Pitfalls
+
+- ❌ **Spawning agents in main worktree** → Creates branch conflicts
+- ❌ **Using restrictive permission modes** → Agent can't execute commands
+- ❌ **Sending messages while agent is executing** → Corrupts input buffer
+- ❌ **Complex bash with subshells** → Use temp scripts instead
+- ❌ **Using `--layout compact`** → Causes tab bar position inconsistency
+- ❌ **Not verifying disk space** → Builds fail with cryptic errors
+
 ## Repository Layout
 - `crates/` – core libraries, binaries, and developer tooling (`core`, `gateway`, `fdev`, etc.)
 - `apps/` – integration binaries (benchmarks, diagnostic tools)
