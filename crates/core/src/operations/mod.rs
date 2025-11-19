@@ -198,6 +198,7 @@ where
     Ok(None)
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum OpEnum {
     Connect(Box<connect::ConnectOp>),
     Put(put::PutOp),

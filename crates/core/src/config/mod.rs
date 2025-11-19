@@ -45,6 +45,9 @@ pub(crate) const PCK_VERSION: &str = env!("CARGO_PKG_VERSION");
 // Initialize the executor once.
 static ASYNC_RT: LazyLock<Option<Runtime>> = LazyLock::new(GlobalExecutor::initialize_async_rt);
 
+const DEFAULT_TRANSIENT_BUDGET: usize = 32;
+const DEFAULT_TRANSIENT_TTL_SECS: u64 = 30;
+
 const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
@@ -97,6 +100,8 @@ impl Default for ConfigArgs {
                 location: None,
                 bandwidth_limit: Some(3_000_000), // 3 MB/s default for streaming transfers only
                 blocked_addresses: None,
+                transient_budget: Some(DEFAULT_TRANSIENT_BUDGET),
+                transient_ttl_secs: Some(DEFAULT_TRANSIENT_TTL_SECS),
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -361,6 +366,14 @@ impl ConfigArgs {
                     .network_api
                     .blocked_addresses
                     .map(|addrs| addrs.into_iter().collect()),
+                transient_budget: self
+                    .network_api
+                    .transient_budget
+                    .unwrap_or(DEFAULT_TRANSIENT_BUDGET),
+                transient_ttl_secs: self
+                    .network_api
+                    .transient_ttl_secs
+                    .unwrap_or(DEFAULT_TRANSIENT_TTL_SECS),
             },
             ws_api: WebsocketApiConfig {
                 // the websocket API is always local
@@ -542,6 +555,16 @@ pub struct NetworkArgs {
     /// List of IP:port addresses to refuse connections to/from.
     #[arg(long, num_args = 0..)]
     pub blocked_addresses: Option<Vec<SocketAddr>>,
+
+    /// Maximum number of concurrent transient connections accepted by a gateway.
+    #[arg(long, env = "TRANSIENT_BUDGET")]
+    #[serde(rename = "transient-budget", skip_serializing_if = "Option::is_none")]
+    pub transient_budget: Option<usize>,
+
+    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    #[arg(long, env = "TRANSIENT_TTL_SECS")]
+    #[serde(rename = "transient-ttl-secs", skip_serializing_if = "Option::is_none")]
+    pub transient_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +631,14 @@ pub struct NetworkApiConfig {
     /// List of IP:port addresses to refuse connections to/from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_addresses: Option<HashSet<SocketAddr>>,
+
+    /// Maximum number of concurrent transient connections accepted by a gateway.
+    #[serde(default = "default_transient_budget", rename = "transient-budget")]
+    pub transient_budget: usize,
+
+    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    #[serde(default = "default_transient_ttl_secs", rename = "transient-ttl-secs")]
+    pub transient_ttl_secs: u64,
 }
 
 mod port_allocation;
@@ -615,6 +646,14 @@ use port_allocation::find_available_port;
 
 pub fn default_network_api_port() -> u16 {
     find_available_port().unwrap_or(31337) // Fallback to 31337 if we can't find a random port
+}
+
+fn default_transient_budget() -> usize {
+    DEFAULT_TRANSIENT_BUDGET
+}
+
+fn default_transient_ttl_secs() -> u64 {
+    DEFAULT_TRANSIENT_TTL_SECS
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]

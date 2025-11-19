@@ -149,6 +149,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             network_port: Some(network_port),
                             bandwidth_limit: None,
                             blocked_addresses: None,
+                            transient_budget: None,
+                            transient_ttl_secs: None,
                         },
                         config_paths: freenet::config::ConfigPathsArgs {
                             config_dir: Some(temp_dir.path().to_path_buf()),
@@ -259,6 +261,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             network_port: Some(network_port),
                             bandwidth_limit: None,
                             blocked_addresses: None,
+                            transient_budget: None,
+                            transient_ttl_secs: None,
                         },
                         config_paths: freenet::config::ConfigPathsArgs {
                             config_dir: Some(temp_dir.path().to_path_buf()),

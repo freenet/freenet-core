@@ -188,6 +188,8 @@ async fn create_peer_config(
             network_port: Some(network_port),
             bandwidth_limit: None,
             blocked_addresses: None,
+            transient_budget: None,
+            transient_ttl_secs: None,
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),
