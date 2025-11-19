@@ -862,7 +862,10 @@ impl Operation for GetOp {
                                     attempts_at_hop: attempts_at_hop + 1,
                                     key,
                                     current_target: next_target,
-                                    skip_list: updated_tried_peers,
+                                    // Preserve the accumulated skip_list so future candidate
+                                    // selection still avoids already-specified peers; tried_peers
+                                    // tracks attempts at this hop.
+                                    skip_list: skip_list.clone(),
                                 });
                             } else if retries < MAX_RETRIES {
                                 // No more alternatives at this hop, try finding new peers
