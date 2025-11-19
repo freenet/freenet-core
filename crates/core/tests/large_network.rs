@@ -247,7 +247,7 @@ impl RiverSession {
             .map(|_| ())
     }
 
-    async fn run_riverctl<'a>(&self, user: RiverUser, args: &[&'a str]) -> anyhow::Result<String> {
+    async fn run_riverctl(&self, user: RiverUser, args: &[&str]) -> anyhow::Result<String> {
         let (url, config_dir) = match user {
             RiverUser::Alice => (&self.alice_url, self.alice_dir.path()),
             RiverUser::Bob => (&self.bob_url, self.bob_dir.path()),
