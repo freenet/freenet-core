@@ -77,6 +77,87 @@ where
     handle_op_result(op_manager, network_bridge, result, tx, sender).await
 }
 
+/// Helper function to handle finalized operations with sub-operation atomicity.
+/// Ensures client receives response only after all sub-operations complete.
+async fn handle_finalized_operation<CB>(
+    op_manager: &OpManager,
+    network_bridge: &mut CB,
+    tx_id: Transaction,
+    final_state: OpEnum,
+    return_msg: Option<NetMessage>,
+) -> Result<Option<OpEnum>, OpError>
+where
+    CB: NetworkBridge,
+{
+    // Check if this operation failed due to a sub-operation failure
+    if op_manager.failed_parents().remove(&tx_id).is_some() {
+        tracing::warn!(
+            "Operation {} reached finalized state after a sub-operation failure; dropping client response",
+            tx_id
+        );
+        op_manager.completed(tx_id);
+
+        // Send network message if present
+        if let Some(msg) = return_msg {
+            if let Some(target) = msg.target() {
+                network_bridge.send(&target.peer, msg).await?;
+            }
+        }
+
+        return Ok(None);
+    }
+
+    // Check atomicity: ensure all sub-operations completed before delivering to client
+    if op_manager.all_sub_operations_completed(tx_id) {
+        // All sub-operations completed - safe to complete and notify client
+        let msg_type = if return_msg.is_some() {
+            "with outgoing message"
+        } else {
+            ""
+        };
+        tracing::debug!(%tx_id, "operation complete {}", msg_type);
+        op_manager.completed(tx_id);
+
+        // Send network message if present
+        if let Some(msg) = return_msg {
+            if let Some(target) = msg.target() {
+                tracing::debug!(%tx_id, %target, "sending final message to target");
+                network_bridge.send(&target.peer, msg).await?;
+            }
+        }
+
+        return Ok(Some(final_state));
+    } else {
+        // Sub-operations still pending - wait before delivering to client
+        let pending_count = op_manager.count_pending_sub_operations(tx_id);
+        let msg_type = if return_msg.is_some() {
+            "with outgoing message"
+        } else {
+            ""
+        };
+        tracing::debug!(
+            %tx_id,
+            pending_count,
+            "root operation awaiting child completion {}", msg_type
+        );
+
+        // Insert into awaiting map - result will be delivered when children complete
+        op_manager
+            .root_ops_awaiting_sub_ops()
+            .insert(tx_id, final_state);
+
+        // Send network message if present, but don't deliver to client yet
+        if let Some(msg) = return_msg {
+            if let Some(target) = msg.target() {
+                tracing::debug!(%tx_id, %target, "sending message to target while awaiting children");
+                network_bridge.send(&target.peer, msg).await?;
+            }
+        }
+
+        return Ok(None);
+    }
+}
+
 #[inline(always)]
 async fn handle_op_result<CB>(
     op_manager: &OpManager,
@@ -106,32 +187,14 @@ where
             return_msg: None,
             state: Some(final_state),
         }) if final_state.finalized() => {
-            if op_manager.failed_parents().remove(&tx_id).is_some() {
-                tracing::warn!(
-                    "Operation {} reached finalized state after a sub-operation failure; dropping client response",
-                    tx_id
-                );
-                op_manager.completed(tx_id);
-                return Ok(None);
-            }
-            if op_manager.all_sub_operations_completed(tx_id) {
-                tracing::debug!(%tx_id, "operation complete");
-                op_manager.completed(tx_id);
-                return Ok(Some(final_state));
-            } else {
-                let pending_count = op_manager.count_pending_sub_operations(tx_id);
-                tracing::debug!(
-                    %tx_id,
-                    pending_count,
-                    "root operation awaiting child completion"
-                );
-
-                op_manager
-                    .root_ops_awaiting_sub_ops()
-                    .insert(tx_id, final_state);
-
-                return Ok(None);
-            }
+            return handle_finalized_operation(
+                op_manager,
+                network_bridge,
+                tx_id,
+                final_state,
+                None, // No return message
+            )
+            .await;
         }
         Ok(OperationResult {
             return_msg: Some(msg),
@@ -139,13 +202,14 @@ where
         }) => {
             if updated_state.finalized() {
                 let id = *msg.id();
-                tracing::debug!(%id, "operation finalized with outgoing message");
-                op_manager.completed(id);
-                if let Some(target) = msg.target() {
-                    tracing::debug!(%id, %target, "sending final message to target");
-                    network_bridge.send(&target.peer, msg).await?;
-                }
-                return Ok(Some(updated_state));
+                return handle_finalized_operation(
+                    op_manager,
+                    network_bridge,
+                    id,
+                    updated_state,
+                    Some(msg), // Has return message
+                )
+                .await;
             } else {
                 let id = *msg.id();
                 tracing::debug!(%id, "operation in progress");
