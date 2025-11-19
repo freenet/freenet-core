@@ -452,19 +452,18 @@ fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
 #[cfg(target_os = "windows")]
 fn get_cpu_cycles_per_second_runtime() -> Option<u64> {
     use serde::Deserialize;
-    use wmi::{COMLibrary, Variant, WMIConnection};
+    use wmi::{WMIConnection};
 
     #[derive(Deserialize, Debug)]
-    struct Win32_Processor {
+    struct Win32Processor {
         #[serde(rename = "MaxClockSpeed")]
         max_clock_speed: u64,
     }
 
-    let com_con = COMLibrary::new().ok()?;
-    let wmi_con = WMIConnection::new(com_con.into()).ok()?;
+    let wmi_con = WMIConnection::new().ok()?;
 
-    let results: Vec<Win32_Processor> = wmi_con
-        .raw_query("SELECT MaxClockSpeed FROM Win32_Processor")
+    let results: Vec<Win32Processor> = wmi_con
+        .raw_query("SELECT MaxClockSpeed FROM Win32Processor")
         .ok()?;
 
     if let Some(cpu) = results.first() {
