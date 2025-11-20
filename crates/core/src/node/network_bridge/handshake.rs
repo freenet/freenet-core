@@ -184,7 +184,7 @@ impl ExpectedInboundTracker {
 
     #[cfg(test)]
     fn contains(&self, addr: SocketAddr) -> bool {
-        self.entries.contains_key(&addr)
+        self.entries.contains_key(&addr.ip())
     }
 }
 
