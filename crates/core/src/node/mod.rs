@@ -619,7 +619,7 @@ pub(crate) async fn process_message_decoupled<CB>(
     msg: NetMessage,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
-    event_listener: Box<dyn NetEventRegister>,
+    mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     message_processor: std::sync::Arc<MessageProcessor>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
@@ -633,14 +633,37 @@ pub(crate) async fn process_message_decoupled<CB>(
         msg,
         op_manager.clone(),
         conn_manager,
-        event_listener,
-        executor_callback,
+        event_listener.as_mut(),
         pending_op_result,
     )
     .await;
 
+    // Prepare host result for session actor routing
+    let host_result = match &op_result {
+        Ok(Some(op_res)) => Some(op_res.to_host_result()),
+        Ok(None) => None,
+        Err(e) => Some(Err(freenet_stdlib::client_api::ClientError::from(
+            freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: e.to_string().into(),
+            },
+        ))),
+    };
+
+    // Report operation completion for telemetry/result routing
+    report_result(
+        Some(tx),
+        op_result,
+        &op_manager,
+        executor_callback,
+        &mut *event_listener,
+    )
+    .await;
+
     // Delegate to MessageProcessor - it handles all client concerns internally
-    if let Err(e) = message_processor.handle_network_result(tx, op_result).await {
+    if let Err(e) = message_processor
+        .handle_network_result(tx, host_result)
+        .await
+    {
         tracing::error!(
             "Failed to handle network result for transaction {}: {}",
             tx,
@@ -655,8 +678,7 @@ async fn handle_pure_network_message<CB>(
     msg: NetMessage,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
-    event_listener: Box<dyn NetEventRegister>,
-    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    event_listener: &mut dyn NetEventRegister,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
 where
@@ -669,7 +691,6 @@ where
                 op_manager,
                 conn_manager,
                 event_listener,
-                executor_callback,
                 pending_op_result,
             )
             .await
@@ -838,8 +859,7 @@ async fn handle_pure_network_message_v1<CB>(
     msg: NetMessageV1,
     op_manager: Arc<OpManager>,
     mut conn_manager: CB,
-    mut event_listener: Box<dyn NetEventRegister>,
-    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    event_listener: &mut dyn NetEventRegister,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
 where
@@ -887,7 +907,6 @@ where
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
@@ -934,7 +953,6 @@ where
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
@@ -972,7 +990,6 @@ where
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
@@ -1000,7 +1017,6 @@ where
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
@@ -1031,7 +1047,6 @@ where
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
@@ -1060,7 +1075,6 @@ async fn handle_pure_network_result(
     tx: Option<Transaction>,
     op_result: Result<Option<crate::operations::OpEnum>, OpError>,
     _op_manager: &Arc<OpManager>,
-    _executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     _event_listener: &mut dyn NetEventRegister,
 ) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError> {
     tracing::debug!("Pure network result handling for transaction: {:?}", tx);
@@ -1080,10 +1094,6 @@ async fn handle_pure_network_result(
             }
 
             // TODO: Handle executor callbacks (network concern)
-            // Executor callback functionality needs to be restored with proper types
-            if let Some(_callback) = _executor_callback {
-                tracing::debug!("Executor callback available for transaction {:?} but not implemented in pure network processing", tx);
-            }
         }
         Ok(None) => {
             tracing::debug!("Network operation returned no result");

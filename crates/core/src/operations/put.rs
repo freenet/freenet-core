@@ -436,7 +436,8 @@ impl Operation for PutOp {
                             skip_list.insert(target.peer.clone());
                         }
 
-                        let child_tx = super::start_subscription_request(op_manager, *id, key);
+                        let child_tx =
+                            super::start_subscription_request_internal(op_manager, *id, key, false);
                         tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                         op_manager.ring.seed_contract(key);
 
@@ -698,8 +699,9 @@ impl Operation for PutOp {
                                         %key,
                                         "starting child subscription for PUT operation"
                                     );
-                                    let child_tx =
-                                        super::start_subscription_request(op_manager, *id, key);
+                                    let child_tx = super::start_subscription_request_internal(
+                                        op_manager, *id, key, false,
+                                    );
                                     tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                                 } else {
                                     tracing::warn!(
@@ -843,7 +845,9 @@ impl Operation for PutOp {
 
                         // Start subscription and handle dropped contracts
                         let (dropped_contract, old_subscribers) = {
-                            let child_tx = super::start_subscription_request(op_manager, *id, key);
+                            let child_tx = super::start_subscription_request_internal(
+                                op_manager, *id, key, false,
+                            );
                             tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                             op_manager.ring.seed_contract(key)
                         };
