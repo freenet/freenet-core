@@ -5,7 +5,7 @@
 //! connection attempts to/from the event loop. Higher-level routing decisions now live inside
 //! `ConnectOp`.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -31,21 +31,21 @@ pub(crate) enum Event {
         transaction: Option<Transaction>,
         peer: Option<PeerId>,
         connection: PeerConnection,
-        courtesy: bool,
+        transient: bool,
     },
     /// An outbound connection attempt succeeded.
     OutboundEstablished {
         transaction: Transaction,
         peer: PeerId,
         connection: PeerConnection,
-        courtesy: bool,
+        transient: bool,
     },
     /// An outbound connection attempt failed.
     OutboundFailed {
         transaction: Transaction,
         peer: PeerId,
         error: ConnectionError,
-        courtesy: bool,
+        transient: bool,
     },
 }
 
@@ -56,13 +56,13 @@ pub(crate) enum Command {
     Connect {
         peer: PeerId,
         transaction: Transaction,
-        courtesy: bool,
+        transient: bool,
     },
     /// Register expectation for an inbound connection from `peer`.
     ExpectInbound {
         peer: PeerId,
         transaction: Option<Transaction>,
-        courtesy: bool,
+        transient: bool,
     },
     /// Remove state associated with `peer`.
     DropConnection { peer: PeerId },
@@ -122,32 +122,64 @@ impl Stream for HandshakeHandler {
 struct ExpectedInbound {
     peer: PeerId,
     transaction: Option<Transaction>,
-    courtesy: bool,
+    transient: bool, // TODO: rename to transient in protocol once we migrate terminology
 }
 
 #[derive(Default)]
 struct ExpectedInboundTracker {
-    entries: HashMap<SocketAddr, ExpectedInbound>,
+    entries: HashMap<IpAddr, Vec<ExpectedInbound>>,
 }
 
 impl ExpectedInboundTracker {
-    fn register(&mut self, peer: PeerId, transaction: Option<Transaction>, courtesy: bool) {
-        self.entries.insert(
-            peer.addr,
-            ExpectedInbound {
+    fn register(&mut self, peer: PeerId, transaction: Option<Transaction>, transient: bool) {
+        tracing::debug!(
+            remote = %peer.addr,
+            transient,
+            tx = ?transaction,
+            "ExpectInbound: registering expectation"
+        );
+        self.entries
+            .entry(peer.addr.ip())
+            .or_default()
+            .push(ExpectedInbound {
                 peer,
                 transaction,
-                courtesy,
-            },
-        );
+                transient,
+            });
     }
 
     fn drop_peer(&mut self, peer: &PeerId) {
-        self.entries.remove(&peer.addr);
+        if let Some(list) = self.entries.get_mut(&peer.addr.ip()) {
+            list.retain(|entry| entry.peer != *peer);
+            if list.is_empty() {
+                self.entries.remove(&peer.addr.ip());
+            }
+        }
     }
 
     fn consume(&mut self, addr: SocketAddr) -> Option<ExpectedInbound> {
-        self.entries.remove(&addr)
+        let ip = addr.ip();
+        let list = self.entries.get_mut(&ip)?;
+        if let Some(pos) = list
+            .iter()
+            .position(|entry| entry.peer.addr.port() == addr.port())
+        {
+            let entry = list.remove(pos);
+            if list.is_empty() {
+                self.entries.remove(&ip);
+            }
+            tracing::debug!(remote = %addr, peer = %entry.peer.addr, transient = entry.transient, tx = ?entry.transaction, "ExpectInbound: matched by exact port");
+            return Some(entry);
+        }
+        let entry = list.pop();
+        if list.is_empty() {
+            self.entries.remove(&ip);
+        }
+        if let Some(entry) = entry {
+            tracing::debug!(remote = %addr, peer = %entry.peer.addr, transient = entry.transient, tx = ?entry.transaction, "ExpectInbound: matched by IP fallback");
+            return Some(entry);
+        }
+        None
     }
 
     #[cfg(test)]
@@ -170,12 +202,12 @@ async fn run_driver(
     loop {
         select! {
             command = commands_rx.recv() => match command {
-                Some(Command::Connect { peer, transaction, courtesy }) => {
-                    spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, courtesy, peer_ready.clone());
+                Some(Command::Connect { peer, transaction, transient }) => {
+                    spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, peer_ready.clone());
                 }
-                Some(Command::ExpectInbound { peer, transaction, courtesy }) => {
-                    expected_inbound.register(peer, transaction, courtesy);
-                }
+            Some(Command::ExpectInbound { peer, transaction, transient }) => {
+                    expected_inbound.register(peer, transaction, transient /* transient */);
+            }
                 Some(Command::DropConnection { peer }) => {
                     expected_inbound.drop_peer(&peer);
                 }
@@ -190,8 +222,8 @@ async fn run_driver(
 
                         let remote_addr = conn.remote_addr();
                         let entry = expected_inbound.consume(remote_addr);
-                        let (peer, transaction, courtesy) = if let Some(entry) = entry {
-                            (Some(entry.peer), entry.transaction, entry.courtesy)
+                        let (peer, transaction, transient) = if let Some(entry) = entry {
+                            (Some(entry.peer), entry.transaction, entry.transient)
                         } else {
                             (None, None, false)
                         };
@@ -200,7 +232,7 @@ async fn run_driver(
                             transaction,
                             peer,
                             connection: conn,
-                            courtesy,
+                            transient,
                         }).await.is_err() {
                             break;
                         }
@@ -217,7 +249,7 @@ fn spawn_outbound(
     events_tx: mpsc::Sender<Event>,
     peer: PeerId,
     transaction: Transaction,
-    courtesy: bool,
+    transient: bool,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     tokio::spawn(async move {
@@ -241,13 +273,13 @@ fn spawn_outbound(
                 transaction,
                 peer: peer.clone(),
                 connection,
-                courtesy,
+                transient,
             },
             Err(error) => Event::OutboundFailed {
                 transaction,
                 peer: peer.clone(),
                 error,
-                courtesy,
+                transient,
             },
         };
 
@@ -280,7 +312,7 @@ mod tests {
             .expect("expected registered inbound entry");
         assert_eq!(entry.peer, peer);
         assert_eq!(entry.transaction, Some(tx));
-        assert!(entry.courtesy);
+        assert!(entry.transient);
         assert!(tracker.consume(peer.addr).is_none());
     }
 
@@ -308,6 +340,6 @@ mod tests {
             .consume(peer.addr)
             .expect("entry should be present after overwrite");
         assert_eq!(entry.transaction, Some(new_tx));
-        assert!(entry.courtesy);
+        assert!(entry.transient);
     }
 }
