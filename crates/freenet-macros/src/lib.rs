@@ -86,15 +86,14 @@ use parser::FreenetTestArgs;
 /// }
 /// ```
 ///
-/// ## Auto-Connect Peers to Gateways
+/// ## Auto-Connect Peers to Gateways (Default Behavior)
 /// ```ignore
 /// #[freenet_test(
 ///     nodes = ["gateway", "peer-1", "peer-2"],
-///     auto_connect_peers = true,  // Peers will connect to gateway
 ///     timeout_secs = 120
 /// )]
 /// async fn test_with_connections(ctx: &mut TestContext) -> TestResult {
-///     // Peers are configured to discover and connect to the gateway
+///     // Peers are automatically configured to connect to the gateway (default: auto_connect_peers = true)
 ///     let gateway = ctx.gateway()?;
 ///     let peers = ctx.peers();
 ///     // Test peer-gateway interactions...

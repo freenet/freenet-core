@@ -234,7 +234,6 @@ async fn send_put_with_retry(
 /// Test PUT operation across two peers (gateway and peer)
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
@@ -342,7 +341,6 @@ async fn test_put_contract(ctx: &mut TestContext) -> TestResult {
 
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 20,
     tokio_flavor = "multi_thread",
@@ -513,7 +511,6 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
 /// This is a regression test for issue #1995.
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
@@ -664,7 +661,6 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
 #[ignore]
 #[freenet_test(
     nodes = ["gateway", "node-a", "node-b"],
-    auto_connect_peers = true,
     timeout_secs = 600,
     startup_wait_secs = 40,
     tokio_flavor = "multi_thread",
@@ -1238,7 +1234,6 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
 
 #[freenet_test(
     nodes = ["gateway", "node-a"],
-    auto_connect_peers = true,
     timeout_secs = 120,
     startup_wait_secs = 20,
     tokio_flavor = "multi_thread",
@@ -1466,7 +1461,6 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 // FIXME Update notification is not received
 #[freenet_test(
     nodes = ["gateway", "node-a"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 20,
     tokio_flavor = "multi_thread",
@@ -1756,7 +1750,6 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
 #[freenet_test(
     nodes = ["gateway", "client-node"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 20,
     tokio_flavor = "multi_thread",
@@ -2553,7 +2546,6 @@ async fn wait_for_subscribe_response(
 
 #[freenet_test(
     nodes = ["gateway", "peer-node"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 10,
     tokio_flavor = "multi_thread",
@@ -2627,7 +2619,6 @@ async fn test_subscription_introspection(ctx: &mut TestContext) -> TestResult {
 
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 20,
     tokio_flavor = "multi_thread",

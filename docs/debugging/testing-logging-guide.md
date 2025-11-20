@@ -72,7 +72,6 @@ use freenet_macros::freenet_test;
 
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true,
     aggregate_events = "on_failure"  // Automatic event aggregation!
 )]
 async fn test_network_operation(ctx: &mut TestContext) -> TestResult {
@@ -156,7 +155,6 @@ async fn test_gateway_starts(ctx: &mut TestContext) -> TestResult {
 ```rust
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 15
 )]

@@ -18,7 +18,6 @@ use tokio_tungstenite::connect_async;
 /// connecting to the gateway.
 #[freenet_test(
     nodes = ["gateway", "peer"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 15,
     aggregate_events = "always",
@@ -251,7 +250,6 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
 ///
 #[freenet_test(
     nodes = ["gateway", "peer1", "peer2"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 30,
     aggregate_events = "always",

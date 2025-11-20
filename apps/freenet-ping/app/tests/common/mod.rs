@@ -307,18 +307,22 @@ fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
         .map_err(|_| anyhow::anyhow!("CARGO_TARGET_DIR should be set"))?;
     println!("trying to compile the test contract, target: {target}");
 
-    compile_rust_wasm_lib(
-        &BuildToolConfig {
-            features: None,
-            package_type: PackageType::Contract,
-            debug: true,
-        },
-        contract_path,
-    )?;
+    let build_config = BuildToolConfig {
+        features: None,
+        package_type: PackageType::Contract,
+        debug: false,
+    };
 
+    compile_rust_wasm_lib(&build_config, contract_path)?;
+
+    let build_dir = if build_config.debug {
+        "debug"
+    } else {
+        "release"
+    };
     let output_file = Path::new(&target)
         .join(WASM_TARGET)
-        .join("debug")
+        .join(build_dir)
         .join(WASM_FILE_NAME.replace('-', "_"))
         .with_extension("wasm");
     println!("output file: {output_file:?}");
