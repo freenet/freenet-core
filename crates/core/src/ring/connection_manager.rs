@@ -530,8 +530,14 @@ impl ConnectionManager {
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
             } else {
+                // Use saturating_sub to prevent underflow if counter already at 0
                 self.reserved_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |val| Some(val.saturating_sub(1)),
+                    )
+                    .ok();
             }
             return None;
         };
