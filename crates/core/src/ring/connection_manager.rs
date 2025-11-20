@@ -365,6 +365,7 @@ impl ConnectionManager {
         self.peer_key.lock().clone()
     }
 
+    #[allow(dead_code)]
     pub fn is_gateway(&self) -> bool {
         self.is_gateway
     }
@@ -607,6 +608,15 @@ impl ConnectionManager {
         router: &Router,
     ) -> Option<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
+        tracing::debug!(
+            total_locations = connections.len(),
+            self_peer = self
+                .get_peer_key()
+                .as_ref()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            "routing: considering connections"
+        );
         let peers = connections.values().filter_map(|conns| {
             let conn = conns.choose(&mut rand::rng())?;
             if self.is_transient(&conn.location.peer) {
