@@ -215,7 +215,6 @@ impl RelayState {
         if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
             self.accepted_locally = true;
             let acceptor = ctx.self_location().clone();
-            let dist = ring_distance(acceptor.location, self.request.joiner.location);
             let transient = ctx.transient_hint(&acceptor, &self.request.joiner);
             self.transient_hint = transient;
             actions.accept_response = Some(ConnectResponse {
@@ -223,27 +222,15 @@ impl RelayState {
                 transient,
             });
             actions.expect_connection_from = Some(self.request.joiner.clone());
-            tracing::info!(
-                acceptor_peer = %acceptor.peer,
-                joiner_peer = %self.request.joiner.peer,
-                acceptor_loc = ?acceptor.location,
-                joiner_loc = ?self.request.joiner.location,
-                ring_distance = ?dist,
-                transient,
-                "connect: acceptance issued"
-            );
         }
 
         if self.forwarded_to.is_none() && self.request.ttl > 0 {
             match ctx.select_next_hop(self.request.desired_location, &self.request.visited) {
                 Some(next) => {
-                    let dist = ring_distance(next.location, Some(self.request.desired_location));
-                    tracing::info!(
+                    tracing::debug!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         next_peer = %next.peer,
-                        next_loc = ?next.location,
-                        ring_distance_to_target = ?dist,
                         "connect: forwarding join request to next hop"
                     );
                     let mut forward_req = self.request.clone();
@@ -255,7 +242,7 @@ impl RelayState {
                     actions.forward = Some((next, forward_snapshot));
                 }
                 None => {
-                    tracing::info!(
+                    tracing::debug!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         visited = ?self.request.visited,
@@ -781,13 +768,6 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
     }
 }
 
-fn ring_distance(a: Option<Location>, b: Option<Location>) -> Option<f64> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.distance(b).as_f64()),
-        _ => None,
-    }
-}
-
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
 pub(crate) async fn join_ring_request(
     backoff: Option<Backoff>,
@@ -799,6 +779,15 @@ pub(crate) async fn join_ring_request(
         tracing::error!("Gateway location not found, this should not be possible, report an error");
         OpError::ConnError(ConnectionError::LocationUnknown)
     })?;
+
+    tracing::debug!(
+        peer = %gateway.peer,
+        reserved_connections = op_manager
+            .ring
+            .connection_manager
+            .get_reserved_connections(),
+        "join_ring_request: evaluating gateway connection attempt"
+    );
 
     if !op_manager
         .ring
@@ -884,56 +873,71 @@ pub(crate) async fn initial_join_procedure(
             gateways.len()
         );
 
+        let mut in_flight_gateways = HashSet::new();
+
         loop {
             let open_conns = op_manager.ring.open_connections();
             let unconnected_gateways: Vec<_> =
                 op_manager.ring.is_not_connected(gateways.iter()).collect();
+            let available_gateways: Vec<_> = unconnected_gateways
+                .into_iter()
+                .filter(|gateway| !in_flight_gateways.contains(&gateway.peer))
+                .collect();
 
             tracing::debug!(
-                "Connection status: open_connections = {}, unconnected_gateways = {}",
-                open_conns,
-                unconnected_gateways.len()
+                open_connections = open_conns,
+                inflight_gateway_dials = in_flight_gateways.len(),
+                available_gateways = available_gateways.len(),
+                "Connection status before join attempt"
             );
 
-            let unconnected_count = unconnected_gateways.len();
+            let available_count = available_gateways.len();
 
-            if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count > 0 {
+            if open_conns < BOOTSTRAP_THRESHOLD && available_count > 0 {
                 tracing::info!(
                     "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways",
                     open_conns,
                     BOOTSTRAP_THRESHOLD,
-                    number_of_parallel_connections.min(unconnected_count)
+                    number_of_parallel_connections.min(available_count)
                 );
-                let select_all = FuturesUnordered::new();
-                for gateway in unconnected_gateways
+                let mut select_all = FuturesUnordered::new();
+                for gateway in available_gateways
                     .into_iter()
                     .shuffle()
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
+                    in_flight_gateways.insert(gateway.peer.clone());
                     let op_manager = op_manager.clone();
+                    let gateway_clone = gateway.clone();
                     select_all.push(async move {
-                        (join_ring_request(None, gateway, &op_manager).await, gateway)
+                        (
+                            join_ring_request(None, &gateway_clone, &op_manager).await,
+                            gateway_clone,
+                        )
                     });
                 }
-                select_all
-                    .for_each(|(res, gateway)| async move {
-                        if let Err(error) = res {
-                            if !matches!(
-                                error,
-                                OpError::ConnError(
-                                    crate::node::ConnectionError::UnwantedConnection
-                                )
-                            ) {
-                                tracing::error!(
-                                    %gateway,
-                                    %error,
-                                    "Failed while attempting connection to gateway"
-                                );
-                            }
+                while let Some((res, gateway)) = select_all.next().await {
+                    if let Err(error) = res {
+                        if !matches!(
+                            error,
+                            OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
+                        ) {
+                            tracing::error!(
+                                %gateway,
+                                %error,
+                                "Failed while attempting connection to gateway"
+                            );
                         }
-                    })
-                    .await;
+                    }
+                    in_flight_gateways.remove(&gateway.peer);
+                }
+            } else if open_conns < BOOTSTRAP_THRESHOLD && available_count == 0 {
+                tracing::debug!(
+                    open_connections = open_conns,
+                    inflight = in_flight_gateways.len(),
+                    "Below threshold but all gateways are already connected or in-flight"
+                );
             } else if open_conns >= BOOTSTRAP_THRESHOLD {
                 tracing::trace!(
                     "Have {} connections (>= threshold of {}), not attempting gateway connections",
