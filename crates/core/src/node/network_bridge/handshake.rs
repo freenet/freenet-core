@@ -138,14 +138,14 @@ impl ExpectedInboundTracker {
             tx = ?transaction,
             "ExpectInbound: registering expectation"
         );
-        let list = self.entries.entry(peer.addr.ip()).or_default();
-        // Replace any existing expectation for the same peer/port to ensure the newest registration wins.
-        list.retain(|entry| entry.peer.addr.port() != peer.addr.port());
-        list.push(ExpectedInbound {
-            peer,
-            transaction,
-            transient,
-        });
+        self.entries
+            .entry(peer.addr.ip())
+            .or_default()
+            .push(ExpectedInbound {
+                peer,
+                transaction,
+                transient,
+            });
     }
 
     fn drop_peer(&mut self, peer: &PeerId) {
@@ -184,7 +184,7 @@ impl ExpectedInboundTracker {
 
     #[cfg(test)]
     fn contains(&self, addr: SocketAddr) -> bool {
-        self.entries.contains_key(&addr.ip())
+        self.entries.contains_key(&addr)
     }
 }
 
