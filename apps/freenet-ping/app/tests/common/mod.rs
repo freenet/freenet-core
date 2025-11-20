@@ -125,6 +125,8 @@ pub async fn base_node_test_config_with_rng(
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port, // if None, node will pick a free one or use default
+            min_connections: None,
+            max_connections: None,
             bandwidth_limit: None,
             blocked_addresses,
             transient_budget: None,
