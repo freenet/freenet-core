@@ -27,7 +27,7 @@ jobs:
       checks: read          # Allows reading check run status
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0  # Full history needed for git operations like rebase
           token: ${{ secrets.GITHUB_TOKEN }}  # Use workflow token for git operations
