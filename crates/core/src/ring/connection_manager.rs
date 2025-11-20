@@ -2,17 +2,21 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::prelude::IndexedRandom;
 use std::collections::{btree_map::Entry, BTreeMap};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::topology::{Limits, TopologyManager};
 
 use super::*;
-use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub(crate) struct TransientEntry {
+    /// Entry tracking a transient connection that hasn't been added to the ring topology yet.
+    /// Transient connections are typically unsolicited inbound connections to gateways.
     #[allow(dead_code)]
     pub opened_at: Instant,
+    /// Advertised location for the transient peer, if known at admission time.
     pub location: Option<Location>,
 }
 
@@ -354,6 +358,7 @@ impl ConnectionManager {
         self.peer_key.lock().clone()
     }
 
+    #[allow(dead_code)]
     pub fn is_gateway(&self) -> bool {
         self.is_gateway
     }
@@ -405,19 +410,22 @@ impl ConnectionManager {
         removed
     }
 
-    #[allow(dead_code)]
+    /// Check whether a peer is currently tracked as transient.
     pub fn is_transient(&self, peer: &PeerId) -> bool {
         self.transient_connections.contains_key(peer)
     }
 
+    /// Current number of tracked transient connections.
     pub fn transient_count(&self) -> usize {
         self.transient_in_use.load(Ordering::Acquire)
     }
 
+    /// Maximum transient slots allowed.
     pub fn transient_budget(&self) -> usize {
         self.transient_budget
     }
 
+    /// Time-to-live for transients before automatic drop.
     pub fn transient_ttl(&self) -> Duration {
         self.transient_ttl
     }
@@ -529,8 +537,18 @@ impl ConnectionManager {
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
             } else {
-                self.reserved_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let prev = self
+                    .reserved_connections
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if prev == 0 {
+                    tracing::warn!(
+                        %peer,
+                        "prune_connection: no reserved slots to release for in-transit peer"
+                    );
+                } else {
+                    self.reserved_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
             return None;
         };
@@ -575,8 +593,20 @@ impl ConnectionManager {
         router: &Router,
     ) -> Option<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
+        tracing::debug!(
+            total_locations = connections.len(),
+            self_peer = self
+                .get_peer_key()
+                .as_ref()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            "routing: considering connections"
+        );
         let peers = connections.values().filter_map(|conns| {
             let conn = conns.choose(&mut rand::rng())?;
+            if self.is_transient(&conn.location.peer) {
+                return None;
+            }
             if let Some(requester) = requesting {
                 if requester == &conn.location.peer {
                     return None;

@@ -38,6 +38,8 @@ async fn create_test_config(
         network_api: NetworkArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: Some(network_socket.local_addr()?.port()),
+            transient_budget: None,
+            transient_ttl_secs: None,
             ..Default::default()
         },
         config_paths: freenet::config::ConfigPathsArgs {
@@ -130,6 +132,8 @@ async fn test_default_token_configuration() -> TestResult {
             network_api: NetworkArgs {
                 address: Some(Ipv4Addr::LOCALHOST.into()),
                 network_port: Some(network_socket.local_addr()?.port()),
+                transient_budget: None,
+                transient_ttl_secs: None,
                 ..Default::default()
             },
             config_paths: freenet::config::ConfigPathsArgs {

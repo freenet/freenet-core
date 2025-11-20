@@ -86,9 +86,9 @@ impl fmt::Display for ConnectMsg {
             ),
             ConnectMsg::Response { sender, target, payload, .. } => write!(
                 f,
-                "ConnectResponse {{ sender: {sender}, target: {target}, acceptor: {}, courtesy: {} }}",
+                "ConnectResponse {{ sender: {sender}, target: {target}, acceptor: {}, transient: {} }}",
                 payload.acceptor,
-                payload.courtesy
+                payload.transient
             ),
             ConnectMsg::ObservedAddress { target, address, .. } => {
                 write!(f, "ObservedAddress {{ target: {target}, address: {address} }}")
@@ -126,8 +126,8 @@ pub(crate) struct ConnectRequest {
 pub(crate) struct ConnectResponse {
     /// The peer that accepted the join request.
     pub acceptor: PeerKeyLocation,
-    /// Whether this acceptance is a short-lived courtesy link.
-    pub courtesy: bool,
+    /// Whether this acceptance is a short-lived transient link.
+    pub transient: bool,
 }
 
 /// New minimal state machine the joiner tracks.
@@ -154,7 +154,7 @@ pub(crate) struct RelayState {
     pub upstream: PeerKeyLocation,
     pub request: ConnectRequest,
     pub forwarded_to: Option<PeerKeyLocation>,
-    pub courtesy_hint: bool,
+    pub transient_hint: bool,
     pub observed_sent: bool,
     pub accepted_locally: bool,
 }
@@ -175,8 +175,8 @@ pub(crate) trait RelayContext {
         visited: &[PeerKeyLocation],
     ) -> Option<PeerKeyLocation>;
 
-    /// Whether the acceptance should be treated as a short-lived courtesy link.
-    fn courtesy_hint(&self, acceptor: &PeerKeyLocation, joiner: &PeerKeyLocation) -> bool;
+    /// Whether the acceptance should be treated as a short-lived transient link.
+    fn transient_hint(&self, acceptor: &PeerKeyLocation, joiner: &PeerKeyLocation) -> bool;
 }
 
 /// Result of processing a request at a relay.
@@ -215,11 +215,11 @@ impl RelayState {
         if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
             self.accepted_locally = true;
             let acceptor = ctx.self_location().clone();
-            let courtesy = ctx.courtesy_hint(&acceptor, &self.request.joiner);
-            self.courtesy_hint = courtesy;
+            let transient = ctx.transient_hint(&acceptor, &self.request.joiner);
+            self.transient_hint = transient;
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
-                courtesy,
+                transient,
             });
             actions.expect_connection_from = Some(self.request.joiner.clone());
         }
@@ -299,10 +299,10 @@ impl RelayContext for RelayEnv<'_> {
             .routing(desired_location, None, skip, &router)
     }
 
-    fn courtesy_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
+    fn transient_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
         // Courtesy slots still piggyback on regular connections. Flag the first acceptance so the
-        // joiner can prioritise it, and keep the logic simple until dedicated courtesy tracking
-        // is wired in (see courtesy-connection-budget branch).
+        // joiner can prioritise it, and keep the logic simple until dedicated transient tracking
+        // is wired in (see transient-connection-budget branch).
         self.op_manager.ring.open_connections() == 0
     }
 }
@@ -310,7 +310,7 @@ impl RelayContext for RelayEnv<'_> {
 #[derive(Debug)]
 pub struct AcceptedPeer {
     pub peer: PeerKeyLocation,
-    pub courtesy: bool,
+    pub transient: bool,
 }
 
 #[derive(Debug, Default)]
@@ -331,7 +331,7 @@ impl JoinerState {
             self.last_progress = now;
             acceptance.new_acceptor = Some(AcceptedPeer {
                 peer: response.acceptor.clone(),
-                courtesy: response.courtesy,
+                transient: response.transient,
             });
             acceptance.assigned_location = self.accepted.len() == 1;
         }
@@ -391,7 +391,7 @@ impl ConnectOp {
             upstream,
             request,
             forwarded_to: None,
-            courtesy_hint: false,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         }));
@@ -507,7 +507,7 @@ impl ConnectOp {
                 upstream: upstream.clone(),
                 request: request.clone(),
                 forwarded_to: None,
-                courtesy_hint: false,
+                transient_hint: false,
                 observed_sent: false,
                 accepted_locally: false,
             })));
@@ -666,7 +666,7 @@ impl Operation for ConnectOp {
                                         peer: new_acceptor.peer.peer.clone(),
                                         tx: self.id,
                                         callback,
-                                        is_gw: new_acceptor.courtesy,
+                                        is_gw: new_acceptor.transient,
                                     })
                                     .await?;
 
@@ -960,7 +960,7 @@ mod tests {
         self_loc: PeerKeyLocation,
         accept: bool,
         next_hop: Option<PeerKeyLocation>,
-        courtesy: bool,
+        transient: bool,
     }
 
     impl TestRelayContext {
@@ -969,7 +969,7 @@ mod tests {
                 self_loc,
                 accept: true,
                 next_hop: None,
-                courtesy: false,
+                transient: false,
             }
         }
 
@@ -983,8 +983,8 @@ mod tests {
             self
         }
 
-        fn courtesy(mut self, courtesy: bool) -> Self {
-            self.courtesy = courtesy;
+        fn transient(mut self, transient: bool) -> Self {
+            self.transient = transient;
             self
         }
     }
@@ -1006,8 +1006,8 @@ mod tests {
             self.next_hop.clone()
         }
 
-        fn courtesy_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
-            self.courtesy
+        fn transient_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
+            self.transient
         }
     }
 
@@ -1034,17 +1034,17 @@ mod tests {
                 observed_addr: Some(joiner.peer.addr),
             },
             forwarded_to: None,
-            courtesy_hint: false,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         };
 
-        let ctx = TestRelayContext::new(self_loc.clone()).courtesy(true);
+        let ctx = TestRelayContext::new(self_loc.clone()).transient(true);
         let actions = state.handle_request(&ctx, &joiner);
 
         let response = actions.accept_response.expect("expected acceptance");
         assert_eq!(response.acceptor.peer, self_loc.peer);
-        assert!(response.courtesy);
+        assert!(response.transient);
         assert_eq!(actions.expect_connection_from.unwrap().peer, joiner.peer);
         assert!(actions.forward.is_none());
     }
@@ -1064,7 +1064,7 @@ mod tests {
                 observed_addr: Some(joiner.peer.addr),
             },
             forwarded_to: None,
-            courtesy_hint: false,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -1099,7 +1099,7 @@ mod tests {
                 observed_addr: Some(observed_addr),
             },
             forwarded_to: None,
-            courtesy_hint: false,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -1127,13 +1127,13 @@ mod tests {
 
         let response = ConnectResponse {
             acceptor: acceptor.clone(),
-            courtesy: false,
+            transient: false,
         };
         let result = state.register_acceptance(&response, Instant::now());
         assert!(result.satisfied);
         let new = result.new_acceptor.expect("expected new acceptor");
         assert_eq!(new.peer.peer, acceptor.peer);
-        assert!(!new.courtesy);
+        assert!(!new.transient);
     }
 
     #[test]
