@@ -1763,9 +1763,11 @@ impl P2pConnManager {
         }
 
         if newly_inserted {
+            tracing::info!(remote = %peer_id, is_transient, "handle_successful_connection: inserted new connection entry");
             let pending_loc = connection_manager.prune_in_transit_connection(&peer_id);
             if !is_transient {
                 let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
+                tracing::info!(remote = %peer_id, %loc, "handle_successful_connection: promoting connection into ring");
                 self.bridge
                     .op_manager
                     .ring
