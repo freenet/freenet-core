@@ -102,6 +102,8 @@ impl Default for ConfigArgs {
                 blocked_addresses: None,
                 transient_budget: Some(DEFAULT_TRANSIENT_BUDGET),
                 transient_ttl_secs: Some(DEFAULT_TRANSIENT_TTL_SECS),
+                min_connections: None,
+                max_connections: None,
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -243,6 +245,38 @@ impl ConfigArgs {
             self.ws_api
                 .token_cleanup_interval_seconds
                 .get_or_insert(cfg.ws_api.token_cleanup_interval_seconds);
+            self.network_api
+                .address
+                .get_or_insert(cfg.network_api.address);
+            self.network_api
+                .network_port
+                .get_or_insert(cfg.network_api.port);
+            if let Some(addr) = cfg.network_api.public_address {
+                self.network_api.public_address.get_or_insert(addr);
+            }
+            if let Some(port) = cfg.network_api.public_port {
+                self.network_api.public_port.get_or_insert(port);
+            }
+            if let Some(limit) = cfg.network_api.bandwidth_limit {
+                self.network_api.bandwidth_limit.get_or_insert(limit);
+            }
+            if let Some(addrs) = cfg.network_api.blocked_addresses {
+                self.network_api
+                    .blocked_addresses
+                    .get_or_insert_with(|| addrs.into_iter().collect());
+            }
+            self.network_api
+                .transient_budget
+                .get_or_insert(cfg.network_api.transient_budget);
+            self.network_api
+                .transient_ttl_secs
+                .get_or_insert(cfg.network_api.transient_ttl_secs);
+            self.network_api
+                .min_connections
+                .get_or_insert(cfg.network_api.min_connections);
+            self.network_api
+                .max_connections
+                .get_or_insert(cfg.network_api.max_connections);
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
         }
@@ -374,6 +408,14 @@ impl ConfigArgs {
                     .network_api
                     .transient_ttl_secs
                     .unwrap_or(DEFAULT_TRANSIENT_TTL_SECS),
+                min_connections: self
+                    .network_api
+                    .min_connections
+                    .unwrap_or(DEFAULT_MIN_CONNECTIONS),
+                max_connections: self
+                    .network_api
+                    .max_connections
+                    .unwrap_or(DEFAULT_MAX_CONNECTIONS),
             },
             ws_api: WebsocketApiConfig {
                 // the websocket API is always local
@@ -565,6 +607,22 @@ pub struct NetworkArgs {
     #[arg(long, env = "TRANSIENT_TTL_SECS")]
     #[serde(rename = "transient-ttl-secs", skip_serializing_if = "Option::is_none")]
     pub transient_ttl_secs: Option<u64>,
+
+    /// Minimum desired connections for the ring topology. Defaults to 10.
+    #[arg(long = "min-number-of-connections", env = "MIN_NUMBER_OF_CONNECTIONS")]
+    #[serde(
+        rename = "min-number-of-connections",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_connections: Option<usize>,
+
+    /// Maximum allowed connections for the ring topology. Defaults to 20.
+    #[arg(long = "max-number-of-connections", env = "MAX_NUMBER_OF_CONNECTIONS")]
+    #[serde(
+        rename = "max-number-of-connections",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_connections: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,6 +697,20 @@ pub struct NetworkApiConfig {
     /// Time (in seconds) before an unpromoted transient connection is dropped.
     #[serde(default = "default_transient_ttl_secs", rename = "transient-ttl-secs")]
     pub transient_ttl_secs: u64,
+
+    /// Minimum desired connections for the ring topology.
+    #[serde(
+        default = "default_min_connections",
+        rename = "min-number-of-connections"
+    )]
+    pub min_connections: usize,
+
+    /// Maximum allowed connections for the ring topology.
+    #[serde(
+        default = "default_max_connections",
+        rename = "max-number-of-connections"
+    )]
+    pub max_connections: usize,
 }
 
 mod port_allocation;
@@ -654,6 +726,14 @@ fn default_transient_budget() -> usize {
 
 fn default_transient_ttl_secs() -> u64 {
     DEFAULT_TRANSIENT_TTL_SECS
+}
+
+fn default_min_connections() -> usize {
+    DEFAULT_MIN_CONNECTIONS
+}
+
+fn default_max_connections() -> usize {
+    DEFAULT_MAX_CONNECTIONS
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
