@@ -82,6 +82,68 @@ async fn test_multi_gateway(ctx: &mut TestContext) -> TestResult {
 }
 ```
 
+#### `node_locations`
+Set explicit ring locations for nodes (order must match the `nodes` list). This is useful for deterministic routing topologies in multi-hop tests.
+
+```rust
+#[freenet_test(
+    nodes = ["gateway", "peer-a", "peer-b"],
+    node_locations = [0.2, 0.6, 0.85], // gateway, peer-a, peer-b
+    auto_connect_peers = true
+)]
+async fn test_with_locations(ctx: &mut TestContext) -> TestResult {
+    // Test logic here...
+    Ok(())
+}
+```
+
+**Rules:**
+- Provide one numeric value per node.
+- Values should be in the range `[0.0, 1.0]`.
+- Omit `node_locations` to use random locations (default behavior).
+
+#### `node_locations_fn`
+Provide a function that returns `Vec<f64>` (one per node) when locations need to be computed dynamically (for example, based on a contract’s ring location).
+
+```rust
+fn my_locations() -> Vec<f64> {
+    // Must return one entry per node in the same order.
+    vec![0.1, 0.6, 0.9]
+}
+
+#[freenet_test(
+    nodes = ["gateway", "peer-a", "peer-b"],
+    node_locations_fn = my_locations,
+    auto_connect_peers = true
+)]
+```
+
+- The function must return exactly as many values as there are nodes; otherwise the test fails early.
+- `node_locations` and `node_locations_fn` are mutually exclusive.
+
+#### `node_configs`
+Override configuration for specific nodes using a map (order must still match the `nodes` list for implicit behavior). Currently supports setting explicit locations per node, with additional fields planned as the macro evolves.
+
+```rust
+fn my_gateway_location() -> f64 { 0.25 }
+
+#[freenet_test(
+    nodes = ["gateway", "peer-a", "peer-b"],
+    node_configs = {
+        "gateway": { location: my_gateway_location() },
+        "peer-a": { location: 0.55 },
+        "peer-b": { location: 0.90 },
+    }
+)]
+async fn test_with_node_configs(ctx: &mut TestContext) -> TestResult {
+    // Test logic ...
+    Ok(())
+}
+```
+
+- Only the fields specified are overridden; unspecified nodes fall back to the default/random configuration.
+- Additional fields can be added over time without changing call sites (e.g., `token_ttl`, custom secrets, etc.).
+
 #### `auto_connect_peers`
 Automatically configure all peer nodes to connect to all gateway nodes.
 

@@ -1911,9 +1911,49 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
 /// Expected flow:
 /// 1. peer-a sends PUT → routes through gateway → stored on peer-c
 /// 2. peer-c sends PUT response → routes back through gateway → received by peer-a
+const THREE_HOP_TEST_CONTRACT: &str = "test-contract-integration";
+
+static THREE_HOP_CONTRACT: LazyLock<(ContractContainer, freenet::dev_tool::Location)> =
+    LazyLock::new(|| {
+        let contract =
+            test_utils::load_contract(THREE_HOP_TEST_CONTRACT, vec![].into()).expect("contract");
+        let location = freenet::dev_tool::Location::from(&contract.key());
+        (contract, location)
+    });
+
+fn three_hop_contract_location() -> freenet::dev_tool::Location {
+    let (_, location) = &*THREE_HOP_CONTRACT;
+    *location
+}
+
+fn three_hop_gateway_location() -> f64 {
+    freenet::dev_tool::Location::new_rounded(three_hop_contract_location().as_f64() + 0.2).as_f64()
+}
+
+fn three_hop_peer_a_location() -> f64 {
+    freenet::dev_tool::Location::new_rounded(three_hop_contract_location().as_f64() + 0.5).as_f64()
+}
+
+fn three_hop_peer_c_location() -> f64 {
+    three_hop_contract_location().as_f64()
+}
+
+fn expected_three_hop_locations() -> [f64; 3] {
+    [
+        three_hop_gateway_location(),
+        three_hop_peer_a_location(),
+        three_hop_peer_c_location(),
+    ]
+}
+
 #[freenet_test(
     nodes = ["gateway", "peer-a", "peer-c"],
     gateways = ["gateway"],
+    node_configs = {
+        "gateway": { location: three_hop_gateway_location() },
+        "peer-a": { location: three_hop_peer_a_location() },
+        "peer-c": { location: three_hop_peer_c_location() },
+    },
     auto_connect_peers = true,
     timeout_secs = 240,
     startup_wait_secs = 15,
@@ -1924,10 +1964,12 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
 async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> TestResult {
     use freenet::dev_tool::Location;
 
-    const TEST_CONTRACT: &str = "test-contract-integration";
-    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let (contract, contract_location) = {
+        let (contract, location) = &*THREE_HOP_CONTRACT;
+        (contract.clone(), *location)
+    };
     let contract_key = contract.key();
-    let contract_location = Location::from(&contract_key);
+    let node_locations = expected_three_hop_locations();
 
     let initial_state = test_utils::create_empty_todo_list();
     let wrapped_state = WrappedState::from(initial_state);
@@ -1937,15 +1979,35 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
     let peer_a = ctx.node("peer-a")?;
     let peer_c = ctx.node("peer-c")?;
 
-    // Note: We cannot modify node locations after they're created with the macro,
-    // so this test will use random locations. The original test had specific location
-    // requirements to ensure proper three-hop routing. For now, we'll proceed with
-    // the test and it should still validate PUT response routing.
+    assert_eq!(gateway.location, node_locations[0]);
+    assert_eq!(peer_a.location, node_locations[1]);
+    assert_eq!(peer_c.location, node_locations[2]);
 
     tracing::info!("Node A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Gateway node data dir: {:?}", gateway.temp_dir_path);
     tracing::info!("Node C data dir: {:?}", peer_c.temp_dir_path);
     tracing::info!("Contract location: {}", contract_location.as_f64());
+
+    let gateway_distance = Location::new(gateway.location).distance(contract_location);
+    let peer_a_distance = Location::new(peer_a.location).distance(contract_location);
+    let peer_c_distance = Location::new(peer_c.location).distance(contract_location);
+
+    // Ensure the contract should naturally route to peer-c to create the 3-hop path:
+    // peer-a (client) -> gateway -> peer-c (closest to contract).
+    assert!(
+        peer_c_distance.as_f64() < gateway_distance.as_f64(),
+        "peer-c must be closer to contract than the gateway for three-hop routing"
+    );
+    assert!(
+        peer_c_distance.as_f64() < peer_a_distance.as_f64(),
+        "peer-c must be closest node to the contract location"
+    );
+    tracing::info!(
+        "Distances to contract - gateway: {}, peer-a: {}, peer-c: {}",
+        gateway_distance.as_f64(),
+        peer_a_distance.as_f64(),
+        peer_c_distance.as_f64()
+    );
 
     // Connect to peer A's WebSocket API
     let uri_a = format!(

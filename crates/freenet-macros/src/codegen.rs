@@ -3,7 +3,83 @@
 use crate::parser::{AggregateEventsMode, FreenetTestArgs};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemFn, LitInt, Result};
+use syn::{ItemFn, LitInt, LitStr, Result};
+
+/// Get the configured location for a node or fall back to randomness.
+fn node_location(args: &FreenetTestArgs, idx: usize, label: &str) -> TokenStream {
+    if let Some(config) = args.node_configs.get(label) {
+        if let Some(expr) = &config.location_expr {
+            let label_lit = LitStr::new(label, proc_macro2::Span::call_site());
+            return quote! {{
+                let value: f64 = (#expr);
+                if !(0.0..=1.0).contains(&value) {
+                    panic!(
+                        "node '{}' location {} is out of range [0.0, 1.0]",
+                        #label_lit, value
+                    );
+                }
+                value
+            }};
+        }
+    }
+
+    if let Some(ref locations) = args.node_locations {
+        let value = locations[idx];
+        return quote! { #value };
+    }
+
+    if args.node_locations_fn.is_some() {
+        let idx_lit = syn::Index::from(idx);
+        return quote! {{
+            if let Some(ref locs) = __node_locations {
+                locs[#idx_lit]
+            } else {
+                rand::Rng::random(&mut rand::rng())
+            }
+        }};
+    }
+
+    quote! { rand::Rng::random(&mut rand::rng()) }
+}
+
+/// Generate node location initialization (literal list or function).
+fn generate_node_locations_init(args: &FreenetTestArgs) -> TokenStream {
+    let node_count = args.nodes.len();
+
+    if let Some(ref fn_path) = args.node_locations_fn {
+        quote! {
+            let __node_locations: Option<Vec<f64>> = {
+                let locs = #fn_path();
+                if locs.len() != #node_count {
+                    return Err(anyhow::anyhow!(
+                        "node_locations_fn returned {} locations, expected {}",
+                        locs.len(),
+                        #node_count
+                    ));
+                }
+                for (idx, loc) in locs.iter().enumerate() {
+                    if !(0.0..=1.0).contains(loc) {
+                        return Err(anyhow::anyhow!(
+                            "node_locations_fn value at index {} is out of range: {} (must be in [0.0, 1.0])",
+                            idx,
+                            loc
+                        ));
+                    }
+                }
+                Some(locs)
+            };
+        }
+    } else if let Some(ref locations) = args.node_locations {
+        let values: Vec<_> = locations.iter().map(|loc| quote! { #loc }).collect();
+        quote! {
+            let __node_locations: Option<Vec<f64>> = Some(vec![#(#values),*]);
+        }
+    } else {
+        quote! {
+            let __node_locations: Option<Vec<f64>> = None;
+        }
+    }
+}
 
 /// Helper to determine if a node is a gateway
 fn is_gateway(args: &FreenetTestArgs, node_label: &str, node_idx: usize) -> bool {
@@ -27,6 +103,7 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
 
     // Generate node setup code
     let node_setup = generate_node_setup(&args);
+    let node_locations_init = generate_node_locations_init(&args);
 
     // Extract values before configs are moved
     let value_extraction = generate_value_extraction(&args);
@@ -71,6 +148,7 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             tracing::info!("Starting test: {}", stringify!(#test_fn_name));
 
             // 2. Create node configurations
+            #node_locations_init
             #node_setup
 
             // 3. Extract values before configs are moved
@@ -117,6 +195,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
         if is_gw {
             // Gateway node configuration
+            let location_expr = node_location(args, idx, node_label);
             setup_code.push(quote! {
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
@@ -128,7 +207,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     let network_port = freenet::test_utils::reserve_local_port()?;
                     let ws_port = freenet::test_utils::reserve_local_port()?;
 
-                    let location: f64 = rand::Rng::random(&mut rand::rng());
+                    let location: f64 = #location_expr;
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
@@ -195,6 +274,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
         let is_gw = is_gateway(args, node_label, idx);
 
         if !is_gw {
+            let location_expr = node_location(args, idx, node_label);
             // Collect gateway info variables to serialize
             let gateways_config = if args.auto_connect_peers {
                 // Collect all gateway_info_X variables
@@ -240,7 +320,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     let network_port = freenet::test_utils::reserve_local_port()?;
                     let ws_port = freenet::test_utils::reserve_local_port()?;
 
-                    let location: f64 = rand::Rng::random(&mut rand::rng());
+                    let location: f64 = #location_expr;
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {

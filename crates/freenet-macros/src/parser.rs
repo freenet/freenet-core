@@ -1,12 +1,20 @@
 //! Parser for `#[freenet_test]` macro attributes
 
 /// Parsed arguments for the `#[freenet_test]` attribute
+use std::collections::HashMap;
+
 #[derive(Debug, Clone)]
 pub struct FreenetTestArgs {
     /// All node labels
     pub nodes: Vec<String>,
     /// Which nodes are gateways (if not specified, first node is gateway)
     pub gateways: Option<Vec<String>>,
+    /// Optional explicit node locations (same order as nodes)
+    pub node_locations: Option<Vec<f64>>,
+    /// Optional function path that returns node locations (same order as nodes)
+    pub node_locations_fn: Option<syn::ExprPath>,
+    /// Per-node configuration overrides
+    pub node_configs: HashMap<String, NodeConfigOverride>,
     /// Whether peers should auto-connect to gateways
     pub auto_connect_peers: bool,
     /// Test timeout in seconds
@@ -40,6 +48,8 @@ impl syn::parse::Parse for FreenetTestArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut nodes = None;
         let mut gateways = None;
+        let mut node_locations = None;
+        let mut node_locations_fn = None;
         let mut auto_connect_peers = false;
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
@@ -47,6 +57,7 @@ impl syn::parse::Parse for FreenetTestArgs {
         let mut log_level = "freenet=debug,info".to_string();
         let mut tokio_flavor = TokioFlavor::CurrentThread;
         let mut tokio_worker_threads = None;
+        let mut node_configs = HashMap::new();
 
         // Parse key-value pairs
         while !input.is_empty() {
@@ -78,6 +89,95 @@ impl syn::parse::Parse for FreenetTestArgs {
                     }
 
                     nodes = Some(node_list);
+                }
+                "node_configs" => {
+                    let content;
+                    syn::braced!(content in input);
+
+                    while !content.is_empty() {
+                        let label: syn::LitStr = content.parse()?;
+                        let label_string = label.value();
+
+                        content.parse::<syn::Token![:]>()?;
+                        let cfg_content;
+                        syn::braced!(cfg_content in content);
+
+                        let mut override_cfg = NodeConfigOverride::default();
+
+                        while !cfg_content.is_empty() {
+                            let key: syn::Ident = cfg_content.parse()?;
+                            cfg_content.parse::<syn::Token![:]>()?;
+
+                            match key.to_string().as_str() {
+                                "location" => {
+                                    if override_cfg.location_expr.is_some() {
+                                        return Err(syn::Error::new(
+                                            key.span(),
+                                            "Duplicate location entry for node config",
+                                        ));
+                                    }
+                                    override_cfg.location_expr = Some(cfg_content.parse()?);
+                                }
+                                other => {
+                                    return Err(syn::Error::new(
+                                        key.span(),
+                                        format!("Unknown node config option '{other}'"),
+                                    ));
+                                }
+                            }
+
+                            if cfg_content.peek(syn::Token![,]) {
+                                cfg_content.parse::<syn::Token![,]>()?;
+                            }
+                        }
+
+                        node_configs.insert(label_string, override_cfg);
+
+                        if content.peek(syn::Token![,]) {
+                            content.parse::<syn::Token![,]>()?;
+                        }
+                    }
+                }
+                "node_locations" => {
+                    // Parse array literal of floats: [0.1, 0.5, 0.9]
+                    let content;
+                    syn::bracketed!(content in input);
+
+                    let mut locations = Vec::new();
+                    while !content.is_empty() {
+                        let lit: syn::Lit = content.parse()?;
+                        let value = match lit {
+                            syn::Lit::Float(f) => f.base10_parse::<f64>()?,
+                            syn::Lit::Int(i) => i.base10_parse::<f64>()?,
+                            other => {
+                                return Err(syn::Error::new(
+                                    other.span(),
+                                    "node_locations must be numeric literals",
+                                ))
+                            }
+                        };
+
+                        locations.push(value);
+
+                        // Handle optional trailing comma
+                        if content.peek(syn::Token![,]) {
+                            content.parse::<syn::Token![,]>()?;
+                        }
+                    }
+
+                    if locations.is_empty() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "node_locations array cannot be empty if specified",
+                        ));
+                    }
+
+                    node_locations = Some(locations);
+                }
+                "node_locations_fn" => {
+                    // Parse a path to a function returning Vec<f64>
+                    let path: syn::ExprPath = input.parse()?;
+                    node_locations_fn = Some(path);
                 }
                 "gateways" => {
                     // Parse array literal: ["gateway-1", "gateway-2", ...]
@@ -191,9 +291,48 @@ impl syn::parse::Parse for FreenetTestArgs {
             }
         }
 
+        // Validate node_configs refer to known nodes
+        for label in node_configs.keys() {
+            if !nodes.contains(label) {
+                return Err(input.error(format!(
+                    "node_configs contains unknown node '{}'. All entries must reference nodes listed in 'nodes'.",
+                    label
+                )));
+            }
+        }
+
+        // Validate node_locations if provided
+        if let Some(ref locations) = node_locations {
+            if locations.len() != nodes.len() {
+                return Err(input.error(format!(
+                    "node_locations length ({}) must match nodes length ({})",
+                    locations.len(),
+                    nodes.len()
+                )));
+            }
+            for (i, &loc) in locations.iter().enumerate() {
+                if !(0.0..=1.0).contains(&loc) {
+                    return Err(input.error(format!(
+                        "node_locations[{}] = {} is out of range. Values must be in [0.0, 1.0]",
+                        i, loc
+                    )));
+                }
+            }
+        }
+
+        // Only one of node_locations or node_locations_fn may be provided
+        if node_locations.is_some() && node_locations_fn.is_some() {
+            return Err(
+                input.error("Specify only one of node_locations or node_locations_fn (not both)")
+            );
+        }
+
         Ok(FreenetTestArgs {
             nodes,
             gateways,
+            node_locations,
+            node_locations_fn,
+            node_configs,
             auto_connect_peers,
             timeout_secs,
             startup_wait_secs,
@@ -261,4 +400,8 @@ mod tests {
         let result: Result<FreenetTestArgs, _> = syn::parse2(tokens);
         assert!(result.is_err());
     }
+}
+#[derive(Debug, Clone, Default)]
+pub struct NodeConfigOverride {
+    pub location_expr: Option<syn::Expr>,
 }
