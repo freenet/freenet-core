@@ -358,6 +358,7 @@ impl ConnectionManager {
         self.peer_key.lock().clone()
     }
 
+    #[allow(dead_code)]
     pub fn is_gateway(&self) -> bool {
         self.is_gateway
     }
@@ -536,8 +537,18 @@ impl ConnectionManager {
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
             } else {
-                self.reserved_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let prev = self
+                    .reserved_connections
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if prev == 0 {
+                    tracing::warn!(
+                        %peer,
+                        "prune_connection: no reserved slots to release for in-transit peer"
+                    );
+                } else {
+                    self.reserved_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
             return None;
         };
@@ -582,6 +593,15 @@ impl ConnectionManager {
         router: &Router,
     ) -> Option<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
+        tracing::debug!(
+            total_locations = connections.len(),
+            self_peer = self
+                .get_peer_key()
+                .as_ref()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            "routing: considering connections"
+        );
         let peers = connections.values().filter_map(|conns| {
             let conn = conns.choose(&mut rand::rng())?;
             if self.is_transient(&conn.location.peer) {
