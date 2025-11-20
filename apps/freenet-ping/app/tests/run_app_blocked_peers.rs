@@ -831,8 +831,12 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
 // as they only varied in non-functional aspects like timeouts and logging
 
 /// Solution/reference implementation for blocked peers
+// TODO-MUST-FIX: WebSocket connection reset during teardown - see issue #2108
+// Test passes functionally (PUT/GET/Subscribe/state propagation all work) but
+// fails with "Connection reset without closing handshake" during cleanup.
+// Likely a test teardown race rather than functional bug.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "fix me"]
+#[ignore]
 async fn test_ping_blocked_peers_solution() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "solution",

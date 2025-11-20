@@ -976,6 +976,13 @@ impl P2pConnManager {
                             } => {
                                 tracing::debug!(%tx, %key, "local subscribe complete");
 
+                                // If this is a child operation, complete it and let the parent flow handle result delivery.
+                                if op_manager.is_sub_operation(tx) {
+                                    tracing::info!(%tx, %key, "completing child subscribe operation");
+                                    op_manager.completed(tx);
+                                    continue;
+                                }
+
                                 if !op_manager.is_sub_operation(tx) {
                                     let response = Ok(HostResponse::ContractResponse(
                                         ContractResponse::SubscribeResponse { key, subscribed },
