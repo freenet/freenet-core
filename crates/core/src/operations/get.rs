@@ -552,11 +552,12 @@ impl Operation for GetOp {
 
                         if let Some((state, contract)) = local_value {
                             // Contract found locally!
-                            tracing::info!(
+                            tracing::warn!(
                                 tx = %id,
                                 %key,
                                 fetch_contract = *fetch_contract,
-                                "GET: contract found locally in RequestGet handler"
+                                current_state = ?self.state,
+                                "Contract found locally in RequestGet handler"
                             );
 
                             // Check if this is a forwarded request or a local request
@@ -564,8 +565,8 @@ impl Operation for GetOp {
                                 Some(GetState::ReceivedRequest { requester })
                                     if requester.is_some() =>
                                 {
-                                    // This is a forwarded request - send result back to requester
                                     let requester = requester.clone().unwrap();
+                                    // This is a forwarded request - send result back to requester
                                     tracing::debug!(tx = %id, "Returning contract {} to requester {}", key, requester.peer);
                                     new_state = None;
                                     return_msg = Some(GetMsg::ReturnGet {
@@ -1042,7 +1043,15 @@ impl Operation for GetOp {
                     let id = *id;
                     let key = *key;
 
-                    tracing::info!(tx = %id, %key, "Received get response with state: {:?}", self.state.as_ref().unwrap());
+                    tracing::warn!(
+                        tx = %id,
+                        %key,
+                        from = %sender.peer,
+                        to = %target.peer,
+                        has_contract = contract.is_some(),
+                        current_state = ?self.state,
+                        "Received GetResponse"
+                    );
 
                     // Check if contract is required
                     let require_contract = matches!(

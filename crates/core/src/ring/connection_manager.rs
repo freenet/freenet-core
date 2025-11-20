@@ -171,6 +171,13 @@ impl ConnectionManager {
             );
         }
 
+        // Check if peer is already pending/connected BEFORE incrementing counter
+        // to avoid leak from repeated should_accept() calls
+        if self.location_for_peer.read().get(peer_id).is_some() {
+            tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance (no reservation needed)");
+            return true;
+        }
+
         let reserved_before = loop {
             let current = self
                 .reserved_connections
@@ -239,12 +246,6 @@ impl ConnectionManager {
                 tracing::info!(%peer_id, "should_accept: gateway direct-accept limit hit, forwarding instead");
                 return false;
             }
-        }
-
-        if self.location_for_peer.read().get(peer_id).is_some() {
-            // We've already accepted this peer (pending or active); treat as a no-op acceptance.
-            tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
-            return true;
         }
 
         let accepted = if total_conn < self.min_connections {
