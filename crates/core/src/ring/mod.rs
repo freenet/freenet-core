@@ -255,10 +255,12 @@ impl Ring {
         &self,
         peers: impl Iterator<Item = &'a PeerKeyLocation>,
     ) -> impl Iterator<Item = &'a PeerKeyLocation> + Send {
-        let locs = &*self.connection_manager.location_for_peer.read();
         let mut filtered = Vec::new();
         for peer in peers {
-            if !locs.contains_key(&peer.peer) {
+            if !self
+                .connection_manager
+                .has_connection_or_pending(&peer.peer)
+            {
                 filtered.push(peer);
             }
         }
