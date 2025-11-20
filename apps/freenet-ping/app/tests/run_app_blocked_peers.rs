@@ -788,7 +788,6 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
 /// Standard blocked peers test (baseline)
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore]
 async fn test_ping_blocked_peers() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "baseline",
@@ -808,7 +807,6 @@ async fn test_ping_blocked_peers() -> TestResult {
 
 /// Simple blocked peers test
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore]
 async fn test_ping_blocked_peers_simple() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "simple",
@@ -835,7 +833,6 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
 // fails with "Connection reset without closing handshake" during cleanup.
 // Likely a test teardown race rather than functional bug.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore]
 async fn test_ping_blocked_peers_solution() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "solution",
