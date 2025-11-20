@@ -1,5 +1,7 @@
 # Freenet Core – Agent Guide
 
+@~/.claude/freenet-local.md
+
 ## Project Overview
 Freenet Core is the peer-to-peer runtime that underpins applications in the Freenet ecosystem. The crates in this workspace implement the networking stack, contract execution environment, and developer tooling used by higher-level projects such as River.
 
@@ -8,12 +10,12 @@ Freenet Core is the peer-to-peer runtime that underpins applications in the Free
 **BEFORE STARTING ANY WORK, verify your working directory:**
 
 ```bash
-pwd  # Must be ~/code/freenet/freenet-core/<branch-name>
-     # NOT ~/code/freenet/freenet-core/main
+pwd  # Must be <repo-root>/<branch-name>
+     # NOT <repo-root>/main
 git branch --show-current  # Should be your feature branch, NOT 'main'
 ```
 
-### ❌ DO NOT work in ~/code/freenet/freenet-core/main
+### ❌ DO NOT work in the main worktree directory
 
 The main worktree should **always** remain on the `main` branch. Multiple agents working in main will conflict and corrupt branches.
 
@@ -21,7 +23,7 @@ The main worktree should **always** remain on the `main` branch. Multiple agents
 
 1. Create a worktree as a sibling directory:
    ```bash
-   cd ~/code/freenet/freenet-core/main
+   cd <repo-root>/main  # Your main checkout directory
    git worktree add ../fix-<issue-number> <your-branch-name>
    cd ../fix-<issue-number>
    ```
@@ -77,27 +79,22 @@ claude --permission-mode bypassPermissions
 
 ### Agent Spawning Template
 
+**Note:** This template assumes you have terminal multiplexer tooling set up. Adapt paths and commands to your local environment.
+
 ```bash
 # 1. Create/verify worktree
-cd ~/code/freenet/freenet-core/main
+cd <repo-root>/main
 git worktree add ../fix-ISSUE-NUMBER branch-name
 
-# 2. Create zellij tab (NO --layout flag!)
-zellij action new-tab --name codex-iISSUE-description
+# 2. Start agent in new terminal/tab
+# Navigate to worktree and launch with correct parameters
+cd <repo-root>/fix-ISSUE-NUMBER
+codex -s danger-full-access -a never
+# OR: claude --permission-mode bypassPermissions
 
-# 3. Switch to mcp tab to avoid input corruption
-zellij action go-to-tab-name mcp
-
-# 4. Start agent with correct params
-~/code/mcp/skills/zellij-agent-manager/scripts/send-to-agent.sh \
-  codex-iISSUE-description \
-  "cd ~/code/freenet/freenet-core/fix-ISSUE-NUMBER && codex -s danger-full-access -a never"
-
-# 5. Wait for agent to start, then send task
-sleep 3
-~/code/mcp/skills/zellij-agent-manager/scripts/send-to-agent.sh \
-  codex-iISSUE-description \
-  "Your task description here [AI-assisted - Claude]"
+# 3. Send task to agent
+# (Use your terminal automation/multiplexer tooling)
+# Example task: "Fix issue #XXXX - [description]. [AI-assisted - Claude]"
 ```
 
 ### Common Pitfalls
@@ -140,8 +137,8 @@ Run these in any worktree before pushing a branch or opening a PR.
 - Never remove or ignore failing tests without understanding the root cause.
 
 ### Integration Testing with `freenet-test-network`
-- Use the `freenet-test-network` crate located at `~/code/freenet/freenet-test-network` to spin up gateways and peers for integration tests.
-- Add it as a dev-dependency in your worktree (`freenet-test-network = { path = "../freenet-test-network" }`) and construct networks with the builder API.
+- Use the `freenet-test-network` crate from https://github.com/freenet/freenet-test-network to spin up gateways and peers for integration tests.
+- Add it as a dev-dependency using either a path (if cloned locally) or git dependency, and construct networks with the builder API.
 - Sample pattern:
   ```rust
   use freenet_test_network::TestNetwork;

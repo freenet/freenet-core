@@ -780,6 +780,15 @@ pub(crate) async fn join_ring_request(
         OpError::ConnError(ConnectionError::LocationUnknown)
     })?;
 
+    tracing::debug!(
+        peer = %gateway.peer,
+        reserved_connections = op_manager
+            .ring
+            .connection_manager
+            .get_reserved_connections(),
+        "join_ring_request: evaluating gateway connection attempt"
+    );
+
     if !op_manager
         .ring
         .connection_manager
@@ -864,56 +873,71 @@ pub(crate) async fn initial_join_procedure(
             gateways.len()
         );
 
+        let mut in_flight_gateways = HashSet::new();
+
         loop {
             let open_conns = op_manager.ring.open_connections();
             let unconnected_gateways: Vec<_> =
                 op_manager.ring.is_not_connected(gateways.iter()).collect();
+            let available_gateways: Vec<_> = unconnected_gateways
+                .into_iter()
+                .filter(|gateway| !in_flight_gateways.contains(&gateway.peer))
+                .collect();
 
             tracing::debug!(
-                "Connection status: open_connections = {}, unconnected_gateways = {}",
-                open_conns,
-                unconnected_gateways.len()
+                open_connections = open_conns,
+                inflight_gateway_dials = in_flight_gateways.len(),
+                available_gateways = available_gateways.len(),
+                "Connection status before join attempt"
             );
 
-            let unconnected_count = unconnected_gateways.len();
+            let available_count = available_gateways.len();
 
-            if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count > 0 {
+            if open_conns < BOOTSTRAP_THRESHOLD && available_count > 0 {
                 tracing::info!(
                     "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways",
                     open_conns,
                     BOOTSTRAP_THRESHOLD,
-                    number_of_parallel_connections.min(unconnected_count)
+                    number_of_parallel_connections.min(available_count)
                 );
-                let select_all = FuturesUnordered::new();
-                for gateway in unconnected_gateways
+                let mut select_all = FuturesUnordered::new();
+                for gateway in available_gateways
                     .into_iter()
                     .shuffle()
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
+                    in_flight_gateways.insert(gateway.peer.clone());
                     let op_manager = op_manager.clone();
+                    let gateway_clone = gateway.clone();
                     select_all.push(async move {
-                        (join_ring_request(None, gateway, &op_manager).await, gateway)
+                        (
+                            join_ring_request(None, &gateway_clone, &op_manager).await,
+                            gateway_clone,
+                        )
                     });
                 }
-                select_all
-                    .for_each(|(res, gateway)| async move {
-                        if let Err(error) = res {
-                            if !matches!(
-                                error,
-                                OpError::ConnError(
-                                    crate::node::ConnectionError::UnwantedConnection
-                                )
-                            ) {
-                                tracing::error!(
-                                    %gateway,
-                                    %error,
-                                    "Failed while attempting connection to gateway"
-                                );
-                            }
+                while let Some((res, gateway)) = select_all.next().await {
+                    if let Err(error) = res {
+                        if !matches!(
+                            error,
+                            OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
+                        ) {
+                            tracing::error!(
+                                %gateway,
+                                %error,
+                                "Failed while attempting connection to gateway"
+                            );
                         }
-                    })
-                    .await;
+                    }
+                    in_flight_gateways.remove(&gateway.peer);
+                }
+            } else if open_conns < BOOTSTRAP_THRESHOLD && available_count == 0 {
+                tracing::debug!(
+                    open_connections = open_conns,
+                    inflight = in_flight_gateways.len(),
+                    "Below threshold but all gateways are already connected or in-flight"
+                );
             } else if open_conns >= BOOTSTRAP_THRESHOLD {
                 tracing::trace!(
                     "Have {} connections (>= threshold of {}), not attempting gateway connections",
