@@ -45,4 +45,8 @@ impl LiveTransactionTracker {
     pub(crate) fn still_alive(&self, tx: &Transaction) -> bool {
         self.tx_per_peer.iter().any(|e| e.value().contains(tx))
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.tx_per_peer.len()
+    }
 }
