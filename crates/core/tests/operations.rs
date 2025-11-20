@@ -93,6 +93,8 @@ async fn base_node_test_config(
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
             network_port: public_port,
+            min_connections: None,
+            max_connections: None,
             bandwidth_limit: None,
             blocked_addresses: None,
             transient_budget: None,
