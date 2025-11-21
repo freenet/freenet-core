@@ -135,15 +135,13 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
         async fn #test_fn_name() -> freenet::test_utils::TestResult {
             use freenet::test_utils::{TestContext, TestLogger, NodeInfo};
             use std::time::{Duration, Instant};
-            use tokio::select;
             use anyhow::anyhow;
 
             // 1. Setup TestLogger
-            let mut __test_logger = TestLogger::new().with_json().with_level(#log_level);
-            if std::env::var_os("FREENET_TEST_LOG_DISABLE_JSON").is_some() {
-                __test_logger = __test_logger.with_pretty();
-            }
-            let _logger = __test_logger.init();
+            let _logger = TestLogger::new()
+                .with_json()
+                .with_level(#log_level)
+                .init();
 
             tracing::info!("Starting test: {}", stringify!(#test_fn_name));
 
@@ -160,21 +158,22 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             // 5. Build TestContext with flush handles
             #context_creation
 
-            // 6. Start node tasks (run already-built nodes)
-            #node_tasks
+            // 6-8. Run test inside a LocalSet to support !Send futures
+            let local = tokio::task::LocalSet::new();
+            local.run_until(async move {
+                // 6. Start node tasks (run already-built nodes)
+                #node_tasks
 
-            // 7. Run test with coordination
-            // Note: Catching panics in async code while maintaining Send bounds
-            // and avoiding ctx move issues is complex. For now, use Result-based
-            // errors (bail!, ensure!) for best diagnostics.
-            let test_result = {
-                #test_coordination
-            };
+                // 7. Run test with coordination
+                let test_result = {
+                    #test_coordination
+                };
 
-            // 8. Handle failure reporting
-            #failure_reporting
+                // 8. Handle failure reporting
+                #failure_reporting
 
-            test_result
+                test_result
+            }).await
         }
 
         // User's test body as inner function
@@ -204,8 +203,13 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_port = freenet::test_utils::reserve_local_port()?;
-                    let ws_port = freenet::test_utils::reserve_local_port()?;
+                    let network_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+                    let ws_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+                    let network_port = network_socket.local_addr()?.port();
+                    let ws_port = ws_socket.local_addr()?.port();
+
+                    std::mem::drop(network_socket);
+                    std::mem::drop(ws_socket);
 
                     let location: f64 = #location_expr;
 
@@ -267,6 +271,35 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
         }
     }
 
+    // Pre-compute peer network ports if we need partial connectivity
+    let peer_network_ports_setup = if args.peer_connectivity_ratio.is_some() {
+        let peer_indices: Vec<_> = args
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(idx, node_label)| !is_gateway(args, node_label, *idx))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let peer_port_vars: Vec<_> = peer_indices
+            .iter()
+            .map(|idx| format_ident!("peer_network_port_{}", idx))
+            .collect();
+
+        quote! {
+            // Pre-bind sockets for all peers to get their network ports
+            #(
+                let peer_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let #peer_port_vars = peer_socket.local_addr()?.port();
+                std::mem::drop(peer_socket);
+            )*
+        }
+    } else {
+        quote! {}
+    };
+
+    setup_code.push(peer_network_ports_setup);
+
     // Third pass: Generate peer configurations (non-gateway nodes)
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let config_var = format_ident!("config_{}", idx);
@@ -308,6 +341,61 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                 }
             };
 
+            // Compute blocked addresses for this peer if partial connectivity is enabled
+            let blocked_addresses_code = if let Some(ratio) = args.peer_connectivity_ratio {
+                // Build mapping from node index to peer index (for deterministic blocking)
+                let peer_indices: Vec<(usize, usize)> = args
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(node_idx, label)| !is_gateway(args, label, *node_idx))
+                    .enumerate()
+                    .map(|(peer_idx, (node_idx, _))| (node_idx, peer_idx))
+                    .collect();
+
+                // Find this peer's relative index
+                let this_peer_idx = peer_indices
+                    .iter()
+                    .find(|(node_idx, _)| *node_idx == idx)
+                    .map(|(_, peer_idx)| *peer_idx)
+                    .expect("Current node must be in peer list");
+
+                let peer_checks: Vec<_> = args
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(other_idx, other_label)| !is_gateway(args, other_label, *other_idx) && *other_idx != idx)
+                    .map(|(other_idx, _)| {
+                        // Find the other peer's relative index
+                        let other_peer_idx = peer_indices.iter()
+                            .find(|(node_idx, _)| *node_idx == other_idx)
+                            .map(|(_, peer_idx)| *peer_idx)
+                            .expect("Other node must be in peer list");
+
+                        let port_var = format_ident!("peer_network_port_{}", other_idx);
+                        quote! {
+                            // Use ordered pair and better hash distribution for deterministic connectivity
+                            // Use relative peer indices (not absolute node indices) for consistent blocking
+                            let (a, b) = if #this_peer_idx < #other_peer_idx { (#this_peer_idx, #other_peer_idx) } else { (#other_peer_idx, #this_peer_idx) };
+                            let hash_value = (a * 17 + b * 31 + a * b * 7) % 100;
+                            if hash_value >= (#ratio * 100.0) as usize {
+                                blocked_addresses.push(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, #port_var)));
+                            }
+                        }
+                    })
+                    .collect();
+
+                quote! {
+                    let mut blocked_addresses = Vec::new();
+                    #(#peer_checks)*
+                    let blocked_addresses = Some(blocked_addresses);
+                }
+            } else {
+                quote! {
+                    let blocked_addresses = None;
+                }
+            };
+
             // Peer node configuration
             setup_code.push(quote! {
                 let (#config_var, #temp_var) = {
@@ -317,10 +405,17 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_port = freenet::test_utils::reserve_local_port()?;
-                    let ws_port = freenet::test_utils::reserve_local_port()?;
+                    let network_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+                    let network_port = network_socket.local_addr()?.port();
+                    std::mem::drop(network_socket);
+
+                    let ws_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+                    let ws_port = ws_socket.local_addr()?.port();
+                    std::mem::drop(ws_socket);
 
                     let location: f64 = #location_expr;
+
+                    #blocked_addresses_code
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
@@ -340,7 +435,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
                             network_port: Some(network_port),
                             bandwidth_limit: None,
-                            blocked_addresses: None,
+                            blocked_addresses,
                             transient_budget: None,
                             transient_ttl_secs: None,
                         },
@@ -414,27 +509,18 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
 fn generate_node_tasks(args: &FreenetTestArgs) -> TokenStream {
     let mut tasks = Vec::new();
 
-    for (idx, node_label) in args.nodes.iter().enumerate() {
+    for (idx, _node_label) in args.nodes.iter().enumerate() {
         let task_var = format_ident!("node_task_{}", idx);
         let node_var = format_ident!("node_{}", idx);
 
         tasks.push(quote! {
-            let #task_var = {
-                let node = #node_var;
-                async move {
-                    tracing::info!("Node running: {}", #node_label);
-                    node.run().await
-                }
-                .instrument(tracing::info_span!("test_peer", test_node = #node_label))
-                .boxed_local()
-            };
+            let #task_var = tokio::task::spawn_local(#node_var.run());
+            // Small delay to ensure proper task startup ordering
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         });
     }
 
     quote! {
-        use futures::FutureExt;
-        use tracing::Instrument;
-
         #(#tasks)*
     }
 }
@@ -498,45 +584,24 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
     }
 }
 
-/// Generate test coordination code with select!
+/// Generate test coordination code with spawned tasks
 fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident) -> TokenStream {
     let timeout_secs = args.timeout_secs;
     let startup_wait_secs = args.startup_wait_secs;
 
-    // Generate select! arms for each node
-    let mut select_arms = Vec::new();
-    for (idx, node_label) in args.nodes.iter().enumerate() {
-        let task_var = format_ident!("node_task_{}", idx);
-        select_arms.push(quote! {
-            result = #task_var => {
-                Err(anyhow!("Node '{}' exited unexpectedly: {:?}", #node_label, result))
-            }
-        });
-    }
-
-    // Add test arm
-    select_arms.push(quote! {
-        result = test_future => {
-            match result {
-                Ok(Ok(val)) => {
-                    // Give event loggers time to flush their batches
-                    // The EventRegister is cloned multiple times, so all senders need to be dropped
-                    // before the record_logs task will exit and flush remaining events
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    Ok(val)
-                },
-                Ok(Err(e)) => {
-                    // Also flush on error
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    Err(e)
-                },
-                Err(_) => Err(anyhow!("Test timed out after {} seconds", #timeout_secs)),
-            }
-        }
-    });
+    // Collect all node task variables
+    let task_vars: Vec<_> = (0..args.nodes.len())
+        .map(|idx| format_ident!("node_task_{}", idx))
+        .collect();
+    let node_labels = &args.nodes;
 
     quote! {
-        let test_future = tokio::time::timeout(
+        // Store node handles for monitoring (optional)
+        let _node_handles = vec![#(#task_vars),*];
+        let _node_labels = vec![#(#node_labels),*];
+
+        // Run test with timeout
+        let test_result = tokio::time::timeout(
             Duration::from_secs(#timeout_secs),
             async {
                 // Wait for nodes to start
@@ -547,10 +612,21 @@ fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident
                 // Run user's test
                 #inner_fn_name(&mut ctx).await
             }
-        );
+        ).await;
 
-        select! {
-            #(#select_arms),*
+        // Check test result
+        match test_result {
+            Ok(Ok(val)) => {
+                // Give event loggers time to flush their batches
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(val)
+            },
+            Ok(Err(e)) => {
+                // Also flush on error
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Err(e)
+            },
+            Err(_) => Err(anyhow!("Test timed out after {} seconds", #timeout_secs)),
         }
     }
 }

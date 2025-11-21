@@ -29,19 +29,18 @@ async fn test_basic_gateway(ctx: &mut TestContext) -> TestResult {
 }
 ```
 
-### Multi-Node Test with Auto-Connect
+### Multi-Node Test
 
 ```rust
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true,
     aggregate_events = "on_failure"
 )]
 async fn test_network_operations(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
     let peers = ctx.peers();
 
-    // All peers are automatically configured to connect to the gateway
+    // Peers are automatically configured to connect to the gateway (default behavior)
     assert_eq!(peers.len(), 2);
 
     // Your test logic here...
@@ -147,16 +146,22 @@ async fn test_with_node_configs(ctx: &mut TestContext) -> TestResult {
 #### `auto_connect_peers`
 Automatically configure all peer nodes to connect to all gateway nodes.
 
+**Default:** `true`
+
 ```rust
+// Default behavior - peers auto-connect
+#[freenet_test(nodes = ["gateway", "peer-1", "peer-2"])]
+
+// Explicitly disable auto-connection if needed
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true  // Peers auto-connect to gateway
+    auto_connect_peers = false
 )]
 ```
 
 **Behavior:**
-- When `true`: Peers are pre-configured with gateway connection info
-- When `false` (default): You must manually configure peer connections
+- When `true` (default): Peers are pre-configured with gateway connection info
+- When `false`: You must manually configure peer connections
 - Works with multiple gateways (peers connect to all gateways)
 
 #### `aggregate_events`
@@ -267,6 +272,32 @@ Logging level for the test.
 
 **Values:** `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`
 
+#### `peer_connectivity_ratio`
+Controls the connectivity ratio between peer nodes (0.0-1.0) for testing partially connected networks.
+
+```rust
+#[freenet_test(
+    nodes = ["gw-0", "gw-1", "node-0", "node-1", "node-2", "node-3"],
+    gateways = ["gw-0", "gw-1"],
+    auto_connect_peers = true,          // Peers connect to all gateways
+    peer_connectivity_ratio = 0.5       // 50% connectivity between peers
+)]
+```
+
+**How it works:**
+- A ratio of `1.0` means full connectivity between all peers
+- A ratio of `0.5` means approximately 50% of peer-to-peer connections are blocked
+- A ratio of `0.0` means no direct peer-to-peer connections (only via gateways)
+- The blocking pattern is deterministic based on node indices
+- Gateway connectivity is not affected - this only controls peer-to-peer connections
+
+**Use cases:**
+- Testing subscription propagation in partially connected networks
+- Simulating network partitions or unreliable peer connections
+- Verifying that updates propagate through gateways when direct peer routes are unavailable
+
+**Note:** When this is set, `auto_connect_peers` should typically be `true` to ensure peers can reach gateways.
+
 ## TestContext API
 
 The macro provides a `TestContext` parameter to your test function with these methods:
@@ -324,7 +355,7 @@ use freenet_stdlib::prelude::*;
 
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true,
+    
     timeout_secs = 180,
     startup_wait_secs = 15,
     aggregate_events = "on_failure",
@@ -474,7 +505,7 @@ EVENT LOG SUMMARY
 #[freenet_test(
     nodes = ["gw-1", "gw-2", "peer-1", "peer-2", "peer-3", "peer-4"],
     gateways = ["gw-1", "gw-2"],
-    auto_connect_peers = true,
+    
     startup_wait_secs = 20  // More time for connections to establish
 )]
 ```

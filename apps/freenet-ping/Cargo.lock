@@ -1028,7 +1028,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.37"
+version = "0.1.36"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1309,7 +1309,6 @@ dependencies = [
  "hickory-resolver",
  "itertools 0.14.0",
  "notify",
- "once_cell",
  "opentelemetry",
  "parking_lot",
  "pav_regression",
@@ -1344,6 +1343,16 @@ dependencies = [
 
 [[package]]
 name = "freenet-macros"
+version = "0.1.0"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
+
+[[package]]
+name = "freenet-macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c21b0e54ae3e7c5c9b9c845bd9eb4df94d24c94c0c5815ce5aa097492b984259"
@@ -1361,6 +1370,7 @@ dependencies = [
  "chrono",
  "clap",
  "freenet",
+ "freenet-macros 0.1.0",
  "freenet-ping-types",
  "freenet-stdlib",
  "futures",
@@ -1399,9 +1409,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.1.24"
+version = "0.1.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f39e2953b4b0d82dd02458653b57166ba8c967c6b3fcec146102a27e05a7081a"
+checksum = "66c64fa03f4a083918c7e347be47122c223d8156f4c012a0fe8e89a643350f2d"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -1410,7 +1420,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "flatbuffers 24.12.23",
- "freenet-macros",
+ "freenet-macros 0.1.1",
  "futures",
  "js-sys",
  "once_cell",
@@ -3718,9 +3728,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "slab"
-version = "0.4.11"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
+checksum = "04dc19736151f35336d325007ac991178d504a119863a2fcb3758cdb5e52c50d"
 
 [[package]]
 name = "slice-group-by"
@@ -5288,9 +5298,9 @@ dependencies = [
 
 [[package]]
 name = "wmi"
-version = "0.18.0"
+version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d71d1d435f7745ba9ed55c43049d47b5fbd1104449beaa2afbc80a1e10a4a018"
+checksum = "120d8c2b6a7c96c27bf4a7947fd7f02d73ca7f5958b8bd72a696e46cb5521ee6"
 dependencies = [
  "chrono",
  "futures",

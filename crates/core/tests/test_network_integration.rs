@@ -7,24 +7,16 @@ use freenet_test_network::TestNetwork;
 use testresult::TestResult;
 use tokio_tungstenite::connect_async;
 
-// Helper to get or create network
-async fn get_network() -> &'static TestNetwork {
-    use tokio::sync::OnceCell;
-    static NETWORK: OnceCell<TestNetwork> = OnceCell::const_new();
-
-    NETWORK
-        .get_or_init(|| async {
-            TestNetwork::builder()
-                .gateways(1)
-                .peers(2)
-                .binary(freenet_test_network::FreenetBinary::CurrentCrate(
-                    freenet_test_network::BuildProfile::Debug,
-                ))
-                .build()
-                .await
-                .expect("Failed to start test network")
-        })
+async fn get_network() -> TestNetwork {
+    TestNetwork::builder()
+        .gateways(1)
+        .peers(2)
+        .binary(freenet_test_network::FreenetBinary::CurrentCrate(
+            freenet_test_network::BuildProfile::Debug,
+        ))
+        .build()
         .await
+        .expect("Failed to start test network")
 }
 
 #[tokio::test]
