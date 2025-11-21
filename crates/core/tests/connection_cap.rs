@@ -9,10 +9,12 @@ use freenet_test_network::{BuildProfile, FreenetBinary, NetworkBuilder};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_cap_respected() -> anyhow::Result<()> {
-    let max_connections = freenet::config::DEFAULT_MAX_CONNECTIONS;
+    let max_connections = 6usize;
     let net = NetworkBuilder::new()
         .gateways(2)
         .peers(6)
+        .min_connections(4)
+        .max_connections(max_connections)
         .start_stagger(std::time::Duration::from_millis(300))
         .require_connectivity(0.9)
         .connectivity_timeout(std::time::Duration::from_secs(40))
