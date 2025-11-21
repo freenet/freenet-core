@@ -22,10 +22,8 @@ pub(crate) struct TransientEntry {
 
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
-    open_connections: Arc<AtomicUsize>,
-    reserved_connections: Arc<AtomicUsize>,
+    pending_reservations: Arc<RwLock<BTreeMap<PeerId, Location>>>,
     pub(super) location_for_peer: Arc<RwLock<BTreeMap<PeerId, Location>>>,
-    pending_locations: Arc<RwLock<BTreeMap<PeerId, Location>>>,
     pub(super) topology_manager: Arc<RwLock<TopologyManager>>,
     connections_by_location: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
     /// Interim connections ongoing handshake or successfully open connections
@@ -125,9 +123,7 @@ impl ConnectionManager {
         Self {
             connections_by_location: Arc::new(RwLock::new(BTreeMap::new())),
             location_for_peer: Arc::new(RwLock::new(BTreeMap::new())),
-            pending_locations: Arc::new(RwLock::new(BTreeMap::new())),
-            open_connections: Arc::new(AtomicUsize::new(0)),
-            reserved_connections: Arc::new(AtomicUsize::new(0)),
+            pending_reservations: Arc::new(RwLock::new(BTreeMap::new())),
             topology_manager,
             own_location: own_location.into(),
             peer_key: Arc::new(Mutex::new(peer_id)),
@@ -150,12 +146,8 @@ impl ConnectionManager {
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: Location, peer_id: &PeerId) -> bool {
         tracing::info!("Checking if should accept connection");
-        let open = self
-            .open_connections
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let reserved_before = self
-            .reserved_connections
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let open = self.connection_count();
+        let reserved_before = self.pending_reservations.read().len();
 
         tracing::info!(
             %peer_id,
@@ -168,16 +160,6 @@ impl ConnectionManager {
             "should_accept: evaluating direct acceptance guard"
         );
 
-        if self.has_connection_or_pending(peer_id) {
-            tracing::debug!(
-                %peer_id,
-                open,
-                reserved_before,
-                "Peer already connected; rejecting duplicate reservation"
-            );
-            return false;
-        }
-
         if self.is_gateway && (open > 0 || reserved_before > 0) {
             tracing::info!(
                 %peer_id,
@@ -187,34 +169,16 @@ impl ConnectionManager {
             );
         }
 
-        let reserved_before = loop {
-            let current = self
-                .reserved_connections
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if current == usize::MAX {
-                tracing::error!(
-                    %peer_id,
-                    "reserved connection counter overflowed; rejecting new connection"
-                );
-                return false;
-            }
-            match self.reserved_connections.compare_exchange(
-                current,
-                current + 1,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            ) {
-                Ok(_) => break current,
-                Err(actual) => {
-                    tracing::debug!(
-                        %peer_id,
-                        expected = current,
-                        actual,
-                        "reserved connection counter changed concurrently; retrying"
-                    );
-                }
-            }
-        };
+        if self.location_for_peer.read().get(peer_id).is_some() {
+            // We've already accepted this peer (pending or active); treat as a no-op acceptance.
+            tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
+            return true;
+        }
+
+        {
+            let mut pending = self.pending_reservations.write();
+            pending.insert(peer_id.clone(), location);
+        }
 
         let total_conn = match reserved_before
             .checked_add(1)
@@ -228,70 +192,66 @@ impl ConnectionManager {
                     open,
                     "connection counters would overflow; rejecting connection"
                 );
-                self.reserved_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.pending_reservations.write().remove(peer_id);
                 return false;
             }
         };
 
-        let accepted = if open == 0 {
+        if open == 0 {
             tracing::debug!(%peer_id, "should_accept: first connection -> accepting");
-            true
-        } else {
-            const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 2;
-            if self.is_gateway {
-                let direct_total = open + reserved_before;
-                if direct_total >= GATEWAY_DIRECT_ACCEPT_LIMIT {
-                    tracing::info!(
-                        %peer_id,
-                        open,
-                        reserved_before,
-                        limit = GATEWAY_DIRECT_ACCEPT_LIMIT,
-                        "Gateway reached direct-accept limit; forwarding join request instead"
-                    );
-                    self.reserved_connections
-                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    tracing::info!(%peer_id, "should_accept: gateway direct-accept limit hit, forwarding instead");
-                    return false;
-                }
-            }
+            return true;
+        }
 
-            if total_conn < self.min_connections {
-                tracing::info!(%peer_id, total_conn, "should_accept: accepted (below min connections)");
-                true
-            } else if total_conn >= self.max_connections {
-                tracing::info!(%peer_id, total_conn, "should_accept: rejected (max connections reached)");
-                false
-            } else {
-                let accepted = self
-                    .topology_manager
-                    .write()
-                    .evaluate_new_connection(location, Instant::now())
-                    .unwrap_or(true);
-
+        const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 2;
+        if self.is_gateway {
+            let direct_total = open + reserved_before;
+            if direct_total >= GATEWAY_DIRECT_ACCEPT_LIMIT {
                 tracing::info!(
                     %peer_id,
-                    total_conn,
-                    accepted,
-                    "should_accept: topology manager decision"
+                    open,
+                    reserved_before,
+                    limit = GATEWAY_DIRECT_ACCEPT_LIMIT,
+                    "Gateway reached direct-accept limit; forwarding join request instead"
                 );
-                accepted
+                self.pending_reservations.write().remove(peer_id);
+                tracing::info!(%peer_id, "should_accept: gateway direct-accept limit hit, forwarding instead");
+                return false;
             }
-        };
+        }
 
+        let accepted = if total_conn < self.min_connections {
+            tracing::info!(%peer_id, total_conn, "should_accept: accepted (below min connections)");
+            true
+        } else if total_conn >= self.max_connections {
+            tracing::info!(%peer_id, total_conn, "should_accept: rejected (max connections reached)");
+            false
+        } else {
+            let accepted = self
+                .topology_manager
+                .write()
+                .evaluate_new_connection(location, Instant::now())
+                .unwrap_or(true);
+
+            tracing::info!(
+                %peer_id,
+                total_conn,
+                accepted,
+                "should_accept: topology manager decision"
+            );
+            accepted
+        };
         tracing::info!(
             %peer_id,
             accepted,
             total_conn,
             open_connections = open,
-            reserved_connections = self
-                .reserved_connections
-                .load(std::sync::atomic::Ordering::SeqCst),
+            reserved_connections = self.pending_reservations.read().len(),
+            max_connections = self.max_connections,
+            min_connections = self.min_connections,
             "should_accept: final decision"
         );
         if !accepted {
-            self.reserved_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.pending_reservations.write().remove(peer_id);
         } else {
             tracing::info!(%peer_id, total_conn, "should_accept: accepted (reserving spot)");
             self.record_pending_location(peer_id, location);
@@ -301,11 +261,11 @@ impl ConnectionManager {
 
     /// Record the advertised location for a peer that we have decided to accept.
     ///
-    /// Pending peers are tracked separately so that other operations cannot route through them
-    /// until the handshake is fully complete. Once the connection is established the entry is
-    /// removed automatically via `prune_in_transit_connection`.
+    /// This makes the peer discoverable to the routing layer even before the connection
+    /// is fully established. The entry is removed automatically if the handshake fails
+    /// via `prune_in_transit_connection`.
     pub fn record_pending_location(&self, peer_id: &PeerId, location: Location) {
-        let mut locations = self.pending_locations.write();
+        let mut locations = self.location_for_peer.write();
         let entry = locations.entry(peer_id.clone());
         match entry {
             Entry::Occupied(_) => {
@@ -459,25 +419,31 @@ impl ConnectionManager {
     pub fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
         tracing::info!(%peer, %loc, %was_reserved, "Adding connection to topology");
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
-        {
-            let mut pending = self.pending_locations.write();
-            pending.remove(&peer);
-        }
         if was_reserved {
-            let old = self
-                .reserved_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            #[cfg(debug_assertions)]
-            {
-                tracing::debug!(old, "Decremented reserved connections");
-                if old == 0 {
-                    panic!("Underflow of reserved connections");
-                }
-            }
-            let _ = old;
+            self.pending_reservations.write().remove(&peer);
         }
         let mut lop = self.location_for_peer.write();
-        lop.insert(peer.clone(), loc);
+        let previous_location = lop.insert(peer.clone(), loc);
+        drop(lop);
+
+        if let Some(prev_loc) = previous_location {
+            tracing::info!(
+                %peer,
+                %prev_loc,
+                %loc,
+                "add_connection: replacing existing connection for peer"
+            );
+            let mut cbl = self.connections_by_location.write();
+            if let Some(prev_list) = cbl.get_mut(&prev_loc) {
+                if let Some(pos) = prev_list.iter().position(|c| c.location.peer == peer) {
+                    prev_list.swap_remove(pos);
+                }
+                if prev_list.is_empty() {
+                    cbl.remove(&prev_loc);
+                }
+            }
+        }
+
         {
             let mut cbl = self.connections_by_location.write();
             cbl.entry(loc).or_default().push(Connection {
@@ -485,12 +451,8 @@ impl ConnectionManager {
                     peer: peer.clone(),
                     location: Some(loc),
                 },
-                open_at: Instant::now(),
             });
         }
-        self.open_connections
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        std::mem::drop(lop);
     }
 
     pub fn update_peer_identity(&self, old_peer: &PeerId, new_peer: PeerId) -> bool {
@@ -530,7 +492,6 @@ impl ConnectionManager {
                     peer: new_peer,
                     location: Some(loc),
                 },
-                open_at: Instant::now(),
             });
         }
 
@@ -541,54 +502,45 @@ impl ConnectionManager {
         let connection_type = if is_alive { "active" } else { "in transit" };
         tracing::debug!(%peer, "Pruning {} connection", connection_type);
 
-        let loc = if is_alive {
-            let mut locations_for_peer = self.location_for_peer.write();
-            match locations_for_peer.remove(peer) {
-                Some(loc) => {
-                    let conns = &mut *self.connections_by_location.write();
-                    if let Some(conns) = conns.get_mut(&loc) {
-                        if let Some(pos) = conns.iter().position(|c| &c.location.peer == peer) {
-                            conns.swap_remove(pos);
-                        }
-                    }
-                    loc
-                }
-                None => {
-                    tracing::debug!("no location found for peer, skip pruning");
-                    return None;
+        let mut locations_for_peer = self.location_for_peer.write();
+
+        let Some(loc) = locations_for_peer.remove(peer) else {
+            if is_alive {
+                tracing::debug!("no location found for peer, skip pruning");
+                return None;
+            } else {
+                let removed = self.pending_reservations.write().remove(peer).is_some();
+                if !removed {
+                    tracing::warn!(
+                        %peer,
+                        "prune_connection: no pending reservation to release for in-transit peer"
+                    );
                 }
             }
-        } else {
-            match self.pending_locations.write().remove(peer) {
-                Some(loc) => loc,
-                None => {
-                    tracing::debug!("no pending location found for peer, skip pruning");
-                    self.reserved_connections
-                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    return None;
-                }
-            }
+            return None;
         };
 
-        if is_alive {
-            self.open_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        } else {
-            self.reserved_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let conns = &mut *self.connections_by_location.write();
+        if let Some(conns) = conns.get_mut(&loc) {
+            if let Some(pos) = conns.iter().position(|c| &c.location.peer == peer) {
+                conns.swap_remove(pos);
+            }
+        }
+
+        if !is_alive {
+            self.pending_reservations.write().remove(peer);
         }
 
         Some(loc)
     }
 
-    pub(super) fn get_open_connections(&self) -> usize {
-        self.open_connections
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub(crate) fn get_reserved_connections(&self) -> usize {
-        self.reserved_connections
-            .load(std::sync::atomic::Ordering::SeqCst)
+    pub(crate) fn connection_count(&self) -> usize {
+        // Count only established connections tracked by location buckets.
+        self.connections_by_location
+            .read()
+            .values()
+            .map(|conns| conns.len())
+            .sum()
     }
 
     pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
@@ -647,121 +599,5 @@ impl ConnectionManager {
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
         read.keys().cloned().collect::<Vec<_>>().into_iter()
-    }
-
-    pub fn has_connection_or_pending(&self, peer: &PeerId) -> bool {
-        if self.location_for_peer.read().contains_key(peer) {
-            return true;
-        }
-        self.pending_locations.read().contains_key(peer)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_pending_connection(&self, peer: &PeerId) -> bool {
-        self.pending_locations.read().contains_key(peer)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::topology::rate::Rate;
-    use crate::transport::TransportKeypair;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
-
-    fn make_connection_manager() -> ConnectionManager {
-        let keypair = TransportKeypair::new();
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4100);
-        let own_location = Location::from_address(&addr);
-        let atomic_loc = AtomicU64::new(u64::from_le_bytes(own_location.as_f64().to_le_bytes()));
-        let self_peer = PeerId::new(addr, keypair.public().clone());
-        ConnectionManager::init(
-            Rate::new_per_second(10_000.0),
-            Rate::new_per_second(10_000.0),
-            1,
-            32,
-            4,
-            (keypair.public().clone(), Some(self_peer), atomic_loc),
-            false,
-            4,
-            Duration::from_secs(30),
-        )
-    }
-
-    fn make_peer(port: u16) -> PeerId {
-        let keypair = TransportKeypair::new();
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        PeerId::new(addr, keypair.public().clone())
-    }
-
-    #[test]
-    fn pending_connections_hidden_from_known_locations() {
-        let manager = make_connection_manager();
-        let peer = make_peer(4200);
-        let location = Location::from_address(&peer.addr);
-
-        assert!(manager.should_accept(location, &peer));
-        assert!(manager.is_pending_connection(&peer));
-        assert!(
-            !manager.get_known_locations().contains_key(&peer),
-            "pending connection leaked into established pool"
-        );
-
-        let restored = manager
-            .prune_in_transit_connection(&peer)
-            .expect("pending location should exist");
-        assert_eq!(restored, location);
-
-        manager.add_connection(restored, peer.clone(), false);
-        assert!(
-            !manager.is_pending_connection(&peer),
-            "pending slot should be cleared after promotion"
-        );
-
-        let known = manager.get_known_locations();
-        assert_eq!(known.get(&peer), Some(&location));
-    }
-
-    #[test]
-    fn should_accept_does_not_leak_reservations_for_duplicate_peer() {
-        let keypair = TransportKeypair::new();
-        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20_000);
-        let peer_id = PeerId::new(peer_addr, keypair.public().clone());
-        let location = Location::from_address(&peer_addr);
-
-        let manager = ConnectionManager::init(
-            Rate::new_per_second(1_000_000.0),
-            Rate::new_per_second(1_000_000.0),
-            Ring::DEFAULT_MIN_CONNECTIONS,
-            Ring::DEFAULT_MAX_CONNECTIONS,
-            Ring::DEFAULT_RAND_WALK_ABOVE_HTL,
-            (keypair.public().clone(), None, AtomicU64::new(0)),
-            false,
-            32,
-            Duration::from_secs(30),
-        );
-
-        assert!(manager.should_accept(location, &peer_id));
-        let after_first = manager.reserved_connections.load(Ordering::SeqCst);
-        assert_eq!(after_first, 1);
-        {
-            assert!(
-                manager.is_pending_connection(&peer_id),
-                "pending connection should be tracked separately after initial acceptance"
-            );
-        }
-
-        // Second attempt for the same peer should be rejected immediately.
-        assert!(
-            !manager.should_accept(location, &peer_id),
-            "duplicate peer should be rejected by should_accept"
-        );
-        assert_eq!(
-            manager.reserved_connections.load(Ordering::SeqCst),
-            after_first,
-            "repeat should_accept calls should not leak reservations for an existing peer"
-        );
     }
 }

@@ -416,46 +416,41 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
 
-                            if !self.is_gateway {
-                                let allow = self.expected_non_gateway.contains(&remote_addr.ip());
-                                let gateway_allow = self
-                                    .known_gateway_addrs
-                                    .as_ref()
-                                    .map(|set| set.contains(&remote_addr))
-                                    .unwrap_or(false);
-                                if !allow && gateway_allow {
-                                    tracing::debug!(
-                                        %remote_addr,
-                                        "allowing inbound handshake from known gateway without prior expectation"
-                                    );
-                                }
-                                if !allow && !gateway_allow {
-                                    tracing::warn!(
-                                        %remote_addr,
-                                        %size,
-                                        "unexpected packet from non-gateway node; dropping intro packet"
-                                    );
-                                    self.expected_non_gateway.insert(remote_addr.ip());
+                            let is_known_gateway = self
+                                .known_gateway_addrs
+                                .as_ref()
+                                .map(|set| set.contains(&remote_addr))
+                                .unwrap_or(false);
+
+                            if self.is_gateway || is_known_gateway {
+                                // Handle gateway-intro packets (peer -> gateway)
+
+                                // Check if we already have a gateway connection in progress
+                                if ongoing_gw_connections.contains_key(&remote_addr) {
+                                    tracing::debug!(%remote_addr, "gateway connection already in progress, ignoring duplicate packet");
                                     continue;
                                 }
-                            }
 
-                            // Check if we already have a gateway connection in progress
-                            if ongoing_gw_connections.contains_key(&remote_addr) {
-                                tracing::debug!(%remote_addr, "gateway connection already in progress, ignoring duplicate packet");
+                                let inbound_key_bytes = key_from_addr(&remote_addr);
+                                let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
+                                let task = tokio::spawn(gw_ongoing_connection
+                                    .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
+                                    .map_err(move |error| {
+                                        tracing::warn!(%remote_addr, %error, "gateway connection error");
+                                        (error, remote_addr)
+                                    }));
+                                ongoing_gw_connections.insert(remote_addr, packets_sender);
+                                gw_connection_tasks.push(task);
+                                continue;
+                            } else {
+                                // Non-gateway peers: mark as expected and wait for the normal peer handshake flow.
+                                self.expected_non_gateway.insert(remote_addr.ip());
+                                tracing::debug!(
+                                    %remote_addr,
+                                    "unexpected peer intro; marking expected_non_gateway"
+                                );
                                 continue;
                             }
-
-                            let inbound_key_bytes = key_from_addr(&remote_addr);
-                            let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
-                            let task = tokio::spawn(gw_ongoing_connection
-                                .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
-                                .map_err(move |error| {
-                                    tracing::warn!(%remote_addr, %error, "gateway connection error");
-                                    (error, remote_addr)
-                                }));
-                            ongoing_gw_connections.insert(remote_addr, packets_sender);
-                            gw_connection_tasks.push(task);
                         }
                         Err(e) => {
                             tracing::error!("Failed to receive UDP packet: {:?}", e);

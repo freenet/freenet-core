@@ -215,6 +215,7 @@ impl RelayState {
         if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
             self.accepted_locally = true;
             let acceptor = ctx.self_location().clone();
+            let dist = ring_distance(acceptor.location, self.request.joiner.location);
             let transient = ctx.transient_hint(&acceptor, &self.request.joiner);
             self.transient_hint = transient;
             actions.accept_response = Some(ConnectResponse {
@@ -222,15 +223,27 @@ impl RelayState {
                 transient,
             });
             actions.expect_connection_from = Some(self.request.joiner.clone());
+            tracing::info!(
+                acceptor_peer = %acceptor.peer,
+                joiner_peer = %self.request.joiner.peer,
+                acceptor_loc = ?acceptor.location,
+                joiner_loc = ?self.request.joiner.location,
+                ring_distance = ?dist,
+                transient,
+                "connect: acceptance issued"
+            );
         }
 
         if self.forwarded_to.is_none() && self.request.ttl > 0 {
             match ctx.select_next_hop(self.request.desired_location, &self.request.visited) {
                 Some(next) => {
-                    tracing::debug!(
+                    let dist = ring_distance(next.location, Some(self.request.desired_location));
+                    tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         next_peer = %next.peer,
+                        next_loc = ?next.location,
+                        ring_distance_to_target = ?dist,
                         "connect: forwarding join request to next hop"
                     );
                     let mut forward_req = self.request.clone();
@@ -242,7 +255,7 @@ impl RelayState {
                     actions.forward = Some((next, forward_snapshot));
                 }
                 None => {
-                    tracing::debug!(
+                    tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         visited = ?self.request.visited,
@@ -765,6 +778,13 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
                 desired_location: op.desired_location,
             }))
         }),
+    }
+}
+
+fn ring_distance(a: Option<Location>, b: Option<Location>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.distance(b).as_f64()),
+        _ => None,
     }
 }
 

@@ -635,6 +635,12 @@ impl P2pConnManager {
                                         "Failed to enqueue DropConnection command"
                                     );
                                 }
+                                // Immediately prune topology counters so we don't leak open connection slots.
+                                ctx.bridge
+                                    .op_manager
+                                    .ring
+                                    .prune_connection(peer.clone())
+                                    .await;
                                 if let Some(conn) = ctx.connections.remove(&peer) {
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     match timeout(
@@ -1723,11 +1729,32 @@ impl P2pConnManager {
             let pending_loc = connection_manager.prune_in_transit_connection(&peer_id);
             if !is_transient {
                 let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
+                // Re-apply admission logic on promotion to avoid bypassing capacity/heuristic checks.
+                let should_accept = connection_manager.should_accept(loc, &peer_id);
+                if !should_accept {
+                    tracing::warn!(
+                        %peer_id,
+                        %loc,
+                        "handle_successful_connection: promotion rejected by admission logic"
+                    );
+                    return Ok(());
+                }
+                let current = connection_manager.connection_count();
+                if current >= connection_manager.max_connections {
+                    tracing::warn!(
+                        %peer_id,
+                        current_connections = current,
+                        max_connections = connection_manager.max_connections,
+                        %loc,
+                        "handle_successful_connection: rejecting new connection to enforce cap"
+                    );
+                    return Ok(());
+                }
                 tracing::info!(remote = %peer_id, %loc, "handle_successful_connection: promoting connection into ring");
                 self.bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, peer_id.clone(), false)
+                    .add_connection(loc, peer_id.clone(), true)
                     .await;
             } else {
                 // Update location now that we know it; budget was reserved before any work.
