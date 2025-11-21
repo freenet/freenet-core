@@ -37,6 +37,7 @@ use which::which;
 const DEFAULT_PEER_COUNT: usize = 38;
 const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_SNAPSHOT_ITERATIONS: usize = 5;
+const DEFAULT_SNAPSHOT_WARMUP: Duration = Duration::from_secs(60);
 const DEFAULT_CONNECTIVITY_TARGET: f64 = 0.75;
 const DEFAULT_MIN_CONNECTIONS: usize = 5;
 const DEFAULT_MAX_CONNECTIONS: usize = 7;
@@ -61,6 +62,11 @@ async fn large_network_soak() -> anyhow::Result<()> {
         .ok()
         .and_then(|val| val.parse::<f64>().ok())
         .unwrap_or(DEFAULT_CONNECTIVITY_TARGET);
+    let snapshot_warmup = env::var("SOAK_SNAPSHOT_WARMUP_SECS")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_SNAPSHOT_WARMUP);
     let min_connections = env::var("SOAK_MIN_CONNECTIONS")
         .ok()
         .and_then(|val| val.parse().ok())
@@ -105,6 +111,13 @@ async fn large_network_soak() -> anyhow::Result<()> {
     let snapshots_dir = network.run_root().join("large-soak");
     fs::create_dir_all(&snapshots_dir)?;
 
+    // Allow topology maintenance to run before the first snapshot.
+    println!(
+        "Waiting {:?} before first snapshot to allow topology maintenance to converge",
+        snapshot_warmup
+    );
+    sleep(snapshot_warmup).await;
+
     let mut iteration = 0usize;
     let mut next_tick = Instant::now();
     while iteration < snapshot_iterations {
@@ -112,6 +125,11 @@ async fn large_network_soak() -> anyhow::Result<()> {
         let snapshot = network.collect_diagnostics().await?;
         let snapshot_path = snapshots_dir.join(format!("snapshot-{iteration:02}.json"));
         fs::write(&snapshot_path, to_string_pretty(&snapshot)?)?;
+
+        // Also capture ring topology for visualizing evolution over time.
+        let ring_snapshot = network.ring_snapshot().await?;
+        let ring_path = snapshots_dir.join(format!("ring-{iteration:02}.json"));
+        fs::write(&ring_path, to_string_pretty(&ring_snapshot)?)?;
 
         let healthy = snapshot
             .peers
