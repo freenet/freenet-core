@@ -38,6 +38,8 @@ const DEFAULT_PEER_COUNT: usize = 38;
 const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_SNAPSHOT_ITERATIONS: usize = 5;
 const DEFAULT_CONNECTIVITY_TARGET: f64 = 0.75;
+const DEFAULT_MIN_CONNECTIONS: usize = 5;
+const DEFAULT_MAX_CONNECTIONS: usize = 7;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "Large soak test - run manually (see file header for instructions)"]
@@ -59,10 +61,20 @@ async fn large_network_soak() -> anyhow::Result<()> {
         .ok()
         .and_then(|val| val.parse::<f64>().ok())
         .unwrap_or(DEFAULT_CONNECTIVITY_TARGET);
+    let min_connections = env::var("SOAK_MIN_CONNECTIONS")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(DEFAULT_MIN_CONNECTIONS);
+    let max_connections = env::var("SOAK_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
 
     let network = TestNetwork::builder()
         .gateways(2)
         .peers(peer_count)
+        .min_connections(min_connections)
+        .max_connections(max_connections)
         .require_connectivity(connectivity_target)
         .connectivity_timeout(Duration::from_secs(120))
         .preserve_temp_dirs_on_failure(true)
@@ -77,6 +89,10 @@ async fn large_network_soak() -> anyhow::Result<()> {
         2,
         peer_count,
         network.run_root().display()
+    );
+    println!(
+        "Min connections: {}, max connections: {} (override via SOAK_MIN_CONNECTIONS / SOAK_MAX_CONNECTIONS)",
+        min_connections, max_connections
     );
 
     let riverctl_path = which("riverctl")
