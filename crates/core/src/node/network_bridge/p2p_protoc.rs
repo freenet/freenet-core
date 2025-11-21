@@ -1294,10 +1294,57 @@ impl P2pConnManager {
                 let loc = entry
                     .location
                     .unwrap_or_else(|| Location::from_address(&peer.addr));
+                // Re-run admission + cap guard when promoting a transient connection.
+                let should_accept = connection_manager.should_accept(loc, &peer);
+                if !should_accept {
+                    tracing::warn!(
+                        tx = %tx,
+                        %peer,
+                        %loc,
+                        "connect_peer: promotion rejected by admission logic"
+                    );
+                    callback
+                        .send_result(Err(()))
+                        .await
+                        .inspect_err(|err| {
+                            tracing::debug!(
+                                tx = %tx,
+                                remote = %peer,
+                                ?err,
+                                "connect_peer: failed to notify rejected-promotion callback"
+                            );
+                        })
+                        .ok();
+                    return Ok(());
+                }
+                let current = connection_manager.connection_count();
+                if current >= connection_manager.max_connections {
+                    tracing::warn!(
+                        tx = %tx,
+                        %peer,
+                        current_connections = current,
+                        max_connections = connection_manager.max_connections,
+                        %loc,
+                        "connect_peer: rejecting transient promotion to enforce cap"
+                    );
+                    callback
+                        .send_result(Err(()))
+                        .await
+                        .inspect_err(|err| {
+                            tracing::debug!(
+                                tx = %tx,
+                                remote = %peer,
+                                ?err,
+                                "connect_peer: failed to notify cap-rejection callback"
+                            );
+                        })
+                        .ok();
+                    return Ok(());
+                }
                 self.bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, peer.clone(), false)
+                    .add_connection(loc, peer.clone(), true)
                     .await;
                 tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
             }
