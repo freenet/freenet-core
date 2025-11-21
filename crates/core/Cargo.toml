@@ -65,6 +65,7 @@ xz2 = { version = "0.1" }
 reqwest = { version = "0.12", features = ["json"] }
 rsa = { version = "0.9", features = ["serde", "pem"] }
 pkcs8 = { version = "0.10", features = ["std", "pem"] }
+sha2 = "0.10"
 
 # Tracing deps
 opentelemetry = "0.31"
@@ -90,7 +91,7 @@ arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
-freenet-test-network = { version = "0.1.2", path = "../../../../freenet-test-network" }
+freenet-test-network = { version = "0.1.3", path = "../../../../freenet-test-network" }
 httptest = "0.16"
 statrs = "0.18"
 tempfile = "3"
