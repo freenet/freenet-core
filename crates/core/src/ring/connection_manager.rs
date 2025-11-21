@@ -420,12 +420,6 @@ impl ConnectionManager {
         tracing::info!(%peer, %loc, %was_reserved, "Adding connection to topology");
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
         if was_reserved {
-            let old = self.pending_reservations.write().remove(&peer);
-            if old.is_none() {
-                tracing::warn!(%peer, "add_connection: expected pending reservation missing");
-            }
-        }
-        if was_reserved {
             self.pending_reservations.write().remove(&peer);
         }
         let mut lop = self.location_for_peer.write();
@@ -473,7 +467,6 @@ impl ConnectionManager {
                     peer: peer.clone(),
                     location: Some(loc),
                 },
-                open_at: Instant::now(),
             });
         }
     }
@@ -515,7 +508,6 @@ impl ConnectionManager {
                     peer: new_peer,
                     location: Some(loc),
                 },
-                open_at: Instant::now(),
             });
         }
 
@@ -565,18 +557,6 @@ impl ConnectionManager {
             .values()
             .map(|conns| conns.len())
             .sum()
-    }
-
-    pub(super) fn get_open_connections(&self) -> usize {
-        self.connections_by_location
-            .read()
-            .values()
-            .map(|conns| conns.len())
-            .sum()
-    }
-
-    pub(crate) fn get_reserved_connections(&self) -> usize {
-        self.pending_reservations.read().len()
     }
 
     pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
@@ -635,10 +615,5 @@ impl ConnectionManager {
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
         read.keys().cloned().collect::<Vec<_>>().into_iter()
-    }
-
-    pub fn has_connection_or_pending(&self, peer: &PeerId) -> bool {
-        self.location_for_peer.read().contains_key(peer)
-            || self.pending_reservations.read().contains_key(peer)
     }
 }
