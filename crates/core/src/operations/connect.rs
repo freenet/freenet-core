@@ -86,9 +86,9 @@ impl fmt::Display for ConnectMsg {
             ),
             ConnectMsg::Response { sender, target, payload, .. } => write!(
                 f,
-                "ConnectResponse {{ sender: {sender}, target: {target}, acceptor: {}, courtesy: {} }}",
+                "ConnectResponse {{ sender: {sender}, target: {target}, acceptor: {}, transient: {} }}",
                 payload.acceptor,
-                payload.courtesy
+                payload.transient
             ),
             ConnectMsg::ObservedAddress { target, address, .. } => {
                 write!(f, "ObservedAddress {{ target: {target}, address: {address} }}")
@@ -126,8 +126,8 @@ pub(crate) struct ConnectRequest {
 pub(crate) struct ConnectResponse {
     /// The peer that accepted the join request.
     pub acceptor: PeerKeyLocation,
-    /// Whether this acceptance is a short-lived courtesy link.
-    pub courtesy: bool,
+    /// Whether this acceptance is a short-lived transient link.
+    pub transient: bool,
 }
 
 /// New minimal state machine the joiner tracks.
@@ -154,7 +154,7 @@ pub(crate) struct RelayState {
     pub upstream: PeerKeyLocation,
     pub request: ConnectRequest,
     pub forwarded_to: Option<PeerKeyLocation>,
-    pub courtesy_hint: bool,
+    pub transient_hint: bool,
     pub observed_sent: bool,
     pub accepted_locally: bool,
 }
@@ -175,8 +175,8 @@ pub(crate) trait RelayContext {
         visited: &[PeerKeyLocation],
     ) -> Option<PeerKeyLocation>;
 
-    /// Whether the acceptance should be treated as a short-lived courtesy link.
-    fn courtesy_hint(&self, acceptor: &PeerKeyLocation, joiner: &PeerKeyLocation) -> bool;
+    /// Whether the acceptance should be treated as a short-lived transient link.
+    fn transient_hint(&self, acceptor: &PeerKeyLocation, joiner: &PeerKeyLocation) -> bool;
 }
 
 /// Result of processing a request at a relay.
@@ -215,22 +215,35 @@ impl RelayState {
         if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
             self.accepted_locally = true;
             let acceptor = ctx.self_location().clone();
-            let courtesy = ctx.courtesy_hint(&acceptor, &self.request.joiner);
-            self.courtesy_hint = courtesy;
+            let dist = ring_distance(acceptor.location, self.request.joiner.location);
+            let transient = ctx.transient_hint(&acceptor, &self.request.joiner);
+            self.transient_hint = transient;
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
-                courtesy,
+                transient,
             });
             actions.expect_connection_from = Some(self.request.joiner.clone());
+            tracing::info!(
+                acceptor_peer = %acceptor.peer,
+                joiner_peer = %self.request.joiner.peer,
+                acceptor_loc = ?acceptor.location,
+                joiner_loc = ?self.request.joiner.location,
+                ring_distance = ?dist,
+                transient,
+                "connect: acceptance issued"
+            );
         }
 
         if self.forwarded_to.is_none() && self.request.ttl > 0 {
             match ctx.select_next_hop(self.request.desired_location, &self.request.visited) {
                 Some(next) => {
-                    tracing::debug!(
+                    let dist = ring_distance(next.location, Some(self.request.desired_location));
+                    tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         next_peer = %next.peer,
+                        next_loc = ?next.location,
+                        ring_distance_to_target = ?dist,
                         "connect: forwarding join request to next hop"
                     );
                     let mut forward_req = self.request.clone();
@@ -242,7 +255,7 @@ impl RelayState {
                     actions.forward = Some((next, forward_snapshot));
                 }
                 None => {
-                    tracing::debug!(
+                    tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         visited = ?self.request.visited,
@@ -299,10 +312,10 @@ impl RelayContext for RelayEnv<'_> {
             .routing(desired_location, None, skip, &router)
     }
 
-    fn courtesy_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
+    fn transient_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
         // Courtesy slots still piggyback on regular connections. Flag the first acceptance so the
-        // joiner can prioritise it, and keep the logic simple until dedicated courtesy tracking
-        // is wired in (see courtesy-connection-budget branch).
+        // joiner can prioritise it, and keep the logic simple until dedicated transient tracking
+        // is wired in (see transient-connection-budget branch).
         self.op_manager.ring.open_connections() == 0
     }
 }
@@ -310,7 +323,7 @@ impl RelayContext for RelayEnv<'_> {
 #[derive(Debug)]
 pub struct AcceptedPeer {
     pub peer: PeerKeyLocation,
-    pub courtesy: bool,
+    pub transient: bool,
 }
 
 #[derive(Debug, Default)]
@@ -331,7 +344,7 @@ impl JoinerState {
             self.last_progress = now;
             acceptance.new_acceptor = Some(AcceptedPeer {
                 peer: response.acceptor.clone(),
-                courtesy: response.courtesy,
+                transient: response.transient,
             });
             acceptance.assigned_location = self.accepted.len() == 1;
         }
@@ -391,7 +404,7 @@ impl ConnectOp {
             upstream,
             request,
             forwarded_to: None,
-            courtesy_hint: false,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         }));
@@ -507,7 +520,7 @@ impl ConnectOp {
                 upstream: upstream.clone(),
                 request: request.clone(),
                 forwarded_to: None,
-                courtesy_hint: false,
+                transient_hint: false,
                 observed_sent: false,
                 accepted_locally: false,
             })));
@@ -666,7 +679,7 @@ impl Operation for ConnectOp {
                                         peer: new_acceptor.peer.peer.clone(),
                                         tx: self.id,
                                         callback,
-                                        is_gw: new_acceptor.courtesy,
+                                        is_gw: new_acceptor.transient,
                                     })
                                     .await?;
 
@@ -768,6 +781,13 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
     }
 }
 
+fn ring_distance(a: Option<Location>, b: Option<Location>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.distance(b).as_f64()),
+        _ => None,
+    }
+}
+
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
 pub(crate) async fn join_ring_request(
     backoff: Option<Backoff>,
@@ -779,15 +799,6 @@ pub(crate) async fn join_ring_request(
         tracing::error!("Gateway location not found, this should not be possible, report an error");
         OpError::ConnError(ConnectionError::LocationUnknown)
     })?;
-
-    tracing::debug!(
-        peer = %gateway.peer,
-        reserved_connections = op_manager
-            .ring
-            .connection_manager
-            .get_reserved_connections(),
-        "join_ring_request: evaluating gateway connection attempt"
-    );
 
     if !op_manager
         .ring
@@ -873,71 +884,56 @@ pub(crate) async fn initial_join_procedure(
             gateways.len()
         );
 
-        let mut in_flight_gateways = HashSet::new();
-
         loop {
             let open_conns = op_manager.ring.open_connections();
             let unconnected_gateways: Vec<_> =
                 op_manager.ring.is_not_connected(gateways.iter()).collect();
-            let available_gateways: Vec<_> = unconnected_gateways
-                .into_iter()
-                .filter(|gateway| !in_flight_gateways.contains(&gateway.peer))
-                .collect();
 
             tracing::debug!(
-                open_connections = open_conns,
-                inflight_gateway_dials = in_flight_gateways.len(),
-                available_gateways = available_gateways.len(),
-                "Connection status before join attempt"
+                "Connection status: open_connections = {}, unconnected_gateways = {}",
+                open_conns,
+                unconnected_gateways.len()
             );
 
-            let available_count = available_gateways.len();
+            let unconnected_count = unconnected_gateways.len();
 
-            if open_conns < BOOTSTRAP_THRESHOLD && available_count > 0 {
+            if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count > 0 {
                 tracing::info!(
                     "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways",
                     open_conns,
                     BOOTSTRAP_THRESHOLD,
-                    number_of_parallel_connections.min(available_count)
+                    number_of_parallel_connections.min(unconnected_count)
                 );
-                let mut select_all = FuturesUnordered::new();
-                for gateway in available_gateways
+                let select_all = FuturesUnordered::new();
+                for gateway in unconnected_gateways
                     .into_iter()
                     .shuffle()
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
-                    in_flight_gateways.insert(gateway.peer.clone());
                     let op_manager = op_manager.clone();
-                    let gateway_clone = gateway.clone();
                     select_all.push(async move {
-                        (
-                            join_ring_request(None, &gateway_clone, &op_manager).await,
-                            gateway_clone,
-                        )
+                        (join_ring_request(None, gateway, &op_manager).await, gateway)
                     });
                 }
-                while let Some((res, gateway)) = select_all.next().await {
-                    if let Err(error) = res {
-                        if !matches!(
-                            error,
-                            OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
-                        ) {
-                            tracing::error!(
-                                %gateway,
-                                %error,
-                                "Failed while attempting connection to gateway"
-                            );
+                select_all
+                    .for_each(|(res, gateway)| async move {
+                        if let Err(error) = res {
+                            if !matches!(
+                                error,
+                                OpError::ConnError(
+                                    crate::node::ConnectionError::UnwantedConnection
+                                )
+                            ) {
+                                tracing::error!(
+                                    %gateway,
+                                    %error,
+                                    "Failed while attempting connection to gateway"
+                                );
+                            }
                         }
-                    }
-                    in_flight_gateways.remove(&gateway.peer);
-                }
-            } else if open_conns < BOOTSTRAP_THRESHOLD && available_count == 0 {
-                tracing::debug!(
-                    open_connections = open_conns,
-                    inflight = in_flight_gateways.len(),
-                    "Below threshold but all gateways are already connected or in-flight"
-                );
+                    })
+                    .await;
             } else if open_conns >= BOOTSTRAP_THRESHOLD {
                 tracing::trace!(
                     "Have {} connections (>= threshold of {}), not attempting gateway connections",
@@ -984,7 +980,7 @@ mod tests {
         self_loc: PeerKeyLocation,
         accept: bool,
         next_hop: Option<PeerKeyLocation>,
-        courtesy: bool,
+        transient: bool,
     }
 
     impl TestRelayContext {
@@ -993,7 +989,7 @@ mod tests {
                 self_loc,
                 accept: true,
                 next_hop: None,
-                courtesy: false,
+                transient: false,
             }
         }
 
@@ -1007,8 +1003,8 @@ mod tests {
             self
         }
 
-        fn courtesy(mut self, courtesy: bool) -> Self {
-            self.courtesy = courtesy;
+        fn transient(mut self, transient: bool) -> Self {
+            self.transient = transient;
             self
         }
     }
@@ -1030,8 +1026,8 @@ mod tests {
             self.next_hop.clone()
         }
 
-        fn courtesy_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
-            self.courtesy
+        fn transient_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
+            self.transient
         }
     }
 
@@ -1058,17 +1054,17 @@ mod tests {
                 observed_addr: Some(joiner.peer.addr),
             },
             forwarded_to: None,
-            courtesy_hint: false,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         };
 
-        let ctx = TestRelayContext::new(self_loc.clone()).courtesy(true);
+        let ctx = TestRelayContext::new(self_loc.clone()).transient(true);
         let actions = state.handle_request(&ctx, &joiner);
 
         let response = actions.accept_response.expect("expected acceptance");
         assert_eq!(response.acceptor.peer, self_loc.peer);
-        assert!(response.courtesy);
+        assert!(response.transient);
         assert_eq!(actions.expect_connection_from.unwrap().peer, joiner.peer);
         assert!(actions.forward.is_none());
     }
@@ -1088,7 +1084,7 @@ mod tests {
                 observed_addr: Some(joiner.peer.addr),
             },
             forwarded_to: None,
-            courtesy_hint: false,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -1123,7 +1119,7 @@ mod tests {
                 observed_addr: Some(observed_addr),
             },
             forwarded_to: None,
-            courtesy_hint: false,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -1151,13 +1147,13 @@ mod tests {
 
         let response = ConnectResponse {
             acceptor: acceptor.clone(),
-            courtesy: false,
+            transient: false,
         };
         let result = state.register_acceptance(&response, Instant::now());
         assert!(result.satisfied);
         let new = result.new_acceptor.expect("expected new acceptor");
         assert_eq!(new.peer.peer, acceptor.peer);
-        assert!(!new.courtesy);
+        assert!(!new.transient);
     }
 
     #[test]
