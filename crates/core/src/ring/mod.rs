@@ -3,7 +3,7 @@
 //! Mainly maintains a healthy and optimal pool of connections to other peers in the network
 //! and routes requests to the optimal peers.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::{
     sync::{atomic::AtomicU64, Arc, Weak},
     time::{Duration, Instant},
@@ -157,7 +157,7 @@ impl Ring {
     }
 
     pub fn open_connections(&self) -> usize {
-        self.connection_manager.get_open_connections()
+        self.connection_manager.connection_count()
     }
 
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
@@ -384,11 +384,6 @@ impl Ring {
         let is_gateway = self.is_gateway;
         tracing::info!(is_gateway, "Connection maintenance task starting");
         #[cfg(not(test))]
-        const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(60 * 5);
-        #[cfg(test)]
-        const CONNECTION_AGE_THRESOLD: Duration = Duration::from_secs(5);
-
-        #[cfg(not(test))]
         const CHECK_TICK_DURATION: Duration = Duration::from_secs(60);
         #[cfg(test)]
         const CHECK_TICK_DURATION: Duration = Duration::from_secs(2);
@@ -458,7 +453,7 @@ impl Ring {
                             error
                         })?;
                     if live_tx.is_none() {
-                        let conns = self.connection_manager.get_open_connections();
+                        let conns = self.connection_manager.connection_count();
                         tracing::warn!(
                             "acquire_new returned None - likely no peers to query through (connections: {})",
                             conns
@@ -475,32 +470,50 @@ impl Ring {
                 }
             }
 
-            let current_connections = self.connection_manager.get_open_connections();
+            let current_connections = self.connection_manager.connection_count();
             let pending_connection_targets = pending_conn_adds.len();
-            let neighbor_locations = {
-                let peers = self.connection_manager.get_connections_by_location();
-                tracing::debug!(
-                    "Maintenance task: current connections = {}, candidates = {}, live_tx_peers = {}",
+            let peers = self.connection_manager.get_connections_by_location();
+            let connections_considered: usize = peers.values().map(|c| c.len()).sum();
+
+            let mut neighbor_locations: BTreeMap<_, Vec<_>> = peers
+                .iter()
+                .map(|(loc, conns)| {
+                    let conns: Vec<_> = conns
+                        .iter()
+                        .filter(|conn| !live_tx_tracker.has_live_connection(&conn.location.peer))
+                        .cloned()
+                        .collect();
+                    (*loc, conns)
+                })
+                .filter(|(_, conns)| !conns.is_empty())
+                .collect();
+
+            if neighbor_locations.is_empty() && connections_considered > 0 {
+                tracing::warn!(
                     current_connections,
-                    peers.len(),
-                    live_tx_tracker.len()
+                    connections_considered,
+                    live_tx_peers = live_tx_tracker.len(),
+                    "Neighbor filtering removed all candidates; using all connections"
                 );
-                peers
+
+                neighbor_locations = peers
                     .iter()
-                    .map(|(loc, conns)| {
-                        let conns: Vec<_> = conns
-                            .iter()
-                            .filter(|conn| {
-                                conn.open_at.elapsed() > CONNECTION_AGE_THRESOLD
-                                    && !live_tx_tracker.has_live_connection(&conn.location.peer)
-                            })
-                            .cloned()
-                            .collect();
-                        (*loc, conns)
-                    })
+                    .map(|(loc, conns)| (*loc, conns.clone()))
                     .filter(|(_, conns)| !conns.is_empty())
-                    .collect()
-            };
+                    .collect();
+            }
+
+            if current_connections > self.connection_manager.max_connections {
+                // When over capacity, consider all connections for removal regardless of live_tx filter.
+                neighbor_locations = peers.clone();
+            }
+
+            tracing::debug!(
+                "Maintenance task: current connections = {}, candidates = {}, live_tx_peers = {}",
+                current_connections,
+                peers.len(),
+                live_tx_tracker.len()
+            );
 
             let adjustment = self
                 .connection_manager
@@ -589,7 +602,7 @@ impl Ring {
         live_tx_tracker: &LiveTransactionTracker,
         op_manager: &Arc<OpManager>,
     ) -> anyhow::Result<Option<Transaction>> {
-        let current_connections = self.connection_manager.get_open_connections();
+        let current_connections = self.connection_manager.connection_count();
         let is_gateway = self.is_gateway;
 
         tracing::info!(

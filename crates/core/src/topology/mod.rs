@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     time::Instant,
 };
-use tracing::{debug, error, event, info, span, Level};
+use tracing::{debug, error, event, info, span, warn, Level};
 
 pub mod connection_evaluator;
 mod constants;
@@ -449,6 +449,28 @@ impl TopologyManager {
             }
         }
 
+        if current_connections > self.limits.max_connections {
+            let mut adj = adjustment.unwrap_or(TopologyAdjustment::NoChange);
+            if matches!(adj, TopologyAdjustment::NoChange) {
+                if let Some(peer) = select_fallback_peer_to_drop(neighbor_locations, my_location) {
+                    info!(
+                        current_connections,
+                        max_allowed = self.limits.max_connections,
+                        %peer.peer,
+                        "Enforcing max-connections cap via fallback removal"
+                    );
+                    adj = TopologyAdjustment::RemoveConnections(vec![peer]);
+                } else {
+                    warn!(
+                        current_connections,
+                        max_allowed = self.limits.max_connections,
+                        "Over capacity but no removable peer found; leaving topology unchanged"
+                    );
+                }
+            }
+            return adj;
+        }
+
         adjustment.unwrap_or(TopologyAdjustment::NoChange)
     }
 
@@ -582,6 +604,30 @@ impl TopologyManager {
             TopologyAdjustment::NoChange
         }
     }
+}
+
+fn select_fallback_peer_to_drop(
+    neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+    my_location: &Option<Location>,
+) -> Option<PeerKeyLocation> {
+    let mut candidate: Option<(PeerKeyLocation, f64)> = None;
+    for (loc, conns) in neighbor_locations.iter() {
+        for conn in conns {
+            let score = match my_location {
+                Some(me) => me.distance(*loc).as_f64(),
+                None => 0.0,
+            };
+            if let Some((_, best_score)) = &mut candidate {
+                if score > *best_score {
+                    *best_score = score;
+                    candidate = Some((conn.location.clone(), score));
+                }
+            } else {
+                candidate = Some((conn.location.clone(), score));
+            }
+        }
+    }
+    candidate.map(|(peer, _)| peer)
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
