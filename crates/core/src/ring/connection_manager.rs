@@ -426,6 +426,22 @@ impl ConnectionManager {
         let previous_location = lop.insert(peer.clone(), loc);
         drop(lop);
 
+        // Enforce the global cap when adding a new peer (not a relocation).
+        if previous_location.is_none() && self.connection_count() >= self.max_connections {
+            tracing::warn!(
+                %peer,
+                %loc,
+                max = self.max_connections,
+                "add_connection: rejecting new connection to enforce cap"
+            );
+            // Roll back bookkeeping since we're refusing the connection.
+            self.location_for_peer.write().remove(&peer);
+            if was_reserved {
+                self.pending_reservations.write().remove(&peer);
+            }
+            return;
+        }
+
         if let Some(prev_loc) = previous_location {
             tracing::info!(
                 %peer,
