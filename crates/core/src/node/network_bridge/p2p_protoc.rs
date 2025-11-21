@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
@@ -665,13 +665,13 @@ impl P2pConnManager {
                                 peer,
                                 tx,
                                 callback,
-                                is_gw: transient,
+                                is_gw: courtesy,
                             } => {
                                 tracing::info!(
                                     tx = %tx,
                                     remote = %peer,
                                     remote_addr = %peer.addr,
-                                    transient,
+                                    courtesy,
                                     "NodeEvent::ConnectPeer received"
                                 );
                                 ctx.handle_connect_peer(
@@ -680,7 +680,7 @@ impl P2pConnManager {
                                     tx,
                                     &handshake_cmd_sender,
                                     &mut state,
-                                    transient,
+                                    courtesy,
                                 )
                                 .await?;
                             }
@@ -691,7 +691,7 @@ impl P2pConnManager {
                                     .send(HandshakeCommand::ExpectInbound {
                                         peer: peer.clone(),
                                         transaction: None,
-                                        transient: false,
+                                        courtesy: false,
                                     })
                                     .await
                                 {
@@ -1215,7 +1215,7 @@ impl P2pConnManager {
         tx: Transaction,
         handshake_commands: &HandshakeCommandSender,
         state: &mut EventListenerState,
-        transient: bool,
+        courtesy: bool,
     ) -> anyhow::Result<()> {
         let mut peer = peer;
         let mut peer_addr = peer.addr;
@@ -1228,13 +1228,13 @@ impl P2pConnManager {
                     tx = %tx,
                     remote = %peer,
                     fallback_addr = %peer_addr,
-                    transient,
+                    courtesy,
                     "ConnectPeer provided unspecified address; using existing connection address"
                 );
             } else {
                 tracing::debug!(
                     tx = %tx,
-                    transient,
+                    courtesy,
                     "ConnectPeer received unspecified address without existing connection reference"
                 );
             }
@@ -1244,7 +1244,7 @@ impl P2pConnManager {
             tx = %tx,
             remote = %peer,
             remote_addr = %peer_addr,
-            transient,
+            courtesy,
             "Connecting to peer"
         );
         if let Some(blocked_addrs) = &self.blocked_addresses {
@@ -1275,57 +1275,77 @@ impl P2pConnManager {
             );
         }
 
-        // If a transient transport already exists, promote it without dialing anew.
+        // If we already have a transport channel, reuse it instead of dialing again. This covers
+        // transient->normal promotion without tripping duplicate connection errors.
         if self.connections.contains_key(&peer) {
             tracing::info!(
                 tx = %tx,
                 remote = %peer,
-                transient,
-                "connect_peer: reusing existing transport / promoting transient if present"
+                courtesy,
+                "connect_peer: reusing existing transport"
             );
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             if let Some(entry) = connection_manager.drop_transient(&peer) {
                 let loc = entry
                     .location
                     .unwrap_or_else(|| Location::from_address(&peer.addr));
-                if connection_manager.should_accept(loc, &peer) {
-                    let current = connection_manager.num_connections();
-                    if current >= connection_manager.max_connections {
-                        tracing::warn!(
-                            tx = %tx,
-                            remote = %peer,
-                            current_connections = current,
-                            max_connections = connection_manager.max_connections,
-                            %loc,
-                            "connect_peer: transient promotion rejected due to capacity"
-                        );
-                    } else {
-                        self.bridge
-                            .op_manager
-                            .ring
-                            .add_connection(loc, peer.clone(), true)
-                            .await;
-                        tracing::info!(
-                            tx = %tx,
-                            remote = %peer,
-                            %loc,
-                            "connect_peer: promoted transient after admission check"
-                        );
-                    }
-                } else {
+                // Re-run admission + cap guard when promoting a transient connection.
+                let should_accept = connection_manager.should_accept(loc, &peer);
+                if !should_accept {
                     tracing::warn!(
                         tx = %tx,
-                        remote = %peer,
+                        %peer,
                         %loc,
-                        "connect_peer: transient failed admission on promotion"
+                        "connect_peer: promotion rejected by admission logic"
                     );
+                    callback
+                        .send_result(Err(()))
+                        .await
+                        .inspect_err(|err| {
+                            tracing::debug!(
+                                tx = %tx,
+                                remote = %peer,
+                                ?err,
+                                "connect_peer: failed to notify rejected-promotion callback"
+                            );
+                        })
+                        .ok();
+                    return Ok(());
                 }
+                let current = connection_manager.connection_count();
+                if current >= connection_manager.max_connections {
+                    tracing::warn!(
+                        tx = %tx,
+                        %peer,
+                        current_connections = current,
+                        max_connections = connection_manager.max_connections,
+                        %loc,
+                        "connect_peer: rejecting transient promotion to enforce cap"
+                    );
+                    callback
+                        .send_result(Err(()))
+                        .await
+                        .inspect_err(|err| {
+                            tracing::debug!(
+                                tx = %tx,
+                                remote = %peer,
+                                ?err,
+                                "connect_peer: failed to notify cap-rejection callback"
+                            );
+                        })
+                        .ok();
+                    return Ok(());
+                }
+                self.bridge
+                    .op_manager
+                    .ring
+                    .add_connection(loc, peer.clone(), true)
+                    .await;
+                tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
             }
 
-            // Return the remote peer we are connected to (not our own peer key).
-            let resolved_peer_id = peer.clone();
             callback
-                .send_result(Ok((resolved_peer_id, None)))
+                .send_result(Ok((peer.clone(), None)))
                 .await
                 .inspect_err(|err| {
                     tracing::debug!(
@@ -1349,7 +1369,7 @@ impl P2pConnManager {
                     tx = %tx,
                     remote = %peer_addr,
                     pending = callbacks.get().len(),
-                    transient,
+                    courtesy,
                     "Connection already pending, queuing additional requester"
                 );
                 callbacks.get_mut().push(callback);
@@ -1358,7 +1378,7 @@ impl P2pConnManager {
                     remote = %peer_addr,
                     pending = callbacks.get().len(),
                     pending_txs = ?txs_entry,
-                    transient,
+                    courtesy,
                     "connect_peer: connection already pending, queued callback"
                 );
                 return Ok(());
@@ -1369,7 +1389,7 @@ impl P2pConnManager {
                 tracing::debug!(
                         tx = %tx,
                     remote = %peer_addr,
-                    transient,
+                    courtesy,
                     "connect_peer: registering new pending connection"
                 );
                 entry.insert(vec![callback]);
@@ -1378,7 +1398,7 @@ impl P2pConnManager {
                 remote = %peer_addr,
                 pending = 1,
                     pending_txs = ?txs_entry,
-                    transient,
+                    courtesy,
                     "connect_peer: registered new pending connection"
                 );
                 state.outbound_handler.expect_incoming(peer_addr);
@@ -1389,14 +1409,14 @@ impl P2pConnManager {
             .send(HandshakeCommand::Connect {
                 peer: peer.clone(),
                 transaction: tx,
-                transient,
+                courtesy,
             })
             .await
         {
             tracing::warn!(
                 tx = %tx,
                 remote = %peer.addr,
-                transient,
+                courtesy,
                 ?error,
                 "Failed to enqueue connect command"
             );
@@ -1411,7 +1431,7 @@ impl P2pConnManager {
                     tx = %tx,
                     remote = %peer_addr,
                     callbacks = callbacks.len(),
-                    transient,
+                    courtesy,
                     "Cleaning up callbacks after connect command failure"
                 );
                 for mut cb in callbacks {
@@ -1438,7 +1458,7 @@ impl P2pConnManager {
             tracing::debug!(
                 tx = %tx,
                 remote = %peer_addr,
-                transient,
+                courtesy,
                 "connect_peer: handshake command dispatched"
             );
         }
@@ -1457,7 +1477,7 @@ impl P2pConnManager {
                 transaction,
                 peer,
                 connection,
-                transient,
+                courtesy,
             } => {
                 let conn_manager = &self.bridge.op_manager.ring.connection_manager;
                 let remote_addr = connection.remote_addr();
@@ -1466,7 +1486,7 @@ impl P2pConnManager {
                     if blocked_addrs.contains(&remote_addr) {
                         tracing::info!(
                             remote = %remote_addr,
-                            transient,
+                            courtesy,
                             transaction = ?transaction,
                             "Inbound connection blocked by local policy"
                         );
@@ -1478,7 +1498,7 @@ impl P2pConnManager {
                 let peer_id = peer.unwrap_or_else(|| {
                     tracing::info!(
                         remote = %remote_addr,
-                        transient,
+                        courtesy,
                         transaction = ?transaction,
                         "Inbound connection arrived without matching expectation; accepting provisionally"
                     );
@@ -1496,7 +1516,7 @@ impl P2pConnManager {
 
                 tracing::info!(
                     remote = %peer_id.addr,
-                    transient,
+                    courtesy,
                     transaction = ?transaction,
                     "Inbound connection established"
                 );
@@ -1511,11 +1531,11 @@ impl P2pConnManager {
                 transaction,
                 peer,
                 connection,
-                transient,
+                courtesy,
             } => {
                 tracing::info!(
                     remote = %peer.addr,
-                    transient,
+                    courtesy,
                     transaction = %transaction,
                     "Outbound connection established"
                 );
@@ -1526,11 +1546,11 @@ impl P2pConnManager {
                 transaction,
                 peer,
                 error,
-                transient,
+                courtesy,
             } => {
                 tracing::info!(
                     remote = %peer.addr,
-                    transient,
+                    courtesy,
                     transaction = %transaction,
                     ?error,
                     "Outbound connection failed"
@@ -1552,7 +1572,7 @@ impl P2pConnManager {
                         remote = %peer.addr,
                         callbacks = callbacks.len(),
                         pending_txs = ?pending_txs,
-                        transient,
+                        courtesy,
                         "Notifying callbacks after outbound failure"
                     );
 
@@ -1644,14 +1664,9 @@ impl P2pConnManager {
                 current = connection_manager.transient_count(),
                 "Transient connection budget exhausted; dropping inbound connection"
             );
-            if let Some(callbacks) = state.awaiting_connection.remove(&peer_id.addr) {
-                for mut cb in callbacks {
-                    let _ = cb.send_result(Err(())).await;
-                }
-            }
-            state.awaiting_connection_txs.remove(&peer_id.addr);
             return Ok(());
         }
+
         let pending_txs = state
             .awaiting_connection_txs
             .remove(&peer_id.addr)
@@ -1714,19 +1729,6 @@ impl P2pConnManager {
         // Only insert if connection doesn't already exist to avoid dropping existing channel
         let mut newly_inserted = false;
         if !self.connections.contains_key(&peer_id) {
-            if is_transient {
-                let cm = &self.bridge.op_manager.ring.connection_manager;
-                let current = cm.transient_count();
-                if current >= cm.transient_budget() {
-                    tracing::warn!(
-                        remote = %peer_id.addr,
-                        budget = cm.transient_budget(),
-                        current,
-                        "Transient connection budget exhausted; dropping inbound connection before insert"
-                    );
-                    return Ok(());
-                }
-            }
             let (tx, rx) = mpsc::channel(10);
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] INSERT: OutboundConnectionSuccessful - adding to connections HashMap");
             self.connections.insert(peer_id.clone(), tx);
@@ -1742,20 +1744,15 @@ impl P2pConnManager {
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] SKIP INSERT: OutboundConnectionSuccessful - connection already exists in HashMap");
         }
 
-        let promote_to_ring = !is_transient || connection_manager.is_gateway();
-
         if newly_inserted {
             let pending_loc = connection_manager.prune_in_transit_connection(&peer_id);
-            if promote_to_ring {
+            if !is_transient {
                 let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
                 self.bridge
                     .op_manager
                     .ring
                     .add_connection(loc, peer_id.clone(), false)
                     .await;
-                if is_transient {
-                    connection_manager.drop_transient(&peer_id);
-                }
             } else {
                 // Update location now that we know it; budget was reserved before any work.
                 connection_manager.try_register_transient(peer_id.clone(), pending_loc);
@@ -1768,18 +1765,14 @@ impl P2pConnManager {
                 let cm = connection_manager.clone();
                 let peer = peer_id.clone();
                 tokio::spawn(async move {
-                    sleep(ttl).await;
+                    tokio::time::sleep(ttl).await;
                     if cm.drop_transient(&peer).is_some() {
                         tracing::info!(%peer, "Transient connection expired; dropping");
                         if let Err(err) = drop_tx
                             .send(Right(NodeEvent::DropConnection(peer.clone())))
                             .await
                         {
-                            tracing::warn!(
-                                %peer,
-                                ?err,
-                                "Failed to dispatch DropConnection for expired transient"
-                            );
+                            tracing::warn!(%peer, ?err, "Failed to dispatch DropConnection for expired transient");
                         }
                     }
                 });
