@@ -543,7 +543,7 @@ impl ConnectionManager {
             .sum()
     }
 
-    pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
+    pub(crate) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
         self.connections_by_location.read().clone()
     }
 
