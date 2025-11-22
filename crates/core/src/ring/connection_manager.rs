@@ -202,23 +202,6 @@ impl ConnectionManager {
             return true;
         }
 
-        const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 2;
-        if self.is_gateway {
-            let direct_total = open + reserved_before;
-            if direct_total >= GATEWAY_DIRECT_ACCEPT_LIMIT {
-                tracing::info!(
-                    %peer_id,
-                    open,
-                    reserved_before,
-                    limit = GATEWAY_DIRECT_ACCEPT_LIMIT,
-                    "Gateway reached direct-accept limit; forwarding join request instead"
-                );
-                self.pending_reservations.write().remove(peer_id);
-                tracing::info!(%peer_id, "should_accept: gateway direct-accept limit hit, forwarding instead");
-                return false;
-            }
-        }
-
         let accepted = if total_conn < self.min_connections {
             tracing::info!(%peer_id, total_conn, "should_accept: accepted (below min connections)");
             true
