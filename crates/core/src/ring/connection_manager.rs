@@ -420,10 +420,7 @@ impl ConnectionManager {
         tracing::info!(%peer, %loc, %was_reserved, "Adding connection to topology");
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
         if was_reserved {
-            let old = self
-                .pending_reservations
-                .write()
-                .remove(&peer);
+            let old = self.pending_reservations.write().remove(&peer);
             if old.is_none() {
                 tracing::warn!(%peer, "add_connection: expected pending reservation missing");
             }
