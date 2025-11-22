@@ -226,24 +226,6 @@ impl ConnectionManager {
             return true;
         }
 
-        const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 2;
-        if self.is_gateway {
-            let direct_total = open + reserved_before;
-            if direct_total >= GATEWAY_DIRECT_ACCEPT_LIMIT {
-                tracing::info!(
-                    %peer_id,
-                    open,
-                    reserved_before,
-                    limit = GATEWAY_DIRECT_ACCEPT_LIMIT,
-                    "Gateway reached direct-accept limit; forwarding join request instead"
-                );
-                self.reserved_connections
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                tracing::info!(%peer_id, "should_accept: gateway direct-accept limit hit, forwarding instead");
-                return false;
-            }
-        }
-
         if self.location_for_peer.read().get(peer_id).is_some() {
             // We've already accepted this peer (pending or active); treat as a no-op acceptance.
             tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
