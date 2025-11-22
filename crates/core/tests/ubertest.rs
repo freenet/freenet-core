@@ -186,6 +186,8 @@ async fn create_peer_config(
             ignore_protocol_checking: true,
             address: Some(peer_ip.into()),
             network_port: Some(network_port),
+            min_connections: None,
+            max_connections: None,
             bandwidth_limit: None,
             blocked_addresses: None,
             transient_budget: None,

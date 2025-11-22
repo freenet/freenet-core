@@ -4,7 +4,6 @@
 //! and routes requests to the optimal peers.
 
 use std::collections::{BTreeSet, HashSet};
-use std::net::SocketAddr;
 use std::{
     sync::{atomic::AtomicU64, Arc, Weak},
     time::{Duration, Instant},
@@ -606,13 +605,18 @@ impl Ring {
                 %ideal_location,
                 num_connections,
                 skip_list_size = skip_list.len(),
+                self_peer = %self.connection_manager.get_peer_key().as_ref().map(|id| id.to_string()).unwrap_or_else(|| "unknown".into()),
                 "Looking for peer to route through"
             );
             if let Some(target) =
                 self.connection_manager
                     .routing(ideal_location, None, skip_list, &router)
             {
-                tracing::debug!(query_target = %target, "Found routing target");
+                tracing::info!(
+                    query_target = %target,
+                    %ideal_location,
+                    "connection_maintenance selected routing target"
+                );
                 target
             } else {
                 tracing::warn!(

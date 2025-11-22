@@ -90,7 +90,7 @@ arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
-freenet-test-network = "0.1.1"
+freenet-test-network = "0.1.3"
 httptest = "0.16"
 statrs = "0.18"
 tempfile = "3"
@@ -100,6 +100,7 @@ tokio-tungstenite = "0.27.0"
 # console-subscriber = { version = "0.4" }
 ureq = { version = "3.1", features = ["json"] }
 which = "8.0"
+regex = "1"
 
 [features]
 default = ["redb", "trace", "websocket"]
