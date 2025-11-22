@@ -565,6 +565,11 @@ impl ConnectionManager {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn get_reserved_connections(&self) -> usize {
+        self.reserved_connections
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
         self.connections_by_location.read().clone()
     }
@@ -612,5 +617,9 @@ impl ConnectionManager {
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
         read.keys().cloned().collect::<Vec<_>>().into_iter()
+    }
+
+    pub fn has_connection_or_pending(&self, peer: &PeerId) -> bool {
+        self.location_for_peer.read().contains_key(peer)
     }
 }
