@@ -49,11 +49,15 @@ impl ConnectionManager {
             Ring::DEFAULT_MIN_CONNECTIONS
         };
 
-        let max_connections = if let Some(v) = config.max_number_conn {
+        let mut max_connections = if let Some(v) = config.max_number_conn {
             v
         } else {
             Ring::DEFAULT_MAX_CONNECTIONS
         };
+        // Gateways benefit from a wider neighbor set for forwarding; default to a higher cap when unset.
+        if config.is_gateway && config.max_number_conn.is_none() {
+            max_connections = 20;
+        }
 
         let max_upstream_bandwidth = if let Some(v) = config.max_upstream_bandwidth {
             v
@@ -200,23 +204,6 @@ impl ConnectionManager {
         if open == 0 {
             tracing::debug!(%peer_id, "should_accept: first connection -> accepting");
             return true;
-        }
-
-        const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 2;
-        if self.is_gateway {
-            let direct_total = open + reserved_before;
-            if direct_total >= GATEWAY_DIRECT_ACCEPT_LIMIT {
-                tracing::info!(
-                    %peer_id,
-                    open,
-                    reserved_before,
-                    limit = GATEWAY_DIRECT_ACCEPT_LIMIT,
-                    "Gateway reached direct-accept limit; forwarding join request instead"
-                );
-                self.pending_reservations.write().remove(peer_id);
-                tracing::info!(%peer_id, "should_accept: gateway direct-accept limit hit, forwarding instead");
-                return false;
-            }
         }
 
         let accepted = if total_conn < self.min_connections {
@@ -472,7 +459,7 @@ impl ConnectionManager {
     }
 
     pub fn update_peer_identity(&self, old_peer: &PeerId, new_peer: PeerId) -> bool {
-        if old_peer == &new_peer {
+        if old_peer.addr == new_peer.addr && old_peer.pub_key == new_peer.pub_key {
             tracing::debug!(%old_peer, "update_peer_identity: identical peers; skipping");
             return false;
         }
@@ -575,29 +562,67 @@ impl ConnectionManager {
         skip_list: impl Contains<PeerId>,
         router: &Router,
     ) -> Option<PeerKeyLocation> {
+        let candidates = self.routing_candidates(target, requesting, skip_list);
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        router.select_peer(candidates.iter(), target).cloned()
+    }
+
+    /// Gather routing candidates after applying skip/transient filters.
+    pub fn routing_candidates(
+        &self,
+        target: Location,
+        requesting: Option<&PeerId>,
+        skip_list: impl Contains<PeerId>,
+    ) -> Vec<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
-        tracing::debug!(
-            total_locations = connections.len(),
-            self_peer = self
-                .get_peer_key()
-                .as_ref()
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "unknown".into()),
-            "routing: considering connections"
-        );
-        let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::rng())?;
-            if self.is_transient(&conn.location.peer) {
-                return None;
-            }
-            if let Some(requester) = requesting {
-                if requester == &conn.location.peer {
+        let candidates: Vec<PeerKeyLocation> = connections
+            .values()
+            .filter_map(|conns| {
+                let conn = conns.choose(&mut rand::rng())?;
+                if self.is_transient(&conn.location.peer) {
                     return None;
                 }
-            }
-            (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
-        });
-        router.select_peer(peers, target).cloned()
+                if let Some(requester) = requesting {
+                    if requester == &conn.location.peer {
+                        return None;
+                    }
+                }
+                (!skip_list.has_element(conn.location.peer.clone()))
+                    .then_some(conn.location.clone())
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            tracing::info!(
+                total_locations = connections.len(),
+                candidates = 0,
+                target = %target,
+                self_peer = self
+                    .get_peer_key()
+                    .as_ref()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                "routing: no non-transient candidates"
+            );
+        } else {
+            tracing::info!(
+                total_locations = connections.len(),
+                candidates = candidates.len(),
+                target = %target,
+                self_peer = self
+                    .get_peer_key()
+                    .as_ref()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                "routing: selecting next hop"
+            );
+        }
+
+        candidates
     }
 
     pub fn num_connections(&self) -> usize {

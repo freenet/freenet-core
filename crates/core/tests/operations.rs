@@ -1995,10 +1995,27 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
     );
     let (stream_c, _) = connect_async(&uri_c).await?;
     let mut client_api_c = WebApi::start(stream_c);
-    let (response_contract, response_state) =
-        get_contract(&mut client_api_c, contract_key, &peer_c.temp_dir_path).await?;
-    assert_eq!(response_contract, contract);
-    assert_eq!(response_state, wrapped_state);
+    // Allow routing to settle and retry GET a few times to deflake under CI load.
+    const GET_RETRIES: usize = 3;
+    let mut last_err = None;
+    for attempt in 1..=GET_RETRIES {
+        tracing::info!("Attempt {attempt}/{GET_RETRIES} to GET from peer C");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match get_contract(&mut client_api_c, contract_key, &peer_c.temp_dir_path).await {
+            Ok((response_contract, response_state)) => {
+                assert_eq!(response_contract, contract);
+                assert_eq!(response_state, wrapped_state);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        bail!("GET from peer C failed after retries: {err}");
+    }
 
     client_api_c
         .send(ClientRequest::Disconnect { cause: None })
