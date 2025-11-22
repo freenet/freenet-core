@@ -4,7 +4,6 @@
 //! and routes requests to the optimal peers.
 
 use std::collections::{BTreeSet, HashSet};
-use std::net::SocketAddr;
 use std::{
     sync::{atomic::AtomicU64, Arc, Weak},
     time::{Duration, Instant},
@@ -483,8 +482,10 @@ impl Ring {
             let neighbor_locations = {
                 let peers = self.connection_manager.get_connections_by_location();
                 tracing::debug!(
-                    "Maintenance task: current connections = {}, checking topology",
-                    current_connections
+                    "Maintenance task: current connections = {}, candidates = {}, live_tx_peers = {}",
+                    current_connections,
+                    peers.len(),
+                    live_tx_tracker.len()
                 );
                 peers
                     .iter()
