@@ -576,6 +576,7 @@ impl ConnectionManager {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_reserved_connections(&self) -> usize {
         self.reserved_connections
             .load(std::sync::atomic::Ordering::SeqCst)

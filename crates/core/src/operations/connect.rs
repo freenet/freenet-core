@@ -77,20 +77,30 @@ impl InnerMessage for ConnectMsg {
 impl fmt::Display for ConnectMsg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConnectMsg::Request { target, payload, .. } => write!(
+            ConnectMsg::Request {
+                target, payload, ..
+            } => write!(
                 f,
                 "ConnectRequest {{ target: {target}, desired: {}, ttl: {}, joiner: {} }}",
-                payload.desired_location,
-                payload.ttl,
-                payload.joiner
+                payload.desired_location, payload.ttl, payload.joiner
             ),
-            ConnectMsg::Response { sender, target, payload, .. } => write!(
+            ConnectMsg::Response {
+                sender,
+                target,
+                payload,
+                ..
+            } => write!(
                 f,
                 "ConnectResponse {{ sender: {sender}, target: {target}, acceptor: {} }}",
                 payload.acceptor,
             ),
-            ConnectMsg::ObservedAddress { target, address, .. } => {
-                write!(f, "ObservedAddress {{ target: {target}, address: {address} }}")
+            ConnectMsg::ObservedAddress {
+                target, address, ..
+            } => {
+                write!(
+                    f,
+                    "ObservedAddress {{ target: {target}, address: {address} }}"
+                )
             }
         }
     }
@@ -226,8 +236,11 @@ impl RelayState {
         }
 
         if self.forwarded_to.is_none() && self.request.ttl > 0 {
-            match ctx.select_next_hop(self.request.desired_location, &self.request.visited, recency)
-            {
+            match ctx.select_next_hop(
+                self.request.desired_location,
+                &self.request.visited,
+                recency,
+            ) {
                 Some(next) => {
                     let dist = ring_distance(next.location, Some(self.request.desired_location));
                     tracing::info!(
@@ -299,11 +312,11 @@ impl RelayContext for RelayEnv<'_> {
     ) -> Option<PeerKeyLocation> {
         let skip = VisitedPeerIds { peers: visited };
         let router = self.op_manager.ring.router.read();
-        let candidates = self
-            .op_manager
-            .ring
-            .connection_manager
-            .routing_candidates(desired_location, None, skip);
+        let candidates = self.op_manager.ring.connection_manager.routing_candidates(
+            desired_location,
+            None,
+            skip,
+        );
 
         // Prefer least recently forwarded peers. Missing recency wins; otherwise pick the oldest
         // recency bucket, then let the router choose among that bucket. This keeps routing bias
@@ -334,7 +347,6 @@ impl RelayContext for RelayEnv<'_> {
             router.select_peer(best.iter(), desired_location).cloned()
         }
     }
-
 }
 
 #[derive(Debug)]
@@ -1079,7 +1091,8 @@ mod tests {
         };
 
         let ctx = TestRelayContext::new(self_loc.clone());
-        let actions = state.handle_request(&ctx, &joiner);
+        let recency = HashMap::new();
+        let actions = state.handle_request(&ctx, &joiner, &recency);
 
         let response = actions.accept_response.expect("expected acceptance");
         assert_eq!(response.acceptor.peer, self_loc.peer);
@@ -1109,7 +1122,8 @@ mod tests {
         let ctx = TestRelayContext::new(self_loc)
             .accept(false)
             .next_hop(Some(next_hop.clone()));
-        let actions = state.handle_request(&ctx, &joiner);
+        let recency = HashMap::new();
+        let actions = state.handle_request(&ctx, &joiner, &recency);
 
         assert!(actions.accept_response.is_none());
         let (forward_to, request) = actions.forward.expect("expected forward");
@@ -1141,7 +1155,8 @@ mod tests {
         };
 
         let ctx = TestRelayContext::new(self_loc);
-        let actions = state.handle_request(&ctx, &joiner);
+        let recency = HashMap::new();
+        let actions = state.handle_request(&ctx, &joiner, &recency);
 
         let (target, addr) = actions
             .observed_address
