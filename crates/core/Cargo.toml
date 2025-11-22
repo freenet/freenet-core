@@ -90,7 +90,7 @@ arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
-freenet-test-network = { version = "0.1.2", path = "../../../../freenet-test-network" }
+freenet-test-network = "0.1.3"
 httptest = "0.16"
 statrs = "0.18"
 tempfile = "3"
