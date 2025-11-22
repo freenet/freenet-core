@@ -49,3 +49,4 @@ async fn gateway_records_real_peer_ids_on_inbound() -> anyhow::Result<()> {
 
     Ok(())
 }
+
