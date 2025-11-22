@@ -697,7 +697,7 @@ impl P2pConnManager {
                                     .send(HandshakeCommand::ExpectInbound {
                                         peer: peer.clone(),
                                         transaction: None,
-                                        transient: false,
+                                        courtesy: false,
                                     })
                                     .await
                                 {
@@ -1385,7 +1385,7 @@ impl P2pConnManager {
             .send(HandshakeCommand::Connect {
                 peer: peer.clone(),
                 transaction: tx,
-                transient,
+                courtesy: transient,
             })
             .await
         {
@@ -1453,9 +1453,9 @@ impl P2pConnManager {
                 transaction,
                 peer,
                 connection,
-                transient,
+                courtesy,
             } => {
-                tracing::info!(provided = ?peer, transient = transient, tx = ?transaction, "InboundConnection event");
+                tracing::info!(provided = ?peer, transient = courtesy, tx = ?transaction, "InboundConnection event");
                 let _conn_manager = &self.bridge.op_manager.ring.connection_manager;
                 let remote_addr = connection.remote_addr();
 
@@ -1463,7 +1463,7 @@ impl P2pConnManager {
                     if blocked_addrs.contains(&remote_addr) {
                         tracing::info!(
                             remote = %remote_addr,
-                            transient = transient,
+                            transient = courtesy,
                             transaction = ?transaction,
                             "Inbound connection blocked by local policy"
                         );
@@ -1475,7 +1475,7 @@ impl P2pConnManager {
                 let peer_id = peer.unwrap_or_else(|| {
                     tracing::info!(
                         remote = %remote_addr,
-                        transient = transient,
+                        transient = courtesy,
                         transaction = ?transaction,
                         "Inbound connection arrived without matching expectation; accepting provisionally"
                     );
@@ -1493,14 +1493,14 @@ impl P2pConnManager {
 
                 tracing::info!(
                     remote = %peer_id.addr,
-                    transient = transient,
+                    transient = courtesy,
                     transaction = ?transaction,
                     "Inbound connection established"
                 );
 
                 // Treat only transient connections as transient. Normal inbound dials (including
                 // gateway bootstrap from peers) should be promoted into the ring once established.
-                let is_transient = transient;
+                let is_transient = courtesy;
 
                 self.handle_successful_connection(peer_id, connection, state, None, is_transient)
                     .await?;
@@ -1509,11 +1509,11 @@ impl P2pConnManager {
                 transaction,
                 peer,
                 connection,
-                transient,
+                courtesy,
             } => {
                 tracing::info!(
                     remote = %peer.addr,
-                    transient = transient,
+                    transient = courtesy,
                     transaction = %transaction,
                     "Outbound connection established"
                 );
@@ -1524,11 +1524,11 @@ impl P2pConnManager {
                 transaction,
                 peer,
                 error,
-                transient,
+                courtesy,
             } => {
                 tracing::info!(
                     remote = %peer.addr,
-                    transient = transient,
+                    transient = courtesy,
                     transaction = %transaction,
                     ?error,
                     "Outbound connection failed"
@@ -1550,7 +1550,7 @@ impl P2pConnManager {
                         remote = %peer.addr,
                         callbacks = callbacks.len(),
                         pending_txs = ?pending_txs,
-                        transient,
+                        transient = courtesy,
                         "Notifying callbacks after outbound failure"
                     );
 
