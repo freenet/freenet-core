@@ -597,29 +597,67 @@ impl ConnectionManager {
         skip_list: impl Contains<PeerId>,
         router: &Router,
     ) -> Option<PeerKeyLocation> {
+        let candidates = self.routing_candidates(target, requesting, skip_list);
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        router.select_peer(candidates.iter(), target).cloned()
+    }
+
+    /// Gather routing candidates after applying skip/transient filters.
+    pub fn routing_candidates(
+        &self,
+        target: Location,
+        requesting: Option<&PeerId>,
+        skip_list: impl Contains<PeerId>,
+    ) -> Vec<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
-        tracing::debug!(
-            total_locations = connections.len(),
-            self_peer = self
-                .get_peer_key()
-                .as_ref()
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "unknown".into()),
-            "routing: considering connections"
-        );
-        let peers = connections.values().filter_map(|conns| {
-            let conn = conns.choose(&mut rand::rng())?;
-            if self.is_transient(&conn.location.peer) {
-                return None;
-            }
-            if let Some(requester) = requesting {
-                if requester == &conn.location.peer {
+        let candidates: Vec<PeerKeyLocation> = connections
+            .values()
+            .filter_map(|conns| {
+                let conn = conns.choose(&mut rand::rng())?;
+                if self.is_transient(&conn.location.peer) {
                     return None;
                 }
-            }
-            (!skip_list.has_element(conn.location.peer.clone())).then_some(&conn.location)
-        });
-        router.select_peer(peers, target).cloned()
+                if let Some(requester) = requesting {
+                    if requester == &conn.location.peer {
+                        return None;
+                    }
+                }
+                (!skip_list.has_element(conn.location.peer.clone()))
+                    .then_some(conn.location.clone())
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            tracing::info!(
+                total_locations = connections.len(),
+                candidates = 0,
+                target = %target,
+                self_peer = self
+                    .get_peer_key()
+                    .as_ref()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                "routing: no non-transient candidates"
+            );
+        } else {
+            tracing::info!(
+                total_locations = connections.len(),
+                candidates = candidates.len(),
+                target = %target,
+                self_peer = self
+                    .get_peer_key()
+                    .as_ref()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                "routing: selecting next hop"
+            );
+        }
+
+        candidates
     }
 
     pub fn num_connections(&self) -> usize {
