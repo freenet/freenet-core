@@ -1794,10 +1794,12 @@ impl P2pConnManager {
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] SKIP INSERT: OutboundConnectionSuccessful - connection already exists in HashMap");
         }
 
+        let promote_to_ring = !is_transient || connection_manager.is_gateway();
+
         if newly_inserted {
             tracing::info!(remote = %peer_id, is_transient, "handle_successful_connection: inserted new connection entry");
             let pending_loc = connection_manager.prune_in_transit_connection(&peer_id);
-            if !is_transient {
+            if promote_to_ring {
                 let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
                 // Re-apply admission logic on promotion to avoid bypassing capacity/heuristic checks.
                 let should_accept = connection_manager.should_accept(loc, &peer_id);
@@ -1826,6 +1828,9 @@ impl P2pConnManager {
                     .ring
                     .add_connection(loc, peer_id.clone(), true)
                     .await;
+                if is_transient {
+                    connection_manager.drop_transient(&peer_id);
+                }
             } else {
                 // Update location now that we know it; budget was reserved before any work.
                 connection_manager.try_register_transient(peer_id.clone(), pending_loc);
