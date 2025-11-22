@@ -543,10 +543,12 @@ impl ConnectionManager {
             .sum()
     }
 
+    #[allow(dead_code)]
     pub(super) fn get_open_connections(&self) -> usize {
         self.connection_count()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_reserved_connections(&self) -> usize {
         self.pending_reservations.read().len()
     }
