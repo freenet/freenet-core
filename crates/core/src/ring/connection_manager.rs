@@ -559,6 +559,21 @@ impl ConnectionManager {
             .sum()
     }
 
+    #[allow(dead_code)]
+    pub(super) fn get_open_connections(&self) -> usize {
+        self.connection_count()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get_reserved_connections(&self) -> usize {
+        self.pending_reservations.read().len()
+    }
+
+    pub fn has_connection_or_pending(&self, peer: &PeerId) -> bool {
+        self.location_for_peer.read().contains_key(peer)
+            || self.pending_reservations.read().contains_key(peer)
+    }
+
     pub(crate) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
         self.connections_by_location.read().clone()
     }
