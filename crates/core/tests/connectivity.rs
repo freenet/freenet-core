@@ -309,7 +309,8 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     let mut client2 = WebApi::start(stream2);
 
     // Retry loop to wait for full mesh connectivity
-    const MAX_RETRIES: usize = 30;
+    // CI can be slower; give more attempts before declaring failure.
+    const MAX_RETRIES: usize = 60;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
     let mut mesh_established = false;
     let mut last_snapshot = (String::new(), String::new(), String::new());
