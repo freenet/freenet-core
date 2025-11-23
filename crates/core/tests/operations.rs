@@ -140,12 +140,13 @@ async fn send_put_with_retry(
     expected_key: Option<ContractKey>,
 ) -> anyhow::Result<()> {
     const MAX_ATTEMPTS: usize = 3;
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
     for attempt in 1..=MAX_ATTEMPTS {
         tracing::info!("Sending {} (attempt {attempt}/{MAX_ATTEMPTS})", description);
 
         make_put(client, state.clone(), contract.clone(), false).await?;
 
-        match tokio::time::timeout(Duration::from_secs(120), client.recv()).await {
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, client.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 if let Some(expected) = expected_key {
                     ensure!(
