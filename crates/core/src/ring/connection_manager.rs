@@ -14,8 +14,6 @@ use super::*;
 pub(crate) struct TransientEntry {
     /// Entry tracking a transient connection that hasn't been added to the ring topology yet.
     /// Transient connections are typically unsolicited inbound connections to gateways.
-    #[allow(dead_code)]
-    pub opened_at: Instant,
     /// Advertised location for the transient peer, if known at admission time.
     pub location: Option<Location>,
 }
@@ -224,6 +222,7 @@ impl ConnectionManager {
 
         if open == 0 {
             tracing::debug!(%peer_id, "should_accept: first connection -> accepting");
+            self.record_pending_location(peer_id, location);
             return true;
         }
 
@@ -248,6 +247,8 @@ impl ConnectionManager {
         if self.location_for_peer.read().get(peer_id).is_some() {
             // We've already accepted this peer (pending or active); treat as a no-op acceptance.
             tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
+            self.reserved_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return true;
         }
 
@@ -294,9 +295,11 @@ impl ConnectionManager {
 
     /// Record the advertised location for a peer that we have decided to accept.
     ///
-    /// This makes the peer discoverable to the routing layer even before the connection
-    /// is fully established. The entry is removed automatically if the handshake fails
-    /// via `prune_in_transit_connection`.
+    /// This tracks the advertised location for pending handshakes so we can de-duplicate
+    /// concurrent attempts. Routing still relies on `connections_by_location`, so this
+    /// does not make the peer routable until the connection is fully established.
+    /// The entry is removed automatically if the handshake fails via
+    /// `prune_in_transit_connection`.
     pub fn record_pending_location(&self, peer_id: &PeerId, location: Location) {
         let mut locations = self.location_for_peer.write();
         let entry = locations.entry(peer_id.clone());
@@ -381,7 +384,6 @@ impl ConnectionManager {
         self.transient_connections.insert(
             peer,
             TransientEntry {
-                opened_at: Instant::now(),
                 location,
             },
         );
