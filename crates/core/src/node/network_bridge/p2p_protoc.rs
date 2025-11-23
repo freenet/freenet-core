@@ -1749,7 +1749,7 @@ impl P2pConnManager {
                 self.bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, peer_id.clone(), true)
+                    .add_connection(loc, peer_id.clone(), false)
                     .await;
             } else {
                 // Update location now that we know it; budget was reserved before any work.

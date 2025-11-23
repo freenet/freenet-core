@@ -381,12 +381,8 @@ impl ConnectionManager {
         }
 
         let key = peer.clone();
-        self.transient_connections.insert(
-            peer,
-            TransientEntry {
-                location,
-            },
-        );
+        self.transient_connections
+            .insert(peer, TransientEntry { location });
         let prev = self.transient_in_use.fetch_add(1, Ordering::SeqCst);
         if prev >= self.transient_budget {
             // Undo if we raced past the budget.
