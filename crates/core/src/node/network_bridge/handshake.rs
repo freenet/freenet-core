@@ -178,6 +178,13 @@ impl ExpectedInboundTracker {
             .get(&addr.ip())
             .map(|list| list.iter().map(|entry| entry.transaction).collect())
     }
+
+    #[cfg(test)]
+    fn transactions_for(&self, addr: SocketAddr) -> Option<Vec<Option<Transaction>>> {
+        self.entries
+            .get(&addr.ip())
+            .map(|list| list.iter().map(|entry| entry.transaction).collect())
+    }
 }
 
 async fn run_driver(
