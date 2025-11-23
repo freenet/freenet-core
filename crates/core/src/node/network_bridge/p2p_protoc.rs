@@ -1288,12 +1288,38 @@ impl P2pConnManager {
                 let loc = entry
                     .location
                     .unwrap_or_else(|| Location::from_address(&peer.addr));
-                self.bridge
-                    .op_manager
-                    .ring
-                    .add_connection(loc, peer.clone(), false)
-                    .await;
-                tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
+                if connection_manager.should_accept(loc, &peer) {
+                    let current = connection_manager.num_connections();
+                    if current >= connection_manager.max_connections {
+                        tracing::warn!(
+                            tx = %tx,
+                            remote = %peer,
+                            current_connections = current,
+                            max_connections = connection_manager.max_connections,
+                            %loc,
+                            "connect_peer: transient promotion rejected due to capacity"
+                        );
+                    } else {
+                        self.bridge
+                            .op_manager
+                            .ring
+                            .add_connection(loc, peer.clone(), false)
+                            .await;
+                        tracing::info!(
+                            tx = %tx,
+                            remote = %peer,
+                            %loc,
+                            "connect_peer: promoted transient after admission check"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        tx = %tx,
+                        remote = %peer,
+                        %loc,
+                        "connect_peer: transient failed admission on promotion"
+                    );
+                }
             }
 
             // Return the remote peer we are connected to (not our own peer key).
