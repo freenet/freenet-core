@@ -14,8 +14,6 @@ use super::*;
 pub(crate) struct TransientEntry {
     /// Entry tracking a transient connection that hasn't been added to the ring topology yet.
     /// Transient connections are typically unsolicited inbound connections to gateways.
-    #[allow(dead_code)]
-    pub opened_at: Instant,
     /// Advertised location for the transient peer, if known at admission time.
     pub location: Option<Location>,
 }
@@ -312,7 +310,6 @@ impl ConnectionManager {
         self.peer_key.lock().clone()
     }
 
-    #[allow(dead_code)]
     pub fn is_gateway(&self) -> bool {
         self.is_gateway
     }
@@ -333,13 +330,8 @@ impl ConnectionManager {
         }
 
         let key = peer.clone();
-        self.transient_connections.insert(
-            peer,
-            TransientEntry {
-                opened_at: Instant::now(),
-                location,
-            },
-        );
+        self.transient_connections
+            .insert(peer, TransientEntry { location });
         let prev = self.transient_in_use.fetch_add(1, Ordering::SeqCst);
         if prev >= self.transient_budget {
             // Undo if we raced past the budget.
@@ -413,7 +405,7 @@ impl ConnectionManager {
         let previous_location = lop.insert(peer.clone(), loc);
         drop(lop);
 
-        // Enforce the global cap when adding a new peer (not a relocation).
+        // Enforce the global cap when adding a new peer (relocations reuse the existing slot).
         if previous_location.is_none() && self.connection_count() >= self.max_connections {
             tracing::warn!(
                 %peer,
@@ -611,31 +603,17 @@ impl ConnectionManager {
             })
             .collect();
 
-        if candidates.is_empty() {
-            tracing::info!(
-                total_locations = connections.len(),
-                candidates = 0,
-                target = %target,
-                self_peer = self
-                    .get_peer_key()
-                    .as_ref()
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "unknown".into()),
-                "routing: no non-transient candidates"
-            );
-        } else {
-            tracing::info!(
-                total_locations = connections.len(),
-                candidates = candidates.len(),
-                target = %target,
-                self_peer = self
-                    .get_peer_key()
-                    .as_ref()
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "unknown".into()),
-                "routing: selecting next hop"
-            );
-        }
+        tracing::debug!(
+            total_locations = connections.len(),
+            candidates = candidates.len(),
+            target = %target,
+            self_peer = self
+                .get_peer_key()
+                .as_ref()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            "routing candidates for next hop (non-transient only)"
+        );
 
         candidates
     }
