@@ -300,10 +300,9 @@ impl RelayContext for RelayEnv<'_> {
     }
 
     fn transient_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
-        // Courtesy slots still piggyback on regular connections. Flag the first acceptance so the
-        // joiner can prioritise it, and keep the logic simple until dedicated transient tracking
-        // is wired in (see transient-connection-budget branch).
-        self.op_manager.ring.open_connections() == 0
+        // Treat joiner acceptances as full connections; marking the first link as transient causes
+        // it to expire under the transient TTL and leaves the ring under-connected.
+        false
     }
 }
 
