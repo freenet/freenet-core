@@ -480,6 +480,11 @@ impl TopologyManager {
         &mut self,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> anyhow::Result<TopologyAdjustment> {
+        if neighbor_locations.is_empty() {
+            tracing::warn!("select_connections_to_add: neighbor map empty; skipping adjustment");
+            return Ok(TopologyAdjustment::NoChange);
+        }
+
         let function_span = span!(Level::INFO, "add_connections");
         let _enter = function_span.enter();
 
