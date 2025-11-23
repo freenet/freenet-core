@@ -50,11 +50,15 @@ impl ConnectionManager {
             Ring::DEFAULT_MIN_CONNECTIONS
         };
 
-        let max_connections = if let Some(v) = config.max_number_conn {
+        let mut max_connections = if let Some(v) = config.max_number_conn {
             v
         } else {
             Ring::DEFAULT_MAX_CONNECTIONS
         };
+        // Gateways benefit from a wider neighbor set for forwarding; default to a higher cap when unset.
+        if config.is_gateway && config.max_number_conn.is_none() {
+            max_connections = 20;
+        }
 
         let max_upstream_bandwidth = if let Some(v) = config.max_upstream_bandwidth {
             v
@@ -465,7 +469,7 @@ impl ConnectionManager {
     }
 
     pub fn update_peer_identity(&self, old_peer: &PeerId, new_peer: PeerId) -> bool {
-        if old_peer == &new_peer {
+        if old_peer.addr == new_peer.addr && old_peer.pub_key == new_peer.pub_key {
             tracing::debug!(%old_peer, "update_peer_identity: identical peers; skipping");
             return false;
         }
