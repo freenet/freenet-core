@@ -101,3 +101,75 @@ impl TransientConnectionManager {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::{TransportKeypair, TransportPublicKey};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::AtomicBool;
+    use tokio::time::timeout;
+
+    fn make_peer(port: u16, pub_key: TransportPublicKey) -> PeerId {
+        PeerId::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            pub_key,
+        )
+    }
+
+    #[tokio::test]
+    async fn respects_budget_and_releases_on_remove() {
+        let keypair = TransportKeypair::new();
+        let pub_key = keypair.public().clone();
+        let manager = TransientConnectionManager::new(2, Duration::from_secs(1));
+
+        let p1 = make_peer(1000, pub_key.clone());
+        let p2 = make_peer(1001, pub_key.clone());
+        let p3 = make_peer(1002, pub_key.clone());
+
+        assert!(manager.try_reserve(p1.clone(), None));
+        assert!(manager.try_reserve(p2.clone(), None));
+        assert!(!manager.try_reserve(p3.clone(), None));
+        assert_eq!(manager.count(), 2);
+
+        manager.remove(&p1);
+        assert_eq!(manager.count(), 1);
+        assert!(manager.try_reserve(p3.clone(), None));
+        assert_eq!(manager.count(), 2);
+        assert!(manager.is_transient(&p2));
+        assert!(manager.is_transient(&p3));
+    }
+
+    #[tokio::test]
+    async fn expires_and_invokes_callback() {
+        let keypair = TransportKeypair::new();
+        let pub_key = keypair.public().clone();
+        let ttl = Duration::from_millis(20);
+        let manager = TransientConnectionManager::new(1, ttl);
+
+        let peer = make_peer(2000, pub_key);
+        assert!(manager.try_reserve(peer.clone(), None));
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_ref = fired.clone();
+        let peer_for_expiry = peer.clone();
+        manager.schedule_expiry(peer_for_expiry.clone(), move |p| {
+            let fired = fired_ref.clone();
+            async move {
+                assert_eq!(p, peer_for_expiry);
+                fired.store(true, Ordering::SeqCst);
+            }
+        });
+
+        timeout(Duration::from_millis(200), async {
+            while manager.is_transient(&peer) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("transient should expire within timeout");
+
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(!manager.is_transient(&peer));
+    }
+}
