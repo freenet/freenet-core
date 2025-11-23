@@ -1479,7 +1479,7 @@ impl P2pConnManager {
                 connection,
                 transient,
             } => {
-                let conn_manager = &self.bridge.op_manager.ring.connection_manager;
+                let _conn_manager = &self.bridge.op_manager.ring.connection_manager;
                 let remote_addr = connection.remote_addr();
 
                 if let Some(blocked_addrs) = &self.blocked_addresses {
@@ -1494,7 +1494,6 @@ impl P2pConnManager {
                     }
                 }
 
-                let provided_peer = peer.clone();
                 let peer_id = peer.unwrap_or_else(|| {
                     tracing::info!(
                         remote = %remote_addr,
@@ -1521,10 +1520,10 @@ impl P2pConnManager {
                     "Inbound connection established"
                 );
 
-                let is_transient =
-                    conn_manager.is_gateway() && provided_peer.is_none() && transaction.is_none();
-
-                self.handle_successful_connection(peer_id, connection, state, None, is_transient)
+                // Honor the handshake’s transient flag; don’t silently downgrade to transient just
+                // because this is an unsolicited inbound (that was causing the gateway to never
+                // register stable links).
+                self.handle_successful_connection(peer_id, connection, state, None, transient)
                     .await?;
             }
             HandshakeEvent::OutboundEstablished {
@@ -1539,7 +1538,7 @@ impl P2pConnManager {
                     transaction = %transaction,
                     "Outbound connection established"
                 );
-                self.handle_successful_connection(peer, connection, state, None, false)
+                self.handle_successful_connection(peer, connection, state, None, transient)
                     .await?;
             }
             HandshakeEvent::OutboundFailed {
