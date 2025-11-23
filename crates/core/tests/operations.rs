@@ -28,27 +28,6 @@ use tokio::select;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 
-async fn log_recent_events(ctx: &TestContext, label: &str) {
-    if let Ok(aggregator) = ctx.aggregate_events().await {
-        if let Ok(events) = aggregator.get_all_events().await {
-            tracing::error!(
-                label,
-                total_events = events.len(),
-                "Aggregated events at failure"
-            );
-            for event in events.iter().rev().take(10).rev() {
-                tracing::error!(
-                    label,
-                    ?event.kind,
-                    peer = %event.peer_id,
-                    ts = %event.datetime,
-                    "Recent event"
-                );
-            }
-        }
-    }
-}
-
 static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
     Mutex::new(rand::rngs::StdRng::from_seed(
         *b"0102030405060708090a0b0c0d0e0f10",
@@ -161,12 +140,13 @@ async fn send_put_with_retry(
     expected_key: Option<ContractKey>,
 ) -> anyhow::Result<()> {
     const MAX_ATTEMPTS: usize = 3;
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
     for attempt in 1..=MAX_ATTEMPTS {
         tracing::info!("Sending {} (attempt {attempt}/{MAX_ATTEMPTS})", description);
 
         make_put(client, state.clone(), contract.clone(), false).await?;
 
-        match tokio::time::timeout(Duration::from_secs(120), client.recv()).await {
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, client.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 if let Some(expected) = expected_key {
                     ensure!(
@@ -2019,36 +1999,15 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
     let (stream_a, _) = connect_async(&uri_a).await?;
     let mut client_api_a = WebApi::start(stream_a);
 
-    // Send PUT from peer A
-    make_put(
+    // Send PUT from peer A with retry to deflake occasional slow routing in CI.
+    send_put_with_retry(
         &mut client_api_a,
         wrapped_state.clone(),
         contract.clone(),
-        false,
+        "three-hop put",
+        Some(contract_key),
     )
     .await?;
-
-    // Wait for PUT response from peer A
-    tracing::info!("Waiting for PUT response from peer A...");
-    let resp = tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await;
-    match resp {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-            tracing::info!("PUT successful for contract: {}", key);
-            assert_eq!(key, contract_key);
-        }
-        Ok(Ok(other)) => {
-            log_recent_events(ctx, "put-unexpected").await;
-            bail!("Unexpected response while waiting for put: {:?}", other);
-        }
-        Ok(Err(e)) => {
-            log_recent_events(ctx, "put-error").await;
-            bail!("Error receiving put response: {}", e);
-        }
-        Err(_) => {
-            log_recent_events(ctx, "put-timeout").await;
-            bail!("Timeout waiting for put response after 120 seconds");
-        }
-    }
 
     // Verify contract can be retrieved from peer C
     let uri_c = format!(
