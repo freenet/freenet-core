@@ -83,30 +83,21 @@ impl InnerMessage for ConnectMsg {
 impl fmt::Display for ConnectMsg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConnectMsg::Request {
-                target, payload, ..
-            } => write!(
+            ConnectMsg::Request { target, payload, .. } => write!(
                 f,
                 "ConnectRequest {{ target: {target}, desired: {}, ttl: {}, joiner: {} }}",
-                payload.desired_location, payload.ttl, payload.joiner
+                payload.desired_location,
+                payload.ttl,
+                payload.joiner
             ),
-            ConnectMsg::Response {
-                sender,
-                target,
-                payload,
-                ..
-            } => write!(
+            ConnectMsg::Response { sender, target, payload, .. } => write!(
                 f,
-                "ConnectResponse {{ sender: {sender}, target: {target}, acceptor: {} }}",
+                "ConnectResponse {{ sender: {sender}, target: {target}, acceptor: {}, transient: {} }}",
                 payload.acceptor,
+                payload.transient
             ),
-            ConnectMsg::ObservedAddress {
-                target, address, ..
-            } => {
-                write!(
-                    f,
-                    "ObservedAddress {{ target: {target}, address: {address} }}"
-                )
+            ConnectMsg::ObservedAddress { target, address, .. } => {
+                write!(f, "ObservedAddress {{ target: {target}, address: {address} }}")
             }
         }
     }
@@ -141,6 +132,8 @@ pub(crate) struct ConnectRequest {
 pub(crate) struct ConnectResponse {
     /// The peer that accepted the join request.
     pub acceptor: PeerKeyLocation,
+    /// Whether this acceptance is a short-lived transient link.
+    pub transient: bool,
 }
 
 /// New minimal state machine the joiner tracks.
@@ -167,6 +160,7 @@ pub(crate) struct RelayState {
     pub upstream: PeerKeyLocation,
     pub request: ConnectRequest,
     pub forwarded_to: Option<PeerKeyLocation>,
+    pub transient_hint: bool,
     pub observed_sent: bool,
     pub accepted_locally: bool,
 }
@@ -187,6 +181,9 @@ pub(crate) trait RelayContext {
         visited: &[PeerKeyLocation],
         recency: &HashMap<PeerId, Instant>,
     ) -> Option<PeerKeyLocation>;
+
+    /// Whether the acceptance should be treated as a short-lived transient link.
+    fn transient_hint(&self, acceptor: &PeerKeyLocation, joiner: &PeerKeyLocation) -> bool;
 }
 
 /// Result of processing a request at a relay.
@@ -284,8 +281,11 @@ impl RelayState {
             self.accepted_locally = true;
             let acceptor = ctx.self_location().clone();
             let dist = ring_distance(acceptor.location, self.request.joiner.location);
+            let transient = ctx.transient_hint(&acceptor, &self.request.joiner);
+            self.transient_hint = transient;
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
+                transient,
             });
             actions.expect_connection_from = Some(self.request.joiner.clone());
             tracing::info!(
@@ -294,6 +294,7 @@ impl RelayState {
                 acceptor_loc = ?acceptor.location,
                 joiner_loc = ?self.request.joiner.location,
                 ring_distance = ?dist,
+                transient,
                 "connect: acceptance issued"
             );
         }
@@ -438,21 +439,72 @@ impl RelayContext for RelayEnv<'_> {
                     } else if key == k {
                         best.push(cand.clone());
                     }
+                    if skip.has_element(conn.location.peer.clone()) {
+                        continue;
+                    }
+                    out.push(conn.location.clone());
                 }
+            }
+            out
+        };
+
+        let now = Instant::now();
+        let estimator = FORWARD_ESTIMATOR.read();
+        let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::new();
+        let mut fallback: Vec<PeerKeyLocation> = Vec::new();
+
+        for cand in candidates {
+            if let Some(ts) = recency.get(&cand.peer) {
+                if now.duration_since(*ts) < RECENCY_COOLDOWN {
+                    continue;
+                }
+            }
+            if cand.location.is_some() {
+                if let Some(score) = estimator.estimate(&cand, desired_location) {
+                    scored.push((score, cand.clone()));
+                    continue;
+                }
+            }
+            fallback.push(cand.clone());
+        }
+
+        if !scored.is_empty() {
+            let best_score = scored
+                .iter()
+                .map(|(s, _)| *s)
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap_or(0.0);
+            let best: Vec<_> = scored
+                .into_iter()
+                .filter(|(s, _)| (*s - best_score).abs() < f64::EPSILON)
+                .map(|(_, c)| c)
+                .collect();
+            if !best.is_empty() {
+                return router.select_peer(best.iter(), desired_location).cloned();
             }
         }
 
-        if best.is_empty() {
+        if fallback.is_empty() {
             None
         } else {
-            router.select_peer(best.iter(), desired_location).cloned()
+            router
+                .select_peer(fallback.iter(), desired_location)
+                .cloned()
         }
+    }
+
+    fn transient_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
+        // Courtesy slots still piggyback on regular connections. Flag the first acceptance so the
+        // joiner can prioritise it, and keep the logic simple until dedicated transient tracking
+        // is wired in (see transient-connection-budget branch).
+        self.op_manager.ring.open_connections() == 0
     }
 }
 
 #[derive(Debug)]
 pub struct AcceptedPeer {
     pub peer: PeerKeyLocation,
+    pub transient: bool,
 }
 
 #[derive(Debug, Default)]
@@ -473,6 +525,7 @@ impl JoinerState {
             self.last_progress = now;
             acceptance.new_acceptor = Some(AcceptedPeer {
                 peer: response.acceptor.clone(),
+                transient: response.transient,
             });
             acceptance.assigned_location = self.accepted.len() == 1;
         }
@@ -556,6 +609,7 @@ impl ConnectOp {
             upstream,
             request,
             forwarded_to: None,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         }));
@@ -646,15 +700,7 @@ impl ConnectOp {
     ) -> Option<JoinerAcceptance> {
         match self.state.as_mut() {
             Some(ConnectState::WaitingForResponses(state)) => {
-                tracing::info!(
-                    acceptor = %response.acceptor.peer,
-                    acceptor_loc = ?response.acceptor.location,
-                    "connect: joiner received ConnectResponse"
-                );
                 let result = state.register_acceptance(response, now);
-                if let Some(new_acceptor) = &result.new_acceptor {
-                    self.recency.remove(&new_acceptor.peer.peer);
-                }
                 if result.satisfied {
                     self.state = Some(ConnectState::Completed);
                 }
@@ -682,6 +728,7 @@ impl ConnectOp {
                 upstream: upstream.clone(),
                 request: request.clone(),
                 forwarded_to: None,
+                transient_hint: false,
                 observed_sent: false,
                 accepted_locally: false,
             })));
@@ -846,7 +893,7 @@ impl Operation for ConnectOp {
                                         peer: new_acceptor.peer.peer.clone(),
                                         tx: self.id,
                                         callback,
-                                        is_gw: false,
+                                        is_gw: new_acceptor.transient,
                                     })
                                     .await?;
 
@@ -1178,6 +1225,7 @@ mod tests {
         self_loc: PeerKeyLocation,
         accept: bool,
         next_hop: Option<PeerKeyLocation>,
+        transient: bool,
     }
 
     impl TestRelayContext {
@@ -1186,6 +1234,7 @@ mod tests {
                 self_loc,
                 accept: true,
                 next_hop: None,
+                transient: false,
             }
         }
 
@@ -1196,6 +1245,11 @@ mod tests {
 
         fn next_hop(mut self, hop: Option<PeerKeyLocation>) -> Self {
             self.next_hop = hop;
+            self
+        }
+
+        fn transient(mut self, transient: bool) -> Self {
+            self.transient = transient;
             self
         }
     }
@@ -1216,6 +1270,10 @@ mod tests {
             _recency: &HashMap<PeerId, Instant>,
         ) -> Option<PeerKeyLocation> {
             self.next_hop.clone()
+        }
+
+        fn transient_hint(&self, _acceptor: &PeerKeyLocation, _joiner: &PeerKeyLocation) -> bool {
+            self.transient
         }
     }
 
@@ -1242,6 +1300,7 @@ mod tests {
                 observed_addr: Some(joiner.peer.addr),
             },
             forwarded_to: None,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -1253,6 +1312,7 @@ mod tests {
 
         let response = actions.accept_response.expect("expected acceptance");
         assert_eq!(response.acceptor.peer, self_loc.peer);
+        assert!(response.transient);
         assert_eq!(actions.expect_connection_from.unwrap().peer, joiner.peer);
         assert!(actions.forward.is_none());
     }
@@ -1272,6 +1332,7 @@ mod tests {
                 observed_addr: Some(joiner.peer.addr),
             },
             forwarded_to: None,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -1308,6 +1369,7 @@ mod tests {
                 observed_addr: Some(observed_addr),
             },
             forwarded_to: None,
+            transient_hint: false,
             observed_sent: false,
             accepted_locally: false,
         };
@@ -1337,11 +1399,13 @@ mod tests {
 
         let response = ConnectResponse {
             acceptor: acceptor.clone(),
+            transient: false,
         };
         let result = state.register_acceptance(&response, Instant::now());
         assert!(result.satisfied);
         let new = result.new_acceptor.expect("expected new acceptor");
         assert_eq!(new.peer.peer, acceptor.peer);
+        assert!(!new.transient);
     }
 
     #[test]
