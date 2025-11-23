@@ -445,9 +445,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                             } else {
                                 // Non-gateway peers: mark as expected and wait for the normal peer handshake flow.
                                 self.expected_non_gateway.insert(remote_addr.ip());
-                                tracing::debug!(
+                                tracing::warn!(
                                     %remote_addr,
-                                    "unexpected peer intro; marking expected_non_gateway"
+                                    "unexpected peer intro from non-gateway; marking expected_non_gateway and continuing"
                                 );
                                 continue;
                             }
