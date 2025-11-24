@@ -210,6 +210,10 @@ async fn run_driver(
                         let (peer, transaction, transient) = if let Some(entry) = entry {
                             (Some(entry.peer), entry.transaction, entry.transient)
                         } else {
+                            tracing::warn!(
+                                remote = %remote_addr,
+                                "Received unexpected inbound connection (no matching expectation)"
+                            );
                             (None, None, false)
                         };
 
