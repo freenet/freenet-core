@@ -202,23 +202,6 @@ impl ConnectionManager {
             return true;
         }
 
-        const GATEWAY_DIRECT_ACCEPT_LIMIT: usize = 2;
-        if self.is_gateway {
-            let direct_total = open + reserved_before;
-            if direct_total >= GATEWAY_DIRECT_ACCEPT_LIMIT {
-                tracing::info!(
-                    %peer_id,
-                    open,
-                    reserved_before,
-                    limit = GATEWAY_DIRECT_ACCEPT_LIMIT,
-                    "Gateway reached direct-accept limit; forwarding join request instead"
-                );
-                self.pending_reservations.write().remove(peer_id);
-                tracing::info!(%peer_id, "should_accept: gateway direct-accept limit hit, forwarding instead");
-                return false;
-            }
-        }
-
         let accepted = if total_conn < self.min_connections {
             tracing::info!(%peer_id, total_conn, "should_accept: accepted (below min connections)");
             true
@@ -420,33 +403,11 @@ impl ConnectionManager {
         tracing::info!(%peer, %loc, %was_reserved, "Adding connection to topology");
         debug_assert!(self.get_peer_key().expect("should be set") != peer);
         if was_reserved {
-            let old = self.pending_reservations.write().remove(&peer);
-            if old.is_none() {
-                tracing::warn!(%peer, "add_connection: expected pending reservation missing");
-            }
-        }
-        if was_reserved {
             self.pending_reservations.write().remove(&peer);
         }
         let mut lop = self.location_for_peer.write();
         let previous_location = lop.insert(peer.clone(), loc);
         drop(lop);
-
-        // Enforce the global cap when adding a new peer (not a relocation).
-        if previous_location.is_none() && self.connection_count() >= self.max_connections {
-            tracing::warn!(
-                %peer,
-                %loc,
-                max = self.max_connections,
-                "add_connection: rejecting new connection to enforce cap"
-            );
-            // Roll back bookkeeping since we're refusing the connection.
-            self.location_for_peer.write().remove(&peer);
-            if was_reserved {
-                self.pending_reservations.write().remove(&peer);
-            }
-            return;
-        }
 
         if let Some(prev_loc) = previous_location {
             tracing::info!(
@@ -473,7 +434,6 @@ impl ConnectionManager {
                     peer: peer.clone(),
                     location: Some(loc),
                 },
-                open_at: Instant::now(),
             });
         }
     }
@@ -515,7 +475,6 @@ impl ConnectionManager {
                     peer: new_peer,
                     location: Some(loc),
                 },
-                open_at: Instant::now(),
             });
         }
 
@@ -567,19 +526,22 @@ impl ConnectionManager {
             .sum()
     }
 
+    #[allow(dead_code)]
     pub(super) fn get_open_connections(&self) -> usize {
-        self.connections_by_location
-            .read()
-            .values()
-            .map(|conns| conns.len())
-            .sum()
+        self.connection_count()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_reserved_connections(&self) -> usize {
         self.pending_reservations.read().len()
     }
 
-    pub(super) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
+    pub fn has_connection_or_pending(&self, peer: &PeerId) -> bool {
+        self.location_for_peer.read().contains_key(peer)
+            || self.pending_reservations.read().contains_key(peer)
+    }
+
+    pub(crate) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
         self.connections_by_location.read().clone()
     }
 
@@ -635,10 +597,5 @@ impl ConnectionManager {
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
         read.keys().cloned().collect::<Vec<_>>().into_iter()
-    }
-
-    pub fn has_connection_or_pending(&self, peer: &PeerId) -> bool {
-        self.location_for_peer.read().contains_key(peer)
-            || self.pending_reservations.read().contains_key(peer)
     }
 }

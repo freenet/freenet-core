@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
@@ -635,6 +635,12 @@ impl P2pConnManager {
                                         "Failed to enqueue DropConnection command"
                                     );
                                 }
+                                // Immediately prune topology counters so we don't leak open connection slots.
+                                ctx.bridge
+                                    .op_manager
+                                    .ring
+                                    .prune_connection(peer.clone())
+                                    .await;
                                 if let Some(conn) = ctx.connections.remove(&peer) {
                                     // TODO: review: this could potentially leave garbage tasks in the background with peer listener
                                     match timeout(
@@ -691,7 +697,7 @@ impl P2pConnManager {
                                     .send(HandshakeCommand::ExpectInbound {
                                         peer: peer.clone(),
                                         transaction: None,
-                                        transient: false,
+                                        courtesy: false,
                                     })
                                     .await
                                 {
@@ -828,15 +834,23 @@ impl P2pConnManager {
 
                                 // Collect network information
                                 if config.include_network_info {
-                                    let connected_peers: Vec<_> = ctx
-                                        .connections
-                                        .keys()
-                                        .map(|p| (p.to_string(), p.addr.to_string()))
-                                        .collect();
+                                    let cm = &op_manager.ring.connection_manager;
+                                    let connections_by_loc = cm.get_connections_by_location();
+                                    let mut connected_peers = Vec::new();
+                                    for conns in connections_by_loc.values() {
+                                        for conn in conns {
+                                            connected_peers.push((
+                                                conn.location.peer.to_string(),
+                                                conn.location.peer.addr.to_string(),
+                                            ));
+                                        }
+                                    }
+                                    connected_peers.sort_by(|a, b| a.0.cmp(&b.0));
+                                    connected_peers.dedup_by(|a, b| a.0 == b.0);
 
                                     response.network_info = Some(NetworkInfo {
+                                        active_connections: connected_peers.len(),
                                         connected_peers,
-                                        active_connections: ctx.connections.len(),
                                     });
                                 }
 
@@ -915,26 +929,41 @@ impl P2pConnManager {
                                     }
                                 }
 
+                                // Collect topology-backed connection info (exclude transient transports).
+                                let cm = &op_manager.ring.connection_manager;
+                                let connections_by_loc = cm.get_connections_by_location();
+                                let mut connected_peer_ids = Vec::new();
+                                if config.include_detailed_peer_info {
+                                    use freenet_stdlib::client_api::ConnectedPeerInfo;
+                                    for conns in connections_by_loc.values() {
+                                        for conn in conns {
+                                            connected_peer_ids.push(conn.location.peer.to_string());
+                                            response.connected_peers_detailed.push(
+                                                ConnectedPeerInfo {
+                                                    peer_id: conn.location.peer.to_string(),
+                                                    address: conn.location.peer.addr.to_string(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    for conns in connections_by_loc.values() {
+                                        connected_peer_ids.extend(
+                                            conns.iter().map(|c| c.location.peer.to_string()),
+                                        );
+                                    }
+                                }
+                                connected_peer_ids.sort();
+                                connected_peer_ids.dedup();
+
                                 // Collect system metrics
                                 if config.include_system_metrics {
                                     let seeding_contracts =
                                         op_manager.ring.all_network_subscriptions().len() as u32;
                                     response.system_metrics = Some(SystemMetrics {
-                                        active_connections: ctx.connections.len() as u32,
+                                        active_connections: connected_peer_ids.len() as u32,
                                         seeding_contracts,
                                     });
-                                }
-
-                                // Collect detailed peer information if requested
-                                if config.include_detailed_peer_info {
-                                    use freenet_stdlib::client_api::ConnectedPeerInfo;
-                                    // Populate detailed peer information from actual connections
-                                    for peer in ctx.connections.keys() {
-                                        response.connected_peers_detailed.push(ConnectedPeerInfo {
-                                            peer_id: peer.to_string(),
-                                            address: peer.addr.to_string(),
-                                        });
-                                    }
                                 }
 
                                 match timeout(
@@ -975,13 +1004,6 @@ impl P2pConnManager {
                                 subscribed,
                             } => {
                                 tracing::debug!(%tx, %key, "local subscribe complete");
-
-                                // If this is a child operation, complete it and let the parent flow handle result delivery.
-                                if op_manager.is_sub_operation(tx) {
-                                    tracing::info!(%tx, %key, "completing child subscribe operation");
-                                    op_manager.completed(tx);
-                                    continue;
-                                }
 
                                 if !op_manager.is_sub_operation(tx) {
                                     let response = Ok(HostResponse::ContractResponse(
@@ -1275,77 +1297,31 @@ impl P2pConnManager {
             );
         }
 
-        // If we already have a transport channel, reuse it instead of dialing again. This covers
-        // transient->normal promotion without tripping duplicate connection errors.
+        // If a transient transport already exists, promote it without dialing anew.
         if self.connections.contains_key(&peer) {
             tracing::info!(
                 tx = %tx,
                 remote = %peer,
                 transient,
-                "connect_peer: reusing existing transport"
+                "connect_peer: reusing existing transport / promoting transient if present"
             );
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             if let Some(entry) = connection_manager.drop_transient(&peer) {
                 let loc = entry
                     .location
                     .unwrap_or_else(|| Location::from_address(&peer.addr));
-                // Re-run admission + cap guard when promoting a transient connection.
-                let should_accept = connection_manager.should_accept(loc, &peer);
-                if !should_accept {
-                    tracing::warn!(
-                        tx = %tx,
-                        %peer,
-                        %loc,
-                        "connect_peer: promotion rejected by admission logic"
-                    );
-                    callback
-                        .send_result(Err(()))
-                        .await
-                        .inspect_err(|err| {
-                            tracing::debug!(
-                                tx = %tx,
-                                remote = %peer,
-                                ?err,
-                                "connect_peer: failed to notify rejected-promotion callback"
-                            );
-                        })
-                        .ok();
-                    return Ok(());
-                }
-                let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections {
-                    tracing::warn!(
-                        tx = %tx,
-                        %peer,
-                        current_connections = current,
-                        max_connections = connection_manager.max_connections,
-                        %loc,
-                        "connect_peer: rejecting transient promotion to enforce cap"
-                    );
-                    callback
-                        .send_result(Err(()))
-                        .await
-                        .inspect_err(|err| {
-                            tracing::debug!(
-                                tx = %tx,
-                                remote = %peer,
-                                ?err,
-                                "connect_peer: failed to notify cap-rejection callback"
-                            );
-                        })
-                        .ok();
-                    return Ok(());
-                }
                 self.bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, peer.clone(), true)
+                    .add_connection(loc, peer.clone(), false)
                     .await;
                 tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
             }
 
+            // Return the remote peer we are connected to (not our own peer key).
+            let resolved_peer_id = peer.clone();
             callback
-                .send_result(Ok((peer.clone(), None)))
+                .send_result(Ok((resolved_peer_id, None)))
                 .await
                 .inspect_err(|err| {
                     tracing::debug!(
@@ -1409,7 +1385,7 @@ impl P2pConnManager {
             .send(HandshakeCommand::Connect {
                 peer: peer.clone(),
                 transaction: tx,
-                transient,
+                courtesy: transient,
             })
             .await
         {
@@ -1477,8 +1453,9 @@ impl P2pConnManager {
                 transaction,
                 peer,
                 connection,
-                transient,
+                courtesy,
             } => {
+                tracing::info!(provided = ?peer, transient = courtesy, tx = ?transaction, "InboundConnection event");
                 let _conn_manager = &self.bridge.op_manager.ring.connection_manager;
                 let remote_addr = connection.remote_addr();
 
@@ -1486,7 +1463,7 @@ impl P2pConnManager {
                     if blocked_addrs.contains(&remote_addr) {
                         tracing::info!(
                             remote = %remote_addr,
-                            transient,
+                            transient = courtesy,
                             transaction = ?transaction,
                             "Inbound connection blocked by local policy"
                         );
@@ -1494,10 +1471,11 @@ impl P2pConnManager {
                     }
                 }
 
+                let _provided_peer = peer.clone();
                 let peer_id = peer.unwrap_or_else(|| {
                     tracing::info!(
                         remote = %remote_addr,
-                        transient,
+                        transient = courtesy,
                         transaction = ?transaction,
                         "Inbound connection arrived without matching expectation; accepting provisionally"
                     );
@@ -1515,41 +1493,42 @@ impl P2pConnManager {
 
                 tracing::info!(
                     remote = %peer_id.addr,
-                    transient,
+                    transient = courtesy,
                     transaction = ?transaction,
                     "Inbound connection established"
                 );
 
-                // Honor the handshake’s transient flag; don’t silently downgrade to transient just
-                // because this is an unsolicited inbound (that was causing the gateway to never
-                // register stable links).
-                self.handle_successful_connection(peer_id, connection, state, None, transient)
+                // Treat only transient connections as transient. Normal inbound dials (including
+                // gateway bootstrap from peers) should be promoted into the ring once established.
+                let is_transient = courtesy;
+
+                self.handle_successful_connection(peer_id, connection, state, None, is_transient)
                     .await?;
             }
             HandshakeEvent::OutboundEstablished {
                 transaction,
                 peer,
                 connection,
-                transient,
+                courtesy,
             } => {
                 tracing::info!(
                     remote = %peer.addr,
-                    transient,
+                    transient = courtesy,
                     transaction = %transaction,
                     "Outbound connection established"
                 );
-                self.handle_successful_connection(peer, connection, state, None, transient)
+                self.handle_successful_connection(peer, connection, state, None, false)
                     .await?;
             }
             HandshakeEvent::OutboundFailed {
                 transaction,
                 peer,
                 error,
-                transient,
+                courtesy,
             } => {
                 tracing::info!(
                     remote = %peer.addr,
-                    transient,
+                    transient = courtesy,
                     transaction = %transaction,
                     ?error,
                     "Outbound connection failed"
@@ -1571,7 +1550,7 @@ impl P2pConnManager {
                         remote = %peer.addr,
                         callbacks = callbacks.len(),
                         pending_txs = ?pending_txs,
-                        transient,
+                        transient = courtesy,
                         "Notifying callbacks after outbound failure"
                     );
 
@@ -1663,9 +1642,14 @@ impl P2pConnManager {
                 current = connection_manager.transient_count(),
                 "Transient connection budget exhausted; dropping inbound connection"
             );
+            if let Some(callbacks) = state.awaiting_connection.remove(&peer_id.addr) {
+                for mut cb in callbacks {
+                    let _ = cb.send_result(Err(())).await;
+                }
+            }
+            state.awaiting_connection_txs.remove(&peer_id.addr);
             return Ok(());
         }
-
         let pending_txs = state
             .awaiting_connection_txs
             .remove(&peer_id.addr)
@@ -1728,6 +1712,19 @@ impl P2pConnManager {
         // Only insert if connection doesn't already exist to avoid dropping existing channel
         let mut newly_inserted = false;
         if !self.connections.contains_key(&peer_id) {
+            if is_transient {
+                let cm = &self.bridge.op_manager.ring.connection_manager;
+                let current = cm.transient_count();
+                if current >= cm.transient_budget() {
+                    tracing::warn!(
+                        remote = %peer_id.addr,
+                        budget = cm.transient_budget(),
+                        current,
+                        "Transient connection budget exhausted; dropping inbound connection before insert"
+                    );
+                    return Ok(());
+                }
+            }
             let (tx, rx) = mpsc::channel(10);
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] INSERT: OutboundConnectionSuccessful - adding to connections HashMap");
             self.connections.insert(peer_id.clone(), tx);
@@ -1743,15 +1740,43 @@ impl P2pConnManager {
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] SKIP INSERT: OutboundConnectionSuccessful - connection already exists in HashMap");
         }
 
+        let promote_to_ring = !is_transient || connection_manager.is_gateway();
+
         if newly_inserted {
+            tracing::info!(remote = %peer_id, is_transient, "handle_successful_connection: inserted new connection entry");
             let pending_loc = connection_manager.prune_in_transit_connection(&peer_id);
-            if !is_transient {
+            if promote_to_ring {
                 let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
+                // Re-apply admission logic on promotion to avoid bypassing capacity/heuristic checks.
+                let should_accept = connection_manager.should_accept(loc, &peer_id);
+                if !should_accept {
+                    tracing::warn!(
+                        %peer_id,
+                        %loc,
+                        "handle_successful_connection: promotion rejected by admission logic"
+                    );
+                    return Ok(());
+                }
+                let current = connection_manager.connection_count();
+                if current >= connection_manager.max_connections {
+                    tracing::warn!(
+                        %peer_id,
+                        current_connections = current,
+                        max_connections = connection_manager.max_connections,
+                        %loc,
+                        "handle_successful_connection: rejecting new connection to enforce cap"
+                    );
+                    return Ok(());
+                }
+                tracing::info!(remote = %peer_id, %loc, "handle_successful_connection: promoting connection into ring");
                 self.bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, peer_id.clone(), false)
+                    .add_connection(loc, peer_id.clone(), true)
                     .await;
+                if is_transient {
+                    connection_manager.drop_transient(&peer_id);
+                }
             } else {
                 // Update location now that we know it; budget was reserved before any work.
                 connection_manager.try_register_transient(peer_id.clone(), pending_loc);
@@ -1764,14 +1789,18 @@ impl P2pConnManager {
                 let cm = connection_manager.clone();
                 let peer = peer_id.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(ttl).await;
+                    sleep(ttl).await;
                     if cm.drop_transient(&peer).is_some() {
                         tracing::info!(%peer, "Transient connection expired; dropping");
                         if let Err(err) = drop_tx
                             .send(Right(NodeEvent::DropConnection(peer.clone())))
                             .await
                         {
-                            tracing::warn!(%peer, ?err, "Failed to dispatch DropConnection for expired transient");
+                            tracing::warn!(
+                                %peer,
+                                ?err,
+                                "Failed to dispatch DropConnection for expired transient"
+                            );
                         }
                     }
                 });
