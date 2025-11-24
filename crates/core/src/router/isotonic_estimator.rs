@@ -20,7 +20,8 @@ pub(crate) struct IsotonicEstimator {
 }
 
 impl IsotonicEstimator {
-    // Define a constant for the adjustment prior size.
+    // Minimum sample size before we apply per-peer adjustments; keeps peer curves from being
+    // dominated by sparse/noisy data.
     const ADJUSTMENT_PRIOR_SIZE: u64 = 10;
 
     /// Creates a new `PeerOutcomeEstimator` from a list of historical events.
@@ -48,9 +49,9 @@ impl IsotonicEstimator {
         }
         .expect("Failed to create isotonic regression");
 
-        let adjustment_prior_size = 20;
+        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
         let global_regression_big_enough_to_estimate_peer_adjustments =
-            global_regression.len() >= adjustment_prior_size;
+            global_regression.len() >= adjustment_prior_size as usize;
 
         let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
 
@@ -95,9 +96,9 @@ impl IsotonicEstimator {
 
         self.global_regression.add_points(&[point]);
 
-        let adjustment_prior_size = 20;
+        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
         let global_regression_big_enough_to_estimate_peer_adjustments =
-            self.global_regression.len() >= adjustment_prior_size;
+            self.global_regression.len() >= adjustment_prior_size as usize;
 
         if global_regression_big_enough_to_estimate_peer_adjustments {
             let adjustment = event.result
@@ -126,9 +127,13 @@ impl IsotonicEstimator {
             return Err(EstimationError::InsufficientData);
         }
 
-        let distance: f64 = contract_location.distance(peer.location.unwrap()).as_f64();
+        let peer_location = peer.location.ok_or(EstimationError::InsufficientData)?;
+        let distance: f64 = contract_location.distance(peer_location).as_f64();
 
-        let global_estimate = self.global_regression.interpolate(distance).unwrap();
+        let global_estimate = self
+            .global_regression
+            .interpolate(distance)
+            .ok_or(EstimationError::InsufficientData)?;
 
         // Regression can sometimes produce negative estimates
         let global_estimate = global_estimate.max(0.0);
@@ -180,7 +185,12 @@ pub(crate) struct IsotonicEvent {
 
 impl IsotonicEvent {
     fn route_distance(&self) -> Distance {
-        self.contract_location.distance(self.peer.location.unwrap())
+        let peer_location = self
+            .peer
+            .location
+            .ok_or(EstimationError::InsufficientData)
+            .expect("IsotonicEvent should always carry a peer location");
+        self.contract_location.distance(peer_location)
     }
 }
 

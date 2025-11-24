@@ -1,7 +1,10 @@
 //! Minimal riverctl propagation smoke test to reproduce intermittent "missing contract" errors.
 //!
-//! Run manually (ignored in CI):
-//! `cargo test -p freenet --test river_smoke -- --ignored --nocapture`
+//! This intentionally runs outside CI (ignored) so it can be executed manually when debugging
+//! contract propagation races:
+//! ```text
+//! cargo test -p freenet --test river_smoke -- --ignored --nocapture
+//! ```
 
 use anyhow::{anyhow, bail, Context, Result};
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
@@ -80,7 +83,7 @@ impl RiverSession {
     }
 
     async fn setup_room(&mut self) -> Result<()> {
-        // No retries—we want to catch propagation races.
+        // No retries here—we want to catch propagation races.
         let create_output = self
             .run_riverctl(
                 RiverUser::Alice,

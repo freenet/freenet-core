@@ -35,13 +35,8 @@ async fn gateway_records_real_peer_ids_on_inbound() -> anyhow::Result<()> {
     );
 
     let gateway = gateways[0];
-    let peers_connected_to_gateway: Vec<_> = snapshots
-        .iter()
-        .filter(|p| !p.is_gateway && p.connections.iter().any(|id| id == &gateway.id))
-        .collect();
-
     assert!(
-        !gateway.connections.is_empty() || !peers_connected_to_gateway.is_empty(),
+        !gateway.connections.is_empty(),
         "gateway should report at least one peer connection, found none"
     );
     assert!(
