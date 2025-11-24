@@ -8,6 +8,11 @@ use freenet_stdlib::{
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
 
+// Fixed ring locations for the three-node connectivity test.
+fn fixed_three_node_locations() -> Vec<f64> {
+    vec![0.1, 0.5, 0.9]
+}
+
 /// Test gateway reconnection:
 /// 1. Start a gateway and a peer connected to it
 /// 2. Perform operations to verify connectivity
@@ -254,6 +259,7 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
     auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 30,
+    node_locations_fn = fixed_three_node_locations,
     aggregate_events = "always",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
@@ -272,6 +278,10 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     let gateway = ctx.node("gateway")?;
     let peer1 = ctx.node("peer1")?;
     let peer2 = ctx.node("peer2")?;
+    println!(
+        "Using deterministic node locations: gateway={:.3}, peer1={:.3}, peer2={:.3}",
+        gateway.location, peer1.location, peer2.location
+    );
 
     let peer1_public_port = peer1.network_port.context(
         "peer1 missing network port; auto_connect_peers requires public_port for mesh connectivity",
