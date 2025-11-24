@@ -165,6 +165,7 @@ impl NodeP2P {
                 ideal_location,
                 ttl,
                 target_connections,
+                self.op_manager.connect_forward_estimator.clone(),
             );
 
             tracing::debug!(

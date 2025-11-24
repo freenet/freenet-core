@@ -138,14 +138,14 @@ impl ExpectedInboundTracker {
             tx = ?transaction,
             "ExpectInbound: registering expectation"
         );
-        self.entries
-            .entry(peer.addr.ip())
-            .or_default()
-            .push(ExpectedInbound {
-                peer,
-                transaction,
-                transient,
-            });
+        let ip = peer.addr.ip();
+        let entry = self.entries.entry(ip).or_default();
+        entry.retain(|existing| existing.peer.addr.port() != peer.addr.port());
+        entry.push(ExpectedInbound {
+            peer,
+            transaction,
+            transient,
+        });
     }
 
     fn drop_peer(&mut self, peer: &PeerId) {
@@ -185,6 +185,13 @@ impl ExpectedInboundTracker {
     #[cfg(test)]
     fn contains(&self, addr: SocketAddr) -> bool {
         self.entries.contains_key(&addr.ip())
+    }
+
+    #[cfg(test)]
+    fn transactions_for(&self, addr: SocketAddr) -> Option<Vec<Option<Transaction>>> {
+        self.entries
+            .get(&addr.ip())
+            .map(|list| list.iter().map(|entry| entry.transaction).collect())
     }
 }
 
@@ -335,6 +342,10 @@ mod tests {
         tracker.register(peer.clone(), None, false);
         let new_tx = Transaction::new::<ConnectMsg>();
         tracker.register(peer.clone(), Some(new_tx), true);
+        let transactions = tracker
+            .transactions_for(peer.addr)
+            .expect("entry should exist");
+        assert_eq!(transactions, vec![Some(new_tx)]);
 
         let entry = tracker
             .consume(peer.addr)

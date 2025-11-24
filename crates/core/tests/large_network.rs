@@ -307,7 +307,8 @@ impl RiverSession {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let retriable = stderr.contains("Timeout waiting for")
                 || stderr.contains("connection refused")
-                || stderr.contains("HTTP request failed");
+                || stderr.contains("HTTP request failed")
+                || stderr.contains("missing contract");
             if attempt == MAX_RETRIES || !retriable {
                 bail!("riverctl failed (user {:?}): {}", user, stderr);
             }

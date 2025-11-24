@@ -16,6 +16,7 @@ use std::{
 use dashmap::{DashMap, DashSet};
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
+use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
@@ -26,7 +27,8 @@ use crate::{
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     node::PeerId,
     operations::{
-        get::GetOp, put::PutOp, subscribe::SubscribeOp, update::UpdateOp, OpEnum, OpError,
+        connect::ConnectForwardEstimator, get::GetOp, put::PutOp, subscribe::SubscribeOp,
+        update::UpdateOp, OpEnum, OpError,
     },
     ring::{ConnectionManager, LiveTransactionTracker, Ring},
 };
@@ -203,6 +205,7 @@ pub(crate) struct OpManager {
     pub ch_outbound: Arc<ContractHandlerChannel<SenderHalve>>,
     new_transactions: tokio::sync::mpsc::Sender<Transaction>,
     pub result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
+    pub(crate) connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
     /// Indicates whether the peer is ready to process client operations.
     /// For gateways: always true (peer_id is set from config)
     /// For regular peers: true only after first successful network handshake sets peer_id
@@ -222,6 +225,7 @@ impl Clone for OpManager {
             ch_outbound: self.ch_outbound.clone(),
             new_transactions: self.new_transactions.clone(),
             result_router_tx: self.result_router_tx.clone(),
+            connect_forward_estimator: self.connect_forward_estimator.clone(),
             peer_ready: self.peer_ready.clone(),
             is_gateway: self.is_gateway,
             sub_op_tracker: self.sub_op_tracker.clone(),
@@ -255,6 +259,7 @@ impl OpManager {
             tracing::info_span!(parent: current_span, "garbage_cleanup_task")
         };
         let sub_op_tracker = SubOperationTracker::new();
+        let connect_forward_estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
 
         GlobalExecutor::spawn(
             garbage_cleanup_task(
@@ -287,6 +292,7 @@ impl OpManager {
             ch_outbound: Arc::new(ch_outbound),
             new_transactions,
             result_router_tx,
+            connect_forward_estimator,
             peer_ready,
             is_gateway,
             sub_op_tracker,
