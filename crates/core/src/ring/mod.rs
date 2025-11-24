@@ -659,6 +659,7 @@ impl Ring {
             ideal_location,
             ttl,
             target_connections,
+            op_manager.connect_forward_estimator.clone(),
         );
 
         live_tx_tracker.add_transaction(query_target.peer.clone(), tx);

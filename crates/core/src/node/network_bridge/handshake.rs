@@ -171,6 +171,11 @@ impl ExpectedInboundTracker {
     fn contains(&self, addr: SocketAddr) -> bool {
         self.entries.contains_key(&addr)
     }
+
+    #[cfg(test)]
+    fn transactions_for(&self, addr: SocketAddr) -> Option<Vec<Option<Transaction>>> {
+        self.entries.get(&addr).map(|entry| vec![entry.transaction])
+    }
 }
 
 async fn run_driver(
@@ -324,6 +329,10 @@ mod tests {
         tracker.register(peer.clone(), None, false);
         let new_tx = Transaction::new::<ConnectMsg>();
         tracker.register(peer.clone(), Some(new_tx), true);
+        let transactions = tracker
+            .transactions_for(peer.addr)
+            .expect("entry should exist");
+        assert_eq!(transactions, vec![Some(new_tx)]);
 
         let entry = tracker
             .consume(peer.addr)

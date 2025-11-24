@@ -2,7 +2,7 @@ mod isotonic_estimator;
 mod util;
 
 use crate::ring::{Distance, Location, PeerKeyLocation};
-use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
+pub(crate) use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use util::{Mean, TransferSpeed};
