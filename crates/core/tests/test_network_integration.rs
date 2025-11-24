@@ -7,7 +7,7 @@ use freenet_test_network::TestNetwork;
 use testresult::TestResult;
 use tokio_tungstenite::connect_async;
 
-// Build a fresh network for each test to avoid static Sync requirements
+// Helper to get or create network
 async fn get_network() -> TestNetwork {
     TestNetwork::builder()
         .gateways(1)

@@ -420,6 +420,9 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
         );
     }
 
+    // Allow a brief settling period before exercising contract operations.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     // Verify functionality with PUT/GET
     tracing::info!("Verifying network functionality with PUT/GET operations");
 

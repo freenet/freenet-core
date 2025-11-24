@@ -45,7 +45,7 @@ pub(crate) const PCK_VERSION: &str = env!("CARGO_PKG_VERSION");
 // Initialize the executor once.
 static ASYNC_RT: LazyLock<Option<Runtime>> = LazyLock::new(GlobalExecutor::initialize_async_rt);
 
-const DEFAULT_TRANSIENT_BUDGET: usize = 32;
+const DEFAULT_TRANSIENT_BUDGET: usize = 2048;
 const DEFAULT_TRANSIENT_TTL_SECS: u64 = 30;
 
 const QUALIFIER: &str = "";
