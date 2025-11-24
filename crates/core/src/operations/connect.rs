@@ -774,9 +774,12 @@ impl Operation for ConnectOp {
             match msg {
                 ConnectMsg::Request { from, payload, .. } => {
                     let env = RelayEnv::new(op_manager);
-                    let estimator_guard = self.connect_forward_estimator.read();
+                    let estimator = {
+                        let estimator_guard = self.connect_forward_estimator.read();
+                        estimator_guard.clone()
+                    };
                     let actions =
-                        self.handle_request(&env, from.clone(), payload.clone(), &estimator_guard);
+                        self.handle_request(&env, from.clone(), payload.clone(), &estimator);
 
                     if let Some((target, address)) = actions.observed_address {
                         let msg = ConnectMsg::ObservedAddress {
@@ -1448,8 +1451,7 @@ mod tests {
             .accept(false)
             .next_hop(Some(relay_b.clone()));
         let estimator = ConnectForwardEstimator::new();
-        let actions =
-            relay_op.handle_request(&ctx, joiner.clone(), request.clone(), &estimator);
+        let actions = relay_op.handle_request(&ctx, joiner.clone(), request.clone(), &estimator);
 
         let (forward_target, forward_request) = actions
             .forward
@@ -1473,8 +1475,12 @@ mod tests {
         );
         let ctx_accept = TestRelayContext::new(relay_b.clone());
         let estimator = ConnectForwardEstimator::new();
-        let accept_actions = accepting_relay
-            .handle_request(&ctx_accept, relay_a.clone(), forward_request, &estimator);
+        let accept_actions = accepting_relay.handle_request(
+            &ctx_accept,
+            relay_a.clone(),
+            forward_request,
+            &estimator,
+        );
 
         let response = accept_actions
             .accept_response
