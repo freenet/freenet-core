@@ -28,7 +28,6 @@ use crate::util::{Backoff, Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
 
 const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
-const RECENCY_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// Top-level message envelope used by the new connect handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,16 +243,11 @@ impl ForwardEstimator {
         };
         self.estimator.add_event(event);
     }
-
-    fn estimate(&self, peer: &PeerKeyLocation, desired: Location) -> Option<f64> {
-        let _ = peer.location?;
-        self.estimator
-            .estimate_retrieval_time(peer, desired)
-            .ok()
-            .map(|p| p.clamp(0.0, 1.0))
-    }
 }
 
+/// Shared estimator used by all connect operations in-process. We keep this global to learn a
+/// shared distance→success curve across peers; follow-ups will add bounds/reset to avoid
+/// unbounded growth (see issue #2127).
 static FORWARD_ESTIMATOR: Lazy<RwLock<ForwardEstimator>> =
     Lazy::new(|| RwLock::new(ForwardEstimator::new()));
 
