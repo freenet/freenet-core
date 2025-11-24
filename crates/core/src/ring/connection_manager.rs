@@ -582,6 +582,40 @@ impl ConnectionManager {
         router.select_peer(peers, target).cloned()
     }
 
+    pub fn routing_candidates(
+        &self,
+        target: Location,
+        requesting: Option<&PeerId>,
+        skip_list: impl Contains<PeerId>,
+    ) -> Vec<PeerKeyLocation> {
+        let connections = self.connections_by_location.read();
+        let mut candidates: Vec<PeerKeyLocation> = connections
+            .values()
+            .flat_map(|conns| conns.iter())
+            .filter(|conn| {
+                !self.is_transient(&conn.location.peer)
+                    && (requesting != Some(&conn.location.peer))
+                    && !skip_list.has_element(conn.location.peer.clone())
+            })
+            .map(|conn| conn.location.clone())
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            let da = a
+                .location
+                .unwrap_or_else(|| Location::from_address(&a.peer.addr))
+                .distance(target)
+                .as_f64();
+            let db = b
+                .location
+                .unwrap_or_else(|| Location::from_address(&b.peer.addr))
+                .distance(target)
+                .as_f64();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates
+    }
+
     pub fn num_connections(&self) -> usize {
         let connections = self.connections_by_location.read();
         let total: usize = connections.values().map(|v| v.len()).sum();
