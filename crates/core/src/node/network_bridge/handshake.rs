@@ -5,7 +5,7 @@
 //! connection attempts to/from the event loop. Higher-level routing decisions now live inside
 //! `ConnectOp`.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -127,7 +127,7 @@ struct ExpectedInbound {
 
 #[derive(Default)]
 struct ExpectedInboundTracker {
-    entries: HashMap<IpAddr, Vec<ExpectedInbound>>,
+    entries: HashMap<SocketAddr, ExpectedInbound>,
 }
 
 impl ExpectedInboundTracker {
@@ -138,53 +138,38 @@ impl ExpectedInboundTracker {
             tx = ?transaction,
             "ExpectInbound: registering expectation"
         );
-        let list = self.entries.entry(peer.addr.ip()).or_default();
-        // Replace any existing expectation for the same peer/port to ensure the newest registration wins.
-        list.retain(|entry| entry.peer.addr.port() != peer.addr.port());
-        list.push(ExpectedInbound {
-            peer,
-            transaction,
-            transient,
-        });
+        // Replace any existing expectation for the same socket to ensure the newest registration wins.
+        self.entries.insert(
+            peer.addr,
+            ExpectedInbound {
+                peer,
+                transaction,
+                transient,
+            },
+        );
     }
 
     fn drop_peer(&mut self, peer: &PeerId) {
-        if let Some(list) = self.entries.get_mut(&peer.addr.ip()) {
-            list.retain(|entry| entry.peer != *peer);
-            if list.is_empty() {
-                self.entries.remove(&peer.addr.ip());
-            }
-        }
+        self.entries.remove(&peer.addr);
     }
 
     fn consume(&mut self, addr: SocketAddr) -> Option<ExpectedInbound> {
-        let ip = addr.ip();
-        let list = self.entries.get_mut(&ip)?;
-        if let Some(pos) = list
-            .iter()
-            .position(|entry| entry.peer.addr.port() == addr.port())
-        {
-            let entry = list.remove(pos);
-            if list.is_empty() {
-                self.entries.remove(&ip);
-            }
-            tracing::debug!(remote = %addr, peer = %entry.peer.addr, transient = entry.transient, tx = ?entry.transaction, "ExpectInbound: matched by exact port");
-            return Some(entry);
+        let entry = self.entries.remove(&addr);
+        if let Some(entry) = &entry {
+            tracing::debug!(
+                remote = %addr,
+                peer = %entry.peer.addr,
+                transient = entry.transient,
+                tx = ?entry.transaction,
+                "ExpectInbound: matched by socket address"
+            );
         }
-        let entry = list.pop();
-        if list.is_empty() {
-            self.entries.remove(&ip);
-        }
-        if let Some(entry) = entry {
-            tracing::debug!(remote = %addr, peer = %entry.peer.addr, transient = entry.transient, tx = ?entry.transaction, "ExpectInbound: matched by IP fallback");
-            return Some(entry);
-        }
-        None
+        entry
     }
 
     #[cfg(test)]
     fn contains(&self, addr: SocketAddr) -> bool {
-        self.entries.contains_key(&addr.ip())
+        self.entries.contains_key(&addr)
     }
 }
 
@@ -341,5 +326,27 @@ mod tests {
             .expect("entry should be present after overwrite");
         assert_eq!(entry.transaction, Some(new_tx));
         assert!(entry.transient);
+    }
+
+    #[test]
+    fn tracker_keeps_peers_separate_on_same_ip() {
+        let mut tracker = ExpectedInboundTracker::default();
+        let peer_a = make_peer(4400);
+        let peer_b = make_peer(4401);
+
+        tracker.register(peer_a.clone(), None, false);
+        tracker.register(peer_b.clone(), None, true);
+
+        let first = tracker
+            .consume(peer_a.addr)
+            .expect("first peer should be matched by exact socket");
+        assert_eq!(first.peer, peer_a);
+        assert!(!first.transient);
+
+        let second = tracker
+            .consume(peer_b.addr)
+            .expect("second peer should still be tracked independently");
+        assert_eq!(second.peer, peer_b);
+        assert!(second.transient);
     }
 }
