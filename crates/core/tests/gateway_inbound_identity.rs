@@ -1,3 +1,4 @@
+#![cfg(feature = "test-network")]
 //! Regression test: gateways must register inbound peers under their real identities
 //! rather than collapsing multiple connections under a placeholder.
 //!

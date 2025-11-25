@@ -130,6 +130,39 @@ jobs:
           river_message_flow_over_freenet_six_peers_five_rounds
           -- --ignored --exact
 
+  six_peer_connection_cap:
+    name: six-peer-connection-cap
+    needs: test_all
+    runs-on: freenet-default-runner
+
+    env:
+      FREENET_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run six-peer connection-cap test
+        run: >
+          cargo test -p freenet
+          --test connection_cap
+          --no-default-features
+          --features trace,websocket,redb,test-network
+          -- connection_cap_respected --nocapture
+
   clippy_check:
     name: Clippy
 

@@ -1,3 +1,4 @@
+#![cfg(feature = "test-network")]
 //! Large-scale soak test using `freenet-test-network`.
 //!
 //! This test intentionally spins up a sizable network (2 gateways + N peers) and exercises the

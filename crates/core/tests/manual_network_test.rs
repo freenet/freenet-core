@@ -1,3 +1,4 @@
+#![cfg(feature = "test-network")]
 //! Manual test to inspect network logs
 
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
