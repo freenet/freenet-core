@@ -147,6 +147,14 @@ impl ConnectionManager {
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: Location, peer_id: &PeerId) -> bool {
+        // Don't accept connections from ourselves
+        if let Some(own_id) = self.get_peer_key() {
+            if &own_id == peer_id {
+                tracing::warn!(%peer_id, "should_accept: rejecting self-connection attempt");
+                return false;
+            }
+        }
+
         tracing::info!("Checking if should accept connection");
         let open = self.connection_count();
         let reserved_before = self.pending_reservations.read().len();
@@ -633,5 +641,88 @@ impl ConnectionManager {
     pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
         let read = self.location_for_peer.read();
         read.keys().cloned().collect::<Vec<_>>().into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::PeerId;
+    use crate::topology::rate::Rate;
+    use crate::transport::TransportKeypair;
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    #[test]
+    fn rejects_self_connection() {
+        // Create a peer id for our node
+        let keypair = TransportKeypair::new();
+        let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let own_peer_id = PeerId::new(addr, keypair.public().clone());
+
+        // Create connection manager with this peer id
+        let cm = ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            1,
+            10,
+            7,
+            (
+                keypair.public().clone(),
+                Some(own_peer_id.clone()),
+                AtomicU64::new(u64::from_le_bytes(0.5f64.to_le_bytes())),
+            ),
+            false,
+            10,
+            Duration::from_secs(60),
+        );
+
+        // Verify the connection manager has our peer id set
+        assert_eq!(cm.get_peer_key(), Some(own_peer_id.clone()));
+
+        // Attempt to accept a connection from ourselves - should be rejected
+        let location = Location::new(0.5);
+        let accepted = cm.should_accept(location, &own_peer_id);
+        assert!(!accepted, "should_accept must reject self-connection");
+    }
+
+    #[test]
+    fn accepts_connection_from_different_peer() {
+        // Create our node's peer id
+        let own_keypair = TransportKeypair::new();
+        let own_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let own_peer_id = PeerId::new(own_addr, own_keypair.public().clone());
+
+        // Create connection manager with our peer id
+        let cm = ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            1,
+            10,
+            7,
+            (
+                own_keypair.public().clone(),
+                Some(own_peer_id.clone()),
+                AtomicU64::new(u64::from_le_bytes(0.5f64.to_le_bytes())),
+            ),
+            false,
+            10,
+            Duration::from_secs(60),
+        );
+
+        // Create a different peer
+        let other_keypair = TransportKeypair::new();
+        let other_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let other_peer_id = PeerId::new(other_addr, other_keypair.public().clone());
+
+        // Attempt to accept a connection from a different peer - should succeed
+        // (first connection with no other constraints)
+        let location = Location::new(0.6);
+        let accepted = cm.should_accept(location, &other_peer_id);
+        assert!(
+            accepted,
+            "should_accept must accept connection from different peer"
+        );
     }
 }
