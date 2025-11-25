@@ -197,6 +197,8 @@ pub(crate) struct RelayActions {
     pub expect_connection_from: Option<PeerKeyLocation>,
     pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
     pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
+    /// The target to send the ConnectResponse to (with observed external address).
+    pub response_target: Option<PeerKeyLocation>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +298,8 @@ impl RelayState {
                 acceptor: acceptor.clone(),
             });
             actions.expect_connection_from = Some(self.request.joiner.clone());
+            // Use the joiner with updated observed address for response routing
+            actions.response_target = Some(self.request.joiner.clone());
             tracing::info!(
                 acceptor_peer = %acceptor.peer,
                 joiner_peer = %self.request.joiner.peer,
@@ -818,10 +822,13 @@ impl Operation for ConnectOp {
                     }
 
                     if let Some(response) = actions.accept_response {
+                        // Use the observed external address, falling back to original sender
+                        let response_target =
+                            actions.response_target.unwrap_or_else(|| from.clone());
                         let response_msg = ConnectMsg::Response {
                             id: self.id,
                             sender: env.self_location().clone(),
-                            target: from.clone(),
+                            target: response_target,
                             payload: response,
                         };
                         return Ok(store_operation_state_with_msg(
@@ -1490,5 +1497,67 @@ mod tests {
             .expect_connection_from
             .expect("acceptance should request inbound connection from joiner");
         assert_eq!(expect_conn.peer, joiner.peer);
+    }
+
+    /// Regression test for issue #2141: ConnectResponse must be sent to the joiner's
+    /// observed external address, not the original private/NAT address.
+    #[test]
+    fn connect_response_uses_observed_address_not_private() {
+        // Joiner behind NAT with private address
+        let private_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 9000);
+        let keypair = TransportKeypair::new();
+        let joiner = PeerKeyLocation {
+            peer: PeerId::new(private_addr, keypair.public().clone()),
+            location: Some(Location::random()),
+        };
+
+        // Gateway observes joiner's public/external address
+        let observed_public_addr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 9000);
+
+        let relay = make_peer(5000);
+
+        let mut state = RelayState {
+            upstream: joiner.clone(),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+                observed_addr: Some(observed_public_addr),
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(relay.clone());
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let actions =
+            state.handle_request(&ctx, &joiner, &recency, &mut forward_attempts, &estimator);
+
+        // Verify acceptance was issued
+        assert!(
+            actions.accept_response.is_some(),
+            "relay should accept joiner"
+        );
+
+        // Critical: response_target must have the observed public address, not private
+        let response_target = actions
+            .response_target
+            .expect("response_target should be set when accepting");
+        assert_eq!(
+            response_target.peer.addr, observed_public_addr,
+            "response_target must use observed external address ({}) not private address ({})",
+            observed_public_addr, private_addr
+        );
+
+        // Double-check: the original joiner had the private address
+        assert_eq!(
+            joiner.peer.addr, private_addr,
+            "original joiner should have private address"
+        );
     }
 }
