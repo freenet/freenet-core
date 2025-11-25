@@ -1,3 +1,4 @@
+#![cfg(feature = "test-network")]
 //! Minimal repro harness for connection-cap enforcement.
 //!
 //! This test spins up a tiny network (2 gateways + 6 peers) with a low max-connections

@@ -1,3 +1,4 @@
+#![cfg(feature = "test-network")]
 //! Integration test demonstrating freenet-test-network usage
 //!
 //! This shows how much simpler tests become with the test-network crate

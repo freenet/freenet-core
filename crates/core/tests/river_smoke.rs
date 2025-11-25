@@ -1,3 +1,4 @@
+#![cfg(feature = "test-network")]
 //! Minimal riverctl propagation smoke test to reproduce intermittent "missing contract" errors.
 //!
 //! This intentionally runs outside CI (ignored) so it can be executed manually when debugging

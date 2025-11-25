@@ -1,3 +1,4 @@
+#![cfg(feature = "test-network")]
 //! Diagnostic test to understand connectivity failures
 
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
