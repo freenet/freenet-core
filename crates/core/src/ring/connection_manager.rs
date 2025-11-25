@@ -148,11 +148,23 @@ impl ConnectionManager {
     /// Will panic if the node checking for this condition has no location assigned.
     pub fn should_accept(&self, location: Location, peer_id: &PeerId) -> bool {
         // Don't accept connections from ourselves
+        // Primary check: compare full PeerId (address-based equality)
         if let Some(own_id) = self.get_peer_key() {
             if &own_id == peer_id {
-                tracing::warn!(%peer_id, "should_accept: rejecting self-connection attempt");
+                tracing::warn!(%peer_id, "should_accept: rejecting self-connection attempt (address match)");
                 return false;
             }
+        }
+
+        // Secondary check: compare pub_key directly
+        // This catches self-connections even when peer_key is not yet set,
+        // which can happen early in initialization. Same pub_key means same node.
+        if *self.pub_key == peer_id.pub_key {
+            tracing::warn!(
+                %peer_id,
+                "should_accept: rejecting self-connection attempt (pub_key match)"
+            );
+            return false;
         }
 
         tracing::info!("Checking if should accept connection");
@@ -723,6 +735,43 @@ mod tests {
         assert!(
             accepted,
             "should_accept must accept connection from different peer"
+        );
+    }
+
+    #[test]
+    fn rejects_self_connection_by_pubkey_when_peer_key_not_set() {
+        // Create a ConnectionManager WITHOUT setting peer_key (simulating early initialization)
+        let keypair = TransportKeypair::new();
+
+        let cm = ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            1,
+            10,
+            7,
+            (
+                keypair.public().clone(),
+                None, // peer_key is None - this is the key difference from the other test
+                AtomicU64::new(u64::from_le_bytes(0.5f64.to_le_bytes())),
+            ),
+            false,
+            10,
+            Duration::from_secs(60),
+        );
+
+        // Verify peer_key is indeed None
+        assert_eq!(cm.get_peer_key(), None);
+
+        // Create a PeerId with the SAME pub_key but different address
+        let self_like_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let self_like_peer_id = PeerId::new(self_like_addr, keypair.public().clone());
+
+        // should_accept must reject this because the pub_key matches our own
+        let location = Location::new(0.5);
+        let accepted = cm.should_accept(location, &self_like_peer_id);
+        assert!(
+            !accepted,
+            "should_accept must reject self-connection by pub_key even when peer_key is not set"
         );
     }
 }
