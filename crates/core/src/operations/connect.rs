@@ -395,7 +395,13 @@ impl RelayContext for RelayEnv<'_> {
         recency: &HashMap<PeerId, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation> {
-        let skip = VisitedPeerIds { peers: visited };
+        // Use SkipListWithSelf to explicitly exclude ourselves from candidates,
+        // ensuring we never select ourselves as a forwarding target even if
+        // self wasn't added to visited by upstream callers.
+        let skip = SkipListWithSelf {
+            visited,
+            self_peer: &self.self_location.peer,
+        };
         let router = self.op_manager.ring.router.read();
         let candidates = self.op_manager.ring.connection_manager.routing_candidates(
             desired_location,
@@ -942,19 +948,23 @@ impl Operation for ConnectOp {
     }
 }
 
-struct VisitedPeerIds<'a> {
-    peers: &'a [PeerKeyLocation],
+/// Skip list that combines visited peers with the current node's own peer ID.
+/// This ensures we never select ourselves as a forwarding target, even if
+/// self wasn't properly added to the visited list by upstream callers.
+struct SkipListWithSelf<'a> {
+    visited: &'a [PeerKeyLocation],
+    self_peer: &'a PeerId,
 }
 
-impl Contains<PeerId> for VisitedPeerIds<'_> {
+impl Contains<PeerId> for SkipListWithSelf<'_> {
     fn has_element(&self, target: PeerId) -> bool {
-        self.peers.iter().any(|p| p.peer == target)
+        &target == self.self_peer || self.visited.iter().any(|p| p.peer == target)
     }
 }
 
-impl Contains<&PeerId> for VisitedPeerIds<'_> {
+impl Contains<&PeerId> for SkipListWithSelf<'_> {
     fn has_element(&self, target: &PeerId) -> bool {
-        self.peers.iter().any(|p| &p.peer == target)
+        target == self.self_peer || self.visited.iter().any(|p| &p.peer == target)
     }
 }
 
@@ -1558,6 +1568,48 @@ mod tests {
         assert_eq!(
             joiner.peer.addr, private_addr,
             "original joiner should have private address"
+        );
+    }
+
+    /// Verify that SkipListWithSelf correctly excludes both visited peers AND self,
+    /// even when self is not in the visited list.
+    #[test]
+    fn skip_list_with_self_excludes_self_and_visited() {
+        use crate::util::Contains;
+
+        let self_peer = make_peer(1000);
+        let visited_peer = make_peer(2000);
+        let other_peer = make_peer(3000);
+
+        let visited = vec![visited_peer.clone()];
+
+        let skip_list = SkipListWithSelf {
+            visited: &visited,
+            self_peer: &self_peer.peer,
+        };
+
+        // Self should be excluded even though not in visited list
+        assert!(
+            skip_list.has_element(self_peer.peer.clone()),
+            "SkipListWithSelf must exclude self even when not in visited list"
+        );
+
+        // Visited peer should be excluded
+        assert!(
+            skip_list.has_element(visited_peer.peer.clone()),
+            "SkipListWithSelf must exclude peers in visited list"
+        );
+
+        // Other peer should NOT be excluded
+        assert!(
+            !skip_list.has_element(other_peer.peer.clone()),
+            "SkipListWithSelf must not exclude unrelated peers"
+        );
+
+        // Test with reference variant
+        assert!(
+            skip_list.has_element(&self_peer.peer),
+            "SkipListWithSelf must exclude &self with reference variant"
         );
     }
 }
