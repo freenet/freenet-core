@@ -181,43 +181,41 @@ pub(crate) async fn request_subscribe(
             );
         }
 
+        // LOCAL-FIRST: If contract exists locally, complete subscription immediately.
+        // This avoids forwarding to peers who may not have a newly-PUT contract.
+        if local_has_contract {
+            tracing::info!(
+                %key,
+                tx = %id,
+                "Contract exists locally, fulfilling subscription locally"
+            );
+            return complete_local_subscription(op_manager, *id, *key).await;
+        }
+
+        // Contract not local - need to find it on the network
         let target = match candidates.first() {
             Some(peer) => peer.clone(),
             None => {
-                // No remote peers available - rely on local contract if present.
-                tracing::debug!(
+                // No remote peers available and no local contract
+                let connection_count = op_manager.ring.connection_manager.num_connections();
+                let subscribers = op_manager
+                    .ring
+                    .subscribers_of(key)
+                    .map(|subs| {
+                        subs.value()
+                            .iter()
+                            .map(|loc| format!("{:.8}", loc.peer))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                tracing::warn!(
                     %key,
-                    "No remote peers available for subscription, checking locally"
+                    tx = %id,
+                    connection_count,
+                    subscribers = ?subscribers,
+                    "Contract not available locally and no remote peers"
                 );
-
-                if local_has_contract {
-                    tracing::info!(
-                        %key,
-                        tx = %id,
-                        "No remote peers, fulfilling subscription locally"
-                    );
-                    return complete_local_subscription(op_manager, *id, *key).await;
-                } else {
-                    let connection_count = op_manager.ring.connection_manager.num_connections();
-                    let subscribers = op_manager
-                        .ring
-                        .subscribers_of(key)
-                        .map(|subs| {
-                            subs.value()
-                                .iter()
-                                .map(|loc| format!("{:.8}", loc.peer))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    tracing::warn!(
-                        %key,
-                        tx = %id,
-                        connection_count,
-                        subscribers = ?subscribers,
-                        "Contract not available locally and no remote peers"
-                    );
-                    return Err(RingError::NoCachingPeers(*key).into());
-                }
+                return Err(RingError::NoCachingPeers(*key).into());
             }
         };
 
