@@ -9,6 +9,11 @@ license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet-core"
 readme = "README.md"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/fdev-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "fdev"
+
 [dependencies]
 bytesize = "2.3"
 anyhow = "1"
