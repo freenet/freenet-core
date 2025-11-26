@@ -41,27 +41,29 @@ impl TransientConnectionManager {
     /// Reserve a transient slot for the peer, updating the location if it already exists.
     /// Returns `false` when the budget is exhausted.
     pub fn try_reserve(&self, peer: PeerId, location: Option<Location>) -> bool {
-        if let Some(mut entry) = self.entries.get_mut(&peer) {
-            entry.location = location;
-            return true;
-        }
+        use dashmap::mapref::entry::Entry;
 
-        let current = self.in_use.load(Ordering::Acquire);
-        if current >= self.budget {
-            return false;
+        match self.entries.entry(peer.clone()) {
+            Entry::Occupied(mut occ) => {
+                occ.get_mut().location = location;
+                true
+            }
+            Entry::Vacant(vac) => {
+                let current = self.in_use.load(Ordering::Acquire);
+                if current >= self.budget {
+                    return false;
+                }
+                vac.insert(TransientEntry { location });
+                let prev = self.in_use.fetch_add(1, Ordering::SeqCst);
+                if prev >= self.budget {
+                    // Undo if we raced past the budget.
+                    self.entries.remove(&peer);
+                    self.in_use.fetch_sub(1, Ordering::SeqCst);
+                    return false;
+                }
+                true
+            }
         }
-
-        let key = peer.clone();
-        self.entries.insert(peer, TransientEntry { location });
-        let prev = self.in_use.fetch_add(1, Ordering::SeqCst);
-        if prev >= self.budget {
-            // Undo if we raced past the budget.
-            self.entries.remove(&key);
-            self.in_use.fetch_sub(1, Ordering::SeqCst);
-            return false;
-        }
-
-        true
     }
 
     /// Remove a transient entry (promotion or drop) and return its metadata.
@@ -171,5 +173,123 @@ mod tests {
 
         assert!(fired.load(Ordering::SeqCst));
         assert!(!manager.is_transient(&peer));
+    }
+
+    #[tokio::test]
+    async fn concurrent_reserve_same_peer() {
+        // Test that concurrent try_reserve calls for the same peer don't corrupt the counter.
+        let keypair = TransportKeypair::new();
+        let pub_key = keypair.public().clone();
+        let manager = Arc::new(TransientConnectionManager::new(10, Duration::from_secs(60)));
+
+        let peer = make_peer(3000, pub_key);
+        let num_tasks = 50;
+
+        let handles: Vec<_> = (0..num_tasks)
+            .map(|_| {
+                let mgr = manager.clone();
+                let p = peer.clone();
+                tokio::spawn(async move { mgr.try_reserve(p, None) })
+            })
+            .collect();
+
+        let results: Vec<bool> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.expect("task panicked"))
+            .collect();
+
+        // All should succeed since it's the same peer (entry update after first insert).
+        assert!(results.iter().all(|&r| r));
+        // Only one entry should exist.
+        assert_eq!(manager.count(), 1);
+        assert!(manager.is_transient(&peer));
+    }
+
+    #[tokio::test]
+    async fn concurrent_reserve_different_peers_respects_budget() {
+        // Test that concurrent try_reserve for different peers correctly enforces budget.
+        let keypair = TransportKeypair::new();
+        let pub_key = keypair.public().clone();
+        let budget = 5;
+        let manager = Arc::new(TransientConnectionManager::new(
+            budget,
+            Duration::from_secs(60),
+        ));
+
+        let num_peers = 20;
+        let peers: Vec<_> = (0..num_peers)
+            .map(|i| make_peer(4000 + i, pub_key.clone()))
+            .collect();
+
+        let handles: Vec<_> = peers
+            .iter()
+            .map(|p| {
+                let mgr = manager.clone();
+                let peer = p.clone();
+                tokio::spawn(async move { mgr.try_reserve(peer, None) })
+            })
+            .collect();
+
+        let results: Vec<bool> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.expect("task panicked"))
+            .collect();
+
+        let successes = results.iter().filter(|&&r| r).count();
+        // Exactly `budget` reservations should succeed.
+        assert_eq!(successes, budget);
+        assert_eq!(manager.count(), budget);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reserve_and_remove() {
+        // Test concurrent reserve and remove operations maintain counter consistency.
+        let keypair = TransportKeypair::new();
+        let pub_key = keypair.public().clone();
+        let manager = Arc::new(TransientConnectionManager::new(
+            100,
+            Duration::from_secs(60),
+        ));
+
+        // First, reserve some peers.
+        let initial_peers: Vec<_> = (0..10)
+            .map(|i| make_peer(5000 + i, pub_key.clone()))
+            .collect();
+        for p in &initial_peers {
+            assert!(manager.try_reserve(p.clone(), None));
+        }
+        assert_eq!(manager.count(), 10);
+
+        // Concurrently remove and add peers.
+        let new_peers: Vec<_> = (0..10)
+            .map(|i| make_peer(6000 + i, pub_key.clone()))
+            .collect();
+
+        let remove_handles: Vec<_> = initial_peers
+            .iter()
+            .map(|p| {
+                let mgr = manager.clone();
+                let peer = p.clone();
+                tokio::spawn(async move { mgr.remove(&peer) })
+            })
+            .collect();
+
+        let add_handles: Vec<_> = new_peers
+            .iter()
+            .map(|p| {
+                let mgr = manager.clone();
+                let peer = p.clone();
+                tokio::spawn(async move { mgr.try_reserve(peer, None) })
+            })
+            .collect();
+
+        futures::future::join_all(remove_handles).await;
+        futures::future::join_all(add_handles).await;
+
+        // Counter should equal actual entries.
+        let actual_count = manager.entries.len();
+        assert_eq!(manager.count(), actual_count);
     }
 }

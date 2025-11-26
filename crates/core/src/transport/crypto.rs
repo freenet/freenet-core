@@ -6,7 +6,6 @@ use rsa::{
     Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransportKeypair {
@@ -113,8 +112,15 @@ impl std::fmt::Display for TransportPublicKey {
         use pkcs8::EncodePublicKey;
 
         let encoded = self.0.to_public_key_der().map_err(|_| std::fmt::Error)?;
-        let digest = Sha256::digest(encoded.as_bytes());
-        write!(f, "{}", bs58::encode(digest).into_string())
+        if encoded.as_bytes().len() >= 16 {
+            let bytes = encoded.as_bytes();
+            let first_six = &bytes[..6];
+            let last_six = &bytes[bytes.len() - 6..];
+            let to_encode = [first_six, last_six].concat();
+            write!(f, "{}", bs58::encode(to_encode).into_string())
+        } else {
+            write!(f, "{}", bs58::encode(encoded.as_bytes()).into_string())
+        }
     }
 }
 
