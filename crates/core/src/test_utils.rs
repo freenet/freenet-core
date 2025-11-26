@@ -960,6 +960,111 @@ impl TestContext {
             .collect()
     }
 
+    /// Wait for peer nodes to establish connections to gateways.
+    ///
+    /// This method polls the event logs looking for connection events until
+    /// the expected number of connections is established or the timeout expires.
+    ///
+    /// # Arguments
+    /// * `expected_connections` - Minimum number of connections expected per peer node
+    /// * `timeout` - Maximum time to wait for connections
+    /// * `poll_interval` - How often to check for new connections
+    ///
+    /// # Returns
+    /// Ok(()) if connections were established, Err if timeout was reached
+    pub async fn wait_for_connections(
+        &self,
+        expected_connections: usize,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> anyhow::Result<()> {
+        use std::collections::HashSet;
+
+        let start = std::time::Instant::now();
+        let peer_count = self.peers().len();
+
+        // If there are no peers (only gateways), we don't need to wait
+        if peer_count == 0 {
+            tracing::info!("No peer nodes, skipping connection wait");
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Waiting for {} peer node(s) to establish {} connection(s) each (timeout: {:?})",
+            peer_count,
+            expected_connections,
+            timeout
+        );
+
+        loop {
+            // Flush event logs to ensure we see recent events
+            for (label, handle) in &self.flush_handles {
+                tracing::trace!("Flushing events for node: {}", label);
+                handle.flush().await;
+            }
+
+            // Check connection status by counting connected events in event logs
+            let mut connected_peers: HashSet<String> = HashSet::new();
+
+            for label in &self.node_order {
+                let node = self.node(label)?;
+                if node.is_gateway {
+                    continue; // Only check peer nodes
+                }
+
+                let event_log_path = self.event_log_path(label)?;
+                if event_log_path.exists() {
+                    // Count connection events for this node
+                    let connection_count =
+                        count_connection_events(&event_log_path).await.unwrap_or(0);
+
+                    if connection_count >= expected_connections {
+                        connected_peers.insert(label.clone());
+                        tracing::debug!("Node '{}' has {} connection(s)", label, connection_count);
+                    } else {
+                        tracing::trace!(
+                            "Node '{}' has {} connection(s), waiting for {}",
+                            label,
+                            connection_count,
+                            expected_connections
+                        );
+                    }
+                }
+            }
+
+            // Check if all peers are connected
+            if connected_peers.len() >= peer_count {
+                let elapsed = start.elapsed();
+                tracing::info!(
+                    "All {} peer node(s) connected (took {:?})",
+                    peer_count,
+                    elapsed
+                );
+                return Ok(());
+            }
+
+            // Check timeout
+            if start.elapsed() > timeout {
+                let elapsed = start.elapsed();
+                tracing::warn!(
+                    "Connection timeout after {:?}: {}/{} peers connected",
+                    elapsed,
+                    connected_peers.len(),
+                    peer_count
+                );
+                return Err(anyhow::anyhow!(
+                    "Timeout waiting for connections: only {}/{} peers connected after {:?}",
+                    connected_peers.len(),
+                    peer_count,
+                    timeout
+                ));
+            }
+
+            // Wait before next poll
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     /// Get the path to a node's event log.
     pub fn event_log_path(&self, node_label: &str) -> anyhow::Result<PathBuf> {
         let node = self.node(node_label)?;
@@ -1455,3 +1560,39 @@ pub mod event_aggregator_utils {
 }
 
 pub use event_aggregator_utils::{NodeLogInfo, TestAggregatorBuilder};
+
+/// Count the number of successful connection events in an event log file.
+///
+/// This function reads the event log and counts EventKind::Connect(ConnectEvent::Connected)
+/// events to determine how many connections have been established.
+async fn count_connection_events(event_log_path: &Path) -> anyhow::Result<usize> {
+    use crate::tracing::{AOFEventSource, ConnectEvent, EventKind, EventSource};
+
+    // Create an AOF event source for this log file
+    let source = AOFEventSource::new(event_log_path.to_path_buf(), None);
+
+    let events = match source.get_events().await {
+        Ok(events) => events,
+        Err(_) => return Ok(0), // File doesn't exist or can't be read yet
+    };
+
+    // Count Connected events specifically (not StartConnection or Finished)
+    // Each successful connection generates a Connected event on both sides
+    let connection_count = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                EventKind::Connect(ConnectEvent::Connected { .. })
+            )
+        })
+        .count();
+
+    // Each connection is logged from both sides, so divide by 2
+    // But ensure we return at least 1 if we see any connected events
+    if connection_count > 0 {
+        Ok(std::cmp::max(1, connection_count / 2))
+    } else {
+        Ok(0)
+    }
+}
