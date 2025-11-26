@@ -159,6 +159,7 @@ impl NodeP2P {
                 .min(u8::MAX as usize) as u8;
             let target_connections = self.op_manager.ring.connection_manager.min_connections;
 
+            let is_gateway = self.op_manager.ring.connection_manager.is_gateway();
             let (tx, op, msg) = ConnectOp::initiate_join_request(
                 joiner,
                 query_target.clone(),
@@ -166,6 +167,7 @@ impl NodeP2P {
                 ttl,
                 target_connections,
                 self.op_manager.connect_forward_estimator.clone(),
+                is_gateway,
             );
 
             tracing::debug!(
