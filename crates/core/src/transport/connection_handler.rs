@@ -88,7 +88,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         Some(Arc::new(
             known_gateways
                 .iter()
-                .map(|g| g.peer.addr)
+                .map(|g| g.addr())
                 .collect::<HashSet<_>>(),
         ))
     };

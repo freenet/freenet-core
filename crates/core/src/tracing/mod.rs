@@ -1552,7 +1552,7 @@ pub(super) mod test {
                             .flat_map(|dcs| dcs.iter())
                             .any(|dc| dc > &l.datetime);
                         if let Some((this_loc, conn_loc)) = this.location.zip(connected.location) {
-                            if &this.peer.pub_key == key && !disconnected {
+                            if this.pub_key() == key && !disconnected {
                                 return Some((connected.peer.clone(), conn_loc.distance(this_loc)));
                             }
                         }
