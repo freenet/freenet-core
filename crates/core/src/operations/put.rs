@@ -1055,6 +1055,24 @@ async fn try_to_broadcast(
                 });
             }
         }
+        // Handle forwarded PUTs that have no prior state - this happens when a peer
+        // receives PutForward and is the final destination (e.g., has no ring location yet).
+        // We still need to send SuccessfulPut back to the sender.
+        None if last_hop && broadcast_to.is_empty() => {
+            tracing::debug!(
+                tx = %id,
+                %key,
+                "Sending SuccessfulPut for forwarded PUT with no prior state (likely peer has no ring location)"
+            );
+            new_state = None;
+            return_msg = Some(PutMsg::SuccessfulPut {
+                id,
+                target: upstream,
+                key,
+                sender: op_manager.ring.connection_manager.own_location(),
+                origin,
+            });
+        }
         _ => return Err(OpError::invalid_transition(id)),
     };
 
