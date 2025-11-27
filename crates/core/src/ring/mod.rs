@@ -650,6 +650,7 @@ impl Ring {
         let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
         let target_connections = self.connection_manager.min_connections;
 
+        let is_gateway = self.connection_manager.is_gateway();
         let (tx, op, msg) = ConnectOp::initiate_join_request(
             joiner,
             query_target.clone(),
@@ -657,6 +658,7 @@ impl Ring {
             ttl,
             target_connections,
             op_manager.connect_forward_estimator.clone(),
+            is_gateway,
         );
 
         live_tx_tracker.add_transaction(query_target.addr(), tx);
