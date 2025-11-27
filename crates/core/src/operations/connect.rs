@@ -22,7 +22,7 @@ use crate::node::{IsOperationCompleted, NetworkBridge, OpManager, PeerId};
 use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::ring::PeerKeyLocation;
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
-use crate::transport::{ObservedAddr, TransportKeypair, TransportPublicKey};
+use crate::transport::{TransportKeypair, TransportPublicKey};
 use crate::util::{Backoff, Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
 
@@ -113,7 +113,6 @@ impl fmt::Display for ConnectMsg {
 }
 
 impl ConnectMsg {
-    #[allow(dead_code)]
     pub fn sender(&self) -> Option<PeerId> {
         match self {
             ConnectMsg::Response { sender, .. } => Some(sender.peer()),
@@ -203,11 +202,10 @@ impl Joiner {
     pub fn to_peer_key_location(&self) -> Option<PeerKeyLocation> {
         match self {
             Joiner::Unknown(_) => None,
-            Joiner::Known(peer_id) => Some(PeerKeyLocation::with_location(
-                peer_id.pub_key.clone(),
-                peer_id.addr,
-                Location::from_address(&peer_id.addr),
-            )),
+            Joiner::Known(peer_id) => Some(PeerKeyLocation {
+                peer: peer_id.clone(),
+                location: Some(Location::from_address(&peer_id.addr)),
+            }),
         }
     }
 
@@ -391,8 +389,8 @@ impl RelayState {
                 // Use the joiner with updated observed address for response routing
                 actions.response_target = Some(joiner_pkl.clone());
                 tracing::info!(
-                    acceptor_pub_key = %acceptor.pub_key(),
-                    joiner_pub_key = %joiner_pkl.pub_key(),
+                    acceptor_peer = %acceptor.peer(),
+                    joiner_peer = %joiner_pkl.peer(),
                     acceptor_loc = ?acceptor.location,
                     joiner_loc = ?joiner_pkl.location,
                     ring_distance = ?dist,
@@ -732,10 +730,10 @@ impl ConnectOp {
         push_unique_peer(&mut visited, target.clone());
         // Gateways know their address, NAT peers don't until observed
         let joiner = if is_gateway {
-            Joiner::Known(own.peer())
+            Joiner::Known(own.peer.clone())
         } else {
             // NAT peer: we only know our public key, not our external address
-            Joiner::Unknown(own.pub_key.clone())
+            Joiner::Unknown(own.peer.pub_key.clone())
         };
         let request = ConnectRequest {
             desired_location,
@@ -850,13 +848,12 @@ impl Operation for ConnectOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<ObservedAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Connect(op))) => Ok(OpInitialization {
                 op: *op,
-                source_addr,
+                sender: msg.sender(),
             }),
             Ok(Some(other)) => {
                 op_manager.push(tx, other).await?;
@@ -875,7 +872,7 @@ impl Operation for ConnectOp {
                         return Err(OpError::OpNotPresent(tx));
                     }
                 };
-                Ok(OpInitialization { op, source_addr })
+                Ok(OpInitialization { op, sender: None })
             }
             Err(err) => Err(err.into()),
         }
@@ -886,7 +883,6 @@ impl Operation for ConnectOp {
         network_bridge: &'a mut NB,
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<ObservedAddr>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
     > {
@@ -907,16 +903,9 @@ impl Operation for ConnectOp {
                             target: target.clone(),
                             address,
                         };
-                        // Route through upstream (where the request came from) since we may
-                        // not have a direct connection to the target
-                        if let Some(upstream) = source_addr {
-                            network_bridge
-                                .send(
-                                    upstream.socket_addr(),
-                                    NetMessage::V1(NetMessageV1::Connect(msg)),
-                                )
-                                .await?;
-                        }
+                        network_bridge
+                            .send(&target.peer(), NetMessage::V1(NetMessageV1::Connect(msg)))
+                            .await?;
                     }
 
                     if let Some(peer) = actions.expect_connection_from {
@@ -938,7 +927,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                next.addr(),
+                                &next.peer(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -954,17 +943,10 @@ impl Operation for ConnectOp {
                             target: response_target,
                             payload: response,
                         };
-                        // Route the response through upstream (where the request came from)
-                        // since we may not have a direct connection to the joiner
-                        if let Some(upstream) = source_addr {
-                            network_bridge
-                                .send(
-                                    upstream.socket_addr(),
-                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
-                                )
-                                .await?;
-                        }
-                        return Ok(store_operation_state(&mut self));
+                        return Ok(store_operation_state_with_msg(
+                            &mut self,
+                            Some(response_msg),
+                        ));
                     }
 
                     Ok(store_operation_state(&mut self))
@@ -1054,7 +1036,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                upstream.addr(),
+                                &upstream.peer(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -1107,7 +1089,6 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
     let state_clone = op.state.clone();
     OperationResult {
         return_msg: msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m))),
-        target_addr: None,
         state: state_clone.map(|state| {
             OpEnum::Connect(Box::new(ConnectOp {
                 id: op.id,
@@ -1375,7 +1356,7 @@ mod tests {
 
     /// Helper to create a Joiner::Known from a PeerKeyLocation
     fn make_joiner(pkl: &PeerKeyLocation) -> Joiner {
-        Joiner::Known(pkl.peer())
+        Joiner::Known(pkl.peer.clone())
     }
 
     #[test]

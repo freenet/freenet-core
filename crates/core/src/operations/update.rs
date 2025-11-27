@@ -12,16 +12,12 @@ use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
-    transport::ObservedAddr,
 };
 
 pub(crate) struct UpdateOp {
     pub id: Transaction,
     pub(crate) state: Option<UpdateState>,
     stats: Option<UpdateStats>,
-    /// The address we received this operation's message from.
-    /// Used for connection-based routing: responses are sent back to this address.
-    upstream_addr: Option<ObservedAddr>,
 }
 
 impl UpdateOp {
@@ -92,14 +88,17 @@ impl Operation for UpdateOp {
     async fn load_or_init<'a>(
         op_manager: &'a crate::node::OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<ObservedAddr>,
     ) -> Result<super::OpInitialization<Self>, OpError> {
+        let mut sender: Option<PeerId> = None;
+        if let Some(peer_key_loc) = msg.sender().cloned() {
+            sender = Some(peer_key_loc.peer());
+        };
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Update(update_op))) => {
                 Ok(OpInitialization {
                     op: update_op,
-                    source_addr,
+                    sender,
                 })
                 // was an existing operation, other peer messaged back
             }
@@ -109,15 +108,14 @@ impl Operation for UpdateOp {
             }
             Ok(None) => {
                 // new request to get a value for a contract, initialize the machine
-                tracing::debug!(tx = %tx, ?source_addr, "initializing new op");
+                tracing::debug!(tx = %tx, sender = ?sender, "initializing new op");
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(UpdateState::ReceivedRequest),
                         id: tx,
                         stats: None, // don't care about stats in target peers
-                        upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                     },
-                    source_addr,
+                    sender,
                 })
             }
             Err(err) => Err(err.into()),
@@ -133,7 +131,7 @@ impl Operation for UpdateOp {
         conn_manager: &'a mut NB,
         op_manager: &'a crate::node::OpManager,
         input: &'a Self::Message,
-        _source_addr: Option<ObservedAddr>,
+        // _client_id: Option<ClientId>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<super::OperationResult, OpError>> + Send + 'a>,
     > {
@@ -576,9 +574,11 @@ impl Operation for UpdateOp {
                     let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
 
+                    // Collect peer_ids first to ensure they outlive the futures
+                    let peer_ids: Vec<_> = broadcast_to.iter().map(|p| p.peer()).collect();
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
 
-                    for peer in broadcast_to.iter() {
+                    for (peer, peer_id) in broadcast_to.iter().zip(peer_ids.iter()) {
                         let msg = UpdateMsg::BroadcastTo {
                             id: *id,
                             key: *key,
@@ -586,7 +586,7 @@ impl Operation for UpdateOp {
                             sender: sender.clone(),
                             target: peer.clone(),
                         };
-                        let f = conn_manager.send(peer.addr(), msg.into());
+                        let f = conn_manager.send(peer_id, msg.into());
                         broadcasting.push(f);
                     }
                     let error_futures = futures::future::join_all(broadcasting)
@@ -611,7 +611,7 @@ impl Operation for UpdateOp {
                             err
                         );
                         // TODO: review this, maybe we should just dropping this subscription
-                        conn_manager.drop_connection(peer.addr()).await?;
+                        conn_manager.drop_connection(&peer.peer()).await?;
                         incorrect_results += 1;
                     }
 
@@ -627,7 +627,7 @@ impl Operation for UpdateOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, stats, self.upstream_addr)
+            build_op_result(self.id, new_state, return_msg, stats)
         })
     }
 }
@@ -758,18 +758,15 @@ fn build_op_result(
     state: Option<UpdateState>,
     return_msg: Option<UpdateMsg>,
     stats: Option<UpdateStats>,
-    upstream_addr: Option<ObservedAddr>,
 ) -> Result<super::OperationResult, OpError> {
     let output_op = state.map(|op| UpdateOp {
         id,
         state: Some(op),
         stats,
-        upstream_addr,
     });
     let state = output_op.map(OpEnum::Update);
     Ok(OperationResult {
         return_msg: return_msg.map(NetMessage::from),
-        target_addr: upstream_addr.map(|a| a.socket_addr()),
         state,
     })
 }
@@ -916,7 +913,6 @@ pub(crate) fn start_op(
         id,
         state,
         stats: Some(UpdateStats { target: None }),
-        upstream_addr: None, // Local operation, no upstream peer
     }
 }
 
@@ -941,7 +937,6 @@ pub(crate) fn start_op_with_id(
         id,
         state,
         stats: Some(UpdateStats { target: None }),
-        upstream_addr: None, // Local operation, no upstream peer
     }
 }
 
@@ -1183,7 +1178,6 @@ async fn deliver_update_result(
             summary: summary.clone(),
         }),
         stats: None,
-        upstream_addr: None, // Terminal state, no routing needed
     };
 
     let host_result = op.to_host_result();
@@ -1312,7 +1306,6 @@ mod messages {
     }
 
     impl UpdateMsg {
-        #[allow(dead_code)]
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
             match self {
                 Self::RequestUpdate { sender, .. } => Some(sender),

@@ -11,7 +11,6 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
-    transport::ObservedAddr,
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, ErrorKind, HostResponse},
@@ -129,21 +128,13 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
 pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     let id = Transaction::new::<SubscribeMsg>();
     let state = Some(SubscribeState::PrepareRequest { id, key });
-    SubscribeOp {
-        id,
-        state,
-        upstream_addr: None, // Local operation, no upstream peer
-    }
+    SubscribeOp { id, state }
 }
 
 /// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
 pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp {
     let state = Some(SubscribeState::PrepareRequest { id, key });
-    SubscribeOp {
-        id,
-        state,
-        upstream_addr: None, // Local operation, no upstream peer
-    }
+    SubscribeOp { id, state }
 }
 
 /// Request to subscribe to value changes from a contract.
@@ -253,7 +244,6 @@ pub(crate) async fn request_subscribe(
         let op = SubscribeOp {
             id: *id,
             state: new_state,
-            upstream_addr: sub_op.upstream_addr,
         };
         op_manager
             .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
@@ -300,9 +290,6 @@ async fn complete_local_subscription(
 pub(crate) struct SubscribeOp {
     pub id: Transaction,
     state: Option<SubscribeState>,
-    /// The address we received this operation's message from.
-    /// Used for connection-based routing: responses are sent back to this address.
-    upstream_addr: Option<ObservedAddr>,
 }
 
 impl SubscribeOp {
@@ -338,8 +325,11 @@ impl Operation for SubscribeOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<ObservedAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
+        let mut sender: Option<PeerId> = None;
+        if let Some(peer_key_loc) = msg.sender().cloned() {
+            sender = Some(peer_key_loc.peer());
+        };
         let id = *msg.id();
 
         match op_manager.pop(msg.id()) {
@@ -347,7 +337,7 @@ impl Operation for SubscribeOp {
                 // was an existing operation, the other peer messaged back
                 Ok(OpInitialization {
                     op: subscribe_op,
-                    source_addr,
+                    sender,
                 })
             }
             Ok(Some(op)) => {
@@ -355,14 +345,13 @@ impl Operation for SubscribeOp {
                 Err(OpError::OpNotPresent(id))
             }
             Ok(None) => {
-                // new request to subscribe to a contract, initialize the machine
+                // new request to subcribe to a contract, initialize the machine
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(SubscribeState::ReceivedRequest),
                         id,
-                        upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                     },
-                    source_addr,
+                    sender,
                 })
             }
             Err(err) => Err(err.into()),
@@ -378,7 +367,6 @@ impl Operation for SubscribeOp {
         _conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        _source_addr: Option<ObservedAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -443,7 +431,6 @@ impl Operation for SubscribeOp {
                                     target: subscriber.clone(),
                                     subscribed: false,
                                 })),
-                                target_addr: self.upstream_addr.map(|a| a.socket_addr()),
                                 state: None,
                             });
                         }
@@ -482,7 +469,7 @@ impl Operation for SubscribeOp {
                                 return Err(err);
                             }
 
-                            return build_op_result(self.id, None, None, self.upstream_addr);
+                            return build_op_result(self.id, None, None);
                         }
 
                         let return_msg = SubscribeMsg::ReturnSub {
@@ -493,12 +480,7 @@ impl Operation for SubscribeOp {
                             subscribed: true,
                         };
 
-                        return build_op_result(
-                            self.id,
-                            None,
-                            Some(return_msg),
-                            self.upstream_addr,
-                        );
+                        return build_op_result(self.id, None, Some(return_msg));
                     }
 
                     let mut skip = HashSet::new();
@@ -510,7 +492,7 @@ impl Operation for SubscribeOp {
                         .k_closest_potentially_caching(key, &skip, 3)
                         .into_iter()
                         .find(|candidate| candidate.peer() != own_loc.peer())
-                        .ok_or(RingError::NoCachingPeers(*key))
+                        .ok_or_else(|| RingError::NoCachingPeers(*key))
                         .map_err(OpError::from)?;
 
                     skip.insert(forward_target.peer().clone());
@@ -538,7 +520,6 @@ impl Operation for SubscribeOp {
                     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
                     let htl = (*htl).min(ring_max_htl);
                     let this_peer = op_manager.ring.connection_manager.own_location();
-                    let upstream_addr = self.upstream_addr;
                     let return_not_subbed = || -> OperationResult {
                         OperationResult {
                             return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
@@ -548,7 +529,6 @@ impl Operation for SubscribeOp {
                                 sender: this_peer.clone(),
                                 target: subscriber.clone(),
                             })),
-                            target_addr: upstream_addr.map(|a| a.socket_addr()),
                             state: None,
                         }
                     };
@@ -661,7 +641,6 @@ impl Operation for SubscribeOp {
                                     retries: *retries,
                                 })
                                 .into(),
-                                self.upstream_addr,
                             );
                         }
                         // After fetch attempt we should now have the contract locally.
@@ -897,7 +876,7 @@ impl Operation for SubscribeOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, self.upstream_addr)
+            build_op_result(self.id, new_state, return_msg)
         })
     }
 }
@@ -906,16 +885,13 @@ fn build_op_result(
     id: Transaction,
     state: Option<SubscribeState>,
     msg: Option<SubscribeMsg>,
-    upstream_addr: Option<ObservedAddr>,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|state| SubscribeOp {
         id,
         state: Some(state),
-        upstream_addr,
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
-        target_addr: upstream_addr.map(|a| a.socket_addr()),
         state: output_op.map(OpEnum::Subscribe),
     })
 }
@@ -994,7 +970,6 @@ mod messages {
     }
 
     impl SubscribeMsg {
-        #[allow(dead_code)]
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
             match self {
                 Self::ReturnSub { sender, .. } => Some(sender),
