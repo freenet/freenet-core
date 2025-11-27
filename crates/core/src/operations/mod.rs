@@ -6,13 +6,11 @@ use freenet_stdlib::prelude::ContractKey;
 use futures::Future;
 use tokio::sync::mpsc::error::SendError;
 
-use std::net::SocketAddr;
-
 use crate::{
     client_events::HostResult,
     contract::{ContractError, ExecutorError},
     message::{InnerMessage, MessageStats, NetMessage, NetMessageV1, Transaction, TransactionType},
-    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable},
+    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -33,7 +31,6 @@ where
     fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<SocketAddr>,
     ) -> impl Future<Output = Result<OpInitialization<Self>, OpError>> + 'a;
 
     fn id(&self) -> &Transaction;
@@ -44,48 +41,40 @@ where
         conn_manager: &'a mut CB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        source_addr: Option<SocketAddr>,
+        // client_id: Option<ClientId>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
 }
 
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
     pub return_msg: Option<NetMessage>,
-    /// Where to send the return message. Required if return_msg is Some.
-    /// This replaces the old pattern of embedding target in the message itself.
-    pub target_addr: Option<SocketAddr>,
     /// None if the operation has been completed.
     pub state: Option<OpEnum>,
 }
 
 pub(crate) struct OpInitialization<Op> {
-    /// The source address of the peer that sent this message.
-    /// Used for sending error responses (Aborted) and as upstream_addr.
-    /// Note: Currently unused but prepared for Phase 4 of #2164.
-    #[allow(dead_code)]
-    pub source_addr: Option<SocketAddr>,
-    pub op: Op,
+    sender: Option<PeerId>,
+    op: Op,
 }
 
 pub(crate) async fn handle_op_request<Op, NB>(
     op_manager: &OpManager,
     network_bridge: &mut NB,
     msg: &Op::Message,
-    source_addr: Option<SocketAddr>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     Op: Operation,
     NB: NetworkBridge,
 {
+    let sender;
     let tx = *msg.id();
     let result = {
-        let OpInitialization { source_addr: _, op } =
-            Op::load_or_init(op_manager, msg, source_addr).await?;
-        op.process_message(network_bridge, op_manager, msg, source_addr)
-            .await
+        let OpInitialization { sender: s, op } = Op::load_or_init(op_manager, msg).await?;
+        sender = s;
+        op.process_message(network_bridge, op_manager, msg).await
     };
 
-    handle_op_result(op_manager, network_bridge, result, tx, source_addr).await
+    handle_op_result(op_manager, network_bridge, result, tx, sender).await
 }
 
 #[inline(always)]
@@ -94,7 +83,7 @@ async fn handle_op_result<CB>(
     network_bridge: &mut CB,
     result: Result<OperationResult, OpError>,
     tx_id: Transaction,
-    source_addr: Option<SocketAddr>,
+    sender: Option<PeerId>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     CB: NetworkBridge,
@@ -106,16 +95,15 @@ where
             return Ok(None);
         }
         Err(err) => {
-            if let Some(addr) = source_addr {
+            if let Some(sender) = sender {
                 network_bridge
-                    .send(addr, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
+                    .send(&sender, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
                     .await?;
             }
             return Err(err);
         }
         Ok(OperationResult {
             return_msg: None,
-            target_addr: _,
             state: Some(final_state),
         }) if final_state.finalized() => {
             if op_manager.failed_parents().remove(&tx_id).is_some() {
@@ -149,24 +137,23 @@ where
         }
         Ok(OperationResult {
             return_msg: Some(msg),
-            target_addr,
             state: Some(updated_state),
         }) => {
             if updated_state.finalized() {
                 let id = *msg.id();
                 tracing::debug!(%id, "operation finalized with outgoing message");
                 op_manager.completed(id);
-                if let Some(target) = target_addr {
-                    tracing::debug!(%id, ?target, "sending final message to target");
-                    network_bridge.send(target, msg).await?;
+                if let Some(target) = msg.target() {
+                    tracing::debug!(%id, %target, "sending final message to target");
+                    network_bridge.send(&target.peer(), msg).await?;
                 }
                 return Ok(Some(updated_state));
             } else {
                 let id = *msg.id();
                 tracing::debug!(%id, "operation in progress");
-                if let Some(target) = target_addr {
-                    tracing::debug!(%id, ?target, "sending updated op state");
-                    network_bridge.send(target, msg).await?;
+                if let Some(target) = msg.target() {
+                    tracing::debug!(%id, %target, "sending updated op state");
+                    network_bridge.send(&target.peer(), msg).await?;
                     op_manager.push(id, updated_state).await?;
                 } else {
                     tracing::debug!(%id, "queueing op state for local processing");
@@ -187,7 +174,6 @@ where
 
         Ok(OperationResult {
             return_msg: None,
-            target_addr: _,
             state: Some(updated_state),
         }) => {
             let id = *updated_state.id();
@@ -195,19 +181,17 @@ where
         }
         Ok(OperationResult {
             return_msg: Some(msg),
-            target_addr,
             state: None,
         }) => {
             op_manager.completed(tx_id);
 
-            if let Some(target) = target_addr {
-                tracing::debug!(%tx_id, ?target, "sending back message to target");
-                network_bridge.send(target, msg).await?;
+            if let Some(target) = msg.target() {
+                tracing::debug!(%tx_id, target=%target.peer(), "sending back message to target");
+                network_bridge.send(&target.peer(), msg).await?;
             }
         }
         Ok(OperationResult {
             return_msg: None,
-            target_addr: _,
             state: None,
         }) => {
             op_manager.completed(tx_id);

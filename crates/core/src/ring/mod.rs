@@ -20,7 +20,7 @@ use crate::topology::rate::Rate;
 use crate::topology::TopologyAdjustment;
 use crate::tracing::{NetEventLog, NetEventRegister};
 
-use crate::transport::{ObservedAddr, TransportPublicKey};
+use crate::transport::TransportPublicKey;
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
@@ -38,8 +38,10 @@ mod location;
 mod peer_key_location;
 mod score;
 mod seeding;
+mod transient_manager;
 
 use self::score::Score;
+pub(crate) use self::transient_manager::TransientConnectionManager;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
@@ -327,18 +329,12 @@ impl Ring {
     }
 
     /// Will return an error in case the max number of subscribers has been added.
-    ///
-    /// The `upstream_addr` parameter is the transport-level address from which the subscribe
-    /// message was received. This is used instead of the address embedded in `subscriber`
-    /// because NAT peers may embed incorrect addresses in their messages.
     pub fn add_subscriber(
         &self,
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
-        upstream_addr: Option<ObservedAddr>,
     ) -> Result<(), ()> {
-        self.seeding_manager
-            .add_subscriber(contract, subscriber, upstream_addr)
+        self.seeding_manager.add_subscriber(contract, subscriber)
     }
 
     /// Remove a subscriber by peer ID from a specific contract
@@ -650,6 +646,7 @@ impl Ring {
         let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
         let target_connections = self.connection_manager.min_connections;
 
+        let is_gateway = self.connection_manager.is_gateway();
         let (tx, op, msg) = ConnectOp::initiate_join_request(
             joiner,
             query_target.clone(),
@@ -657,6 +654,7 @@ impl Ring {
             ttl,
             target_connections,
             op_manager.connect_forward_estimator.clone(),
+            is_gateway,
         );
 
         live_tx_tracker.add_transaction(query_target.addr(), tx);
