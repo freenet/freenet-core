@@ -642,7 +642,7 @@ impl ConnectOp {
             tx,
             desired_location,
             target_connections,
-            Some(own.peer.addr),
+            Some(own.addr()),
             Some(target.clone()),
             None,
             connect_forward_estimator,
@@ -1295,7 +1295,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: vec![],
-                observed_addr: Some(joiner.peer.addr),
+                observed_addr: Some(joiner.addr()),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1327,7 +1327,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 2,
                 visited: vec![],
-                observed_addr: Some(joiner.peer.addr),
+                observed_addr: Some(joiner.addr()),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1356,7 +1356,7 @@ mod tests {
         let joiner = make_peer(5050);
         let observed_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
-            joiner.peer.addr.port(),
+            joiner.addr().port(),
         );
         let mut state = RelayState {
             upstream: joiner.clone(),
@@ -1383,8 +1383,14 @@ mod tests {
             .observed_address
             .expect("expected observed address update");
         assert_eq!(addr, observed_addr);
-        assert_eq!(target.peer.addr, observed_addr);
-        assert_eq!(state.request.joiner.peer.addr, observed_addr);
+        assert_eq!(target.addr(), observed_addr);
+        // After handling, the joiner should be upgraded to Known with the observed address
+        let joiner_peer = state
+            .request
+            .joiner
+            .peer_id()
+            .expect("joiner should be Known after observed_addr");
+        assert_eq!(joiner_peer.addr, observed_addr);
     }
 
     #[test]
@@ -1454,7 +1460,7 @@ mod tests {
             joiner: joiner.clone(),
             ttl: 3,
             visited: vec![joiner.clone()],
-            observed_addr: Some(joiner.peer.addr),
+            observed_addr: Some(joiner.addr()),
         };
 
         let tx = Transaction::new::<ConnectMsg>();
@@ -1559,14 +1565,17 @@ mod tests {
             .response_target
             .expect("response_target should be set when accepting");
         assert_eq!(
-            response_target.peer.addr, observed_public_addr,
+            response_target.addr(),
+            observed_public_addr,
             "response_target must use observed external address ({}) not private address ({})",
-            observed_public_addr, private_addr
+            observed_public_addr,
+            private_addr
         );
 
         // Double-check: the original joiner had the private address
         assert_eq!(
-            joiner.peer.addr, private_addr,
+            joiner.addr(),
+            private_addr,
             "original joiner should have private address"
         );
     }
