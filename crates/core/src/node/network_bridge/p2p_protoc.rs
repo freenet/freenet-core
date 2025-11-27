@@ -357,7 +357,7 @@ impl P2pConnManager {
                                 .connection_manager
                                 .get_peer_key()
                                 .unwrap();
-                            if target_peer.peer == self_peer_id {
+                            if target_peer.peer() == self_peer_id {
                                 tracing::error!(
                                     tx = %msg.id(),
                                     msg_type = %msg,
@@ -382,14 +382,14 @@ impl P2pConnManager {
                             // removed by another task between those two calls.
                             let peer_connection = ctx
                                 .connections
-                                .get(&target_peer.peer)
+                                .get(&target_peer.peer())
                                 .or_else(|| {
                                     if target_peer.addr().ip().is_unspecified() {
                                         ctx.connection_entry_by_pub_key(target_peer.pub_key())
                                             .map(|(existing_peer, sender)| {
                                                 tracing::info!(
                                                     tx = %msg.id(),
-                                                    target_peer = %target_peer.peer,
+                                                    target_peer = %target_peer.peer(),
                                                     resolved_addr = %existing_peer.addr,
                                                     "Resolved outbound connection using peer public key due to unspecified address"
                                                 );
@@ -402,7 +402,7 @@ impl P2pConnManager {
                             tracing::debug!(
                                 tx = %msg.id(),
                                 self_peer = %ctx.bridge.op_manager.ring.connection_manager.pub_key,
-                                target = %target_peer.peer,
+                                target = %target_peer.peer(),
                                 conn_map_size = ctx.connections.len(),
                                 has_connection = peer_connection.is_some(),
                                 "[CONN_TRACK] LOOKUP: Checking for existing connection in HashMap"
@@ -425,14 +425,14 @@ impl P2pConnManager {
                                 None => {
                                     tracing::warn!(
                                         id = %msg.id(),
-                                        target = %target_peer.peer,
+                                        target = %target_peer.peer(),
                                         "No existing outbound connection, establishing connection first"
                                     );
 
                                     // Queue the message for sending after connection is established
                                     let tx = *msg.id();
                                     let (callback, mut result) = tokio::sync::mpsc::channel(10);
-                                    let target_peer_id = target_peer.peer.clone();
+                                    let target_peer_id = target_peer.peer().clone();
                                     let msg_clone = msg.clone();
                                     let bridge_sender = ctx.bridge.ev_listener_tx.clone();
                                     let self_peer_id = ctx
@@ -448,7 +448,7 @@ impl P2pConnManager {
                                     ctx.bridge
                                         .ev_listener_tx
                                         .send(Right(NodeEvent::ConnectPeer {
-                                            peer: target_peer.peer.clone(),
+                                            peer: target_peer.peer().clone(),
                                             tx,
                                             callback,
                                             is_gw: false,
@@ -840,7 +840,7 @@ impl P2pConnManager {
                                     for conns in connections_by_loc.values() {
                                         for conn in conns {
                                             connected_peers.push((
-                                                conn.location.peer.to_string(),
+                                                conn.location.peer().to_string(),
                                                 conn.location.addr().to_string(),
                                             ));
                                         }
@@ -911,7 +911,7 @@ impl P2pConnManager {
                                                     .map(|s| {
                                                         s.value()
                                                             .iter()
-                                                            .map(|pk| pk.peer.to_string())
+                                                            .map(|pk| pk.peer().to_string())
                                                             .collect()
                                                     })
                                                     .unwrap_or_default()
@@ -937,10 +937,11 @@ impl P2pConnManager {
                                     use freenet_stdlib::client_api::ConnectedPeerInfo;
                                     for conns in connections_by_loc.values() {
                                         for conn in conns {
-                                            connected_peer_ids.push(conn.location.peer.to_string());
+                                            connected_peer_ids
+                                                .push(conn.location.peer().to_string());
                                             response.connected_peers_detailed.push(
                                                 ConnectedPeerInfo {
-                                                    peer_id: conn.location.peer.to_string(),
+                                                    peer_id: conn.location.peer().to_string(),
                                                     address: conn.location.addr().to_string(),
                                                 },
                                             );
@@ -949,7 +950,7 @@ impl P2pConnManager {
                                 } else {
                                     for conns in connections_by_loc.values() {
                                         connected_peer_ids.extend(
-                                            conns.iter().map(|c| c.location.peer.to_string()),
+                                            conns.iter().map(|c| c.location.peer().to_string()),
                                         );
                                     }
                                 }
@@ -1916,14 +1917,14 @@ impl P2pConnManager {
                         if sender_peer.addr() == remote_addr
                             || sender_peer.addr().ip().is_unspecified()
                         {
-                            let mut new_peer_id = sender_peer.peer.clone();
+                            let mut new_peer_id = sender_peer.peer().clone();
                             if new_peer_id.addr.ip().is_unspecified() {
                                 new_peer_id.addr = remote_addr;
                                 if let Some(sender_mut) =
                                     extract_sender_from_message_mut(&mut inbound.msg)
                                 {
-                                    if sender_mut.peer.addr.ip().is_unspecified() {
-                                        sender_mut.peer.addr = remote_addr;
+                                    if sender_mut.peer().addr.ip().is_unspecified() {
+                                        sender_mut.peer().addr = remote_addr;
                                     }
                                 }
                             }
@@ -2023,11 +2024,11 @@ impl P2pConnManager {
                         msg_type = %msg,
                         target_peer = %target,
                         self_peer = %self_peer,
-                        target_equals_self = (target.peer == self_peer),
+                        target_equals_self = (target.peer() == self_peer),
                         "[ROUTING] handle_notification_msg: Checking if message targets self"
                     );
 
-                    if target.peer != self_peer {
+                    if target.peer() != self_peer {
                         // Message targets another peer - send as outbound
                         tracing::info!(
                             tx = %msg.id(),

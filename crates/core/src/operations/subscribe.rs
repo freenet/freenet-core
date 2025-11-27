@@ -29,7 +29,7 @@ fn subscribers_snapshot(op_manager: &OpManager, key: &ContractKey) -> Vec<String
         .subscribers_of(key)
         .map(|subs| {
             subs.iter()
-                .map(|loc| format!("{:.8}", loc.peer))
+                .map(|loc| format!("{:.8}", loc.peer()))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
@@ -149,13 +149,13 @@ pub(crate) async fn request_subscribe(
         tracing::debug!(
             tx = %id,
             %key,
-            subscriber_peer = %own_loc.peer,
+            subscriber_peer = %own_loc.peer(),
             local_has_contract,
             "subscribe: request_subscribe invoked"
         );
 
         let mut skip_list: HashSet<PeerId> = HashSet::new();
-        skip_list.insert(own_loc.peer.clone());
+        skip_list.insert(own_loc.peer().clone());
 
         // Use k_closest_potentially_caching to try multiple candidates
         // Try up to 3 candidates
@@ -170,7 +170,7 @@ pub(crate) async fn request_subscribe(
                 .collect();
             let candidate_display: Vec<String> = candidates
                 .iter()
-                .map(|cand| format!("{:.8}", cand.peer))
+                .map(|cand| format!("{:.8}", cand.peer()))
                 .collect();
             tracing::info!(
                 tx = %id,
@@ -205,7 +205,7 @@ pub(crate) async fn request_subscribe(
                         .map(|subs| {
                             subs.value()
                                 .iter()
-                                .map(|loc| format!("{:.8}", loc.peer))
+                                .map(|loc| format!("{:.8}", loc.peer()))
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
@@ -231,7 +231,7 @@ pub(crate) async fn request_subscribe(
         tracing::debug!(
             tx = %id,
             %key,
-            target_peer = %target.peer,
+            target_peer = %target.peer(),
             target_location = ?target.location,
             "subscribe: forwarding RequestSub to target peer"
         );
@@ -265,7 +265,7 @@ async fn complete_local_subscription(
         tracing::warn!(
             %key,
             tx = %id,
-            subscriber = %subscriber.peer,
+            subscriber = %subscriber.peer(),
             error = ?err,
             "Failed to register local subscriber"
         );
@@ -273,7 +273,7 @@ async fn complete_local_subscription(
         tracing::debug!(
             %key,
             tx = %id,
-            subscriber = %subscriber.peer,
+            subscriber = %subscriber.peer(),
             "Registered local subscriber"
         );
     }
@@ -328,7 +328,7 @@ impl Operation for SubscribeOp {
     ) -> Result<OpInitialization<Self>, OpError> {
         let mut sender: Option<PeerId> = None;
         if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer);
+            sender = Some(peer_key_loc.peer());
         };
         let id = *msg.id();
 
@@ -382,7 +382,7 @@ impl Operation for SubscribeOp {
                     tracing::debug!(
                         tx = %id,
                         %key,
-                        subscriber = %subscriber.peer,
+                        subscriber = %subscriber.peer(),
                         "subscribe: processing RequestSub"
                     );
                     let own_loc = op_manager.ring.connection_manager.own_location();
@@ -406,7 +406,7 @@ impl Operation for SubscribeOp {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            subscriber = %subscriber.peer,
+                            subscriber = %subscriber.peer(),
                             subscribers_before = ?before_direct,
                             "subscribe: handling RequestSub locally (contract available)"
                         );
@@ -419,7 +419,7 @@ impl Operation for SubscribeOp {
                             tracing::warn!(
                                 tx = %id,
                                 %key,
-                                subscriber = %subscriber.peer,
+                                subscriber = %subscriber.peer(),
                                 subscribers_before = ?before_direct,
                                 "subscribe: direct registration failed (max subscribers reached)"
                             );
@@ -439,12 +439,12 @@ impl Operation for SubscribeOp {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            subscriber = %subscriber.peer,
+                            subscriber = %subscriber.peer(),
                             subscribers_after = ?after_direct,
                             "subscribe: registered direct subscriber (RequestSub)"
                         );
 
-                        if subscriber.peer == own_loc.peer {
+                        if subscriber.peer() == own_loc.peer() {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
@@ -484,18 +484,18 @@ impl Operation for SubscribeOp {
                     }
 
                     let mut skip = HashSet::new();
-                    skip.insert(subscriber.peer.clone());
-                    skip.insert(own_loc.peer.clone());
+                    skip.insert(subscriber.peer().clone());
+                    skip.insert(own_loc.peer().clone());
 
                     let forward_target = op_manager
                         .ring
                         .k_closest_potentially_caching(key, &skip, 3)
                         .into_iter()
-                        .find(|candidate| candidate.peer != own_loc.peer)
+                        .find(|candidate| candidate.peer() != own_loc.peer())
                         .ok_or_else(|| RingError::NoCachingPeers(*key))
                         .map_err(OpError::from)?;
 
-                    skip.insert(forward_target.peer.clone());
+                    skip.insert(forward_target.peer().clone());
 
                     new_state = self.state;
                     return_msg = Some(SubscribeMsg::SeekNode {
@@ -537,7 +537,7 @@ impl Operation for SubscribeOp {
                         tracing::warn!(
                             tx = %id,
                             %key,
-                            subscriber = %subscriber.peer,
+                            subscriber = %subscriber.peer(),
                             "Dropping Subscribe SeekNode with zero HTL"
                         );
                         return Ok(return_not_subbed());
@@ -606,13 +606,13 @@ impl Operation for SubscribeOp {
                             }
 
                             let mut new_skip_list = skip_list.clone();
-                            new_skip_list.insert(target.peer.clone());
+                            new_skip_list.insert(target.peer().clone());
 
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                new_target = %new_target.peer,
-                                upstream = %subscriber.peer,
+                                new_target = %new_target.peer(),
+                                upstream = %subscriber.peer(),
                                 "Forward request to peer"
                             );
                             tracing::debug!(
@@ -650,7 +650,7 @@ impl Operation for SubscribeOp {
                     tracing::info!(
                         tx = %id,
                         %key,
-                        subscriber = %subscriber.peer,
+                        subscriber = %subscriber.peer(),
                         subscribers_before = ?before_direct,
                         "subscribe: attempting to register direct subscriber"
                     );
@@ -662,7 +662,7 @@ impl Operation for SubscribeOp {
                         tracing::warn!(
                             tx = %id,
                             %key,
-                            subscriber = %subscriber.peer,
+                            subscriber = %subscriber.peer(),
                             subscribers_before = ?before_direct,
                             "subscribe: direct registration failed (max subscribers reached)"
                         );
@@ -673,7 +673,7 @@ impl Operation for SubscribeOp {
                     tracing::info!(
                         tx = %id,
                         %key,
-                        subscriber = %subscriber.peer,
+                        subscriber = %subscriber.peer(),
                         subscribers_after = ?after_direct,
                         "subscribe: registered direct subscriber"
                     );
@@ -683,7 +683,7 @@ impl Operation for SubscribeOp {
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                subscriber = % subscriber.peer,
+                                subscriber = % subscriber.peer(),
                                 "Peer successfully subscribed to contract",
                             );
                             new_state = None;
@@ -708,7 +708,7 @@ impl Operation for SubscribeOp {
                     tracing::warn!(
                         tx = %id,
                         %key,
-                        potential_provider = %sender.peer,
+                        potential_provider = %sender.peer(),
                         "Contract not found at potential subscription provider",
                     );
                     // will error out in case it has reached max number of retries
@@ -720,7 +720,7 @@ impl Operation for SubscribeOp {
                             current_hop,
                         }) => {
                             if retries < MAX_RETRIES {
-                                skip_list.insert(sender.peer.clone());
+                                skip_list.insert(sender.peer().clone());
                                 // Use k_closest_potentially_caching to try multiple candidates
                                 let candidates = op_manager
                                     .ring
@@ -773,8 +773,8 @@ impl Operation for SubscribeOp {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            this_peer = %target.peer,
-                            provider = %sender.peer,
+                            this_peer = %target.peer(),
+                            provider = %sender.peer(),
                             "Subscribed to contract"
                         );
                         tracing::info!(
@@ -782,7 +782,7 @@ impl Operation for SubscribeOp {
                             %key,
                             upstream = upstream_subscriber
                                 .as_ref()
-                                .map(|loc| format!("{:.8}", loc.peer))
+                                .map(|loc| format!("{:.8}", loc.peer()))
                                 .unwrap_or_else(|| "<none>".into()),
                             "Handling ReturnSub (subscribed=true)"
                         );
@@ -791,7 +791,7 @@ impl Operation for SubscribeOp {
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                upstream = %upstream_subscriber.peer,
+                                upstream = %upstream_subscriber.peer(),
                                 subscribers_before = ?before_upstream,
                                 "subscribe: attempting to register upstream link"
                             );
@@ -803,7 +803,7 @@ impl Operation for SubscribeOp {
                                 tracing::warn!(
                                     tx = %id,
                                     %key,
-                                    upstream = %upstream_subscriber.peer,
+                                    upstream = %upstream_subscriber.peer(),
                                     subscribers_before = ?before_upstream,
                                     "subscribe: upstream registration failed (max subscribers reached)"
                                 );
@@ -812,7 +812,7 @@ impl Operation for SubscribeOp {
                                 tracing::info!(
                                     tx = %id,
                                     %key,
-                                    upstream = %upstream_subscriber.peer,
+                                    upstream = %upstream_subscriber.peer(),
                                     subscribers_after = ?after_upstream,
                                     "subscribe: registered upstream link"
                                 );
@@ -823,7 +823,7 @@ impl Operation for SubscribeOp {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            provider = %sender.peer,
+                            provider = %sender.peer(),
                             subscribers_before = ?before_provider,
                             "subscribe: registering provider/subscription source"
                         );
@@ -840,7 +840,7 @@ impl Operation for SubscribeOp {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            provider = %sender.peer,
+                            provider = %sender.peer(),
                             subscribers_after = ?after_provider,
                             "subscribe: registered provider/subscription source"
                         );
@@ -850,7 +850,7 @@ impl Operation for SubscribeOp {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                upstream_subscriber = %upstream_subscriber.peer,
+                                upstream_subscriber = %upstream_subscriber.peer(),
                                 "Forwarding subscription to upstream subscriber"
                             );
                             return_msg = Some(SubscribeMsg::ReturnSub {
