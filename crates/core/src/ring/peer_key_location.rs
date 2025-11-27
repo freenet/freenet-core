@@ -13,7 +13,6 @@ use std::{fmt::Display, hash::Hash};
 ///   The first recipient should fill this in from the packet source address.
 /// - `Known`: The address is known and explicitly specified.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
-#[allow(dead_code)] // Will be used as refactoring progresses
 pub enum PeerAddr {
     /// Address unknown - will be filled in by first recipient from packet source.
     /// Used when a peer doesn't know its own external address (e.g., behind NAT).
@@ -22,7 +21,6 @@ pub enum PeerAddr {
     Known(SocketAddr),
 }
 
-#[allow(dead_code)] // Will be used as refactoring progresses
 impl PeerAddr {
     /// Returns the socket address if known, None otherwise.
     pub fn as_known(&self) -> Option<&SocketAddr> {
