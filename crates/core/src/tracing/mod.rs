@@ -140,11 +140,10 @@ impl<'a> NetEventLog<'a> {
             peer_id,
             kind: EventKind::Connect(ConnectEvent::Connected {
                 this: ring.connection_manager.own_location(),
-                connected: PeerKeyLocation::with_location(
-                    peer.pub_key.clone(),
-                    peer.addr,
-                    location,
-                ),
+                connected: PeerKeyLocation {
+                    peer,
+                    location: Some(location),
+                },
             }),
         }
     }
@@ -193,7 +192,7 @@ impl<'a> NetEventLog<'a> {
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
-                        peer_id: acceptor.peer().clone(),
+                        peer_id: acceptor.peer.clone(),
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: acceptor.clone(),
                             connected: target.clone(),
@@ -201,7 +200,7 @@ impl<'a> NetEventLog<'a> {
                     },
                     NetEventLog {
                         tx: msg.id(),
-                        peer_id: target.peer().clone(),
+                        peer_id: target.peer.clone(),
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: target.clone(),
                             connected: acceptor,
@@ -659,20 +658,20 @@ async fn send_to_metrics_server(
     let res = match &send_msg.kind {
         EventKind::Connect(ConnectEvent::Connected {
             this:
-                this_peer @ PeerKeyLocation {
+                PeerKeyLocation {
+                    peer: from_peer,
                     location: Some(from_loc),
-                    ..
                 },
             connected:
-                connected_peer @ PeerKeyLocation {
+                PeerKeyLocation {
+                    peer: to_peer,
                     location: Some(to_loc),
-                    ..
                 },
         }) => {
             let msg = PeerChange::added_connection_msg(
                 (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
-                (this_peer.peer().to_string(), from_loc.as_f64()),
-                (connected_peer.peer().to_string(), to_loc.as_f64()),
+                (from_peer.clone().to_string(), from_loc.as_f64()),
+                (to_peer.clone().to_string(), to_loc.as_f64()),
             );
             ws_stream.send(Message::Binary(msg.into())).await
         }
@@ -695,7 +694,7 @@ async fn send_to_metrics_server(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
-                target.peer().to_string(),
+                target.peer.to_string(),
                 *timestamp,
                 contract_location.as_f64(),
             );
@@ -715,7 +714,7 @@ async fn send_to_metrics_server(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
-                target.peer().to_string(),
+                target.peer.to_string(),
                 *timestamp,
                 contract_location.as_f64(),
             );
@@ -795,7 +794,7 @@ async fn send_to_metrics_server(
                 id.to_string(),
                 key.to_string(),
                 contract_location.as_f64(),
-                at.peer().to_string(),
+                at.peer.to_string(),
                 at.location.unwrap().as_f64(),
                 *timestamp,
             );
@@ -814,7 +813,7 @@ async fn send_to_metrics_server(
                 id.to_string(),
                 key.to_string(),
                 requester.to_string(),
-                target.peer().to_string(),
+                target.peer.to_string(),
                 *timestamp,
                 contract_location.as_f64(),
             );
@@ -832,7 +831,7 @@ async fn send_to_metrics_server(
                 id.to_string(),
                 key.to_string(),
                 requester.to_string(),
-                target.peer().to_string(),
+                target.peer.to_string(),
                 *timestamp,
                 contract_location.as_f64(),
             );
@@ -1548,16 +1547,13 @@ pub(super) mod test {
                     if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = &l.kind
                     {
                         let disconnected = disconnects
-                            .get(&connected.peer())
+                            .get(&connected.peer)
                             .iter()
                             .flat_map(|dcs| dcs.iter())
                             .any(|dc| dc > &l.datetime);
                         if let Some((this_loc, conn_loc)) = this.location.zip(connected.location) {
                             if this.pub_key() == key && !disconnected {
-                                return Some((
-                                    connected.peer().clone(),
-                                    conn_loc.distance(this_loc),
-                                ));
+                                return Some((connected.peer.clone(), conn_loc.distance(this_loc)));
                             }
                         }
                     }
@@ -1650,16 +1646,14 @@ pub(super) mod test {
                     tx: &tx,
                     peer_id: peer_id.clone(),
                     kind: EventKind::Connect(ConnectEvent::Connected {
-                        this: PeerKeyLocation::with_location(
-                            peer_id.pub_key.clone(),
-                            peer_id.addr,
-                            loc,
-                        ),
-                        connected: PeerKeyLocation::with_location(
-                            other.pub_key.clone(),
-                            other.addr,
-                            *location,
-                        ),
+                        this: PeerKeyLocation {
+                            peer: peer_id.clone(),
+                            location: Some(loc),
+                        },
+                        connected: PeerKeyLocation {
+                            peer: other.clone(),
+                            location: Some(*location),
+                        },
                     }),
                 }))
             },
