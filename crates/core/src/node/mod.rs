@@ -1225,18 +1225,20 @@ pub struct PeerId {
 
 impl Hash for PeerId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
+        self.pub_key.hash(state);
     }
 }
 
 impl PartialEq<PeerId> for PeerId {
     fn eq(&self, other: &PeerId) -> bool {
-        self.addr == other.addr
+        self.pub_key == other.pub_key
     }
 }
 
 impl Ord for PeerId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Compare by address since TransportPublicKey doesn't impl Ord.
+        // This is only used for ordering in BTreeMap/BTreeSet, not for equality.
         self.addr.cmp(&other.addr)
     }
 }
@@ -1253,26 +1255,14 @@ impl PeerId {
     }
 }
 
-thread_local! {
-    static PEER_ID: std::cell::RefCell<Option<TransportPublicKey>> = const { std::cell::RefCell::new(None) };
-}
-
 #[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for PeerId {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let addr: ([u8; 4], u16) = u.arbitrary()?;
 
-        let pub_key = PEER_ID.with(|peer_id| {
-            let mut peer_id = peer_id.borrow_mut();
-            match &*peer_id {
-                Some(k) => k.clone(),
-                None => {
-                    let key = TransportKeypair::new().public().clone();
-                    peer_id.replace(key.clone());
-                    key
-                }
-            }
-        });
+        // Always generate a unique keypair. PeerId equality is based on pub_key,
+        // so distinct peers must have distinct keys.
+        let pub_key = TransportKeypair::new().public().clone();
 
         Ok(Self {
             addr: addr.into(),
@@ -1288,17 +1278,9 @@ impl PeerId {
         rand::rng().fill(&mut addr[..]);
         let port = crate::util::get_free_port().unwrap();
 
-        let pub_key = PEER_ID.with(|peer_id| {
-            let mut peer_id = peer_id.borrow_mut();
-            match &*peer_id {
-                Some(k) => k.clone(),
-                None => {
-                    let key = TransportKeypair::new().public().clone();
-                    peer_id.replace(key.clone());
-                    key
-                }
-            }
-        });
+        // Always generate a unique keypair. PeerId equality is based on pub_key,
+        // so distinct peers must have distinct keys.
+        let pub_key = TransportKeypair::new().public().clone();
 
         Self {
             addr: (addr, port).into(),
