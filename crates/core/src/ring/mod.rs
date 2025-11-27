@@ -259,7 +259,7 @@ impl Ring {
         for peer in peers {
             if !self
                 .connection_manager
-                .has_connection_or_pending(&peer.peer)
+                .has_connection_or_pending(&peer.peer())
             {
                 filtered.push(peer);
             }
@@ -297,7 +297,7 @@ impl Ring {
         let connections = self.connection_manager.get_connections_by_location();
         for conns in connections.values() {
             for conn in conns {
-                let peer = conn.location.peer.clone();
+                let peer = conn.location.peer().clone();
                 if skip_list.has_element(peer.clone()) || !seen.insert(peer) {
                     continue;
                 }
@@ -311,10 +311,11 @@ impl Ring {
                 if skip_list.has_element(peer.clone()) || !seen.insert(peer.clone()) {
                     continue;
                 }
-                candidates.push(PeerKeyLocation {
-                    peer,
-                    location: Some(location),
-                });
+                candidates.push(PeerKeyLocation::with_location(
+                    peer.pub_key.clone(),
+                    peer.addr,
+                    location,
+                ));
                 if candidates.len() >= k {
                     break;
                 }
@@ -483,7 +484,7 @@ impl Ring {
                 .map(|(loc, conns)| {
                     let conns: Vec<_> = conns
                         .iter()
-                        .filter(|conn| !live_tx_tracker.has_live_connection(&conn.location.peer))
+                        .filter(|conn| !live_tx_tracker.has_live_connection(&conn.location.peer()))
                         .cloned()
                         .collect();
                     (*loc, conns)
@@ -572,7 +573,7 @@ impl Ring {
                         notifier
                             .notifications_sender
                             .send(Either::Right(crate::message::NodeEvent::DropConnection(
-                                peer.peer,
+                                peer.peer(),
                             )))
                             .await
                             .map_err(|error| {
@@ -647,7 +648,7 @@ impl Ring {
         let joiner = self.connection_manager.own_location();
         tracing::info!(
             this_peer = %joiner,
-            query_target_peer = %query_target.peer,
+            query_target_peer = %query_target.peer(),
             %ideal_location,
             "Sending connect request via connection_maintenance"
         );
@@ -663,7 +664,7 @@ impl Ring {
             op_manager.connect_forward_estimator.clone(),
         );
 
-        live_tx_tracker.add_transaction(query_target.peer.clone(), tx);
+        live_tx_tracker.add_transaction(query_target.peer().clone(), tx);
         op_manager
             .push(tx, OpEnum::Connect(Box::new(op)))
             .await

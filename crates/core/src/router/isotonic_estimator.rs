@@ -323,7 +323,7 @@ mod tests {
     ) -> IsotonicEvent {
         let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
 
-        let result = distance.powf(0.5) + peer.peer.clone().to_bytes()[0] as f64;
+        let result = distance.powf(0.5) + peer.peer().clone().to_bytes()[0] as f64;
         IsotonicEvent {
             peer,
             contract_location,
@@ -337,7 +337,7 @@ mod tests {
     ) -> IsotonicEvent {
         let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
 
-        let result = (100.0 - distance).powf(0.5) + peer.peer.clone().to_bytes()[0] as f64;
+        let result = (100.0 - distance).powf(0.5) + peer.peer().clone().to_bytes()[0] as f64;
         IsotonicEvent {
             peer,
             contract_location,

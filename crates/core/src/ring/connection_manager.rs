@@ -311,7 +311,9 @@ impl ConnectionManager {
             Some(Location::new(location))
         };
         let peer = self.get_peer_key().expect("peer key not set");
-        PeerKeyLocation { peer, location }
+        let mut pkl = PeerKeyLocation::from(peer);
+        pkl.location = location;
+        pkl
     }
 
     pub fn get_peer_key(&self) -> Option<PeerId> {
@@ -438,7 +440,7 @@ impl ConnectionManager {
             );
             let mut cbl = self.connections_by_location.write();
             if let Some(prev_list) = cbl.get_mut(&prev_loc) {
-                if let Some(pos) = prev_list.iter().position(|c| c.location.peer == peer) {
+                if let Some(pos) = prev_list.iter().position(|c| c.location.peer() == peer) {
                     prev_list.swap_remove(pos);
                 }
                 if prev_list.is_empty() {
@@ -450,10 +452,7 @@ impl ConnectionManager {
         {
             let mut cbl = self.connections_by_location.write();
             cbl.entry(loc).or_default().push(Connection {
-                location: PeerKeyLocation {
-                    peer: peer.clone(),
-                    location: Some(loc),
-                },
+                location: PeerKeyLocation::with_location(peer.pub_key.clone(), peer.addr, loc),
             });
         }
     }
@@ -482,19 +481,22 @@ impl ConnectionManager {
         let entry = cbl.entry(loc).or_default();
         if let Some(conn) = entry
             .iter_mut()
-            .find(|conn| conn.location.peer == *old_peer)
+            .find(|conn| conn.location.peer() == *old_peer)
         {
-            conn.location.peer = new_peer;
+            // Update the public key and address to match the new peer
+            conn.location.pub_key = new_peer.pub_key.clone();
+            conn.location.set_addr(new_peer.addr);
         } else {
             tracing::warn!(
                 %old_peer,
                 "update_peer_identity: connection entry missing; creating placeholder"
             );
             entry.push(Connection {
-                location: PeerKeyLocation {
-                    peer: new_peer,
-                    location: Some(loc),
-                },
+                location: PeerKeyLocation::with_location(
+                    new_peer.pub_key.clone(),
+                    new_peer.addr,
+                    loc,
+                ),
             });
         }
 
@@ -525,7 +527,7 @@ impl ConnectionManager {
 
         let conns = &mut *self.connections_by_location.write();
         if let Some(conns) = conns.get_mut(&loc) {
-            if let Some(pos) = conns.iter().position(|c| &c.location.peer == peer) {
+            if let Some(pos) = conns.iter().position(|c| &c.location.peer() == peer) {
                 conns.swap_remove(pos);
             }
         }
@@ -598,15 +600,15 @@ impl ConnectionManager {
             .values()
             .filter_map(|conns| {
                 let conn = conns.choose(&mut rand::rng())?;
-                if self.is_transient(&conn.location.peer) {
+                if self.is_transient(&conn.location.peer()) {
                     return None;
                 }
                 if let Some(requester) = requesting {
-                    if requester == &conn.location.peer {
+                    if requester == &conn.location.peer() {
                         return None;
                     }
                 }
-                (!skip_list.has_element(conn.location.peer.clone()))
+                (!skip_list.has_element(conn.location.peer().clone()))
                     .then_some(conn.location.clone())
             })
             .collect();
