@@ -646,7 +646,7 @@ impl OpManager {
         }
         self.ring
             .live_tx_tracker
-            .add_transaction(peer.clone(), *transaction);
+            .add_transaction(peer.addr, *transaction);
     }
 }
 
