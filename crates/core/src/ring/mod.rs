@@ -44,7 +44,8 @@ use self::score::Score;
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
 pub use location::{Distance, Location};
-pub use peer_key_location::PeerKeyLocation;
+#[allow(unused_imports)] // PeerAddr will be used as refactoring progresses
+pub use peer_key_location::{PeerAddr, PeerKeyLocation};
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
