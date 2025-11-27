@@ -384,8 +384,8 @@ impl P2pConnManager {
                                 .connections
                                 .get(&target_peer.peer)
                                 .or_else(|| {
-                                    if target_peer.peer.addr.ip().is_unspecified() {
-                                        ctx.connection_entry_by_pub_key(&target_peer.peer.pub_key)
+                                    if target_peer.addr().ip().is_unspecified() {
+                                        ctx.connection_entry_by_pub_key(target_peer.pub_key())
                                             .map(|(existing_peer, sender)| {
                                                 tracing::info!(
                                                     tx = %msg.id(),
@@ -841,7 +841,7 @@ impl P2pConnManager {
                                         for conn in conns {
                                             connected_peers.push((
                                                 conn.location.peer.to_string(),
-                                                conn.location.peer.addr.to_string(),
+                                                conn.location.addr().to_string(),
                                             ));
                                         }
                                     }
@@ -941,7 +941,7 @@ impl P2pConnManager {
                                             response.connected_peers_detailed.push(
                                                 ConnectedPeerInfo {
                                                     peer_id: conn.location.peer.to_string(),
-                                                    address: conn.location.peer.addr.to_string(),
+                                                    address: conn.location.addr().to_string(),
                                                 },
                                             );
                                         }
@@ -1915,8 +1915,8 @@ impl P2pConnManager {
 
                 if let Some(remote_addr) = inbound.remote_addr {
                     if let Some(sender_peer) = extract_sender_from_message(&inbound.msg) {
-                        if sender_peer.peer.addr == remote_addr
-                            || sender_peer.peer.addr.ip().is_unspecified()
+                        if sender_peer.addr() == remote_addr
+                            || sender_peer.addr().ip().is_unspecified()
                         {
                             let mut new_peer_id = sender_peer.peer.clone();
                             if new_peer_id.addr.ip().is_unspecified() {
