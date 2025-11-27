@@ -114,26 +114,13 @@ where
                 op_manager.completed(tx_id);
                 return Ok(None);
             }
-            if op_manager.all_sub_operations_completed(tx_id) {
-                tracing::debug!(%tx_id, "operation complete");
-                op_manager.completed(tx_id);
-                return Ok(Some(final_state));
-            } else {
-                let pending_count = op_manager.count_pending_sub_operations(tx_id);
-                tracing::debug!(
-                    %tx_id,
-                    pending_count,
-                    "root operation awaiting child completion"
-                );
-
-                // Track the root op so child completions can finish it later.
-                op_manager
-                    .root_ops_awaiting_sub_ops()
-                    .insert(tx_id, final_state);
-                tracing::info!(%tx_id, "root operation registered as awaiting sub-ops");
-
-                return Ok(None);
-            }
+            // Return finalized state immediately to the client, regardless of pending
+            // sub-operations. Sub-operations like subscriptions are "fire and forget"
+            // from the client's perspective - they want to know their PUT/GET succeeded,
+            // not wait for the subscription to complete.
+            tracing::debug!(%tx_id, "operation complete");
+            op_manager.completed(tx_id);
+            return Ok(Some(final_state));
         }
         Ok(OperationResult {
             return_msg: Some(msg),

@@ -552,18 +552,6 @@ impl OpManager {
             .expect_and_register_sub_operation(parent, child);
     }
 
-    /// Returns true if all child operations of the parent have completed.
-    pub fn all_sub_operations_completed(&self, parent: Transaction) -> bool {
-        self.sub_op_tracker
-            .all_sub_operations_completed(parent, &self.ops.completed)
-    }
-
-    /// Returns the number of pending child operations for the parent.
-    pub fn count_pending_sub_operations(&self, parent: Transaction) -> usize {
-        self.sub_op_tracker
-            .count_pending_sub_operations(parent, &self.ops.completed)
-    }
-
     /// Handle sub-operation failure - propagate error to parent.
     pub async fn sub_operation_failed(
         &self,
@@ -625,11 +613,6 @@ impl OpManager {
     /// Sub-operations should not send responses directly to clients.
     pub fn is_sub_operation(&self, tx: Transaction) -> bool {
         self.sub_op_tracker.is_sub_operation(tx)
-    }
-
-    /// Exposes root operations awaiting sub-operation completion.
-    pub(crate) fn root_ops_awaiting_sub_ops(&self) -> &Arc<DashMap<Transaction, OpEnum>> {
-        &self.sub_op_tracker.root_ops_awaiting_sub_ops
     }
 
     /// Exposes failed parent operations.
