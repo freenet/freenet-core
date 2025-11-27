@@ -355,7 +355,7 @@ impl Ring {
 
     pub async fn prune_connection(&self, peer: PeerId) {
         tracing::debug!(%peer, "Removing connection");
-        self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
+        self.live_tx_tracker.prune_transactions_from_peer(&peer);
         // This case would be when a connection is being open, so peer location hasn't been recorded yet and we can ignore everything below
         let Some(loc) = self.connection_manager.prune_alive_connection(&peer) else {
             return;
@@ -473,7 +473,7 @@ impl Ring {
                 .map(|(loc, conns)| {
                     let conns: Vec<_> = conns
                         .iter()
-                        .filter(|conn| !live_tx_tracker.has_live_connection(conn.location.addr()))
+                        .filter(|conn| !live_tx_tracker.has_live_connection(&conn.location.peer()))
                         .cloned()
                         .collect();
                     (*loc, conns)
@@ -644,6 +644,7 @@ impl Ring {
         let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
         let target_connections = self.connection_manager.min_connections;
 
+        let is_gateway = self.connection_manager.is_gateway();
         let (tx, op, msg) = ConnectOp::initiate_join_request(
             joiner,
             query_target.clone(),
@@ -651,9 +652,10 @@ impl Ring {
             ttl,
             target_connections,
             op_manager.connect_forward_estimator.clone(),
+            is_gateway,
         );
 
-        live_tx_tracker.add_transaction(query_target.addr(), tx);
+        live_tx_tracker.add_transaction(query_target.peer().clone(), tx);
         op_manager
             .push(tx, OpEnum::Connect(Box::new(op)))
             .await
