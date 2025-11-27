@@ -542,6 +542,12 @@ fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident
 
     // Generate the startup waiting code based on wait_for_connections flag
     let startup_wait_code = if wait_for_connections {
+        // Determine expected_connections: use explicit value or default to 1
+        // (each peer should connect to at least one gateway)
+        let expected_conn = args.expected_connections.unwrap_or(1);
+        let expected_conn_lit =
+            syn::LitInt::new(&expected_conn.to_string(), proc_macro2::Span::call_site());
+
         // Use condition-based waiting: poll for connection events
         quote! {
             // Wait for peer nodes to establish connections (condition-based)
@@ -551,8 +557,8 @@ fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident
             );
             let connection_timeout = Duration::from_secs(#startup_wait_secs);
             let poll_interval = Duration::from_millis(500);
-            // Each peer needs at least 1 connection (to a gateway)
-            let expected_connections = 1usize;
+            // Expected connections per peer (configurable via expected_connections parameter)
+            let expected_connections = #expected_conn_lit;
 
             match ctx.wait_for_connections(expected_connections, connection_timeout, poll_interval).await {
                 Ok(()) => {

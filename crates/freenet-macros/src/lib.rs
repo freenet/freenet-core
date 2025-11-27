@@ -51,6 +51,8 @@ use parser::FreenetTestArgs;
 ///   this becomes the maximum timeout for waiting for connections.
 /// - `wait_for_connections` (optional): If true, polls for connection events instead of sleeping for a fixed duration.
 ///   This makes tests more reliable by waiting until connections are actually established. (default: false)
+/// - `expected_connections` (optional): Minimum number of connections expected per peer node when using
+///   `wait_for_connections`. If not specified, defaults to 1 (each peer connects to at least one gateway).
 /// - `aggregate_events` (optional): When to aggregate events:
 ///   - `"on_failure"` (default): Only on test failure
 ///   - `"always"`: Always show event analysis

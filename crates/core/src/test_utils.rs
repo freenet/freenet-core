@@ -1561,12 +1561,25 @@ pub mod event_aggregator_utils {
 
 pub use event_aggregator_utils::{NodeLogInfo, TestAggregatorBuilder};
 
-/// Count the number of successful connection events in an event log file.
+/// Count the number of unique peer connections in an event log file.
 ///
-/// This function reads the event log and counts EventKind::Connect(ConnectEvent::Connected)
-/// events to determine how many connections have been established.
+/// This function reads the event log and counts unique peers that have Connected events.
+/// Due to the way connection events are logged (varying number of events per connection
+/// depending on which node initiates and processes the response), we count unique
+/// `connected` peer IDs rather than raw event counts to get an accurate connection count.
+///
+/// # Connection Event Logging Details
+///
+/// The number of Connected events per logical connection varies:
+/// - When a node receives a ConnectMsg::Response, it may log 1-2 Connected events
+/// - When a node sends a ConnectMsg::Response, it logs 1 Connected event
+/// - Events are logged from the perspective of the local node
+///
+/// By counting unique remote peers in Connected events, we get the actual number
+/// of distinct connections regardless of how many events were logged.
 async fn count_connection_events(event_log_path: &Path) -> anyhow::Result<usize> {
     use crate::tracing::{AOFEventSource, ConnectEvent, EventKind, EventSource};
+    use std::collections::HashSet;
 
     // Create an AOF event source for this log file
     let source = AOFEventSource::new(event_log_path.to_path_buf(), None);
@@ -1576,23 +1589,16 @@ async fn count_connection_events(event_log_path: &Path) -> anyhow::Result<usize>
         Err(_) => return Ok(0), // File doesn't exist or can't be read yet
     };
 
-    // Count Connected events specifically (not StartConnection or Finished)
-    // Each successful connection generates a Connected event on both sides
-    let connection_count = events
-        .iter()
-        .filter(|event| {
-            matches!(
-                &event.kind,
-                EventKind::Connect(ConnectEvent::Connected { .. })
-            )
-        })
-        .count();
+    // Collect unique connected peer IDs to count actual connections
+    // Each unique peer in a Connected event represents one logical connection
+    let mut connected_peers: HashSet<String> = HashSet::new();
 
-    // Each connection is logged from both sides, so divide by 2
-    // But ensure we return at least 1 if we see any connected events
-    if connection_count > 0 {
-        Ok(std::cmp::max(1, connection_count / 2))
-    } else {
-        Ok(0)
+    for event in &events {
+        if let EventKind::Connect(ConnectEvent::Connected { connected, .. }) = &event.kind {
+            // Use the connected peer's ID as the unique identifier
+            connected_peers.insert(connected.peer.to_string());
+        }
     }
+
+    Ok(connected_peers.len())
 }
