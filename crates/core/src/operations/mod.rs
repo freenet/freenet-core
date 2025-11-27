@@ -145,7 +145,7 @@ where
                 op_manager.completed(id);
                 if let Some(target) = msg.target() {
                     tracing::debug!(%id, %target, "sending final message to target");
-                    network_bridge.send(&target.peer, msg).await?;
+                    network_bridge.send(&target.peer(), msg).await?;
                 }
                 return Ok(Some(updated_state));
             } else {
@@ -153,7 +153,7 @@ where
                 tracing::debug!(%id, "operation in progress");
                 if let Some(target) = msg.target() {
                     tracing::debug!(%id, %target, "sending updated op state");
-                    network_bridge.send(&target.peer, msg).await?;
+                    network_bridge.send(&target.peer(), msg).await?;
                     op_manager.push(id, updated_state).await?;
                 } else {
                     tracing::debug!(%id, "queueing op state for local processing");
@@ -186,8 +186,8 @@ where
             op_manager.completed(tx_id);
 
             if let Some(target) = msg.target() {
-                tracing::debug!(%tx_id, target=%target.peer, "sending back message to target");
-                network_bridge.send(&target.peer, msg).await?;
+                tracing::debug!(%tx_id, target=%target.peer(), "sending back message to target");
+                network_bridge.send(&target.peer(), msg).await?;
             }
         }
         Ok(OperationResult {

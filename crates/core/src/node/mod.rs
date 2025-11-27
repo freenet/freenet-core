@@ -369,9 +369,12 @@ impl NodeConfig {
         let gateways: Vec<PeerKeyLocation> = self
             .gateways
             .iter()
-            .map(|node| PeerKeyLocation {
-                peer: node.peer_id.clone(),
-                location: Some(node.location),
+            .map(|node| {
+                PeerKeyLocation::with_location(
+                    node.peer_id.pub_key.clone(),
+                    node.peer_id.addr,
+                    node.location,
+                )
             })
             .collect();
 
@@ -1174,7 +1177,7 @@ async fn handle_aborted_op(
                 {
                     let gateway = op.gateway().cloned();
                     if let Some(gateway) = gateway {
-                        tracing::warn!("Retry connecting to gateway {}", gateway.peer);
+                        tracing::warn!("Retry connecting to gateway {}", gateway.peer());
                         connect::join_ring_request(None, &gateway, op_manager).await?;
                     }
                 }

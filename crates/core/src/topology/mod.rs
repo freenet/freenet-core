@@ -456,7 +456,7 @@ impl TopologyManager {
                     info!(
                         current_connections,
                         max_allowed = self.limits.max_connections,
-                        %peer.peer,
+                        peer = %peer.peer(),
                         "Enforcing max-connections cap via fallback removal"
                     );
                     adj = TopologyAdjustment::RemoveConnections(vec![peer]);
