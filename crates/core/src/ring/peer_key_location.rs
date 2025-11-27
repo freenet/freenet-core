@@ -1,5 +1,6 @@
 use super::Location;
 use crate::node::PeerId;
+use crate::transport::TransportPublicKey;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::{fmt::Display, hash::Hash};
@@ -67,6 +68,38 @@ pub struct PeerKeyLocation {
 }
 
 impl PeerKeyLocation {
+    /// Creates a new PeerKeyLocation with the given public key and address.
+    pub fn new(pub_key: TransportPublicKey, addr: SocketAddr) -> Self {
+        PeerKeyLocation {
+            peer: PeerId::new(addr, pub_key),
+            location: None,
+        }
+    }
+
+    /// Creates a new PeerKeyLocation with the given public key and address, plus explicit location.
+    pub fn with_location(
+        pub_key: TransportPublicKey,
+        addr: SocketAddr,
+        location: Location,
+    ) -> Self {
+        PeerKeyLocation {
+            peer: PeerId::new(addr, pub_key),
+            location: Some(location),
+        }
+    }
+
+    /// Returns the peer's public key (identity).
+    #[inline]
+    pub fn pub_key(&self) -> &TransportPublicKey {
+        &self.peer.pub_key
+    }
+
+    /// Returns the peer's socket address.
+    #[inline]
+    pub fn addr(&self) -> SocketAddr {
+        self.peer.addr
+    }
+
     #[cfg(test)]
     pub fn random() -> Self {
         PeerKeyLocation {
