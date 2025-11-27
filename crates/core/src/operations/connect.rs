@@ -941,6 +941,14 @@ impl Operation for ConnectOp {
                 }
                 ConnectMsg::ObservedAddress { address, .. } => {
                     self.handle_observed_address(*address, Instant::now());
+                    // Update the node's own PeerId with the externally-observed address.
+                    // This is critical for NAT peers - without this, they embed their
+                    // local loopback address (127.0.0.1) in messages, causing remote
+                    // peers to fail when trying to connect back.
+                    op_manager
+                        .ring
+                        .connection_manager
+                        .update_own_address(*address);
                     Ok(store_operation_state(&mut self))
                 }
             }

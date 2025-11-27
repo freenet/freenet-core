@@ -395,6 +395,25 @@ impl ConnectionManager {
         }
     }
 
+    /// Updates the own peer's address to the externally-observed address.
+    /// This is called when a NAT peer receives its observed address from a gateway.
+    /// Returns true if the address was updated, false if unchanged.
+    pub fn update_own_address(&self, observed_addr: SocketAddr) -> bool {
+        let mut this_peer = self.peer_key.lock();
+        if let Some(ref mut peer_id) = *this_peer {
+            if peer_id.addr != observed_addr {
+                tracing::info!(
+                    old_addr = %peer_id.addr,
+                    new_addr = %observed_addr,
+                    "Updating own peer address to externally-observed address"
+                );
+                peer_id.addr = observed_addr;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn prune_alive_connection(&self, peer: &PeerId) -> Option<Location> {
         self.prune_connection(peer, true)
     }
