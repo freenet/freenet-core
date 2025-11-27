@@ -230,10 +230,11 @@ impl<'a> NetEventLog<'a> {
                 id,
                 target,
                 key,
-                origin,
+                sender,
+                ..
             }) => EventKind::Put(PutEvent::PutSuccess {
                 id: *id,
-                requester: origin.clone(),
+                requester: sender.clone(),
                 target: target.clone(),
                 key: *key,
                 timestamp: chrono::Utc::now().timestamp() as u64,
@@ -245,7 +246,7 @@ impl<'a> NetEventLog<'a> {
                 key,
                 id,
                 upstream,
-                origin,
+                sender,
                 ..
             }) => EventKind::Put(PutEvent::BroadcastEmitted {
                 id: *id,
@@ -254,11 +255,11 @@ impl<'a> NetEventLog<'a> {
                 broadcasted_to: *broadcasted_to,
                 key: *key,
                 value: new_value.clone(),
-                sender: origin.clone(),
+                sender: sender.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Put(PutMsg::BroadcastTo {
-                origin,
+                sender,
                 new_value,
                 key,
                 target,
@@ -266,7 +267,7 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => EventKind::Put(PutEvent::BroadcastReceived {
                 id: *id,
-                requester: origin.clone(),
+                requester: sender.clone(),
                 key: *key,
                 value: new_value.clone(),
                 target: target.clone(),
@@ -276,6 +277,7 @@ impl<'a> NetEventLog<'a> {
                 id,
                 key,
                 value: StoreResponse { state: Some(_), .. },
+                sender,
                 target,
                 ..
             }) => EventKind::Get {
@@ -283,19 +285,18 @@ impl<'a> NetEventLog<'a> {
                 key: *key,
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 requester: target.clone(),
-                // Note: sender no longer embedded in message - use connection-based routing
-                target: target.clone(), // Placeholder - actual sender from source_addr
+                target: sender.clone(),
             },
             NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
                 id,
                 subscribed: true,
                 key,
+                sender,
                 target,
             }) => EventKind::Subscribed {
                 id: *id,
                 key: *key,
-                // Note: sender no longer embedded in message - use connection-based routing
-                at: target.clone(), // Placeholder - actual sender from source_addr
+                at: sender.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 requester: target.clone(),
             },
@@ -318,6 +319,8 @@ impl<'a> NetEventLog<'a> {
                 key,
                 id,
                 upstream,
+                sender,
+                ..
             }) => EventKind::Update(UpdateEvent::BroadcastEmitted {
                 id: *id,
                 upstream: upstream.clone(),
@@ -325,22 +328,22 @@ impl<'a> NetEventLog<'a> {
                 broadcasted_to: *broadcasted_to,
                 key: *key,
                 value: new_value.clone(),
-                // Note: sender no longer embedded in message - use connection-based routing
-                sender: upstream.clone(), // Placeholder - actual sender from source_addr
+                sender: sender.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Update(UpdateMsg::BroadcastTo {
+                sender,
                 new_value,
                 key,
                 target,
                 id,
+                ..
             }) => EventKind::Update(UpdateEvent::BroadcastReceived {
                 id: *id,
                 requester: target.clone(),
                 key: *key,
                 value: new_value.clone(),
-                // Note: sender no longer embedded in message - use connection-based routing
-                target: target.clone(), // Placeholder - actual sender from source_addr
+                target: sender.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             _ => EventKind::Ignored,
@@ -1225,7 +1228,7 @@ impl EventKind {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-enum ConnectEvent {
+pub enum ConnectEvent {
     StartConnection {
         from: PeerId,
     },
