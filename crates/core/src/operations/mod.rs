@@ -12,7 +12,7 @@ use crate::{
     client_events::HostResult,
     contract::{ContractError, ExecutorError},
     message::{InnerMessage, MessageStats, NetMessage, NetMessageV1, Transaction, TransactionType},
-    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable, PeerId},
+    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -33,6 +33,7 @@ where
     fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<SocketAddr>,
     ) -> impl Future<Output = Result<OpInitialization<Self>, OpError>> + 'a;
 
     fn id(&self) -> &Transaction;
@@ -43,7 +44,7 @@ where
         conn_manager: &'a mut CB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        // client_id: Option<ClientId>,
+        source_addr: Option<SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
 }
 
@@ -58,28 +59,33 @@ pub(crate) struct OperationResult {
 }
 
 pub(crate) struct OpInitialization<Op> {
-    sender: Option<PeerId>,
-    op: Op,
+    /// The source address of the peer that sent this message.
+    /// Used for sending error responses (Aborted) and as upstream_addr.
+    /// Note: Currently unused but prepared for Phase 4 of #2164.
+    #[allow(dead_code)]
+    pub source_addr: Option<SocketAddr>,
+    pub op: Op,
 }
 
 pub(crate) async fn handle_op_request<Op, NB>(
     op_manager: &OpManager,
     network_bridge: &mut NB,
     msg: &Op::Message,
+    source_addr: Option<SocketAddr>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     Op: Operation,
     NB: NetworkBridge,
 {
-    let sender;
     let tx = *msg.id();
     let result = {
-        let OpInitialization { sender: s, op } = Op::load_or_init(op_manager, msg).await?;
-        sender = s;
-        op.process_message(network_bridge, op_manager, msg).await
+        let OpInitialization { source_addr: _, op } =
+            Op::load_or_init(op_manager, msg, source_addr).await?;
+        op.process_message(network_bridge, op_manager, msg, source_addr)
+            .await
     };
 
-    handle_op_result(op_manager, network_bridge, result, tx, sender).await
+    handle_op_result(op_manager, network_bridge, result, tx, source_addr).await
 }
 
 #[inline(always)]
@@ -88,7 +94,7 @@ async fn handle_op_result<CB>(
     network_bridge: &mut CB,
     result: Result<OperationResult, OpError>,
     tx_id: Transaction,
-    sender: Option<PeerId>,
+    source_addr: Option<SocketAddr>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     CB: NetworkBridge,
@@ -100,9 +106,9 @@ where
             return Ok(None);
         }
         Err(err) => {
-            if let Some(sender) = sender {
+            if let Some(addr) = source_addr {
                 network_bridge
-                    .send(sender.addr, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
+                    .send(addr, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
                     .await?;
             }
             return Err(err);
