@@ -1450,7 +1450,8 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     nodes = ["gateway", "node-a"],
     auto_connect_peers = true,
     timeout_secs = 180,
-    startup_wait_secs = 20,
+    startup_wait_secs = 30,
+    wait_for_connections = true,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -1472,8 +1473,8 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Node A data dir: {:?}", node_a.temp_dir_path);
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
 
-    // Give extra time for peer to connect to gateway
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Note: No extra sleep needed here - wait_for_connections already ensured
+    // that the peer has connected to the gateway before we reach this point.
 
     // Connect first client to node A's websocket API (for putting with auto-subscribe)
     let uri_a =
