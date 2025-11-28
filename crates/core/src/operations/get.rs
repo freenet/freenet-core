@@ -1336,6 +1336,7 @@ fn build_op_result(
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
+        target_addr: None,
         state: output_op.map(OpEnum::Get),
     })
 }
@@ -1526,23 +1527,6 @@ mod messages {
                 Self::RequestGet { sender, .. } => Some(sender),
                 Self::SeekNode { sender, .. } => Some(sender),
                 Self::ReturnGet { sender, .. } => Some(sender),
-            }
-        }
-
-        /// Updates sender addresses with the observed transport address.
-        /// This is essential for NAT traversal - peers behind NAT don't know their external
-        /// address, so we rewrite it based on what the transport layer observed.
-        pub(crate) fn rewrite_sender_addr(&mut self, observed_addr: std::net::SocketAddr) {
-            match self {
-                Self::RequestGet { sender, .. } => {
-                    sender.set_addr(observed_addr);
-                }
-                Self::SeekNode { sender, .. } => {
-                    sender.set_addr(observed_addr);
-                }
-                Self::ReturnGet { sender, .. } => {
-                    sender.set_addr(observed_addr);
-                }
             }
         }
     }

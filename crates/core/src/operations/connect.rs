@@ -992,6 +992,7 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
     let state_clone = op.state.clone();
     OperationResult {
         return_msg: msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m))),
+        target_addr: None,
         state: state_clone.map(|state| {
             OpEnum::Connect(Box::new(ConnectOp {
                 id: op.id,

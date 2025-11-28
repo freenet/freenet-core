@@ -384,15 +384,10 @@ impl P2pConnManager {
                                     payload.observed_addr = Some(remote_addr);
                                 }
                             }
-                            // Rewrite sender addresses in all inbound messages with the observed
-                            // transport address. This is essential for NAT traversal - peers behind
-                            // NAT don't know their external address, so we update it based on what
-                            // the transport layer observed. Without this, responses would be sent
-                            // to the wrong address (e.g., 127.0.0.1 instead of the real NAT address).
-                            if let Some(remote_addr) = remote {
-                                msg.rewrite_sender_addr(remote_addr);
-                            }
-                            ctx.handle_inbound_message(msg, &op_manager, &mut state)
+                            // Pass the source address through to operations for routing.
+                            // This replaces the old rewrite_sender_addr hack - instead of mutating
+                            // message contents, we pass the observed transport address separately.
+                            ctx.handle_inbound_message(msg, remote, &op_manager, &mut state)
                                 .await?;
                         }
                         ConnEvent::OutboundMessage(NetMessage::V1(NetMessageV1::Aborted(tx))) => {
@@ -423,8 +418,8 @@ impl P2pConnManager {
                                     self_peer = %self_peer_id,
                                     "BUG: OutboundMessage targets self! This indicates a routing logic error - messages should not reach OutboundMessage handler if they target self"
                                 );
-                                // Convert to InboundMessage and process locally
-                                ctx.handle_inbound_message(msg, &op_manager, &mut state)
+                                // Convert to InboundMessage and process locally (no remote source)
+                                ctx.handle_inbound_message(msg, None, &op_manager, &mut state)
                                     .await?;
                                 continue;
                             }
@@ -1267,6 +1262,7 @@ impl P2pConnManager {
     async fn handle_inbound_message(
         &self,
         msg: NetMessage,
+        source_addr: Option<SocketAddr>,
         op_manager: &Arc<OpManager>,
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
@@ -1274,6 +1270,7 @@ impl P2pConnManager {
         tracing::debug!(
             %tx,
             tx_type = ?tx.transaction_type(),
+            ?source_addr,
             "Handling inbound NetMessage at event loop"
         );
         match msg {
@@ -1281,7 +1278,8 @@ impl P2pConnManager {
                 handle_aborted_op(tx, op_manager, &self.gateways).await?;
             }
             msg => {
-                self.process_message(msg, op_manager, None, state).await;
+                self.process_message(msg, source_addr, op_manager, None, state)
+                    .await;
             }
         }
         Ok(())
@@ -1290,6 +1288,7 @@ impl P2pConnManager {
     async fn process_message(
         &self,
         msg: NetMessage,
+        source_addr: Option<SocketAddr>,
         op_manager: &Arc<OpManager>,
         executor_callback_opt: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
         state: &mut EventListenerState,
@@ -1298,6 +1297,7 @@ impl P2pConnManager {
             tx = %msg.id(),
             tx_type = ?msg.id().transaction_type(),
             msg_type = %msg,
+            ?source_addr,
             peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
             "process_message called - processing network message"
         );
@@ -1325,6 +1325,7 @@ impl P2pConnManager {
         GlobalExecutor::spawn(
             process_message_decoupled(
                 msg,
+                source_addr,
                 op_manager.clone(),
                 self.bridge.clone(),
                 self.event_listener.trait_clone(),
