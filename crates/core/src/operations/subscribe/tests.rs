@@ -485,6 +485,7 @@ async fn test_subscription_validates_k_closest_usage() {
                 upstream_subscriber: None,
                 current_hop: 5,
             }),
+            upstream_addr: None,
         };
 
         // Verify skip list is maintained in state

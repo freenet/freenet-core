@@ -128,13 +128,21 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
 pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     let id = Transaction::new::<SubscribeMsg>();
     let state = Some(SubscribeState::PrepareRequest { id, key });
-    SubscribeOp { id, state }
+    SubscribeOp {
+        id,
+        state,
+        upstream_addr: None, // Local operation, no upstream peer
+    }
 }
 
 /// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
 pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp {
     let state = Some(SubscribeState::PrepareRequest { id, key });
-    SubscribeOp { id, state }
+    SubscribeOp {
+        id,
+        state,
+        upstream_addr: None, // Local operation, no upstream peer
+    }
 }
 
 /// Request to subscribe to value changes from a contract.
@@ -244,6 +252,7 @@ pub(crate) async fn request_subscribe(
         let op = SubscribeOp {
             id: *id,
             state: new_state,
+            upstream_addr: sub_op.upstream_addr,
         };
         op_manager
             .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
@@ -290,6 +299,9 @@ async fn complete_local_subscription(
 pub(crate) struct SubscribeOp {
     pub id: Transaction,
     state: Option<SubscribeState>,
+    /// The address we received this operation's message from.
+    /// Used for connection-based routing: responses are sent back to this address.
+    upstream_addr: Option<std::net::SocketAddr>,
 }
 
 impl SubscribeOp {
@@ -342,11 +354,12 @@ impl Operation for SubscribeOp {
                 Err(OpError::OpNotPresent(id))
             }
             Ok(None) => {
-                // new request to subcribe to a contract, initialize the machine
+                // new request to subscribe to a contract, initialize the machine
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(SubscribeState::ReceivedRequest),
                         id,
+                        upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                     },
                     source_addr,
                 })
@@ -468,7 +481,7 @@ impl Operation for SubscribeOp {
                                 return Err(err);
                             }
 
-                            return build_op_result(self.id, None, None);
+                            return build_op_result(self.id, None, None, self.upstream_addr);
                         }
 
                         let return_msg = SubscribeMsg::ReturnSub {
@@ -479,7 +492,12 @@ impl Operation for SubscribeOp {
                             subscribed: true,
                         };
 
-                        return build_op_result(self.id, None, Some(return_msg));
+                        return build_op_result(
+                            self.id,
+                            None,
+                            Some(return_msg),
+                            self.upstream_addr,
+                        );
                     }
 
                     let mut skip = HashSet::new();
@@ -641,6 +659,7 @@ impl Operation for SubscribeOp {
                                     retries: *retries,
                                 })
                                 .into(),
+                                self.upstream_addr,
                             );
                         }
                         // After fetch attempt we should now have the contract locally.
@@ -876,7 +895,7 @@ impl Operation for SubscribeOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg)
+            build_op_result(self.id, new_state, return_msg, self.upstream_addr)
         })
     }
 }
@@ -885,10 +904,12 @@ fn build_op_result(
     id: Transaction,
     state: Option<SubscribeState>,
     msg: Option<SubscribeMsg>,
+    upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|state| SubscribeOp {
         id,
         state: Some(state),
+        upstream_addr,
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
