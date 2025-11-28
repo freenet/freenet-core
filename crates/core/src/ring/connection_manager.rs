@@ -320,6 +320,31 @@ impl ConnectionManager {
         self.peer_key.lock().clone()
     }
 
+    /// Look up a PeerId by socket address from connections_by_location or transient connections.
+    pub fn get_peer_by_addr(&self, addr: SocketAddr) -> Option<PeerId> {
+        // Check connections by location
+        let connections = self.connections_by_location.read();
+        for conns in connections.values() {
+            for conn in conns {
+                if conn.location.addr() == addr {
+                    return Some(conn.location.peer());
+                }
+            }
+        }
+        drop(connections);
+
+        // Check transient connections
+        if let Some((peer, _)) = self
+            .transient_connections
+            .iter()
+            .find(|e| e.key().addr == addr)
+            .map(|e| (e.key().clone(), e.value().clone()))
+        {
+            return Some(peer);
+        }
+        None
+    }
+
     pub fn is_gateway(&self) -> bool {
         self.is_gateway
     }

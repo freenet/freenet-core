@@ -282,7 +282,7 @@ impl RelayState {
             // observed socket is loopback, this guard is skipped only in local/unit tests where
             // peers share 127.0.0.1, so keep a one-shot overwrite and avoid early returns.
             if !self.observed_sent {
-                self.request.joiner.peer().addr = joiner_addr;
+                self.request.joiner.set_addr(joiner_addr);
                 if self.request.joiner.location.is_none() {
                     self.request.joiner.location = Some(Location::from_address(&joiner_addr));
                 }
@@ -799,7 +799,7 @@ impl Operation for ConnectOp {
                             address,
                         };
                         network_bridge
-                            .send(&target.peer(), NetMessage::V1(NetMessageV1::Connect(msg)))
+                            .send(target.addr(), NetMessage::V1(NetMessageV1::Connect(msg)))
                             .await?;
                     }
 
@@ -822,7 +822,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                &next.peer(),
+                                next.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -931,7 +931,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                &upstream.peer(),
+                                upstream.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;

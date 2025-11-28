@@ -574,11 +574,9 @@ impl Operation for UpdateOp {
                     let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
 
-                    // Collect peer_ids first to ensure they outlive the futures
-                    let peer_ids: Vec<_> = broadcast_to.iter().map(|p| p.peer()).collect();
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
 
-                    for (peer, peer_id) in broadcast_to.iter().zip(peer_ids.iter()) {
+                    for peer in broadcast_to.iter() {
                         let msg = UpdateMsg::BroadcastTo {
                             id: *id,
                             key: *key,
@@ -586,7 +584,7 @@ impl Operation for UpdateOp {
                             sender: sender.clone(),
                             target: peer.clone(),
                         };
-                        let f = conn_manager.send(peer_id, msg.into());
+                        let f = conn_manager.send(peer.addr(), msg.into());
                         broadcasting.push(f);
                     }
                     let error_futures = futures::future::join_all(broadcasting)
@@ -611,7 +609,7 @@ impl Operation for UpdateOp {
                             err
                         );
                         // TODO: review this, maybe we should just dropping this subscription
-                        conn_manager.drop_connection(&peer.peer()).await?;
+                        conn_manager.drop_connection(peer.addr()).await?;
                         incorrect_results += 1;
                     }
 

@@ -573,7 +573,7 @@ impl Ring {
                         notifier
                             .notifications_sender
                             .send(Either::Right(crate::message::NodeEvent::DropConnection(
-                                peer.peer(),
+                                peer.addr(),
                             )))
                             .await
                             .map_err(|error| {
