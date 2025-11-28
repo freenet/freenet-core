@@ -771,6 +771,7 @@ impl Operation for PutOp {
                         );
                         return Ok(OperationResult {
                             return_msg: None,
+                            target_addr: None,
                             state: None,
                         });
                     }
@@ -940,6 +941,7 @@ fn build_op_result(
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
+        target_addr: None,
         state: output_op.map(OpEnum::Put),
     })
 }
@@ -1636,39 +1638,6 @@ mod messages {
                 Self::SeekNode { sender, .. } => Some(sender),
                 Self::BroadcastTo { sender, .. } => Some(sender),
                 _ => None,
-            }
-        }
-
-        /// Updates sender/origin addresses with the observed transport address.
-        /// This is essential for NAT traversal - peers behind NAT don't know their external
-        /// address, so we rewrite it based on what the transport layer observed.
-        pub(crate) fn rewrite_sender_addr(&mut self, observed_addr: std::net::SocketAddr) {
-            match self {
-                Self::RequestPut { sender, origin, .. } => {
-                    sender.set_addr(observed_addr);
-                    origin.set_addr(observed_addr);
-                }
-                Self::SeekNode { sender, origin, .. } => {
-                    sender.set_addr(observed_addr);
-                    origin.set_addr(observed_addr);
-                }
-                Self::PutForward { sender, origin, .. } => {
-                    sender.set_addr(observed_addr);
-                    origin.set_addr(observed_addr);
-                }
-                Self::SuccessfulPut { sender, origin, .. } => {
-                    sender.set_addr(observed_addr);
-                    origin.set_addr(observed_addr);
-                }
-                Self::Broadcasting { sender, origin, .. } => {
-                    sender.set_addr(observed_addr);
-                    origin.set_addr(observed_addr);
-                }
-                Self::BroadcastTo { sender, origin, .. } => {
-                    sender.set_addr(observed_addr);
-                    origin.set_addr(observed_addr);
-                }
-                Self::AwaitPut { .. } => {}
             }
         }
     }

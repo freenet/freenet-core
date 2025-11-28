@@ -268,20 +268,57 @@ pub(crate) trait MessageStats {
     fn requested_location(&self) -> Option<Location>;
 }
 
+/// Wrapper for inbound messages that carries the source address from the transport layer.
+/// This separates routing concerns from message content - the source address is determined by
+/// the network layer (from the packet), not embedded in the serialized message.
+///
+/// Generic over the message type so it can wrap:
+/// - `NetMessage` at the network layer (p2p_protoc.rs)
+/// - Specific operation messages (GetMsg, PutMsg, etc.) at the operation layer
+///
+/// Note: Currently unused but prepared for Phase 4 of #2164.
+/// Will be used to thread source addresses to operations for routing.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct InboundMessage<M> {
+    /// The message content
+    pub msg: M,
+    /// The socket address this message was received from (from UDP packet source)
+    pub source_addr: SocketAddr,
+}
+
+#[allow(dead_code)]
+impl<M> InboundMessage<M> {
+    /// Create a new inbound message wrapper
+    pub fn new(msg: M, source_addr: SocketAddr) -> Self {
+        Self { msg, source_addr }
+    }
+
+    /// Transform the inner message while preserving source_addr
+    pub fn map<N>(self, f: impl FnOnce(M) -> N) -> InboundMessage<N> {
+        InboundMessage {
+            msg: f(self.msg),
+            source_addr: self.source_addr,
+        }
+    }
+
+    /// Get a reference to the inner message
+    pub fn inner(&self) -> &M {
+        &self.msg
+    }
+}
+
+#[allow(dead_code)]
+impl InboundMessage<NetMessage> {
+    /// Get the transaction ID from the wrapped network message
+    pub fn id(&self) -> &Transaction {
+        self.msg.id()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NetMessage {
     V1(NetMessageV1),
-}
-
-impl NetMessage {
-    /// Updates the sender's address in the message with the observed transport address.
-    /// This is essential for NAT traversal - peers behind NAT don't know their external
-    /// address, so we update it based on what the transport layer observed.
-    pub(crate) fn rewrite_sender_addr(&mut self, observed_addr: SocketAddr) {
-        match self {
-            NetMessage::V1(msg) => msg.rewrite_sender_addr(observed_addr),
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -297,22 +334,6 @@ pub(crate) enum NetMessageV1 {
     },
     Update(UpdateMsg),
     Aborted(Transaction),
-}
-
-impl NetMessageV1 {
-    /// Updates the sender's address in the message with the observed transport address.
-    fn rewrite_sender_addr(&mut self, observed_addr: SocketAddr) {
-        match self {
-            NetMessageV1::Put(msg) => msg.rewrite_sender_addr(observed_addr),
-            NetMessageV1::Get(msg) => msg.rewrite_sender_addr(observed_addr),
-            NetMessageV1::Subscribe(msg) => msg.rewrite_sender_addr(observed_addr),
-            NetMessageV1::Update(msg) => msg.rewrite_sender_addr(observed_addr),
-            // Connect messages are handled separately (they use observed_addr field)
-            NetMessageV1::Connect(_) => {}
-            // These don't have sender addresses to rewrite
-            NetMessageV1::Unsubscribed { .. } | NetMessageV1::Aborted(_) => {}
-        }
-    }
 }
 
 trait Versioned {
