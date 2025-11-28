@@ -18,6 +18,9 @@ pub(crate) struct UpdateOp {
     pub id: Transaction,
     pub(crate) state: Option<UpdateState>,
     stats: Option<UpdateStats>,
+    /// The address we received this operation's message from.
+    /// Used for connection-based routing: responses are sent back to this address.
+    upstream_addr: Option<std::net::SocketAddr>,
 }
 
 impl UpdateOp {
@@ -111,6 +114,7 @@ impl Operation for UpdateOp {
                         state: Some(UpdateState::ReceivedRequest),
                         id: tx,
                         stats: None, // don't care about stats in target peers
+                        upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                     },
                     source_addr,
                 })
@@ -622,7 +626,7 @@ impl Operation for UpdateOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, stats)
+            build_op_result(self.id, new_state, return_msg, stats, self.upstream_addr)
         })
     }
 }
@@ -753,11 +757,13 @@ fn build_op_result(
     state: Option<UpdateState>,
     return_msg: Option<UpdateMsg>,
     stats: Option<UpdateStats>,
+    upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<super::OperationResult, OpError> {
     let output_op = state.map(|op| UpdateOp {
         id,
         state: Some(op),
         stats,
+        upstream_addr,
     });
     let state = output_op.map(OpEnum::Update);
     Ok(OperationResult {
@@ -909,6 +915,7 @@ pub(crate) fn start_op(
         id,
         state,
         stats: Some(UpdateStats { target: None }),
+        upstream_addr: None, // Local operation, no upstream peer
     }
 }
 
@@ -933,6 +940,7 @@ pub(crate) fn start_op_with_id(
         id,
         state,
         stats: Some(UpdateStats { target: None }),
+        upstream_addr: None, // Local operation, no upstream peer
     }
 }
 
@@ -1174,6 +1182,7 @@ async fn deliver_update_result(
             summary: summary.clone(),
         }),
         stats: None,
+        upstream_addr: None, // Terminal state, no routing needed
     };
 
     let host_result = op.to_host_result();

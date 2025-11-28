@@ -25,6 +25,9 @@ use crate::{
 pub(crate) struct PutOp {
     pub id: Transaction,
     state: Option<PutState>,
+    /// The address we received this operation's message from.
+    /// Used for connection-based routing: responses are sent back to this address.
+    upstream_addr: Option<std::net::SocketAddr>,
 }
 
 impl PutOp {
@@ -130,6 +133,7 @@ impl Operation for PutOp {
                     op: Self {
                         state: Some(PutState::ReceivedRequest),
                         id: tx,
+                        upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                     },
                     source_addr,
                 })
@@ -457,6 +461,7 @@ impl Operation for PutOp {
                         (broadcast_to, sender.clone()),
                         key,
                         (contract.clone(), value.clone()),
+                        self.upstream_addr,
                     )
                     .await
                     {
@@ -510,6 +515,7 @@ impl Operation for PutOp {
                         (broadcast_to, sender.clone()),
                         *key,
                         (contract.clone(), updated_value),
+                        self.upstream_addr,
                     )
                     .await
                     {
@@ -895,6 +901,7 @@ impl Operation for PutOp {
                         (broadcast_to, sender.clone()),
                         key,
                         (contract.clone(), new_value.clone()),
+                        self.upstream_addr,
                     )
                     .await
                     {
@@ -908,7 +915,7 @@ impl Operation for PutOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg)
+            build_op_result(self.id, new_state, return_msg, self.upstream_addr)
         })
     }
 }
@@ -934,10 +941,12 @@ fn build_op_result(
     id: Transaction,
     state: Option<PutState>,
     msg: Option<PutMsg>,
+    upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|op| PutOp {
         id,
         state: Some(op),
+        upstream_addr,
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
@@ -956,6 +965,7 @@ async fn try_to_broadcast(
     (broadcast_to, upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
     key: ContractKey,
     (contract, new_value): (ContractContainer, WrappedState),
+    upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<(Option<PutState>, Option<PutMsg>), OpError> {
     let new_state;
     let return_msg;
@@ -1041,6 +1051,7 @@ async fn try_to_broadcast(
                 let op = PutOp {
                     id,
                     state: new_state,
+                    upstream_addr,
                 };
                 op_manager
                     .notify_op_change(NetMessage::from(return_msg.unwrap()), OpEnum::Put(op))
@@ -1084,7 +1095,11 @@ pub(crate) fn start_op(
         subscribe,
     });
 
-    PutOp { id, state }
+    PutOp {
+        id,
+        state,
+        upstream_addr: None, // Local operation, no upstream peer
+    }
 }
 
 /// Create a PUT operation with a specific transaction ID (for operation deduplication)
@@ -1109,7 +1124,11 @@ pub(crate) fn start_op_with_id(
         subscribe,
     });
 
-    PutOp { id, state }
+    PutOp {
+        id,
+        state,
+        upstream_addr: None, // Local operation, no upstream peer
+    }
 }
 
 #[derive(Debug)]
@@ -1244,6 +1263,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
                 (broadcast_to, sender),
                 key,
                 (contract.clone(), updated_value),
+                put_op.upstream_addr,
             )
             .await?;
 
