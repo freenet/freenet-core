@@ -88,17 +88,14 @@ impl Operation for UpdateOp {
     async fn load_or_init<'a>(
         op_manager: &'a crate::node::OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Result<super::OpInitialization<Self>, OpError> {
-        let mut sender: Option<PeerId> = None;
-        if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer());
-        };
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Update(update_op))) => {
                 Ok(OpInitialization {
                     op: update_op,
-                    sender,
+                    source_addr,
                 })
                 // was an existing operation, other peer messaged back
             }
@@ -108,14 +105,14 @@ impl Operation for UpdateOp {
             }
             Ok(None) => {
                 // new request to get a value for a contract, initialize the machine
-                tracing::debug!(tx = %tx, sender = ?sender, "initializing new op");
+                tracing::debug!(tx = %tx, ?source_addr, "initializing new op");
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(UpdateState::ReceivedRequest),
                         id: tx,
                         stats: None, // don't care about stats in target peers
                     },
-                    sender,
+                    source_addr,
                 })
             }
             Err(err) => Err(err.into()),
@@ -131,7 +128,7 @@ impl Operation for UpdateOp {
         conn_manager: &'a mut NB,
         op_manager: &'a crate::node::OpManager,
         input: &'a Self::Message,
-        // _client_id: Option<ClientId>,
+        _source_addr: Option<std::net::SocketAddr>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<super::OperationResult, OpError>> + Send + 'a>,
     > {
@@ -1305,6 +1302,7 @@ mod messages {
     }
 
     impl UpdateMsg {
+        #[allow(dead_code)]
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
             match self {
                 Self::RequestUpdate { sender, .. } => Some(sender),

@@ -325,11 +325,8 @@ impl Operation for SubscribeOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
-        let mut sender: Option<PeerId> = None;
-        if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer());
-        };
         let id = *msg.id();
 
         match op_manager.pop(msg.id()) {
@@ -337,7 +334,7 @@ impl Operation for SubscribeOp {
                 // was an existing operation, the other peer messaged back
                 Ok(OpInitialization {
                     op: subscribe_op,
-                    sender,
+                    source_addr,
                 })
             }
             Ok(Some(op)) => {
@@ -351,7 +348,7 @@ impl Operation for SubscribeOp {
                         state: Some(SubscribeState::ReceivedRequest),
                         id,
                     },
-                    sender,
+                    source_addr,
                 })
             }
             Err(err) => Err(err.into()),
@@ -367,6 +364,7 @@ impl Operation for SubscribeOp {
         _conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
+        _source_addr: Option<std::net::SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -973,6 +971,7 @@ mod messages {
     }
 
     impl SubscribeMsg {
+        #[allow(dead_code)]
         pub fn sender(&self) -> Option<&PeerKeyLocation> {
             match self {
                 Self::ReturnSub { sender, .. } => Some(sender),

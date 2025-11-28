@@ -113,6 +113,7 @@ impl fmt::Display for ConnectMsg {
 }
 
 impl ConnectMsg {
+    #[allow(dead_code)]
     pub fn sender(&self) -> Option<PeerId> {
         match self {
             ConnectMsg::Response { sender, .. } => Some(sender.peer()),
@@ -751,12 +752,13 @@ impl Operation for ConnectOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Connect(op))) => Ok(OpInitialization {
                 op: *op,
-                sender: msg.sender(),
+                source_addr,
             }),
             Ok(Some(other)) => {
                 op_manager.push(tx, other).await?;
@@ -775,7 +777,7 @@ impl Operation for ConnectOp {
                         return Err(OpError::OpNotPresent(tx));
                     }
                 };
-                Ok(OpInitialization { op, sender: None })
+                Ok(OpInitialization { op, source_addr })
             }
             Err(err) => Err(err.into()),
         }
@@ -786,6 +788,7 @@ impl Operation for ConnectOp {
         network_bridge: &'a mut NB,
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        _source_addr: Option<std::net::SocketAddr>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
     > {

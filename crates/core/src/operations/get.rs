@@ -445,15 +445,15 @@ impl Operation for GetOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
-        let mut sender: Option<PeerId> = None;
-        if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer());
-        };
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Get(get_op))) => {
-                Ok(OpInitialization { op: get_op, sender })
+                Ok(OpInitialization {
+                    op: get_op,
+                    source_addr,
+                })
                 // was an existing operation, other peer messaged back
             }
             Ok(Some(op)) => {
@@ -470,7 +470,7 @@ impl Operation for GetOp {
                         result: None,
                         stats: None, // don't care about stats in target peers
                     },
-                    sender,
+                    source_addr,
                 })
             }
             Err(err) => Err(err.into()),
@@ -486,6 +486,7 @@ impl Operation for GetOp {
         _conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
+        _source_addr: Option<std::net::SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             #[allow(unused_assignments)]
