@@ -976,6 +976,26 @@ mod messages {
                 _ => None,
             }
         }
+
+        /// Updates subscriber/sender addresses with the observed transport address.
+        /// This is essential for NAT traversal - peers behind NAT don't know their external
+        /// address, so we rewrite it based on what the transport layer observed.
+        pub(crate) fn rewrite_sender_addr(&mut self, observed_addr: std::net::SocketAddr) {
+            match self {
+                Self::FetchRouting { .. } => {
+                    // No sender field to rewrite
+                }
+                Self::RequestSub { subscriber, .. } => {
+                    subscriber.set_addr(observed_addr);
+                }
+                Self::SeekNode { subscriber, .. } => {
+                    subscriber.set_addr(observed_addr);
+                }
+                Self::ReturnSub { sender, .. } => {
+                    sender.set_addr(observed_addr);
+                }
+            }
+        }
     }
 
     impl Display for SubscribeMsg {

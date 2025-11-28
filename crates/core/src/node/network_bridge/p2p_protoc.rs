@@ -365,6 +365,14 @@ impl P2pConnManager {
                                     payload.observed_addr = Some(remote_addr);
                                 }
                             }
+                            // Rewrite sender addresses in all inbound messages with the observed
+                            // transport address. This is essential for NAT traversal - peers behind
+                            // NAT don't know their external address, so we update it based on what
+                            // the transport layer observed. Without this, responses would be sent
+                            // to the wrong address (e.g., 127.0.0.1 instead of the real NAT address).
+                            if let Some(remote_addr) = remote {
+                                msg.rewrite_sender_addr(remote_addr);
+                            }
                             ctx.handle_inbound_message(msg, &op_manager, &mut state)
                                 .await?;
                         }
