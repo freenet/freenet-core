@@ -485,26 +485,26 @@ mod tests {
         let bytes = crate::util::test::random_bytes_2mb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
-        let mut peers = vec![];
         let mut events = vec![];
+
+        // Reuse a single PeerId - these tests validate log I/O, not peer identity
+        let peer = PeerId::random();
 
         for _ in 0..TEST_LOGS {
             let tx: Transaction = gen.arbitrary()?;
             transactions.push(tx);
-            let peer: PeerId = PeerId::random();
-            peers.push(peer);
         }
         let mut total_route_events: usize = 0;
 
-        for i in 0..TEST_LOGS {
+        for tx in &transactions {
             let kind: EventKind = gen.arbitrary()?;
             // The route events in first REMOVE_RECS will be dropped
             if matches!(kind, EventKind::Route(_)) {
                 total_route_events += 1;
             }
             events.push(NetEventLog {
-                tx: &transactions[i],
-                peer_id: peers[i].clone(),
+                tx,
+                peer_id: peer.clone(),
                 kind,
             });
         }
@@ -531,26 +531,26 @@ mod tests {
         let bytes = crate::util::test::random_bytes_2mb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
-        let mut peers = vec![];
         let mut events = vec![];
+
+        // Reuse a single PeerId - these tests validate log I/O, not peer identity
+        let peer = PeerId::random();
 
         for _ in 0..TEST_LOGS {
             let tx: Transaction = gen.arbitrary()?;
             transactions.push(tx);
-            let peer: PeerId = PeerId::random();
-            peers.push(peer);
         }
         let mut total_route_events: usize = 0;
 
-        for i in 0..TEST_LOGS {
+        for tx in &transactions {
             let kind: EventKind = gen.arbitrary()?;
             // The route events in first REMOVE_RECS will be dropped
             if matches!(kind, EventKind::Route(_)) {
                 total_route_events += 1;
             }
             events.push(NetEventLog {
-                tx: &transactions[i],
-                peer_id: peers[i].clone(),
+                tx,
+                peer_id: peer.clone(),
                 kind,
             });
         }
@@ -577,26 +577,26 @@ mod tests {
         let bytes = crate::util::test::random_bytes_2mb();
         let mut gen = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
-        let mut peers = vec![];
         let mut events = vec![];
+
+        // Reuse a single PeerId - these tests validate log I/O, not peer identity
+        let peer = PeerId::random();
 
         for _ in 0..TEST_LOGS {
             let tx: Transaction = gen.arbitrary()?;
             transactions.push(tx);
-            let peer: PeerId = PeerId::random();
-            peers.push(peer);
         }
         let mut total_route_events: usize = 0;
 
-        for i in 0..TEST_LOGS {
+        for (i, tx) in transactions.iter().enumerate() {
             let kind: EventKind = gen.arbitrary()?;
             // The route events in first REMOVE_RECS will be dropped
             if matches!(kind, EventKind::Route(_)) && i >= REMOVE_RECS {
                 total_route_events += 1;
             }
             events.push(NetEventLog {
-                tx: &transactions[i],
-                peer_id: peers[i].clone(),
+                tx,
+                peer_id: peer.clone(),
                 kind,
             });
         }
