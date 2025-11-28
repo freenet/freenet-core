@@ -8,12 +8,12 @@
 //! See [`../../architecture.md`](../../architecture.md) for its interactions with event loops and other components.
 
 use std::future::Future;
+use std::net::SocketAddr;
 
 use either::Either;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use super::PeerId;
 use crate::message::{NetMessage, NodeEvent};
 
 mod handshake;
@@ -25,19 +25,29 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
 /// Allows handling of connections to the network as well as sending messages
 /// to other peers in the network with whom connection has been established.
+///
+/// Connections are keyed by socket address since that's what identifies
+/// a network connection. The cryptographic identity is handled separately
+/// at the transport layer.
 pub(crate) trait NetworkBridge: Send + Sync {
-    fn drop_connection(&mut self, peer: &PeerId) -> impl Future<Output = ConnResult<()>> + Send;
+    fn drop_connection(
+        &mut self,
+        peer_addr: SocketAddr,
+    ) -> impl Future<Output = ConnResult<()>> + Send;
 
-    fn send(&self, target: &PeerId, msg: NetMessage)
-        -> impl Future<Output = ConnResult<()>> + Send;
+    fn send(
+        &self,
+        target_addr: SocketAddr,
+        msg: NetMessage,
+    ) -> impl Future<Output = ConnResult<()>> + Send;
 }
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub(crate) enum ConnectionError {
     #[error("location unknown for this node")]
     LocationUnknown,
-    #[error("unable to send message")]
-    SendNotCompleted(PeerId),
+    #[error("unable to send message to {0}")]
+    SendNotCompleted(SocketAddr),
     #[error("Unexpected connection req")]
     UnexpectedReq,
     #[error("error while de/serializing message")]
@@ -76,7 +86,7 @@ impl Clone for ConnectionError {
         match self {
             Self::LocationUnknown => Self::LocationUnknown,
             Self::Serialization(_) => Self::Serialization(None),
-            Self::SendNotCompleted(peer) => Self::SendNotCompleted(peer.clone()),
+            Self::SendNotCompleted(addr) => Self::SendNotCompleted(*addr),
             Self::IOError(err) => Self::IOError(err.clone()),
             Self::Timeout => Self::Timeout,
             Self::UnexpectedReq => Self::UnexpectedReq,

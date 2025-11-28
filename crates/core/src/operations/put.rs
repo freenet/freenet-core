@@ -564,16 +564,14 @@ impl Operation for PutOp {
                         );
 
                         conn_manager
-                            .send(&upstream.peer(), NetMessage::from(ack))
+                            .send(upstream.addr(), NetMessage::from(ack))
                             .await?;
                         new_state = None;
                     }
 
                     // Broadcast to all peers in parallel
-                    // Collect peer_ids first to ensure they outlive the futures
-                    let peer_ids: Vec<_> = broadcast_to.iter().map(|p| p.peer()).collect();
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
-                    for (peer, peer_id) in broadcast_to.iter().zip(peer_ids.iter()) {
+                    for peer in broadcast_to.iter() {
                         let msg = PutMsg::BroadcastTo {
                             id: *id,
                             key: *key,
@@ -583,7 +581,7 @@ impl Operation for PutOp {
                             contract: contract.clone(),
                             target: peer.clone(),
                         };
-                        let f = conn_manager.send(peer_id, msg.into());
+                        let f = conn_manager.send(peer.addr(), msg.into());
                         broadcasting.push(f);
                     }
 
@@ -611,7 +609,7 @@ impl Operation for PutOp {
                             err
                         );
                         // todo: review this, maybe we should just dropping this subscription
-                        conn_manager.drop_connection(&peer.peer()).await?;
+                        conn_manager.drop_connection(peer.addr()).await?;
                         incorrect_results += 1;
                     }
 
@@ -859,7 +857,7 @@ impl Operation for PutOp {
                             for subscriber in old_subscribers {
                                 conn_manager
                                     .send(
-                                        &subscriber.peer(),
+                                        subscriber.addr(),
                                         NetMessage::V1(NetMessageV1::Unsubscribed {
                                             transaction: Transaction::new::<PutMsg>(),
                                             key: dropped_key,
@@ -1489,7 +1487,7 @@ where
 
         let _ = conn_manager
             .send(
-                &peer.peer(),
+                peer.addr(),
                 (PutMsg::PutForward {
                     id,
                     sender: own_pkloc,

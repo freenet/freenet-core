@@ -807,7 +807,7 @@ impl Operation for ConnectOp {
                             address,
                         };
                         network_bridge
-                            .send(&target.peer(), NetMessage::V1(NetMessageV1::Connect(msg)))
+                            .send(target.addr(), NetMessage::V1(NetMessageV1::Connect(msg)))
                             .await?;
                     }
 
@@ -830,7 +830,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                &next.peer(),
+                                next.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -939,7 +939,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                &upstream.peer(),
+                                upstream.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;

@@ -97,7 +97,7 @@ where
         Err(err) => {
             if let Some(sender) = sender {
                 network_bridge
-                    .send(&sender, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
+                    .send(sender.addr, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
                     .await?;
             }
             return Err(err);
@@ -145,7 +145,7 @@ where
                 op_manager.completed(id);
                 if let Some(target) = msg.target() {
                     tracing::debug!(%id, %target, "sending final message to target");
-                    network_bridge.send(&target.peer(), msg).await?;
+                    network_bridge.send(target.addr(), msg).await?;
                 }
                 return Ok(Some(updated_state));
             } else {
@@ -153,7 +153,7 @@ where
                 tracing::debug!(%id, "operation in progress");
                 if let Some(target) = msg.target() {
                     tracing::debug!(%id, %target, "sending updated op state");
-                    network_bridge.send(&target.peer(), msg).await?;
+                    network_bridge.send(target.addr(), msg).await?;
                     op_manager.push(id, updated_state).await?;
                 } else {
                     tracing::debug!(%id, "queueing op state for local processing");
@@ -187,7 +187,7 @@ where
 
             if let Some(target) = msg.target() {
                 tracing::debug!(%tx_id, target=%target.peer(), "sending back message to target");
-                network_bridge.send(&target.peer(), msg).await?;
+                network_bridge.send(target.addr(), msg).await?;
             }
         }
         Ok(OperationResult {
