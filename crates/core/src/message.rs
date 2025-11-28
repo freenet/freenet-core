@@ -5,6 +5,7 @@
 use std::{
     borrow::{Borrow, Cow},
     fmt::Display,
+    net::SocketAddr,
     time::{Duration, SystemTime},
 };
 
@@ -272,6 +273,17 @@ pub(crate) enum NetMessage {
     V1(NetMessageV1),
 }
 
+impl NetMessage {
+    /// Updates the sender's address in the message with the observed transport address.
+    /// This is essential for NAT traversal - peers behind NAT don't know their external
+    /// address, so we update it based on what the transport layer observed.
+    pub(crate) fn rewrite_sender_addr(&mut self, observed_addr: SocketAddr) {
+        match self {
+            NetMessage::V1(msg) => msg.rewrite_sender_addr(observed_addr),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NetMessageV1 {
     Connect(ConnectMsg),
@@ -285,6 +297,22 @@ pub(crate) enum NetMessageV1 {
     },
     Update(UpdateMsg),
     Aborted(Transaction),
+}
+
+impl NetMessageV1 {
+    /// Updates the sender's address in the message with the observed transport address.
+    fn rewrite_sender_addr(&mut self, observed_addr: SocketAddr) {
+        match self {
+            NetMessageV1::Put(msg) => msg.rewrite_sender_addr(observed_addr),
+            NetMessageV1::Get(msg) => msg.rewrite_sender_addr(observed_addr),
+            NetMessageV1::Subscribe(msg) => msg.rewrite_sender_addr(observed_addr),
+            NetMessageV1::Update(msg) => msg.rewrite_sender_addr(observed_addr),
+            // Connect messages are handled separately (they use observed_addr field)
+            NetMessageV1::Connect(_) => {}
+            // These don't have sender addresses to rewrite
+            NetMessageV1::Unsubscribed { .. } | NetMessageV1::Aborted(_) => {}
+        }
+    }
 }
 
 trait Versioned {
