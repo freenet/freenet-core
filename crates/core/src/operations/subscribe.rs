@@ -492,7 +492,7 @@ impl Operation for SubscribeOp {
                         .k_closest_potentially_caching(key, &skip, 3)
                         .into_iter()
                         .find(|candidate| candidate.peer() != own_loc.peer())
-                        .ok_or_else(|| RingError::NoCachingPeers(*key))
+                        .ok_or(RingError::NoCachingPeers(*key))
                         .map_err(OpError::from)?;
 
                     skip.insert(forward_target.peer().clone());

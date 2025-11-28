@@ -333,8 +333,8 @@ type ConnectResult = Result<(PeerId, RemainingChecks), ()>;
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Clone)]
 pub(crate) enum NodeEvent {
-    /// Drop the given peer connection.
-    DropConnection(PeerId),
+    /// Drop the given peer connection by socket address.
+    DropConnection(std::net::SocketAddr),
     // Try connecting to the given peer.
     ConnectPeer {
         peer: PeerId,
