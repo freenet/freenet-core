@@ -1596,7 +1596,7 @@ async fn count_connection_events(event_log_path: &Path) -> anyhow::Result<usize>
     for event in &events {
         if let EventKind::Connect(ConnectEvent::Connected { connected, .. }) = &event.kind {
             // Use the connected peer's ID as the unique identifier
-            connected_peers.insert(connected.peer.to_string());
+            connected_peers.insert(connected.peer().to_string());
         }
     }
 

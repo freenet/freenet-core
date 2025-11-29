@@ -127,8 +127,9 @@ impl ConnectMsg {
 pub(crate) struct ConnectRequest {
     /// Joiner's advertised location (fallbacks to the joiner's socket address).
     pub desired_location: Location,
-    /// Joiner's identity as observed so far.
-    pub joiner: PeerKeyLocation,
+    /// Joiner's identity. NAT peers start as Unknown (just public key) until
+    /// a gateway observes their address and upgrades them to Known.
+    pub joiner: Joiner,
     /// Remaining hops before the request stops travelling.
     pub ttl: u8,
     /// Simple visited set to avoid trivial loops.
@@ -142,6 +143,90 @@ pub(crate) struct ConnectRequest {
 pub(crate) struct ConnectResponse {
     /// The peer that accepted the join request.
     pub acceptor: PeerKeyLocation,
+}
+
+/// Represents a peer joining the network.
+///
+/// NAT peers don't know their public address until a gateway observes it,
+/// so we distinguish between:
+/// - `Unknown`: Only have the public key (NAT peer before address discovery)
+/// - `Known`: Have full PeerId with known address (gateway or after ObservedAddress)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum Joiner {
+    /// Peer that doesn't yet know its public address (NAT peer before discovery).
+    Unknown(TransportPublicKey),
+    /// Peer with a known address (gateway, or NAT peer after ObservedAddress).
+    Known(PeerId),
+}
+
+impl Joiner {
+    /// Returns the public key of the joiner.
+    #[allow(dead_code)]
+    pub fn pub_key(&self) -> &TransportPublicKey {
+        match self {
+            Joiner::Unknown(key) => key,
+            Joiner::Known(peer_id) => &peer_id.pub_key,
+        }
+    }
+
+    /// Returns the PeerId if known, None if address is unknown.
+    pub fn peer_id(&self) -> Option<&PeerId> {
+        match self {
+            Joiner::Unknown(_) => None,
+            Joiner::Known(peer_id) => Some(peer_id),
+        }
+    }
+
+    /// Returns true if this joiner has a known address.
+    #[allow(dead_code)]
+    pub fn has_known_address(&self) -> bool {
+        matches!(self, Joiner::Known(_))
+    }
+
+    /// Upgrades an Unknown joiner to Known once we observe their address.
+    pub fn with_observed_address(&self, addr: SocketAddr) -> Self {
+        match self {
+            Joiner::Unknown(key) => Joiner::Known(PeerId::new(addr, key.clone())),
+            Joiner::Known(peer_id) => {
+                // Avoid allocation if address hasn't changed
+                if peer_id.addr == addr {
+                    self.clone()
+                } else {
+                    Joiner::Known(PeerId::new(addr, peer_id.pub_key.clone()))
+                }
+            }
+        }
+    }
+
+    /// Converts to a PeerKeyLocation if we have a known address.
+    /// Returns None if address is unknown.
+    pub fn to_peer_key_location(&self) -> Option<PeerKeyLocation> {
+        match self {
+            Joiner::Unknown(_) => None,
+            Joiner::Known(peer_id) => Some(PeerKeyLocation::with_location(
+                peer_id.pub_key.clone(),
+                peer_id.addr,
+                Location::from_address(&peer_id.addr),
+            )),
+        }
+    }
+
+    /// Returns the location if we have a known address.
+    pub fn location(&self) -> Option<Location> {
+        match self {
+            Joiner::Unknown(_) => None,
+            Joiner::Known(peer_id) => Some(Location::from_address(&peer_id.addr)),
+        }
+    }
+}
+
+impl fmt::Display for Joiner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Joiner::Unknown(key) => write!(f, "Unknown({})", key),
+            Joiner::Known(peer_id) => write!(f, "Known({})", peer_id),
+        }
+    }
 }
 
 /// New minimal state machine the joiner tracks.
@@ -179,7 +264,8 @@ pub(crate) trait RelayContext {
     fn self_location(&self) -> &PeerKeyLocation;
 
     /// Determine whether we should accept the joiner immediately.
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool;
+    /// Takes a Joiner which may or may not have a known address yet.
+    fn should_accept(&self, joiner: &Joiner) -> bool;
 
     /// Choose the next hop for the request, avoiding peers already visited.
     fn select_next_hop(
@@ -279,23 +365,23 @@ impl RelayState {
         push_unique_peer(&mut self.request.visited, ctx.self_location().clone());
 
         if let Some(joiner_addr) = self.request.observed_addr {
-            // Always overwrite with observed socket rather than checking routability. If the
-            // observed socket is loopback, this guard is skipped only in local/unit tests where
-            // peers share 127.0.0.1, so keep a one-shot overwrite and avoid early returns.
+            // Upgrade the joiner to Known with the observed address.
+            // This is critical for NAT peers who start as Unknown.
             if !self.observed_sent {
-                self.request.joiner.peer.addr = joiner_addr;
-                if self.request.joiner.location.is_none() {
-                    self.request.joiner.location = Some(Location::from_address(&joiner_addr));
-                }
+                self.request.joiner = self.request.joiner.with_observed_address(joiner_addr);
                 self.observed_sent = true;
-                actions.observed_address = Some((self.request.joiner.clone(), joiner_addr));
+                // Now that we have a known address, we can create a PeerKeyLocation
+                if let Some(joiner_pkl) = self.request.joiner.to_peer_key_location() {
+                    actions.observed_address = Some((joiner_pkl, joiner_addr));
+                }
             }
         }
 
         if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
             self.accepted_locally = true;
             let acceptor = ctx.self_location().clone();
-            let dist = ring_distance(acceptor.location, self.request.joiner.location);
+            let joiner_location = self.request.joiner.location();
+            let dist = ring_distance(acceptor.location, joiner_location);
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
             });
@@ -388,14 +474,18 @@ impl RelayContext for RelayEnv<'_> {
         &self.self_location
     }
 
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool {
+    fn should_accept(&self, joiner: &Joiner) -> bool {
+        // We can only accept joiners with known addresses
+        let Some(peer_id) = joiner.peer_id() else {
+            return false;
+        };
         let location = joiner
-            .location
-            .unwrap_or_else(|| Location::from_address(&joiner.peer.addr));
+            .location()
+            .unwrap_or_else(|| Location::from_address(&peer_id.addr));
         self.op_manager
             .ring
             .connection_manager
-            .should_accept(location, &joiner.peer)
+            .should_accept(location, peer_id)
     }
 
     fn select_next_hop(
@@ -636,12 +726,20 @@ impl ConnectOp {
         ttl: u8,
         target_connections: usize,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
+        is_gateway: bool,
     ) -> (Transaction, Self, ConnectMsg) {
         let mut visited = vec![own.clone()];
         push_unique_peer(&mut visited, target.clone());
+        // Gateways know their address, NAT peers don't until observed
+        let joiner = if is_gateway {
+            Joiner::Known(own.peer())
+        } else {
+            // NAT peer: we only know our public key, not our external address
+            Joiner::Unknown(own.pub_key.clone())
+        };
         let request = ConnectRequest {
             desired_location,
-            joiner: own.clone(),
+            joiner,
             ttl,
             visited,
             observed_addr: None,
@@ -953,6 +1051,14 @@ impl Operation for ConnectOp {
                 }
                 ConnectMsg::ObservedAddress { address, .. } => {
                     self.handle_observed_address(*address, Instant::now());
+                    // Update our peer address now that we know our external address.
+                    // This is critical for peers behind NAT who start with a placeholder
+                    // address (127.0.0.1) and need to update it when a gateway observes
+                    // their actual public address.
+                    op_manager
+                        .ring
+                        .connection_manager
+                        .update_peer_address(*address);
                     Ok(store_operation_state(&mut self))
                 }
             }
@@ -1063,6 +1169,7 @@ pub(crate) async fn join_ring_request(
         .min(u8::MAX as usize) as u8;
     let target_connections = op_manager.ring.connection_manager.min_connections;
 
+    let is_gateway = op_manager.ring.connection_manager.is_gateway();
     let (tx, mut op, msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
@@ -1070,6 +1177,7 @@ pub(crate) async fn join_ring_request(
         ttl,
         target_connections,
         op_manager.connect_forward_estimator.clone(),
+        is_gateway,
     );
 
     op.gateway = Some(Box::new(gateway.clone()));
@@ -1238,7 +1346,7 @@ mod tests {
             &self.self_loc
         }
 
-        fn should_accept(&self, _joiner: &PeerKeyLocation) -> bool {
+        fn should_accept(&self, _joiner: &Joiner) -> bool {
             self.accept
         }
 
@@ -1257,6 +1365,11 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let keypair = TransportKeypair::new();
         PeerKeyLocation::with_location(keypair.public().clone(), addr, Location::random())
+    }
+
+    /// Helper to create a Joiner::Known from a PeerKeyLocation
+    fn make_joiner(pkl: &PeerKeyLocation) -> Joiner {
+        Joiner::Known(pkl.peer())
     }
 
     #[test]
@@ -1299,7 +1412,7 @@ mod tests {
             upstream: joiner.clone(),
             request: ConnectRequest {
                 desired_location: Location::random(),
-                joiner: joiner.clone(),
+                joiner: make_joiner(&joiner),
                 ttl: 3,
                 visited: vec![],
                 observed_addr: Some(joiner.addr()),
@@ -1334,7 +1447,7 @@ mod tests {
             upstream: joiner.clone(),
             request: ConnectRequest {
                 desired_location: Location::random(),
-                joiner: joiner.clone(),
+                joiner: make_joiner(&joiner),
                 ttl: 2,
                 visited: vec![],
                 observed_addr: Some(joiner.addr()),
@@ -1375,7 +1488,7 @@ mod tests {
             upstream: joiner.clone(),
             request: ConnectRequest {
                 desired_location: Location::random(),
-                joiner: joiner.clone(),
+                joiner: make_joiner(&joiner),
                 ttl: 3,
                 visited: vec![],
                 observed_addr: Some(observed_addr),
@@ -1438,6 +1551,7 @@ mod tests {
             ttl,
             2,
             Arc::new(RwLock::new(ConnectForwardEstimator::new())),
+            true, // is_gateway for test
         );
 
         match msg {
@@ -1470,7 +1584,7 @@ mod tests {
 
         let request = ConnectRequest {
             desired_location: Location::random(),
-            joiner: joiner.clone(),
+            joiner: make_joiner(&joiner),
             ttl: 3,
             visited: vec![joiner.clone()],
             observed_addr: Some(joiner.addr()),
@@ -1551,7 +1665,7 @@ mod tests {
             upstream: joiner.clone(),
             request: ConnectRequest {
                 desired_location: Location::random(),
-                joiner: joiner.clone(),
+                joiner: make_joiner(&joiner),
                 ttl: 3,
                 visited: vec![],
                 observed_addr: Some(observed_public_addr),
