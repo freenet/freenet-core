@@ -320,8 +320,8 @@ impl RelayState {
             // Use the joiner with updated observed address for response routing
             actions.response_target = Some(self.request.joiner.clone());
             tracing::info!(
-                acceptor_peer = %acceptor.peer(),
-                joiner_peer = %self.request.joiner.peer(),
+                acceptor_pub_key = %acceptor.pub_key(),
+                joiner_pub_key = %self.request.joiner.pub_key(),
                 acceptor_loc = ?acceptor.location,
                 joiner_loc = ?self.request.joiner.location,
                 ring_distance = ?dist,
@@ -830,12 +830,9 @@ impl Operation for ConnectOp {
                         };
                         // Route through upstream (where the request came from) since we may
                         // not have a direct connection to the target
-                        if let Some(upstream) = &source_addr {
+                        if let Some(upstream) = source_addr {
                             network_bridge
-                                .send(
-                                    upstream.socket_addr(),
-                                    NetMessage::V1(NetMessageV1::Connect(msg)),
-                                )
+                                .send(upstream, NetMessage::V1(NetMessageV1::Connect(msg)))
                                 .await?;
                         }
                     }
@@ -879,10 +876,10 @@ impl Operation for ConnectOp {
                         };
                         // Route the response through upstream (where the request came from)
                         // since we may not have a direct connection to the joiner
-                        if let Some(upstream) = &source_addr {
+                        if let Some(upstream) = source_addr {
                             network_bridge
                                 .send(
-                                    upstream.socket_addr(),
+                                    upstream,
                                     NetMessage::V1(NetMessageV1::Connect(response_msg)),
                                 )
                                 .await?;
