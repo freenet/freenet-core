@@ -364,7 +364,7 @@ impl Operation for SubscribeOp {
             }
             Ok(None) => {
                 // new request to subscribe to a contract, initialize the machine
-                tracing::info!(
+                tracing::debug!(
                     tx = %id,
                     ?source_addr,
                     "subscribe: load_or_init creating new op with source_addr as upstream_addr"
@@ -530,7 +530,7 @@ impl Operation for SubscribeOp {
                             subscribed: true,
                         };
 
-                        tracing::info!(
+                        tracing::debug!(
                             tx = %id,
                             %key,
                             upstream_addr = ?self.upstream_addr,
@@ -997,7 +997,7 @@ fn build_op_result(
         _ => msg.as_ref().and_then(|m| m.target_addr()),
     };
 
-    tracing::info!(
+    tracing::debug!(
         tx = %id,
         msg_type = ?msg.as_ref().map(|m| std::any::type_name_of_val(m)),
         ?upstream_addr,
