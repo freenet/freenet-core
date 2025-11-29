@@ -13,6 +13,7 @@ use crate::{
     node::{NetworkBridge, OpManager, PeerId},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
+    transport::ObservedAddr,
 };
 
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
@@ -45,6 +46,7 @@ pub(crate) fn start_op(key: ContractKey, fetch_contract: bool, subscribe: bool) 
             transfer_time: None,
             first_response_time: None,
         })),
+        upstream_addr: None, // Local operation, no upstream peer
     }
 }
 
@@ -73,6 +75,7 @@ pub(crate) fn start_op_with_id(
             transfer_time: None,
             first_response_time: None,
         })),
+        upstream_addr: None, // Local operation, no upstream peer
     }
 }
 
@@ -146,6 +149,7 @@ pub(crate) async fn request_get(
                     contract,
                 }),
                 stats: get_op.stats,
+                upstream_addr: get_op.upstream_addr,
             };
 
             op_manager.push(*id, OpEnum::Get(completed_op)).await?;
@@ -230,6 +234,7 @@ pub(crate) async fn request_get(
                     s.next_peer = Some(target);
                     s
                 }),
+                upstream_addr: get_op.upstream_addr,
             };
 
             op_manager
@@ -342,6 +347,9 @@ pub(crate) struct GetOp {
     state: Option<GetState>,
     pub(super) result: Option<GetResult>,
     stats: Option<Box<GetStats>>,
+    /// The address we received this operation's message from.
+    /// Used for connection-based routing: responses are sent back to this address.
+    upstream_addr: Option<ObservedAddr>,
 }
 
 impl GetOp {
@@ -445,15 +453,15 @@ impl Operation for GetOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<ObservedAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
-        let mut sender: Option<PeerId> = None;
-        if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer());
-        };
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Get(get_op))) => {
-                Ok(OpInitialization { op: get_op, sender })
+                Ok(OpInitialization {
+                    op: get_op,
+                    source_addr,
+                })
                 // was an existing operation, other peer messaged back
             }
             Ok(Some(op)) => {
@@ -469,8 +477,9 @@ impl Operation for GetOp {
                         id: tx,
                         result: None,
                         stats: None, // don't care about stats in target peers
+                        upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                     },
-                    sender,
+                    source_addr,
                 })
             }
             Err(err) => Err(err.into()),
@@ -486,6 +495,7 @@ impl Operation for GetOp {
         _conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
+        _source_addr: Option<ObservedAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             #[allow(unused_assignments)]
@@ -641,6 +651,7 @@ impl Operation for GetOp {
                                 new_skip_list,
                                 op_manager,
                                 stats,
+                                self.upstream_addr,
                             )
                             .await;
                         }
@@ -685,6 +696,7 @@ impl Operation for GetOp {
                             }),
                             None,
                             stats,
+                            self.upstream_addr,
                         );
                     }
 
@@ -796,6 +808,7 @@ impl Operation for GetOp {
                             new_skip_list,
                             op_manager,
                             stats,
+                            self.upstream_addr,
                         )
                         .await;
                     }
@@ -1129,6 +1142,7 @@ impl Operation for GetOp {
                                         state: self.state,
                                         result: None,
                                         stats,
+                                        upstream_addr: self.upstream_addr,
                                     }),
                                 )
                                 .await?;
@@ -1316,7 +1330,14 @@ impl Operation for GetOp {
                 }
             }
 
-            build_op_result(self.id, new_state, return_msg, result, stats)
+            build_op_result(
+                self.id,
+                new_state,
+                return_msg,
+                result,
+                stats,
+                self.upstream_addr,
+            )
         })
     }
 }
@@ -1327,19 +1348,23 @@ fn build_op_result(
     msg: Option<GetMsg>,
     result: Option<GetResult>,
     stats: Option<Box<GetStats>>,
+    upstream_addr: Option<ObservedAddr>,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|state| GetOp {
         id,
         state: Some(state),
         result,
         stats,
+        upstream_addr,
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
+        target_addr: upstream_addr.map(|a| a.socket_addr()),
         state: output_op.map(OpEnum::Get),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_forward_or_return(
     id: Transaction,
     key: ContractKey,
@@ -1348,6 +1373,7 @@ async fn try_forward_or_return(
     skip_list: HashSet<PeerId>,
     op_manager: &OpManager,
     stats: Option<Box<GetStats>>,
+    upstream_addr: Option<ObservedAddr>,
 ) -> Result<OperationResult, OpError> {
     tracing::warn!(
         tx = %id,
@@ -1424,6 +1450,7 @@ async fn try_forward_or_return(
             }),
             None,
             stats,
+            upstream_addr,
         )
     } else {
         tracing::debug!(
@@ -1448,6 +1475,7 @@ async fn try_forward_or_return(
             }),
             None,
             stats,
+            upstream_addr,
         )
     }
 }
