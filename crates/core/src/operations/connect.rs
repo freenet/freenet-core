@@ -22,7 +22,7 @@ use crate::node::{IsOperationCompleted, NetworkBridge, OpManager, PeerId};
 use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::ring::PeerKeyLocation;
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
-use crate::transport::{TransportKeypair, TransportPublicKey};
+use crate::transport::{ObservedAddr, TransportKeypair, TransportPublicKey};
 use crate::util::{Backoff, Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
 
@@ -113,6 +113,7 @@ impl fmt::Display for ConnectMsg {
 }
 
 impl ConnectMsg {
+    #[allow(dead_code)]
     pub fn sender(&self) -> Option<PeerId> {
         match self {
             ConnectMsg::Response { sender, .. } => Some(sender.peer()),
@@ -848,12 +849,13 @@ impl Operation for ConnectOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<ObservedAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Connect(op))) => Ok(OpInitialization {
                 op: *op,
-                sender: msg.sender(),
+                source_addr,
             }),
             Ok(Some(other)) => {
                 op_manager.push(tx, other).await?;
@@ -872,7 +874,7 @@ impl Operation for ConnectOp {
                         return Err(OpError::OpNotPresent(tx));
                     }
                 };
-                Ok(OpInitialization { op, sender: None })
+                Ok(OpInitialization { op, source_addr })
             }
             Err(err) => Err(err.into()),
         }
@@ -883,6 +885,7 @@ impl Operation for ConnectOp {
         network_bridge: &'a mut NB,
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        _source_addr: Option<ObservedAddr>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
     > {
@@ -904,7 +907,7 @@ impl Operation for ConnectOp {
                             address,
                         };
                         network_bridge
-                            .send(&target.peer(), NetMessage::V1(NetMessageV1::Connect(msg)))
+                            .send(target.addr(), NetMessage::V1(NetMessageV1::Connect(msg)))
                             .await?;
                     }
 
@@ -927,7 +930,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                &next.peer(),
+                                next.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -1036,7 +1039,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                &upstream.peer(),
+                                upstream.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -1097,6 +1100,7 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
     let state_clone = op.state.clone();
     OperationResult {
         return_msg: msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m))),
+        target_addr: None,
         state: state_clone.map(|state| {
             OpEnum::Connect(Box::new(ConnectOp {
                 id: op.id,
