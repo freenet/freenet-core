@@ -5,7 +5,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::time::Duration;
 use std::{
@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
@@ -25,13 +25,12 @@ use crate::node::network_bridge::handshake::{
     HandshakeHandler,
 };
 use crate::node::network_bridge::priority_select;
-use crate::node::subscribe::SubscribeMsg;
 use crate::node::{MessageProcessor, PeerId};
-use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
+use crate::operations::connect::ConnectMsg;
 use crate::ring::Location;
 use crate::transport::{
-    create_connection_handler, ObservedAddr, OutboundConnectionHandler, PeerConnection,
-    TransportError, TransportKeypair, TransportPublicKey,
+    create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
+    TransportKeypair, TransportPublicKey,
 };
 use crate::{
     client_events::ClientId,
@@ -42,7 +41,7 @@ use crate::{
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction},
     node::{handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager},
-    ring::PeerKeyLocation,
+    ring::{PeerAddr, PeerKeyLocation},
     tracing::NetEventLog,
 };
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
@@ -195,19 +194,21 @@ impl P2pConnManager {
         let gateways = config.get_gateways()?;
         let key_pair = config.key_pair.clone();
 
-        // Initialize our peer identity.
-        // - Gateways must know their public address upfront (required)
-        // - Peers with configured public_address use that
-        // - Peers behind NAT start with a placeholder (127.0.0.1) which will be updated
-        //   when they receive ObservedAddress from a gateway
-        let advertised_addr = if config.is_gateway {
-            // Gateways must have a public address configured
+        // Initialize our peer identity before any connection attempts so join requests can
+        // reference the correct address.
+        let advertised_addr = {
             let advertised_ip = config
                 .peer_id
                 .as_ref()
                 .map(|peer| peer.addr.ip())
                 .or(config.config.network_api.public_address)
-                .expect("Gateway must have public_address configured");
+                .unwrap_or_else(|| {
+                    if listener_ip.is_unspecified() {
+                        IpAddr::V4(Ipv4Addr::LOCALHOST)
+                    } else {
+                        listener_ip
+                    }
+                });
             let advertised_port = config
                 .peer_id
                 .as_ref()
@@ -215,14 +216,6 @@ impl P2pConnManager {
                 .or(config.config.network_api.public_port)
                 .unwrap_or(listen_port);
             SocketAddr::new(advertised_ip, advertised_port)
-        } else if let Some(public_addr) = config.config.network_api.public_address {
-            // Non-gateway peer with explicitly configured public address
-            let port = config.config.network_api.public_port.unwrap_or(listen_port);
-            SocketAddr::new(public_addr, port)
-        } else {
-            // Non-gateway peer behind NAT: use placeholder address.
-            // This will be updated when we receive ObservedAddress from gateway.
-            SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), listen_port)
         };
         bridge
             .op_manager
@@ -378,6 +371,9 @@ impl P2pConnManager {
                             // Only the hop that owns the transport socket (gateway/first hop in
                             // practice) knows the UDP source address; tag the connect request here
                             // so downstream relays don't guess at the joiner's address.
+                            // The joiner creates the request with PeerAddr::Unknown because it
+                            // doesn't know its own external address (especially behind NAT).
+                            // We fill it in from the transport layer's observed source address.
                             if let (
                                 Some(remote_addr),
                                 NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
@@ -386,20 +382,15 @@ impl P2pConnManager {
                                 })),
                             ) = (remote, &mut msg)
                             {
-                                if payload.observed_addr.is_none() {
-                                    payload.observed_addr = Some(remote_addr);
+                                if payload.joiner.peer_addr.is_unknown() {
+                                    payload.joiner.peer_addr = PeerAddr::Known(remote_addr);
                                 }
                             }
                             // Pass the source address through to operations for routing.
                             // This replaces the old rewrite_sender_addr hack - instead of mutating
                             // message contents, we pass the observed transport address separately.
-                            ctx.handle_inbound_message(
-                                msg,
-                                remote.map(ObservedAddr::new),
-                                &op_manager,
-                                &mut state,
-                            )
-                            .await?;
+                            ctx.handle_inbound_message(msg, remote, &op_manager, &mut state)
+                                .await?;
                         }
                         ConnEvent::OutboundMessage(NetMessage::V1(NetMessageV1::Aborted(tx))) => {
                             // TODO: handle aborted transaction as internal message
@@ -607,53 +598,6 @@ impl P2pConnManager {
                                             }
                                         }
                                     });
-                                }
-                            }
-                        }
-                        ConnEvent::OutboundMessageWithTarget { target_addr, msg } => {
-                            // This variant uses an explicit target address from OperationResult.target_addr,
-                            // which is critical for NAT scenarios where the address in the message
-                            // differs from the actual transport address we should send to.
-                            tracing::info!(
-                                tx = %msg.id(),
-                                msg_type = %msg,
-                                target_addr = %target_addr,
-                                msg_target = ?msg.target().map(|t| t.addr()),
-                                "Sending outbound message with explicit target address (NAT routing)"
-                            );
-
-                            // Look up the connection using the explicit target address
-                            let peer_connection = ctx.connections.get(&target_addr);
-
-                            match peer_connection {
-                                Some(peer_connection) => {
-                                    if let Err(e) =
-                                        peer_connection.sender.send(Left(msg.clone())).await
-                                    {
-                                        tracing::error!(
-                                            tx = %msg.id(),
-                                            target_addr = %target_addr,
-                                            "Failed to send message to peer: {}", e
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            tx = %msg.id(),
-                                            target_addr = %target_addr,
-                                            "Message successfully sent to peer connection via explicit address"
-                                        );
-                                    }
-                                }
-                                None => {
-                                    // No existing connection - this is unexpected for NAT scenarios
-                                    // since we should have the connection from the original request
-                                    tracing::error!(
-                                        tx = %msg.id(),
-                                        target_addr = %target_addr,
-                                        msg_target = ?msg.target().map(|t| t.addr()),
-                                        connections = ?ctx.connections.keys().collect::<Vec<_>>(),
-                                        "No connection found for explicit target address - NAT routing failed"
-                                    );
-                                    ctx.bridge.op_manager.completed(*msg.id());
                                 }
                             }
                         }
@@ -1320,7 +1264,7 @@ impl P2pConnManager {
     async fn handle_inbound_message(
         &self,
         msg: NetMessage,
-        source_addr: Option<ObservedAddr>,
+        source_addr: Option<SocketAddr>,
         op_manager: &Arc<OpManager>,
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
@@ -1346,7 +1290,7 @@ impl P2pConnManager {
     async fn process_message(
         &self,
         msg: NetMessage,
-        source_addr: Option<ObservedAddr>,
+        source_addr: Option<SocketAddr>,
         op_manager: &Arc<OpManager>,
         executor_callback_opt: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
         state: &mut EventListenerState,
@@ -1479,11 +1423,10 @@ impl P2pConnManager {
                 tx = %tx,
                 remote = %peer,
                 transient,
-                "connect_peer: reusing existing transport"
+                "connect_peer: reusing existing transport / promoting transient if present"
             );
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            let transient_manager = connection_manager.transient_manager();
-            if let Some(entry) = transient_manager.remove(&peer) {
+            if let Some(entry) = connection_manager.drop_transient(&peer) {
                 let loc = entry
                     .location
                     .unwrap_or_else(|| Location::from_address(&peer.addr));
@@ -1679,6 +1622,7 @@ impl P2pConnManager {
                 connection,
                 transient,
             } => {
+                tracing::info!(provided = ?peer, transient, tx = ?transaction, "InboundConnection event");
                 let _conn_manager = &self.bridge.op_manager.ring.connection_manager;
                 let remote_addr = connection.remote_addr();
 
@@ -1694,6 +1638,7 @@ impl P2pConnManager {
                     }
                 }
 
+                let _provided_peer = peer.clone();
                 let peer_id = peer.unwrap_or_else(|| {
                     tracing::info!(
                         remote = %remote_addr,
@@ -1720,10 +1665,11 @@ impl P2pConnManager {
                     "Inbound connection established"
                 );
 
-                // Honor the handshake’s transient flag; don’t silently downgrade to transient just
-                // because this is an unsolicited inbound (that was causing the gateway to never
-                // register stable links).
-                self.handle_successful_connection(peer_id, connection, state, None, transient)
+                // Treat only transient connections as transient. Normal inbound dials (including
+                // gateway bootstrap from peers) should be promoted into the ring once established.
+                let is_transient = transient;
+
+                self.handle_successful_connection(peer_id, connection, state, None, is_transient)
                     .await?;
             }
             HandshakeEvent::OutboundEstablished {
@@ -1738,7 +1684,7 @@ impl P2pConnManager {
                     transaction = %transaction,
                     "Outbound connection established"
                 );
-                self.handle_successful_connection(peer, connection, state, None, transient)
+                self.handle_successful_connection(peer, connection, state, None, false)
                     .await?;
             }
             HandshakeEvent::OutboundFailed {
@@ -1856,8 +1802,7 @@ impl P2pConnManager {
         is_transient: bool,
     ) -> anyhow::Result<()> {
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-        let transient_manager = connection_manager.transient_manager();
-        if is_transient && !transient_manager.try_reserve(peer_id.clone(), None) {
+        if is_transient && !connection_manager.try_register_transient(peer_id.clone(), None) {
             tracing::warn!(
                 remote = %peer_id.addr,
                 budget = connection_manager.transient_budget(),
@@ -1935,11 +1880,12 @@ impl P2pConnManager {
         let mut newly_inserted = false;
         if !self.connections.contains_key(&peer_id.addr) {
             if is_transient {
-                let current = transient_manager.count();
-                if current >= transient_manager.budget() {
+                let cm = &self.bridge.op_manager.ring.connection_manager;
+                let current = cm.transient_count();
+                if current >= cm.transient_budget() {
                     tracing::warn!(
                         remote = %peer_id.addr,
-                        budget = transient_manager.budget(),
+                        budget = cm.transient_budget(),
                         current,
                         "Transient connection budget exhausted; dropping inbound connection before insert"
                     );
@@ -1966,8 +1912,6 @@ impl P2pConnManager {
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] SKIP INSERT: OutboundConnectionSuccessful - connection already exists in HashMap");
         }
 
-        // Gateways must promote transient connections to build their ring topology;
-        // without this, routing fails with "no caching peers".
         let promote_to_ring = !is_transient || connection_manager.is_gateway();
 
         if newly_inserted {
@@ -2008,16 +1952,15 @@ impl P2pConnManager {
                     .ring
                     .add_connection(loc, peer_id.clone(), true)
                     .await;
-                // If this was a transient being promoted (gateway case), release the slot.
                 if is_transient {
-                    transient_manager.remove(&peer_id);
+                    connection_manager.drop_transient(&peer_id);
                 }
             } else {
                 let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
                 // Evaluate whether this transient should be promoted; gateways need routable peers.
                 let should_accept = connection_manager.should_accept(loc, &peer_id);
                 if should_accept {
-                    transient_manager.remove(&peer_id);
+                    connection_manager.drop_transient(&peer_id);
                     let current = connection_manager.connection_count();
                     if current >= connection_manager.max_connections {
                         tracing::warn!(
@@ -2042,16 +1985,19 @@ impl P2pConnManager {
                         .await;
                 } else {
                     // Keep the connection as transient; budget was reserved before any work.
-                    transient_manager.try_reserve(peer_id.clone(), pending_loc);
+                    connection_manager.try_register_transient(peer_id.clone(), pending_loc);
                     tracing::info!(
                         peer = %peer_id,
                         pending_loc_known = pending_loc.is_some(),
                         "Registered transient connection (not added to ring topology)"
                     );
+                    let ttl = connection_manager.transient_ttl();
                     let drop_tx = self.bridge.ev_listener_tx.clone();
-                    transient_manager.schedule_expiry(peer_id.clone(), move |peer| {
-                        let drop_tx = drop_tx.clone();
-                        async move {
+                    let cm = connection_manager.clone();
+                    let peer = peer_id.clone();
+                    tokio::spawn(async move {
+                        sleep(ttl).await;
+                        if cm.drop_transient(&peer).is_some() {
                             tracing::info!(%peer, "Transient connection expired; dropping");
                             if let Err(err) = drop_tx
                                 .send(Right(NodeEvent::DropConnection(peer.addr)))
@@ -2069,7 +2015,7 @@ impl P2pConnManager {
             }
         } else if is_transient {
             // We reserved budget earlier, but didn't take ownership of the connection.
-            transient_manager.remove(&peer_id);
+            connection_manager.drop_transient(&peer_id);
         }
         Ok(())
     }
@@ -2269,19 +2215,8 @@ impl P2pConnManager {
 
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((target, msg))) => {
-                // Use OutboundMessageWithTarget to preserve the target address from
-                // OperationResult.target_addr. This is critical for NAT scenarios where
-                // the address in the message differs from the actual transport address.
-                // The PeerId.addr contains the address that was used to look up the peer
-                // in P2pBridge::send(), which is the correct transport address.
-                EventResult::Event(
-                    ConnEvent::OutboundMessageWithTarget {
-                        target_addr: target.addr,
-                        msg: *msg,
-                    }
-                    .into(),
-                )
+            Some(Left((_target, msg))) => {
+                EventResult::Event(ConnEvent::OutboundMessage(*msg).into())
             }
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
             None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
@@ -2412,12 +2347,6 @@ enum EventResult {
 pub(super) enum ConnEvent {
     InboundMessage(IncomingMessage),
     OutboundMessage(NetMessage),
-    /// Outbound message with explicit target address from OperationResult.target_addr.
-    /// Used when the target address differs from what's in the message (NAT scenarios).
-    OutboundMessageWithTarget {
-        target_addr: SocketAddr,
-        msg: NetMessage,
-    },
     NodeAction(NodeEvent),
     ClosedChannel(ChannelCloseReason),
     TransportClosed {
@@ -2672,41 +2601,27 @@ fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
     bincode::deserialize(data).map_err(|err| ConnectionError::Serialization(Some(err)))
 }
 
-/// Extract sender information from various message types
+/// Extract sender information from various message types.
+/// Note: Most message types use connection-based routing (sender determined from socket),
+/// so this only returns info for ObservedAddress which has a target field.
 fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
     match msg {
         NetMessage::V1(msg_v1) => match msg_v1 {
             NetMessageV1::Connect(connect_msg) => match connect_msg {
-                ConnectMsg::Response { sender, .. } => Some(sender.clone()),
-                ConnectMsg::Request { from, .. } => Some(from.clone()),
+                // Connect Request/Response no longer have from/sender fields -
+                // use connection-based routing from transport layer source address
+                ConnectMsg::Response { .. } => None,
+                ConnectMsg::Request { .. } => None,
                 ConnectMsg::ObservedAddress { target, .. } => Some(target.clone()),
             },
-            // Get messages have sender in some variants
-            NetMessageV1::Get(get_msg) => match get_msg {
-                GetMsg::SeekNode { sender, .. } => Some(sender.clone()),
-                GetMsg::ReturnGet { sender, .. } => Some(sender.clone()),
-                _ => None,
-            },
-            // Put messages have sender in some variants
-            NetMessageV1::Put(put_msg) => match put_msg {
-                PutMsg::SeekNode { sender, .. } => Some(sender.clone()),
-                PutMsg::SuccessfulPut { sender, .. } => Some(sender.clone()),
-                PutMsg::PutForward { sender, .. } => Some(sender.clone()),
-                _ => None,
-            },
-            // Update messages have sender in some variants
-            NetMessageV1::Update(update_msg) => match update_msg {
-                UpdateMsg::SeekNode { sender, .. } => Some(sender.clone()),
-                UpdateMsg::Broadcasting { sender, .. } => Some(sender.clone()),
-                UpdateMsg::BroadcastTo { sender, .. } => Some(sender.clone()),
-                _ => None,
-            },
-            // Subscribe messages
-            NetMessageV1::Subscribe(subscribe_msg) => match subscribe_msg {
-                SubscribeMsg::SeekNode { subscriber, .. } => Some(subscriber.clone()),
-                SubscribeMsg::ReturnSub { sender, .. } => Some(sender.clone()),
-                _ => None,
-            },
+            // Get messages no longer have sender - use connection-based routing
+            NetMessageV1::Get(_) => None,
+            // Put messages no longer have sender - use connection-based routing
+            NetMessageV1::Put(_) => None,
+            // Update messages no longer have sender - use connection-based routing
+            NetMessageV1::Update(_) => None,
+            // Subscribe messages no longer have sender - use connection-based routing
+            NetMessageV1::Subscribe(_) => None,
             // Other message types don't have sender info
             _ => None,
         },
@@ -2717,32 +2632,20 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
     match msg {
         NetMessage::V1(msg_v1) => match msg_v1 {
             NetMessageV1::Connect(connect_msg) => match connect_msg {
-                ConnectMsg::Response { sender, .. } => Some(sender),
-                ConnectMsg::Request { from, .. } => Some(from),
+                // Connect Request/Response no longer have from/sender fields -
+                // use connection-based routing from transport layer source address
+                ConnectMsg::Response { .. } => None,
+                ConnectMsg::Request { .. } => None,
                 ConnectMsg::ObservedAddress { target, .. } => Some(target),
             },
-            NetMessageV1::Get(get_msg) => match get_msg {
-                GetMsg::SeekNode { sender, .. } => Some(sender),
-                GetMsg::ReturnGet { sender, .. } => Some(sender),
-                _ => None,
-            },
-            NetMessageV1::Put(put_msg) => match put_msg {
-                PutMsg::SeekNode { sender, .. } => Some(sender),
-                PutMsg::SuccessfulPut { sender, .. } => Some(sender),
-                PutMsg::PutForward { sender, .. } => Some(sender),
-                _ => None,
-            },
-            NetMessageV1::Update(update_msg) => match update_msg {
-                UpdateMsg::SeekNode { sender, .. } => Some(sender),
-                UpdateMsg::Broadcasting { sender, .. } => Some(sender),
-                UpdateMsg::BroadcastTo { sender, .. } => Some(sender),
-                _ => None,
-            },
-            NetMessageV1::Subscribe(subscribe_msg) => match subscribe_msg {
-                SubscribeMsg::SeekNode { subscriber, .. } => Some(subscriber),
-                SubscribeMsg::ReturnSub { sender, .. } => Some(sender),
-                _ => None,
-            },
+            // Get messages no longer have sender - use connection-based routing
+            NetMessageV1::Get(_) => None,
+            // Put messages no longer have sender - use connection-based routing
+            NetMessageV1::Put(_) => None,
+            // Update messages no longer have sender - use connection-based routing
+            NetMessageV1::Update(_) => None,
+            // Subscribe messages no longer have sender - use connection-based routing
+            NetMessageV1::Subscribe(_) => None,
             _ => None,
         },
     }

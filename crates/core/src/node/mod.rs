@@ -61,7 +61,7 @@ use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
 use crate::topology::rate::Rate;
-use crate::transport::{ObservedAddr, TransportKeypair, TransportPublicKey};
+use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod message_processor;
@@ -620,7 +620,7 @@ pub(super) async fn process_message<CB>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_message_decoupled<CB>(
     msg: NetMessage,
-    source_addr: Option<ObservedAddr>,
+    source_addr: Option<std::net::SocketAddr>,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
@@ -681,7 +681,7 @@ pub(crate) async fn process_message_decoupled<CB>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message<CB>(
     msg: NetMessage,
-    source_addr: Option<ObservedAddr>,
+    source_addr: Option<std::net::SocketAddr>,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
@@ -876,7 +876,7 @@ async fn process_message_v1<CB>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message_v1<CB>(
     msg: NetMessageV1,
-    source_addr: Option<ObservedAddr>,
+    source_addr: Option<std::net::SocketAddr>,
     op_manager: Arc<OpManager>,
     mut conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
