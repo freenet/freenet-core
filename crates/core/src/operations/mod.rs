@@ -1,10 +1,12 @@
 #[cfg(debug_assertions)]
 use std::backtrace::Backtrace as StdTrace;
-use std::{net::SocketAddr, pin::Pin, time::Duration};
+use std::{pin::Pin, time::Duration};
 
 use freenet_stdlib::prelude::ContractKey;
 use futures::Future;
 use tokio::sync::mpsc::error::SendError;
+
+use std::net::SocketAddr;
 
 use crate::{
     client_events::HostResult,
@@ -12,7 +14,6 @@ use crate::{
     message::{InnerMessage, MessageStats, NetMessage, NetMessageV1, Transaction, TransactionType},
     node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable},
     ring::{Location, PeerKeyLocation, RingError},
-    transport::ObservedAddr,
 };
 
 pub(crate) mod connect;
@@ -32,7 +33,7 @@ where
     fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<ObservedAddr>,
+        source_addr: Option<SocketAddr>,
     ) -> impl Future<Output = Result<OpInitialization<Self>, OpError>> + 'a;
 
     fn id(&self) -> &Transaction;
@@ -43,7 +44,7 @@ where
         conn_manager: &'a mut CB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        source_addr: Option<ObservedAddr>,
+        source_addr: Option<SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
 }
 
@@ -62,7 +63,7 @@ pub(crate) struct OpInitialization<Op> {
     /// Used for sending error responses (Aborted) and as upstream_addr.
     /// Note: Currently unused but prepared for Phase 4 of #2164.
     #[allow(dead_code)]
-    pub source_addr: Option<ObservedAddr>,
+    pub source_addr: Option<SocketAddr>,
     pub op: Op,
 }
 
@@ -70,7 +71,7 @@ pub(crate) async fn handle_op_request<Op, NB>(
     op_manager: &OpManager,
     network_bridge: &mut NB,
     msg: &Op::Message,
-    source_addr: Option<ObservedAddr>,
+    source_addr: Option<SocketAddr>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     Op: Operation,
@@ -93,7 +94,7 @@ async fn handle_op_result<CB>(
     network_bridge: &mut CB,
     result: Result<OperationResult, OpError>,
     tx_id: Transaction,
-    source_addr: Option<ObservedAddr>,
+    source_addr: Option<SocketAddr>,
 ) -> Result<Option<OpEnum>, OpError>
 where
     CB: NetworkBridge,
@@ -107,10 +108,7 @@ where
         Err(err) => {
             if let Some(addr) = source_addr {
                 network_bridge
-                    .send(
-                        addr.socket_addr(),
-                        NetMessage::V1(NetMessageV1::Aborted(tx_id)),
-                    )
+                    .send(addr, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
                     .await?;
             }
             return Err(err);

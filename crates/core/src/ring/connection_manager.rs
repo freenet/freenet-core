@@ -320,7 +320,7 @@ impl ConnectionManager {
         self.peer_key.lock().clone()
     }
 
-    /// Look up a PeerId by socket address from connections_by_location.
+    /// Look up a PeerId by socket address from connections_by_location or transient connections.
     pub fn get_peer_by_addr(&self, addr: SocketAddr) -> Option<PeerId> {
         // Check connections by location
         let connections = self.connections_by_location.read();
@@ -330,6 +330,45 @@ impl ConnectionManager {
                     return Some(conn.location.peer());
                 }
             }
+        }
+        drop(connections);
+
+        // Check transient connections
+        if let Some((peer, _)) = self
+            .transient_connections
+            .iter()
+            .find(|e| e.key().addr == addr)
+            .map(|e| (e.key().clone(), e.value().clone()))
+        {
+            return Some(peer);
+        }
+        None
+    }
+
+    /// Look up a PeerKeyLocation by socket address from connections_by_location or transient connections.
+    /// Used for connection-based routing when we need full peer info from just an address.
+    pub fn get_peer_location_by_addr(&self, addr: SocketAddr) -> Option<PeerKeyLocation> {
+        // Check connections by location
+        let connections = self.connections_by_location.read();
+        for conns in connections.values() {
+            for conn in conns {
+                if conn.location.addr() == addr {
+                    return Some(conn.location.clone());
+                }
+            }
+        }
+        drop(connections);
+
+        // Check transient connections - construct PeerKeyLocation from PeerId
+        if let Some((peer, entry)) = self
+            .transient_connections
+            .iter()
+            .find(|e| e.key().addr == addr)
+            .map(|e| (e.key().clone(), e.value().clone()))
+        {
+            let mut pkl = PeerKeyLocation::new(peer.pub_key, peer.addr);
+            pkl.location = entry.location;
+            return Some(pkl);
         }
         None
     }
