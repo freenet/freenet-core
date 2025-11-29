@@ -22,7 +22,7 @@ use crate::node::{IsOperationCompleted, NetworkBridge, OpManager, PeerId};
 use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::ring::PeerKeyLocation;
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
-use crate::transport::TransportKeypair;
+use crate::transport::{ObservedAddr, TransportKeypair, TransportPublicKey};
 use crate::util::{Backoff, Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
 
@@ -752,7 +752,7 @@ impl Operation for ConnectOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<std::net::SocketAddr>,
+        source_addr: Option<ObservedAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
@@ -788,7 +788,7 @@ impl Operation for ConnectOp {
         network_bridge: &'a mut NB,
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        _source_addr: Option<std::net::SocketAddr>,
+        _source_addr: Option<ObservedAddr>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
     > {

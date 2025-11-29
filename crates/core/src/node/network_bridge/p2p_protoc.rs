@@ -30,8 +30,8 @@ use crate::node::{MessageProcessor, PeerId};
 use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
 use crate::ring::Location;
 use crate::transport::{
-    create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
-    TransportKeypair, TransportPublicKey,
+    create_connection_handler, ObservedAddr, OutboundConnectionHandler, PeerConnection,
+    TransportError, TransportKeypair, TransportPublicKey,
 };
 use crate::{
     client_events::ClientId,
@@ -387,8 +387,13 @@ impl P2pConnManager {
                             // Pass the source address through to operations for routing.
                             // This replaces the old rewrite_sender_addr hack - instead of mutating
                             // message contents, we pass the observed transport address separately.
-                            ctx.handle_inbound_message(msg, remote, &op_manager, &mut state)
-                                .await?;
+                            ctx.handle_inbound_message(
+                                msg,
+                                remote.map(ObservedAddr::new),
+                                &op_manager,
+                                &mut state,
+                            )
+                            .await?;
                         }
                         ConnEvent::OutboundMessage(NetMessage::V1(NetMessageV1::Aborted(tx))) => {
                             // TODO: handle aborted transaction as internal message
@@ -1309,7 +1314,7 @@ impl P2pConnManager {
     async fn handle_inbound_message(
         &self,
         msg: NetMessage,
-        source_addr: Option<SocketAddr>,
+        source_addr: Option<ObservedAddr>,
         op_manager: &Arc<OpManager>,
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
@@ -1335,7 +1340,7 @@ impl P2pConnManager {
     async fn process_message(
         &self,
         msg: NetMessage,
-        source_addr: Option<SocketAddr>,
+        source_addr: Option<ObservedAddr>,
         op_manager: &Arc<OpManager>,
         executor_callback_opt: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
         state: &mut EventListenerState,

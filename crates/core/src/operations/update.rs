@@ -12,6 +12,7 @@ use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager, PeerId},
+    transport::ObservedAddr,
 };
 
 pub(crate) struct UpdateOp {
@@ -20,7 +21,7 @@ pub(crate) struct UpdateOp {
     stats: Option<UpdateStats>,
     /// The address we received this operation's message from.
     /// Used for connection-based routing: responses are sent back to this address.
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 }
 
 impl UpdateOp {
@@ -91,7 +92,7 @@ impl Operation for UpdateOp {
     async fn load_or_init<'a>(
         op_manager: &'a crate::node::OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<std::net::SocketAddr>,
+        source_addr: Option<ObservedAddr>,
     ) -> Result<super::OpInitialization<Self>, OpError> {
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
@@ -132,7 +133,7 @@ impl Operation for UpdateOp {
         conn_manager: &'a mut NB,
         op_manager: &'a crate::node::OpManager,
         input: &'a Self::Message,
-        _source_addr: Option<std::net::SocketAddr>,
+        _source_addr: Option<ObservedAddr>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<super::OperationResult, OpError>> + Send + 'a>,
     > {
@@ -757,7 +758,7 @@ fn build_op_result(
     state: Option<UpdateState>,
     return_msg: Option<UpdateMsg>,
     stats: Option<UpdateStats>,
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 ) -> Result<super::OperationResult, OpError> {
     let output_op = state.map(|op| UpdateOp {
         id,
@@ -768,7 +769,7 @@ fn build_op_result(
     let state = output_op.map(OpEnum::Update);
     Ok(OperationResult {
         return_msg: return_msg.map(NetMessage::from),
-        target_addr: None,
+        target_addr: upstream_addr.map(|a| a.socket_addr()),
         state,
     })
 }

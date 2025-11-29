@@ -11,6 +11,7 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
+    transport::ObservedAddr,
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, ErrorKind, HostResponse},
@@ -301,7 +302,7 @@ pub(crate) struct SubscribeOp {
     state: Option<SubscribeState>,
     /// The address we received this operation's message from.
     /// Used for connection-based routing: responses are sent back to this address.
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 }
 
 impl SubscribeOp {
@@ -337,7 +338,7 @@ impl Operation for SubscribeOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<std::net::SocketAddr>,
+        source_addr: Option<ObservedAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let id = *msg.id();
 
@@ -377,7 +378,7 @@ impl Operation for SubscribeOp {
         _conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        _source_addr: Option<std::net::SocketAddr>,
+        _source_addr: Option<ObservedAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -442,7 +443,7 @@ impl Operation for SubscribeOp {
                                     target: subscriber.clone(),
                                     subscribed: false,
                                 })),
-                                target_addr: None,
+                                target_addr: self.upstream_addr.map(|a| a.socket_addr()),
                                 state: None,
                             });
                         }
@@ -537,6 +538,7 @@ impl Operation for SubscribeOp {
                     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
                     let htl = (*htl).min(ring_max_htl);
                     let this_peer = op_manager.ring.connection_manager.own_location();
+                    let upstream_addr = self.upstream_addr;
                     let return_not_subbed = || -> OperationResult {
                         OperationResult {
                             return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
@@ -546,7 +548,7 @@ impl Operation for SubscribeOp {
                                 sender: this_peer.clone(),
                                 target: subscriber.clone(),
                             })),
-                            target_addr: None,
+                            target_addr: upstream_addr.map(|a| a.socket_addr()),
                             state: None,
                         }
                     };
@@ -904,7 +906,7 @@ fn build_op_result(
     id: Transaction,
     state: Option<SubscribeState>,
     msg: Option<SubscribeMsg>,
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|state| SubscribeOp {
         id,
@@ -913,7 +915,7 @@ fn build_op_result(
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
-        target_addr: None,
+        target_addr: upstream_addr.map(|a| a.socket_addr()),
         state: output_op.map(OpEnum::Subscribe),
     })
 }
