@@ -886,7 +886,7 @@ impl Operation for ConnectOp {
         network_bridge: &'a mut NB,
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        _source_addr: Option<ObservedAddr>,
+        source_addr: Option<ObservedAddr>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
     > {
@@ -907,9 +907,16 @@ impl Operation for ConnectOp {
                             target: target.clone(),
                             address,
                         };
-                        network_bridge
-                            .send(target.addr(), NetMessage::V1(NetMessageV1::Connect(msg)))
-                            .await?;
+                        // Route through upstream (where the request came from) since we may
+                        // not have a direct connection to the target
+                        if let Some(upstream) = &source_addr {
+                            network_bridge
+                                .send(
+                                    upstream.socket_addr(),
+                                    NetMessage::V1(NetMessageV1::Connect(msg)),
+                                )
+                                .await?;
+                        }
                     }
 
                     if let Some(peer) = actions.expect_connection_from {
@@ -947,10 +954,17 @@ impl Operation for ConnectOp {
                             target: response_target,
                             payload: response,
                         };
-                        return Ok(store_operation_state_with_msg(
-                            &mut self,
-                            Some(response_msg),
-                        ));
+                        // Route the response through upstream (where the request came from)
+                        // since we may not have a direct connection to the joiner
+                        if let Some(upstream) = &source_addr {
+                            network_bridge
+                                .send(
+                                    upstream.socket_addr(),
+                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
+                                )
+                                .await?;
+                        }
+                        return Ok(store_operation_state(&mut self));
                     }
 
                     Ok(store_operation_state(&mut self))
