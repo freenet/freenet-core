@@ -30,8 +30,8 @@ use crate::node::{MessageProcessor, PeerId};
 use crate::operations::{connect::ConnectMsg, get::GetMsg, put::PutMsg, update::UpdateMsg};
 use crate::ring::Location;
 use crate::transport::{
-    create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
-    TransportKeypair, TransportPublicKey,
+    create_connection_handler, ObservedAddr, OutboundConnectionHandler, PeerConnection,
+    TransportError, TransportKeypair, TransportPublicKey,
 };
 use crate::{
     client_events::ClientId,
@@ -390,16 +390,16 @@ impl P2pConnManager {
                                     payload.observed_addr = Some(remote_addr);
                                 }
                             }
-                            // Rewrite sender addresses in all inbound messages with the observed
-                            // transport address. This is essential for NAT traversal - peers behind
-                            // NAT don't know their external address, so we update it based on what
-                            // the transport layer observed. Without this, responses would be sent
-                            // to the wrong address (e.g., 127.0.0.1 instead of the real NAT address).
-                            if let Some(remote_addr) = remote {
-                                msg.rewrite_sender_addr(remote_addr);
-                            }
-                            ctx.handle_inbound_message(msg, &op_manager, &mut state)
-                                .await?;
+                            // Pass the source address through to operations for routing.
+                            // This replaces the old rewrite_sender_addr hack - instead of mutating
+                            // message contents, we pass the observed transport address separately.
+                            ctx.handle_inbound_message(
+                                msg,
+                                remote.map(ObservedAddr::new),
+                                &op_manager,
+                                &mut state,
+                            )
+                            .await?;
                         }
                         ConnEvent::OutboundMessage(NetMessage::V1(NetMessageV1::Aborted(tx))) => {
                             // TODO: handle aborted transaction as internal message
@@ -429,8 +429,8 @@ impl P2pConnManager {
                                     self_peer = %self_peer_id,
                                     "BUG: OutboundMessage targets self! This indicates a routing logic error - messages should not reach OutboundMessage handler if they target self"
                                 );
-                                // Convert to InboundMessage and process locally
-                                ctx.handle_inbound_message(msg, &op_manager, &mut state)
+                                // Convert to InboundMessage and process locally (no remote source)
+                                ctx.handle_inbound_message(msg, None, &op_manager, &mut state)
                                     .await?;
                                 continue;
                             }
@@ -607,6 +607,53 @@ impl P2pConnManager {
                                             }
                                         }
                                     });
+                                }
+                            }
+                        }
+                        ConnEvent::OutboundMessageWithTarget { target_addr, msg } => {
+                            // This variant uses an explicit target address from OperationResult.target_addr,
+                            // which is critical for NAT scenarios where the address in the message
+                            // differs from the actual transport address we should send to.
+                            tracing::info!(
+                                tx = %msg.id(),
+                                msg_type = %msg,
+                                target_addr = %target_addr,
+                                msg_target = ?msg.target().map(|t| t.addr()),
+                                "Sending outbound message with explicit target address (NAT routing)"
+                            );
+
+                            // Look up the connection using the explicit target address
+                            let peer_connection = ctx.connections.get(&target_addr);
+
+                            match peer_connection {
+                                Some(peer_connection) => {
+                                    if let Err(e) =
+                                        peer_connection.sender.send(Left(msg.clone())).await
+                                    {
+                                        tracing::error!(
+                                            tx = %msg.id(),
+                                            target_addr = %target_addr,
+                                            "Failed to send message to peer: {}", e
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            tx = %msg.id(),
+                                            target_addr = %target_addr,
+                                            "Message successfully sent to peer connection via explicit address"
+                                        );
+                                    }
+                                }
+                                None => {
+                                    // No existing connection - this is unexpected for NAT scenarios
+                                    // since we should have the connection from the original request
+                                    tracing::error!(
+                                        tx = %msg.id(),
+                                        target_addr = %target_addr,
+                                        msg_target = ?msg.target().map(|t| t.addr()),
+                                        connections = ?ctx.connections.keys().collect::<Vec<_>>(),
+                                        "No connection found for explicit target address - NAT routing failed"
+                                    );
+                                    ctx.bridge.op_manager.completed(*msg.id());
                                 }
                             }
                         }
@@ -1273,6 +1320,7 @@ impl P2pConnManager {
     async fn handle_inbound_message(
         &self,
         msg: NetMessage,
+        source_addr: Option<ObservedAddr>,
         op_manager: &Arc<OpManager>,
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
@@ -1280,6 +1328,7 @@ impl P2pConnManager {
         tracing::debug!(
             %tx,
             tx_type = ?tx.transaction_type(),
+            ?source_addr,
             "Handling inbound NetMessage at event loop"
         );
         match msg {
@@ -1287,7 +1336,8 @@ impl P2pConnManager {
                 handle_aborted_op(tx, op_manager, &self.gateways).await?;
             }
             msg => {
-                self.process_message(msg, op_manager, None, state).await;
+                self.process_message(msg, source_addr, op_manager, None, state)
+                    .await;
             }
         }
         Ok(())
@@ -1296,6 +1346,7 @@ impl P2pConnManager {
     async fn process_message(
         &self,
         msg: NetMessage,
+        source_addr: Option<ObservedAddr>,
         op_manager: &Arc<OpManager>,
         executor_callback_opt: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
         state: &mut EventListenerState,
@@ -1304,6 +1355,7 @@ impl P2pConnManager {
             tx = %msg.id(),
             tx_type = ?msg.id().transaction_type(),
             msg_type = %msg,
+            ?source_addr,
             peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
             "process_message called - processing network message"
         );
@@ -1331,6 +1383,7 @@ impl P2pConnManager {
         GlobalExecutor::spawn(
             process_message_decoupled(
                 msg,
+                source_addr,
                 op_manager.clone(),
                 self.bridge.clone(),
                 self.event_listener.trait_clone(),
@@ -2216,8 +2269,19 @@ impl P2pConnManager {
 
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((_target, msg))) => {
-                EventResult::Event(ConnEvent::OutboundMessage(*msg).into())
+            Some(Left((target, msg))) => {
+                // Use OutboundMessageWithTarget to preserve the target address from
+                // OperationResult.target_addr. This is critical for NAT scenarios where
+                // the address in the message differs from the actual transport address.
+                // The PeerId.addr contains the address that was used to look up the peer
+                // in P2pBridge::send(), which is the correct transport address.
+                EventResult::Event(
+                    ConnEvent::OutboundMessageWithTarget {
+                        target_addr: target.addr,
+                        msg: *msg,
+                    }
+                    .into(),
+                )
             }
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
             None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
@@ -2348,6 +2412,12 @@ enum EventResult {
 pub(super) enum ConnEvent {
     InboundMessage(IncomingMessage),
     OutboundMessage(NetMessage),
+    /// Outbound message with explicit target address from OperationResult.target_addr.
+    /// Used when the target address differs from what's in the message (NAT scenarios).
+    OutboundMessageWithTarget {
+        target_addr: SocketAddr,
+        msg: NetMessage,
+    },
     NodeAction(NodeEvent),
     ClosedChannel(ChannelCloseReason),
     TransportClosed {
