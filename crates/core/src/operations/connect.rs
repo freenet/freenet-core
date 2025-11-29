@@ -830,11 +830,9 @@ impl Operation for ConnectOp {
                         };
                         // Route through upstream (where the request came from) since we may
                         // not have a direct connection to the target
-                        if let Some(upstream) = source_addr {
-                            network_bridge
-                                .send(upstream, NetMessage::V1(NetMessageV1::Connect(msg)))
-                                .await?;
-                        }
+                        network_bridge
+                            .send(upstream_addr, NetMessage::V1(NetMessageV1::Connect(msg)))
+                            .await?;
                     }
 
                     if let Some(peer) = actions.expect_connection_from {
@@ -876,14 +874,12 @@ impl Operation for ConnectOp {
                         };
                         // Route the response through upstream (where the request came from)
                         // since we may not have a direct connection to the joiner
-                        if let Some(upstream) = source_addr {
-                            network_bridge
-                                .send(
-                                    upstream,
-                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
-                                )
-                                .await?;
-                        }
+                        network_bridge
+                            .send(
+                                upstream_addr,
+                                NetMessage::V1(NetMessageV1::Connect(response_msg)),
+                            )
+                            .await?;
                         return Ok(store_operation_state(&mut self));
                     }
 
