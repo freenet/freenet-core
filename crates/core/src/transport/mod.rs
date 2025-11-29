@@ -33,40 +33,6 @@ pub(crate) use self::{
     peer_connection::PeerConnection,
 };
 
-/// Address observed at the transport layer (from UDP packet source).
-///
-/// This is the "ground truth" for NAT scenarios - it's the actual address we see
-/// at the network layer, not what the peer claims in protocol messages.
-///
-/// Using a newtype instead of raw `SocketAddr` makes the address semantics explicit
-/// and prevents accidental confusion with advertised/claimed addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ObservedAddr(SocketAddr);
-
-impl ObservedAddr {
-    /// Create a new observed address from a socket address.
-    pub fn new(addr: SocketAddr) -> Self {
-        Self(addr)
-    }
-
-    /// Get the underlying socket address.
-    pub fn socket_addr(&self) -> SocketAddr {
-        self.0
-    }
-}
-
-impl std::fmt::Display for ObservedAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<SocketAddr> for ObservedAddr {
-    fn from(addr: SocketAddr) -> Self {
-        Self(addr)
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransportError {
     #[error("transport handler channel closed, socket likely closed")]
