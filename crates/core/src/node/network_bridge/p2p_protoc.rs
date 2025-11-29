@@ -2137,8 +2137,11 @@ impl P2pConnManager {
                                 if let Some(sender_mut) =
                                     extract_sender_from_message_mut(&mut inbound.msg)
                                 {
-                                    if sender_mut.peer().addr.ip().is_unspecified() {
-                                        sender_mut.peer().addr = remote_addr;
+                                    if sender_mut
+                                        .socket_addr()
+                                        .is_some_and(|a| a.ip().is_unspecified())
+                                    {
+                                        sender_mut.set_addr(remote_addr);
                                     }
                                 }
                             }
