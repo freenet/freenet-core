@@ -125,12 +125,12 @@ where
                 self.op_manager.ring.seed_contract(key);
             }
             if let Some(subscribers) = contract_subscribers.get(&key) {
-                // add contract subscribers
+                // add contract subscribers (test setup - no upstream_addr)
                 for subscriber in subscribers {
                     if self
                         .op_manager
                         .ring
-                        .add_subscriber(&key, subscriber.clone())
+                        .add_subscriber(&key, subscriber.clone(), None)
                         .is_err()
                     {
                         tracing::warn!("Max subscribers for contract {} reached", key);
