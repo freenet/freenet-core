@@ -20,6 +20,7 @@ use crate::{
     message::{InnerMessage, NetMessage, NetMessageV1, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation},
+    transport::ObservedAddr,
 };
 
 pub(crate) struct PutOp {
@@ -27,7 +28,7 @@ pub(crate) struct PutOp {
     state: Option<PutState>,
     /// The address we received this operation's message from.
     /// Used for connection-based routing: responses are sent back to this address.
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 }
 
 impl PutOp {
@@ -93,7 +94,7 @@ impl Operation for PutOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<std::net::SocketAddr>,
+        source_addr: Option<ObservedAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let tx = *msg.id();
         tracing::debug!(
@@ -158,7 +159,7 @@ impl Operation for PutOp {
         conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        _source_addr: Option<std::net::SocketAddr>,
+        _source_addr: Option<ObservedAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let return_msg;
@@ -941,7 +942,7 @@ fn build_op_result(
     id: Transaction,
     state: Option<PutState>,
     msg: Option<PutMsg>,
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|op| PutOp {
         id,
@@ -950,7 +951,7 @@ fn build_op_result(
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
-        target_addr: None,
+        target_addr: upstream_addr.map(|a| a.socket_addr()),
         state: output_op.map(OpEnum::Put),
     })
 }
@@ -965,7 +966,7 @@ async fn try_to_broadcast(
     (broadcast_to, upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
     key: ContractKey,
     (contract, new_value): (ContractContainer, WrappedState),
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 ) -> Result<(Option<PutState>, Option<PutMsg>), OpError> {
     let new_state;
     let return_msg;

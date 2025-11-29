@@ -13,6 +13,7 @@ use crate::{
     node::{NetworkBridge, OpManager, PeerId},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
+    transport::ObservedAddr,
 };
 
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
@@ -348,7 +349,7 @@ pub(crate) struct GetOp {
     stats: Option<Box<GetStats>>,
     /// The address we received this operation's message from.
     /// Used for connection-based routing: responses are sent back to this address.
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 }
 
 impl GetOp {
@@ -452,7 +453,7 @@ impl Operation for GetOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
-        source_addr: Option<std::net::SocketAddr>,
+        source_addr: Option<ObservedAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
@@ -494,7 +495,7 @@ impl Operation for GetOp {
         _conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        _source_addr: Option<std::net::SocketAddr>,
+        _source_addr: Option<ObservedAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             #[allow(unused_assignments)]
@@ -1347,7 +1348,7 @@ fn build_op_result(
     msg: Option<GetMsg>,
     result: Option<GetResult>,
     stats: Option<Box<GetStats>>,
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 ) -> Result<OperationResult, OpError> {
     let output_op = state.map(|state| GetOp {
         id,
@@ -1358,7 +1359,7 @@ fn build_op_result(
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
-        target_addr: None,
+        target_addr: upstream_addr.map(|a| a.socket_addr()),
         state: output_op.map(OpEnum::Get),
     })
 }
@@ -1372,7 +1373,7 @@ async fn try_forward_or_return(
     skip_list: HashSet<PeerId>,
     op_manager: &OpManager,
     stats: Option<Box<GetStats>>,
-    upstream_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<ObservedAddr>,
 ) -> Result<OperationResult, OpError> {
     tracing::warn!(
         tx = %id,
