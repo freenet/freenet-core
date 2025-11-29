@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::Instrument;
 
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
@@ -1310,10 +1310,11 @@ impl P2pConnManager {
                 tx = %tx,
                 remote = %peer,
                 transient,
-                "connect_peer: reusing existing transport / promoting transient if present"
+                "connect_peer: reusing existing transport"
             );
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            if let Some(entry) = connection_manager.drop_transient(&peer) {
+            let transient_manager = connection_manager.transient_manager();
+            if let Some(entry) = transient_manager.remove(&peer) {
                 let loc = entry
                     .location
                     .unwrap_or_else(|| Location::from_address(&peer.addr));
@@ -1509,7 +1510,6 @@ impl P2pConnManager {
                 connection,
                 transient,
             } => {
-                tracing::info!(provided = ?peer, transient, tx = ?transaction, "InboundConnection event");
                 let _conn_manager = &self.bridge.op_manager.ring.connection_manager;
                 let remote_addr = connection.remote_addr();
 
@@ -1525,7 +1525,6 @@ impl P2pConnManager {
                     }
                 }
 
-                let _provided_peer = peer.clone();
                 let peer_id = peer.unwrap_or_else(|| {
                     tracing::info!(
                         remote = %remote_addr,
@@ -1552,11 +1551,10 @@ impl P2pConnManager {
                     "Inbound connection established"
                 );
 
-                // Treat only transient connections as transient. Normal inbound dials (including
-                // gateway bootstrap from peers) should be promoted into the ring once established.
-                let is_transient = transient;
-
-                self.handle_successful_connection(peer_id, connection, state, None, is_transient)
+                // Honor the handshake’s transient flag; don’t silently downgrade to transient just
+                // because this is an unsolicited inbound (that was causing the gateway to never
+                // register stable links).
+                self.handle_successful_connection(peer_id, connection, state, None, transient)
                     .await?;
             }
             HandshakeEvent::OutboundEstablished {
@@ -1571,7 +1569,7 @@ impl P2pConnManager {
                     transaction = %transaction,
                     "Outbound connection established"
                 );
-                self.handle_successful_connection(peer, connection, state, None, false)
+                self.handle_successful_connection(peer, connection, state, None, transient)
                     .await?;
             }
             HandshakeEvent::OutboundFailed {
@@ -1689,7 +1687,8 @@ impl P2pConnManager {
         is_transient: bool,
     ) -> anyhow::Result<()> {
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-        if is_transient && !connection_manager.try_register_transient(peer_id.clone(), None) {
+        let transient_manager = connection_manager.transient_manager();
+        if is_transient && !transient_manager.try_reserve(peer_id.clone(), None) {
             tracing::warn!(
                 remote = %peer_id.addr,
                 budget = connection_manager.transient_budget(),
@@ -1767,12 +1766,11 @@ impl P2pConnManager {
         let mut newly_inserted = false;
         if !self.connections.contains_key(&peer_id) {
             if is_transient {
-                let cm = &self.bridge.op_manager.ring.connection_manager;
-                let current = cm.transient_count();
-                if current >= cm.transient_budget() {
+                let current = transient_manager.count();
+                if current >= transient_manager.budget() {
                     tracing::warn!(
                         remote = %peer_id.addr,
-                        budget = cm.transient_budget(),
+                        budget = transient_manager.budget(),
                         current,
                         "Transient connection budget exhausted; dropping inbound connection before insert"
                     );
@@ -1794,6 +1792,8 @@ impl P2pConnManager {
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] SKIP INSERT: OutboundConnectionSuccessful - connection already exists in HashMap");
         }
 
+        // Gateways must promote transient connections to build their ring topology;
+        // without this, routing fails with "no caching peers".
         let promote_to_ring = !is_transient || connection_manager.is_gateway();
 
         if newly_inserted {
@@ -1834,15 +1834,16 @@ impl P2pConnManager {
                     .ring
                     .add_connection(loc, peer_id.clone(), true)
                     .await;
+                // If this was a transient being promoted (gateway case), release the slot.
                 if is_transient {
-                    connection_manager.drop_transient(&peer_id);
+                    transient_manager.remove(&peer_id);
                 }
             } else {
                 let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
                 // Evaluate whether this transient should be promoted; gateways need routable peers.
                 let should_accept = connection_manager.should_accept(loc, &peer_id);
                 if should_accept {
-                    connection_manager.drop_transient(&peer_id);
+                    transient_manager.remove(&peer_id);
                     let current = connection_manager.connection_count();
                     if current >= connection_manager.max_connections {
                         tracing::warn!(
@@ -1867,19 +1868,16 @@ impl P2pConnManager {
                         .await;
                 } else {
                     // Keep the connection as transient; budget was reserved before any work.
-                    connection_manager.try_register_transient(peer_id.clone(), pending_loc);
+                    transient_manager.try_reserve(peer_id.clone(), pending_loc);
                     tracing::info!(
                         peer = %peer_id,
                         pending_loc_known = pending_loc.is_some(),
                         "Registered transient connection (not added to ring topology)"
                     );
-                    let ttl = connection_manager.transient_ttl();
                     let drop_tx = self.bridge.ev_listener_tx.clone();
-                    let cm = connection_manager.clone();
-                    let peer = peer_id.clone();
-                    tokio::spawn(async move {
-                        sleep(ttl).await;
-                        if cm.drop_transient(&peer).is_some() {
+                    transient_manager.schedule_expiry(peer_id.clone(), move |peer| {
+                        let drop_tx = drop_tx.clone();
+                        async move {
                             tracing::info!(%peer, "Transient connection expired; dropping");
                             if let Err(err) = drop_tx
                                 .send(Right(NodeEvent::DropConnection(peer.clone())))
@@ -1897,7 +1895,7 @@ impl P2pConnManager {
             }
         } else if is_transient {
             // We reserved budget earlier, but didn't take ownership of the connection.
-            connection_manager.drop_transient(&peer_id);
+            transient_manager.remove(&peer_id);
         }
         Ok(())
     }

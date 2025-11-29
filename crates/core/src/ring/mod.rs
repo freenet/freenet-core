@@ -38,8 +38,10 @@ mod location;
 mod peer_key_location;
 mod score;
 mod seeding;
+mod transient_manager;
 
 use self::score::Score;
+pub(crate) use self::transient_manager::TransientConnectionManager;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
