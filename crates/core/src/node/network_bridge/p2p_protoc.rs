@@ -5,7 +5,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::time::Duration;
 use std::{
@@ -148,21 +148,19 @@ impl P2pConnManager {
         let gateways = config.get_gateways()?;
         let key_pair = config.key_pair.clone();
 
-        // Initialize our peer identity before any connection attempts so join requests can
-        // reference the correct address.
-        let advertised_addr = {
+        // Initialize our peer identity.
+        // - Gateways must know their public address upfront (required)
+        // - Peers with configured public_address use that
+        // - Peers behind NAT start with a placeholder (127.0.0.1) which will be updated
+        //   when they receive ObservedAddress from a gateway
+        let advertised_addr = if config.is_gateway {
+            // Gateways must have a public address configured
             let advertised_ip = config
                 .peer_id
                 .as_ref()
                 .map(|peer| peer.addr.ip())
                 .or(config.config.network_api.public_address)
-                .unwrap_or_else(|| {
-                    if listener_ip.is_unspecified() {
-                        IpAddr::V4(Ipv4Addr::LOCALHOST)
-                    } else {
-                        listener_ip
-                    }
-                });
+                .expect("Gateway must have public_address configured");
             let advertised_port = config
                 .peer_id
                 .as_ref()
@@ -170,6 +168,14 @@ impl P2pConnManager {
                 .or(config.config.network_api.public_port)
                 .unwrap_or(listen_port);
             SocketAddr::new(advertised_ip, advertised_port)
+        } else if let Some(public_addr) = config.config.network_api.public_address {
+            // Non-gateway peer with explicitly configured public address
+            let port = config.config.network_api.public_port.unwrap_or(listen_port);
+            SocketAddr::new(public_addr, port)
+        } else {
+            // Non-gateway peer behind NAT: use placeholder address.
+            // This will be updated when we receive ObservedAddress from gateway.
+            SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), listen_port)
         };
         bridge
             .op_manager
