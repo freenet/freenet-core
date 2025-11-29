@@ -473,7 +473,9 @@ impl P2pConnManager {
                             );
                             match peer_connection {
                                 Some(peer_connection) => {
-                                    if let Err(e) = peer_connection.sender.send(Left(msg.clone())).await {
+                                    if let Err(e) =
+                                        peer_connection.sender.send(Left(msg.clone())).await
+                                    {
                                         tracing::error!(
                                             tx = %msg.id(),
                                             "Failed to send message to peer: {}", e
@@ -680,10 +682,11 @@ impl P2pConnManager {
                                     );
 
                                     // Clean up all active connections
-                                    let peers_to_cleanup: Vec<_> =
-                                        ctx.connections.iter().map(|(addr, entry)| {
-                                            (*addr, entry.pub_key.clone())
-                                        }).collect();
+                                    let peers_to_cleanup: Vec<_> = ctx
+                                        .connections
+                                        .iter()
+                                        .map(|(addr, entry)| (*addr, entry.pub_key.clone()))
+                                        .collect();
                                     for (peer_addr, pub_key_opt) in peers_to_cleanup {
                                         tracing::debug!(%peer_addr, "Cleaning up active connection due to critical channel closure");
 
@@ -692,7 +695,16 @@ impl P2pConnManager {
                                             PeerId::new(peer_addr, pub_key)
                                         } else {
                                             // Use our own pub_key as placeholder if we don't know the peer's
-                                            PeerId::new(peer_addr, (*ctx.bridge.op_manager.ring.connection_manager.pub_key).clone())
+                                            PeerId::new(
+                                                peer_addr,
+                                                (*ctx
+                                                    .bridge
+                                                    .op_manager
+                                                    .ring
+                                                    .connection_manager
+                                                    .pub_key)
+                                                    .clone(),
+                                            )
                                         };
                                         ctx.bridge
                                             .op_manager
@@ -752,7 +764,16 @@ impl P2pConnManager {
                                     let peer = if let Some(ref pub_key) = entry.pub_key {
                                         PeerId::new(peer_addr, pub_key.clone())
                                     } else {
-                                        PeerId::new(peer_addr, (*ctx.bridge.op_manager.ring.connection_manager.pub_key).clone())
+                                        PeerId::new(
+                                            peer_addr,
+                                            (*ctx
+                                                .bridge
+                                                .op_manager
+                                                .ring
+                                                .connection_manager
+                                                .pub_key)
+                                                .clone(),
+                                        )
                                     };
                                     let pub_key_to_remove = entry.pub_key.clone();
 
@@ -851,13 +872,24 @@ impl P2pConnManager {
                             }
                             NodeEvent::QueryConnections { callback } => {
                                 // Reconstruct PeerIds from stored connections
-                                let connections: Vec<PeerId> = ctx.connections.iter()
+                                let connections: Vec<PeerId> = ctx
+                                    .connections
+                                    .iter()
                                     .map(|(addr, entry)| {
                                         if let Some(ref pub_key) = entry.pub_key {
                                             PeerId::new(*addr, pub_key.clone())
                                         } else {
                                             // Use our own pub_key as placeholder if we don't know the peer's
-                                            PeerId::new(*addr, (*ctx.bridge.op_manager.ring.connection_manager.pub_key).clone())
+                                            PeerId::new(
+                                                *addr,
+                                                (*ctx
+                                                    .bridge
+                                                    .op_manager
+                                                    .ring
+                                                    .connection_manager
+                                                    .pub_key)
+                                                    .clone(),
+                                            )
                                         }
                                     })
                                     .collect();
@@ -917,12 +949,23 @@ impl P2pConnManager {
                                 }
 
                                 // Reconstruct PeerIds from stored connections
-                                let connections: Vec<PeerId> = ctx.connections.iter()
+                                let connections: Vec<PeerId> = ctx
+                                    .connections
+                                    .iter()
                                     .map(|(addr, entry)| {
                                         if let Some(ref pub_key) = entry.pub_key {
                                             PeerId::new(*addr, pub_key.clone())
                                         } else {
-                                            PeerId::new(*addr, (*ctx.bridge.op_manager.ring.connection_manager.pub_key).clone())
+                                            PeerId::new(
+                                                *addr,
+                                                (*ctx
+                                                    .bridge
+                                                    .op_manager
+                                                    .ring
+                                                    .connection_manager
+                                                    .pub_key)
+                                                    .clone(),
+                                            )
                                         }
                                     })
                                     .collect();
@@ -1948,12 +1991,16 @@ impl P2pConnManager {
             }
             let (tx, rx) = mpsc::channel(10);
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] INSERT: OutboundConnectionSuccessful - adding to connections HashMap");
-            self.connections.insert(peer_id.addr, ConnectionEntry {
-                sender: tx,
-                pub_key: Some(peer_id.pub_key.clone()),
-            });
+            self.connections.insert(
+                peer_id.addr,
+                ConnectionEntry {
+                    sender: tx,
+                    pub_key: Some(peer_id.pub_key.clone()),
+                },
+            );
             // Add to reverse lookup
-            self.addr_by_pub_key.insert(peer_id.pub_key.clone(), peer_id.addr);
+            self.addr_by_pub_key
+                .insert(peer_id.pub_key.clone(), peer_id.addr);
             let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
                 anyhow::bail!("Connection event channel not initialized");
             };
@@ -2131,7 +2178,8 @@ impl P2pConnManager {
                                         entry.pub_key = Some(new_peer_id.pub_key.clone());
                                     }
                                     // Add new reverse lookup
-                                    self.addr_by_pub_key.insert(new_peer_id.pub_key.clone(), remote_addr);
+                                    self.addr_by_pub_key
+                                        .insert(new_peer_id.pub_key.clone(), remote_addr);
                                 }
                             }
                         }
@@ -2160,7 +2208,10 @@ impl P2pConnManager {
                     let peer = if let Some(ref pub_key) = entry.pub_key {
                         PeerId::new(remote_addr, pub_key.clone())
                     } else {
-                        PeerId::new(remote_addr, (*self.bridge.op_manager.ring.connection_manager.pub_key).clone())
+                        PeerId::new(
+                            remote_addr,
+                            (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
+                        )
                     };
                     // Remove from reverse lookup
                     if let Some(pub_key) = entry.pub_key {

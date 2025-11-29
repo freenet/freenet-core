@@ -203,10 +203,11 @@ impl Joiner {
     pub fn to_peer_key_location(&self) -> Option<PeerKeyLocation> {
         match self {
             Joiner::Unknown(_) => None,
-            Joiner::Known(peer_id) => Some(PeerKeyLocation {
-                peer: peer_id.clone(),
-                location: Some(Location::from_address(&peer_id.addr)),
-            }),
+            Joiner::Known(peer_id) => Some(PeerKeyLocation::with_location(
+                peer_id.pub_key.clone(),
+                peer_id.addr,
+                Location::from_address(&peer_id.addr),
+            )),
         }
     }
 
@@ -731,10 +732,10 @@ impl ConnectOp {
         push_unique_peer(&mut visited, target.clone());
         // Gateways know their address, NAT peers don't until observed
         let joiner = if is_gateway {
-            Joiner::Known(own.peer.clone())
+            Joiner::Known(own.peer())
         } else {
             // NAT peer: we only know our public key, not our external address
-            Joiner::Unknown(own.peer.pub_key.clone())
+            Joiner::Unknown(own.pub_key.clone())
         };
         let request = ConnectRequest {
             desired_location,
@@ -1368,7 +1369,7 @@ mod tests {
 
     /// Helper to create a Joiner::Known from a PeerKeyLocation
     fn make_joiner(pkl: &PeerKeyLocation) -> Joiner {
-        Joiner::Known(pkl.peer.clone())
+        Joiner::Known(pkl.peer())
     }
 
     #[test]
