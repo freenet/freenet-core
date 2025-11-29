@@ -469,11 +469,14 @@ impl Operation for SubscribeOp {
                                 target: subscriber.clone(),
                                 subscribed: false,
                             };
-                            return Ok(OperationResult {
-                                target_addr: return_msg.target_addr(),
-                                return_msg: Some(NetMessage::from(return_msg)),
-                                state: None,
-                            });
+                            // Use build_op_result to ensure upstream_addr is used for routing
+                            // (important for peers behind NAT)
+                            return build_op_result(
+                                self.id,
+                                None,
+                                Some(return_msg),
+                                self.upstream_addr,
+                            );
                         }
 
                         let after_direct = subscribers_snapshot(op_manager, key);
@@ -581,18 +584,18 @@ impl Operation for SubscribeOp {
                     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
                     let htl = (*htl).min(ring_max_htl);
                     let this_peer = op_manager.ring.connection_manager.own_location();
-                    let return_not_subbed = || -> OperationResult {
+                    // Capture upstream_addr for NAT-friendly routing in error responses
+                    let upstream_addr = self.upstream_addr;
+                    let return_not_subbed = || -> Result<OperationResult, OpError> {
                         let return_msg = SubscribeMsg::ReturnSub {
                             key: *key,
                             id: *id,
                             subscribed: false,
                             target: subscriber.clone(),
                         };
-                        OperationResult {
-                            target_addr: return_msg.target_addr(),
-                            return_msg: Some(NetMessage::from(return_msg)),
-                            state: None,
-                        }
+                        // Use build_op_result to ensure upstream_addr is used for routing
+                        // (important for peers behind NAT)
+                        build_op_result(*id, None, Some(return_msg), upstream_addr)
                     };
 
                     if htl == 0 {
@@ -602,7 +605,7 @@ impl Operation for SubscribeOp {
                             subscriber = %subscriber.peer(),
                             "Dropping Subscribe SeekNode with zero HTL"
                         );
-                        return Ok(return_not_subbed());
+                        return return_not_subbed();
                     }
 
                     if !super::has_contract(op_manager, *key).await? {
@@ -638,7 +641,7 @@ impl Operation for SubscribeOp {
                                     error = %fetch_err,
                                     "Failed to fetch contract locally while handling subscribe"
                                 );
-                                return Ok(return_not_subbed());
+                                return return_not_subbed();
                             }
 
                             if wait_for_local_contract(op_manager, *key).await? {
@@ -653,18 +656,18 @@ impl Operation for SubscribeOp {
                                     %key,
                                     "Contract still unavailable locally after fetch attempt"
                                 );
-                                return Ok(return_not_subbed());
+                                return return_not_subbed();
                             }
                         } else {
                             let Some(new_target) = candidates.first() else {
-                                return Ok(return_not_subbed());
+                                return return_not_subbed();
                             };
                             let new_target = new_target.clone();
                             let new_htl = htl.saturating_sub(1);
 
                             if new_htl == 0 {
                                 tracing::debug!(tx = %id, %key, "Max number of hops reached while trying to get contract");
-                                return Ok(return_not_subbed());
+                                return return_not_subbed();
                             }
 
                             let mut new_skip_list = skip_list.clone();
@@ -735,7 +738,7 @@ impl Operation for SubscribeOp {
                             "subscribe: direct registration failed (max subscribers reached)"
                         );
                         // max number of subscribers for this contract reached
-                        return Ok(return_not_subbed());
+                        return return_not_subbed();
                     }
                     let after_direct = subscribers_snapshot(op_manager, key);
                     tracing::info!(
