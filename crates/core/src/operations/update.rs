@@ -1005,10 +1005,10 @@ pub(crate) async fn request_update(
             .closest_potentially_caching(&key, [sender.peer().clone()].as_slice());
 
         if let Some(target) = remote_target {
-            // Subscribe to the contract
+            // Subscribe to the contract - sender is ourselves, no upstream_addr needed
             op_manager
                 .ring
-                .add_subscriber(&key, sender.clone())
+                .add_subscriber(&key, sender.clone(), None)
                 .map_err(|_| RingError::NoCachingPeers(key))?;
 
             target
