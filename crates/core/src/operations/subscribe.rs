@@ -739,10 +739,13 @@ impl Operation for SubscribeOp {
                         subscribers_before = ?before_direct,
                         "subscribe: attempting to register direct subscriber"
                     );
-                    // Use upstream_addr for NAT routing - subscriber may embed wrong address
+                    // Pass None: subscriber address was already corrected by Gateway at the
+                    // start of the subscribe flow. Using self.upstream_addr here would
+                    // incorrectly overwrite with the forwarder's address instead of the
+                    // original subscriber's Gateway-corrected address.
                     if op_manager
                         .ring
-                        .add_subscriber(key, subscriber.clone(), self.upstream_addr)
+                        .add_subscriber(key, subscriber.clone(), None)
                         .is_err()
                     {
                         tracing::warn!(
@@ -923,10 +926,13 @@ impl Operation for SubscribeOp {
                             subscribers_before = ?before_provider,
                             "subscribe: registering provider/subscription source"
                         );
-                        // Use upstream_addr for NAT routing - sender may embed wrong address
+                        // Pass None: sender was already looked up from source_addr (line ~866),
+                        // so it has the correct transport address. Using self.upstream_addr
+                        // would incorrectly use the original requester's address instead of
+                        // the provider's address.
                         if op_manager
                             .ring
-                            .add_subscriber(key, sender.clone(), self.upstream_addr)
+                            .add_subscriber(key, sender.clone(), None)
                             .is_err()
                         {
                             // concurrently it reached max number of subscribers for this contract
