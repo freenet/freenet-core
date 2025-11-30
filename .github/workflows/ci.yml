@@ -6,22 +6,108 @@ on:
   pull_request:
   merge_group:
 
-jobs:
-  test_all:
-    name: Test
+# Cancel in-progress runs when a new commit is pushed to the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-    runs-on: freenet-default-runner
+jobs:
+  # Fast checks first - fail fast on simple issues
+  # Order: fastest to slowest for single-runner efficiency
+
+  conventional_commits:
+    name: Conventional Commits
+    runs-on: self-hosted
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check PR title follows Conventional Commits
+        uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" found in the pull request title "{title}"
+            didn't match the configured pattern. Please ensure that the subject
+            doesn't start with an uppercase character.
+
+  fmt_check:
+    name: Fmt
+    runs-on: self-hosted
+    needs: conventional_commits
+    if: always() && (needs.conventional_commits.result == 'success' || needs.conventional_commits.result == 'skipped')
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check code formatting
+        run: cargo fmt -- --check
+
+  clippy_check:
+    name: Clippy
+    runs-on: self-hosted
+    needs: fmt_check
 
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
+      - uses: actions/checkout@v6
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: |
+          cargo build --locked --bin fdev --manifest-path ../../crates/fdev/Cargo.toml
+          export PATH="$PWD/../../target/debug:$PATH"
+          make -f run-ping.mk build
+        working-directory: apps/freenet-ping
+
+      - name: clippy
+        run: cargo clippy -- -D warnings
+
+  test_all:
+    name: Test
+    runs-on: self-hosted
+    needs: clippy_check
+
+    env:
+      FREENET_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+    steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
@@ -40,65 +126,25 @@ jobs:
           export PATH="$PWD/target/debug:$PATH"
           make -C apps/freenet-ping -f run-ping.mk build
 
+      - name: Clean test directories
+        run: |
+          # Remove freenet test directories from /tmp to avoid permission issues
+          # when tests create directories with different user ownership
+          rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
+
       - name: Test
         run: cargo test --workspace --no-default-features --features trace,websocket,redb
-
-  ubertest:
-    name: Ubertest
-    needs: test_all
-    # TODO: Re-enable when ubertest is stable - currently failing
-    if: false
-
-    runs-on: freenet-default-runner
-
-    env:
-      FREENET_LOG: error
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      UBERTEST_PEER_COUNT: 6  # Fewer peers for faster CI
-
-    steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-        if: success() || steps.test.conclusion == 'failure'
-        with:
-          save-if: false
-
-      - name: Install riverctl
-        run: cargo install riverctl
-
-      - name: Build
-        run: cargo build --locked
-
-      - name: Run Ubertest
-        run: cargo test --test ubertest --no-default-features --features trace,websocket,redb
-        working-directory: crates/core
 
   six_peer_regression:
     name: six-peer-regression
     needs: test_all
-    runs-on: freenet-default-runner
-    timeout-minutes: 120
+    runs-on: self-hosted
+    timeout-minutes: 30
 
     env:
       FREENET_LOG: error
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -133,18 +179,13 @@ jobs:
   six_peer_connection_cap:
     name: six-peer-connection-cap
     needs: test_all
-    runs-on: freenet-default-runner
+    runs-on: self-hosted
 
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
@@ -163,98 +204,44 @@ jobs:
           --features trace,websocket,redb,test-network
           -- connection_cap_respected --nocapture
 
-  clippy_check:
-    name: Clippy
-
-    runs-on: freenet-default-runner
+  ubertest:
+    name: Ubertest
+    needs: test_all
+    # TODO: Re-enable when ubertest is stable - currently failing
+    if: false
+    runs-on: self-hosted
 
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      UBERTEST_PEER_COUNT: 6  # Fewer peers for faster CI
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          components: clippy
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
+        if: success() || steps.test.conclusion == 'failure'
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
+
+      - name: Install riverctl
+        run: cargo install riverctl
 
       - name: Build
-        run: |
-          cargo build --locked --bin fdev --manifest-path ../../crates/fdev/Cargo.toml
-          export PATH="$PWD/../../target/debug:$PATH"
-          make -f run-ping.mk build
-        working-directory: apps/freenet-ping
+        run: cargo build --locked
 
-      - name: clippy
-        run: cargo clippy -- -D warnings
-
-  fmt_check:
-    name: Fmt
-
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: rustfmt
-
-      - name: Check code formatting
-        run: cargo fmt -- --check
-
-  conventional_commits:
-    name: Conventional Commits
-
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Check PR title follows Conventional Commits
-        uses: amannn/action-semantic-pull-request@v6
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          types: |
-            feat
-            fix
-            docs
-            style
-            refactor
-            perf
-            test
-            build
-            ci
-            chore
-            revert
-          requireScope: false
-          subjectPattern: ^(?![A-Z]).+$
-          subjectPatternError: |
-            The subject "{subject}" found in the pull request title "{title}"
-            didn't match the configured pattern. Please ensure that the subject
-            doesn't start with an uppercase character.
+      - name: Run Ubertest
+        run: cargo test --test ubertest --no-default-features --features trace,websocket,redb
+        working-directory: crates/core
 
   claude-ci-analysis:
     name: Claude CI Analysis
-
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: [test_all, clippy_check, fmt_check]
     if: failure() && contains(github.event.pull_request.labels.*.name, 'claude-debug')
 

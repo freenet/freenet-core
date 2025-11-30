@@ -2,8 +2,7 @@ name: Build and Cross-Compile
 
 on:
   workflow_dispatch:
-  pull_request:
-  merge_group:
+  # Skip PRs - only build on main and releases to reduce CI costs
   push:
     branches: [main]
     tags: ['v*']
