@@ -307,22 +307,11 @@ impl Ring {
             }
         }
 
-        if candidates.len() < k {
-            let known_locations = self.connection_manager.get_known_locations();
-            for (peer, location) in known_locations {
-                if skip_list.has_element(peer.clone()) || !seen.insert(peer.clone()) {
-                    continue;
-                }
-                candidates.push(PeerKeyLocation::with_location(
-                    peer.pub_key.clone(),
-                    peer.addr,
-                    location,
-                ));
-                if candidates.len() >= k {
-                    break;
-                }
-            }
-        }
+        // Note: We intentionally do NOT fall back to known_locations here.
+        // known_locations may contain peers we're not currently connected to,
+        // and attempting to route to them would require establishing a new connection
+        // which may fail (especially in NAT scenarios without coordination).
+        // It's better to return fewer candidates than unreachable ones.
 
         router
             .select_k_best_peers(candidates.iter(), target_location, k)
