@@ -19,14 +19,8 @@ pub struct FreenetTestArgs {
     pub auto_connect_peers: bool,
     /// Test timeout in seconds
     pub timeout_secs: u64,
-    /// Node startup wait in seconds (used as timeout when wait_for_connections is true)
+    /// Node startup wait in seconds
     pub startup_wait_secs: u64,
-    /// Whether to wait for connections to be established before running the test
-    /// When true, polls for connection events instead of just sleeping
-    pub wait_for_connections: bool,
-    /// Expected number of connections per peer node (used with wait_for_connections).
-    /// If None, defaults to 1 (each peer connects to at least one gateway).
-    pub expected_connections: Option<usize>,
     /// When to aggregate events
     pub aggregate_events: AggregateEventsMode,
     /// Log level filter
@@ -59,8 +53,6 @@ impl syn::parse::Parse for FreenetTestArgs {
         let mut auto_connect_peers = false;
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
-        let mut wait_for_connections = false;
-        let mut expected_connections: Option<usize> = None;
         let mut aggregate_events = AggregateEventsMode::OnFailure;
         let mut log_level = "freenet=debug,info".to_string();
         let mut tokio_flavor = TokioFlavor::CurrentThread;
@@ -267,14 +259,6 @@ impl syn::parse::Parse for FreenetTestArgs {
                     let lit: syn::LitBool = input.parse()?;
                     auto_connect_peers = lit.value;
                 }
-                "wait_for_connections" => {
-                    let lit: syn::LitBool = input.parse()?;
-                    wait_for_connections = lit.value;
-                }
-                "expected_connections" => {
-                    let lit: syn::LitInt = input.parse()?;
-                    expected_connections = Some(lit.base10_parse()?);
-                }
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -352,8 +336,6 @@ impl syn::parse::Parse for FreenetTestArgs {
             auto_connect_peers,
             timeout_secs,
             startup_wait_secs,
-            wait_for_connections,
-            expected_connections,
             aggregate_events,
             log_level,
             tokio_flavor,
