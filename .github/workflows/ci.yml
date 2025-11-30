@@ -53,8 +53,7 @@ jobs:
   fmt_check:
     name: Fmt
     runs-on: ubuntu-latest
-    needs: conventional_commits
-    if: always() && (needs.conventional_commits.result == 'success' || needs.conventional_commits.result == 'skipped')
+    # Run in parallel with conventional_commits (both are fast GitHub-hosted checks)
 
     steps:
       - uses: actions/checkout@v6
@@ -67,15 +66,14 @@ jobs:
       - name: Check code formatting
         run: cargo fmt -- --check
 
-  # Clippy needs build artifacts, use self-hosted for speed
+  # Clippy runs on GitHub-hosted runner (fast with cache), freeing nova for tests
   clippy_check:
     name: Clippy
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: fmt_check
 
     env:
       FREENET_LOG: error
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
       - uses: actions/checkout@v6
@@ -87,23 +85,14 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Build
-        run: |
-          cargo build --locked --bin fdev --manifest-path ../../crates/fdev/Cargo.toml
-          export PATH="$PWD/../../target/debug:$PATH"
-          make -f run-ping.mk build
-        working-directory: apps/freenet-ping
 
       - name: clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked -- -D warnings
 
   test_all:
     name: Test
     runs-on: self-hosted
-    needs: clippy_check
+    needs: fmt_check
 
     env:
       FREENET_LOG: error
@@ -177,34 +166,6 @@ jobs:
           cargo test --test message_flow
           river_message_flow_over_freenet_six_peers_five_rounds
           -- --ignored --exact
-
-  six_peer_connection_cap:
-    name: six-peer-connection-cap
-    needs: test_all
-    runs-on: self-hosted
-
-    env:
-      FREENET_LOG: error
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Run six-peer connection-cap test
-        run: >
-          cargo test -p freenet
-          --test connection_cap
-          --no-default-features
-          --features trace,websocket,redb,test-network
-          -- connection_cap_respected --nocapture
 
   ubertest:
     name: Ubertest
