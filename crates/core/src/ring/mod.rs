@@ -653,6 +653,7 @@ impl Ring {
             ttl,
             target_connections,
             op_manager.connect_forward_estimator.clone(),
+            false, // is_gateway: connection_maintenance is for peers, not gateways
         );
 
         live_tx_tracker.add_transaction(query_target.addr(), tx);

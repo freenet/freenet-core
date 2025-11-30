@@ -1065,14 +1065,6 @@ impl Operation for ConnectOp {
                 }
                 ConnectMsg::ObservedAddress { address, .. } => {
                     self.handle_observed_address(*address, Instant::now());
-                    // Update our peer address now that we know our external address.
-                    // This is critical for peers behind NAT who start with a placeholder
-                    // address (127.0.0.1) and need to update it when a gateway observes
-                    // their actual public address.
-                    op_manager
-                        .ring
-                        .connection_manager
-                        .update_peer_address(*address);
                     Ok(store_operation_state(&mut self))
                 }
             }
