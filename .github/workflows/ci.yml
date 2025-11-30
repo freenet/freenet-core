@@ -52,6 +52,8 @@ jobs:
   fmt_check:
     name: Fmt
     runs-on: self-hosted
+    needs: conventional_commits
+    if: always() && (needs.conventional_commits.result == 'success' || needs.conventional_commits.result == 'skipped')
 
     steps:
       - uses: actions/checkout@v6
@@ -67,6 +69,7 @@ jobs:
   clippy_check:
     name: Clippy
     runs-on: self-hosted
+    needs: fmt_check
 
     env:
       FREENET_LOG: error
@@ -98,6 +101,7 @@ jobs:
   test_all:
     name: Test
     runs-on: self-hosted
+    needs: clippy_check
 
     env:
       FREENET_LOG: error
