@@ -391,8 +391,8 @@ impl RelayState {
                 // Use the joiner with updated observed address for response routing
                 actions.response_target = Some(joiner_pkl.clone());
                 tracing::info!(
-                    acceptor_peer = %acceptor.peer(),
-                    joiner_peer = %joiner_pkl.peer(),
+                    acceptor_pub_key = %acceptor.pub_key(),
+                    joiner_pub_key = %joiner_pkl.pub_key(),
                     acceptor_loc = ?acceptor.location,
                     joiner_loc = ?joiner_pkl.location,
                     ring_distance = ?dist,
@@ -909,7 +909,7 @@ impl Operation for ConnectOp {
                         };
                         // Route through upstream (where the request came from) since we may
                         // not have a direct connection to the target
-                        if let Some(upstream) = &source_addr {
+                        if let Some(upstream) = source_addr {
                             network_bridge
                                 .send(
                                     upstream.socket_addr(),
@@ -956,7 +956,7 @@ impl Operation for ConnectOp {
                         };
                         // Route the response through upstream (where the request came from)
                         // since we may not have a direct connection to the joiner
-                        if let Some(upstream) = &source_addr {
+                        if let Some(upstream) = source_addr {
                             network_bridge
                                 .send(
                                     upstream.socket_addr(),
