@@ -320,8 +320,8 @@ impl RelayState {
             // Use the joiner with updated observed address for response routing
             actions.response_target = Some(self.request.joiner.clone());
             tracing::info!(
-                acceptor_pub_key = %acceptor.pub_key(),
-                joiner_pub_key = %self.request.joiner.pub_key(),
+                acceptor_key = %acceptor.pub_key(),
+                joiner_key = %self.request.joiner.pub_key(),
                 acceptor_loc = ?acceptor.location,
                 joiner_loc = ?self.request.joiner.location,
                 ring_distance = ?dist,
@@ -690,7 +690,7 @@ impl ConnectOp {
         match self.state.as_mut() {
             Some(ConnectState::WaitingForResponses(state)) => {
                 tracing::info!(
-                    acceptor = %response.acceptor.peer(),
+                    acceptor_key = %response.acceptor.pub_key(),
                     acceptor_loc = ?response.acceptor.location,
                     "connect: joiner received ConnectResponse"
                 );
@@ -830,11 +830,9 @@ impl Operation for ConnectOp {
                         };
                         // Route through upstream (where the request came from) since we may
                         // not have a direct connection to the target
-                        if let Some(upstream) = source_addr {
-                            network_bridge
-                                .send(upstream, NetMessage::V1(NetMessageV1::Connect(msg)))
-                                .await?;
-                        }
+                        network_bridge
+                            .send(upstream_addr, NetMessage::V1(NetMessageV1::Connect(msg)))
+                            .await?;
                     }
 
                     if let Some(peer) = actions.expect_connection_from {
@@ -876,14 +874,12 @@ impl Operation for ConnectOp {
                         };
                         // Route the response through upstream (where the request came from)
                         // since we may not have a direct connection to the joiner
-                        if let Some(upstream) = source_addr {
-                            network_bridge
-                                .send(
-                                    upstream,
-                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
-                                )
-                                .await?;
-                        }
+                        network_bridge
+                            .send(
+                                upstream_addr,
+                                NetMessage::V1(NetMessageV1::Connect(response_msg)),
+                            )
+                            .await?;
                         return Ok(store_operation_state(&mut self));
                     }
 
@@ -977,7 +973,7 @@ impl Operation for ConnectOp {
                                 updated_payload
                             } else {
                                 tracing::warn!(
-                                    acceptor = %payload.acceptor.peer(),
+                                    acceptor_key = %payload.acceptor.pub_key(),
                                     "connect: response received without source_addr, cannot fill acceptor address"
                                 );
                                 payload.clone()
@@ -988,7 +984,7 @@ impl Operation for ConnectOp {
 
                         tracing::debug!(
                             upstream_addr = %upstream_addr,
-                            acceptor = %forward_payload.acceptor.peer(),
+                            acceptor_key = %forward_payload.acceptor.pub_key(),
                             "connect: forwarding response towards joiner"
                         );
                         // Forward response toward the joiner via upstream
