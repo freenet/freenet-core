@@ -47,11 +47,15 @@ impl LiveTransactionTracker {
         self.tx_per_peer.contains_key(&peer_addr)
     }
 
-    pub(crate) fn still_alive(&self, tx: &Transaction) -> bool {
-        self.tx_per_peer.iter().any(|e| e.value().contains(tx))
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.tx_per_peer.len()
+    }
+
+    /// Returns the total number of active transactions across all peers.
+    pub(crate) fn active_transaction_count(&self) -> usize {
+        self.tx_per_peer
+            .iter()
+            .map(|entry| entry.value().len())
+            .sum()
     }
 }
