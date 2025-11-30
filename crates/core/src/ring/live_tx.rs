@@ -59,3 +59,59 @@ impl LiveTransactionTracker {
             .sum()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::connect::ConnectMsg;
+
+    #[test]
+    fn active_transaction_count_empty() {
+        let tracker = LiveTransactionTracker::new();
+        assert_eq!(tracker.active_transaction_count(), 0);
+    }
+
+    #[test]
+    fn active_transaction_count_single_peer() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+        assert_eq!(tracker.active_transaction_count(), 1);
+
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+        assert_eq!(tracker.active_transaction_count(), 2);
+    }
+
+    #[test]
+    fn active_transaction_count_multiple_peers() {
+        let tracker = LiveTransactionTracker::new();
+        let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        tracker.add_transaction(addr1, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(addr1, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(addr2, Transaction::new::<ConnectMsg>());
+
+        assert_eq!(tracker.active_transaction_count(), 3);
+    }
+
+    #[test]
+    fn active_transaction_count_after_removal() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        let tx1 = Transaction::new::<ConnectMsg>();
+        let tx2 = Transaction::new::<ConnectMsg>();
+
+        tracker.add_transaction(addr, tx1);
+        tracker.add_transaction(addr, tx2);
+        assert_eq!(tracker.active_transaction_count(), 2);
+
+        tracker.remove_finished_transaction(tx1);
+        assert_eq!(tracker.active_transaction_count(), 1);
+
+        tracker.remove_finished_transaction(tx2);
+        assert_eq!(tracker.active_transaction_count(), 0);
+    }
+}
