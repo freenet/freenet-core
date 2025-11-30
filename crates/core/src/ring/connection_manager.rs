@@ -333,43 +333,6 @@ impl ConnectionManager {
         }
     }
 
-    /// Updates the address of the peer key.
-    ///
-    /// This is used when a peer behind NAT learns its actual public address from a gateway
-    /// via the ObservedAddress message. The peer initially starts with a placeholder address
-    /// (127.0.0.1) and updates it here when the real address is discovered.
-    ///
-    /// Returns true if the address was updated, false if the address was already set to a
-    /// non-placeholder value.
-    pub fn update_peer_address(&self, new_addr: SocketAddr) -> bool {
-        let mut this_peer = self.peer_key.lock();
-        if let Some(ref mut peer) = *this_peer {
-            // Only update if current address is a placeholder (localhost)
-            if peer.addr.ip().is_loopback() {
-                tracing::info!(
-                    old_addr = %peer.addr,
-                    %new_addr,
-                    "Updating peer address from placeholder to observed address"
-                );
-                peer.addr = new_addr;
-                true
-            } else {
-                tracing::debug!(
-                    current_addr = %peer.addr,
-                    %new_addr,
-                    "Peer address already set to non-placeholder, not updating"
-                );
-                false
-            }
-        } else {
-            tracing::warn!(
-                %new_addr,
-                "Attempted to update peer address but peer key not set"
-            );
-            false
-        }
-    }
-
     pub fn prune_alive_connection(&self, peer: &PeerId) -> Option<Location> {
         self.prune_connection(peer, true)
     }
