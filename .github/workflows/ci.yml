@@ -6,22 +6,22 @@ on:
   pull_request:
   merge_group:
 
+# Cancel in-progress runs when a new commit is pushed to the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test_all:
     name: Test
 
-    runs-on: freenet-default-runner
+    runs-on: ubuntu-latest
 
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
@@ -49,7 +49,7 @@ jobs:
     # TODO: Re-enable when ubertest is stable - currently failing
     if: false
 
-    runs-on: freenet-default-runner
+    runs-on: ubuntu-latest
 
     env:
       FREENET_LOG: error
@@ -57,11 +57,6 @@ jobs:
       UBERTEST_PEER_COUNT: 6  # Fewer peers for faster CI
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
@@ -87,18 +82,13 @@ jobs:
   six_peer_regression:
     name: six-peer-regression
     needs: test_all
-    runs-on: freenet-default-runner
-    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     env:
       FREENET_LOG: error
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -133,18 +123,13 @@ jobs:
   six_peer_connection_cap:
     name: six-peer-connection-cap
     needs: test_all
-    runs-on: freenet-default-runner
+    runs-on: ubuntu-latest
 
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
@@ -166,18 +151,13 @@ jobs:
   clippy_check:
     name: Clippy
 
-    runs-on: freenet-default-runner
+    runs-on: ubuntu-latest
 
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
