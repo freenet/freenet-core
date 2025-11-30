@@ -506,6 +506,7 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
 fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident) -> TokenStream {
     let timeout_secs = args.timeout_secs;
     let startup_wait_secs = args.startup_wait_secs;
+    let wait_for_connections = args.wait_for_connections;
 
     // Generate select! arms for each node
     let mut select_arms = Vec::new();
@@ -539,14 +540,50 @@ fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident
         }
     });
 
+    // Generate the startup waiting code based on wait_for_connections flag
+    let startup_wait_code = if wait_for_connections {
+        // Determine expected_connections: use explicit value or default to 1
+        // (each peer should connect to at least one gateway)
+        let expected_conn = args.expected_connections.unwrap_or(1);
+        let expected_conn_lit =
+            syn::LitInt::new(&expected_conn.to_string(), proc_macro2::Span::call_site());
+
+        // Use condition-based waiting: poll for connection events
+        quote! {
+            // Wait for peer nodes to establish connections (condition-based)
+            tracing::info!(
+                "Waiting for connections to be established (timeout: {} seconds)",
+                #startup_wait_secs
+            );
+            let connection_timeout = Duration::from_secs(#startup_wait_secs);
+            let poll_interval = Duration::from_millis(500);
+            // Expected connections per peer (configurable via expected_connections parameter)
+            let expected_connections = #expected_conn_lit;
+
+            match ctx.wait_for_connections(expected_connections, connection_timeout, poll_interval).await {
+                Ok(()) => {
+                    tracing::info!("All connections established, running test");
+                }
+                Err(e) => {
+                    tracing::warn!("Connection wait failed: {}. Proceeding with test anyway.", e);
+                }
+            }
+        }
+    } else {
+        // Use fixed timing wait (backward compatible behavior)
+        quote! {
+            // Wait for nodes to start (fixed timing)
+            tracing::info!("Waiting {} seconds for nodes to start up", #startup_wait_secs);
+            tokio::time::sleep(Duration::from_secs(#startup_wait_secs)).await;
+            tracing::info!("Nodes should be ready, running test");
+        }
+    };
+
     quote! {
         let test_future = tokio::time::timeout(
             Duration::from_secs(#timeout_secs),
             async {
-                // Wait for nodes to start
-                tracing::info!("Waiting {} seconds for nodes to start up", #startup_wait_secs);
-                tokio::time::sleep(Duration::from_secs(#startup_wait_secs)).await;
-                tracing::info!("Nodes should be ready, running test");
+                #startup_wait_code
 
                 // Run user's test
                 #inner_fn_name(&mut ctx).await

@@ -1227,7 +1227,7 @@ impl EventKind {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-enum ConnectEvent {
+pub enum ConnectEvent {
     StartConnection {
         from: PeerId,
     },

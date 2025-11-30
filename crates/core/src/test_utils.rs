@@ -960,6 +960,111 @@ impl TestContext {
             .collect()
     }
 
+    /// Wait for peer nodes to establish connections to gateways.
+    ///
+    /// This method polls the event logs looking for connection events until
+    /// the expected number of connections is established or the timeout expires.
+    ///
+    /// # Arguments
+    /// * `expected_connections` - Minimum number of connections expected per peer node
+    /// * `timeout` - Maximum time to wait for connections
+    /// * `poll_interval` - How often to check for new connections
+    ///
+    /// # Returns
+    /// Ok(()) if connections were established, Err if timeout was reached
+    pub async fn wait_for_connections(
+        &self,
+        expected_connections: usize,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> anyhow::Result<()> {
+        use std::collections::HashSet;
+
+        let start = std::time::Instant::now();
+        let peer_count = self.peers().len();
+
+        // If there are no peers (only gateways), we don't need to wait
+        if peer_count == 0 {
+            tracing::info!("No peer nodes, skipping connection wait");
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Waiting for {} peer node(s) to establish {} connection(s) each (timeout: {:?})",
+            peer_count,
+            expected_connections,
+            timeout
+        );
+
+        loop {
+            // Flush event logs to ensure we see recent events
+            for (label, handle) in &self.flush_handles {
+                tracing::trace!("Flushing events for node: {}", label);
+                handle.flush().await;
+            }
+
+            // Check connection status by counting connected events in event logs
+            let mut connected_peers: HashSet<String> = HashSet::new();
+
+            for label in &self.node_order {
+                let node = self.node(label)?;
+                if node.is_gateway {
+                    continue; // Only check peer nodes
+                }
+
+                let event_log_path = self.event_log_path(label)?;
+                if event_log_path.exists() {
+                    // Count connection events for this node
+                    let connection_count =
+                        count_connection_events(&event_log_path).await.unwrap_or(0);
+
+                    if connection_count >= expected_connections {
+                        connected_peers.insert(label.clone());
+                        tracing::debug!("Node '{}' has {} connection(s)", label, connection_count);
+                    } else {
+                        tracing::trace!(
+                            "Node '{}' has {} connection(s), waiting for {}",
+                            label,
+                            connection_count,
+                            expected_connections
+                        );
+                    }
+                }
+            }
+
+            // Check if all peers are connected
+            if connected_peers.len() >= peer_count {
+                let elapsed = start.elapsed();
+                tracing::info!(
+                    "All {} peer node(s) connected (took {:?})",
+                    peer_count,
+                    elapsed
+                );
+                return Ok(());
+            }
+
+            // Check timeout
+            if start.elapsed() > timeout {
+                let elapsed = start.elapsed();
+                tracing::warn!(
+                    "Connection timeout after {:?}: {}/{} peers connected",
+                    elapsed,
+                    connected_peers.len(),
+                    peer_count
+                );
+                return Err(anyhow::anyhow!(
+                    "Timeout waiting for connections: only {}/{} peers connected after {:?}",
+                    connected_peers.len(),
+                    peer_count,
+                    timeout
+                ));
+            }
+
+            // Wait before next poll
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     /// Get the path to a node's event log.
     pub fn event_log_path(&self, node_label: &str) -> anyhow::Result<PathBuf> {
         let node = self.node(node_label)?;
@@ -1455,3 +1560,45 @@ pub mod event_aggregator_utils {
 }
 
 pub use event_aggregator_utils::{NodeLogInfo, TestAggregatorBuilder};
+
+/// Count the number of unique peer connections in an event log file.
+///
+/// This function reads the event log and counts unique peers that have Connected events.
+/// Due to the way connection events are logged (varying number of events per connection
+/// depending on which node initiates and processes the response), we count unique
+/// `connected` peer IDs rather than raw event counts to get an accurate connection count.
+///
+/// # Connection Event Logging Details
+///
+/// The number of Connected events per logical connection varies:
+/// - When a node receives a ConnectMsg::Response, it may log 1-2 Connected events
+/// - When a node sends a ConnectMsg::Response, it logs 1 Connected event
+/// - Events are logged from the perspective of the local node
+///
+/// By counting unique remote peers in Connected events, we get the actual number
+/// of distinct connections regardless of how many events were logged.
+async fn count_connection_events(event_log_path: &Path) -> anyhow::Result<usize> {
+    use crate::tracing::{AOFEventSource, ConnectEvent, EventKind, EventSource};
+    use std::collections::HashSet;
+
+    // Create an AOF event source for this log file
+    let source = AOFEventSource::new(event_log_path.to_path_buf(), None);
+
+    let events = match source.get_events().await {
+        Ok(events) => events,
+        Err(_) => return Ok(0), // File doesn't exist or can't be read yet
+    };
+
+    // Collect unique connected peer IDs to count actual connections
+    // Each unique peer in a Connected event represents one logical connection
+    let mut connected_peers: HashSet<String> = HashSet::new();
+
+    for event in &events {
+        if let EventKind::Connect(ConnectEvent::Connected { connected, .. }) = &event.kind {
+            // Use the connected peer's ID as the unique identifier
+            connected_peers.insert(connected.peer.to_string());
+        }
+    }
+
+    Ok(connected_peers.len())
+}
