@@ -61,7 +61,7 @@ use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 
 use crate::topology::rate::Rate;
-use crate::transport::{TransportKeypair, TransportPublicKey};
+use crate::transport::{ObservedAddr, TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
 
 mod message_processor;
@@ -369,9 +369,12 @@ impl NodeConfig {
         let gateways: Vec<PeerKeyLocation> = self
             .gateways
             .iter()
-            .map(|node| PeerKeyLocation {
-                peer: node.peer_id.clone(),
-                location: Some(node.location),
+            .map(|node| {
+                PeerKeyLocation::with_location(
+                    node.peer_id.pub_key.clone(),
+                    node.peer_id.addr,
+                    node.location,
+                )
             })
             .collect();
 
@@ -617,6 +620,7 @@ pub(super) async fn process_message<CB>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_message_decoupled<CB>(
     msg: NetMessage,
+    source_addr: Option<ObservedAddr>,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
@@ -631,6 +635,7 @@ pub(crate) async fn process_message_decoupled<CB>(
     // Pure network message processing - no client types involved
     let op_result = handle_pure_network_message(
         msg,
+        source_addr,
         op_manager.clone(),
         conn_manager,
         event_listener.as_mut(),
@@ -676,6 +681,7 @@ pub(crate) async fn process_message_decoupled<CB>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message<CB>(
     msg: NetMessage,
+    source_addr: Option<ObservedAddr>,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
@@ -688,6 +694,7 @@ where
         NetMessage::V1(msg_v1) => {
             handle_pure_network_message_v1(
                 msg_v1,
+                source_addr,
                 op_manager,
                 conn_manager,
                 event_listener,
@@ -725,8 +732,9 @@ async fn process_message_v1<CB>(
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
+                // Legacy path - no source_addr available
                 let op_result =
-                    handle_op_request::<ConnectOp, _>(&op_manager, &mut conn_manager, op)
+                    handle_op_request::<ConnectOp, _>(&op_manager, &mut conn_manager, op, None)
                         .instrument(span)
                         .await;
 
@@ -741,8 +749,10 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Put(ref op) => {
+                // Legacy path - no source_addr available
                 let op_result =
-                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
+                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op, None)
+                        .await;
 
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
@@ -767,8 +777,10 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Get(ref op) => {
+                // Legacy path - no source_addr available
                 let op_result =
-                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
+                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op, None)
+                        .await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
                         let tx_id = *op.id();
@@ -789,10 +801,12 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Subscribe(ref op) => {
+                // Legacy path - no source_addr available
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                     &op_manager,
                     &mut conn_manager,
                     op,
+                    None,
                 )
                 .await;
                 if is_operation_completed(&op_result) {
@@ -815,9 +829,14 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Update(ref op) => {
-                let op_result =
-                    handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
-                        .await;
+                // Legacy path - no source_addr available
+                let op_result = handle_op_request::<update::UpdateOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    None,
+                )
+                .await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
                         let tx_id = *op.id();
@@ -857,6 +876,7 @@ async fn process_message_v1<CB>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message_v1<CB>(
     msg: NetMessageV1,
+    source_addr: Option<ObservedAddr>,
     op_manager: Arc<OpManager>,
     mut conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
@@ -884,10 +904,14 @@ where
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
-                let op_result =
-                    handle_op_request::<ConnectOp, _>(&op_manager, &mut conn_manager, op)
-                        .instrument(span)
-                        .await;
+                let op_result = handle_op_request::<ConnectOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .instrument(span)
+                .await;
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -916,8 +940,13 @@ where
                     tx = %op.id(),
                     "handle_pure_network_message_v1: Processing PUT message"
                 );
-                let op_result =
-                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
+                let op_result = handle_op_request::<put::PutOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .await;
                 tracing::debug!(
                     tx = %op.id(),
                     op_result_ok = op_result.is_ok(),
@@ -958,8 +987,13 @@ where
                 .await;
             }
             NetMessageV1::Get(ref op) => {
-                let op_result =
-                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
+                let op_result = handle_op_request::<get::GetOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .await;
 
                 // Handle pending operation results (network concern)
                 if is_operation_completed(&op_result) {
@@ -995,9 +1029,13 @@ where
                 .await;
             }
             NetMessageV1::Update(ref op) => {
-                let op_result =
-                    handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
-                        .await;
+                let op_result = handle_op_request::<update::UpdateOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .await;
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -1026,6 +1064,7 @@ where
                     &op_manager,
                     &mut conn_manager,
                     op,
+                    source_addr,
                 )
                 .await;
 
@@ -1174,7 +1213,7 @@ async fn handle_aborted_op(
                 {
                     let gateway = op.gateway().cloned();
                     if let Some(gateway) = gateway {
-                        tracing::warn!("Retry connecting to gateway {}", gateway.peer);
+                        tracing::warn!("Retry connecting to gateway {}", gateway.peer());
                         connect::join_ring_request(None, &gateway, op_manager).await?;
                     }
                 }

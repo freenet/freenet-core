@@ -899,15 +899,21 @@ where
         let msg = match msg {
             Ok(Either::Left(msg)) => msg,
             Ok(Either::Right(action)) => match action {
-                NodeEvent::DropConnection(peer) => {
-                    tracing::info!("Dropping connection to {peer}");
-                    event_register
-                        .register_events(Either::Left(crate::tracing::NetEventLog::disconnected(
-                            &op_manager.ring,
-                            &peer,
-                        )))
-                        .await;
-                    op_manager.ring.prune_connection(peer).await;
+                NodeEvent::DropConnection(peer_addr) => {
+                    tracing::info!("Dropping connection to {peer_addr}");
+                    // Look up the peer by address in the ring
+                    if let Some(peer) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(peer_addr)
+                    {
+                        event_register
+                            .register_events(Either::Left(
+                                crate::tracing::NetEventLog::disconnected(&op_manager.ring, &peer),
+                            ))
+                            .await;
+                        op_manager.ring.prune_connection(peer).await;
+                    }
                     continue;
                 }
                 NodeEvent::ConnectPeer { peer, .. } => {

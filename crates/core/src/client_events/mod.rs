@@ -422,7 +422,7 @@ async fn process_open_request(
                         let own_location = op_manager.ring.connection_manager.own_location();
                         let has_remote_peers = op_manager
                             .ring
-                            .closest_potentially_caching(&contract_key, &[own_location.peer][..])
+                            .closest_potentially_caching(&contract_key, &[own_location.peer()][..])
                             .is_some();
 
                         if !has_remote_peers {
