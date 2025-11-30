@@ -177,9 +177,11 @@ where
                             msg,
                             NetMessage::V1(NetMessageV1::Update(
                                 crate::operations::update::UpdateMsg::Broadcasting { .. }
+                            )) | NetMessage::V1(NetMessageV1::Get(
+                                crate::operations::get::GetMsg::ReturnGet { .. }
                             ))
                         ),
-                        "Only Update::Broadcasting messages should be re-queued locally"
+                        "Only Update::Broadcasting and Get::ReturnGet messages should be re-queued locally"
                     );
                     op_manager.notify_op_change(msg, updated_state).await?;
                     return Err(OpError::StatePushed);
