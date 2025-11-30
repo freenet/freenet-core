@@ -518,10 +518,6 @@ impl ConnectionManager {
         self.connections_by_location.read().clone()
     }
 
-    pub(super) fn get_known_locations(&self) -> BTreeMap<PeerId, Location> {
-        self.location_for_peer.read().clone()
-    }
-
     /// Route an op to the most optimal target.
     pub fn routing(
         &self,
