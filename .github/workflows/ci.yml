@@ -126,6 +126,12 @@ jobs:
           export PATH="$PWD/target/debug:$PATH"
           make -C apps/freenet-ping -f run-ping.mk build
 
+      - name: Clean test directories
+        run: |
+          # Remove freenet test directories from /tmp to avoid permission issues
+          # when tests create directories with different user ownership
+          rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
+
       - name: Test
         run: cargo test --workspace --no-default-features --features trace,websocket,redb
 
