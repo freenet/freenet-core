@@ -28,6 +28,9 @@ use freenet_stdlib::client_api::HostResponse;
 
 const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 const RECENCY_COOLDOWN: Duration = Duration::from_secs(30);
+/// Timeout for joiner waiting for responses. If no progress (acceptances or
+/// observed address updates) is made within this duration, the operation fails.
+const JOINER_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Top-level message envelope used by the new connect handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,6 +515,11 @@ impl JoinerState {
         self.observed_address = Some(address);
         self.last_progress = now;
     }
+
+    /// Returns true if no progress has been made within the timeout period.
+    pub(crate) fn has_timed_out(&self, now: Instant) -> bool {
+        now.duration_since(self.last_progress) >= JOINER_PROGRESS_TIMEOUT
+    }
 }
 
 /// Placeholder operation wrapper so we can exercise the logic in isolation in
@@ -806,6 +814,21 @@ impl Operation for ConnectOp {
         Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            // Check for joiner timeout before processing any message
+            if self.gateway.is_some() {
+                if let Some(ConnectState::WaitingForResponses(ref state)) = self.state {
+                    if state.has_timed_out(Instant::now()) {
+                        tracing::warn!(
+                            tx = %self.id,
+                            last_progress_secs = state.last_progress.elapsed().as_secs(),
+                            accepted_count = state.accepted.len(),
+                            "connect: joiner timed out waiting for responses"
+                        );
+                        return Err(OpError::Timeout);
+                    }
+                }
+            }
+
             match msg {
                 ConnectMsg::Request { payload, .. } => {
                     let env = RelayEnv::new(op_manager);
