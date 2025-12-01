@@ -20,7 +20,7 @@ use crate::topology::rate::Rate;
 use crate::topology::TopologyAdjustment;
 use crate::tracing::{NetEventLog, NetEventRegister};
 
-use crate::transport::TransportPublicKey;
+use crate::transport::{ObservedAddr, TransportPublicKey};
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
@@ -327,12 +327,19 @@ impl Ring {
     }
 
     /// Will return an error in case the max number of subscribers has been added.
+    ///
+    /// The `upstream_addr` parameter is the transport-level address from which the subscribe
+    /// message was received. This is used instead of the address embedded in `subscriber`
+    /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
+    /// The transport address is the only reliable way to route back to them.
     pub fn add_subscriber(
         &self,
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
+        upstream_addr: Option<ObservedAddr>,
     ) -> Result<(), ()> {
-        self.seeding_manager.add_subscriber(contract, subscriber)
+        self.seeding_manager
+            .add_subscriber(contract, subscriber, upstream_addr)
     }
 
     /// Remove a subscriber by peer ID from a specific contract

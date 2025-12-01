@@ -274,7 +274,11 @@ async fn complete_local_subscription(
     key: ContractKey,
 ) -> Result<(), OpError> {
     let subscriber = op_manager.ring.connection_manager.own_location();
-    if let Err(err) = op_manager.ring.add_subscriber(&key, subscriber.clone()) {
+    // Local subscription - no upstream NAT address
+    if let Err(err) = op_manager
+        .ring
+        .add_subscriber(&key, subscriber.clone(), None)
+    {
         tracing::warn!(
             %key,
             tx = %id,
@@ -451,9 +455,10 @@ impl Operation for SubscribeOp {
                             "subscribe: handling RequestSub locally (contract available)"
                         );
 
+                        // Local registration - no upstream NAT address
                         if op_manager
                             .ring
-                            .add_subscriber(key, subscriber.clone())
+                            .add_subscriber(key, subscriber.clone(), None)
                             .is_err()
                         {
                             tracing::warn!(
@@ -722,9 +727,10 @@ impl Operation for SubscribeOp {
                         subscribers_before = ?before_direct,
                         "subscribe: attempting to register direct subscriber"
                     );
+                    // Local registration - no upstream NAT address
                     if op_manager
                         .ring
-                        .add_subscriber(key, subscriber.clone())
+                        .add_subscriber(key, subscriber.clone(), None)
                         .is_err()
                     {
                         tracing::warn!(
@@ -872,9 +878,10 @@ impl Operation for SubscribeOp {
                                 subscribers_before = ?before_upstream,
                                 "subscribe: attempting to register upstream link"
                             );
+                            // Local registration - no upstream NAT address
                             if op_manager
                                 .ring
-                                .add_subscriber(key, upstream_subscriber.clone())
+                                .add_subscriber(key, upstream_subscriber.clone(), None)
                                 .is_err()
                             {
                                 tracing::warn!(
@@ -904,7 +911,12 @@ impl Operation for SubscribeOp {
                             subscribers_before = ?before_provider,
                             "subscribe: registering provider/subscription source"
                         );
-                        if op_manager.ring.add_subscriber(key, sender.clone()).is_err() {
+                        // Local registration - no upstream NAT address
+                        if op_manager
+                            .ring
+                            .add_subscriber(key, sender.clone(), None)
+                            .is_err()
+                        {
                             // concurrently it reached max number of subscribers for this contract
                             tracing::debug!(
                                 tx = %id,
