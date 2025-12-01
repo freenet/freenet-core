@@ -134,8 +134,8 @@ pub(crate) struct ConnectRequest {
     pub ttl: u8,
     /// Simple visited set to avoid trivial loops.
     pub visited: Vec<PeerKeyLocation>,
-    /// Address observed by the gateway/relay for the joiner, if known.
-    pub observed_addr: Option<ObservedAddr>,
+    /// Socket observed by the gateway/relay for the joiner, if known.
+    pub observed_addr: Option<SocketAddr>,
 }
 
 /// Acceptance payload returned by candidates.
@@ -184,15 +184,15 @@ impl Joiner {
     }
 
     /// Upgrades an Unknown joiner to Known once we observe their address.
-    pub fn with_observed_address(&self, addr: ObservedAddr) -> Self {
+    pub fn with_observed_address(&self, addr: SocketAddr) -> Self {
         match self {
-            Joiner::Unknown(key) => Joiner::Known(PeerId::new(addr.socket_addr(), key.clone())),
+            Joiner::Unknown(key) => Joiner::Known(PeerId::new(addr, key.clone())),
             Joiner::Known(peer_id) => {
                 // Avoid allocation if address hasn't changed
-                if peer_id.addr == addr.socket_addr() {
+                if peer_id.addr == addr {
                     self.clone()
                 } else {
-                    Joiner::Known(PeerId::new(addr.socket_addr(), peer_id.pub_key.clone()))
+                    Joiner::Known(PeerId::new(addr, peer_id.pub_key.clone()))
                 }
             }
         }
@@ -243,7 +243,7 @@ pub(crate) enum ConnectState {
 #[derive(Debug, Clone)]
 pub(crate) struct JoinerState {
     pub target_connections: usize,
-    pub observed_address: Option<ObservedAddr>,
+    pub observed_address: Option<SocketAddr>,
     pub accepted: HashSet<PeerKeyLocation>,
     pub last_progress: Instant,
 }
@@ -283,7 +283,7 @@ pub(crate) struct RelayActions {
     pub accept_response: Option<ConnectResponse>,
     pub expect_connection_from: Option<PeerKeyLocation>,
     pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
-    pub observed_address: Option<(PeerKeyLocation, ObservedAddr)>,
+    pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
     /// The target to send the ConnectResponse to (with observed external address).
     pub response_target: Option<PeerKeyLocation>,
 }
@@ -588,7 +588,7 @@ impl JoinerState {
         acceptance
     }
 
-    pub(crate) fn update_observed_address(&mut self, address: ObservedAddr, now: Instant) {
+    pub(crate) fn update_observed_address(&mut self, address: SocketAddr, now: Instant) {
         self.observed_address = Some(address);
         self.last_progress = now;
     }
@@ -639,7 +639,7 @@ impl ConnectOp {
         id: Transaction,
         desired_location: Location,
         target_connections: usize,
-        observed_address: Option<ObservedAddr>,
+        observed_address: Option<SocketAddr>,
         gateway: Option<PeerKeyLocation>,
         backoff: Option<Backoff>,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
@@ -750,7 +750,7 @@ impl ConnectOp {
             tx,
             desired_location,
             target_connections,
-            Some(ObservedAddr::new(own.addr())),
+            Some(own.addr()),
             Some(target.clone()),
             None,
             connect_forward_estimator,
@@ -793,7 +793,7 @@ impl ConnectOp {
 
     pub(crate) fn handle_observed_address(&mut self, address: SocketAddr, now: Instant) {
         if let Some(ConnectState::WaitingForResponses(state)) = self.state.as_mut() {
-            state.update_observed_address(ObservedAddr::new(address), now);
+            state.update_observed_address(address, now);
         }
     }
 
@@ -905,13 +905,16 @@ impl Operation for ConnectOp {
                         let msg = ConnectMsg::ObservedAddress {
                             id: self.id,
                             target: target.clone(),
-                            address: address.socket_addr(),
+                            address,
                         };
                         // Route through upstream (where the request came from) since we may
                         // not have a direct connection to the target
                         if let Some(upstream) = source_addr {
                             network_bridge
-                                .send(upstream, NetMessage::V1(NetMessageV1::Connect(msg)))
+                                .send(
+                                    upstream.socket_addr(),
+                                    NetMessage::V1(NetMessageV1::Connect(msg)),
+                                )
                                 .await?;
                         }
                     }
@@ -935,7 +938,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                ObservedAddr::new(next.addr()),
+                                next.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -956,7 +959,7 @@ impl Operation for ConnectOp {
                         if let Some(upstream) = source_addr {
                             network_bridge
                                 .send(
-                                    upstream,
+                                    upstream.socket_addr(),
                                     NetMessage::V1(NetMessageV1::Connect(response_msg)),
                                 )
                                 .await?;
@@ -1051,7 +1054,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                ObservedAddr::new(upstream.addr()),
+                                upstream.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -1418,7 +1421,7 @@ mod tests {
                 joiner: make_joiner(&joiner),
                 ttl: 3,
                 visited: vec![],
-                observed_addr: Some(ObservedAddr::new(joiner.addr())),
+                observed_addr: Some(joiner.addr()),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1453,7 +1456,7 @@ mod tests {
                 joiner: make_joiner(&joiner),
                 ttl: 2,
                 visited: vec![],
-                observed_addr: Some(ObservedAddr::new(joiner.addr())),
+                observed_addr: Some(joiner.addr()),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1483,10 +1486,10 @@ mod tests {
     fn relay_emits_observed_address_for_private_joiner() {
         let self_loc = make_peer(4050);
         let joiner = make_peer(5050);
-        let observed_addr = ObservedAddr::new(SocketAddr::new(
+        let observed_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
             joiner.addr().port(),
-        ));
+        );
         let mut state = RelayState {
             upstream: joiner.clone(),
             request: ConnectRequest {
@@ -1512,14 +1515,14 @@ mod tests {
             .observed_address
             .expect("expected observed address update");
         assert_eq!(addr, observed_addr);
-        assert_eq!(target.addr(), observed_addr.socket_addr());
+        assert_eq!(target.addr(), observed_addr);
         // After handling, the joiner should be upgraded to Known with the observed address
         let joiner_peer = state
             .request
             .joiner
             .peer_id()
             .expect("joiner should be Known after observed_addr");
-        assert_eq!(joiner_peer.addr, observed_addr.socket_addr());
+        assert_eq!(joiner_peer.addr, observed_addr);
     }
 
     #[test]
@@ -1590,7 +1593,7 @@ mod tests {
             joiner: make_joiner(&joiner),
             ttl: 3,
             visited: vec![joiner.clone()],
-            observed_addr: Some(ObservedAddr::new(joiner.addr())),
+            observed_addr: Some(joiner.addr()),
         };
 
         let tx = Transaction::new::<ConnectMsg>();
@@ -1671,7 +1674,7 @@ mod tests {
                 joiner: make_joiner(&joiner),
                 ttl: 3,
                 visited: vec![],
-                observed_addr: Some(ObservedAddr::new(observed_public_addr)),
+                observed_addr: Some(observed_public_addr),
             },
             forwarded_to: None,
             observed_sent: false,

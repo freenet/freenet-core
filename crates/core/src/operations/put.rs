@@ -571,10 +571,7 @@ impl Operation for PutOp {
                         );
 
                         conn_manager
-                            .send(
-                                crate::transport::ObservedAddr::new(upstream.addr()),
-                                NetMessage::from(ack),
-                            )
+                            .send(upstream.addr(), NetMessage::from(ack))
                             .await?;
                         new_state = None;
                     }
@@ -591,8 +588,7 @@ impl Operation for PutOp {
                             contract: contract.clone(),
                             target: peer.clone(),
                         };
-                        let f = conn_manager
-                            .send(crate::transport::ObservedAddr::new(peer.addr()), msg.into());
+                        let f = conn_manager.send(peer.addr(), msg.into());
                         broadcasting.push(f);
                     }
 
@@ -620,9 +616,7 @@ impl Operation for PutOp {
                             err
                         );
                         // todo: review this, maybe we should just dropping this subscription
-                        conn_manager
-                            .drop_connection(crate::transport::ObservedAddr::new(peer.addr()))
-                            .await?;
+                        conn_manager.drop_connection(peer.addr()).await?;
                         incorrect_results += 1;
                     }
 
@@ -871,7 +865,7 @@ impl Operation for PutOp {
                             for subscriber in old_subscribers {
                                 conn_manager
                                     .send(
-                                        crate::transport::ObservedAddr::new(subscriber.addr()),
+                                        subscriber.addr(),
                                         NetMessage::V1(NetMessageV1::Unsubscribed {
                                             transaction: Transaction::new::<PutMsg>(),
                                             key: dropped_key,
@@ -1516,7 +1510,7 @@ where
 
         let _ = conn_manager
             .send(
-                crate::transport::ObservedAddr::new(peer.addr()),
+                peer.addr(),
                 (PutMsg::PutForward {
                     id,
                     sender: own_pkloc,

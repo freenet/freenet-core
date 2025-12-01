@@ -586,8 +586,7 @@ impl Operation for UpdateOp {
                             sender: sender.clone(),
                             target: peer.clone(),
                         };
-                        let f = conn_manager
-                            .send(crate::transport::ObservedAddr::new(peer.addr()), msg.into());
+                        let f = conn_manager.send(peer.addr(), msg.into());
                         broadcasting.push(f);
                     }
                     let error_futures = futures::future::join_all(broadcasting)
@@ -612,9 +611,7 @@ impl Operation for UpdateOp {
                             err
                         );
                         // TODO: review this, maybe we should just dropping this subscription
-                        conn_manager
-                            .drop_connection(crate::transport::ObservedAddr::new(peer.addr()))
-                            .await?;
+                        conn_manager.drop_connection(peer.addr()).await?;
                         incorrect_results += 1;
                     }
 

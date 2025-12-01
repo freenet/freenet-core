@@ -2,6 +2,7 @@
 use std::{
     collections::HashMap,
     io::Cursor,
+    net::SocketAddr,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
@@ -16,7 +17,6 @@ use crate::{
     message::NetMessage,
     node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager, PeerId},
     tracing::NetEventLog,
-    transport::ObservedAddr,
 };
 
 #[derive(Clone)]
@@ -61,22 +61,19 @@ impl MemoryConnManager {
 }
 
 impl NetworkBridge for MemoryConnManager {
-    async fn send(&self, target_addr: ObservedAddr, msg: NetMessage) -> super::ConnResult<()> {
+    async fn send(&self, target_addr: SocketAddr, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
             .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
         // Create a temporary PeerId for tracking (in-memory transport uses PeerId internally)
-        let target_peer = PeerId::new(
-            target_addr.socket_addr(),
-            self.transport.interface_peer.pub_key.clone(),
-        );
+        let target_peer = PeerId::new(target_addr, self.transport.interface_peer.pub_key.clone());
         self.op_manager.sending_transaction(&target_peer, &msg);
         let msg = bincode::serialize(&msg)?;
         self.transport.send(target_peer, msg);
         Ok(())
     }
 
-    async fn drop_connection(&mut self, _peer_addr: ObservedAddr) -> super::ConnResult<()> {
+    async fn drop_connection(&mut self, _peer_addr: SocketAddr) -> super::ConnResult<()> {
         Ok(())
     }
 }

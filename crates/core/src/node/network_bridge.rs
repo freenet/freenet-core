@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::message::{NetMessage, NodeEvent};
-use crate::transport::ObservedAddr;
 
 mod handshake;
 pub(crate) mod in_memory;
@@ -33,12 +32,12 @@ pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 pub(crate) trait NetworkBridge: Send + Sync {
     fn drop_connection(
         &mut self,
-        peer_addr: ObservedAddr,
+        peer_addr: SocketAddr,
     ) -> impl Future<Output = ConnResult<()>> + Send;
 
     fn send(
         &self,
-        target_addr: ObservedAddr,
+        target_addr: SocketAddr,
         msg: NetMessage,
     ) -> impl Future<Output = ConnResult<()>> + Send;
 }
