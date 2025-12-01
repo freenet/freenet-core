@@ -8,7 +8,7 @@ use std::{
 };
 
 use clap::ValueEnum;
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, WebApi},
     prelude::*,
@@ -815,25 +815,40 @@ mod test {
 
 // Port reservation utilities for integration tests
 static RESERVED_PORTS: Lazy<DashSet<u16>> = Lazy::new(DashSet::new);
+/// Holds sockets to keep ports reserved until explicitly released.
+/// The tuple stores (UdpSocket, TcpListener) for each port.
+static RESERVED_SOCKETS: Lazy<DashMap<u16, (std::net::UdpSocket, std::net::TcpListener)>> =
+    Lazy::new(DashMap::new);
 
 /// Reserve a unique localhost TCP port for tests.
 ///
-/// Ports are allocated by binding to an ephemeral listener to ensure the port
-/// is currently free, then tracked in a global set so concurrent tests do not
-/// reuse the same value. Ports remain reserved until released via
-/// [`release_local_port`].
+/// Ports are allocated by binding to both UDP and TCP on an ephemeral port to
+/// ensure the port is currently free for both protocols, then tracked in a
+/// global set so concurrent tests do not reuse the same value. Ports remain
+/// reserved until released via [`release_local_port`].
+///
+/// The sockets are kept alive in a global map to prevent the OS from
+/// reassigning the port before the test node binds to it.
 pub fn reserve_local_port() -> anyhow::Result<u16> {
     const MAX_ATTEMPTS: usize = 128;
     for _ in 0..MAX_ATTEMPTS {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| anyhow::anyhow!("failed to bind ephemeral port: {e}"))?;
-        let port = listener
+        // Bind UDP first since that's what Freenet nodes primarily use
+        let udp_socket = std::net::UdpSocket::bind(("127.0.0.1", 0))
+            .map_err(|e| anyhow::anyhow!("failed to bind ephemeral UDP port: {e}"))?;
+        let port = udp_socket
             .local_addr()
             .map_err(|e| anyhow::anyhow!("failed to read ephemeral port address: {e}"))?
             .port();
-        drop(listener);
+
+        // Also bind TCP on the same port for WebSocket listeners
+        let tcp_listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => l,
+            Err(_) => continue, // Port available for UDP but not TCP, try another
+        };
 
         if RESERVED_PORTS.insert(port) {
+            // Keep sockets alive to prevent OS from reassigning the port
+            RESERVED_SOCKETS.insert(port, (udp_socket, tcp_listener));
             return Ok(port);
         }
     }
@@ -844,8 +859,12 @@ pub fn reserve_local_port() -> anyhow::Result<u16> {
 }
 
 /// Release a previously reserved port so future tests may reuse it.
+///
+/// This drops the held sockets, allowing the OS to reclaim the port.
 pub fn release_local_port(port: u16) {
     RESERVED_PORTS.remove(&port);
+    // Dropping the sockets releases the port back to the OS
+    RESERVED_SOCKETS.remove(&port);
 }
 
 // Test context for integration tests
