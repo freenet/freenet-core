@@ -322,8 +322,6 @@ pub(crate) enum OpError {
     OpNotPresent(Transaction),
     #[error("max number of retries for tx {0} of op type `{1}` reached")]
     MaxRetriesExceeded(Transaction, TransactionType),
-    #[error("operation timed out waiting for progress")]
-    Timeout,
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
 
