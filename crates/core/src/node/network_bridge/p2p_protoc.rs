@@ -76,19 +76,19 @@ impl P2pBridge {
 }
 
 impl NetworkBridge for P2pBridge {
-    async fn drop_connection(&mut self, peer_addr: SocketAddr) -> super::ConnResult<()> {
+    async fn drop_connection(&mut self, peer_addr: ObservedAddr) -> super::ConnResult<()> {
         // Find the peer by address and remove it
         let peer = self
             .accepted_peers
             .iter()
-            .find(|p| p.addr == peer_addr)
+            .find(|p| p.addr == peer_addr.socket_addr())
             .map(|p| p.clone());
         if let Some(peer) = peer {
             self.accepted_peers.remove(&peer);
             self.ev_listener_tx
-                .send(Right(NodeEvent::DropConnection(peer_addr)))
+                .send(Right(NodeEvent::DropConnection(peer_addr.socket_addr())))
                 .await
-                .map_err(|_| ConnectionError::SendNotCompleted(peer_addr))?;
+                .map_err(|_| ConnectionError::SendNotCompleted(peer_addr.socket_addr()))?;
             self.log_register
                 .register_events(Either::Left(NetEventLog::disconnected(
                     &self.op_manager.ring,
@@ -99,7 +99,7 @@ impl NetworkBridge for P2pBridge {
         Ok(())
     }
 
-    async fn send(&self, target_addr: SocketAddr, msg: NetMessage) -> super::ConnResult<()> {
+    async fn send(&self, target_addr: ObservedAddr, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
             .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
@@ -107,14 +107,14 @@ impl NetworkBridge for P2pBridge {
         let target = self
             .accepted_peers
             .iter()
-            .find(|p| p.addr == target_addr)
+            .find(|p| p.addr == target_addr.socket_addr())
             .map(|p| p.clone());
         if let Some(ref target) = target {
             self.op_manager.sending_transaction(target, &msg);
             self.ev_listener_tx
                 .send(Left((target.clone(), Box::new(msg))))
                 .await
-                .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
+                .map_err(|_| ConnectionError::SendNotCompleted(target_addr.socket_addr()))?;
         } else {
             // No known peer at this address - create a temporary PeerId for the event
             // This should rarely happen in practice
@@ -123,13 +123,13 @@ impl NetworkBridge for P2pBridge {
                 "Sending to unknown peer address - creating temporary PeerId"
             );
             let temp_peer = PeerId::new(
-                target_addr,
+                target_addr.socket_addr(),
                 (*self.op_manager.ring.connection_manager.pub_key).clone(),
             );
             self.ev_listener_tx
                 .send(Left((temp_peer, Box::new(msg))))
                 .await
-                .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
+                .map_err(|_| ConnectionError::SendNotCompleted(target_addr.socket_addr()))?;
         }
         Ok(())
     }
@@ -381,7 +381,7 @@ impl P2pConnManager {
                             ) = (remote, &mut msg)
                             {
                                 if payload.observed_addr.is_none() {
-                                    payload.observed_addr = Some(remote_addr);
+                                    payload.observed_addr = Some(ObservedAddr::new(remote_addr));
                                 }
                             }
                             // Pass the source address through to operations for routing.

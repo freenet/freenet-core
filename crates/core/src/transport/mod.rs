@@ -40,7 +40,9 @@ pub(crate) use self::{
 ///
 /// Using a newtype instead of raw `SocketAddr` makes the address semantics explicit
 /// and prevents accidental confusion with advertised/claimed addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ObservedAddr(SocketAddr);
 
 impl ObservedAddr {
