@@ -174,15 +174,31 @@ impl PeerKeyLocation {
 
     #[cfg(test)]
     pub fn random() -> Self {
-        use crate::transport::TransportKeypair;
+        use crate::transport::{TransportKeypair, TransportPublicKey};
         use rand::Rng;
+        use std::cell::RefCell;
+
+        // Cache the keypair per thread to avoid expensive key generation in tests
+        thread_local! {
+            static CACHED_KEY: RefCell<Option<TransportPublicKey>> = const { RefCell::new(None) };
+        }
 
         let mut addr_bytes = [0u8; 4];
         rand::rng().fill(&mut addr_bytes[..]);
         let port = crate::util::get_free_port().unwrap();
         let addr = SocketAddr::from((addr_bytes, port));
 
-        let pub_key = TransportKeypair::new().public().clone();
+        let pub_key = CACHED_KEY.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            match &*cached {
+                Some(k) => k.clone(),
+                None => {
+                    let key = TransportKeypair::new().public().clone();
+                    cached.replace(key.clone());
+                    key
+                }
+            }
+        });
 
         PeerKeyLocation {
             pub_key,
