@@ -1005,7 +1005,7 @@ pub(crate) async fn request_update(
             .closest_potentially_caching(&key, [sender.peer().clone()].as_slice());
 
         if let Some(target) = remote_target {
-            // Subscribe to the contract (local subscription, no upstream NAT addr)
+            // Subscribe on behalf of the requesting peer (no upstream_addr - direct registration)
             op_manager
                 .ring
                 .add_subscriber(&key, sender.clone(), None)
