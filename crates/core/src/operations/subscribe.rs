@@ -418,22 +418,24 @@ impl Operation for SubscribeOp {
                     // (e.g., 127.0.0.1:31337 for loopback). The transport address is the only
                     // reliable way to route responses back through the NAT.
                     let mut subscriber = subscriber.clone();
+
+                    tracing::debug!(
+                        tx = %id,
+                        %key,
+                        subscriber_orig = %subscriber.peer(),
+                        source_addr = ?source_addr,
+                        "subscribe: processing RequestSub"
+                    );
+
                     if let Some(addr) = source_addr {
                         subscriber.set_addr(addr);
                         tracing::debug!(
                             tx = %id,
                             %key,
-                            subscriber_addr = %addr,
-                            "subscribe: using transport source_addr for subscriber"
+                            subscriber_updated = %subscriber.peer(),
+                            "subscribe: updated subscriber address from transport source"
                         );
                     }
-
-                    tracing::debug!(
-                        tx = %id,
-                        %key,
-                        subscriber = %subscriber.peer(),
-                        "subscribe: processing RequestSub"
-                    );
                     let own_loc = op_manager.ring.connection_manager.own_location();
 
                     if !matches!(
