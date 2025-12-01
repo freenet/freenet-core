@@ -410,25 +410,28 @@ impl Operation for SubscribeOp {
                     // Fill in subscriber's external address from transport layer if unknown.
                     // This is the key step where the first recipient (gateway) determines the
                     // subscriber's external address from the actual packet source address.
+                    // IMPORTANT: Must fill address BEFORE any .peer() calls to avoid panic.
                     let mut subscriber = subscriber.clone();
+
+                    if subscriber.peer_addr.is_unknown() {
+                        if let Some(addr) = source_addr {
+                            subscriber.set_addr(addr);
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                subscriber_addr = %addr,
+                                "subscribe: filled subscriber address from source_addr"
+                            );
+                        }
+                    }
 
                     tracing::debug!(
                         tx = %id,
                         %key,
-                        subscriber_orig = %subscriber.peer(),
+                        subscriber = %subscriber.peer(),
                         source_addr = ?source_addr,
                         "subscribe: processing RequestSub"
                     );
-
-                    if let Some(addr) = source_addr {
-                        subscriber.set_addr(addr);
-                        tracing::debug!(
-                            tx = %id,
-                            %key,
-                            subscriber_updated = %subscriber.peer(),
-                            "subscribe: updated subscriber address from transport source"
-                        );
-                    }
                     let own_loc = op_manager.ring.connection_manager.own_location();
 
                     if !matches!(
