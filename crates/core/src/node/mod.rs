@@ -1141,6 +1141,18 @@ async fn handle_pure_network_result(
         Ok(None) => {
             tracing::debug!("Network operation returned no result");
         }
+        Err(OpError::StatePushed) => {
+            // StatePushed is NOT an error - it's a control flow signal indicating
+            // the operation continues asynchronously via notify_op_change.
+            // The operation state has been pushed to the op stack and a message
+            // has been queued for local processing.
+            tracing::debug!(
+                "Network operation continuing asynchronously (StatePushed) for transaction: {:?}",
+                tx
+            );
+            // Return Ok(None) since the operation will continue processing
+            return Ok(None);
+        }
         Err(e) => {
             tracing::error!("Network operation failed: {}", e);
             // TODO: Register error event properly

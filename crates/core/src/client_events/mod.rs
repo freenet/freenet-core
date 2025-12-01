@@ -781,24 +781,38 @@ async fn process_open_request(
                                     "Request-Transaction correlation"
                                 );
 
-                                if let Err(err) = update::request_update(&op_manager, op).await {
-                                    tracing::error!("request update error {}", err);
-
-                                    // Notify client of error via result router
-                                    let error_response = Err(ErrorKind::OperationError {
-                                        cause: format!("UPDATE operation failed: {}", err).into(),
+                                match update::request_update(&op_manager, op).await {
+                                    Ok(()) => {
+                                        // UPDATE completed synchronously
                                     }
-                                    .into());
-
-                                    if let Err(e) = op_manager
-                                        .result_router_tx
-                                        .send((transaction_id, error_response))
-                                        .await
-                                    {
-                                        tracing::error!(
-                                            "Failed to send UPDATE error to result router: {}. Transaction: {}",
-                                            e, transaction_id
+                                    Err(OpError::StatePushed) => {
+                                        // StatePushed is a control flow signal, not an error
+                                        // The operation continues asynchronously via notify_op_change
+                                        tracing::debug!(
+                                            transaction_id = %transaction_id,
+                                            "UPDATE operation continuing asynchronously (StatePushed)"
                                         );
+                                    }
+                                    Err(err) => {
+                                        tracing::error!("request update error {}", err);
+
+                                        // Notify client of error via result router
+                                        let error_response = Err(ErrorKind::OperationError {
+                                            cause: format!("UPDATE operation failed: {}", err)
+                                                .into(),
+                                        }
+                                        .into());
+
+                                        if let Err(e) = op_manager
+                                            .result_router_tx
+                                            .send((transaction_id, error_response))
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send UPDATE error to result router: {}. Transaction: {}",
+                                                e, transaction_id
+                                            );
+                                        }
                                     }
                                 }
                             } else {
