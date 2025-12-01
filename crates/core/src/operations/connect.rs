@@ -832,10 +832,7 @@ impl Operation for ConnectOp {
                         // not have a direct connection to the target
                         if let Some(upstream) = &source_addr {
                             network_bridge
-                                .send(
-                                    upstream.socket_addr(),
-                                    NetMessage::V1(NetMessageV1::Connect(msg)),
-                                )
+                                .send(*upstream, NetMessage::V1(NetMessageV1::Connect(msg)))
                                 .await?;
                         }
                     }
@@ -882,7 +879,7 @@ impl Operation for ConnectOp {
                         if let Some(upstream) = &source_addr {
                             network_bridge
                                 .send(
-                                    upstream.socket_addr(),
+                                    *upstream,
                                     NetMessage::V1(NetMessageV1::Connect(response_msg)),
                                 )
                                 .await?;
