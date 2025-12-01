@@ -320,8 +320,8 @@ impl RelayState {
             // Use the joiner with updated observed address for response routing
             actions.response_target = Some(self.request.joiner.clone());
             tracing::info!(
-                acceptor_peer = %acceptor.peer(),
-                joiner_peer = %self.request.joiner.peer(),
+                acceptor_pub_key = %acceptor.pub_key(),
+                joiner_pub_key = %self.request.joiner.pub_key(),
                 acceptor_loc = ?acceptor.location,
                 joiner_loc = ?self.request.joiner.location,
                 ring_distance = ?dist,
@@ -690,7 +690,7 @@ impl ConnectOp {
         match self.state.as_mut() {
             Some(ConnectState::WaitingForResponses(state)) => {
                 tracing::info!(
-                    acceptor = %response.acceptor.peer(),
+                    acceptor_pub_key = %response.acceptor.pub_key(),
                     acceptor_loc = ?response.acceptor.location,
                     "connect: joiner received ConnectResponse"
                 );
@@ -970,14 +970,14 @@ impl Operation for ConnectOp {
                                 let mut updated_payload = payload.clone();
                                 updated_payload.acceptor.peer_addr = PeerAddr::Known(acceptor_addr);
                                 tracing::debug!(
-                                    acceptor = %updated_payload.acceptor.peer(),
+                                    acceptor_pub_key = %updated_payload.acceptor.pub_key(),
                                     acceptor_addr = %acceptor_addr,
                                     "connect: filled acceptor address from source_addr"
                                 );
                                 updated_payload
                             } else {
                                 tracing::warn!(
-                                    acceptor = %payload.acceptor.peer(),
+                                    acceptor_pub_key = %payload.acceptor.pub_key(),
                                     "connect: response received without source_addr, cannot fill acceptor address"
                                 );
                                 payload.clone()
@@ -988,7 +988,7 @@ impl Operation for ConnectOp {
 
                         tracing::debug!(
                             upstream_addr = %upstream_addr,
-                            acceptor = %forward_payload.acceptor.peer(),
+                            acceptor_pub_key = %forward_payload.acceptor.pub_key(),
                             "connect: forwarding response towards joiner"
                         );
                         // Forward response toward the joiner via upstream
