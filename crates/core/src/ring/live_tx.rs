@@ -1,23 +1,28 @@
-use crate::{message::Transaction, node::PeerId};
+use crate::message::Transaction;
 use dashmap::DashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Tracks live transactions per peer address.
+///
+/// Uses `SocketAddr` as the key since transactions are tied to network connections,
+/// not cryptographic identities.
 #[derive(Clone)]
 pub struct LiveTransactionTracker {
-    tx_per_peer: Arc<DashMap<PeerId, Vec<Transaction>>>,
+    tx_per_peer: Arc<DashMap<SocketAddr, Vec<Transaction>>>,
 }
 
 impl LiveTransactionTracker {
-    pub fn add_transaction(&self, peer: PeerId, tx: Transaction) {
-        self.tx_per_peer.entry(peer).or_default().push(tx);
+    pub fn add_transaction(&self, peer_addr: SocketAddr, tx: Transaction) {
+        self.tx_per_peer.entry(peer_addr).or_default().push(tx);
     }
 
     pub fn remove_finished_transaction(&self, tx: Transaction) {
-        let keys_to_remove: Vec<PeerId> = self
+        let keys_to_remove: Vec<SocketAddr> = self
             .tx_per_peer
             .iter()
             .filter(|entry| entry.value().iter().any(|otx| otx == &tx))
-            .map(|entry| entry.key().clone())
+            .map(|entry| *entry.key())
             .collect();
 
         for k in keys_to_remove {
@@ -34,12 +39,12 @@ impl LiveTransactionTracker {
         }
     }
 
-    pub(crate) fn prune_transactions_from_peer(&self, peer: &PeerId) {
-        self.tx_per_peer.remove(peer);
+    pub(crate) fn prune_transactions_from_peer(&self, peer_addr: SocketAddr) {
+        self.tx_per_peer.remove(&peer_addr);
     }
 
-    pub(crate) fn has_live_connection(&self, peer: &PeerId) -> bool {
-        self.tx_per_peer.contains_key(peer)
+    pub(crate) fn has_live_connection(&self, peer_addr: SocketAddr) -> bool {
+        self.tx_per_peer.contains_key(&peer_addr)
     }
 
     pub(crate) fn still_alive(&self, tx: &Transaction) -> bool {

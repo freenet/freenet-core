@@ -196,7 +196,11 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
         if is_gw {
             // Gateway node configuration
             let location_expr = node_location(args, idx, node_label);
+            let network_port_var = format_ident!("network_port_{}", idx);
+            let ws_port_var_local = format_ident!("ws_port_{}", idx);
             setup_code.push(quote! {
+                let #network_port_var = freenet::test_utils::reserve_local_port()?;
+                let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
                     let key = freenet::dev_tool::TransportKeypair::new();
@@ -204,8 +208,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_port = freenet::test_utils::reserve_local_port()?;
-                    let ws_port = freenet::test_utils::reserve_local_port()?;
+                    let network_port = #network_port_var;
+                    let ws_port = #ws_port_var_local;
 
                     let location: f64 = #location_expr;
 
@@ -311,7 +315,11 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
             };
 
             // Peer node configuration
+            let network_port_var = format_ident!("network_port_{}", idx);
+            let ws_port_var_local = format_ident!("ws_port_{}", idx);
             setup_code.push(quote! {
+                let #network_port_var = freenet::test_utils::reserve_local_port()?;
+                let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
                     let key = freenet::dev_tool::TransportKeypair::new();
@@ -319,8 +327,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_port = freenet::test_utils::reserve_local_port()?;
-                    let ws_port = freenet::test_utils::reserve_local_port()?;
+                    let network_port = #network_port_var;
+                    let ws_port = #ws_port_var_local;
 
                     let location: f64 = #location_expr;
 
@@ -397,9 +405,14 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
         let node_var = format_ident!("node_{}", idx);
         let flush_handle_var = format_ident!("flush_handle_{}", idx);
         let config_var = format_ident!("config_{}", idx);
+        let network_port_var = format_ident!("network_port_{}", idx);
+        let ws_port_var = format_ident!("ws_port_{}", idx);
 
         builds.push(quote! {
             tracing::info!("Building node: {}", #node_label);
+            // Release reserved ports just before binding to minimize race window
+            freenet::test_utils::release_local_port(#network_port_var);
+            freenet::test_utils::release_local_port(#ws_port_var);
             let built_config = #config_var.build().await?;
             let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
             #connection_tuning
@@ -444,18 +457,17 @@ fn generate_node_tasks(args: &FreenetTestArgs) -> TokenStream {
 }
 
 /// Extract values from configs before they're moved
+/// Note: ws_port and network_port are already defined at top level by generate_config_setup,
+/// so we only need to extract location here.
 fn generate_value_extraction(args: &FreenetTestArgs) -> TokenStream {
     let mut value_extractions = Vec::new();
 
     for (idx, _node_label) in args.nodes.iter().enumerate() {
         let config_var = format_ident!("config_{}", idx);
-        let ws_port_var = format_ident!("ws_port_{}", idx);
-        let network_port_var = format_ident!("network_port_{}", idx);
         let location_var = format_ident!("location_{}", idx);
 
         value_extractions.push(quote! {
-            let #ws_port_var = #config_var.ws_api.ws_api_port.unwrap();
-            let #network_port_var = #config_var.network_api.public_port;
+            // ws_port_X and network_port_X already exist from reserve_local_port calls
             let #location_var = #config_var.network_api.location.unwrap();
         });
     }
@@ -483,7 +495,7 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
                 label: #node_label.to_string(),
                 temp_dir_path: #temp_var.path().to_path_buf(),
                 ws_port: #ws_port_var,
-                network_port: #network_port_var,
+                network_port: Some(#network_port_var),
                 is_gateway: #is_gw,
                 location: #location_var,
             }

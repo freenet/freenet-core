@@ -22,7 +22,7 @@ use crate::node::{IsOperationCompleted, NetworkBridge, OpManager, PeerId};
 use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::ring::PeerKeyLocation;
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
-use crate::transport::TransportKeypair;
+use crate::transport::{ObservedAddr, TransportKeypair, TransportPublicKey};
 use crate::util::{Backoff, Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
 
@@ -113,9 +113,10 @@ impl fmt::Display for ConnectMsg {
 }
 
 impl ConnectMsg {
-    pub fn sender(&self) -> Option<&PeerId> {
+    #[allow(dead_code)]
+    pub fn sender(&self) -> Option<PeerId> {
         match self {
-            ConnectMsg::Response { sender, .. } => Some(&sender.peer),
+            ConnectMsg::Response { sender, .. } => Some(sender.peer()),
             _ => None,
         }
     }
@@ -126,8 +127,9 @@ impl ConnectMsg {
 pub(crate) struct ConnectRequest {
     /// Joiner's advertised location (fallbacks to the joiner's socket address).
     pub desired_location: Location,
-    /// Joiner's identity as observed so far.
-    pub joiner: PeerKeyLocation,
+    /// Joiner's identity. NAT peers start as Unknown (just public key) until
+    /// a gateway observes their address and upgrades them to Known.
+    pub joiner: Joiner,
     /// Remaining hops before the request stops travelling.
     pub ttl: u8,
     /// Simple visited set to avoid trivial loops.
@@ -141,6 +143,90 @@ pub(crate) struct ConnectRequest {
 pub(crate) struct ConnectResponse {
     /// The peer that accepted the join request.
     pub acceptor: PeerKeyLocation,
+}
+
+/// Represents a peer joining the network.
+///
+/// NAT peers don't know their public address until a gateway observes it,
+/// so we distinguish between:
+/// - `Unknown`: Only have the public key (NAT peer before address discovery)
+/// - `Known`: Have full PeerId with known address (gateway or after ObservedAddress)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum Joiner {
+    /// Peer that doesn't yet know its public address (NAT peer before discovery).
+    Unknown(TransportPublicKey),
+    /// Peer with a known address (gateway, or NAT peer after ObservedAddress).
+    Known(PeerId),
+}
+
+impl Joiner {
+    /// Returns the public key of the joiner.
+    #[allow(dead_code)]
+    pub fn pub_key(&self) -> &TransportPublicKey {
+        match self {
+            Joiner::Unknown(key) => key,
+            Joiner::Known(peer_id) => &peer_id.pub_key,
+        }
+    }
+
+    /// Returns the PeerId if known, None if address is unknown.
+    pub fn peer_id(&self) -> Option<&PeerId> {
+        match self {
+            Joiner::Unknown(_) => None,
+            Joiner::Known(peer_id) => Some(peer_id),
+        }
+    }
+
+    /// Returns true if this joiner has a known address.
+    #[allow(dead_code)]
+    pub fn has_known_address(&self) -> bool {
+        matches!(self, Joiner::Known(_))
+    }
+
+    /// Upgrades an Unknown joiner to Known once we observe their address.
+    pub fn with_observed_address(&self, addr: SocketAddr) -> Self {
+        match self {
+            Joiner::Unknown(key) => Joiner::Known(PeerId::new(addr, key.clone())),
+            Joiner::Known(peer_id) => {
+                // Avoid allocation if address hasn't changed
+                if peer_id.addr == addr {
+                    self.clone()
+                } else {
+                    Joiner::Known(PeerId::new(addr, peer_id.pub_key.clone()))
+                }
+            }
+        }
+    }
+
+    /// Converts to a PeerKeyLocation if we have a known address.
+    /// Returns None if address is unknown.
+    pub fn to_peer_key_location(&self) -> Option<PeerKeyLocation> {
+        match self {
+            Joiner::Unknown(_) => None,
+            Joiner::Known(peer_id) => Some(PeerKeyLocation::with_location(
+                peer_id.pub_key.clone(),
+                peer_id.addr,
+                Location::from_address(&peer_id.addr),
+            )),
+        }
+    }
+
+    /// Returns the location if we have a known address.
+    pub fn location(&self) -> Option<Location> {
+        match self {
+            Joiner::Unknown(_) => None,
+            Joiner::Known(peer_id) => Some(Location::from_address(&peer_id.addr)),
+        }
+    }
+}
+
+impl fmt::Display for Joiner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Joiner::Unknown(key) => write!(f, "Unknown({})", key),
+            Joiner::Known(peer_id) => write!(f, "Known({})", peer_id),
+        }
+    }
 }
 
 /// New minimal state machine the joiner tracks.
@@ -178,7 +264,8 @@ pub(crate) trait RelayContext {
     fn self_location(&self) -> &PeerKeyLocation;
 
     /// Determine whether we should accept the joiner immediately.
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool;
+    /// Takes a Joiner which may or may not have a known address yet.
+    fn should_accept(&self, joiner: &Joiner) -> bool;
 
     /// Choose the next hop for the request, avoiding peers already visited.
     fn select_next_hop(
@@ -219,10 +306,11 @@ impl ConnectForwardEstimator {
         // learns, per-node, how often downstream peers accept/complete forwarded Connect
         // requests so we can bias forwarding toward peers likely to have capacity.
         let key = TransportKeypair::new();
-        let dummy_peer = PeerKeyLocation {
-            peer: PeerId::new("127.0.0.1:0".parse().unwrap(), key.public().clone()),
-            location: Some(Location::new(0.0)),
-        };
+        let dummy_peer = PeerKeyLocation::with_location(
+            key.public().clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            Location::new(0.0),
+        );
         let seed_events = [
             IsotonicEvent {
                 peer: dummy_peer.clone(),
@@ -277,37 +365,45 @@ impl RelayState {
         push_unique_peer(&mut self.request.visited, ctx.self_location().clone());
 
         if let Some(joiner_addr) = self.request.observed_addr {
-            // Always overwrite with observed socket rather than checking routability. If the
-            // observed socket is loopback, this guard is skipped only in local/unit tests where
-            // peers share 127.0.0.1, so keep a one-shot overwrite and avoid early returns.
+            // Upgrade the joiner to Known with the observed address.
+            // This is critical for NAT peers who start as Unknown.
             if !self.observed_sent {
-                self.request.joiner.peer.addr = joiner_addr;
-                if self.request.joiner.location.is_none() {
-                    self.request.joiner.location = Some(Location::from_address(&joiner_addr));
-                }
+                self.request.joiner = self.request.joiner.with_observed_address(joiner_addr);
                 self.observed_sent = true;
-                actions.observed_address = Some((self.request.joiner.clone(), joiner_addr));
+                // Now that we have a known address, we can create a PeerKeyLocation
+                if let Some(joiner_pkl) = self.request.joiner.to_peer_key_location() {
+                    actions.observed_address = Some((joiner_pkl, joiner_addr));
+                }
             }
         }
 
         if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
             self.accepted_locally = true;
             let acceptor = ctx.self_location().clone();
-            let dist = ring_distance(acceptor.location, self.request.joiner.location);
+            let joiner_location = self.request.joiner.location();
+            let dist = ring_distance(acceptor.location, joiner_location);
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
             });
-            actions.expect_connection_from = Some(self.request.joiner.clone());
-            // Use the joiner with updated observed address for response routing
-            actions.response_target = Some(self.request.joiner.clone());
-            tracing::info!(
-                acceptor_peer = %acceptor.peer,
-                joiner_peer = %self.request.joiner.peer,
-                acceptor_loc = ?acceptor.location,
-                joiner_loc = ?self.request.joiner.location,
-                ring_distance = ?dist,
-                "connect: acceptance issued"
-            );
+            // Get PeerKeyLocation for the joiner - should always succeed after observed_addr upgrade
+            if let Some(joiner_pkl) = self.request.joiner.to_peer_key_location() {
+                actions.expect_connection_from = Some(joiner_pkl.clone());
+                // Use the joiner with updated observed address for response routing
+                actions.response_target = Some(joiner_pkl.clone());
+                tracing::info!(
+                    acceptor_pub_key = %acceptor.pub_key(),
+                    joiner_pub_key = %joiner_pkl.pub_key(),
+                    acceptor_loc = ?acceptor.location,
+                    joiner_loc = ?joiner_pkl.location,
+                    ring_distance = ?dist,
+                    "connect: acceptance issued"
+                );
+            } else {
+                tracing::warn!(
+                    joiner = %self.request.joiner,
+                    "connect: cannot accept joiner without known address"
+                );
+            }
         }
 
         if self.forwarded_to.is_none() && self.request.ttl > 0 {
@@ -322,7 +418,7 @@ impl RelayState {
                     tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
-                        next_peer = %next.peer,
+                        next_peer = %next.peer(),
                         next_loc = ?next.location,
                         ring_distance_to_target = ?dist,
                         "connect: forwarding join request to next hop"
@@ -334,7 +430,7 @@ impl RelayState {
                     self.forwarded_to = Some(next.clone());
                     self.request = forward_req;
                     forward_attempts.insert(
-                        next.peer.clone(),
+                        next.peer().clone(),
                         ForwardAttempt {
                             peer: next.clone(),
                             desired: self.request.desired_location,
@@ -378,14 +474,18 @@ impl RelayContext for RelayEnv<'_> {
         &self.self_location
     }
 
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool {
+    fn should_accept(&self, joiner: &Joiner) -> bool {
+        // We can only accept joiners with known addresses
+        let Some(peer_id) = joiner.peer_id() else {
+            return false;
+        };
         let location = joiner
-            .location
-            .unwrap_or_else(|| Location::from_address(&joiner.peer.addr));
+            .location()
+            .unwrap_or_else(|| Location::from_address(&peer_id.addr));
         self.op_manager
             .ring
             .connection_manager
-            .should_accept(location, &joiner.peer)
+            .should_accept(location, peer_id)
     }
 
     fn select_next_hop(
@@ -400,7 +500,7 @@ impl RelayContext for RelayEnv<'_> {
         // self wasn't added to visited by upstream callers.
         let skip = SkipListWithSelf {
             visited,
-            self_peer: &self.self_location.peer,
+            self_peer: &self.self_location.peer(),
         };
         let router = self.op_manager.ring.router.read();
         let candidates = self.op_manager.ring.connection_manager.routing_candidates(
@@ -414,7 +514,7 @@ impl RelayContext for RelayEnv<'_> {
         let mut eligible: Vec<PeerKeyLocation> = Vec::new();
 
         for cand in candidates {
-            if let Some(ts) = recency.get(&cand.peer) {
+            if let Some(ts) = recency.get(&cand.peer()) {
                 if now.duration_since(*ts) < RECENCY_COOLDOWN {
                     continue;
                 }
@@ -514,7 +614,7 @@ pub(crate) struct ConnectOp {
 
 impl ConnectOp {
     fn record_forward_outcome(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
-        self.forward_attempts.remove(&peer.peer);
+        self.forward_attempts.remove(&peer.peer());
         self.connect_forward_estimator
             .write()
             .record(peer, desired, success);
@@ -626,12 +726,20 @@ impl ConnectOp {
         ttl: u8,
         target_connections: usize,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
+        is_gateway: bool,
     ) -> (Transaction, Self, ConnectMsg) {
         let mut visited = vec![own.clone()];
         push_unique_peer(&mut visited, target.clone());
+        // Gateways know their address, NAT peers don't until observed
+        let joiner = if is_gateway {
+            Joiner::Known(own.peer())
+        } else {
+            // NAT peer: we only know our public key, not our external address
+            Joiner::Unknown(own.pub_key.clone())
+        };
         let request = ConnectRequest {
             desired_location,
-            joiner: own.clone(),
+            joiner,
             ttl,
             visited,
             observed_addr: None,
@@ -642,7 +750,7 @@ impl ConnectOp {
             tx,
             desired_location,
             target_connections,
-            Some(own.peer.addr),
+            Some(own.addr()),
             Some(target.clone()),
             None,
             connect_forward_estimator,
@@ -666,13 +774,13 @@ impl ConnectOp {
         match self.state.as_mut() {
             Some(ConnectState::WaitingForResponses(state)) => {
                 tracing::info!(
-                    acceptor = %response.acceptor.peer,
+                    acceptor = %response.acceptor.peer(),
                     acceptor_loc = ?response.acceptor.location,
                     "connect: joiner received ConnectResponse"
                 );
                 let result = state.register_acceptance(response, now);
                 if let Some(new_acceptor) = &result.new_acceptor {
-                    self.recency.remove(&new_acceptor.peer.peer);
+                    self.recency.remove(&new_acceptor.peer.peer());
                 }
                 if result.satisfied {
                     self.state = Some(ConnectState::Completed);
@@ -742,12 +850,13 @@ impl Operation for ConnectOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<ObservedAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Connect(op))) => Ok(OpInitialization {
                 op: *op,
-                sender: msg.sender().cloned(),
+                source_addr,
             }),
             Ok(Some(other)) => {
                 op_manager.push(tx, other).await?;
@@ -766,7 +875,7 @@ impl Operation for ConnectOp {
                         return Err(OpError::OpNotPresent(tx));
                     }
                 };
-                Ok(OpInitialization { op, sender: None })
+                Ok(OpInitialization { op, source_addr })
             }
             Err(err) => Err(err.into()),
         }
@@ -777,6 +886,7 @@ impl Operation for ConnectOp {
         network_bridge: &'a mut NB,
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<ObservedAddr>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
     > {
@@ -797,22 +907,29 @@ impl Operation for ConnectOp {
                             target: target.clone(),
                             address,
                         };
-                        network_bridge
-                            .send(&target.peer, NetMessage::V1(NetMessageV1::Connect(msg)))
-                            .await?;
+                        // Route through upstream (where the request came from) since we may
+                        // not have a direct connection to the target
+                        if let Some(upstream) = source_addr {
+                            network_bridge
+                                .send(
+                                    upstream.socket_addr(),
+                                    NetMessage::V1(NetMessageV1::Connect(msg)),
+                                )
+                                .await?;
+                        }
                     }
 
                     if let Some(peer) = actions.expect_connection_from {
                         op_manager
                             .notify_node_event(NodeEvent::ExpectPeerConnection {
-                                peer: peer.peer.clone(),
+                                peer: peer.peer().clone(),
                             })
                             .await?;
                     }
 
                     if let Some((next, request)) = actions.forward {
                         // Record recency for this forward to avoid hammering the same neighbor.
-                        self.recency.insert(next.peer.clone(), Instant::now());
+                        self.recency.insert(next.peer().clone(), Instant::now());
                         let forward_msg = ConnectMsg::Request {
                             id: self.id,
                             from: env.self_location().clone(),
@@ -821,7 +938,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                &next.peer,
+                                next.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -837,10 +954,17 @@ impl Operation for ConnectOp {
                             target: response_target,
                             payload: response,
                         };
-                        return Ok(store_operation_state_with_msg(
-                            &mut self,
-                            Some(response_msg),
-                        ));
+                        // Route the response through upstream (where the request came from)
+                        // since we may not have a direct connection to the joiner
+                        if let Some(upstream) = source_addr {
+                            network_bridge
+                                .send(
+                                    upstream.socket_addr(),
+                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
+                                )
+                                .await?;
+                        }
+                        return Ok(store_operation_state(&mut self));
                     }
 
                     Ok(store_operation_state(&mut self))
@@ -868,7 +992,7 @@ impl Operation for ConnectOp {
                                 op_manager
                                     .notify_node_event(
                                         crate::message::NodeEvent::ExpectPeerConnection {
-                                            peer: new_acceptor.peer.peer.clone(),
+                                            peer: new_acceptor.peer.peer().clone(),
                                         },
                                     )
                                     .await?;
@@ -876,7 +1000,7 @@ impl Operation for ConnectOp {
                                 let (callback, mut rx) = mpsc::channel(1);
                                 op_manager
                                     .notify_node_event(NodeEvent::ConnectPeer {
-                                        peer: new_acceptor.peer.peer.clone(),
+                                        peer: new_acceptor.peer.peer().clone(),
                                         tx: self.id,
                                         callback,
                                         is_gw: false,
@@ -918,8 +1042,8 @@ impl Operation for ConnectOp {
                             self.record_forward_outcome(&fwd, desired, true);
                         }
                         tracing::debug!(
-                            %upstream.peer,
-                            acceptor = %sender.peer,
+                            upstream = %upstream.peer(),
+                            acceptor = %sender.peer(),
                             "connect: forwarding response towards joiner"
                         );
                         let forward_msg = ConnectMsg::Response {
@@ -930,7 +1054,7 @@ impl Operation for ConnectOp {
                         };
                         network_bridge
                             .send(
-                                &upstream.peer,
+                                upstream.addr(),
                                 NetMessage::V1(NetMessageV1::Connect(forward_msg)),
                             )
                             .await?;
@@ -958,18 +1082,18 @@ struct SkipListWithSelf<'a> {
 
 impl Contains<PeerId> for SkipListWithSelf<'_> {
     fn has_element(&self, target: PeerId) -> bool {
-        &target == self.self_peer || self.visited.iter().any(|p| p.peer == target)
+        &target == self.self_peer || self.visited.iter().any(|p| p.peer() == target)
     }
 }
 
 impl Contains<&PeerId> for SkipListWithSelf<'_> {
     fn has_element(&self, target: &PeerId) -> bool {
-        target == self.self_peer || self.visited.iter().any(|p| &p.peer == target)
+        target == self.self_peer || self.visited.iter().any(|p| &p.peer() == target)
     }
 }
 
 fn push_unique_peer(list: &mut Vec<PeerKeyLocation>, peer: PeerKeyLocation) {
-    let already_present = list.iter().any(|p| p.peer == peer.peer);
+    let already_present = list.iter().any(|p| p.peer() == peer.peer());
     if !already_present {
         list.push(peer);
     }
@@ -983,6 +1107,7 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
     let state_clone = op.state.clone();
     OperationResult {
         return_msg: msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m))),
+        target_addr: None,
         state: state_clone.map(|state| {
             OpEnum::Connect(Box::new(ConnectOp {
                 id: op.id,
@@ -1020,7 +1145,7 @@ pub(crate) async fn join_ring_request(
     if !op_manager
         .ring
         .connection_manager
-        .should_accept(location, &gateway.peer)
+        .should_accept(location, &gateway.peer())
     {
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
     }
@@ -1050,6 +1175,7 @@ pub(crate) async fn join_ring_request(
         .min(u8::MAX as usize) as u8;
     let target_connections = op_manager.ring.connection_manager.min_connections;
 
+    let is_gateway = op_manager.ring.connection_manager.is_gateway();
     let (tx, mut op, msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
@@ -1057,6 +1183,7 @@ pub(crate) async fn join_ring_request(
         ttl,
         target_connections,
         op_manager.connect_forward_estimator.clone(),
+        is_gateway,
     );
 
     op.gateway = Some(Box::new(gateway.clone()));
@@ -1064,7 +1191,7 @@ pub(crate) async fn join_ring_request(
         op.backoff = Some(backoff);
     }
 
-    tracing::info!(%gateway.peer, tx = %tx, "Attempting network join using connect");
+    tracing::info!(gateway = %gateway.peer(), tx = %tx, "Attempting network join using connect");
 
     op_manager
         .notify_op_change(
@@ -1225,7 +1352,7 @@ mod tests {
             &self.self_loc
         }
 
-        fn should_accept(&self, _joiner: &PeerKeyLocation) -> bool {
+        fn should_accept(&self, _joiner: &Joiner) -> bool {
             self.accept
         }
 
@@ -1243,20 +1370,19 @@ mod tests {
     fn make_peer(port: u16) -> PeerKeyLocation {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let keypair = TransportKeypair::new();
-        PeerKeyLocation {
-            peer: PeerId::new(addr, keypair.public().clone()),
-            location: Some(Location::random()),
-        }
+        PeerKeyLocation::with_location(keypair.public().clone(), addr, Location::random())
+    }
+
+    /// Helper to create a Joiner::Known from a PeerKeyLocation
+    fn make_joiner(pkl: &PeerKeyLocation) -> Joiner {
+        Joiner::Known(pkl.peer())
     }
 
     #[test]
     fn forward_estimator_handles_missing_location() {
         let mut estimator = ConnectForwardEstimator::new();
         let key = TransportKeypair::new();
-        let peer = PeerKeyLocation {
-            peer: PeerId::new("127.0.0.1:1111".parse().unwrap(), key.public().clone()),
-            location: None,
-        };
+        let peer = PeerKeyLocation::new(key.public().clone(), "127.0.0.1:1111".parse().unwrap());
         estimator.record(&peer, Location::new(0.25), true);
     }
 
@@ -1273,7 +1399,7 @@ mod tests {
         );
         let peer = make_peer(2000);
         op.forward_attempts.insert(
-            peer.peer.clone(),
+            peer.peer().clone(),
             ForwardAttempt {
                 peer: peer.clone(),
                 desired: Location::new(0.2),
@@ -1292,10 +1418,10 @@ mod tests {
             upstream: joiner.clone(),
             request: ConnectRequest {
                 desired_location: Location::random(),
-                joiner: joiner.clone(),
+                joiner: make_joiner(&joiner),
                 ttl: 3,
                 visited: vec![],
-                observed_addr: Some(joiner.peer.addr),
+                observed_addr: Some(joiner.addr()),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1310,8 +1436,11 @@ mod tests {
             state.handle_request(&ctx, &joiner, &recency, &mut forward_attempts, &estimator);
 
         let response = actions.accept_response.expect("expected acceptance");
-        assert_eq!(response.acceptor.peer, self_loc.peer);
-        assert_eq!(actions.expect_connection_from.unwrap().peer, joiner.peer);
+        assert_eq!(response.acceptor.peer(), self_loc.peer());
+        assert_eq!(
+            actions.expect_connection_from.unwrap().peer(),
+            joiner.peer()
+        );
         assert!(actions.forward.is_none());
     }
 
@@ -1324,10 +1453,10 @@ mod tests {
             upstream: joiner.clone(),
             request: ConnectRequest {
                 desired_location: Location::random(),
-                joiner: joiner.clone(),
+                joiner: make_joiner(&joiner),
                 ttl: 2,
                 visited: vec![],
-                observed_addr: Some(joiner.peer.addr),
+                observed_addr: Some(joiner.addr()),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1345,9 +1474,12 @@ mod tests {
 
         assert!(actions.accept_response.is_none());
         let (forward_to, request) = actions.forward.expect("expected forward");
-        assert_eq!(forward_to.peer, next_hop.peer);
+        assert_eq!(forward_to.peer(), next_hop.peer());
         assert_eq!(request.ttl, 1);
-        assert!(request.visited.iter().any(|pkl| pkl.peer == joiner.peer));
+        assert!(request
+            .visited
+            .iter()
+            .any(|pkl| pkl.peer() == joiner.peer()));
     }
 
     #[test]
@@ -1356,13 +1488,13 @@ mod tests {
         let joiner = make_peer(5050);
         let observed_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
-            joiner.peer.addr.port(),
+            joiner.addr().port(),
         );
         let mut state = RelayState {
             upstream: joiner.clone(),
             request: ConnectRequest {
                 desired_location: Location::random(),
-                joiner: joiner.clone(),
+                joiner: make_joiner(&joiner),
                 ttl: 3,
                 visited: vec![],
                 observed_addr: Some(observed_addr),
@@ -1383,8 +1515,14 @@ mod tests {
             .observed_address
             .expect("expected observed address update");
         assert_eq!(addr, observed_addr);
-        assert_eq!(target.peer.addr, observed_addr);
-        assert_eq!(state.request.joiner.peer.addr, observed_addr);
+        assert_eq!(target.addr(), observed_addr);
+        // After handling, the joiner should be upgraded to Known with the observed address
+        let joiner_peer = state
+            .request
+            .joiner
+            .peer_id()
+            .expect("joiner should be Known after observed_addr");
+        assert_eq!(joiner_peer.addr, observed_addr);
     }
 
     #[test]
@@ -1403,7 +1541,7 @@ mod tests {
         let result = state.register_acceptance(&response, Instant::now());
         assert!(result.satisfied);
         let new = result.new_acceptor.expect("expected new acceptor");
-        assert_eq!(new.peer.peer, acceptor.peer);
+        assert_eq!(new.peer.peer(), acceptor.peer());
     }
 
     #[test]
@@ -1419,6 +1557,7 @@ mod tests {
             ttl,
             2,
             Arc::new(RwLock::new(ConnectForwardEstimator::new())),
+            true, // is_gateway for test
         );
 
         match msg {
@@ -1428,11 +1567,11 @@ mod tests {
                 payload,
                 ..
             } => {
-                assert_eq!(msg_target.peer, target.peer);
+                assert_eq!(msg_target.peer(), target.peer());
                 assert_eq!(payload.desired_location, desired);
                 assert_eq!(payload.ttl, ttl);
-                assert!(payload.visited.iter().any(|p| p.peer == from.peer));
-                assert!(payload.visited.iter().any(|p| p.peer == target.peer));
+                assert!(payload.visited.iter().any(|p| p.peer() == from.peer()));
+                assert!(payload.visited.iter().any(|p| p.peer() == target.peer()));
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -1451,10 +1590,10 @@ mod tests {
 
         let request = ConnectRequest {
             desired_location: Location::random(),
-            joiner: joiner.clone(),
+            joiner: make_joiner(&joiner),
             ttl: 3,
             visited: vec![joiner.clone()],
-            observed_addr: Some(joiner.peer.addr),
+            observed_addr: Some(joiner.addr()),
         };
 
         let tx = Transaction::new::<ConnectMsg>();
@@ -1473,13 +1612,13 @@ mod tests {
         let (forward_target, forward_request) = actions
             .forward
             .expect("relay should forward when it declines to accept");
-        assert_eq!(forward_target.peer, relay_b.peer);
+        assert_eq!(forward_target.peer(), relay_b.peer());
         assert_eq!(forward_request.ttl, 2);
         assert!(
             forward_request
                 .visited
                 .iter()
-                .any(|p| p.peer == relay_a.peer),
+                .any(|p| p.peer() == relay_a.peer()),
             "forwarded request should record intermediate relay"
         );
 
@@ -1502,11 +1641,11 @@ mod tests {
         let response = accept_actions
             .accept_response
             .expect("second relay should accept when policy allows");
-        assert_eq!(response.acceptor.peer, relay_b.peer);
+        assert_eq!(response.acceptor.peer(), relay_b.peer());
         let expect_conn = accept_actions
             .expect_connection_from
             .expect("acceptance should request inbound connection from joiner");
-        assert_eq!(expect_conn.peer, joiner.peer);
+        assert_eq!(expect_conn.peer(), joiner.peer());
     }
 
     /// Regression test for issue #2141: ConnectResponse must be sent to the joiner's
@@ -1516,10 +1655,11 @@ mod tests {
         // Joiner behind NAT with private address
         let private_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 9000);
         let keypair = TransportKeypair::new();
-        let joiner = PeerKeyLocation {
-            peer: PeerId::new(private_addr, keypair.public().clone()),
-            location: Some(Location::random()),
-        };
+        let joiner = PeerKeyLocation::with_location(
+            keypair.public().clone(),
+            private_addr,
+            Location::random(),
+        );
 
         // Gateway observes joiner's public/external address
         let observed_public_addr =
@@ -1531,7 +1671,7 @@ mod tests {
             upstream: joiner.clone(),
             request: ConnectRequest {
                 desired_location: Location::random(),
-                joiner: joiner.clone(),
+                joiner: make_joiner(&joiner),
                 ttl: 3,
                 visited: vec![],
                 observed_addr: Some(observed_public_addr),
@@ -1559,14 +1699,17 @@ mod tests {
             .response_target
             .expect("response_target should be set when accepting");
         assert_eq!(
-            response_target.peer.addr, observed_public_addr,
+            response_target.addr(),
+            observed_public_addr,
             "response_target must use observed external address ({}) not private address ({})",
-            observed_public_addr, private_addr
+            observed_public_addr,
+            private_addr
         );
 
         // Double-check: the original joiner had the private address
         assert_eq!(
-            joiner.peer.addr, private_addr,
+            joiner.addr(),
+            private_addr,
             "original joiner should have private address"
         );
     }
@@ -1585,30 +1728,30 @@ mod tests {
 
         let skip_list = SkipListWithSelf {
             visited: &visited,
-            self_peer: &self_peer.peer,
+            self_peer: &self_peer.peer(),
         };
 
         // Self should be excluded even though not in visited list
         assert!(
-            skip_list.has_element(self_peer.peer.clone()),
+            skip_list.has_element(self_peer.peer().clone()),
             "SkipListWithSelf must exclude self even when not in visited list"
         );
 
         // Visited peer should be excluded
         assert!(
-            skip_list.has_element(visited_peer.peer.clone()),
+            skip_list.has_element(visited_peer.peer().clone()),
             "SkipListWithSelf must exclude peers in visited list"
         );
 
         // Other peer should NOT be excluded
         assert!(
-            !skip_list.has_element(other_peer.peer.clone()),
+            !skip_list.has_element(other_peer.peer().clone()),
             "SkipListWithSelf must not exclude unrelated peers"
         );
 
         // Test with reference variant
         assert!(
-            skip_list.has_element(&self_peer.peer),
+            skip_list.has_element(&self_peer.peer()),
             "SkipListWithSelf must exclude &self with reference variant"
         );
     }
