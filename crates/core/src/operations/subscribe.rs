@@ -11,7 +11,6 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager, PeerId},
     ring::{Location, PeerKeyLocation, RingError},
-    transport::ObservedAddr,
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, ErrorKind, HostResponse},
@@ -275,7 +274,7 @@ async fn complete_local_subscription(
     key: ContractKey,
 ) -> Result<(), OpError> {
     let subscriber = op_manager.ring.connection_manager.own_location();
-    // Local subscription - no upstream_addr needed since it's our own peer
+    // Local subscription - no upstream NAT address
     if let Err(err) = op_manager
         .ring
         .add_subscriber(&key, subscriber.clone(), None)
@@ -310,7 +309,7 @@ pub(crate) struct SubscribeOp {
     state: Option<SubscribeState>,
     /// The address we received this operation's message from.
     /// Used for connection-based routing: responses are sent back to this address.
-    upstream_addr: Option<ObservedAddr>,
+    upstream_addr: Option<std::net::SocketAddr>,
 }
 
 impl SubscribeOp {
@@ -364,16 +363,11 @@ impl Operation for SubscribeOp {
             }
             Ok(None) => {
                 // new request to subscribe to a contract, initialize the machine
-                tracing::debug!(
-                    tx = %id,
-                    ?source_addr,
-                    "subscribe: load_or_init creating new op with source_addr as upstream_addr"
-                );
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(SubscribeState::ReceivedRequest),
                         id,
-                        upstream_addr: source_addr.map(ObservedAddr::new), // Connection-based routing: store who sent us this request
+                        upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                     },
                     source_addr,
                 })
@@ -413,29 +407,31 @@ impl Operation for SubscribeOp {
                     target: _,
                     subscriber,
                 } => {
-                    // ALWAYS use the transport-level source address when available.
-                    // This is critical for NAT peers: they may embed a "known" but wrong address
-                    // (e.g., 127.0.0.1:31337 for loopback). The transport address is the only
-                    // reliable way to route responses back through the NAT.
+                    // Fill in subscriber's external address from transport layer if unknown.
+                    // This is the key step where the first recipient (gateway) determines the
+                    // subscriber's external address from the actual packet source address.
+                    // IMPORTANT: Must fill address BEFORE any .peer() calls to avoid panic.
                     let mut subscriber = subscriber.clone();
+
+                    if subscriber.peer_addr.is_unknown() {
+                        if let Some(addr) = source_addr {
+                            subscriber.set_addr(addr);
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                subscriber_addr = %addr,
+                                "subscribe: filled subscriber address from source_addr"
+                            );
+                        }
+                    }
 
                     tracing::debug!(
                         tx = %id,
                         %key,
-                        subscriber_orig = %subscriber.peer(),
+                        subscriber = %subscriber.peer(),
                         source_addr = ?source_addr,
                         "subscribe: processing RequestSub"
                     );
-
-                    if let Some(addr) = source_addr {
-                        subscriber.set_addr(addr);
-                        tracing::debug!(
-                            tx = %id,
-                            %key,
-                            subscriber_updated = %subscriber.peer(),
-                            "subscribe: updated subscriber address from transport source"
-                        );
-                    }
                     let own_loc = op_manager.ring.connection_manager.own_location();
 
                     if !matches!(
@@ -462,10 +458,10 @@ impl Operation for SubscribeOp {
                             "subscribe: handling RequestSub locally (contract available)"
                         );
 
-                        // Use upstream_addr for NAT routing - subscriber may embed wrong address
+                        // Local registration - no upstream NAT address
                         if op_manager
                             .ring
-                            .add_subscriber(key, subscriber.clone(), self.upstream_addr)
+                            .add_subscriber(key, subscriber.clone(), None)
                             .is_err()
                         {
                             tracing::warn!(
@@ -531,13 +527,6 @@ impl Operation for SubscribeOp {
                             target: subscriber.clone(),
                             subscribed: true,
                         };
-
-                        tracing::debug!(
-                            tx = %id,
-                            %key,
-                            upstream_addr = ?self.upstream_addr,
-                            "subscribe: creating ReturnSub with upstream_addr"
-                        );
 
                         return build_op_result(
                             self.id,
@@ -741,10 +730,7 @@ impl Operation for SubscribeOp {
                         subscribers_before = ?before_direct,
                         "subscribe: attempting to register direct subscriber"
                     );
-                    // Pass None: subscriber address was already corrected by Gateway at the
-                    // start of the subscribe flow. Using self.upstream_addr here would
-                    // incorrectly overwrite with the forwarder's address instead of the
-                    // original subscriber's Gateway-corrected address.
+                    // Local registration - no upstream NAT address
                     if op_manager
                         .ring
                         .add_subscriber(key, subscriber.clone(), None)
@@ -895,7 +881,7 @@ impl Operation for SubscribeOp {
                                 subscribers_before = ?before_upstream,
                                 "subscribe: attempting to register upstream link"
                             );
-                            // upstream_subscriber was stored in op state, no transport address available
+                            // Local registration - no upstream NAT address
                             if op_manager
                                 .ring
                                 .add_subscriber(key, upstream_subscriber.clone(), None)
@@ -928,10 +914,7 @@ impl Operation for SubscribeOp {
                             subscribers_before = ?before_provider,
                             "subscribe: registering provider/subscription source"
                         );
-                        // Pass None: sender was already looked up from source_addr (line ~866),
-                        // so it has the correct transport address. Using self.upstream_addr
-                        // would incorrectly use the original requester's address instead of
-                        // the provider's address.
+                        // Local registration - no upstream NAT address
                         if op_manager
                             .ring
                             .add_subscriber(key, sender.clone(), None)
@@ -993,25 +976,16 @@ fn build_op_result(
     id: Transaction,
     state: Option<SubscribeState>,
     msg: Option<SubscribeMsg>,
-    upstream_addr: Option<ObservedAddr>,
+    upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<OperationResult, OpError> {
     // For response messages (ReturnSub), use upstream_addr directly for routing.
     // This is more reliable than extracting from the message's target field, which
     // may have been looked up from connection_manager (subject to race conditions).
     // For forward messages (SeekNode, RequestSub, FetchRouting), use the message's target.
     let target_addr = match &msg {
-        // Convert ObservedAddr to SocketAddr at the transport boundary
-        Some(SubscribeMsg::ReturnSub { .. }) => upstream_addr.map(|a| a.socket_addr()),
+        Some(SubscribeMsg::ReturnSub { .. }) => upstream_addr,
         _ => msg.as_ref().and_then(|m| m.target_addr()),
     };
-
-    tracing::debug!(
-        tx = %id,
-        msg_type = ?msg.as_ref().map(|m| std::any::type_name_of_val(m)),
-        ?upstream_addr,
-        ?target_addr,
-        "build_op_result: computed target_addr"
-    );
 
     let output_op = state.map(|state| SubscribeOp {
         id,
