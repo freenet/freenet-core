@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::PCK_VERSION;
-use crate::ring::PeerKeyLocation;
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
@@ -65,7 +64,6 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     listen_port: u16,
     is_gateway: bool,
     bandwidth_limit: Option<usize>,
-    _known_gateways: &[PeerKeyLocation],
 ) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
     // Bind the UDP socket to the specified port
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
