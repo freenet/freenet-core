@@ -1257,8 +1257,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_serde_config_args() {
+        // Use tempfile for a guaranteed-writable directory (avoids CI permission issues on /tmp)
+        let temp_dir = tempfile::tempdir().unwrap();
         let args = ConfigArgs {
             mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+            },
             ..Default::default()
         };
         let cfg = args.build().await.unwrap();
