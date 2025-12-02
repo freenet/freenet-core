@@ -274,7 +274,11 @@ async fn complete_local_subscription(
     key: ContractKey,
 ) -> Result<(), OpError> {
     let subscriber = op_manager.ring.connection_manager.own_location();
-    if let Err(err) = op_manager.ring.add_subscriber(&key, subscriber.clone()) {
+    // Local subscription - no upstream NAT address
+    if let Err(err) = op_manager
+        .ring
+        .add_subscriber(&key, subscriber.clone(), None)
+    {
         tracing::warn!(
             %key,
             tx = %id,
@@ -406,7 +410,9 @@ impl Operation for SubscribeOp {
                     // Fill in subscriber's external address from transport layer if unknown.
                     // This is the key step where the first recipient (gateway) determines the
                     // subscriber's external address from the actual packet source address.
+                    // IMPORTANT: Must fill address BEFORE any .peer() calls to avoid panic.
                     let mut subscriber = subscriber.clone();
+
                     if subscriber.peer_addr.is_unknown() {
                         if let Some(addr) = source_addr {
                             subscriber.set_addr(addr);
@@ -423,6 +429,7 @@ impl Operation for SubscribeOp {
                         tx = %id,
                         %key,
                         subscriber = %subscriber.peer(),
+                        source_addr = ?source_addr,
                         "subscribe: processing RequestSub"
                     );
                     let own_loc = op_manager.ring.connection_manager.own_location();
@@ -451,9 +458,10 @@ impl Operation for SubscribeOp {
                             "subscribe: handling RequestSub locally (contract available)"
                         );
 
+                        // Local registration - no upstream NAT address
                         if op_manager
                             .ring
-                            .add_subscriber(key, subscriber.clone())
+                            .add_subscriber(key, subscriber.clone(), None)
                             .is_err()
                         {
                             tracing::warn!(
@@ -469,14 +477,11 @@ impl Operation for SubscribeOp {
                                 target: subscriber.clone(),
                                 subscribed: false,
                             };
-                            // Use build_op_result to ensure upstream_addr is used for routing
-                            // (important for peers behind NAT)
-                            return build_op_result(
-                                self.id,
-                                None,
-                                Some(return_msg),
-                                self.upstream_addr,
-                            );
+                            return Ok(OperationResult {
+                                target_addr: return_msg.target_addr(),
+                                return_msg: Some(NetMessage::from(return_msg)),
+                                state: None,
+                            });
                         }
 
                         let after_direct = subscribers_snapshot(op_manager, key);
@@ -584,18 +589,18 @@ impl Operation for SubscribeOp {
                     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
                     let htl = (*htl).min(ring_max_htl);
                     let this_peer = op_manager.ring.connection_manager.own_location();
-                    // Capture upstream_addr for NAT-friendly routing in error responses
-                    let upstream_addr = self.upstream_addr;
-                    let return_not_subbed = || -> Result<OperationResult, OpError> {
+                    let return_not_subbed = || -> OperationResult {
                         let return_msg = SubscribeMsg::ReturnSub {
                             key: *key,
                             id: *id,
                             subscribed: false,
                             target: subscriber.clone(),
                         };
-                        // Use build_op_result to ensure upstream_addr is used for routing
-                        // (important for peers behind NAT)
-                        build_op_result(*id, None, Some(return_msg), upstream_addr)
+                        OperationResult {
+                            target_addr: return_msg.target_addr(),
+                            return_msg: Some(NetMessage::from(return_msg)),
+                            state: None,
+                        }
                     };
 
                     if htl == 0 {
@@ -605,7 +610,7 @@ impl Operation for SubscribeOp {
                             subscriber = %subscriber.peer(),
                             "Dropping Subscribe SeekNode with zero HTL"
                         );
-                        return return_not_subbed();
+                        return Ok(return_not_subbed());
                     }
 
                     if !super::has_contract(op_manager, *key).await? {
@@ -641,7 +646,7 @@ impl Operation for SubscribeOp {
                                     error = %fetch_err,
                                     "Failed to fetch contract locally while handling subscribe"
                                 );
-                                return return_not_subbed();
+                                return Ok(return_not_subbed());
                             }
 
                             if wait_for_local_contract(op_manager, *key).await? {
@@ -656,18 +661,18 @@ impl Operation for SubscribeOp {
                                     %key,
                                     "Contract still unavailable locally after fetch attempt"
                                 );
-                                return return_not_subbed();
+                                return Ok(return_not_subbed());
                             }
                         } else {
                             let Some(new_target) = candidates.first() else {
-                                return return_not_subbed();
+                                return Ok(return_not_subbed());
                             };
                             let new_target = new_target.clone();
                             let new_htl = htl.saturating_sub(1);
 
                             if new_htl == 0 {
                                 tracing::debug!(tx = %id, %key, "Max number of hops reached while trying to get contract");
-                                return return_not_subbed();
+                                return Ok(return_not_subbed());
                             }
 
                             let mut new_skip_list = skip_list.clone();
@@ -725,9 +730,10 @@ impl Operation for SubscribeOp {
                         subscribers_before = ?before_direct,
                         "subscribe: attempting to register direct subscriber"
                     );
+                    // Local registration - no upstream NAT address
                     if op_manager
                         .ring
-                        .add_subscriber(key, subscriber.clone())
+                        .add_subscriber(key, subscriber.clone(), None)
                         .is_err()
                     {
                         tracing::warn!(
@@ -738,7 +744,7 @@ impl Operation for SubscribeOp {
                             "subscribe: direct registration failed (max subscribers reached)"
                         );
                         // max number of subscribers for this contract reached
-                        return return_not_subbed();
+                        return Ok(return_not_subbed());
                     }
                     let after_direct = subscribers_snapshot(op_manager, key);
                     tracing::info!(
@@ -875,9 +881,10 @@ impl Operation for SubscribeOp {
                                 subscribers_before = ?before_upstream,
                                 "subscribe: attempting to register upstream link"
                             );
+                            // Local registration - no upstream NAT address
                             if op_manager
                                 .ring
-                                .add_subscriber(key, upstream_subscriber.clone())
+                                .add_subscriber(key, upstream_subscriber.clone(), None)
                                 .is_err()
                             {
                                 tracing::warn!(
@@ -907,7 +914,12 @@ impl Operation for SubscribeOp {
                             subscribers_before = ?before_provider,
                             "subscribe: registering provider/subscription source"
                         );
-                        if op_manager.ring.add_subscriber(key, sender.clone()).is_err() {
+                        // Local registration - no upstream NAT address
+                        if op_manager
+                            .ring
+                            .add_subscriber(key, sender.clone(), None)
+                            .is_err()
+                        {
                             // concurrently it reached max number of subscribers for this contract
                             tracing::debug!(
                                 tx = %id,

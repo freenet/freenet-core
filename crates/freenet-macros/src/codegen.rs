@@ -410,14 +410,12 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
 
         builds.push(quote! {
             tracing::info!("Building node: {}", #node_label);
+            // Release reserved ports just before binding to minimize race window
+            freenet::test_utils::release_local_port(#network_port_var);
+            freenet::test_utils::release_local_port(#ws_port_var);
             let built_config = #config_var.build().await?;
             let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
             #connection_tuning
-
-            // Release ports immediately before building node (minimizes race window)
-            freenet::test_utils::release_local_port(#network_port_var);
-            freenet::test_utils::release_local_port(#ws_port_var);
-
             let (#node_var, #flush_handle_var) = node_config
                 .build_with_flush_handle(freenet::server::serve_gateway(built_config.ws_api).await)
                 .await?;

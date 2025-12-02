@@ -603,53 +603,6 @@ impl P2pConnManager {
                                 }
                             }
                         }
-                        ConnEvent::OutboundMessageWithTarget { target_addr, msg } => {
-                            // This variant uses an explicit target address from OperationResult.target_addr,
-                            // which is critical for NAT scenarios where the address in the message
-                            // differs from the actual transport address we should send to.
-                            tracing::info!(
-                                tx = %msg.id(),
-                                msg_type = %msg,
-                                target_addr = %target_addr,
-                                msg_target = ?msg.target().map(|t| t.addr()),
-                                "Sending outbound message with explicit target address (NAT routing)"
-                            );
-
-                            // Look up the connection using the explicit target address
-                            let peer_connection = ctx.connections.get(&target_addr);
-
-                            match peer_connection {
-                                Some(peer_connection) => {
-                                    if let Err(e) =
-                                        peer_connection.sender.send(Left(msg.clone())).await
-                                    {
-                                        tracing::error!(
-                                            tx = %msg.id(),
-                                            target_addr = %target_addr,
-                                            "Failed to send message to peer: {}", e
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            tx = %msg.id(),
-                                            target_addr = %target_addr,
-                                            "Message successfully sent to peer connection via explicit address"
-                                        );
-                                    }
-                                }
-                                None => {
-                                    // No existing connection - this is unexpected for NAT scenarios
-                                    // since we should have the connection from the original request
-                                    tracing::error!(
-                                        tx = %msg.id(),
-                                        target_addr = %target_addr,
-                                        msg_target = ?msg.target().map(|t| t.addr()),
-                                        connections = ?ctx.connections.keys().collect::<Vec<_>>(),
-                                        "No connection found for explicit target address - NAT routing failed"
-                                    );
-                                    ctx.bridge.op_manager.completed(*msg.id());
-                                }
-                            }
-                        }
                         ConnEvent::TransportClosed { remote_addr, error } => {
                             tracing::debug!(
                                 remote = %remote_addr,
@@ -2313,19 +2266,8 @@ impl P2pConnManager {
 
     fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
         match msg {
-            Some(Left((target, msg))) => {
-                // Use OutboundMessageWithTarget to preserve the target address from
-                // OperationResult.target_addr. This is critical for NAT scenarios where
-                // the address in the message differs from the actual transport address.
-                // The PeerId.addr contains the address that was used to look up the peer
-                // in P2pBridge::send(), which is the correct transport address.
-                EventResult::Event(
-                    ConnEvent::OutboundMessageWithTarget {
-                        target_addr: target.addr,
-                        msg: *msg,
-                    }
-                    .into(),
-                )
+            Some(Left((_target, msg))) => {
+                EventResult::Event(ConnEvent::OutboundMessage(*msg).into())
             }
             Some(Right(action)) => EventResult::Event(ConnEvent::NodeAction(action).into()),
             None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
@@ -2456,12 +2398,6 @@ enum EventResult {
 pub(super) enum ConnEvent {
     InboundMessage(IncomingMessage),
     OutboundMessage(NetMessage),
-    /// Outbound message with explicit target address from OperationResult.target_addr.
-    /// Used when the target address differs from what's in the message (NAT scenarios).
-    OutboundMessageWithTarget {
-        target_addr: SocketAddr,
-        msg: NetMessage,
-    },
     NodeAction(NodeEvent),
     ClosedChannel(ChannelCloseReason),
     TransportClosed {
