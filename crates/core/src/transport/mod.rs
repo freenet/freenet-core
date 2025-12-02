@@ -25,16 +25,7 @@ type MessagePayload = Vec<u8>;
 
 type PacketId = u32;
 
-pub use self::crypto::{TransportKeypair, TransportPublicKey};
-pub(crate) use self::{
-    connection_handler::{
-        create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
-    },
-    peer_connection::PeerConnection,
-};
-
-/// Address observed at the transport layer (from UDP packet source).
-///
+/// A wrapper around SocketAddr that represents an address observed at the transport layer.
 /// This is the "ground truth" for NAT scenarios - it's the actual address we see
 /// at the network layer, not what the peer claims in protocol messages.
 ///
@@ -44,11 +35,6 @@ pub(crate) use self::{
 pub struct ObservedAddr(SocketAddr);
 
 impl ObservedAddr {
-    /// Create a new observed address from a socket address.
-    pub fn new(addr: SocketAddr) -> Self {
-        Self(addr)
-    }
-
     /// Get the underlying socket address.
     pub fn socket_addr(&self) -> SocketAddr {
         self.0
@@ -66,6 +52,14 @@ impl From<SocketAddr> for ObservedAddr {
         Self(addr)
     }
 }
+
+pub use self::crypto::{TransportKeypair, TransportPublicKey};
+pub(crate) use self::{
+    connection_handler::{
+        create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
+    },
+    peer_connection::PeerConnection,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransportError {

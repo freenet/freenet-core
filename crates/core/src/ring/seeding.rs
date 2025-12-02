@@ -1,4 +1,5 @@
 use super::{Location, PeerKeyLocation, Score};
+use crate::transport::ObservedAddr;
 use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use freenet_stdlib::prelude::ContractKey;
 use tracing::{info, warn};
@@ -102,11 +103,23 @@ impl SeedingManager {
     }
 
     /// Will return an error in case the max number of subscribers has been added.
+    ///
+    /// The `upstream_addr` parameter is the transport-level address from which the subscribe
+    /// message was received. This is used instead of the address embedded in `subscriber`
+    /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
+    /// The transport address is the only reliable way to route back to them.
     pub fn add_subscriber(
         &self,
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
+        upstream_addr: Option<ObservedAddr>,
     ) -> Result<(), ()> {
+        // Use the transport-level address if available, otherwise fall back to the embedded address
+        let subscriber = if let Some(addr) = upstream_addr {
+            PeerKeyLocation::new(subscriber.pub_key.clone(), addr.socket_addr())
+        } else {
+            subscriber
+        };
         let mut subs = self
             .subscribers
             .entry(*contract)
@@ -255,15 +268,15 @@ mod tests {
             Location::try_from(0.3).unwrap(),
         );
 
-        // Add subscribers
+        // Add subscribers (test setup - no upstream_addr)
         assert!(seeding_manager
-            .add_subscriber(&contract_key, peer_loc1.clone())
+            .add_subscriber(&contract_key, peer_loc1.clone(), None)
             .is_ok());
         assert!(seeding_manager
-            .add_subscriber(&contract_key, peer_loc2.clone())
+            .add_subscriber(&contract_key, peer_loc2.clone(), None)
             .is_ok());
         assert!(seeding_manager
-            .add_subscriber(&contract_key, peer_loc3.clone())
+            .add_subscriber(&contract_key, peer_loc3.clone(), None)
             .is_ok());
 
         // Verify all subscribers are present
