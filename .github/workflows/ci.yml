@@ -162,10 +162,18 @@ jobs:
         env:
           FREENET_CORE_PATH: ${{ github.workspace }}
           RUST_LOG: info
-        run: >
-          cargo test --test message_flow
-          river_message_flow_over_freenet_six_peers_five_rounds
-          -- --ignored --exact
+        # Use Docker NAT to simulate realistic network topology where peers
+        # are behind NAT and gateways are on the public network. This provides
+        # better test coverage for NAT traversal and gateway connection code paths.
+        # See issue #2204 for context. Only enable if Docker is accessible.
+        run: |
+          if docker info >/dev/null 2>&1; then
+            echo "Docker available - using Docker NAT backend"
+            export FREENET_TEST_DOCKER_NAT=1
+          else
+            echo "Docker not available - using local backend"
+          fi
+          cargo test --test message_flow river_message_flow_over_freenet_six_peers_five_rounds -- --ignored --exact
 
   ubertest:
     name: Ubertest
