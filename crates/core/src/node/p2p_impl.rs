@@ -170,7 +170,7 @@ impl NodeP2P {
 
             tracing::debug!(
                 %tx,
-                query_peer = %query_target.peer,
+                query_peer = %query_target.peer(),
                 %ideal_location,
                 "Triggering connection maintenance connect request"
             );

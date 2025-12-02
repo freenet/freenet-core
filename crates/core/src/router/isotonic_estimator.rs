@@ -229,27 +229,25 @@ mod tests {
     use super::*;
     use tracing::debug;
 
-    // This test `test_peer_time_estimator` checks the accuracy of the `IsotonicEstimator` struct's
-    // `estimate_retrieval_time()` method. It generates a list of 200 random events, where each event
+    // This test `test_peer_time_estimator` checks the accuracy of the `RoutingOutcomeEstimator` struct's
+    // `estimate_retrieval_time()` method. It generates a list of 100 random events, where each event
     // represents a simulated request made by a random `PeerId` at a random `Location` to retrieve data
     // from a contract at another random `Location`. Each event is created by calling the `simulate_request()`
     // helper function which calculates the distance between the `Peer` and the `Contract`, then estimates
-    // the retrieval time based on the distance. The list of events is then split into two sets: a
-    // training set (100 events) and a testing set (100 events).
+    // the retrieval time based on the distance and some random factor. The list of events is then split
+    // into two sets: a training set and a testing set.
     //
-    // The `IsotonicEstimator` is then instantiated using the training set, and the `estimate_retrieval_time()`
+    // The `RoutingOutcomeEstimator` is then instantiated using the training set, and the `estimate_retrieval_time()`
     // method is called for each event in the testing set. The estimated retrieval time is compared to the
     // actual retrieval time recorded in the event, and the error between the two is calculated. The average
-    // error across all events is then calculated, and the test passes if the average error is less than 0.02.
-    // The 0.02 threshold allows for isotonic regression interpolation error while still verifying accuracy.
+    // error across all events is then calculated, and the test passes if the average error is less than 0.01.
+    // If the error is greater than or equal to 0.01, the test fails.
 
     #[test]
     fn test_positive_peer_time_estimator() {
-        // Generate a list of random events. Using 200 events (100 training, 100 test)
-        // provides enough data for the isotonic regression to fit well and reduces
-        // variance in the test results.
+        // Generate a list of random events
         let mut events = Vec::new();
-        for _ in 0..200 {
+        for _ in 0..100 {
             let peer = PeerKeyLocation::random();
             if peer.location.is_none() {
                 debug!("Peer location is none for {peer:?}");
@@ -276,20 +274,17 @@ mod tests {
             errors.push(error);
         }
 
-        // Check that the errors are small. The 0.02 threshold allows for isotonic
-        // regression interpolation error while still verifying the estimator works.
+        // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
         debug!("Average error: {average_error}");
-        assert!(average_error < 0.02);
+        assert!(average_error < 0.01);
     }
 
     #[test]
     fn test_negative_peer_time_estimator() {
-        // Generate a list of random events. Using 200 events (100 training, 100 test)
-        // provides enough data for the isotonic regression to fit well and reduces
-        // variance in the test results.
+        // Generate a list of random events
         let mut events = Vec::new();
-        for _ in 0..200 {
+        for _ in 0..100 {
             let peer = PeerKeyLocation::random();
             if peer.location.is_none() {
                 debug!("Peer location is none for {peer:?}");
@@ -316,11 +311,10 @@ mod tests {
             errors.push(error);
         }
 
-        // Check that the errors are small. The 0.02 threshold allows for isotonic
-        // regression interpolation error while still verifying the estimator works.
+        // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
         debug!("Average error: {average_error}");
-        assert!(average_error < 0.02);
+        assert!(average_error < 0.01);
     }
 
     fn simulate_positive_request(
@@ -329,7 +323,7 @@ mod tests {
     ) -> IsotonicEvent {
         let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
 
-        let result = distance.powf(0.5) + peer.peer.clone().to_bytes()[0] as f64;
+        let result = distance.powf(0.5) + peer.peer().clone().to_bytes()[0] as f64;
         IsotonicEvent {
             peer,
             contract_location,
@@ -343,7 +337,7 @@ mod tests {
     ) -> IsotonicEvent {
         let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
 
-        let result = (100.0 - distance).powf(0.5) + peer.peer.clone().to_bytes()[0] as f64;
+        let result = (100.0 - distance).powf(0.5) + peer.peer().clone().to_bytes()[0] as f64;
         IsotonicEvent {
             peer,
             contract_location,
