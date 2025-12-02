@@ -829,21 +829,10 @@ impl Operation for ConnectOp {
                             address,
                         };
                         // Route through upstream (where the request came from) since we may
-                        // not have a direct connection to the target
-                        let Some(upstream) = source_addr else {
-                            tracing::warn!(
-                                tx = %self.id,
-                                "ObservedAddress message has no upstream - was this locally initiated?"
-                            );
-                            // No upstream to route through - this shouldn't happen for relayed connections
-                            return Ok(OperationResult {
-                                return_msg: None,
-                                target_addr: None,
-                                state: Some(OpEnum::Connect(Box::new(self))),
-                            });
-                        };
+                        // not have a direct connection to the target.
+                        // Note: upstream_addr is already validated from source_addr at the start of this match arm.
                         network_bridge
-                            .send(upstream, NetMessage::V1(NetMessageV1::Connect(msg)))
+                            .send(upstream_addr, NetMessage::V1(NetMessageV1::Connect(msg)))
                             .await?;
                     }
 
@@ -885,18 +874,11 @@ impl Operation for ConnectOp {
                             payload: response,
                         };
                         // Route the response through upstream (where the request came from)
-                        // since we may not have a direct connection to the joiner
-                        let Some(upstream) = source_addr else {
-                            tracing::warn!(
-                                tx = %self.id,
-                                "ConnectResponse has no upstream - was this locally initiated?"
-                            );
-                            // No upstream to route through - this shouldn't happen for relayed connections
-                            return Ok(store_operation_state(&mut self));
-                        };
+                        // since we may not have a direct connection to the joiner.
+                        // Note: upstream_addr is already validated from source_addr at the start of this match arm.
                         network_bridge
                             .send(
-                                upstream,
+                                upstream_addr,
                                 NetMessage::V1(NetMessageV1::Connect(response_msg)),
                             )
                             .await?;
