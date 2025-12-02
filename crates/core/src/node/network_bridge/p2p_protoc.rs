@@ -279,7 +279,6 @@ impl P2pConnManager {
             listening_port,
             is_gateway,
             bandwidth_limit,
-            if is_gateway { &[] } else { &gateways },
         )
         .await?;
 
