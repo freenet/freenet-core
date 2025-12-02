@@ -38,15 +38,14 @@ mod location;
 mod peer_key_location;
 mod score;
 mod seeding;
-mod transient_manager;
 
 use self::score::Score;
-pub(crate) use self::transient_manager::TransientConnectionManager;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
 pub use location::{Distance, Location};
-pub use peer_key_location::PeerKeyLocation;
+#[allow(unused_imports)] // PeerAddr will be used as refactoring progresses
+pub use peer_key_location::{PeerAddr, PeerKeyLocation};
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
@@ -260,7 +259,7 @@ impl Ring {
         for peer in peers {
             if !self
                 .connection_manager
-                .has_connection_or_pending(&peer.peer)
+                .has_connection_or_pending(&peer.peer())
             {
                 filtered.push(peer);
             }
@@ -298,7 +297,7 @@ impl Ring {
         let connections = self.connection_manager.get_connections_by_location();
         for conns in connections.values() {
             for conn in conns {
-                let peer = conn.location.peer.clone();
+                let peer = conn.location.peer().clone();
                 if skip_list.has_element(peer.clone()) || !seen.insert(peer) {
                     continue;
                 }
@@ -306,21 +305,11 @@ impl Ring {
             }
         }
 
-        if candidates.len() < k {
-            let known_locations = self.connection_manager.get_known_locations();
-            for (peer, location) in known_locations {
-                if skip_list.has_element(peer.clone()) || !seen.insert(peer.clone()) {
-                    continue;
-                }
-                candidates.push(PeerKeyLocation {
-                    peer,
-                    location: Some(location),
-                });
-                if candidates.len() >= k {
-                    break;
-                }
-            }
-        }
+        // Note: We intentionally do NOT fall back to known_locations here.
+        // known_locations may contain peers we're not currently connected to,
+        // and attempting to route to them would require establishing a new connection
+        // which may fail (especially in NAT scenarios without coordination).
+        // It's better to return fewer candidates than unreachable ones.
 
         router
             .select_k_best_peers(candidates.iter(), target_location, k)
@@ -366,7 +355,7 @@ impl Ring {
 
     pub async fn prune_connection(&self, peer: PeerId) {
         tracing::debug!(%peer, "Removing connection");
-        self.live_tx_tracker.prune_transactions_from_peer(&peer);
+        self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
         // This case would be when a connection is being open, so peer location hasn't been recorded yet and we can ignore everything below
         let Some(loc) = self.connection_manager.prune_alive_connection(&peer) else {
             return;
@@ -484,7 +473,7 @@ impl Ring {
                 .map(|(loc, conns)| {
                     let conns: Vec<_> = conns
                         .iter()
-                        .filter(|conn| !live_tx_tracker.has_live_connection(&conn.location.peer))
+                        .filter(|conn| !live_tx_tracker.has_live_connection(conn.location.addr()))
                         .cloned()
                         .collect();
                     (*loc, conns)
@@ -573,7 +562,7 @@ impl Ring {
                         notifier
                             .notifications_sender
                             .send(Either::Right(crate::message::NodeEvent::DropConnection(
-                                peer.peer,
+                                peer.addr(),
                             )))
                             .await
                             .map_err(|error| {
@@ -648,7 +637,7 @@ impl Ring {
         let joiner = self.connection_manager.own_location();
         tracing::info!(
             this_peer = %joiner,
-            query_target_peer = %query_target.peer,
+            query_target_peer = %query_target.peer(),
             %ideal_location,
             "Sending connect request via connection_maintenance"
         );
@@ -664,7 +653,7 @@ impl Ring {
             op_manager.connect_forward_estimator.clone(),
         );
 
-        live_tx_tracker.add_transaction(query_target.peer.clone(), tx);
+        live_tx_tracker.add_transaction(query_target.addr(), tx);
         op_manager
             .push(tx, OpEnum::Connect(Box::new(op)))
             .await

@@ -18,6 +18,9 @@ pub(crate) struct UpdateOp {
     pub id: Transaction,
     pub(crate) state: Option<UpdateState>,
     stats: Option<UpdateStats>,
+    /// The address we received this operation's message from.
+    /// Used for connection-based routing: responses are sent back to this address.
+    upstream_addr: Option<std::net::SocketAddr>,
 }
 
 impl UpdateOp {
@@ -88,17 +91,14 @@ impl Operation for UpdateOp {
     async fn load_or_init<'a>(
         op_manager: &'a crate::node::OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Result<super::OpInitialization<Self>, OpError> {
-        let mut sender: Option<PeerId> = None;
-        if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer);
-        };
         let tx = *msg.id();
         match op_manager.pop(msg.id()) {
             Ok(Some(OpEnum::Update(update_op))) => {
                 Ok(OpInitialization {
                     op: update_op,
-                    sender,
+                    source_addr,
                 })
                 // was an existing operation, other peer messaged back
             }
@@ -108,14 +108,15 @@ impl Operation for UpdateOp {
             }
             Ok(None) => {
                 // new request to get a value for a contract, initialize the machine
-                tracing::debug!(tx = %tx, sender = ?sender, "initializing new op");
+                tracing::debug!(tx = %tx, ?source_addr, "initializing new op");
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(UpdateState::ReceivedRequest),
                         id: tx,
                         stats: None, // don't care about stats in target peers
+                        upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                     },
-                    sender,
+                    source_addr,
                 })
             }
             Err(err) => Err(err.into()),
@@ -131,11 +132,20 @@ impl Operation for UpdateOp {
         conn_manager: &'a mut NB,
         op_manager: &'a crate::node::OpManager,
         input: &'a Self::Message,
-        // _client_id: Option<ClientId>,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<super::OperationResult, OpError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            // Look up sender's PeerKeyLocation from source address for logging/routing
+            // This replaces the sender field that was previously embedded in messages
+            let sender_from_addr = source_addr.and_then(|addr| {
+                op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_location_by_addr(addr)
+            });
+
             let return_msg;
             let new_state;
             let stats = self.stats;
@@ -144,33 +154,36 @@ impl Operation for UpdateOp {
                 UpdateMsg::RequestUpdate {
                     id,
                     key,
-                    sender: request_sender,
                     target,
                     related_contracts,
                     value,
                 } => {
+                    // Get sender from connection-based routing
+                    let request_sender = sender_from_addr
+                        .clone()
+                        .expect("RequestUpdate requires source_addr");
                     let self_location = op_manager.ring.connection_manager.own_location();
 
                     tracing::debug!(
                         tx = %id,
                         %key,
-                        executing_peer = %self_location.peer,
-                        request_sender = %request_sender.peer,
-                        target_peer = %target.peer,
+                        executing_peer = %self_location.peer(),
+                        request_sender = %request_sender.peer(),
+                        target_peer = %target.peer(),
                         "UPDATE RequestUpdate: executing_peer={} received request from={} targeting={}",
-                        self_location.peer,
-                        request_sender.peer,
-                        target.peer
+                        self_location.peer(),
+                        request_sender.peer(),
+                        target.peer()
                     );
 
                     // If target is not us, this message is meant for another peer
                     // This can happen when the initiator processes its own message before sending to network
-                    if target.peer != self_location.peer {
+                    if target.peer() != self_location.peer() {
                         tracing::debug!(
                             tx = %id,
                             %key,
-                            our_peer = %self_location.peer,
-                            target_peer = %target.peer,
+                            our_peer = %self_location.peer(),
+                            target_peer = %target.peer(),
                             "RequestUpdate target is not us - message will be routed to target"
                         );
                         // Keep current state, message will be sent to target peer via network
@@ -249,7 +262,7 @@ impl Operation for UpdateOp {
                             } else {
                                 // Get broadcast targets for propagating UPDATE to subscribers
                                 let broadcast_to = op_manager
-                                    .get_broadcast_targets_update(key, &request_sender.peer);
+                                    .get_broadcast_targets_update(key, &request_sender.peer());
 
                                 if broadcast_to.is_empty() {
                                     tracing::debug!(
@@ -294,21 +307,20 @@ impl Operation for UpdateOp {
                             // Contract not found locally - forward to another peer
                             let next_target = op_manager.ring.closest_potentially_caching(
                                 key,
-                                [&self_location.peer, &request_sender.peer].as_slice(),
+                                [&self_location.peer(), &request_sender.peer()].as_slice(),
                             );
 
                             if let Some(forward_target) = next_target {
                                 tracing::debug!(
                                     tx = %id,
                                     %key,
-                                    next_peer = %forward_target.peer,
+                                    next_peer = %forward_target.peer(),
                                     "Forwarding UPDATE to peer that might have contract"
                                 );
 
                                 // Create a SeekNode message to forward to the next hop
                                 return_msg = Some(UpdateMsg::SeekNode {
                                     id: *id,
-                                    sender: self_location.clone(),
                                     target: forward_target,
                                     value: value.clone(),
                                     key: *key,
@@ -317,14 +329,14 @@ impl Operation for UpdateOp {
                                 new_state = None;
                             } else {
                                 // No peers available and we don't have the contract - capture context
-                                let skip_list = [&self_location.peer, &request_sender.peer];
+                                let skip_list = [&self_location.peer(), &request_sender.peer()];
                                 let subscribers = op_manager
                                     .ring
                                     .subscribers_of(key)
                                     .map(|subs| {
                                         subs.value()
                                             .iter()
-                                            .map(|loc| format!("{:.8}", loc.peer))
+                                            .map(|loc| format!("{:.8}", loc.peer()))
                                             .collect::<Vec<_>>()
                                     })
                                     .unwrap_or_default();
@@ -332,7 +344,7 @@ impl Operation for UpdateOp {
                                     .ring
                                     .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
                                     .into_iter()
-                                    .map(|loc| format!("{:.8}", loc.peer))
+                                    .map(|loc| format!("{:.8}", loc.peer()))
                                     .collect::<Vec<_>>();
                                 let connection_count =
                                     op_manager.ring.connection_manager.num_connections();
@@ -342,7 +354,7 @@ impl Operation for UpdateOp {
                                     subscribers = ?subscribers,
                                     candidates = ?candidates,
                                     connection_count,
-                                    request_sender = %request_sender.peer,
+                                    request_sender = %request_sender.peer(),
                                     "Cannot handle UPDATE: contract not found locally and no peers to forward to"
                                 );
                                 return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
@@ -355,9 +367,12 @@ impl Operation for UpdateOp {
                     value,
                     key,
                     related_contracts,
-                    target,
-                    sender,
+                    target: _,
                 } => {
+                    // Get sender from connection-based routing
+                    let sender = sender_from_addr
+                        .clone()
+                        .expect("SeekNode requires source_addr");
                     // Check if we have the contract locally
                     let has_contract = match op_manager
                         .notify_contract_handler(ContractHandlerEvent::GetQuery {
@@ -392,11 +407,12 @@ impl Operation for UpdateOp {
                             related_contracts.clone(),
                         )
                         .await?;
+                        let self_location = op_manager.ring.connection_manager.own_location();
                         tracing::debug!(
                             tx = %id,
                             "Successfully updated a value for contract {} @ {:?} - update",
                             key,
-                            target.location
+                            self_location.location
                         );
 
                         if !changed {
@@ -410,7 +426,7 @@ impl Operation for UpdateOp {
                         } else {
                             // Get broadcast targets
                             let broadcast_to =
-                                op_manager.get_broadcast_targets_update(key, &sender.peer);
+                                op_manager.get_broadcast_targets_update(key, &sender.peer());
 
                             // If no peers to broadcast to, nothing else to do
                             if broadcast_to.is_empty() {
@@ -448,21 +464,20 @@ impl Operation for UpdateOp {
                         let self_location = op_manager.ring.connection_manager.own_location();
                         let next_target = op_manager.ring.closest_potentially_caching(
                             key,
-                            [&sender.peer, &self_location.peer].as_slice(),
+                            [&sender.peer(), &self_location.peer()].as_slice(),
                         );
 
                         if let Some(forward_target) = next_target {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                next_peer = %forward_target.peer,
+                                next_peer = %forward_target.peer(),
                                 "Contract not found - forwarding SeekNode to next peer"
                             );
 
                             // Forward SeekNode to the next peer
                             return_msg = Some(UpdateMsg::SeekNode {
                                 id: *id,
-                                sender: self_location.clone(),
                                 target: forward_target,
                                 value: value.clone(),
                                 key: *key,
@@ -471,14 +486,14 @@ impl Operation for UpdateOp {
                             new_state = None;
                         } else {
                             // No more peers to try - capture context for diagnostics
-                            let skip_list = [&sender.peer, &self_location.peer];
+                            let skip_list = [&sender.peer(), &self_location.peer()];
                             let subscribers = op_manager
                                 .ring
                                 .subscribers_of(key)
                                 .map(|subs| {
                                     subs.value()
                                         .iter()
-                                        .map(|loc| format!("{:.8}", loc.peer))
+                                        .map(|loc| format!("{:.8}", loc.peer()))
                                         .collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default();
@@ -486,7 +501,7 @@ impl Operation for UpdateOp {
                                 .ring
                                 .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
                                 .into_iter()
-                                .map(|loc| format!("{:.8}", loc.peer))
+                                .map(|loc| format!("{:.8}", loc.peer()))
                                 .collect::<Vec<_>>();
                             let connection_count =
                                 op_manager.ring.connection_manager.num_connections();
@@ -496,7 +511,7 @@ impl Operation for UpdateOp {
                                 subscribers = ?subscribers,
                                 candidates = ?candidates,
                                 connection_count,
-                                sender = %sender.peer,
+                                sender = %sender.peer(),
                                 "Cannot handle UPDATE SeekNode: contract not found and no peers to forward to"
                             );
                             return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
@@ -507,9 +522,13 @@ impl Operation for UpdateOp {
                     id,
                     key,
                     new_value,
-                    sender,
-                    target,
+                    target: _,
                 } => {
+                    // Get sender from connection-based routing
+                    let sender = sender_from_addr
+                        .clone()
+                        .expect("BroadcastTo requires source_addr");
+                    let self_location = op_manager.ring.connection_manager.own_location();
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let UpdateExecution {
                         value: updated_value,
@@ -534,12 +553,12 @@ impl Operation for UpdateOp {
                         return_msg = None;
                     } else {
                         let broadcast_to =
-                            op_manager.get_broadcast_targets_update(key, &sender.peer);
+                            op_manager.get_broadcast_targets_update(key, &sender.peer());
 
                         tracing::debug!(
                             "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
                             key,
-                            target.location
+                            self_location.location
                         );
 
                         match try_to_broadcast(
@@ -571,7 +590,6 @@ impl Operation for UpdateOp {
                     upstream: _upstream,
                     ..
                 } => {
-                    let sender = op_manager.ring.connection_manager.own_location();
                     let mut broadcasted_to = *broadcasted_to;
 
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
@@ -581,10 +599,9 @@ impl Operation for UpdateOp {
                             id: *id,
                             key: *key,
                             new_value: new_value.clone(),
-                            sender: sender.clone(),
                             target: peer.clone(),
                         };
-                        let f = conn_manager.send(&peer.peer, msg.into());
+                        let f = conn_manager.send(peer.addr(), msg.into());
                         broadcasting.push(f);
                     }
                     let error_futures = futures::future::join_all(broadcasting)
@@ -605,11 +622,11 @@ impl Operation for UpdateOp {
                         let peer = broadcast_to.get(peer_num).unwrap();
                         tracing::warn!(
                             "failed broadcasting update change to {} with error {}; dropping connection",
-                            peer.peer,
+                            peer.peer(),
                             err
                         );
                         // TODO: review this, maybe we should just dropping this subscription
-                        conn_manager.drop_connection(&peer.peer).await?;
+                        conn_manager.drop_connection(peer.addr()).await?;
                         incorrect_results += 1;
                     }
 
@@ -625,7 +642,7 @@ impl Operation for UpdateOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg, stats)
+            build_op_result(self.id, new_state, return_msg, stats, self.upstream_addr)
         })
     }
 }
@@ -634,7 +651,7 @@ impl Operation for UpdateOp {
 async fn try_to_broadcast(
     id: Transaction,
     last_hop: bool,
-    op_manager: &OpManager,
+    _op_manager: &OpManager,
     state: Option<UpdateState>,
     (broadcast_to, upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
     key: ContractKey,
@@ -672,7 +689,6 @@ async fn try_to_broadcast(
                     broadcast_to,
                     key,
                     upstream,
-                    sender: op_manager.ring.connection_manager.own_location(),
                 });
             } else {
                 new_state = None;
@@ -702,8 +718,8 @@ impl OpManager {
                     .filter(|pk| {
                         // Allow the sender (or ourselves) to stay in the broadcast list when we're
                         // originating the UPDATE so local auto-subscribes still receive events.
-                        let is_sender = &pk.peer == sender;
-                        let is_self = self_peer.as_ref() == Some(&pk.peer);
+                        let is_sender = &pk.peer() == sender;
+                        let is_self = self_peer.as_ref() == Some(&pk.peer());
                         if is_sender || is_self {
                             allow_self
                         } else {
@@ -723,7 +739,7 @@ impl OpManager {
                 sender,
                 subscribers
                     .iter()
-                    .map(|s| format!("{:.8}", s.peer))
+                    .map(|s| format!("{:.8}", s.peer()))
                     .collect::<Vec<_>>()
                     .join(","),
                 subscribers.len()
@@ -735,7 +751,7 @@ impl OpManager {
                 .ring
                 .k_closest_potentially_caching(key, skip_slice, 5)
                 .into_iter()
-                .map(|candidate| format!("{:.8}", candidate.peer))
+                .map(|candidate| format!("{:.8}", candidate.peer()))
                 .collect::<Vec<_>>();
 
             tracing::warn!(
@@ -756,15 +772,21 @@ fn build_op_result(
     state: Option<UpdateState>,
     return_msg: Option<UpdateMsg>,
     stats: Option<UpdateStats>,
+    upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<super::OperationResult, OpError> {
+    // Extract target address from the message for routing
+    let target_addr = return_msg.as_ref().and_then(|m| m.target_addr());
+
     let output_op = state.map(|op| UpdateOp {
         id,
         state: Some(op),
         stats,
+        upstream_addr,
     });
     let state = output_op.map(OpEnum::Update);
     Ok(OperationResult {
         return_msg: return_msg.map(NetMessage::from),
+        target_addr,
         state,
     })
 }
@@ -911,6 +933,7 @@ pub(crate) fn start_op(
         id,
         state,
         stats: Some(UpdateStats { target: None }),
+        upstream_addr: None, // Local operation, no upstream peer
     }
 }
 
@@ -935,6 +958,7 @@ pub(crate) fn start_op_with_id(
         id,
         state,
         stats: Some(UpdateStats { target: None }),
+        upstream_addr: None, // Local operation, no upstream peer
     }
 }
 
@@ -964,7 +988,7 @@ pub(crate) async fn request_update(
         // Clone and filter out self from subscribers to prevent self-targeting
         let mut filtered_subscribers: Vec<_> = subscribers
             .iter()
-            .filter(|sub| sub.peer != sender.peer)
+            .filter(|sub| sub.peer() != sender.peer())
             .cloned()
             .collect();
         filtered_subscribers.pop()
@@ -978,7 +1002,7 @@ pub(crate) async fn request_update(
         // Find the best peer to send the update to
         let remote_target = op_manager
             .ring
-            .closest_potentially_caching(&key, [sender.peer.clone()].as_slice());
+            .closest_potentially_caching(&key, [sender.peer().clone()].as_slice());
 
         if let Some(target) = remote_target {
             // Subscribe to the contract
@@ -1038,7 +1062,7 @@ pub(crate) async fn request_update(
             }
 
             // Check if there are any subscribers to broadcast to
-            let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer);
+            let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer());
 
             deliver_update_result(op_manager, id, key, summary.clone()).await?;
 
@@ -1101,7 +1125,7 @@ pub(crate) async fn request_update(
     tracing::debug!(
         tx = %id,
         %key,
-        target_peer = %target.peer,
+        target_peer = %target.peer(),
         "Applying UPDATE locally before forwarding to target peer"
     );
 
@@ -1137,7 +1161,6 @@ pub(crate) async fn request_update(
     let msg = UpdateMsg::RequestUpdate {
         id,
         key,
-        sender,
         related_contracts,
         target,
         value: updated_value, // Send the updated value, not the original
@@ -1176,6 +1199,7 @@ async fn deliver_update_result(
             summary: summary.clone(),
         }),
         stats: None,
+        upstream_addr: None, // Terminal state, no routing needed
     };
 
     let host_result = op.to_host_result();
@@ -1233,7 +1257,6 @@ mod messages {
         RequestUpdate {
             id: Transaction,
             key: ContractKey,
-            sender: PeerKeyLocation,
             target: PeerKeyLocation,
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
@@ -1244,7 +1267,6 @@ mod messages {
         },
         SeekNode {
             id: Transaction,
-            sender: PeerKeyLocation,
             target: PeerKeyLocation,
             value: WrappedState,
             key: ContractKey,
@@ -1260,12 +1282,10 @@ mod messages {
             new_value: WrappedState,
             //contract: ContractContainer,
             upstream: PeerKeyLocation,
-            sender: PeerKeyLocation,
         },
         /// Broadcasting a change to a peer, which then will relay the changes to other peers.
         BroadcastTo {
             id: Transaction,
-            sender: PeerKeyLocation,
             key: ContractKey,
             new_value: WrappedState,
             target: PeerKeyLocation,
@@ -1304,12 +1324,17 @@ mod messages {
     }
 
     impl UpdateMsg {
-        pub fn sender(&self) -> Option<&PeerKeyLocation> {
+        // sender() method removed - use connection-based routing via source_addr instead
+
+        /// Returns the socket address of the target peer for routing.
+        /// Used by OperationResult to determine where to send the message.
+        pub fn target_addr(&self) -> Option<std::net::SocketAddr> {
             match self {
-                Self::RequestUpdate { sender, .. } => Some(sender),
-                Self::SeekNode { sender, .. } => Some(sender),
-                Self::BroadcastTo { sender, .. } => Some(sender),
-                _ => None,
+                Self::RequestUpdate { target, .. }
+                | Self::SeekNode { target, .. }
+                | Self::BroadcastTo { target, .. } => target.socket_addr(),
+                // AwaitUpdate and Broadcasting are internal messages, no network target
+                Self::AwaitUpdate { .. } | Self::Broadcasting { .. } => None,
             }
         }
     }
