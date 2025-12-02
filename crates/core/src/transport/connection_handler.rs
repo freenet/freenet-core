@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
@@ -65,7 +65,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     listen_port: u16,
     is_gateway: bool,
     bandwidth_limit: Option<usize>,
-    known_gateways: &[PeerKeyLocation],
+    _known_gateways: &[PeerKeyLocation],
 ) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
     // Bind the UDP socket to the specified port
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
@@ -82,23 +82,12 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         is_gateway,
         "UDP socket bound successfully"
     );
-    let gateway_addrs: Option<Arc<HashSet<SocketAddr>>> = if is_gateway {
-        None
-    } else {
-        Some(Arc::new(
-            known_gateways
-                .iter()
-                .map(|g| g.addr())
-                .collect::<HashSet<_>>(),
-        ))
-    };
     let (och, new_connection_notifier) = OutboundConnectionHandler::config_listener(
         Arc::new(socket),
         keypair,
         is_gateway,
         (listen_host, listen_port).into(),
         bandwidth_limit,
-        gateway_addrs.clone(),
     )?;
     Ok((
         och,
@@ -133,7 +122,6 @@ impl OutboundConnectionHandler {
         is_gateway: bool,
         socket_addr: SocketAddr,
         bandwidth_limit: Option<usize>,
-        known_gateway_addrs: Option<Arc<HashSet<SocketAddr>>>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
@@ -156,7 +144,6 @@ impl OutboundConnectionHandler {
             last_drop_warning: Instant::now(),
             bandwidth_limit,
             expected_non_gateway: expected_non_gateway.clone(),
-            known_gateway_addrs: known_gateway_addrs.clone(),
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
@@ -192,7 +179,7 @@ impl OutboundConnectionHandler {
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
-        Self::config_listener(socket, keypair, is_gateway, socket_addr, None, None)
+        Self::config_listener(socket, keypair, is_gateway, socket_addr, None)
     }
 
     pub async fn connect(
@@ -250,7 +237,6 @@ struct UdpPacketsListener<S = UdpSocket> {
     last_drop_warning: Instant,
     bandwidth_limit: Option<usize>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
-    known_gateway_addrs: Option<Arc<HashSet<SocketAddr>>>,
 }
 
 type OngoingConnection = (
@@ -416,14 +402,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
 
-                            let is_known_gateway = self
-                                .known_gateway_addrs
-                                .as_ref()
-                                .map(|set| set.contains(&remote_addr))
-                                .unwrap_or(false);
-
-                            if self.is_gateway || is_known_gateway {
+                            if self.is_gateway {
                                 // Handle gateway-intro packets (peer -> gateway)
+                                // Note: We only enter this path when this node IS a gateway.
+                                // Previously, `is_known_gateway` was also checked here, but that
+                                // caused NAT peers to misroute gateway ACKs to this handler instead
+                                // of the traverse_nat handler, breaking peer->gateway connections.
 
                                 // Check if we already have a gateway connection in progress
                                 if ongoing_gw_connections.contains_key(&remote_addr) {
