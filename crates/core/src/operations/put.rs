@@ -988,8 +988,10 @@ fn build_op_result(
     msg: Option<PutMsg>,
     upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<OperationResult, OpError> {
-    // Extract target address from the message for routing
-    let target_addr = msg.as_ref().and_then(|m| m.target_addr());
+    // For routing, prefer upstream_addr (the actual connection address) over msg.target_addr().
+    // msg.target_addr() may return None if the target's address is unknown (NAT scenario).
+    // upstream_addr is set when we receive a message and need to route a response back.
+    let target_addr = upstream_addr.or_else(|| msg.as_ref().and_then(|m| m.target_addr()));
 
     let output_op = state.map(|op| PutOp {
         id,
