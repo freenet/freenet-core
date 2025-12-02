@@ -1,4 +1,4 @@
-use crate::message::Transaction;
+use crate::message::{Transaction, TransactionType};
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -47,11 +47,125 @@ impl LiveTransactionTracker {
         self.tx_per_peer.contains_key(&peer_addr)
     }
 
-    pub(crate) fn still_alive(&self, tx: &Transaction) -> bool {
-        self.tx_per_peer.iter().any(|e| e.value().contains(tx))
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.tx_per_peer.len()
+    }
+
+    /// Returns the total number of active transactions across all peers.
+    #[cfg(test)]
+    pub(crate) fn active_transaction_count(&self) -> usize {
+        self.tx_per_peer
+            .iter()
+            .map(|entry| entry.value().len())
+            .sum()
+    }
+
+    /// Returns the number of active Connect transactions across all peers.
+    /// Used to limit concurrent connection acquisition attempts.
+    pub(crate) fn active_connect_transaction_count(&self) -> usize {
+        self.tx_per_peer
+            .iter()
+            .map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .filter(|tx| tx.transaction_type() == TransactionType::Connect)
+                    .count()
+            })
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::connect::ConnectMsg;
+    use crate::operations::get::GetMsg;
+    use crate::operations::put::PutMsg;
+
+    #[test]
+    fn active_transaction_count_empty() {
+        let tracker = LiveTransactionTracker::new();
+        assert_eq!(tracker.active_transaction_count(), 0);
+    }
+
+    #[test]
+    fn active_transaction_count_single_peer() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+        assert_eq!(tracker.active_transaction_count(), 1);
+
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+        assert_eq!(tracker.active_transaction_count(), 2);
+    }
+
+    #[test]
+    fn active_transaction_count_multiple_peers() {
+        let tracker = LiveTransactionTracker::new();
+        let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        tracker.add_transaction(addr1, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(addr1, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(addr2, Transaction::new::<ConnectMsg>());
+
+        assert_eq!(tracker.active_transaction_count(), 3);
+    }
+
+    #[test]
+    fn active_transaction_count_after_removal() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        let tx1 = Transaction::new::<ConnectMsg>();
+        let tx2 = Transaction::new::<ConnectMsg>();
+
+        tracker.add_transaction(addr, tx1);
+        tracker.add_transaction(addr, tx2);
+        assert_eq!(tracker.active_transaction_count(), 2);
+
+        tracker.remove_finished_transaction(tx1);
+        assert_eq!(tracker.active_transaction_count(), 1);
+
+        tracker.remove_finished_transaction(tx2);
+        assert_eq!(tracker.active_transaction_count(), 0);
+    }
+
+    #[test]
+    fn active_connect_transaction_count_filters_by_type() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // Add mixed transaction types
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(addr, Transaction::new::<GetMsg>());
+        tracker.add_transaction(addr, Transaction::new::<PutMsg>());
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+
+        // Total count should be 4
+        assert_eq!(tracker.active_transaction_count(), 4);
+        // Connect count should only be 2
+        assert_eq!(tracker.active_connect_transaction_count(), 2);
+    }
+
+    #[test]
+    fn active_connect_transaction_count_empty() {
+        let tracker = LiveTransactionTracker::new();
+        assert_eq!(tracker.active_connect_transaction_count(), 0);
+    }
+
+    #[test]
+    fn active_connect_transaction_count_no_connects() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // Add only non-connect transactions
+        tracker.add_transaction(addr, Transaction::new::<GetMsg>());
+        tracker.add_transaction(addr, Transaction::new::<PutMsg>());
+
+        assert_eq!(tracker.active_transaction_count(), 2);
+        assert_eq!(tracker.active_connect_transaction_count(), 0);
     }
 }

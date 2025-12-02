@@ -20,7 +20,7 @@ use crate::topology::rate::Rate;
 use crate::topology::TopologyAdjustment;
 use crate::tracing::{NetEventLog, NetEventRegister};
 
-use crate::transport::TransportPublicKey;
+use crate::transport::{ObservedAddr, TransportPublicKey};
 use crate::util::Contains;
 use crate::{
     config::GlobalExecutor,
@@ -327,12 +327,19 @@ impl Ring {
     }
 
     /// Will return an error in case the max number of subscribers has been added.
+    ///
+    /// The `upstream_addr` parameter is the transport-level address from which the subscribe
+    /// message was received. This is used instead of the address embedded in `subscriber`
+    /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
+    /// The transport address is the only reliable way to route back to them.
     pub fn add_subscriber(
         &self,
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
+        upstream_addr: Option<ObservedAddr>,
     ) -> Result<(), ()> {
-        self.seeding_manager.add_subscriber(contract, subscriber)
+        self.seeding_manager
+            .add_subscriber(contract, subscriber, upstream_addr)
     }
 
     /// Remove a subscriber by peer ID from a specific contract
@@ -383,6 +390,11 @@ impl Ring {
 
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
+        /// Maximum number of concurrent connection acquisition attempts.
+        /// Allows parallel connection attempts to speed up network formation
+        /// instead of serial blocking on a single connection at a time.
+        const MAX_CONCURRENT_CONNECTIONS: usize = 3;
+
         let mut check_interval = tokio::time::interval(CHECK_TICK_DURATION);
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut refresh_density_map = tokio::time::interval(REGENERATE_DENSITY_MAP_INTERVAL);
@@ -393,7 +405,6 @@ impl Ring {
         tokio::time::sleep(Duration::from_secs(2)).await;
         tracing::info!("Connection maintenance task: initial sleep completed");
 
-        let mut live_tx = None;
         let mut pending_conn_adds = BTreeSet::new();
         let mut this_peer = None;
         loop {
@@ -416,20 +427,18 @@ impl Ring {
             let mut skip_list = HashSet::new();
             skip_list.insert(this_peer);
 
-            // if there are no open connections, we need to acquire more
-            if let Some(tx) = &live_tx {
-                if !live_tx_tracker.still_alive(tx) {
-                    let _ = live_tx.take();
-                }
-            }
-
+            // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit
+            // Only count Connect transactions, not all operations (Get/Put/Subscribe/Update)
+            let active_count = live_tx_tracker.active_connect_transaction_count();
             if let Some(ideal_location) = pending_conn_adds.pop_first() {
-                if live_tx.is_none() {
+                if active_count < MAX_CONCURRENT_CONNECTIONS {
                     tracing::info!(
+                        active_connections = active_count,
+                        max_concurrent = MAX_CONCURRENT_CONNECTIONS,
                         "Attempting to acquire new connection for location: {:?}",
                         ideal_location
                     );
-                    live_tx = self
+                    let tx = self
                         .acquire_new(
                             ideal_location,
                             &skip_list,
@@ -445,18 +454,23 @@ impl Ring {
                             );
                             error
                         })?;
-                    if live_tx.is_none() {
+                    if tx.is_none() {
                         let conns = self.connection_manager.connection_count();
                         tracing::warn!(
                             "acquire_new returned None - likely no peers to query through (connections: {})",
                             conns
                         );
                     } else {
-                        tracing::info!("Successfully initiated connection acquisition");
+                        tracing::info!(
+                            active_connections = active_count + 1,
+                            "Successfully initiated connection acquisition"
+                        );
                     }
                 } else {
                     tracing::debug!(
-                        "Skipping connection attempt - live transaction still active, re-queuing location {}",
+                        active_connections = active_count,
+                        max_concurrent = MAX_CONCURRENT_CONNECTIONS,
+                        "At max concurrent connections, re-queuing location {}",
                         ideal_location
                     );
                     pending_conn_adds.insert(ideal_location);

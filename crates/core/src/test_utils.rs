@@ -829,20 +829,6 @@ static RESERVED_SOCKETS: Lazy<DashMap<u16, (std::net::UdpSocket, std::net::TcpLi
 ///
 /// The sockets are kept alive in a global map to prevent the OS from
 /// reassigning the port before the test node binds to it.
-///
-/// ## Known Issue: Race Window on Self-Hosted Runners
-///
-/// There is an unavoidable race condition between releasing the reservation
-/// and the node binding to the port. On busy self-hosted runners, another
-/// process may occasionally grab the port in this window, causing "Address
-/// already in use" failures.
-///
-/// This is a transient issue - retriggering the test typically succeeds.
-/// A complete fix would require either:
-/// - SO_REUSEADDR on both reservation and node sockets
-/// - Dedicated test port ranges via sysctl ip_local_reserved_ports
-/// - Network namespace isolation for tests
-/// - Restructuring test framework to build nodes before configs
 pub fn reserve_local_port() -> anyhow::Result<u16> {
     const MAX_ATTEMPTS: usize = 128;
     for _ in 0..MAX_ATTEMPTS {

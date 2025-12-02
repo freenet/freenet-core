@@ -549,9 +549,14 @@ impl Operation for GetOp {
                     );
 
                     // Use sender_from_addr (looked up from source_addr) instead of message field
-                    let sender = sender_from_addr.clone().expect(
-                        "RequestGet requires sender lookup from connection - source_addr should resolve to known peer",
-                    );
+                    let Some(sender) = sender_from_addr.clone() else {
+                        tracing::warn!(
+                            tx = %id,
+                            %key,
+                            "GET: RequestGet without sender lookup - cannot process"
+                        );
+                        return Err(OpError::invalid_transition(self.id));
+                    };
 
                     // Check if operation is already completed
                     if matches!(self.state, Some(GetState::Finished { .. })) {
@@ -702,9 +707,14 @@ impl Operation for GetOp {
                     let this_peer = target.clone();
 
                     // Use sender_from_addr (looked up from source_addr) instead of message field
-                    let sender = sender_from_addr.clone().expect(
-                        "SeekNode requires sender lookup from connection - source_addr should resolve to known peer",
-                    );
+                    let Some(sender) = sender_from_addr.clone() else {
+                        tracing::warn!(
+                            tx = %id,
+                            %key,
+                            "GET: SeekNode without sender lookup - cannot process"
+                        );
+                        return Err(OpError::invalid_transition(self.id));
+                    };
 
                     if htl == 0 {
                         let sender_display = sender.peer().to_string();
@@ -854,23 +864,21 @@ impl Operation for GetOp {
                     let id = *id;
                     let key = *key;
 
-                    // Handle case where sender lookup failed (e.g., peer disconnected)
+                    // Use sender_from_addr for logging
                     let Some(sender) = sender_from_addr.clone() else {
                         tracing::warn!(
                             tx = %id,
                             %key,
-                            source = ?source_addr,
-                            "GET: ReturnGet (empty) received but sender lookup failed - cannot process"
+                            "GET: ReturnGet without sender lookup - cannot process"
                         );
                         return Err(OpError::invalid_transition(self.id));
                     };
 
-                    // Use pub_key for logging to avoid panics on Unknown addresses
                     tracing::info!(
                         tx = %id,
                         %key,
-                        from = %sender.pub_key(),
-                        to = %target.pub_key(),
+                        from = %sender.peer(),
+                        to = %target.peer(),
                         skip = ?skip_list,
                         "GET: ReturnGet received with empty value"
                     );
@@ -882,7 +890,7 @@ impl Operation for GetOp {
                         %this_peer,
                         "Neither contract or contract value for contract found at peer {}, \
                         retrying with other peers",
-                        sender.pub_key()
+                        sender.peer()
                     );
 
                     match self.state {
@@ -901,10 +909,8 @@ impl Operation for GetOp {
                         }) => {
                             // todo: register in the stats for the outcome of the op that failed to get a response from this peer
 
-                            // Add the failed peer to tried list (only if address is known)
-                            if let Some(addr) = sender.socket_addr() {
-                                tried_peers.insert(PeerId::new(addr, sender.pub_key().clone()));
-                            }
+                            // Add the failed peer to tried list
+                            tried_peers.insert(sender.peer().clone());
 
                             // First, check if we have alternatives at this hop level
                             if !alternatives.is_empty() && attempts_at_hop < DEFAULT_MAX_BREADTH {
@@ -914,7 +920,7 @@ impl Operation for GetOp {
                                 tracing::info!(
                                     tx = %id,
                                     %key,
-                                    next_peer = %next_target.pub_key(),
+                                    next_peer = %next_target.peer(),
                                     fetch_contract,
                                     attempts_at_hop = attempts_at_hop + 1,
                                     max_attempts = DEFAULT_MAX_BREADTH,
@@ -932,11 +938,8 @@ impl Operation for GetOp {
                                     skip_list: tried_peers.clone(),
                                 });
 
-                                // Update state with the new alternative being tried (only if address is known)
-                                if let Some(addr) = next_target.socket_addr() {
-                                    tried_peers
-                                        .insert(PeerId::new(addr, next_target.pub_key().clone()));
-                                }
+                                // Update state with the new alternative being tried
+                                tried_peers.insert(next_target.peer().clone());
                                 let updated_tried_peers = tried_peers.clone();
                                 new_state = Some(GetState::AwaitingResponse {
                                     retries,
@@ -1125,9 +1128,14 @@ impl Operation for GetOp {
                     let key = *key;
 
                     // Use sender_from_addr for logging
-                    let sender = sender_from_addr.clone().expect(
-                        "ReturnGet requires sender lookup from connection - source_addr should resolve to known peer",
-                    );
+                    let Some(sender) = sender_from_addr.clone() else {
+                        tracing::warn!(
+                            tx = %id,
+                            %key,
+                            "GET: ReturnGet without sender lookup - cannot process"
+                        );
+                        return Err(OpError::invalid_transition(self.id));
+                    };
 
                     tracing::info!(tx = %id, %key, "Received get response with state: {:?}", self.state.as_ref().unwrap());
 
