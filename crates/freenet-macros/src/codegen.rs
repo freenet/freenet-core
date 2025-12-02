@@ -196,7 +196,11 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
         if is_gw {
             // Gateway node configuration
             let location_expr = node_location(args, idx, node_label);
+            let network_port_var = format_ident!("network_port_{}", idx);
+            let ws_port_var_local = format_ident!("ws_port_{}", idx);
             setup_code.push(quote! {
+                let #network_port_var = freenet::test_utils::reserve_local_port()?;
+                let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
                     let key = freenet::dev_tool::TransportKeypair::new();
@@ -204,8 +208,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_port = freenet::test_utils::reserve_local_port()?;
-                    let ws_port = freenet::test_utils::reserve_local_port()?;
+                    let network_port = #network_port_var;
+                    let ws_port = #ws_port_var_local;
 
                     let location: f64 = #location_expr;
 
@@ -311,7 +315,11 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
             };
 
             // Peer node configuration
+            let network_port_var = format_ident!("network_port_{}", idx);
+            let ws_port_var_local = format_ident!("ws_port_{}", idx);
             setup_code.push(quote! {
+                let #network_port_var = freenet::test_utils::reserve_local_port()?;
+                let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
                     let key = freenet::dev_tool::TransportKeypair::new();
@@ -319,8 +327,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
-                    let network_port = freenet::test_utils::reserve_local_port()?;
-                    let ws_port = freenet::test_utils::reserve_local_port()?;
+                    let network_port = #network_port_var;
+                    let ws_port = #ws_port_var_local;
 
                     let location: f64 = #location_expr;
 
@@ -397,12 +405,19 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
         let node_var = format_ident!("node_{}", idx);
         let flush_handle_var = format_ident!("flush_handle_{}", idx);
         let config_var = format_ident!("config_{}", idx);
+        let network_port_var = format_ident!("network_port_{}", idx);
+        let ws_port_var = format_ident!("ws_port_{}", idx);
 
         builds.push(quote! {
             tracing::info!("Building node: {}", #node_label);
             let built_config = #config_var.build().await?;
             let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
             #connection_tuning
+
+            // Release ports immediately before building node (minimizes race window)
+            freenet::test_utils::release_local_port(#network_port_var);
+            freenet::test_utils::release_local_port(#ws_port_var);
+
             let (#node_var, #flush_handle_var) = node_config
                 .build_with_flush_handle(freenet::server::serve_gateway(built_config.ws_api).await)
                 .await?;
@@ -444,18 +459,17 @@ fn generate_node_tasks(args: &FreenetTestArgs) -> TokenStream {
 }
 
 /// Extract values from configs before they're moved
+/// Note: ws_port and network_port are already defined at top level by generate_config_setup,
+/// so we only need to extract location here.
 fn generate_value_extraction(args: &FreenetTestArgs) -> TokenStream {
     let mut value_extractions = Vec::new();
 
     for (idx, _node_label) in args.nodes.iter().enumerate() {
         let config_var = format_ident!("config_{}", idx);
-        let ws_port_var = format_ident!("ws_port_{}", idx);
-        let network_port_var = format_ident!("network_port_{}", idx);
         let location_var = format_ident!("location_{}", idx);
 
         value_extractions.push(quote! {
-            let #ws_port_var = #config_var.ws_api.ws_api_port.unwrap();
-            let #network_port_var = #config_var.network_api.public_port;
+            // ws_port_X and network_port_X already exist from reserve_local_port calls
             let #location_var = #config_var.network_api.location.unwrap();
         });
     }
@@ -483,7 +497,7 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
                 label: #node_label.to_string(),
                 temp_dir_path: #temp_var.path().to_path_buf(),
                 ws_port: #ws_port_var,
-                network_port: #network_port_var,
+                network_port: Some(#network_port_var),
                 is_gateway: #is_gw,
                 location: #location_var,
             }
@@ -506,7 +520,6 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
 fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident) -> TokenStream {
     let timeout_secs = args.timeout_secs;
     let startup_wait_secs = args.startup_wait_secs;
-    let wait_for_connections = args.wait_for_connections;
 
     // Generate select! arms for each node
     let mut select_arms = Vec::new();
@@ -540,50 +553,14 @@ fn generate_test_coordination(args: &FreenetTestArgs, inner_fn_name: &syn::Ident
         }
     });
 
-    // Generate the startup waiting code based on wait_for_connections flag
-    let startup_wait_code = if wait_for_connections {
-        // Determine expected_connections: use explicit value or default to 1
-        // (each peer should connect to at least one gateway)
-        let expected_conn = args.expected_connections.unwrap_or(1);
-        let expected_conn_lit =
-            syn::LitInt::new(&expected_conn.to_string(), proc_macro2::Span::call_site());
-
-        // Use condition-based waiting: poll for connection events
-        quote! {
-            // Wait for peer nodes to establish connections (condition-based)
-            tracing::info!(
-                "Waiting for connections to be established (timeout: {} seconds)",
-                #startup_wait_secs
-            );
-            let connection_timeout = Duration::from_secs(#startup_wait_secs);
-            let poll_interval = Duration::from_millis(500);
-            // Expected connections per peer (configurable via expected_connections parameter)
-            let expected_connections = #expected_conn_lit;
-
-            match ctx.wait_for_connections(expected_connections, connection_timeout, poll_interval).await {
-                Ok(()) => {
-                    tracing::info!("All connections established, running test");
-                }
-                Err(e) => {
-                    tracing::warn!("Connection wait failed: {}. Proceeding with test anyway.", e);
-                }
-            }
-        }
-    } else {
-        // Use fixed timing wait (backward compatible behavior)
-        quote! {
-            // Wait for nodes to start (fixed timing)
-            tracing::info!("Waiting {} seconds for nodes to start up", #startup_wait_secs);
-            tokio::time::sleep(Duration::from_secs(#startup_wait_secs)).await;
-            tracing::info!("Nodes should be ready, running test");
-        }
-    };
-
     quote! {
         let test_future = tokio::time::timeout(
             Duration::from_secs(#timeout_secs),
             async {
-                #startup_wait_code
+                // Wait for nodes to start
+                tracing::info!("Waiting {} seconds for nodes to start up", #startup_wait_secs);
+                tokio::time::sleep(Duration::from_secs(#startup_wait_secs)).await;
+                tracing::info!("Nodes should be ready, running test");
 
                 // Run user's test
                 #inner_fn_name(&mut ctx).await
