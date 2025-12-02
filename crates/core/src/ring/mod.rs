@@ -38,10 +38,8 @@ mod location;
 mod peer_key_location;
 mod score;
 mod seeding;
-mod transient_manager;
 
 use self::score::Score;
-pub(crate) use self::transient_manager::TransientConnectionManager;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
@@ -653,7 +651,6 @@ impl Ring {
             ttl,
             target_connections,
             op_manager.connect_forward_estimator.clone(),
-            false, // is_gateway: connection_maintenance is for peers, not gateways
         );
 
         live_tx_tracker.add_transaction(query_target.addr(), tx);
