@@ -385,7 +385,7 @@ impl OpManager {
             .all_network_subscriptions()
             .into_iter()
             .map(|(contract_key, subscribers)| {
-                let peer_ids: Vec<PeerId> = subscribers.into_iter().map(|sub| sub.peer).collect();
+                let peer_ids: Vec<PeerId> = subscribers.into_iter().map(|sub| sub.peer()).collect();
                 (contract_key, peer_ids)
             })
             .collect()
@@ -646,7 +646,7 @@ impl OpManager {
         }
         self.ring
             .live_tx_tracker
-            .add_transaction(peer.clone(), *transaction);
+            .add_transaction(peer.addr, *transaction);
     }
 }
 
