@@ -428,7 +428,8 @@ impl Ring {
             skip_list.insert(this_peer);
 
             // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit
-            let active_count = live_tx_tracker.active_transaction_count();
+            // Only count Connect transactions, not all operations (Get/Put/Subscribe/Update)
+            let active_count = live_tx_tracker.active_connect_transaction_count();
             if let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if active_count < MAX_CONCURRENT_CONNECTIONS {
                     tracing::info!(
