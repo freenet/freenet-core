@@ -1327,9 +1327,11 @@ impl<'a> arbitrary::Arbitrary<'a> for PeerId {
 impl PeerId {
     pub fn random() -> Self {
         use rand::Rng;
+        let mut rng = rand::rng();
         let mut addr = [0; 4];
-        rand::rng().fill(&mut addr[..]);
-        let port = crate::util::get_free_port().unwrap();
+        rng.fill(&mut addr[..]);
+        // Use random port instead of get_free_port() for speed - tests don't actually bind
+        let port: u16 = rng.random_range(1024..65535);
 
         let pub_key = PEER_ID.with(|peer_id| {
             let mut peer_id = peer_id.borrow_mut();

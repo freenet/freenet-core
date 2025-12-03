@@ -129,9 +129,11 @@ impl PeerKeyLocation {
             static CACHED_KEY: RefCell<Option<TransportPublicKey>> = const { RefCell::new(None) };
         }
 
+        let mut rng = rand::rng();
         let mut addr_bytes = [0u8; 4];
-        rand::rng().fill(&mut addr_bytes[..]);
-        let port = crate::util::get_free_port().unwrap();
+        rng.fill(&mut addr_bytes[..]);
+        // Use random port instead of get_free_port() for speed - tests don't actually bind
+        let port: u16 = rng.random_range(1024..65535);
         let addr = SocketAddr::from((addr_bytes, port));
 
         let pub_key = CACHED_KEY.with(|cached| {
