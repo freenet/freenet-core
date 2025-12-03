@@ -189,11 +189,27 @@ impl Display for PeerKeyLocation {
 }
 
 #[cfg(test)]
+thread_local! {
+    static CACHED_PUB_KEY: std::cell::RefCell<Option<crate::transport::TransportPublicKey>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for PeerKeyLocation {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         use crate::transport::TransportKeypair;
         let addr: SocketAddr = u.arbitrary()?;
-        let pub_key = TransportKeypair::new().public().clone();
+        // Cache the public key to avoid expensive keypair generation on each call
+        let pub_key = CACHED_PUB_KEY.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            match &*cached {
+                Some(k) => k.clone(),
+                None => {
+                    let key = TransportKeypair::new().public().clone();
+                    cached.replace(key.clone());
+                    key
+                }
+            }
+        });
         Ok(PeerKeyLocation {
             pub_key,
             peer_addr: PeerAddr::Known(addr),
