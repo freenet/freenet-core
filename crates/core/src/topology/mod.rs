@@ -456,7 +456,7 @@ impl TopologyManager {
                     info!(
                         current_connections,
                         max_allowed = self.limits.max_connections,
-                        peer = %peer.peer(),
+                        peer = %peer,
                         "Enforcing max-connections cap via fallback removal"
                     );
                     adj = TopologyAdjustment::RemoveConnections(vec![peer]);
@@ -776,7 +776,7 @@ mod tests {
         let worst_peer = &peers[worst_ix];
         let mut neighbor_locations = BTreeMap::new();
         for peer in &peers {
-            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
         }
 
         let adjustment = resource_manager.adjust_topology(
@@ -798,14 +798,7 @@ mod tests {
     fn test_add_connections() {
         let mut resource_manager = setup_topology_manager(1000.0);
         // Generate 5 peers with locations specified in a vec!
-        let mut peers: Vec<PeerKeyLocation> = generate_random_peers(5);
-        let peer_locations: Vec<Location> = [0.1, 0.3, 0.5, 0.7, 0.9]
-            .into_iter()
-            .map(Location::new)
-            .collect();
-        for (ix, peer) in peers.iter_mut().enumerate() {
-            peer.location = Some(peer_locations[ix]);
-        }
+        let peers: Vec<PeerKeyLocation> = generate_random_peers(5);
 
         // Total bw usage will be way lower than MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION, triggering
         // the TopologyManager to add a connection
@@ -823,7 +816,7 @@ mod tests {
 
         let mut neighbor_locations = BTreeMap::new();
         for peer in &peers {
-            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
         }
 
         let adjustment = resource_manager.adjust_topology(
@@ -838,8 +831,8 @@ mod tests {
                 assert_eq!(locations.len(), 1);
                 // Location should be between peers[0] and peers[1] because they have the highest
                 // number of requests per hour for any adjacent peers
-                assert!(locations[0] >= peers[0].location.unwrap());
-                assert!(locations[0] <= peers[1].location.unwrap());
+                assert!(locations[0] >= peers[0].location().unwrap());
+                assert!(locations[0] <= peers[1].location().unwrap());
             }
             _ => panic!("Expected to add a connection, adjustment was {adjustment:?}"),
         }
@@ -866,7 +859,7 @@ mod tests {
 
         let mut neighbor_locations = BTreeMap::new();
         for peer in &peers {
-            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
         }
 
         let adjustment =
@@ -899,7 +892,7 @@ mod tests {
 
         let mut neighbor_locations = BTreeMap::new();
         for peer in &peers {
-            neighbor_locations.insert(peer.location.unwrap(), vec![]);
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
         }
 
         let my_location = Location::random();
@@ -973,7 +966,7 @@ mod tests {
                 // For simplicity we'll just assume that the target location of the request is the
                 // neighboring peer's own location
                 resource_manager
-                    .report_outbound_request(peers[i].clone(), peers[i].location.unwrap());
+                    .report_outbound_request(peers[i].clone(), peers[i].location().unwrap());
             }
         }
     }
@@ -1045,7 +1038,7 @@ mod tests {
         // Simulate having 1 existing connection
         let mut neighbor_locations = BTreeMap::new();
         let peer = PeerKeyLocation::random();
-        neighbor_locations.insert(peer.location.unwrap(), vec![]);
+        neighbor_locations.insert(peer.location().unwrap(), vec![]);
 
         let adjustment = topology_manager.adjust_topology(
             &neighbor_locations,

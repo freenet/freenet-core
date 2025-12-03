@@ -13,11 +13,12 @@ use crate::contract::{
     ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
     WaitingResolution,
 };
-use crate::dev_tool::{PeerId, Transaction};
+use crate::dev_tool::Transaction;
 use crate::message::{NetMessage, NodeEvent};
+use crate::ring::PeerKeyLocation;
 
 // P2pBridgeEvent type alias for the event bridge channel
-pub type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
+pub type P2pBridgeEvent = Either<(PeerKeyLocation, Box<NetMessage>), NodeEvent>;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]

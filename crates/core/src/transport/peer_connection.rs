@@ -47,6 +47,7 @@ pub(crate) struct RemoteConnection {
     pub(super) inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
     pub(super) inbound_symmetric_key: Aes128Gcm,
     pub(super) inbound_symmetric_key_bytes: [u8; 16],
+    #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
     pub(super) transport_secret_key: TransportSecretKey,
     pub(super) bandwidth_limit: Option<usize>,
@@ -543,6 +544,7 @@ impl PeerConnection {
     }
 
     /// Returns the external address of the peer holding this connection.
+    #[allow(dead_code)]
     pub fn my_address(&self) -> Option<SocketAddr> {
         self.remote_conn.my_address
     }

@@ -20,16 +20,20 @@ pub(crate) struct TransientEntry {
 
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
-    pending_reservations: Arc<RwLock<BTreeMap<PeerId, Location>>>,
-    pub(super) location_for_peer: Arc<RwLock<BTreeMap<PeerId, Location>>>,
+    /// Pending connection reservations, keyed by socket address.
+    pending_reservations: Arc<RwLock<BTreeMap<SocketAddr, Location>>>,
+    /// Mapping from socket address to location for established connections.
+    pub(super) location_for_peer: Arc<RwLock<BTreeMap<SocketAddr, Location>>>,
     pub(super) topology_manager: Arc<RwLock<TopologyManager>>,
     connections_by_location: Arc<RwLock<BTreeMap<Location, Vec<Connection>>>>,
     /// Interim connections ongoing handshake or successfully open connections
     /// Is important to keep track of this so no more connections are accepted prematurely.
     own_location: Arc<AtomicU64>,
-    peer_key: Arc<Mutex<Option<PeerId>>>,
+    /// Our own socket address, set once we know it (e.g., from gateway observation).
+    own_addr: Arc<Mutex<Option<SocketAddr>>>,
     is_gateway: bool,
-    transient_connections: Arc<DashMap<PeerId, TransientEntry>>,
+    /// Transient connections keyed by socket address.
+    transient_connections: Arc<DashMap<SocketAddr, TransientEntry>>,
     transient_in_use: Arc<AtomicUsize>,
     transient_budget: usize,
     transient_ttl: Duration,
@@ -77,9 +81,9 @@ impl ConnectionManager {
 
         let own_location = if let Some(location) = config.location {
             AtomicU64::new(u64::from_le_bytes(location.as_f64().to_le_bytes()))
-        } else if let Some(peer_key) = &config.peer_id {
-            // if the peer id is set, then the location must be set, since it is a gateway
-            let location = Location::from_address(&peer_key.addr);
+        } else if let Some(addr) = config.own_addr {
+            // if the address is set, compute location from it (gateway case)
+            let location = Location::from_address(&addr);
             AtomicU64::new(u64::from_le_bytes(location.as_f64().to_le_bytes()))
         } else {
             // for location here consider -1 == None
@@ -94,7 +98,7 @@ impl ConnectionManager {
             rnd_if_htl_above,
             (
                 config.key_pair.public().clone(),
-                config.peer_id.clone(),
+                config.own_addr,
                 own_location,
             ),
             config.is_gateway,
@@ -110,7 +114,7 @@ impl ConnectionManager {
         min_connections: usize,
         max_connections: usize,
         rnd_if_htl_above: usize,
-        (pub_key, peer_id, own_location): (TransportPublicKey, Option<PeerId>, AtomicU64),
+        (pub_key, own_addr, own_location): (TransportPublicKey, Option<SocketAddr>, AtomicU64),
         is_gateway: bool,
         transient_budget: usize,
         transient_ttl: Duration,
@@ -128,7 +132,7 @@ impl ConnectionManager {
             pending_reservations: Arc::new(RwLock::new(BTreeMap::new())),
             topology_manager,
             own_location: own_location.into(),
-            peer_key: Arc::new(Mutex::new(peer_id)),
+            own_addr: Arc::new(Mutex::new(own_addr)),
             is_gateway,
             transient_connections: Arc::new(DashMap::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
@@ -146,11 +150,11 @@ impl ConnectionManager {
     ///
     /// # Panic
     /// Will panic if the node checking for this condition has no location assigned.
-    pub fn should_accept(&self, location: Location, peer_id: &PeerId) -> bool {
+    pub fn should_accept(&self, location: Location, addr: SocketAddr) -> bool {
         // Don't accept connections from ourselves
-        if let Some(own_id) = self.get_peer_key() {
-            if &own_id == peer_id {
-                tracing::warn!(%peer_id, "should_accept: rejecting self-connection attempt");
+        if let Some(own_addr) = self.get_own_addr() {
+            if own_addr == addr {
+                tracing::warn!(%addr, "should_accept: rejecting self-connection attempt");
                 return false;
             }
         }
@@ -160,7 +164,7 @@ impl ConnectionManager {
         let reserved_before = self.pending_reservations.read().len();
 
         tracing::info!(
-            %peer_id,
+            %addr,
             open,
             reserved_before,
             is_gateway = self.is_gateway,
@@ -172,22 +176,22 @@ impl ConnectionManager {
 
         if self.is_gateway && (open > 0 || reserved_before > 0) {
             tracing::info!(
-                %peer_id,
+                %addr,
                 open,
                 reserved_before,
                 "Gateway evaluating additional direct connection (post-bootstrap)"
             );
         }
 
-        if self.location_for_peer.read().get(peer_id).is_some() {
+        if self.location_for_peer.read().get(&addr).is_some() {
             // We've already accepted this peer (pending or active); treat as a no-op acceptance.
-            tracing::debug!(%peer_id, "Peer already pending/connected; acknowledging acceptance");
+            tracing::debug!(%addr, "Peer already pending/connected; acknowledging acceptance");
             return true;
         }
 
         {
             let mut pending = self.pending_reservations.write();
-            pending.insert(peer_id.clone(), location);
+            pending.insert(addr, location);
         }
 
         let total_conn = match reserved_before
@@ -197,26 +201,26 @@ impl ConnectionManager {
             Some(val) => val,
             None => {
                 tracing::error!(
-                    %peer_id,
+                    %addr,
                     reserved_before,
                     open,
                     "connection counters would overflow; rejecting connection"
                 );
-                self.pending_reservations.write().remove(peer_id);
+                self.pending_reservations.write().remove(&addr);
                 return false;
             }
         };
 
         if open == 0 {
-            tracing::debug!(%peer_id, "should_accept: first connection -> accepting");
+            tracing::debug!(%addr, "should_accept: first connection -> accepting");
             return true;
         }
 
         let accepted = if total_conn < self.min_connections {
-            tracing::info!(%peer_id, total_conn, "should_accept: accepted (below min connections)");
+            tracing::info!(%addr, total_conn, "should_accept: accepted (below min connections)");
             true
         } else if total_conn >= self.max_connections {
-            tracing::info!(%peer_id, total_conn, "should_accept: rejected (max connections reached)");
+            tracing::info!(%addr, total_conn, "should_accept: rejected (max connections reached)");
             false
         } else {
             let accepted = self
@@ -226,7 +230,7 @@ impl ConnectionManager {
                 .unwrap_or(true);
 
             tracing::info!(
-                %peer_id,
+                %addr,
                 total_conn,
                 accepted,
                 "should_accept: topology manager decision"
@@ -234,7 +238,7 @@ impl ConnectionManager {
             accepted
         };
         tracing::info!(
-            %peer_id,
+            %addr,
             accepted,
             total_conn,
             open_connections = open,
@@ -244,10 +248,10 @@ impl ConnectionManager {
             "should_accept: final decision"
         );
         if !accepted {
-            self.pending_reservations.write().remove(peer_id);
+            self.pending_reservations.write().remove(&addr);
         } else {
-            tracing::info!(%peer_id, total_conn, "should_accept: accepted (reserving spot)");
-            self.record_pending_location(peer_id, location);
+            tracing::info!(%addr, total_conn, "should_accept: accepted (reserving spot)");
+            self.record_pending_location(addr, location);
         }
         accepted
     }
@@ -257,20 +261,20 @@ impl ConnectionManager {
     /// This makes the peer discoverable to the routing layer even before the connection
     /// is fully established. The entry is removed automatically if the handshake fails
     /// via `prune_in_transit_connection`.
-    pub fn record_pending_location(&self, peer_id: &PeerId, location: Location) {
+    pub fn record_pending_location(&self, addr: SocketAddr, location: Location) {
         let mut locations = self.location_for_peer.write();
-        let entry = locations.entry(peer_id.clone());
+        let entry = locations.entry(addr);
         match entry {
             Entry::Occupied(_) => {
                 tracing::info!(
-                    %peer_id,
+                    %addr,
                     %location,
                     "record_pending_location: location already known"
                 );
             }
             Entry::Vacant(v) => {
                 tracing::info!(
-                    %peer_id,
+                    %addr,
                     %location,
                     "record_pending_location: registering advertised location for peer"
                 );
@@ -294,53 +298,49 @@ impl ConnectionManager {
         }
     }
 
-    /// Returns this node location in the ring, if any (must have join the ring already).
+    /// Returns this node location in the ring, if any (must have joined the ring already).
     ///
     /// # Panic
     ///
-    /// Will panic if the node has no peer id assigned yet.
+    /// Will panic if the node has no address assigned yet.
     pub fn own_location(&self) -> PeerKeyLocation {
         let location = f64::from_le_bytes(
             self.own_location
                 .load(std::sync::atomic::Ordering::Acquire)
                 .to_le_bytes(),
         );
-        let location = if (location - -1f64).abs() < f64::EPSILON {
+        let _location = if (location - -1f64).abs() < f64::EPSILON {
             None
         } else {
             Some(Location::new(location))
         };
-        let peer = self.get_peer_key().expect("peer key not set");
-        let mut pkl = PeerKeyLocation::from(peer);
-        pkl.location = location;
-        pkl
+        let addr = self.get_own_addr().expect("own address not set");
+        PeerKeyLocation::new((*self.pub_key).clone(), addr)
     }
 
-    pub fn get_peer_key(&self) -> Option<PeerId> {
-        self.peer_key.lock().clone()
+    /// Returns our own socket address if set.
+    pub fn get_own_addr(&self) -> Option<SocketAddr> {
+        *self.own_addr.lock()
     }
 
-    /// Look up a PeerId by socket address from connections_by_location or transient connections.
-    pub fn get_peer_by_addr(&self, addr: SocketAddr) -> Option<PeerId> {
+    /// Look up a PeerKeyLocation by socket address from connections_by_location or transient connections.
+    pub fn get_peer_by_addr(&self, addr: SocketAddr) -> Option<PeerKeyLocation> {
         // Check connections by location
         let connections = self.connections_by_location.read();
         for conns in connections.values() {
             for conn in conns {
-                if conn.location.addr() == addr {
-                    return Some(conn.location.peer());
+                if conn.location.socket_addr() == Some(addr) {
+                    return Some(conn.location.clone());
                 }
             }
         }
         drop(connections);
 
         // Check transient connections
-        if let Some((peer, _)) = self
-            .transient_connections
-            .iter()
-            .find(|e| e.key().addr == addr)
-            .map(|e| (e.key().clone(), e.value().clone()))
-        {
-            return Some(peer);
+        if self.transient_connections.contains_key(&addr) {
+            // For transient connections, we don't have full peer info yet
+            // Return None since we don't have the public key
+            return None;
         }
         None
     }
@@ -352,24 +352,14 @@ impl ConnectionManager {
         let connections = self.connections_by_location.read();
         for conns in connections.values() {
             for conn in conns {
-                if conn.location.addr() == addr {
+                if conn.location.socket_addr() == Some(addr) {
                     return Some(conn.location.clone());
                 }
             }
         }
         drop(connections);
 
-        // Check transient connections - construct PeerKeyLocation from PeerId
-        if let Some((peer, entry)) = self
-            .transient_connections
-            .iter()
-            .find(|e| e.key().addr == addr)
-            .map(|e| (e.key().clone(), e.value().clone()))
-        {
-            let mut pkl = PeerKeyLocation::new(peer.pub_key, peer.addr);
-            pkl.location = entry.location;
-            return Some(pkl);
-        }
+        // Transient connections don't have full PeerKeyLocation info
         None
     }
 
@@ -379,9 +369,9 @@ impl ConnectionManager {
 
     /// Attempts to register a transient connection, enforcing the configured budget.
     /// Returns `false` when the budget is exhausted, leaving the map unchanged.
-    pub fn try_register_transient(&self, peer: PeerId, location: Option<Location>) -> bool {
-        if self.transient_connections.contains_key(&peer) {
-            if let Some(mut entry) = self.transient_connections.get_mut(&peer) {
+    pub fn try_register_transient(&self, addr: SocketAddr, location: Option<Location>) -> bool {
+        if self.transient_connections.contains_key(&addr) {
+            if let Some(mut entry) = self.transient_connections.get_mut(&addr) {
                 entry.location = location;
             }
             return true;
@@ -392,13 +382,12 @@ impl ConnectionManager {
             return false;
         }
 
-        let key = peer.clone();
         self.transient_connections
-            .insert(peer, TransientEntry { location });
+            .insert(addr, TransientEntry { location });
         let prev = self.transient_in_use.fetch_add(1, Ordering::SeqCst);
         if prev >= self.transient_budget {
             // Undo if we raced past the budget.
-            self.transient_connections.remove(&key);
+            self.transient_connections.remove(&addr);
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
             return false;
         }
@@ -408,10 +397,10 @@ impl ConnectionManager {
 
     /// Drops a transient connection and returns its metadata, if it existed.
     /// Also decrements the transient budget counter.
-    pub fn drop_transient(&self, peer: &PeerId) -> Option<TransientEntry> {
+    pub fn drop_transient(&self, addr: SocketAddr) -> Option<TransientEntry> {
         let removed = self
             .transient_connections
-            .remove(peer)
+            .remove(&addr)
             .map(|(_, entry)| entry);
         if removed.is_some() {
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
@@ -420,8 +409,8 @@ impl ConnectionManager {
     }
 
     /// Check whether a peer is currently tracked as transient.
-    pub fn is_transient(&self, peer: &PeerId) -> bool {
-        self.transient_connections.contains_key(peer)
+    pub fn is_transient(&self, addr: SocketAddr) -> bool {
+        self.transient_connections.contains_key(&addr)
     }
 
     /// Current number of tracked transient connections.
@@ -439,61 +428,70 @@ impl ConnectionManager {
         self.transient_ttl
     }
 
-    /// Sets the peer id if is not already set, or returns the current peer id.
-    pub fn try_set_peer_key(&self, addr: SocketAddr) -> Option<PeerId> {
-        let mut this_peer = self.peer_key.lock();
-        if this_peer.is_none() {
-            *this_peer = Some(PeerId::new(addr, (*self.pub_key).clone()));
+    /// Sets the own address if it is not already set, or returns the current address.
+    pub fn try_set_own_addr(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        let mut own_addr = self.own_addr.lock();
+        if own_addr.is_none() {
+            *own_addr = Some(addr);
             None
         } else {
-            this_peer.clone()
+            *own_addr
         }
     }
 
-    pub fn prune_alive_connection(&self, peer: &PeerId) -> Option<Location> {
-        self.prune_connection(peer, true)
+    pub fn prune_alive_connection(&self, addr: SocketAddr) -> Option<Location> {
+        self.prune_connection(addr, true)
     }
 
-    pub fn prune_in_transit_connection(&self, peer: &PeerId) -> Option<Location> {
-        self.prune_connection(peer, false)
+    pub fn prune_in_transit_connection(&self, addr: SocketAddr) -> Option<Location> {
+        self.prune_connection(addr, false)
     }
 
-    pub fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
-        tracing::info!(%peer, %loc, %was_reserved, "Adding connection to topology");
-        debug_assert!(self.get_peer_key().expect("should be set") != peer);
+    pub fn add_connection(
+        &self,
+        loc: Location,
+        addr: SocketAddr,
+        pub_key: TransportPublicKey,
+        was_reserved: bool,
+    ) {
+        tracing::info!(%addr, %loc, %was_reserved, "Adding connection to topology");
+        debug_assert!(self.get_own_addr().expect("should be set") != addr);
         if was_reserved {
-            self.pending_reservations.write().remove(&peer);
+            self.pending_reservations.write().remove(&addr);
         }
         let mut lop = self.location_for_peer.write();
-        let previous_location = lop.insert(peer.clone(), loc);
+        let previous_location = lop.insert(addr, loc);
         drop(lop);
 
         // Enforce the global cap when adding a new peer (relocations reuse the existing slot).
         if previous_location.is_none() && self.connection_count() >= self.max_connections {
             tracing::warn!(
-                %peer,
+                %addr,
                 %loc,
                 max = self.max_connections,
                 "add_connection: rejecting new connection to enforce cap"
             );
             // Roll back bookkeeping since we're refusing the connection.
-            self.location_for_peer.write().remove(&peer);
+            self.location_for_peer.write().remove(&addr);
             if was_reserved {
-                self.pending_reservations.write().remove(&peer);
+                self.pending_reservations.write().remove(&addr);
             }
             return;
         }
 
         if let Some(prev_loc) = previous_location {
             tracing::info!(
-                %peer,
+                %addr,
                 %prev_loc,
                 %loc,
                 "add_connection: replacing existing connection for peer"
             );
             let mut cbl = self.connections_by_location.write();
             if let Some(prev_list) = cbl.get_mut(&prev_loc) {
-                if let Some(pos) = prev_list.iter().position(|c| c.location.peer() == peer) {
+                if let Some(pos) = prev_list
+                    .iter()
+                    .position(|c| c.location.socket_addr() == Some(addr))
+                {
                     prev_list.swap_remove(pos);
                 }
                 if prev_list.is_empty() {
@@ -505,72 +503,73 @@ impl ConnectionManager {
         {
             let mut cbl = self.connections_by_location.write();
             cbl.entry(loc).or_default().push(Connection {
-                location: PeerKeyLocation::with_location(peer.pub_key.clone(), peer.addr, loc),
+                location: PeerKeyLocation::new(pub_key, addr),
             });
         }
     }
 
-    pub fn update_peer_identity(&self, old_peer: &PeerId, new_peer: PeerId) -> bool {
-        if old_peer.addr == new_peer.addr && old_peer.pub_key == new_peer.pub_key {
-            tracing::debug!(%old_peer, "update_peer_identity: identical peers; skipping");
+    pub fn update_peer_identity(
+        &self,
+        old_addr: SocketAddr,
+        new_addr: SocketAddr,
+        new_pub_key: TransportPublicKey,
+    ) -> bool {
+        if old_addr == new_addr {
+            tracing::debug!(%old_addr, "update_peer_identity: same address; skipping");
             return false;
         }
 
         let mut loc_for_peer = self.location_for_peer.write();
-        let Some(loc) = loc_for_peer.remove(old_peer) else {
+        let Some(loc) = loc_for_peer.remove(&old_addr) else {
             tracing::debug!(
-                %old_peer,
-                %new_peer,
+                %old_addr,
+                %new_addr,
                 "update_peer_identity: old peer entry not found"
             );
             return false;
         };
 
-        tracing::info!(%old_peer, %new_peer, %loc, "Updating peer identity for active connection");
-        loc_for_peer.insert(new_peer.clone(), loc);
+        tracing::info!(%old_addr, %new_addr, %loc, "Updating peer identity for active connection");
+        loc_for_peer.insert(new_addr, loc);
         drop(loc_for_peer);
 
         let mut cbl = self.connections_by_location.write();
         let entry = cbl.entry(loc).or_default();
         if let Some(conn) = entry
             .iter_mut()
-            .find(|conn| conn.location.peer() == *old_peer)
+            .find(|conn| conn.location.socket_addr() == Some(old_addr))
         {
             // Update the public key and address to match the new peer
-            conn.location.pub_key = new_peer.pub_key.clone();
-            conn.location.set_addr(new_peer.addr);
+            conn.location.pub_key = new_pub_key.clone();
+            conn.location.set_addr(new_addr);
         } else {
             tracing::warn!(
-                %old_peer,
+                %old_addr,
                 "update_peer_identity: connection entry missing; creating placeholder"
             );
             entry.push(Connection {
-                location: PeerKeyLocation::with_location(
-                    new_peer.pub_key.clone(),
-                    new_peer.addr,
-                    loc,
-                ),
+                location: PeerKeyLocation::new(new_pub_key, new_addr),
             });
         }
 
         true
     }
 
-    fn prune_connection(&self, peer: &PeerId, is_alive: bool) -> Option<Location> {
+    fn prune_connection(&self, addr: SocketAddr, is_alive: bool) -> Option<Location> {
         let connection_type = if is_alive { "active" } else { "in transit" };
-        tracing::debug!(%peer, "Pruning {} connection", connection_type);
+        tracing::debug!(%addr, "Pruning {} connection", connection_type);
 
         let mut locations_for_peer = self.location_for_peer.write();
 
-        let Some(loc) = locations_for_peer.remove(peer) else {
+        let Some(loc) = locations_for_peer.remove(&addr) else {
             if is_alive {
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
             } else {
-                let removed = self.pending_reservations.write().remove(peer).is_some();
+                let removed = self.pending_reservations.write().remove(&addr).is_some();
                 if !removed {
                     tracing::warn!(
-                        %peer,
+                        %addr,
                         "prune_connection: no pending reservation to release for in-transit peer"
                     );
                 }
@@ -580,13 +579,16 @@ impl ConnectionManager {
 
         let conns = &mut *self.connections_by_location.write();
         if let Some(conns) = conns.get_mut(&loc) {
-            if let Some(pos) = conns.iter().position(|c| &c.location.peer() == peer) {
+            if let Some(pos) = conns
+                .iter()
+                .position(|c| c.location.socket_addr() == Some(addr))
+            {
                 conns.swap_remove(pos);
             }
         }
 
         if !is_alive {
-            self.pending_reservations.write().remove(peer);
+            self.pending_reservations.write().remove(&addr);
         }
 
         Some(loc)
@@ -611,9 +613,9 @@ impl ConnectionManager {
         self.pending_reservations.read().len()
     }
 
-    pub fn has_connection_or_pending(&self, peer: &PeerId) -> bool {
-        self.location_for_peer.read().contains_key(peer)
-            || self.pending_reservations.read().contains_key(peer)
+    pub fn has_connection_or_pending(&self, addr: SocketAddr) -> bool {
+        self.location_for_peer.read().contains_key(&addr)
+            || self.pending_reservations.read().contains_key(&addr)
     }
 
     pub(crate) fn get_connections_by_location(&self) -> BTreeMap<Location, Vec<Connection>> {
@@ -624,8 +626,8 @@ impl ConnectionManager {
     pub fn routing(
         &self,
         target: Location,
-        requesting: Option<&PeerId>,
-        skip_list: impl Contains<PeerId>,
+        requesting: Option<SocketAddr>,
+        skip_list: impl Contains<SocketAddr>,
         router: &Router,
     ) -> Option<PeerKeyLocation> {
         let candidates = self.routing_candidates(target, requesting, skip_list);
@@ -641,24 +643,24 @@ impl ConnectionManager {
     pub fn routing_candidates(
         &self,
         target: Location,
-        requesting: Option<&PeerId>,
-        skip_list: impl Contains<PeerId>,
+        requesting: Option<SocketAddr>,
+        skip_list: impl Contains<SocketAddr>,
     ) -> Vec<PeerKeyLocation> {
         let connections = self.connections_by_location.read();
         let candidates: Vec<PeerKeyLocation> = connections
             .values()
             .filter_map(|conns| {
                 let conn = conns.choose(&mut rand::rng())?;
-                if self.is_transient(&conn.location.peer()) {
+                let addr = conn.location.socket_addr()?;
+                if self.is_transient(addr) {
                     return None;
                 }
                 if let Some(requester) = requesting {
-                    if requester == &conn.location.peer() {
+                    if requester == addr {
                         return None;
                     }
                 }
-                (!skip_list.has_element(conn.location.peer().clone()))
-                    .then_some(conn.location.clone())
+                (!skip_list.has_element(addr)).then_some(conn.location.clone())
             })
             .collect();
 
@@ -666,10 +668,10 @@ impl ConnectionManager {
             total_locations = connections.len(),
             candidates = candidates.len(),
             target = %target,
-            self_peer = self
-                .get_peer_key()
+            self_addr = self
+                .get_own_addr()
                 .as_ref()
-                .map(|id| id.to_string())
+                .map(|a| a.to_string())
                 .unwrap_or_else(|| "unknown".into()),
             "routing candidates for next hop (non-transient only)"
         );
@@ -689,16 +691,15 @@ impl ConnectionManager {
     }
 
     #[allow(dead_code)]
-    pub(super) fn connected_peers(&self) -> impl Iterator<Item = PeerId> {
+    pub(super) fn connected_peers(&self) -> impl Iterator<Item = SocketAddr> {
         let read = self.location_for_peer.read();
-        read.keys().cloned().collect::<Vec<_>>().into_iter()
+        read.keys().copied().collect::<Vec<_>>().into_iter()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::PeerId;
     use crate::topology::rate::Rate;
     use crate::transport::TransportKeypair;
     use std::net::SocketAddr;
@@ -710,9 +711,8 @@ mod tests {
         // Create a peer id for our node
         let keypair = TransportKeypair::new();
         let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let own_peer_id = PeerId::new(addr, keypair.public().clone());
 
-        // Create connection manager with this peer id
+        // Create connection manager with this address
         let cm = ConnectionManager::init(
             Rate::new_per_second(1_000_000.0),
             Rate::new_per_second(1_000_000.0),
@@ -721,7 +721,7 @@ mod tests {
             7,
             (
                 keypair.public().clone(),
-                Some(own_peer_id.clone()),
+                Some(addr),
                 AtomicU64::new(u64::from_le_bytes(0.5f64.to_le_bytes())),
             ),
             false,
@@ -729,23 +729,22 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        // Verify the connection manager has our peer id set
-        assert_eq!(cm.get_peer_key(), Some(own_peer_id.clone()));
+        // Verify the connection manager has our address set
+        assert_eq!(cm.get_own_addr(), Some(addr));
 
         // Attempt to accept a connection from ourselves - should be rejected
         let location = Location::new(0.5);
-        let accepted = cm.should_accept(location, &own_peer_id);
+        let accepted = cm.should_accept(location, addr);
         assert!(!accepted, "should_accept must reject self-connection");
     }
 
     #[test]
     fn accepts_connection_from_different_peer() {
-        // Create our node's peer id
+        // Create our node's address
         let own_keypair = TransportKeypair::new();
         let own_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-        let own_peer_id = PeerId::new(own_addr, own_keypair.public().clone());
 
-        // Create connection manager with our peer id
+        // Create connection manager with our address
         let cm = ConnectionManager::init(
             Rate::new_per_second(1_000_000.0),
             Rate::new_per_second(1_000_000.0),
@@ -754,7 +753,7 @@ mod tests {
             7,
             (
                 own_keypair.public().clone(),
-                Some(own_peer_id.clone()),
+                Some(own_addr),
                 AtomicU64::new(u64::from_le_bytes(0.5f64.to_le_bytes())),
             ),
             false,
@@ -763,14 +762,11 @@ mod tests {
         );
 
         // Create a different peer
-        let other_keypair = TransportKeypair::new();
-        let other_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let other_peer_id = PeerId::new(other_addr, other_keypair.public().clone());
+        let other_addr: SocketAddr = "127.0.0.2:8001".parse().unwrap();
 
-        // Attempt to accept a connection from a different peer - should succeed
-        // (first connection with no other constraints)
+        // Attempt to accept a connection from a different peer - should be accepted
         let location = Location::new(0.6);
-        let accepted = cm.should_accept(location, &other_peer_id);
+        let accepted = cm.should_accept(location, other_addr);
         assert!(
             accepted,
             "should_accept must accept connection from different peer"

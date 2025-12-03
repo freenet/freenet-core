@@ -11,8 +11,9 @@ use crate::node::IsOperationCompleted;
 use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
-    node::{NetworkBridge, OpManager, PeerId},
+    node::{NetworkBridge, OpManager},
 };
+use std::net::SocketAddr;
 
 pub(crate) struct UpdateOp {
     pub id: Transaction,
@@ -164,26 +165,27 @@ impl Operation for UpdateOp {
                         .expect("RequestUpdate requires source_addr");
                     let self_location = op_manager.ring.connection_manager.own_location();
 
+                    let executing_addr = self_location.socket_addr();
+                    let request_sender_addr = request_sender.socket_addr();
+                    let target_addr_opt = target.socket_addr();
+
                     tracing::debug!(
                         tx = %id,
                         %key,
-                        executing_peer = %self_location.peer(),
-                        request_sender = %request_sender.peer(),
-                        target_peer = %target.peer(),
-                        "UPDATE RequestUpdate: executing_peer={} received request from={} targeting={}",
-                        self_location.peer(),
-                        request_sender.peer(),
-                        target.peer()
+                        executing_peer = ?executing_addr,
+                        request_sender = ?request_sender_addr,
+                        target_peer = ?target_addr_opt,
+                        "UPDATE RequestUpdate: executing_peer received request from sender targeting peer"
                     );
 
                     // If target is not us, this message is meant for another peer
                     // This can happen when the initiator processes its own message before sending to network
-                    if target.peer() != self_location.peer() {
+                    if target_addr_opt != executing_addr {
                         tracing::debug!(
                             tx = %id,
                             %key,
-                            our_peer = %self_location.peer(),
-                            target_peer = %target.peer(),
+                            our_peer = ?executing_addr,
+                            target_peer = ?target_addr_opt,
                             "RequestUpdate target is not us - message will be routed to target"
                         );
                         // Keep current state, message will be sent to target peer via network
@@ -261,8 +263,11 @@ impl Operation for UpdateOp {
                                 return_msg = None;
                             } else {
                                 // Get broadcast targets for propagating UPDATE to subscribers
-                                let broadcast_to = op_manager
-                                    .get_broadcast_targets_update(key, &request_sender.peer());
+                                let sender_addr = request_sender.socket_addr().expect(
+                                    "request_sender must have socket address for broadcast",
+                                );
+                                let broadcast_to =
+                                    op_manager.get_broadcast_targets_update(key, &sender_addr);
 
                                 if broadcast_to.is_empty() {
                                     tracing::debug!(
@@ -305,16 +310,26 @@ impl Operation for UpdateOp {
                             }
                         } else {
                             // Contract not found locally - forward to another peer
-                            let next_target = op_manager.ring.closest_potentially_caching(
-                                key,
-                                [&self_location.peer(), &request_sender.peer()].as_slice(),
-                            );
+                            let self_addr = self_location
+                                .socket_addr()
+                                .expect("self location must have socket address");
+                            let sender_addr = request_sender
+                                .socket_addr()
+                                .expect("request sender must have socket address");
+                            let skip_list = vec![self_addr, sender_addr];
+
+                            let next_target = op_manager
+                                .ring
+                                .closest_potentially_caching(key, skip_list.as_slice());
 
                             if let Some(forward_target) = next_target {
+                                let forward_addr = forward_target
+                                    .socket_addr()
+                                    .expect("forward target must have socket address");
                                 tracing::debug!(
                                     tx = %id,
                                     %key,
-                                    next_peer = %forward_target.peer(),
+                                    next_peer = %forward_addr,
                                     "Forwarding UPDATE to peer that might have contract"
                                 );
 
@@ -329,14 +344,14 @@ impl Operation for UpdateOp {
                                 new_state = None;
                             } else {
                                 // No peers available and we don't have the contract - capture context
-                                let skip_list = [&self_location.peer(), &request_sender.peer()];
                                 let subscribers = op_manager
                                     .ring
                                     .subscribers_of(key)
                                     .map(|subs| {
                                         subs.value()
                                             .iter()
-                                            .map(|loc| format!("{:.8}", loc.peer()))
+                                            .filter_map(|loc| loc.socket_addr())
+                                            .map(|addr| format!("{:.8}", addr))
                                             .collect::<Vec<_>>()
                                     })
                                     .unwrap_or_default();
@@ -344,7 +359,8 @@ impl Operation for UpdateOp {
                                     .ring
                                     .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
                                     .into_iter()
-                                    .map(|loc| format!("{:.8}", loc.peer()))
+                                    .filter_map(|loc| loc.socket_addr())
+                                    .map(|addr| format!("{:.8}", addr))
                                     .collect::<Vec<_>>();
                                 let connection_count =
                                     op_manager.ring.connection_manager.num_connections();
@@ -354,7 +370,7 @@ impl Operation for UpdateOp {
                                     subscribers = ?subscribers,
                                     candidates = ?candidates,
                                     connection_count,
-                                    request_sender = %request_sender.peer(),
+                                    request_sender = ?sender_addr,
                                     "Cannot handle UPDATE: contract not found locally and no peers to forward to"
                                 );
                                 return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
@@ -412,7 +428,7 @@ impl Operation for UpdateOp {
                             tx = %id,
                             "Successfully updated a value for contract {} @ {:?} - update",
                             key,
-                            self_location.location
+                            self_location.location()
                         );
 
                         if !changed {
@@ -425,8 +441,11 @@ impl Operation for UpdateOp {
                             return_msg = None;
                         } else {
                             // Get broadcast targets
+                            let sender_addr = sender
+                                .socket_addr()
+                                .expect("sender must have socket address for broadcast");
                             let broadcast_to =
-                                op_manager.get_broadcast_targets_update(key, &sender.peer());
+                                op_manager.get_broadcast_targets_update(key, &sender_addr);
 
                             // If no peers to broadcast to, nothing else to do
                             if broadcast_to.is_empty() {
@@ -462,16 +481,26 @@ impl Operation for UpdateOp {
                     } else {
                         // Contract not found - forward to another peer
                         let self_location = op_manager.ring.connection_manager.own_location();
-                        let next_target = op_manager.ring.closest_potentially_caching(
-                            key,
-                            [&sender.peer(), &self_location.peer()].as_slice(),
-                        );
+                        let self_addr = self_location
+                            .socket_addr()
+                            .expect("self location must have socket address");
+                        let sender_addr = sender
+                            .socket_addr()
+                            .expect("sender must have socket address");
+                        let skip_list = vec![sender_addr, self_addr];
+
+                        let next_target = op_manager
+                            .ring
+                            .closest_potentially_caching(key, skip_list.as_slice());
 
                         if let Some(forward_target) = next_target {
+                            let forward_addr = forward_target
+                                .socket_addr()
+                                .expect("forward target must have socket address");
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                next_peer = %forward_target.peer(),
+                                next_peer = %forward_addr,
                                 "Contract not found - forwarding SeekNode to next peer"
                             );
 
@@ -486,14 +515,14 @@ impl Operation for UpdateOp {
                             new_state = None;
                         } else {
                             // No more peers to try - capture context for diagnostics
-                            let skip_list = [&sender.peer(), &self_location.peer()];
                             let subscribers = op_manager
                                 .ring
                                 .subscribers_of(key)
                                 .map(|subs| {
                                     subs.value()
                                         .iter()
-                                        .map(|loc| format!("{:.8}", loc.peer()))
+                                        .filter_map(|loc| loc.socket_addr())
+                                        .map(|addr| format!("{:.8}", addr))
                                         .collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default();
@@ -501,7 +530,8 @@ impl Operation for UpdateOp {
                                 .ring
                                 .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
                                 .into_iter()
-                                .map(|loc| format!("{:.8}", loc.peer()))
+                                .filter_map(|loc| loc.socket_addr())
+                                .map(|addr| format!("{:.8}", addr))
                                 .collect::<Vec<_>>();
                             let connection_count =
                                 op_manager.ring.connection_manager.num_connections();
@@ -511,7 +541,7 @@ impl Operation for UpdateOp {
                                 subscribers = ?subscribers,
                                 candidates = ?candidates,
                                 connection_count,
-                                sender = %sender.peer(),
+                                sender = ?sender_addr,
                                 "Cannot handle UPDATE SeekNode: contract not found and no peers to forward to"
                             );
                             return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
@@ -552,13 +582,16 @@ impl Operation for UpdateOp {
                         new_state = None;
                         return_msg = None;
                     } else {
+                        let sender_addr = sender
+                            .socket_addr()
+                            .expect("sender must have socket address for broadcast");
                         let broadcast_to =
-                            op_manager.get_broadcast_targets_update(key, &sender.peer());
+                            op_manager.get_broadcast_targets_update(key, &sender_addr);
 
                         tracing::debug!(
                             "Successfully updated a value for contract {} @ {:?} - BroadcastTo - update",
                             key,
-                            self_location.location
+                            self_location.location()
                         );
 
                         match try_to_broadcast(
@@ -601,7 +634,10 @@ impl Operation for UpdateOp {
                             new_value: new_value.clone(),
                             target: peer.clone(),
                         };
-                        let f = conn_manager.send(peer.addr(), msg.into());
+                        let peer_addr = peer
+                            .socket_addr()
+                            .expect("broadcast target must have socket address");
+                        let f = conn_manager.send(peer_addr, msg.into());
                         broadcasting.push(f);
                     }
                     let error_futures = futures::future::join_all(broadcasting)
@@ -620,13 +656,16 @@ impl Operation for UpdateOp {
                     for (peer_num, err) in error_futures {
                         // remove the failed peers in reverse order
                         let peer = broadcast_to.get(peer_num).unwrap();
+                        let peer_addr = peer
+                            .socket_addr()
+                            .expect("broadcast target must have socket address");
                         tracing::warn!(
                             "failed broadcasting update change to {} with error {}; dropping connection",
-                            peer.peer(),
+                            peer_addr,
                             err
                         );
                         // TODO: review this, maybe we should just dropping this subscription
-                        conn_manager.drop_connection(peer.addr()).await?;
+                        conn_manager.drop_connection(peer_addr).await?;
                         incorrect_results += 1;
                     }
 
@@ -705,21 +744,21 @@ impl OpManager {
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
-        sender: &PeerId,
+        sender: &SocketAddr,
     ) -> Vec<PeerKeyLocation> {
         let subscribers = self
             .ring
             .subscribers_of(key)
             .map(|subs| {
-                let self_peer = self.ring.connection_manager.get_peer_key();
-                let allow_self = self_peer.as_ref().map(|me| me == sender).unwrap_or(false);
+                let self_addr = self.ring.connection_manager.get_own_addr();
+                let allow_self = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
                 subs.value()
                     .iter()
                     .filter(|pk| {
                         // Allow the sender (or ourselves) to stay in the broadcast list when we're
                         // originating the UPDATE so local auto-subscribes still receive events.
-                        let is_sender = &pk.peer() == sender;
-                        let is_self = self_peer.as_ref() == Some(&pk.peer());
+                        let is_sender = pk.socket_addr().as_ref() == Some(sender);
+                        let is_self = self_addr.as_ref() == pk.socket_addr().as_ref();
                         if is_sender || is_self {
                             allow_self
                         } else {
@@ -739,26 +778,28 @@ impl OpManager {
                 sender,
                 subscribers
                     .iter()
-                    .map(|s| format!("{:.8}", s.peer()))
+                    .filter_map(|s| s.socket_addr())
+                    .map(|addr| format!("{:.8}", addr))
                     .collect::<Vec<_>>()
                     .join(","),
                 subscribers.len()
             );
         } else {
-            let own_peer = self.ring.connection_manager.get_peer_key();
+            let own_addr = self.ring.connection_manager.get_own_addr();
             let skip_slice = std::slice::from_ref(sender);
             let fallback_candidates = self
                 .ring
                 .k_closest_potentially_caching(key, skip_slice, 5)
                 .into_iter()
-                .map(|candidate| format!("{:.8}", candidate.peer()))
+                .filter_map(|candidate| candidate.socket_addr())
+                .map(|addr| format!("{:.8}", addr))
                 .collect::<Vec<_>>();
 
             tracing::warn!(
                 "UPDATE_PROPAGATION: contract={:.8} from={} NO_TARGETS - update will not propagate (self={:?}, fallback_candidates={:?})",
                 key,
                 sender,
-                own_peer.map(|p| format!("{:.8}", p)),
+                own_addr.map(|a| format!("{:.8}", a)),
                 fallback_candidates
             );
         }
@@ -984,11 +1025,15 @@ pub(crate) async fn request_update(
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to update
+    let sender_addr = sender
+        .socket_addr()
+        .expect("own location must have socket address");
+
     let target_from_subscribers = if let Some(subscribers) = op_manager.ring.subscribers_of(&key) {
         // Clone and filter out self from subscribers to prevent self-targeting
         let mut filtered_subscribers: Vec<_> = subscribers
             .iter()
-            .filter(|sub| sub.peer() != sender.peer())
+            .filter(|sub| sub.socket_addr() != Some(sender_addr))
             .cloned()
             .collect();
         filtered_subscribers.pop()
@@ -1002,7 +1047,7 @@ pub(crate) async fn request_update(
         // Find the best peer to send the update to
         let remote_target = op_manager
             .ring
-            .closest_potentially_caching(&key, [sender.peer().clone()].as_slice());
+            .closest_potentially_caching(&key, [sender_addr].as_slice());
 
         if let Some(target) = remote_target {
             // Subscribe on behalf of the requesting peer (no upstream_addr - direct registration)
@@ -1062,7 +1107,7 @@ pub(crate) async fn request_update(
             }
 
             // Check if there are any subscribers to broadcast to
-            let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender.peer());
+            let broadcast_to = op_manager.get_broadcast_targets_update(&key, &sender_addr);
 
             deliver_update_result(op_manager, id, key, summary.clone()).await?;
 
@@ -1122,10 +1167,13 @@ pub(crate) async fn request_update(
     // Apply the update locally first to ensure the initiating peer has the updated state
     let id = update_op.id;
 
+    let target_addr = target
+        .socket_addr()
+        .expect("target must have socket address");
     tracing::debug!(
         tx = %id,
         %key,
-        target_peer = %target.peer(),
+        target_peer = %target_addr,
         "Applying UPDATE locally before forwarding to target peer"
     );
 

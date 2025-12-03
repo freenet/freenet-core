@@ -126,11 +126,11 @@ impl SeedingManager {
             .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS));
         let before = subs
             .iter()
-            .map(|loc| format!("{:.8}", loc.peer()))
+            .map(|loc| format!("{:.8}", loc.pub_key))
             .collect::<Vec<_>>();
         info!(
             %contract,
-            subscriber = %subscriber.peer(),
+            subscriber = %subscriber.pub_key,
             subscribers_before = ?before,
             current_len = subs.len(),
             "seeding_manager: attempting to add subscriber"
@@ -138,7 +138,7 @@ impl SeedingManager {
         if subs.len() >= Self::MAX_SUBSCRIBERS {
             warn!(
                 %contract,
-                subscriber = %subscriber.peer(),
+                subscriber = %subscriber.pub_key,
                 subscribers_before = ?before,
                 "seeding_manager: max subscribers reached"
             );
@@ -149,7 +149,7 @@ impl SeedingManager {
             Ok(_) => {
                 info!(
                     %contract,
-                    subscriber = %subscriber.peer(),
+                    subscriber = %subscriber.pub_key,
                     subscribers_before = ?before,
                     "seeding_manager: subscriber already registered"
                 );
@@ -159,7 +159,7 @@ impl SeedingManager {
                 if subs_vec.len() == Self::MAX_SUBSCRIBERS {
                     warn!(
                         %contract,
-                        subscriber = %subscriber.peer(),
+                        subscriber = %subscriber.pub_key,
                         subscribers_before = ?before,
                         "seeding_manager: max subscribers reached during insert"
                     );
@@ -168,7 +168,7 @@ impl SeedingManager {
                     subs_vec.insert(next_idx, subscriber);
                     let after = subs_vec
                         .iter()
-                        .map(|loc| format!("{:.8}", loc.peer()))
+                        .map(|loc| format!("{:.8}", loc.pub_key))
                         .collect::<Vec<_>>();
                     info!(
                         %contract,
@@ -190,12 +190,12 @@ impl SeedingManager {
 
     pub fn prune_subscriber(&self, loc: Location) {
         self.subscribers.alter_all(|contract_key, mut subs| {
-            if let Some(pos) = subs.iter().position(|l| l.location == Some(loc)) {
+            if let Some(pos) = subs.iter().position(|l| l.location() == Some(loc)) {
                 let removed = subs[pos].clone();
                 tracing::debug!(
                     %contract_key,
-                    removed_peer = %removed.peer(),
-                    removed_location = ?removed.location,
+                    removed_peer = %removed.pub_key,
+                    removed_location = ?removed.location(),
                     "seeding_manager: pruning subscriber due to location match"
                 );
                 subs.swap_remove(pos);
@@ -207,7 +207,10 @@ impl SeedingManager {
     /// Remove a subscriber by peer ID from a specific contract
     pub fn remove_subscriber_by_peer(&self, contract: &ContractKey, peer: &crate::node::PeerId) {
         if let Some(mut subs) = self.subscribers.get_mut(contract) {
-            if let Some(pos) = subs.iter().position(|l| &l.peer() == peer) {
+            if let Some(pos) = subs
+                .iter()
+                .position(|l| l.pub_key == peer.pub_key && l.socket_addr() == Some(peer.addr))
+            {
                 subs.swap_remove(pos);
                 tracing::debug!(
                     "Removed peer {} from subscriber list for contract {}",
@@ -252,21 +255,10 @@ mod tests {
         let peer2 = test_peer_id(2);
         let peer3 = test_peer_id(3);
 
-        let peer_loc1 = PeerKeyLocation::with_location(
-            peer1.pub_key.clone(),
-            peer1.addr,
-            Location::try_from(0.1).unwrap(),
-        );
-        let peer_loc2 = PeerKeyLocation::with_location(
-            peer2.pub_key.clone(),
-            peer2.addr,
-            Location::try_from(0.2).unwrap(),
-        );
-        let peer_loc3 = PeerKeyLocation::with_location(
-            peer3.pub_key.clone(),
-            peer3.addr,
-            Location::try_from(0.3).unwrap(),
-        );
+        // Location is now computed from address automatically
+        let peer_loc1 = PeerKeyLocation::new(peer1.pub_key.clone(), peer1.addr);
+        let peer_loc2 = PeerKeyLocation::new(peer2.pub_key.clone(), peer2.addr);
+        let peer_loc3 = PeerKeyLocation::new(peer3.pub_key.clone(), peer3.addr);
 
         // Add subscribers (test setup - no upstream_addr)
         assert!(seeding_manager
@@ -292,9 +284,15 @@ mod tests {
         {
             let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
             assert_eq!(subs.len(), 2);
-            assert!(!subs.iter().any(|p| p.peer() == peer2));
-            assert!(subs.iter().any(|p| p.peer() == peer1));
-            assert!(subs.iter().any(|p| p.peer() == peer3));
+            assert!(!subs
+                .iter()
+                .any(|p| p.pub_key == peer2.pub_key && p.socket_addr() == Some(peer2.addr)));
+            assert!(subs
+                .iter()
+                .any(|p| p.pub_key == peer1.pub_key && p.socket_addr() == Some(peer1.addr)));
+            assert!(subs
+                .iter()
+                .any(|p| p.pub_key == peer3.pub_key && p.socket_addr() == Some(peer3.addr)));
         }
 
         // Remove peer1
@@ -304,8 +302,12 @@ mod tests {
         {
             let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
             assert_eq!(subs.len(), 1);
-            assert!(!subs.iter().any(|p| p.peer() == peer1));
-            assert!(subs.iter().any(|p| p.peer() == peer3));
+            assert!(!subs
+                .iter()
+                .any(|p| p.pub_key == peer1.pub_key && p.socket_addr() == Some(peer1.addr)));
+            assert!(subs
+                .iter()
+                .any(|p| p.pub_key == peer3.pub_key && p.socket_addr() == Some(peer3.addr)));
         }
 
         // Remove non-existent peer (should not error)

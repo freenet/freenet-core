@@ -125,7 +125,13 @@ pub(crate) struct NetEventLog<'a> {
 
 impl<'a> NetEventLog<'a> {
     pub fn route_event(tx: &'a Transaction, ring: &'a Ring, route_event: &RouteEvent) -> Self {
-        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key,
+        );
         NetEventLog {
             tx,
             peer_id,
@@ -133,24 +139,34 @@ impl<'a> NetEventLog<'a> {
         }
     }
 
-    pub fn connected(ring: &'a Ring, peer: PeerId, location: Location) -> Self {
-        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
+    pub fn connected(ring: &'a Ring, peer: PeerId, _location: Location) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        let connected = PeerKeyLocation::new(peer.pub_key.clone(), peer.addr);
+        // Note: location is computed from address, so we don't need to set it separately
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
             kind: EventKind::Connect(ConnectEvent::Connected {
                 this: ring.connection_manager.own_location(),
-                connected: PeerKeyLocation::with_location(
-                    peer.pub_key.clone(),
-                    peer.addr,
-                    location,
-                ),
+                connected,
             }),
         }
     }
 
     pub fn disconnected(ring: &'a Ring, from: &'a PeerId) -> Self {
-        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
@@ -159,9 +175,11 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
-        let Some(peer_id) = ring.connection_manager.get_peer_key() else {
+        let own_loc = ring.connection_manager.own_location();
+        let Some(own_addr) = own_loc.socket_addr() else {
             return Either::Right(vec![]);
         };
+        let peer_id = PeerId::new(own_addr, own_loc.pub_key().clone());
         let kind = match msg {
             NetMessage::V1(NetMessageV1::Connect(connect::ConnectMsg::Response {
                 target, ..
@@ -190,10 +208,20 @@ impl<'a> NetEventLog<'a> {
                 target, payload, ..
             }) => {
                 let acceptor = payload.acceptor.clone();
+                let acceptor_peer = PeerId::new(
+                    acceptor
+                        .socket_addr()
+                        .expect("acceptor should have address"),
+                    acceptor.pub_key().clone(),
+                );
+                let target_peer = PeerId::new(
+                    target.socket_addr().expect("target should have address"),
+                    target.pub_key().clone(),
+                );
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
-                        peer_id: acceptor.peer().clone(),
+                        peer_id: acceptor_peer.clone(),
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: acceptor.clone(),
                             connected: target.clone(),
@@ -201,7 +229,7 @@ impl<'a> NetEventLog<'a> {
                     },
                     NetEventLog {
                         tx: msg.id(),
-                        peer_id: target.peer().clone(),
+                        peer_id: target_peer,
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: target.clone(),
                             connected: acceptor,
@@ -345,14 +373,16 @@ impl<'a> NetEventLog<'a> {
             }),
             _ => EventKind::Ignored,
         };
+        let own_loc = op_manager.ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: op_manager
-                .ring
-                .connection_manager
-                .get_peer_key()
-                .unwrap()
-                .clone(),
+            peer_id,
             kind,
         })
     }
@@ -655,23 +685,34 @@ async fn send_to_metrics_server(
 
     let res = match &send_msg.kind {
         EventKind::Connect(ConnectEvent::Connected {
-            this:
-                this_peer @ PeerKeyLocation {
-                    location: Some(from_loc),
-                    ..
-                },
-            connected:
-                connected_peer @ PeerKeyLocation {
-                    location: Some(to_loc),
-                    ..
-                },
+            this: this_peer,
+            connected: connected_peer,
         }) => {
-            let msg = PeerChange::added_connection_msg(
-                (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
-                (this_peer.peer().to_string(), from_loc.as_f64()),
-                (connected_peer.peer().to_string(), to_loc.as_f64()),
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            // Both peers must have known locations to send to metrics server
+            if let (Some(from_loc), Some(to_loc)) =
+                (this_peer.location(), connected_peer.location())
+            {
+                let this_id = PeerId::new(
+                    this_peer
+                        .socket_addr()
+                        .expect("this peer should have address"),
+                    this_peer.pub_key().clone(),
+                );
+                let connected_id = PeerId::new(
+                    connected_peer
+                        .socket_addr()
+                        .expect("connected peer should have address"),
+                    connected_peer.pub_key().clone(),
+                );
+                let msg = PeerChange::added_connection_msg(
+                    (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
+                    (this_id.to_string(), from_loc.as_f64()),
+                    (connected_id.to_string(), to_loc.as_f64()),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Disconnected { from } => {
             let msg = PeerChange::removed_connection_msg(
@@ -688,11 +729,15 @@ async fn send_to_metrics_server(
             ..
         }) => {
             let contract_location = Location::from_contract_key(key.as_bytes());
+            let target_id = PeerId::new(
+                target.socket_addr().expect("target should have address"),
+                target.pub_key().clone(),
+            );
             let msg = ContractChange::put_request_msg(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
-                target.peer().to_string(),
+                target_id.to_string(),
                 *timestamp,
                 contract_location.as_f64(),
             );
@@ -707,12 +752,15 @@ async fn send_to_metrics_server(
             ..
         }) => {
             let contract_location = Location::from_contract_key(key.as_bytes());
-
+            let target_id = PeerId::new(
+                target.socket_addr().expect("target should have address"),
+                target.pub_key().clone(),
+            );
             let msg = ContractChange::put_success_msg(
                 send_msg.tx.to_string(),
                 key.to_string(),
                 requester.to_string(),
-                target.peer().to_string(),
+                target_id.to_string(),
                 *timestamp,
                 contract_location.as_f64(),
             );
@@ -787,13 +835,17 @@ async fn send_to_metrics_server(
             requester,
         } => {
             let contract_location = Location::from_contract_key(key.as_bytes());
+            let at_id = PeerId::new(
+                at.socket_addr().expect("at should have address"),
+                at.pub_key().clone(),
+            );
             let msg = ContractChange::subscribed_msg(
                 requester.to_string(),
                 id.to_string(),
                 key.to_string(),
                 contract_location.as_f64(),
-                at.peer().to_string(),
-                at.location.unwrap().as_f64(),
+                at_id.to_string(),
+                at.location().expect("at should have location").as_f64(),
                 *timestamp,
             );
             ws_stream.send(Message::Binary(msg.into())).await
@@ -807,11 +859,15 @@ async fn send_to_metrics_server(
             timestamp,
         }) => {
             let contract_location = Location::from_contract_key(key.as_bytes());
+            let target_id = PeerId::new(
+                target.socket_addr().expect("target should have address"),
+                target.pub_key().clone(),
+            );
             let msg = ContractChange::update_request_msg(
                 id.to_string(),
                 key.to_string(),
                 requester.to_string(),
-                target.peer().to_string(),
+                target_id.to_string(),
                 *timestamp,
                 contract_location.as_f64(),
             );
@@ -825,11 +881,15 @@ async fn send_to_metrics_server(
             timestamp,
         }) => {
             let contract_location = Location::from_contract_key(key.as_bytes());
+            let target_id = PeerId::new(
+                target.socket_addr().expect("target should have address"),
+                target.pub_key().clone(),
+            );
             let msg = ContractChange::update_success_msg(
                 id.to_string(),
                 key.to_string(),
                 requester.to_string(),
-                target.peer().to_string(),
+                target_id.to_string(),
                 *timestamp,
                 contract_location.as_f64(),
             );
@@ -1544,17 +1604,18 @@ pub(super) mod test {
                 .filter_map(|l| {
                     if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = &l.kind
                     {
+                        let connected_id =
+                            PeerId::new(connected.socket_addr()?, connected.pub_key().clone());
                         let disconnected = disconnects
-                            .get(&connected.peer())
+                            .get(&connected_id)
                             .iter()
                             .flat_map(|dcs| dcs.iter())
                             .any(|dc| dc > &l.datetime);
-                        if let Some((this_loc, conn_loc)) = this.location.zip(connected.location) {
+                        if let Some((this_loc, conn_loc)) =
+                            this.location().zip(connected.location())
+                        {
                             if this.pub_key() == key && !disconnected {
-                                return Some((
-                                    connected.peer().clone(),
-                                    conn_loc.distance(this_loc),
-                                ));
+                                return Some((connected_id, conn_loc.distance(this_loc)));
                             }
                         }
                     }
@@ -1632,7 +1693,7 @@ pub(super) mod test {
     async fn test_get_connections() -> anyhow::Result<()> {
         use crate::ring::Location;
         let peer_id = PeerId::random();
-        let loc = Location::try_from(0.5)?;
+        let _loc = Location::try_from(0.5)?;
         let tx = Transaction::new::<connect::ConnectMsg>();
         let locations = [
             (PeerId::random(), Location::try_from(0.5)?),
@@ -1642,21 +1703,13 @@ pub(super) mod test {
 
         let listener = TestEventListener::new().await;
         let futs = futures::stream::FuturesUnordered::from_iter(locations.iter().map(
-            |(other, location)| {
+            |(other, _location)| {
                 listener.register_events(Either::Left(NetEventLog {
                     tx: &tx,
                     peer_id: peer_id.clone(),
                     kind: EventKind::Connect(ConnectEvent::Connected {
-                        this: PeerKeyLocation::with_location(
-                            peer_id.pub_key.clone(),
-                            peer_id.addr,
-                            loc,
-                        ),
-                        connected: PeerKeyLocation::with_location(
-                            other.pub_key.clone(),
-                            other.addr,
-                            *location,
-                        ),
+                        this: PeerKeyLocation::new(peer_id.pub_key.clone(), peer_id.addr),
+                        connected: PeerKeyLocation::new(other.pub_key.clone(), other.addr),
                     }),
                 }))
             },

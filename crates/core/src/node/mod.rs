@@ -114,7 +114,8 @@ pub struct NodeConfig {
     pub network_listener_ip: IpAddr,
     /// socket port to bind to the network listener.
     pub network_listener_port: u16,
-    pub(crate) peer_id: Option<PeerId>,
+    /// Our own external socket address, if known (set for gateways, learned for peers).
+    pub(crate) own_addr: Option<SocketAddr>,
     pub(crate) config: Arc<Config>,
     /// At least one gateway is required for joining the network.
     /// Not necessary if this is an initial node.
@@ -166,26 +167,26 @@ impl NodeConfig {
             }
 
             let address = Self::parse_socket_addr(address).await?;
-            let peer_id = PeerId::new(address, transport_pub_key);
+            let peer_key_location = PeerKeyLocation::new(transport_pub_key, address);
             let location = location
                 .map(Location::new)
                 .unwrap_or_else(|| Location::from_address(&address));
-            gateways.push(InitPeerNode::new(peer_id, location));
+            gateways.push(InitPeerNode::new(peer_key_location, location));
         }
         tracing::info!(
             "Node will be listening at {}:{} internal address",
             config.network_api.address,
             config.network_api.port
         );
-        if let Some(peer_id) = &config.peer_id {
-            tracing::info!("Node external address: {}", peer_id.addr);
+        if let Some(own_addr) = &config.peer_id {
+            tracing::info!("Node external address: {}", own_addr.addr);
         }
         Ok(NodeConfig {
             should_connect: true,
             is_gateway: config.is_gateway,
             key_pair: config.transport_keypair().clone(),
             gateways,
-            peer_id: config.peer_id.clone(),
+            own_addr: config.peer_id.clone().map(|p| p.addr),
             network_listener_ip: config.network_api.address,
             network_listener_port: config.network_api.port,
             location: config.location.map(Location::new),
@@ -300,8 +301,8 @@ impl NodeConfig {
         self
     }
 
-    pub fn with_peer_id(&mut self, peer_id: PeerId) -> &mut Self {
-        self.peer_id = Some(peer_id);
+    pub fn with_own_addr(&mut self, addr: SocketAddr) -> &mut Self {
+        self.own_addr = Some(addr);
         self
     }
 
@@ -359,8 +360,8 @@ impl NodeConfig {
         Ok((Node(node), flush_handle))
     }
 
-    pub fn get_peer_id(&self) -> Option<PeerId> {
-        self.peer_id.clone()
+    pub fn get_own_addr(&self) -> Option<SocketAddr> {
+        self.own_addr
     }
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
@@ -369,13 +370,7 @@ impl NodeConfig {
         let gateways: Vec<PeerKeyLocation> = self
             .gateways
             .iter()
-            .map(|node| {
-                PeerKeyLocation::with_location(
-                    node.peer_id.pub_key.clone(),
-                    node.peer_id.addr,
-                    node.location,
-                )
-            })
+            .map(|node| node.peer_key_location.clone())
             .collect();
 
         if !self.is_gateway && gateways.is_empty() {
@@ -391,13 +386,16 @@ impl NodeConfig {
 /// Gateway node to use for joining the network.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct InitPeerNode {
-    peer_id: PeerId,
+    peer_key_location: PeerKeyLocation,
     location: Location,
 }
 
 impl InitPeerNode {
-    pub fn new(peer_id: PeerId, location: Location) -> Self {
-        Self { peer_id, location }
+    pub fn new(peer_key_location: PeerKeyLocation, location: Location) -> Self {
+        Self {
+            peer_key_location,
+            location,
+        }
     }
 }
 
@@ -539,11 +537,7 @@ async fn report_result(
                             second_trace_lines.join("\n")
                         })
                         .unwrap_or_default();
-                    let peer = &op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_key()
-                        .expect("Peer key not found");
+                    let peer = op_manager.ring.connection_manager.own_location();
                     let log = format!(
                         "Transaction ({tx} @ {peer}) error trace:\n {trace} \nstate:\n {state:?}\n"
                     );
@@ -551,11 +545,7 @@ async fn report_result(
                 }
                 #[cfg(not(debug_assertions))]
                 {
-                    let peer = &op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_key()
-                        .expect("Peer key not found");
+                    let peer = op_manager.ring.connection_manager.own_location();
                     let log = format!("Transaction ({tx} @ {peer}) error\n");
                     std::io::stderr().write_all(log.as_bytes()).unwrap();
                 }
@@ -864,7 +854,14 @@ async fn process_message_v1<CB>(
                     key,
                     from
                 );
-                op_manager.ring.remove_subscriber(key, from);
+                // Convert PeerKeyLocation to PeerId for remove_subscriber
+                let peer_id = PeerId {
+                    addr: from
+                        .socket_addr()
+                        .expect("from peer should have socket address"),
+                    pub_key: from.pub_key().clone(),
+                };
+                op_manager.ring.remove_subscriber(key, &peer_id);
                 break;
             }
             _ => break, // Exit the loop if no applicable message type is found
@@ -1098,7 +1095,14 @@ where
                     key,
                     from
                 );
-                op_manager.ring.remove_subscriber(key, from);
+                // Convert PeerKeyLocation to PeerId for remove_subscriber
+                let peer_id = PeerId {
+                    addr: from
+                        .socket_addr()
+                        .expect("from peer should have socket address"),
+                    pub_key: from.pub_key().clone(),
+                };
+                op_manager.ring.remove_subscriber(key, &peer_id);
                 break;
             }
             _ => break, // Exit the loop if no applicable message type is found
@@ -1213,7 +1217,7 @@ async fn handle_aborted_op(
                 {
                     let gateway = op.gateway().cloned();
                     if let Some(gateway) = gateway {
-                        tracing::warn!("Retry connecting to gateway {}", gateway.peer());
+                        tracing::warn!("Retry connecting to gateway {}", gateway);
                         connect::join_ring_request(None, &gateway, op_manager).await?;
                     }
                 }
@@ -1490,7 +1494,7 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
             .then(|| {
                 node.0
                     .peer_id
-                    .clone()
+                    .as_ref()
                     .map(|id| Location::from_address(&id.addr))
             })
             .flatten()

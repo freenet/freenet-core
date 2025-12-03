@@ -70,9 +70,9 @@ impl<ER> Builder<ER> {
         );
 
         let mut config = super::RunnerConfig {
-            peer_key: PeerId::new(
-                ([127, 0, 0, 1], 0).into(),
+            peer_key: PeerKeyLocation::new(
                 self.config.key_pair.public().clone(),
+                ([127, 0, 0, 1], 0).into(),
             ),
             gateways,
             parent_span: Some(parent_span),
@@ -118,7 +118,7 @@ where
                 self.op_manager
                     .ring
                     .connection_manager
-                    .get_peer_key()
+                    .get_own_addr()
                     .unwrap()
             );
             if subscription {

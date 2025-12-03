@@ -15,9 +15,9 @@ use futures::Stream;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
-use crate::dev_tool::{Location, PeerId, Transaction};
+use crate::dev_tool::{Location, Transaction};
 use crate::node::network_bridge::ConnectionError;
-use crate::ring::ConnectionManager;
+use crate::ring::{ConnectionManager, PeerKeyLocation};
 use crate::router::Router;
 use std::collections::HashMap;
 
@@ -29,21 +29,21 @@ pub(crate) enum Event {
     /// A remote peer initiated or completed a connection to us.
     InboundConnection {
         transaction: Option<Transaction>,
-        peer: Option<PeerId>,
+        peer: Option<PeerKeyLocation>,
         connection: PeerConnection,
         transient: bool,
     },
     /// An outbound connection attempt succeeded.
     OutboundEstablished {
         transaction: Transaction,
-        peer: PeerId,
+        peer: PeerKeyLocation,
         connection: PeerConnection,
         transient: bool,
     },
     /// An outbound connection attempt failed.
     OutboundFailed {
         transaction: Transaction,
-        peer: PeerId,
+        peer: PeerKeyLocation,
         error: ConnectionError,
         transient: bool,
     },
@@ -54,18 +54,18 @@ pub(crate) enum Event {
 pub(crate) enum Command {
     /// Initiate a transport connection to `peer`.
     Connect {
-        peer: PeerId,
+        peer: PeerKeyLocation,
         transaction: Transaction,
         transient: bool,
     },
     /// Register expectation for an inbound connection from `peer`.
     ExpectInbound {
-        peer: PeerId,
+        peer: PeerKeyLocation,
         transaction: Option<Transaction>,
         transient: bool,
     },
     /// Remove state associated with `peer`.
-    DropConnection { peer: PeerId },
+    DropConnection { peer: PeerKeyLocation },
 }
 
 #[derive(Clone)]
@@ -120,7 +120,7 @@ impl Stream for HandshakeHandler {
 
 #[derive(Debug)]
 struct ExpectedInbound {
-    peer: PeerId,
+    peer: PeerKeyLocation,
     transaction: Option<Transaction>,
     transient: bool, // TODO: rename to transient in protocol once we migrate terminology
 }
@@ -131,16 +131,24 @@ struct ExpectedInboundTracker {
 }
 
 impl ExpectedInboundTracker {
-    fn register(&mut self, peer: PeerId, transaction: Option<Transaction>, transient: bool) {
+    fn register(
+        &mut self,
+        peer: PeerKeyLocation,
+        transaction: Option<Transaction>,
+        transient: bool,
+    ) {
+        let addr = peer
+            .socket_addr()
+            .expect("ExpectInbound requires known peer address");
         tracing::debug!(
-            remote = %peer.addr,
+            remote = %addr,
             transient,
             tx = ?transaction,
             "ExpectInbound: registering expectation"
         );
         // Replace any existing expectation for the same socket to ensure the newest registration wins.
         self.entries.insert(
-            peer.addr,
+            addr,
             ExpectedInbound {
                 peer,
                 transaction,
@@ -149,8 +157,10 @@ impl ExpectedInboundTracker {
         );
     }
 
-    fn drop_peer(&mut self, peer: &PeerId) {
-        self.entries.remove(&peer.addr);
+    fn drop_peer(&mut self, peer: &PeerKeyLocation) {
+        if let Some(addr) = peer.socket_addr() {
+            self.entries.remove(&addr);
+        }
     }
 
     fn consume(&mut self, addr: SocketAddr) -> Option<ExpectedInbound> {
@@ -158,7 +168,7 @@ impl ExpectedInboundTracker {
         if let Some(entry) = &entry {
             tracing::debug!(
                 remote = %addr,
-                peer = %entry.peer.addr,
+                peer = %entry.peer,
                 transient = entry.transient,
                 tx = ?entry.transaction,
                 "ExpectInbound: matched by socket address"
@@ -241,7 +251,7 @@ async fn run_driver(
 fn spawn_outbound(
     outbound: OutboundConnectionHandler,
     events_tx: mpsc::Sender<Event>,
-    peer: PeerId,
+    peer: PeerKeyLocation,
     transaction: Transaction,
     transient: bool,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -249,8 +259,11 @@ fn spawn_outbound(
     tokio::spawn(async move {
         let peer_for_connect = peer.clone();
         let mut handler = outbound;
+        let addr = peer_for_connect
+            .socket_addr()
+            .expect("Connect requires known peer address");
         let connect_future = handler
-            .connect(peer_for_connect.pub_key.clone(), peer_for_connect.addr)
+            .connect(peer_for_connect.pub_key.clone(), addr)
             .await;
         let result: Result<PeerConnection, ConnectionError> =
             match tokio::time::timeout(Duration::from_secs(10), connect_future).await {
@@ -288,54 +301,55 @@ mod tests {
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr};
 
-    fn make_peer(port: u16) -> PeerId {
+    fn make_peer(port: u16) -> PeerKeyLocation {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let keypair = TransportKeypair::new();
-        PeerId::new(addr, keypair.public().clone())
+        PeerKeyLocation::new(keypair.public().clone(), addr)
     }
 
     #[test]
     fn tracker_returns_registered_entry_exactly_once() {
         let mut tracker = ExpectedInboundTracker::default();
         let peer = make_peer(4100);
+        let addr = peer.socket_addr().unwrap();
         let tx = Transaction::new::<ConnectMsg>();
         tracker.register(peer.clone(), Some(tx), true);
 
         let entry = tracker
-            .consume(peer.addr)
+            .consume(addr)
             .expect("expected registered inbound entry");
         assert_eq!(entry.peer, peer);
         assert_eq!(entry.transaction, Some(tx));
         assert!(entry.transient);
-        assert!(tracker.consume(peer.addr).is_none());
+        assert!(tracker.consume(addr).is_none());
     }
 
     #[test]
     fn tracker_drop_removes_entry() {
         let mut tracker = ExpectedInboundTracker::default();
         let peer = make_peer(4200);
+        let addr = peer.socket_addr().unwrap();
         tracker.register(peer.clone(), None, false);
-        assert!(tracker.contains(peer.addr));
+        assert!(tracker.contains(addr));
 
         tracker.drop_peer(&peer);
-        assert!(!tracker.contains(peer.addr));
-        assert!(tracker.consume(peer.addr).is_none());
+        assert!(!tracker.contains(addr));
+        assert!(tracker.consume(addr).is_none());
     }
 
     #[test]
     fn tracker_overwrites_existing_expectation() {
         let mut tracker = ExpectedInboundTracker::default();
         let peer = make_peer(4300);
+        let addr = peer.socket_addr().unwrap();
         tracker.register(peer.clone(), None, false);
         let new_tx = Transaction::new::<ConnectMsg>();
         tracker.register(peer.clone(), Some(new_tx), true);
-        let transactions = tracker
-            .transactions_for(peer.addr)
-            .expect("entry should exist");
+        let transactions = tracker.transactions_for(addr).expect("entry should exist");
         assert_eq!(transactions, vec![Some(new_tx)]);
 
         let entry = tracker
-            .consume(peer.addr)
+            .consume(addr)
             .expect("entry should be present after overwrite");
         assert_eq!(entry.transaction, Some(new_tx));
         assert!(entry.transient);
@@ -346,18 +360,20 @@ mod tests {
         let mut tracker = ExpectedInboundTracker::default();
         let peer_a = make_peer(4400);
         let peer_b = make_peer(4401);
+        let addr_a = peer_a.socket_addr().unwrap();
+        let addr_b = peer_b.socket_addr().unwrap();
 
         tracker.register(peer_a.clone(), None, false);
         tracker.register(peer_b.clone(), None, true);
 
         let first = tracker
-            .consume(peer_a.addr)
+            .consume(addr_a)
             .expect("first peer should be matched by exact socket");
         assert_eq!(first.peer, peer_a);
         assert!(!first.transient);
 
         let second = tracker
-            .consume(peer_b.addr)
+            .consume(addr_b)
             .expect("second peer should still be tracked independently");
         assert_eq!(second.peer, peer_b);
         assert!(second.transient);

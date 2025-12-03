@@ -4,6 +4,7 @@
 //! and routes requests to the optimal peers.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::net::SocketAddr;
 use std::{
     sync::{atomic::AtomicU64, Arc, Weak},
     time::{Duration, Instant},
@@ -120,8 +121,8 @@ impl Ring {
         };
 
         if let Some(loc) = config.location {
-            if config.peer_id.is_none() && is_gateway {
-                return Err(anyhow::anyhow!("PeerId is required for gateways"));
+            if config.own_addr.is_none() && is_gateway {
+                return Err(anyhow::anyhow!("own_addr is required for gateways"));
             }
             ring.connection_manager.update_location(Some(loc));
         }
@@ -183,7 +184,7 @@ impl Ring {
 
     /// Return if a contract is within appropiate seeding distance.
     pub fn should_seed(&self, key: &ContractKey) -> bool {
-        match self.connection_manager.own_location().location {
+        match self.connection_manager.own_location().location() {
             Some(own_loc) => self.seeding_manager.should_seed(key, own_loc),
             None => {
                 tracing::debug!(
@@ -196,7 +197,7 @@ impl Ring {
 
     /// Add a new subscription for this peer.
     pub fn seed_contract(&self, key: ContractKey) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
-        match self.connection_manager.own_location().location {
+        match self.connection_manager.own_location().location() {
             Some(own_loc) => self.seeding_manager.seed_contract(key, own_loc),
             None => {
                 tracing::debug!(
@@ -226,9 +227,11 @@ impl Ring {
     }
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
-        tracing::info!(%peer, this = ?self.connection_manager.get_peer_key(), %was_reserved, "Adding connection to peer");
+        tracing::info!(%peer, this = ?self.connection_manager.get_own_addr(), %was_reserved, "Adding connection to peer");
+        let addr = peer.addr;
+        let pub_key = peer.pub_key.clone();
         self.connection_manager
-            .add_connection(loc, peer.clone(), was_reserved);
+            .add_connection(loc, addr, pub_key, was_reserved);
         self.event_register
             .register_events(Either::Left(NetEventLog::connected(self, peer, loc)))
             .await;
@@ -236,10 +239,11 @@ impl Ring {
     }
 
     pub fn update_connection_identity(&self, old_peer: &PeerId, new_peer: PeerId) {
-        if self
-            .connection_manager
-            .update_peer_identity(old_peer, new_peer)
-        {
+        if self.connection_manager.update_peer_identity(
+            old_peer.addr,
+            new_peer.addr,
+            new_peer.pub_key,
+        ) {
             self.refresh_density_request_cache();
         }
     }
@@ -257,10 +261,12 @@ impl Ring {
     ) -> impl Iterator<Item = &'a PeerKeyLocation> + Send {
         let mut filtered = Vec::new();
         for peer in peers {
-            if !self
-                .connection_manager
-                .has_connection_or_pending(&peer.peer())
-            {
+            if let Some(addr) = peer.socket_addr() {
+                if !self.connection_manager.has_connection_or_pending(addr) {
+                    filtered.push(peer);
+                }
+            } else {
+                // If address is unknown, include the peer
                 filtered.push(peer);
             }
         }
@@ -274,7 +280,7 @@ impl Ring {
     pub fn closest_potentially_caching(
         &self,
         contract_key: &ContractKey,
-        skip_list: impl Contains<PeerId>,
+        skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
         let router = self.router.read();
         self.connection_manager
@@ -285,7 +291,7 @@ impl Ring {
     pub fn k_closest_potentially_caching(
         &self,
         contract_key: &ContractKey,
-        skip_list: impl Contains<PeerId> + Clone,
+        skip_list: impl Contains<std::net::SocketAddr> + Clone,
         k: usize,
     ) -> Vec<PeerKeyLocation> {
         let router = self.router.read();
@@ -297,9 +303,10 @@ impl Ring {
         let connections = self.connection_manager.get_connections_by_location();
         for conns in connections.values() {
             for conn in conns {
-                let peer = conn.location.peer().clone();
-                if skip_list.has_element(peer.clone()) || !seen.insert(peer) {
-                    continue;
+                if let Some(addr) = conn.location.socket_addr() {
+                    if skip_list.has_element(addr) || !seen.insert(addr) {
+                        continue;
+                    }
                 }
                 candidates.push(conn.location.clone());
             }
@@ -364,7 +371,7 @@ impl Ring {
         tracing::debug!(%peer, "Removing connection");
         self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
         // This case would be when a connection is being open, so peer location hasn't been recorded yet and we can ignore everything below
-        let Some(loc) = self.connection_manager.prune_alive_connection(&peer) else {
+        let Some(loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
             return;
         };
         {
@@ -415,17 +422,17 @@ impl Ring {
                     continue;
                 }
             };
-            let Some(this_peer) = &this_peer else {
-                let Some(peer) = self.connection_manager.get_peer_key() else {
+            let Some(this_addr) = &this_peer else {
+                let Some(addr) = self.connection_manager.get_own_addr() else {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 };
-                this_peer = Some(peer);
+                this_peer = Some(addr);
                 continue;
             };
             // avoid connecting to the same peer multiple times
             let mut skip_list = HashSet::new();
-            skip_list.insert(this_peer);
+            skip_list.insert(*this_addr);
 
             // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit
             // Only count Connect transactions, not all operations (Get/Put/Subscribe/Update)
@@ -487,7 +494,12 @@ impl Ring {
                 .map(|(loc, conns)| {
                     let conns: Vec<_> = conns
                         .iter()
-                        .filter(|conn| !live_tx_tracker.has_live_connection(conn.location.addr()))
+                        .filter(|conn| {
+                            conn.location
+                                .socket_addr()
+                                .map(|addr| !live_tx_tracker.has_live_connection(addr))
+                                .unwrap_or(true)
+                        })
                         .cloned()
                         .collect();
                     (*loc, conns)
@@ -528,7 +540,7 @@ impl Ring {
                 .write()
                 .adjust_topology(
                     &neighbor_locations,
-                    &self.connection_manager.own_location().location,
+                    &self.connection_manager.own_location().location(),
                     Instant::now(),
                     current_connections,
                 );
@@ -573,19 +585,21 @@ impl Ring {
                 }
                 TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
                     for peer in should_disconnect_peers.drain(..) {
-                        notifier
-                            .notifications_sender
-                            .send(Either::Right(crate::message::NodeEvent::DropConnection(
-                                peer.addr(),
-                            )))
-                            .await
-                            .map_err(|error| {
-                                tracing::debug!(
-                                    ?error,
-                                    "Shutting down connection maintenance task"
-                                );
-                                error
-                            })?;
+                        if let Some(addr) = peer.socket_addr() {
+                            notifier
+                                .notifications_sender
+                                .send(Either::Right(crate::message::NodeEvent::DropConnection(
+                                    addr,
+                                )))
+                                .await
+                                .map_err(|error| {
+                                    tracing::debug!(
+                                        ?error,
+                                        "Shutting down connection maintenance task"
+                                    );
+                                    error
+                                })?;
+                        }
                     }
                 }
                 TopologyAdjustment::NoChange => {}
@@ -604,7 +618,7 @@ impl Ring {
     async fn acquire_new(
         &self,
         ideal_location: Location,
-        skip_list: &HashSet<&PeerId>,
+        skip_list: &HashSet<SocketAddr>,
         notifier: &EventLoopNotificationsSender,
         live_tx_tracker: &LiveTransactionTracker,
         op_manager: &Arc<OpManager>,
@@ -625,7 +639,7 @@ impl Ring {
                 %ideal_location,
                 num_connections,
                 skip_list_size = skip_list.len(),
-                self_peer = %self.connection_manager.get_peer_key().as_ref().map(|id| id.to_string()).unwrap_or_else(|| "unknown".into()),
+                self_addr = ?self.connection_manager.get_own_addr(),
                 "Looking for peer to route through"
             );
             if let Some(target) =
@@ -651,7 +665,7 @@ impl Ring {
         let joiner = self.connection_manager.own_location();
         tracing::info!(
             this_peer = %joiner,
-            query_target_peer = %query_target.peer(),
+            query_target_peer = %query_target,
             %ideal_location,
             "Sending connect request via connection_maintenance"
         );
@@ -667,7 +681,9 @@ impl Ring {
             op_manager.connect_forward_estimator.clone(),
         );
 
-        live_tx_tracker.add_transaction(query_target.addr(), tx);
+        if let Some(addr) = query_target.socket_addr() {
+            live_tx_tracker.add_transaction(addr, tx);
+        }
         op_manager
             .push(tx, OpEnum::Connect(Box::new(op)))
             .await

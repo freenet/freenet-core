@@ -127,7 +127,7 @@ impl IsotonicEstimator {
             return Err(EstimationError::InsufficientData);
         }
 
-        let peer_location = peer.location.ok_or(EstimationError::InsufficientData)?;
+        let peer_location = peer.location().ok_or(EstimationError::InsufficientData)?;
         let distance: f64 = contract_location.distance(peer_location).as_f64();
 
         let global_estimate = self
@@ -187,7 +187,7 @@ impl IsotonicEvent {
     fn route_distance(&self) -> Distance {
         let peer_location = self
             .peer
-            .location
+            .location()
             .ok_or(EstimationError::InsufficientData)
             .expect("IsotonicEvent should always carry a peer location");
         self.contract_location.distance(peer_location)
@@ -249,7 +249,7 @@ mod tests {
         let mut events = Vec::new();
         for _ in 0..100 {
             let peer = PeerKeyLocation::random();
-            if peer.location.is_none() {
+            if peer.location().is_none() {
                 debug!("Peer location is none for {peer:?}");
             }
             let contract_location = Location::random();
@@ -286,7 +286,7 @@ mod tests {
         let mut events = Vec::new();
         for _ in 0..100 {
             let peer = PeerKeyLocation::random();
-            if peer.location.is_none() {
+            if peer.location().is_none() {
                 debug!("Peer location is none for {peer:?}");
             }
             let contract_location = Location::random();
@@ -321,9 +321,20 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
+        let distance: f64 = peer
+            .location()
+            .unwrap()
+            .distance(contract_location)
+            .as_f64();
 
-        let result = distance.powf(0.5) + peer.peer().clone().to_bytes()[0] as f64;
+        // Use the hash of the public key for deterministic but random-like variation
+        let key_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{}", peer.pub_key()).hash(&mut hasher);
+            hasher.finish()
+        };
+        let result = distance.powf(0.5) + (key_hash as u8) as f64;
         IsotonicEvent {
             peer,
             contract_location,
@@ -335,9 +346,20 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
+        let distance: f64 = peer
+            .location()
+            .unwrap()
+            .distance(contract_location)
+            .as_f64();
 
-        let result = (100.0 - distance).powf(0.5) + peer.peer().clone().to_bytes()[0] as f64;
+        // Use the hash of the public key for deterministic but random-like variation
+        let key_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{}", peer.pub_key()).hash(&mut hasher);
+            hasher.finish()
+        };
+        let result = (100.0 - distance).powf(0.5) + (key_hash as u8) as f64;
         IsotonicEvent {
             peer,
             contract_location,
