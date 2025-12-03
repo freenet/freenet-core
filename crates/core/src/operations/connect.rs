@@ -298,11 +298,9 @@ impl RelayState {
 
         if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
             self.accepted_locally = true;
-            let self_loc = ctx.self_location();
-            // Use PeerAddr::Unknown for acceptor - the acceptor doesn't know their own
-            // external address (especially behind NAT). The first recipient of the response
-            // will fill this in from the packet source address.
-            let acceptor = PeerKeyLocation::with_unknown_addr(self_loc.pub_key().clone());
+            // Use self_location which already has our address set (from --public-network-address
+            // for gateways, or from observed address for peers).
+            let acceptor = ctx.self_location().clone();
             let dist = ring_distance(acceptor.location(), self.request.joiner.location());
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
