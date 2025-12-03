@@ -301,6 +301,10 @@ impl RelayState {
             // Use self_location which already has our address set (from --public-network-address
             // for gateways, or from observed address for peers).
             let acceptor = ctx.self_location().clone();
+            debug_assert!(
+                acceptor.socket_addr().is_some(),
+                "ConnectResponse acceptor must have known address - joiner needs it to connect back"
+            );
             let dist = ring_distance(acceptor.location(), self.request.joiner.location());
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
@@ -1384,13 +1388,59 @@ mod tests {
         let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
 
         let response = actions.accept_response.expect("expected acceptance");
-        // Compare pub_key since acceptor's address is intentionally Unknown (NAT scenario)
+        // Verify acceptor has both correct identity and known address
         assert_eq!(response.acceptor.pub_key(), self_loc.pub_key());
+        assert_eq!(
+            response.acceptor.socket_addr(),
+            self_loc.socket_addr(),
+            "ConnectResponse acceptor must have known address for joiner to connect back"
+        );
         assert_eq!(
             actions.expect_connection_from.unwrap().pub_key(),
             joiner.pub_key()
         );
         assert!(actions.forward.is_none());
+    }
+
+    #[test]
+    fn connect_response_acceptor_must_have_known_address() {
+        // Regression test: ConnectResponse.acceptor must include a known address
+        // so the joiner can establish a connection back to the acceptor.
+        // See: https://github.com/freenet/freenet-core/issues/2207
+        let self_loc = make_peer(4001);
+        let joiner = make_peer(5001);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc.clone());
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        let response = actions.accept_response.expect("expected acceptance");
+
+        // Critical invariant: acceptor address must be known
+        assert!(
+            response.acceptor.socket_addr().is_some(),
+            "ConnectResponse.acceptor must have a known address"
+        );
+        // Address should match self_location
+        assert_eq!(
+            response.acceptor.socket_addr(),
+            self_loc.socket_addr(),
+            "acceptor address should come from self_location"
+        );
     }
 
     #[test]
