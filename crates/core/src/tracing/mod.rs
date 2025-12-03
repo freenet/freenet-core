@@ -208,16 +208,14 @@ impl<'a> NetEventLog<'a> {
                 target, payload, ..
             }) => {
                 let acceptor = payload.acceptor.clone();
-                let acceptor_peer = PeerId::new(
-                    acceptor
-                        .socket_addr()
-                        .expect("acceptor should have address"),
-                    acceptor.pub_key().clone(),
-                );
-                let target_peer = PeerId::new(
-                    target.socket_addr().expect("target should have address"),
-                    target.pub_key().clone(),
-                );
+                // Skip event if addresses are unknown (e.g., gateway behind NAT without public address)
+                let (Some(acceptor_addr), Some(target_addr)) =
+                    (acceptor.socket_addr(), target.socket_addr())
+                else {
+                    return Either::Right(vec![]);
+                };
+                let acceptor_peer = PeerId::new(acceptor_addr, acceptor.pub_key().clone());
+                let target_peer = PeerId::new(target_addr, target.pub_key().clone());
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
@@ -728,21 +726,21 @@ async fn send_to_metrics_server(
             timestamp,
             ..
         }) => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-            let target_id = PeerId::new(
-                target.socket_addr().expect("target should have address"),
-                target.pub_key().clone(),
-            );
-            let msg = ContractChange::put_request_msg(
-                send_msg.tx.to_string(),
-                key.to_string(),
-                requester.to_string(),
-                target_id.to_string(),
-                *timestamp,
-                contract_location.as_f64(),
-            );
-
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let Some(target_addr) = target.socket_addr() {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let msg = ContractChange::put_request_msg(
+                    send_msg.tx.to_string(),
+                    key.to_string(),
+                    requester.to_string(),
+                    target_id.to_string(),
+                    *timestamp,
+                    contract_location.as_f64(),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Put(PutEvent::PutSuccess {
             requester,
@@ -751,20 +749,21 @@ async fn send_to_metrics_server(
             timestamp,
             ..
         }) => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-            let target_id = PeerId::new(
-                target.socket_addr().expect("target should have address"),
-                target.pub_key().clone(),
-            );
-            let msg = ContractChange::put_success_msg(
-                send_msg.tx.to_string(),
-                key.to_string(),
-                requester.to_string(),
-                target_id.to_string(),
-                *timestamp,
-                contract_location.as_f64(),
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let Some(target_addr) = target.socket_addr() {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let msg = ContractChange::put_success_msg(
+                    send_msg.tx.to_string(),
+                    key.to_string(),
+                    requester.to_string(),
+                    target_id.to_string(),
+                    *timestamp,
+                    contract_location.as_f64(),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Put(PutEvent::BroadcastEmitted {
             id,
@@ -834,21 +833,22 @@ async fn send_to_metrics_server(
             timestamp,
             requester,
         } => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-            let at_id = PeerId::new(
-                at.socket_addr().expect("at should have address"),
-                at.pub_key().clone(),
-            );
-            let msg = ContractChange::subscribed_msg(
-                requester.to_string(),
-                id.to_string(),
-                key.to_string(),
-                contract_location.as_f64(),
-                at_id.to_string(),
-                at.location().expect("at should have location").as_f64(),
-                *timestamp,
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let (Some(at_addr), Some(at_loc)) = (at.socket_addr(), at.location()) {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let at_id = PeerId::new(at_addr, at.pub_key().clone());
+                let msg = ContractChange::subscribed_msg(
+                    requester.to_string(),
+                    id.to_string(),
+                    key.to_string(),
+                    contract_location.as_f64(),
+                    at_id.to_string(),
+                    at_loc.as_f64(),
+                    *timestamp,
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
 
         EventKind::Update(UpdateEvent::Request {
@@ -858,20 +858,21 @@ async fn send_to_metrics_server(
             target,
             timestamp,
         }) => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-            let target_id = PeerId::new(
-                target.socket_addr().expect("target should have address"),
-                target.pub_key().clone(),
-            );
-            let msg = ContractChange::update_request_msg(
-                id.to_string(),
-                key.to_string(),
-                requester.to_string(),
-                target_id.to_string(),
-                *timestamp,
-                contract_location.as_f64(),
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let Some(target_addr) = target.socket_addr() {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let msg = ContractChange::update_request_msg(
+                    id.to_string(),
+                    key.to_string(),
+                    requester.to_string(),
+                    target_id.to_string(),
+                    *timestamp,
+                    contract_location.as_f64(),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Update(UpdateEvent::UpdateSuccess {
             id,
@@ -880,20 +881,21 @@ async fn send_to_metrics_server(
             key,
             timestamp,
         }) => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-            let target_id = PeerId::new(
-                target.socket_addr().expect("target should have address"),
-                target.pub_key().clone(),
-            );
-            let msg = ContractChange::update_success_msg(
-                id.to_string(),
-                key.to_string(),
-                requester.to_string(),
-                target_id.to_string(),
-                *timestamp,
-                contract_location.as_f64(),
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let Some(target_addr) = target.socket_addr() {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let msg = ContractChange::update_success_msg(
+                    id.to_string(),
+                    key.to_string(),
+                    requester.to_string(),
+                    target_id.to_string(),
+                    *timestamp,
+                    contract_location.as_f64(),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Update(UpdateEvent::BroadcastEmitted {
             id,
