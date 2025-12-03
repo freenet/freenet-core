@@ -927,7 +927,16 @@ mod tests {
     }
 
     fn generate_random_peers(num_peers: usize) -> Vec<PeerKeyLocation> {
-        (0..num_peers).map(|_| PeerKeyLocation::random()).collect()
+        let mut peers: Vec<PeerKeyLocation> =
+            (0..num_peers).map(|_| PeerKeyLocation::random()).collect();
+        // Sort by location so tests can make index-based assumptions about location ordering
+        peers.sort_by(|a, b| {
+            a.location()
+                .unwrap()
+                .partial_cmp(&b.location().unwrap())
+                .unwrap()
+        });
+        peers
     }
 
     fn report_resource_usage(

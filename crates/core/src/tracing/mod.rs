@@ -1691,37 +1691,34 @@ pub(super) mod test {
 
     #[tokio::test]
     async fn test_get_connections() -> anyhow::Result<()> {
-        use crate::ring::Location;
         let peer_id = PeerId::random();
-        let _loc = Location::try_from(0.5)?;
         let tx = Transaction::new::<connect::ConnectMsg>();
-        let locations = [
-            (PeerId::random(), Location::try_from(0.5)?),
-            (PeerId::random(), Location::try_from(0.75)?),
-            (PeerId::random(), Location::try_from(0.25)?),
-        ];
+        // Create other peers - location is now computed from their addresses
+        let other_peers = [PeerId::random(), PeerId::random(), PeerId::random()];
 
         let listener = TestEventListener::new().await;
-        let futs = futures::stream::FuturesUnordered::from_iter(locations.iter().map(
-            |(other, _location)| {
-                listener.register_events(Either::Left(NetEventLog {
-                    tx: &tx,
-                    peer_id: peer_id.clone(),
-                    kind: EventKind::Connect(ConnectEvent::Connected {
-                        this: PeerKeyLocation::new(peer_id.pub_key.clone(), peer_id.addr),
-                        connected: PeerKeyLocation::new(other.pub_key.clone(), other.addr),
-                    }),
-                }))
-            },
-        ));
+        let futs = futures::stream::FuturesUnordered::from_iter(other_peers.iter().map(|other| {
+            listener.register_events(Either::Left(NetEventLog {
+                tx: &tx,
+                peer_id: peer_id.clone(),
+                kind: EventKind::Connect(ConnectEvent::Connected {
+                    this: PeerKeyLocation::new(peer_id.pub_key.clone(), peer_id.addr),
+                    connected: PeerKeyLocation::new(other.pub_key.clone(), other.addr),
+                }),
+            }))
+        }));
 
         futures::future::join_all(futs).await;
 
         let distances: Vec<_> = listener.connections(&peer_id.pub_key).collect();
-        assert!(distances.len() == 3);
-        assert!(
-            (distances.iter().map(|(_, l)| l.as_f64()).sum::<f64>() - 0.5f64).abs() < f64::EPSILON
-        );
+        assert_eq!(distances.len(), 3, "Should have 3 connections");
+        // Verify each distance is valid (between 0 and 0.5 on the ring)
+        for (_, dist) in &distances {
+            assert!(
+                dist.as_f64() >= 0.0 && dist.as_f64() <= 0.5,
+                "Distance should be valid ring distance"
+            );
+        }
         Ok(())
     }
 }
