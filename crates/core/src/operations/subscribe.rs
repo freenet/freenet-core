@@ -311,9 +311,7 @@ async fn complete_local_subscription(
         })
         .await?;
 
-    // Mark operation as completed. This will handle parent completion if this is a sub-operation.
     op_manager.completed(id);
-
     Ok(())
 }
 

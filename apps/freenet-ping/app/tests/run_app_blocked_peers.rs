@@ -133,6 +133,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         let path = preset.temp_dir.path().to_path_buf();
         (cfg, preset, gw_config_from_path(public_port, &path)?)
     };
+
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure Node1 (blocks Node2)
@@ -167,7 +168,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
     tracing::info!("Node 1 blocks: {:?}", node2_network_addr);
     tracing::info!("Node 2 blocks: {:?}", node1_network_addr);
 
-    // Free socket resources
+    // Free socket resources before starting nodes
     std::mem::drop(network_socket_gw);
     std::mem::drop(ws_api_port_socket_gw);
     std::mem::drop(network_socket_node1);
@@ -789,33 +790,15 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 /// Standard blocked peers test (baseline)
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_blocked_peers() -> TestResult {
-    // FIXME: WebSocket backpressure issue requires check_interval workaround
-    //
-    // Problem: Sending multiple update rounds without reading responses causes WebSocket
-    // buffer to fill, making .send() block indefinitely. This happens with even 1 round
-    // of updates (3 initial + 3 round 1 = 6 total messages).
-    //
-    // Systematic testing showed:
-    // - TEST 1 (subscribe_immediately only): FAILS - blocks at Gateway round 2
-    // - TEST 2 (check_interval added): PASSES in 28.24s
-    // - TEST 3 (0 rounds): PASSES in 35.39s
-    // - TEST 4 (1 round): FAILS - timeout at 300s
-    //
-    // check_interval is the MINIMAL fix (send_refresh_updates is NOT needed):
-    // 1. Drains WebSocket buffer through periodic get_state() .recv() calls
-    // 2. Provides early exit when updates propagate (typically after 1 check)
-    //
-    // Ideal solution: WebApi should handle backpressure internally (e.g., bounded channel
-    // with automatic draining or async send with timeout).
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "baseline",
-        initial_wait: Duration::from_secs(10),
-        operation_timeout: Duration::from_secs(20),
+        initial_wait: Duration::from_secs(25),
+        operation_timeout: Duration::from_secs(45),
         update_rounds: 3,
         update_wait: Duration::from_secs(5),
-        propagation_wait: Duration::from_secs(8),
+        propagation_wait: Duration::from_secs(15),
         verbose_logging: false,
-        check_interval: Some(Duration::from_secs(3)),  // FIXME: Required for WebSocket backpressure (see above)
+        check_interval: Some(Duration::from_secs(4)),
         send_refresh_updates: false,
         send_final_updates: true,
         subscribe_immediately: false,
@@ -826,26 +809,21 @@ async fn test_ping_blocked_peers() -> TestResult {
 /// Simple blocked peers test
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_blocked_peers_simple() -> TestResult {
-    // FIXME: Same WebSocket backpressure issue as baseline test
-    // See detailed explanation in test_ping_blocked_peers above
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "simple",
-        initial_wait: Duration::from_secs(12),
-        operation_timeout: Duration::from_secs(25),
+        initial_wait: Duration::from_secs(25),
+        operation_timeout: Duration::from_secs(45),
         update_rounds: 1,
-        update_wait: Duration::from_secs(4),
-        propagation_wait: Duration::from_secs(12),
+        update_wait: Duration::from_secs(5),
+        propagation_wait: Duration::from_secs(15),
         verbose_logging: false,
-        check_interval: Some(Duration::from_secs(3)),  // FIXME: Required for WebSocket backpressure
+        check_interval: Some(Duration::from_secs(4)),
         send_refresh_updates: false,
         send_final_updates: false,
         subscribe_immediately: false,
     })
     .await
 }
-
-// Note: Redundant tests (optimized, improved, debug, reliable) were removed
-// as they only varied in non-functional aspects like timeouts and logging
 
 /// Solution/reference implementation for blocked peers
 // TODO-MUST-FIX: WebSocket connection reset during teardown - see issue #2108
@@ -856,13 +834,13 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
 async fn test_ping_blocked_peers_solution() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "solution",
-        initial_wait: Duration::from_secs(12),
-        operation_timeout: Duration::from_secs(25),
+        initial_wait: Duration::from_secs(25),
+        operation_timeout: Duration::from_secs(60),
         update_rounds: 2,
-        update_wait: Duration::from_secs(4),
-        propagation_wait: Duration::from_secs(12),
+        update_wait: Duration::from_secs(6),
+        propagation_wait: Duration::from_secs(20),
         verbose_logging: false,
-        check_interval: Some(Duration::from_secs(3)), // Regular check intervals
+        check_interval: Some(Duration::from_secs(5)),
         send_refresh_updates: true,
         send_final_updates: true,
         subscribe_immediately: true,

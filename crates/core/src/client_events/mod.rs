@@ -262,9 +262,6 @@ pub async fn client_event_handling<ClientEv>(
 where
     ClientEv: ClientEventsProxy + Send + 'static,
 {
-    // Create RequestRouter for centralized request deduplication
-    // NOTE: This is ALWAYS Some, so the legacy mode code paths below are never executed.
-    // TODO: Consider removing legacy mode in a future PR and making request_router non-optional.
     let request_router = Some(std::sync::Arc::new(crate::node::RequestRouter::new()));
     let mut results = FuturesUnordered::new();
     loop {
@@ -607,8 +604,6 @@ async fn process_open_request(
                                 );
                             }
                         } else {
-                            // TODO: This legacy mode block is never executed since request_router is always Some.
-                            // Consider removing in a future PR.
                             tracing::debug!(
                                 peer_id = %peer_id,
                                 key = %contract_key,
@@ -782,17 +777,7 @@ async fn process_open_request(
                                 );
 
                                 match update::request_update(&op_manager, op).await {
-                                    Ok(()) => {
-                                        // UPDATE completed synchronously
-                                    }
-                                    Err(OpError::StatePushed) => {
-                                        // StatePushed is a control flow signal, not an error
-                                        // The operation continues asynchronously via notify_op_change
-                                        tracing::debug!(
-                                            transaction_id = %transaction_id,
-                                            "UPDATE operation continuing asynchronously (StatePushed)"
-                                        );
-                                    }
+                                    Ok(()) | Err(OpError::StatePushed) => {}
                                     Err(err) => {
                                         tracing::error!("request update error {}", err);
 
@@ -1038,8 +1023,6 @@ async fn process_open_request(
                                 }
                             }
                         } else {
-                            // TODO: This legacy mode block is never executed since request_router is always Some.
-                            // Consider removing in a future PR.
                             tracing::debug!(
                                 this_peer = %peer_id,
                                 "Contract not found, starting direct GET operation (legacy mode)",

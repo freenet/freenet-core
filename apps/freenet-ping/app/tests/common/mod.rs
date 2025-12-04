@@ -19,15 +19,17 @@ use futures::{future::BoxFuture, FutureExt};
 use rand::{random, Rng, SeedableRng};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{
     collections::HashSet,
     io,
     net::{Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
-    sync::Mutex,
     time::Duration,
 };
+
+/// Global lock to prevent concurrent contract compilation which causes race conditions
+static COMPILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 use tokio::{select, time::sleep};
 use tokio_tungstenite::connect_async;
 use tracing::{info, span, Instrument, Level};
@@ -36,11 +38,6 @@ use serde::{Deserialize, Serialize};
 
 const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
 
-pub static RNG: LazyLock<Mutex<rand::rngs::StdRng>> = LazyLock::new(|| {
-    Mutex::new(rand::rngs::StdRng::from_seed(
-        *b"0102030405060708090a0b0c0d0e0f10",
-    ))
-});
 
 #[derive(Debug)]
 pub struct PresetConfig {
@@ -58,7 +55,6 @@ pub fn get_free_socket_addr() -> Result<SocketAddr> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::await_holding_lock)]
 pub async fn base_node_test_config(
     is_gateway: bool,
     gateways: Vec<String>,
@@ -68,7 +64,13 @@ pub async fn base_node_test_config(
     base_tmp_dir: Option<&Path>,
     blocked_addresses: Option<Vec<SocketAddr>>,
 ) -> Result<(ConfigArgs, PresetConfig)> {
-    let mut rng = RNG.lock().unwrap();
+    // Create RNG seeded from test name for reproducibility while maintaining isolation
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data_dir_suffix.hash(&mut hasher);
+    let seed = hasher.finish();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
     base_node_test_config_with_rng(
         is_gateway,
         gateways,
@@ -83,7 +85,7 @@ pub async fn base_node_test_config(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn base_node_test_config_with_rng(
+pub async fn base_node_test_config_with_rng<R: Rng>(
     is_gateway: bool,
     gateways: Vec<String>,
     public_port: Option<u16>,
@@ -91,7 +93,7 @@ pub async fn base_node_test_config_with_rng(
     data_dir_suffix: &str,
     base_tmp_dir: Option<&Path>,
     blocked_addresses: Option<Vec<SocketAddr>>,
-    rng: &mut rand::rngs::StdRng,
+    rng: &mut R,
 ) -> Result<(ConfigArgs, PresetConfig)> {
     if is_gateway {
         assert!(public_port.is_some());
@@ -146,13 +148,19 @@ pub async fn base_node_test_config_with_rng(
 }
 
 pub fn gw_config_from_path(port: u16, path: &Path) -> Result<InlineGwConfig> {
-    gw_config_from_path_with_rng(port, path, &mut RNG.lock().unwrap())
+    // Create RNG seeded from path for reproducibility while maintaining isolation
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    let seed = hasher.finish();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    gw_config_from_path_with_rng(port, path, &mut rng)
 }
 
-pub fn gw_config_from_path_with_rng(
+pub fn gw_config_from_path_with_rng<R: Rng>(
     port: u16,
     path: &Path,
-    rng: &mut rand::rngs::StdRng,
+    rng: &mut R,
 ) -> Result<InlineGwConfig> {
     Ok(InlineGwConfig {
         address: (Ipv4Addr::LOCALHOST, port).into(),
@@ -303,6 +311,9 @@ fn find_workspace_root() -> PathBuf {
 }
 
 fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
+    // Acquire lock to prevent concurrent compilations which cause race conditions
+    let _lock = COMPILE_LOCK.lock().unwrap();
+
     ensure_target_dir_env();
     println!("module path: {contract_path:?}");
     let target = std::env::var(TARGET_DIR_VAR)
