@@ -524,3 +524,108 @@ async fn perform_put_with_retries(
 
     Err(last_err.unwrap_or_else(|| anyhow!("PUT failed after {max_attempts} attempts")))
 }
+
+/// Regression test for: when a gateway promotes a transient connection,
+/// the peer's identity must be immediately visible via QueryConnections.
+///
+/// This test validates that after the Connect operation completes:
+/// 1. The gateway's QueryConnections returns the peer (not empty)
+/// 2. The peer's QueryConnections returns the gateway
+///
+/// Previously, transient connections were stored with `pub_key: None` and
+/// only updated via message-based identity learning, which created race
+/// conditions where QueryConnections could return empty despite successful
+/// connections.
+///
+/// The fix ensures handle_connect_peer updates the transport entry's pub_key
+/// when promoting transients.
+#[freenet_test(
+    nodes = ["gateway", "peer"],
+    auto_connect_peers = true,
+    timeout_secs = 60,
+    startup_wait_secs = 15,
+    aggregate_events = "always",
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext) -> TestResult {
+    use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
+
+    let gateway = ctx.node("gateway")?;
+    let peer = ctx.node("peer")?;
+
+    // Wait for the connection handshake to complete - but no extra time
+    // This is the minimum wait for the test framework's startup_wait_secs
+    // After this, connections MUST be established and identities known
+
+    // Connect to websockets
+    let uri_gw = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        gateway.ws_port
+    );
+    let (stream_gw, _) = connect_async(&uri_gw).await?;
+    let mut client_gw = WebApi::start(stream_gw);
+
+    let uri_peer = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        peer.ws_port
+    );
+    let (stream_peer, _) = connect_async(&uri_peer).await?;
+    let mut client_peer = WebApi::start(stream_peer);
+
+    // Query gateway for connections - should return the peer IMMEDIATELY
+    // No retry loop allowed here - this is the regression test's core assertion
+    client_gw
+        .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+        .await?;
+    let gw_resp = tokio::time::timeout(Duration::from_secs(5), client_gw.recv()).await?;
+    let gw_peers = match gw_resp {
+        Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
+        Ok(other) => bail!("Unexpected response from gateway: {:?}", other),
+        Err(e) => bail!("Error receiving gateway response: {}", e),
+    };
+
+    // Query peer for connections - should return the gateway
+    client_peer
+        .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+        .await?;
+    let peer_resp = tokio::time::timeout(Duration::from_secs(5), client_peer.recv()).await?;
+    let peer_peers = match peer_resp {
+        Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
+        Ok(other) => bail!("Unexpected response from peer: {:?}", other),
+        Err(e) => bail!("Error receiving peer response: {}", e),
+    };
+
+    tracing::info!(
+        gateway_connections = gw_peers.len(),
+        peer_connections = peer_peers.len(),
+        "Connection visibility check"
+    );
+
+    // CRITICAL ASSERTIONS - the whole point of this regression test
+    // Gateway MUST see the peer immediately after connect handshake
+    if gw_peers.is_empty() {
+        bail!(
+            "REGRESSION: Gateway's QueryConnections returned empty! \
+             This indicates the peer's identity was not propagated to the \
+             transport layer when the transient connection was promoted. \
+             See PR #2211 for the original bug fix."
+        );
+    }
+
+    // Peer MUST see the gateway
+    if peer_peers.is_empty() {
+        bail!(
+            "REGRESSION: Peer's QueryConnections returned empty! \
+             This indicates the connection wasn't properly established."
+        );
+    }
+
+    tracing::info!(
+        "✅ Connection identity propagation verified: gateway sees {} peer(s), peer sees {} connection(s)",
+        gw_peers.len(),
+        peer_peers.len()
+    );
+
+    Ok(())
+}
