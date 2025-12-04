@@ -165,14 +165,18 @@ jobs:
         # Use Docker NAT to simulate realistic network topology where peers
         # are behind NAT and gateways are on the public network. This provides
         # better test coverage for NAT traversal and gateway connection code paths.
-        # See issue #2204 for context. Only enable if Docker is accessible.
+        # See issue #2204 for context.
+        # IMPORTANT: This test MUST run with Docker NAT. If Docker is unavailable,
+        # the test fails rather than silently falling back to local mode, which
+        # would skip NAT hole punching validation entirely.
         run: |
-          if docker info >/dev/null 2>&1; then
-            echo "Docker available - using Docker NAT backend"
-            export FREENET_TEST_DOCKER_NAT=1
-          else
-            echo "Docker not available - using local backend"
+          if ! docker info >/dev/null 2>&1; then
+            echo "ERROR: Docker is not available but is REQUIRED for NAT hole punching tests"
+            echo "A test that doesn't test what it claims to test is worse than no test"
+            exit 1
           fi
+          echo "Docker available - using Docker NAT backend"
+          export FREENET_TEST_DOCKER_NAT=1
           cargo test --test message_flow river_message_flow_over_freenet_six_peers_five_rounds -- --ignored --exact
 
   ubertest:
