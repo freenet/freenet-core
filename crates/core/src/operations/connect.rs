@@ -420,6 +420,7 @@ impl RelayContext for RelayEnv<'_> {
             self_addr: self.self_location.socket_addr(),
         };
         let router = self.op_manager.ring.router.read();
+
         let candidates = self.op_manager.ring.connection_manager.routing_candidates(
             desired_location,
             None,
@@ -840,9 +841,58 @@ impl Operation for ConnectOp {
 
                     if let Some(peer) = actions.expect_connection_from {
                         if let Some(addr) = peer.socket_addr() {
+                            // Log to confirm this code path is executed
+                            tracing::info!(
+                                joiner_addr = %addr,
+                                tx = %self.id,
+                                "connect: acceptor accepted joiner, initiating hole punch"
+                            );
+
+                            // Register expectation for incoming connection from joiner
                             op_manager
                                 .notify_node_event(NodeEvent::ExpectPeerConnection { addr })
                                 .await?;
+
+                            // UDP hole punching: The acceptor must ALSO initiate an outbound
+                            // connection to the joiner. This creates a NAT binding on the
+                            // acceptor's side, allowing the joiner's packets to pass through.
+                            // Without this, NAT peers cannot connect to each other because
+                            // only the joiner would be sending packets.
+                            let (callback, mut rx) = mpsc::channel(1);
+                            op_manager
+                                .notify_node_event(NodeEvent::ConnectPeer {
+                                    peer: peer.clone(),
+                                    tx: self.id,
+                                    callback,
+                                    is_gw: false,
+                                })
+                                .await?;
+
+                            // Don't block waiting for connection result - the joiner will
+                            // also be connecting to us simultaneously. Just spawn a task
+                            // to log the outcome.
+                            let tx_id = self.id;
+                            let peer_clone = peer.clone();
+                            tokio::spawn(async move {
+                                if let Some(result) = rx.recv().await {
+                                    match result {
+                                        Ok((connected_peer, _)) => {
+                                            tracing::info!(
+                                                %connected_peer,
+                                                tx=%tx_id,
+                                                "connect: acceptor hole-punch connection succeeded"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            tracing::debug!(
+                                                %peer_clone,
+                                                tx=%tx_id,
+                                                "connect: acceptor hole-punch connection failed (joiner may connect to us instead)"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
                         }
                     }
 
