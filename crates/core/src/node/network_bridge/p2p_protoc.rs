@@ -1596,6 +1596,22 @@ impl P2pConnManager {
                 tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
             }
 
+            // Now that we know the peer's identity (from ConnectRequest), update the
+            // transport-level tracking so QueryConnections returns this peer.
+            if let Some(entry) = self.connections.get_mut(&peer_addr) {
+                if entry.pub_key.is_none() {
+                    entry.pub_key = Some(peer.pub_key().clone());
+                    self.addr_by_pub_key
+                        .insert(peer.pub_key().clone(), peer_addr);
+                    tracing::debug!(
+                        tx = %tx,
+                        %peer_addr,
+                        pub_key = %peer.pub_key(),
+                        "connect_peer: updated transport entry with peer identity"
+                    );
+                }
+            }
+
             // Return the remote peer's address we are connected to.
             let resolved_addr = peer
                 .socket_addr()
@@ -2181,10 +2197,12 @@ impl P2pConnManager {
                                 };
                                 if should_update {
                                     let old_pub_key = entry.pub_key.clone();
+                                    let is_first_identity = old_pub_key.is_none();
                                     tracing::info!(
                                         remote = %remote_addr,
                                         old_pub_key = ?old_pub_key,
                                         new_pub_key = %&new_peer_id.pub_key,
+                                        is_first_identity,
                                         "Updating peer identity after inbound message"
                                     );
                                     // Remove old reverse lookup if it exists
@@ -2204,6 +2222,10 @@ impl P2pConnManager {
                                     // Add new reverse lookup
                                     self.addr_by_pub_key
                                         .insert(new_peer_id.pub_key.clone().clone(), remote_addr);
+                                    // Note: We do NOT automatically promote to ring here.
+                                    // Transient connections are promoted only when the Connect
+                                    // operation explicitly accepts via NodeEvent::ConnectPeer,
+                                    // which is handled by handle_connect_peer().
                                 }
                             }
                         }
