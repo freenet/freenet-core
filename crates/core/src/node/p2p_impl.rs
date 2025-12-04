@@ -144,7 +144,7 @@ impl NodeP2P {
             self.op_manager.ring.connection_manager.routing(
                 ideal_location,
                 None,
-                &HashSet::<PeerId>::new(),
+                &HashSet::<std::net::SocketAddr>::new(),
                 &router,
             )
         };
@@ -170,7 +170,7 @@ impl NodeP2P {
 
             tracing::debug!(
                 %tx,
-                query_peer = %query_target.peer(),
+                query_peer = %query_target,
                 %ideal_location,
                 "Triggering connection maintenance connect request"
             );
@@ -352,7 +352,7 @@ impl NodeP2P {
             executor_listener,
             node_controller: node_controller_rx,
             should_try_connect: config.should_connect,
-            peer_id: config.peer_id,
+            peer_id: None, // PeerId removed - using PeerKeyLocation instead
             is_gateway: config.is_gateway,
             location: config.location,
             client_events_task,

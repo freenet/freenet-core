@@ -1,64 +1,68 @@
 use super::*;
-use crate::{
-    message::Transaction,
-    node::PeerId,
-    ring::{Location, PeerKeyLocation},
-    util::Contains,
-};
+use crate::{message::Transaction, ring::PeerKeyLocation, util::Contains};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use std::collections::HashSet;
+use std::net::SocketAddr;
 
-/// Helper to create PeerKeyLocation with a random peer and specific location
-fn random_peer_at(loc: f64) -> PeerKeyLocation {
-    let mut pkl = PeerKeyLocation::from(PeerId::random());
-    pkl.location = Some(Location::try_from(loc).unwrap());
-    pkl
+/// Helper to create PeerKeyLocation with a random peer
+fn random_peer() -> PeerKeyLocation {
+    PeerKeyLocation::random()
 }
 
 /// TestRing implements only the methods used by subscription routing
+/// Uses SocketAddr for skip lists to match production code
 #[allow(clippy::type_complexity)]
 struct TestRing {
-    pub k_closest_calls: std::sync::Arc<tokio::sync::Mutex<Vec<(ContractKey, Vec<PeerId>, usize)>>>,
+    pub k_closest_calls:
+        std::sync::Arc<tokio::sync::Mutex<Vec<(ContractKey, Vec<SocketAddr>, usize)>>>,
     pub candidates: Vec<PeerKeyLocation>,
-    pub own_peer: PeerId,
+    pub own_addr: SocketAddr,
 }
 
 impl TestRing {
     fn new(candidates: Vec<PeerKeyLocation>, own_location: PeerKeyLocation) -> Self {
+        let own_addr = own_location
+            .socket_addr()
+            .expect("own location must have address");
         Self {
             k_closest_calls: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
             candidates,
-            own_peer: own_location.peer(),
+            own_addr,
         }
     }
 
     pub async fn k_closest_potentially_caching(
         &self,
         key: &ContractKey,
-        skip_list: impl Contains<PeerId> + Clone,
+        skip_list: impl Contains<SocketAddr> + Clone,
         k: usize,
     ) -> Vec<PeerKeyLocation> {
-        // Record the call - use async lock
-        let mut skip_vec: Vec<PeerId> = self
+        // Record skipped addresses from candidates
+        let mut skip_vec: Vec<SocketAddr> = self
             .candidates
             .iter()
-            .filter(|peer| skip_list.has_element(peer.peer().clone()))
-            .map(|peer| peer.peer().clone())
+            .filter_map(|peer| {
+                peer.socket_addr()
+                    .filter(|addr| skip_list.has_element(*addr))
+            })
             .collect();
-        if skip_list.has_element(self.own_peer.clone())
-        // avoid duplicates if own peer also in candidates
-            && !skip_vec.iter().any(|p| p == &self.own_peer)
-        {
-            skip_vec.push(self.own_peer.clone());
+
+        // Add own address if it's in skip list
+        if skip_list.has_element(self.own_addr) && !skip_vec.contains(&self.own_addr) {
+            skip_vec.push(self.own_addr);
         }
 
-        // Use async lock
+        // Record the call
         self.k_closest_calls.lock().await.push((*key, skip_vec, k));
 
         // Return candidates not in skip list
         self.candidates
             .iter()
-            .filter(|peer| !skip_list.has_element(peer.peer().clone()))
+            .filter(|peer| {
+                peer.socket_addr()
+                    .map(|addr| !skip_list.has_element(addr))
+                    .unwrap_or(true)
+            })
             .take(k)
             .cloned()
             .collect()
@@ -71,15 +75,18 @@ impl TestRing {
 async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     let contract_key = ContractKey::from(ContractInstanceId::new([10u8; 32]));
 
-    // Create test peers using From<PeerId> and setting specific locations
-    let mut peer1 = PeerKeyLocation::from(PeerId::random());
-    peer1.location = Some(Location::try_from(0.1).unwrap());
-    let mut peer2 = PeerKeyLocation::from(PeerId::random());
-    peer2.location = Some(Location::try_from(0.2).unwrap());
-    let mut peer3 = PeerKeyLocation::from(PeerId::random());
-    peer3.location = Some(Location::try_from(0.3).unwrap());
-    let mut own_location = PeerKeyLocation::from(PeerId::random());
-    own_location.location = Some(Location::try_from(0.5).unwrap());
+    // Create test peers
+    let peer1 = random_peer();
+    let peer2 = random_peer();
+    let peer3 = random_peer();
+    let own_location = random_peer();
+
+    // Get socket addresses for skip list operations
+    let peer1_addr = peer1.socket_addr().expect("peer1 must have address");
+    let peer2_addr = peer2.socket_addr().expect("peer2 must have address");
+    let own_addr = own_location
+        .socket_addr()
+        .expect("own location must have address");
 
     // Create TestRing with multiple candidates
     let test_ring = TestRing::new(
@@ -94,9 +101,9 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
         Some(SubscribeState::PrepareRequest { .. })
     ));
 
-    // 2. Test k_closest_potentially_caching with initial skip list containing self (simulates request_subscribe call)
-    let mut initial_skip = HashSet::new();
-    initial_skip.insert(own_location.peer().clone());
+    // 2. Test k_closest_potentially_caching with initial skip list containing self
+    let mut initial_skip: HashSet<SocketAddr> = HashSet::new();
+    initial_skip.insert(own_addr);
     let initial_candidates = test_ring
         .k_closest_potentially_caching(&contract_key, &initial_skip, 3)
         .await;
@@ -118,9 +125,8 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
         "Initial call should only skip own peer"
     );
     assert_eq!(
-        k_closest_calls[0].1[0],
-        own_location.peer(),
-        "Initial skip list should contain own peer"
+        k_closest_calls[0].1[0], own_addr,
+        "Initial skip list should contain own address"
     );
     assert_eq!(k_closest_calls[0].2, 3, "Should request 3 candidates");
     drop(k_closest_calls);
@@ -134,8 +140,8 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     assert_eq!(initial_candidates[0], peer1, "Should return peer1 first");
 
     // 5. Test retry with skip list (simulates ReturnSub handler)
-    let mut skip_list = HashSet::new();
-    skip_list.insert(peer1.peer().clone()); // First peer failed
+    let mut skip_list: HashSet<SocketAddr> = HashSet::new();
+    skip_list.insert(peer1_addr); // First peer failed
 
     // This is the critical call that would happen in the ReturnSub handler
     let candidates_after_failure = test_ring
@@ -159,9 +165,8 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
         "Skip list should contain 1 failed peer"
     );
     assert_eq!(
-        k_closest_calls[1].1[0],
-        peer1.peer(),
-        "Skip list should contain the failed peer"
+        k_closest_calls[1].1[0], peer1_addr,
+        "Skip list should contain the failed peer's address"
     );
     assert_eq!(k_closest_calls[1].2, 3, "Should still request 3 candidates");
     drop(k_closest_calls);
@@ -170,7 +175,7 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     assert!(
         !candidates_after_failure
             .iter()
-            .any(|p| p.peer() == peer1.peer()),
+            .any(|p| p.socket_addr() == Some(peer1_addr)),
         "Failed peer should be excluded from candidates"
     );
     assert!(
@@ -183,7 +188,7 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     );
 
     // 8. Test multiple failures
-    skip_list.insert(peer2.peer().clone()); // Second peer also failed
+    skip_list.insert(peer2_addr); // Second peer also failed
     let final_candidates = test_ring
         .k_closest_potentially_caching(&contract_key, &skip_list, 3)
         .await;
@@ -214,20 +219,9 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     assert!(
         !final_candidates
             .iter()
-            .any(|p| p.peer() == peer1.peer() || p.peer() == peer2.peer()),
+            .any(|p| p.socket_addr() == Some(peer1_addr) || p.socket_addr() == Some(peer2_addr)),
         "Failed peers should be excluded"
     );
-
-    // This test validates the TestRing behavior that supports subscription routing:
-    // 1. start_op always works (no early return bug)
-    // 2. k_closest_potentially_caching is called with a skip list that already excludes the local peer
-    // 3. k_closest_potentially_caching is called with proper skip list after failures
-    // 4. Skip list correctly excludes failed peers
-    // 5. Alternative peers are found after failures
-    // 6. Multiple failures are handled correctly
-
-    // This test validates our TestRing mock implementation works correctly
-    // The real integration test is test_real_subscription_code_calls_k_closest_with_skip_list
 }
 
 /// Integration test that exercises the production subscription code paths that use k_closest_potentially_caching
@@ -236,15 +230,18 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
 async fn test_subscription_production_code_paths_use_k_closest() {
     let contract_key = ContractKey::from(ContractInstanceId::new([11u8; 32]));
 
-    // Create test peers using From<PeerId> and setting specific locations
-    let mut peer1 = PeerKeyLocation::from(PeerId::random());
-    peer1.location = Some(Location::try_from(0.1).unwrap());
-    let mut peer2 = PeerKeyLocation::from(PeerId::random());
-    peer2.location = Some(Location::try_from(0.2).unwrap());
-    let mut peer3 = PeerKeyLocation::from(PeerId::random());
-    peer3.location = Some(Location::try_from(0.3).unwrap());
-    let mut own_location = PeerKeyLocation::from(PeerId::random());
-    own_location.location = Some(Location::try_from(0.5).unwrap());
+    // Create test peers
+    let peer1 = random_peer();
+    let peer2 = random_peer();
+    let peer3 = random_peer();
+    let own_location = random_peer();
+
+    // Get socket addresses
+    let peer1_addr = peer1.socket_addr().expect("peer1 must have address");
+    let peer2_addr = peer2.socket_addr().expect("peer2 must have address");
+    let own_addr = own_location
+        .socket_addr()
+        .expect("own location must have address");
 
     // Create TestRing that records all k_closest_potentially_caching calls
     let test_ring = TestRing::new(
@@ -260,14 +257,13 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     ));
 
     // Test 2: Simulate the k_closest_potentially_caching call made in request_subscribe
-    // (Line 72 in subscribe.rs: op_manager.ring.k_closest_potentially_caching(key, skip_list, 3))
-    let mut initial_skip = HashSet::new();
-    initial_skip.insert(own_location.peer().clone());
+    let mut initial_skip: HashSet<SocketAddr> = HashSet::new();
+    initial_skip.insert(own_addr);
     let initial_candidates = test_ring
         .k_closest_potentially_caching(&contract_key, &initial_skip, 3)
         .await;
 
-    // Verify the call was recorded (this proves our test setup works)
+    // Verify the call was recorded
     let k_closest_calls = test_ring.k_closest_calls.lock().await;
     assert_eq!(
         k_closest_calls.len(),
@@ -284,9 +280,8 @@ async fn test_subscription_production_code_paths_use_k_closest() {
         "Should skip own peer initially"
     );
     assert_eq!(
-        k_closest_calls[0].1[0],
-        own_location.peer(),
-        "Skip list should contain own peer"
+        k_closest_calls[0].1[0], own_addr,
+        "Skip list should contain own address"
     );
     assert_eq!(k_closest_calls[0].2, 3, "Should request 3 candidates");
     drop(k_closest_calls);
@@ -299,9 +294,8 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     assert_eq!(initial_candidates[0], peer1, "Should return peer1 first");
 
     // Test 3: Simulate the k_closest_potentially_caching call made in SeekNode handler
-    // (Line 241 in subscribe.rs: op_manager.ring.k_closest_potentially_caching(key, skip_list, 3))
-    let mut skip_list = HashSet::new();
-    skip_list.insert(peer1.peer().clone());
+    let mut skip_list: HashSet<SocketAddr> = HashSet::new();
+    skip_list.insert(peer1_addr);
     let seek_candidates = test_ring
         .k_closest_potentially_caching(&contract_key, &skip_list, 3)
         .await;
@@ -319,16 +313,17 @@ async fn test_subscription_production_code_paths_use_k_closest() {
         "Should include failed peer in skip list"
     );
     assert_eq!(
-        k_closest_calls[1].1[0],
-        peer1.peer(),
-        "Should skip the failed peer"
+        k_closest_calls[1].1[0], peer1_addr,
+        "Should skip the failed peer's address"
     );
     assert_eq!(k_closest_calls[1].2, 3, "Should still request 3 candidates");
     drop(k_closest_calls);
 
     // Verify failed peer is excluded from results
     assert!(
-        !seek_candidates.iter().any(|p| p.peer() == peer1.peer()),
+        !seek_candidates
+            .iter()
+            .any(|p| p.socket_addr() == Some(peer1_addr)),
         "Should exclude failed peer"
     );
     assert_eq!(
@@ -339,8 +334,7 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     assert_eq!(seek_candidates[0], peer2, "Should return peer2 first");
 
     // Test 4: Simulate the k_closest_potentially_caching call made in ReturnSub(false) handler
-    // (Line 336 in subscribe.rs: op_manager.ring.k_closest_potentially_caching(key, &skip_list, 3))
-    skip_list.insert(peer2.peer().clone()); // Second peer also failed
+    skip_list.insert(peer2_addr); // Second peer also failed
     let retry_candidates = test_ring
         .k_closest_potentially_caching(&contract_key, &skip_list, 3)
         .await;
@@ -358,11 +352,11 @@ async fn test_subscription_production_code_paths_use_k_closest() {
         "Should include both failed peers in skip list"
     );
     assert!(
-        k_closest_calls[2].1.contains(&peer1.peer()),
+        k_closest_calls[2].1.contains(&peer1_addr),
         "Should skip peer1"
     );
     assert!(
-        k_closest_calls[2].1.contains(&peer2.peer()),
+        k_closest_calls[2].1.contains(&peer2_addr),
         "Should skip peer2"
     );
     assert_eq!(k_closest_calls[2].2, 3, "Should still request 3 candidates");
@@ -372,7 +366,7 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     assert!(
         !retry_candidates
             .iter()
-            .any(|p| p.peer() == peer1.peer() || p.peer() == peer2.peer()),
+            .any(|p| p.socket_addr() == Some(peer1_addr) || p.socket_addr() == Some(peer2_addr)),
         "Should exclude both failed peers"
     );
     assert_eq!(retry_candidates.len(), 1, "Should return final 1 candidate");
@@ -380,20 +374,6 @@ async fn test_subscription_production_code_paths_use_k_closest() {
         retry_candidates[0], peer3,
         "Should return peer3 as last option"
     );
-
-    // This test validates the 3 critical code paths in subscription logic where k_closest_potentially_caching is called:
-    // 1. request_subscribe (line 72): op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3)
-    // 2. SeekNode handler (line 241): op_manager.ring.k_closest_potentially_caching(key, skip_list, 3)
-    // 3. ReturnSub(false) handler (line 336): op_manager.ring.k_closest_potentially_caching(key, &skip_list, 3)
-
-    // This test would FAIL if someone:
-    // - Removed any of these k_closest_potentially_caching calls
-    // - Changed the parameters (key, skip_list, k) passed to k_closest_potentially_caching
-    // - Broke the skip list logic that excludes failed peers
-    // - Changed the retry/forwarding logic to not use k_closest_potentially_caching
-
-    // The key insight: By testing the exact same call patterns and parameters that the production code uses,
-    // we can be confident that if those calls were broken, this test would break too.
 }
 
 /// Test that validates the subscription operation would call k_closest_potentially_caching correctly
@@ -410,18 +390,14 @@ async fn test_subscription_validates_k_closest_usage() {
 
     // Create TestRing that records all k_closest calls
     let test_ring = TestRing::new(
-        vec![
-            random_peer_at(0.1),
-            random_peer_at(0.2),
-            random_peer_at(0.3),
-        ],
-        random_peer_at(0.5),
+        vec![random_peer(), random_peer(), random_peer()],
+        random_peer(),
     );
 
     // Test 1: Validate the exact call pattern from request_subscribe (line 72)
     {
-        let mut initial_skip = HashSet::new();
-        initial_skip.insert(test_ring.own_peer.clone());
+        let mut initial_skip: HashSet<SocketAddr> = HashSet::new();
+        initial_skip.insert(test_ring.own_addr);
         let _candidates = test_ring
             .k_closest_potentially_caching(&contract_key, &initial_skip, 3)
             .await;
@@ -436,8 +412,8 @@ async fn test_subscription_validates_k_closest_usage() {
             "First attempt should only skip own peer"
         );
         assert_eq!(
-            skip_list[0], test_ring.own_peer,
-            "Skip list should contain own peer"
+            skip_list[0], test_ring.own_addr,
+            "Skip list should contain own address"
         );
         assert_eq!(*k, 3, "Uses k=3 as per fix");
     }
@@ -446,8 +422,10 @@ async fn test_subscription_validates_k_closest_usage() {
     {
         test_ring.k_closest_calls.lock().await.clear();
 
-        let failed_peer = test_ring.candidates[0].peer().clone();
-        let skip_list = [failed_peer.clone()];
+        let failed_addr = test_ring.candidates[0]
+            .socket_addr()
+            .expect("candidate must have address");
+        let skip_list = [failed_addr];
 
         let candidates = test_ring
             .k_closest_potentially_caching(&contract_key, &skip_list[..], 3)
@@ -458,24 +436,27 @@ async fn test_subscription_validates_k_closest_usage() {
         let (key, used_skip_list, k) = &calls[0];
         assert_eq!(*key, contract_key);
         assert_eq!(used_skip_list.len(), 1, "Skip list includes failed peer");
-        assert_eq!(used_skip_list[0], failed_peer);
+        assert_eq!(used_skip_list[0], failed_addr);
         assert_eq!(*k, 3);
 
         // Verify failed peer is excluded from candidates
         assert!(
-            !candidates.iter().any(|c| c.peer() == failed_peer),
+            !candidates
+                .iter()
+                .any(|c| c.socket_addr() == Some(failed_addr)),
             "Failed peer must be excluded"
         );
     }
 
     // Test 3: Validate subscription state transitions maintain skip list correctly
     {
-        // Create AwaitingResponse state with skip list
-        let failed_peer1 = PeerId::random();
-        let failed_peer2 = PeerId::random();
-        let mut skip_list = HashSet::new();
-        skip_list.insert(failed_peer1.clone());
-        skip_list.insert(failed_peer2.clone());
+        // Create AwaitingResponse state with skip list (of socket addresses)
+        use std::net::{IpAddr, Ipv4Addr};
+        let failed_addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
+        let failed_addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
+        let mut skip_list: HashSet<SocketAddr> = HashSet::new();
+        skip_list.insert(failed_addr1);
+        skip_list.insert(failed_addr2);
 
         let op = SubscribeOp {
             id: transaction_id,
@@ -496,14 +477,9 @@ async fn test_subscription_validates_k_closest_usage() {
         }) = &op.state
         {
             assert_eq!(list.len(), 2, "Skip list maintains failed peers");
-            assert!(list.contains(&failed_peer1));
-            assert!(list.contains(&failed_peer2));
+            assert!(list.contains(&failed_addr1));
+            assert!(list.contains(&failed_addr2));
             assert_eq!(*retries, 2, "Retry count is tracked");
         }
     }
-
-    // This test demonstrates that our TestRing correctly validates the subscription operation's
-    // use of k_closest_potentially_caching. The production code in subscribe.rs calls this
-    // function at exactly these points with these parameters, so if the production code
-    // was broken, these tests would fail
 }

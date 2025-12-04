@@ -16,6 +16,7 @@ use crate::{
     config::GlobalExecutor,
     message::NetMessage,
     node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager, PeerId},
+    ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
 
@@ -65,11 +66,15 @@ impl NetworkBridge for MemoryConnManager {
         self.log_register
             .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
-        // Create a temporary PeerId for tracking (in-memory transport uses PeerId internally)
-        let target_peer = PeerId::new(target_addr, self.transport.interface_peer.pub_key.clone());
+        // Create a temporary PeerId for in-memory transport (still uses PeerId internally)
+        let target_peer_id =
+            PeerId::new(target_addr, self.transport.interface_peer.pub_key.clone());
+        // Create PeerKeyLocation for op_manager tracking
+        let target_peer =
+            PeerKeyLocation::new(self.transport.interface_peer.pub_key.clone(), target_addr);
         self.op_manager.sending_transaction(&target_peer, &msg);
         let msg = bincode::serialize(&msg)?;
-        self.transport.send(target_peer, msg);
+        self.transport.send(target_peer_id, msg);
         Ok(())
     }
 

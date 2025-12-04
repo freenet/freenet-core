@@ -284,7 +284,7 @@ where
                         let res = match res {
                             QueryResult::Connections(conns) => {
                                 Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
-                                    peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.addr)).collect() }
+                                    peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.socket_addr().expect("connected peer should have socket address"))).collect() }
                                 ))
                             }
                             QueryResult::GetResult { key, state, contract } => {
@@ -307,7 +307,7 @@ where
                                 }).collect();
 
                                 let connected_peers = debug_info.connected_peers.into_iter().map(|peer| {
-                                    (peer.to_string(), peer.addr)
+                                    (peer.to_string(), peer.socket_addr().expect("connected peer should have socket address"))
                                 }).collect();
 
                                 Ok(HostResponse::QueryResponse(QueryResponse::NetworkDebug(
@@ -403,9 +403,9 @@ async fn process_open_request(
                             return Err(Error::Disconnected);
                         }
 
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
+                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
                         else {
-                            tracing::error!("peer id not found at put op, it should be set");
+                            tracing::error!("peer address not found at put op, it should be set");
                             return Err(Error::Disconnected);
                         };
 
@@ -420,9 +420,10 @@ async fn process_open_request(
                         // This prevents race condition where PUT completes instantly and TX is removed
                         // before a second client can reuse it (issue #1886)
                         let own_location = op_manager.ring.connection_manager.own_location();
+                        let skip_list: Vec<_> = own_location.socket_addr().into_iter().collect();
                         let has_remote_peers = op_manager
                             .ring
-                            .closest_potentially_caching(&contract_key, &[own_location.peer()][..])
+                            .closest_potentially_caching(&contract_key, skip_list.as_slice())
                             .is_some();
 
                         if !has_remote_peers {
@@ -651,9 +652,11 @@ async fn process_open_request(
                         }
                     }
                     ContractRequest::Update { key, data } => {
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
+                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
                         else {
-                            tracing::error!("Peer id not found at update op, it should be set");
+                            tracing::error!(
+                                "Peer address not found at update op, it should be set"
+                            );
                             return Err(Error::Disconnected);
                         };
 
@@ -841,9 +844,9 @@ async fn process_open_request(
                         return_contract_code,
                         subscribe,
                     } => {
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
+                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
                         else {
-                            tracing::error!("Peer id not found at get op, it should be set");
+                            tracing::error!("Peer address not found at get op, it should be set");
                             return Err(Error::Disconnected);
                         };
 
@@ -1050,9 +1053,11 @@ async fn process_open_request(
                         }
                     }
                     ContractRequest::Subscribe { key, summary } => {
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_peer_key()
+                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
                         else {
-                            tracing::error!("Peer id not found at subscribe op, it should be set");
+                            tracing::error!(
+                                "Peer address not found at subscribe op, it should be set"
+                            );
                             return Err(Error::Disconnected);
                         };
 

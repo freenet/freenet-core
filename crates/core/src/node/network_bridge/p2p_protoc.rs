@@ -25,7 +25,7 @@ use crate::node::network_bridge::handshake::{
     HandshakeHandler,
 };
 use crate::node::network_bridge::priority_select;
-use crate::node::{MessageProcessor, PeerId};
+use crate::node::MessageProcessor;
 use crate::operations::connect::ConnectMsg;
 use crate::ring::Location;
 use crate::transport::{
@@ -40,17 +40,20 @@ use crate::{
         WaitingResolution,
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction},
-    node::{handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager},
+    node::{
+        handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager,
+        PeerId,
+    },
     ring::{PeerAddr, PeerKeyLocation},
     tracing::NetEventLog,
 };
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 
-type P2pBridgeEvent = Either<(PeerId, Box<NetMessage>), NodeEvent>;
+type P2pBridgeEvent = Either<(PeerKeyLocation, Box<NetMessage>), NodeEvent>;
 
 #[derive(Clone)]
 pub(crate) struct P2pBridge {
-    accepted_peers: Arc<DashSet<PeerId>>,
+    accepted_peers: Arc<DashSet<SocketAddr>>,
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
     log_register: Arc<dyn NetEventRegister>,
@@ -76,24 +79,28 @@ impl P2pBridge {
 
 impl NetworkBridge for P2pBridge {
     async fn drop_connection(&mut self, peer_addr: SocketAddr) -> super::ConnResult<()> {
-        // Find the peer by address and remove it
-        let peer = self
-            .accepted_peers
-            .iter()
-            .find(|p| p.addr == peer_addr)
-            .map(|p| p.clone());
-        if let Some(peer) = peer {
-            self.accepted_peers.remove(&peer);
+        if self.accepted_peers.remove(&peer_addr).is_some() {
             self.ev_listener_tx
                 .send(Right(NodeEvent::DropConnection(peer_addr)))
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted(peer_addr))?;
-            self.log_register
-                .register_events(Either::Left(NetEventLog::disconnected(
-                    &self.op_manager.ring,
-                    &peer,
-                )))
-                .await;
+            // Log disconnect with PeerKeyLocation if we can construct one
+            if let Some(peer_loc) = self
+                .op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(peer_addr)
+            {
+                self.log_register
+                    .register_events(Either::Left(NetEventLog::disconnected(
+                        &self.op_manager.ring,
+                        &PeerId::new(
+                            peer_loc.socket_addr().expect("peer should have address"),
+                            peer_loc.pub_key().clone(),
+                        ),
+                    )))
+                    .await;
+            }
         }
         Ok(())
     }
@@ -102,29 +109,30 @@ impl NetworkBridge for P2pBridge {
         self.log_register
             .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
-        // Look up the full PeerId from accepted_peers for transaction tracking and sending
-        let target = self
-            .accepted_peers
-            .iter()
-            .find(|p| p.addr == target_addr)
-            .map(|p| p.clone());
-        if let Some(ref target) = target {
+        // Look up the full PeerKeyLocation from connection manager for transaction tracking
+        let target_loc = self
+            .op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_addr(target_addr);
+        if let Some(ref target) = target_loc {
             self.op_manager.sending_transaction(target, &msg);
             self.ev_listener_tx
                 .send(Left((target.clone(), Box::new(msg))))
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
         } else {
-            // No known peer at this address - create a temporary PeerId for the event
-            // This should rarely happen in practice
+            // No known peer at this address - create a temporary PeerKeyLocation
+            // using our own pub_key as placeholder
             tracing::warn!(
                 %target_addr,
-                "Sending to unknown peer address - creating temporary PeerId"
+                "Sending to unknown peer address - creating temporary PeerKeyLocation"
             );
-            let temp_peer = PeerId::new(
-                target_addr,
+            let temp_peer = PeerKeyLocation::new(
                 (*self.op_manager.ring.connection_manager.pub_key).clone(),
+                target_addr,
             );
+            self.op_manager.sending_transaction(&temp_peer, &msg);
             self.ev_listener_tx
                 .send(Left((temp_peer, Box::new(msg))))
                 .await
@@ -195,12 +203,12 @@ impl P2pConnManager {
         let key_pair = config.key_pair.clone();
 
         // Initialize our peer identity before any connection attempts so join requests can
+        // Initialize our peer identity before any connection attempts so join requests can
         // reference the correct address.
         let advertised_addr = {
             let advertised_ip = config
-                .peer_id
-                .as_ref()
-                .map(|peer| peer.addr.ip())
+                .own_addr
+                .map(|addr| addr.ip())
                 .or(config.config.network_api.public_address)
                 .unwrap_or_else(|| {
                     if listener_ip.is_unspecified() {
@@ -210,9 +218,8 @@ impl P2pConnManager {
                     }
                 });
             let advertised_port = config
-                .peer_id
-                .as_ref()
-                .map(|peer| peer.addr.port())
+                .own_addr
+                .map(|addr| addr.port())
                 .or(config.config.network_api.public_port)
                 .unwrap_or(listen_port);
             SocketAddr::new(advertised_ip, advertised_port)
@@ -221,7 +228,7 @@ impl P2pConnManager {
             .op_manager
             .ring
             .connection_manager
-            .try_set_peer_key(advertised_addr);
+            .try_set_own_addr(advertised_addr);
 
         Ok(P2pConnManager {
             gateways,
@@ -364,7 +371,7 @@ impl P2pConnManager {
                                 tx = %msg.id(),
                                 msg_type = %msg,
                                 remote = ?remote,
-                                peer = %ctx.bridge.op_manager.ring.connection_manager.get_peer_key().unwrap(),
+                                peer = ?ctx.bridge.op_manager.ring.connection_manager.get_own_addr(),
                                 "Received inbound message from peer - processing"
                             );
                             // Only the hop that owns the transport socket (gateway/first hop in
@@ -404,19 +411,19 @@ impl P2pConnManager {
                             };
 
                             // Check if message targets self - if so, process locally instead of sending over network
-                            let self_peer_id = ctx
+                            let self_addr = ctx
                                 .bridge
                                 .op_manager
                                 .ring
                                 .connection_manager
-                                .get_peer_key()
-                                .unwrap();
-                            if target_peer.peer() == self_peer_id {
+                                .get_own_addr()
+                                .expect("own address should be set");
+                            if target_peer.socket_addr() == Some(self_addr) {
                                 tracing::error!(
                                     tx = %msg.id(),
                                     msg_type = %msg,
                                     target_peer = %target_peer,
-                                    self_peer = %self_peer_id,
+                                    self_addr = %self_addr,
                                     "BUG: OutboundMessage targets self! This indicates a routing logic error - messages should not reach OutboundMessage handler if they target self"
                                 );
                                 // Convert to InboundMessage and process locally (no remote source)
@@ -436,14 +443,14 @@ impl P2pConnManager {
                             // removed by another task between those two calls.
                             let peer_connection = ctx
                                 .connections
-                                .get(&target_peer.addr())
+                                .get(&target_peer.socket_addr().expect("target peer should have address"))
                                 .or_else(|| {
-                                    if target_peer.addr().ip().is_unspecified() {
+                                    if target_peer.socket_addr().expect("target peer should have address").ip().is_unspecified() {
                                         ctx.connection_entry_by_pub_key(target_peer.pub_key())
                                             .map(|(resolved_addr, entry)| {
                                                 tracing::info!(
                                                     tx = %msg.id(),
-                                                    target_peer = %target_peer.peer(),
+                                                    target_peer = %target_peer.pub_key(),
                                                     resolved_addr = %resolved_addr,
                                                     "Resolved outbound connection using peer public key due to unspecified address"
                                                 );
@@ -456,7 +463,7 @@ impl P2pConnManager {
                             tracing::debug!(
                                 tx = %msg.id(),
                                 self_peer = %ctx.bridge.op_manager.ring.connection_manager.pub_key,
-                                target = %target_peer.peer(),
+                                target = %target_peer.pub_key(),
                                 conn_map_size = ctx.connections.len(),
                                 has_connection = peer_connection.is_some(),
                                 "[CONN_TRACK] LOOKUP: Checking for existing connection in HashMap"
@@ -481,22 +488,22 @@ impl P2pConnManager {
                                 None => {
                                     tracing::warn!(
                                         id = %msg.id(),
-                                        target = %target_peer.peer(),
+                                        target = %target_peer.pub_key(),
                                         "No existing outbound connection, establishing connection first"
                                     );
 
                                     // Queue the message for sending after connection is established
                                     let tx = *msg.id();
                                     let (callback, mut result) = tokio::sync::mpsc::channel(10);
-                                    let target_peer_id = target_peer.peer().clone();
+                                    let target_peer_loc = target_peer.clone();
                                     let msg_clone = msg.clone();
                                     let bridge_sender = ctx.bridge.ev_listener_tx.clone();
-                                    let self_peer_id = ctx
+                                    let self_addr = ctx
                                         .bridge
                                         .op_manager
                                         .ring
                                         .connection_manager
-                                        .get_peer_key();
+                                        .get_own_addr();
                                     let op_manager = ctx.bridge.op_manager.clone();
                                     let gateways = ctx.gateways.clone();
 
@@ -504,7 +511,7 @@ impl P2pConnManager {
                                     ctx.bridge
                                         .ev_listener_tx
                                         .send(Right(NodeEvent::ConnectPeer {
-                                            peer: target_peer.peer().clone(),
+                                            peer: target_peer.clone(),
                                             tx,
                                             callback,
                                             is_gw: false,
@@ -513,7 +520,7 @@ impl P2pConnManager {
 
                                     tracing::info!(
                                         tx = %tx,
-                                        target = %target_peer_id,
+                                        target = %target_peer_loc,
                                         "connect_peer: dispatched connect request, waiting asynchronously"
                                     );
 
@@ -523,20 +530,20 @@ impl P2pConnManager {
                                             Ok(Some(Ok(_))) => {
                                                 tracing::info!(
                                                     tx = %tx,
-                                                    target = %target_peer_id,
-                                                    self_peer = ?self_peer_id,
+                                                    target = %target_peer_loc,
+                                                    self_addr = ?self_addr,
                                                     "connect_peer: connection established, rescheduling message send"
                                                 );
                                                 if let Err(e) = bridge_sender
                                                     .send(Left((
-                                                        target_peer_id.clone(),
+                                                        target_peer_loc.clone(),
                                                         Box::new(msg_clone),
                                                     )))
                                                     .await
                                                 {
                                                     tracing::error!(
                                                         tx = %tx,
-                                                        target = %target_peer_id,
+                                                        target = %target_peer_loc,
                                                         "connect_peer: failed to reschedule message after connection: {:?}",
                                                         e
                                                     );
@@ -545,7 +552,7 @@ impl P2pConnManager {
                                             Ok(Some(Err(e))) => {
                                                 tracing::error!(
                                                     tx = %tx,
-                                                    target = %target_peer_id,
+                                                    target = %target_peer_loc,
                                                     "connect_peer: connection attempt returned error: {:?}",
                                                     e
                                                 );
@@ -555,7 +562,7 @@ impl P2pConnManager {
                                                 {
                                                     tracing::warn!(
                                                         tx = %tx,
-                                                        target = %target_peer_id,
+                                                        target = %target_peer_loc,
                                                         ?err,
                                                         "connect_peer: failed to propagate aborted operation"
                                                     );
@@ -564,7 +571,7 @@ impl P2pConnManager {
                                             Ok(None) => {
                                                 tracing::error!(
                                                     tx = %tx,
-                                                    target = %target_peer_id,
+                                                    target = %target_peer_loc,
                                                     "connect_peer: response channel closed before connection result"
                                                 );
                                                 if let Err(err) =
@@ -573,7 +580,7 @@ impl P2pConnManager {
                                                 {
                                                     tracing::warn!(
                                                         tx = %tx,
-                                                        target = %target_peer_id,
+                                                        target = %target_peer_loc,
                                                         ?err,
                                                         "connect_peer: failed to propagate aborted operation"
                                                     );
@@ -582,7 +589,7 @@ impl P2pConnManager {
                                             Err(_) => {
                                                 tracing::error!(
                                                     tx = %tx,
-                                                    target = %target_peer_id,
+                                                    target = %target_peer_loc,
                                                     "connect_peer: timeout waiting for connection result"
                                                 );
                                                 if let Err(err) =
@@ -591,7 +598,7 @@ impl P2pConnManager {
                                                 {
                                                     tracing::warn!(
                                                         tx = %tx,
-                                                        target = %target_peer_id,
+                                                        target = %target_peer_loc,
                                                         ?err,
                                                         "connect_peer: failed to propagate aborted operation"
                                                     );
@@ -633,13 +640,12 @@ impl P2pConnManager {
                                     for (peer_addr, pub_key_opt) in peers_to_cleanup {
                                         tracing::debug!(%peer_addr, "Cleaning up active connection due to critical channel closure");
 
-                                        // Clean up ring state - construct PeerId with pub_key if available
+                                        // Clean up ring state - construct PeerKeyLocation with pub_key if available
                                         let peer = if let Some(pub_key) = pub_key_opt.clone() {
-                                            PeerId::new(peer_addr, pub_key)
+                                            PeerKeyLocation::new(pub_key, peer_addr)
                                         } else {
                                             // Use our own pub_key as placeholder if we don't know the peer's
-                                            PeerId::new(
-                                                peer_addr,
+                                            PeerKeyLocation::new(
                                                 (*ctx
                                                     .bridge
                                                     .op_manager
@@ -647,12 +653,16 @@ impl P2pConnManager {
                                                     .connection_manager
                                                     .pub_key)
                                                     .clone(),
+                                                peer_addr,
                                             )
                                         };
                                         ctx.bridge
                                             .op_manager
                                             .ring
-                                            .prune_connection(peer.clone())
+                                            .prune_connection(PeerId::new(
+                                                peer_addr,
+                                                peer.pub_key().clone(),
+                                            ))
                                             .await;
 
                                         // Remove from connection map
@@ -703,12 +713,11 @@ impl P2pConnManager {
                             NodeEvent::DropConnection(peer_addr) => {
                                 // Look up the connection entry by address
                                 if let Some(entry) = ctx.connections.get(&peer_addr) {
-                                    // Construct PeerId from stored pub_key or fallback
+                                    // Construct PeerKeyLocation from stored pub_key or fallback
                                     let peer = if let Some(ref pub_key) = entry.pub_key {
-                                        PeerId::new(peer_addr, pub_key.clone())
+                                        PeerKeyLocation::new(pub_key.clone(), peer_addr)
                                     } else {
-                                        PeerId::new(
-                                            peer_addr,
+                                        PeerKeyLocation::new(
                                             (*ctx
                                                 .bridge
                                                 .op_manager
@@ -716,6 +725,7 @@ impl P2pConnManager {
                                                 .connection_manager
                                                 .pub_key)
                                                 .clone(),
+                                            peer_addr,
                                         )
                                     };
                                     let pub_key_to_remove = entry.pub_key.clone();
@@ -737,7 +747,10 @@ impl P2pConnManager {
                                     ctx.bridge
                                         .op_manager
                                         .ring
-                                        .prune_connection(peer.clone())
+                                        .prune_connection(PeerId::new(
+                                            peer_addr,
+                                            peer.pub_key().clone(),
+                                        ))
                                         .await;
                                     if let Some(conn) = ctx.connections.remove(&peer_addr) {
                                         // Also remove from reverse lookup
@@ -781,7 +794,7 @@ impl P2pConnManager {
                                 tracing::info!(
                                     tx = %tx,
                                     remote = %peer,
-                                    remote_addr = %peer.addr,
+                                    remote_addr = ?peer.socket_addr(),
                                     transient,
                                     "NodeEvent::ConnectPeer received"
                                 );
@@ -795,45 +808,41 @@ impl P2pConnManager {
                                 )
                                 .await?;
                             }
-                            NodeEvent::ExpectPeerConnection { peer } => {
-                                tracing::debug!(%peer, "ExpectPeerConnection event received; registering inbound expectation via handshake driver");
-                                state.outbound_handler.expect_incoming(peer.addr);
+                            NodeEvent::ExpectPeerConnection { addr } => {
+                                tracing::debug!(%addr, "ExpectPeerConnection event received; registering inbound expectation via handshake driver");
+                                state.outbound_handler.expect_incoming(addr);
+                                // We don't know the peer's public key yet for expected inbound connections,
+                                // so use our own pub_key as a placeholder. The handshake will update it.
+                                let peer_placeholder = PeerKeyLocation::new(
+                                    (*ctx.bridge.op_manager.ring.connection_manager.pub_key)
+                                        .clone(),
+                                    addr,
+                                );
                                 if let Err(error) = handshake_cmd_sender
                                     .send(HandshakeCommand::ExpectInbound {
-                                        peer: peer.clone(),
+                                        peer: peer_placeholder,
                                         transaction: None,
                                         transient: false,
                                     })
                                     .await
                                 {
                                     tracing::warn!(
-                                        %peer,
+                                        %addr,
                                         ?error,
                                         "Failed to enqueue ExpectInbound command; inbound connection may be dropped"
                                     );
                                 }
                             }
                             NodeEvent::QueryConnections { callback } => {
-                                // Reconstruct PeerIds from stored connections
-                                let connections: Vec<PeerId> = ctx
+                                // Reconstruct PeerKeyLocations from stored connections
+                                let connections: Vec<PeerKeyLocation> = ctx
                                     .connections
                                     .iter()
-                                    .map(|(addr, entry)| {
-                                        if let Some(ref pub_key) = entry.pub_key {
-                                            PeerId::new(*addr, pub_key.clone())
-                                        } else {
-                                            // Use our own pub_key as placeholder if we don't know the peer's
-                                            PeerId::new(
-                                                *addr,
-                                                (*ctx
-                                                    .bridge
-                                                    .op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .pub_key)
-                                                    .clone(),
-                                            )
-                                        }
+                                    .filter_map(|(addr, entry)| {
+                                        // Only include connections where we know the public key
+                                        entry.pub_key.as_ref().map(|pub_key| {
+                                            PeerKeyLocation::new(pub_key.clone(), *addr)
+                                        })
                                     })
                                     .collect();
                                 match timeout(
@@ -860,6 +869,20 @@ impl P2pConnManager {
                             NodeEvent::QuerySubscriptions { callback } => {
                                 // Get network subscriptions from OpManager
                                 let network_subs = op_manager.get_network_subscriptions();
+                                // Convert PeerKeyLocations to SocketAddrs for NetworkDebugInfo
+                                let network_subs: Vec<(
+                                    freenet_stdlib::prelude::ContractKey,
+                                    Vec<SocketAddr>,
+                                )> = network_subs
+                                    .into_iter()
+                                    .map(|(key, peers)| {
+                                        let addrs = peers
+                                            .into_iter()
+                                            .filter_map(|p| p.socket_addr())
+                                            .collect();
+                                        (key, addrs)
+                                    })
+                                    .collect();
 
                                 // Get application subscriptions from contract executor
                                 // For now, we'll send a query to the contract handler
@@ -891,25 +914,15 @@ impl P2pConnManager {
                                     }
                                 }
 
-                                // Reconstruct PeerIds from stored connections
-                                let connections: Vec<PeerId> = ctx
+                                // Reconstruct PeerKeyLocations from stored connections
+                                let connections: Vec<PeerKeyLocation> = ctx
                                     .connections
                                     .iter()
-                                    .map(|(addr, entry)| {
-                                        if let Some(ref pub_key) = entry.pub_key {
-                                            PeerId::new(*addr, pub_key.clone())
-                                        } else {
-                                            PeerId::new(
-                                                *addr,
-                                                (*ctx
-                                                    .bridge
-                                                    .op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .pub_key)
-                                                    .clone(),
-                                            )
-                                        }
+                                    .filter_map(|(addr, entry)| {
+                                        // Only include connections where we know the public key
+                                        entry.pub_key.as_ref().map(|pub_key| {
+                                            PeerKeyLocation::new(pub_key.clone(), *addr)
+                                        })
                                     })
                                     .collect();
                                 let debug_info = crate::message::NetworkDebugInfo {
@@ -957,12 +970,12 @@ impl P2pConnManager {
 
                                 // Collect node information
                                 if config.include_node_info {
-                                    // Calculate location and adress if is set
-                                    let (addr, location) = if let Some(peer_id) =
-                                        op_manager.ring.connection_manager.get_peer_key()
+                                    // Calculate location and address if set
+                                    let (addr, location) = if let Some(own_addr) =
+                                        op_manager.ring.connection_manager.get_own_addr()
                                     {
-                                        let location = Location::from_address(&peer_id.addr);
-                                        (Some(peer_id.addr), Some(location))
+                                        let location = Location::from_address(&own_addr);
+                                        (Some(own_addr), Some(location))
                                     } else {
                                         (None, None)
                                     };
@@ -986,8 +999,11 @@ impl P2pConnManager {
                                     for conns in connections_by_loc.values() {
                                         for conn in conns {
                                             connected_peers.push((
-                                                conn.location.peer().to_string(),
-                                                conn.location.addr().to_string(),
+                                                conn.location.pub_key().to_string(),
+                                                conn.location
+                                                    .socket_addr()
+                                                    .expect("connection should have address")
+                                                    .to_string(),
                                             ));
                                         }
                                     }
@@ -1057,7 +1073,7 @@ impl P2pConnManager {
                                                     .map(|s| {
                                                         s.value()
                                                             .iter()
-                                                            .map(|pk| pk.peer().to_string())
+                                                            .map(|pk| pk.pub_key().to_string())
                                                             .collect()
                                                     })
                                                     .unwrap_or_default()
@@ -1084,11 +1100,15 @@ impl P2pConnManager {
                                     for conns in connections_by_loc.values() {
                                         for conn in conns {
                                             connected_peer_ids
-                                                .push(conn.location.peer().to_string());
+                                                .push(conn.location.pub_key().to_string());
                                             response.connected_peers_detailed.push(
                                                 ConnectedPeerInfo {
-                                                    peer_id: conn.location.peer().to_string(),
-                                                    address: conn.location.addr().to_string(),
+                                                    peer_id: conn.location.pub_key().to_string(),
+                                                    address: conn
+                                                        .location
+                                                        .socket_addr()
+                                                        .expect("connection should have address")
+                                                        .to_string(),
                                                 },
                                             );
                                         }
@@ -1096,7 +1116,7 @@ impl P2pConnManager {
                                 } else {
                                     for conns in connections_by_loc.values() {
                                         connected_peer_ids.extend(
-                                            conns.iter().map(|c| c.location.peer().to_string()),
+                                            conns.iter().map(|c| c.location.pub_key().to_string()),
                                         );
                                     }
                                 }
@@ -1342,7 +1362,7 @@ impl P2pConnManager {
             tx_type = ?msg.id().transaction_type(),
             msg_type = %msg,
             ?source_addr,
-            peer = %op_manager.ring.connection_manager.get_peer_key().unwrap(),
+            peer = ?op_manager.ring.connection_manager.get_own_addr(),
             "process_message called - processing network message"
         );
 
@@ -1394,7 +1414,7 @@ impl P2pConnManager {
 
     async fn handle_connect_peer(
         &mut self,
-        peer: PeerId,
+        peer: PeerKeyLocation,
         mut callback: Box<dyn ConnectResultSender>,
         tx: Transaction,
         handshake_commands: &HandshakeCommandSender,
@@ -1402,12 +1422,14 @@ impl P2pConnManager {
         transient: bool,
     ) -> anyhow::Result<()> {
         let mut peer = peer;
-        let mut peer_addr = peer.addr;
+        let mut peer_addr = peer
+            .socket_addr()
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
 
         if peer_addr.ip().is_unspecified() {
-            if let Some((existing_addr, _)) = self.connection_entry_by_pub_key(&peer.pub_key) {
+            if let Some((existing_addr, _)) = self.connection_entry_by_pub_key(peer.pub_key()) {
                 peer_addr = existing_addr;
-                peer.addr = existing_addr;
+                peer = PeerKeyLocation::new(peer.pub_key().clone(), existing_addr);
                 tracing::info!(
                     tx = %tx,
                     remote = %peer,
@@ -1432,10 +1454,10 @@ impl P2pConnManager {
             "Connecting to peer"
         );
         if let Some(blocked_addrs) = &self.blocked_addresses {
-            if blocked_addrs.contains(&peer.addr) {
+            if blocked_addrs.contains(&peer_addr) {
                 tracing::info!(
                     tx = %tx,
-                    remote = %peer.addr,
+                    remote = %peer_addr,
                     "Outgoing connection to peer blocked by local policy"
                 );
                 callback
@@ -1443,7 +1465,7 @@ impl P2pConnManager {
                     .await
                     .inspect_err(|error| {
                         tracing::debug!(
-                            remote = %peer.addr,
+                            remote = %peer_addr,
                             ?error,
                             "Failed to notify caller about blocked connection"
                         );
@@ -1455,12 +1477,12 @@ impl P2pConnManager {
                 tx = %tx,
                 "Blocked addresses: {:?}, peer addr: {}",
                 blocked_addrs,
-                peer.addr
+                peer_addr
             );
         }
 
         // If a transient transport already exists, promote it without dialing anew.
-        if self.connections.contains_key(&peer.addr) {
+        if self.connections.contains_key(&peer_addr) {
             tracing::info!(
                 tx = %tx,
                 remote = %peer,
@@ -1468,12 +1490,12 @@ impl P2pConnManager {
                 "connect_peer: reusing existing transport / promoting transient if present"
             );
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            if let Some(entry) = connection_manager.drop_transient(&peer) {
+            if let Some(entry) = connection_manager.drop_transient(peer_addr) {
                 let loc = entry
                     .location
-                    .unwrap_or_else(|| Location::from_address(&peer.addr));
+                    .unwrap_or_else(|| Location::from_address(&peer_addr));
                 // Re-run admission + cap guard when promoting a transient connection.
-                let should_accept = connection_manager.should_accept(loc, &peer);
+                let should_accept = connection_manager.should_accept(loc, peer_addr);
                 if !should_accept {
                     tracing::warn!(
                         tx = %tx,
@@ -1522,15 +1544,17 @@ impl P2pConnManager {
                 self.bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, peer.clone(), true)
+                    .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
                 tracing::info!(tx = %tx, remote = %peer, "connect_peer: promoted transient");
             }
 
-            // Return the remote peer we are connected to (not our own peer key).
-            let resolved_peer_id = peer.clone();
+            // Return the remote peer's address we are connected to.
+            let resolved_addr = peer
+                .socket_addr()
+                .expect("connected peer should have socket address");
             callback
-                .send_result(Ok((resolved_peer_id, None)))
+                .send_result(Ok((resolved_addr, None)))
                 .await
                 .inspect_err(|err| {
                     tracing::debug!(
@@ -1600,7 +1624,7 @@ impl P2pConnManager {
         {
             tracing::warn!(
                 tx = %tx,
-                remote = %peer.addr,
+                remote = %peer_addr,
                 transient,
                 ?error,
                 "Failed to enqueue connect command"
@@ -1609,7 +1633,7 @@ impl P2pConnManager {
                 .op_manager
                 .ring
                 .connection_manager
-                .prune_in_transit_connection(&peer);
+                .prune_in_transit_connection(peer_addr);
             let pending_txs = state.awaiting_connection_txs.remove(&peer_addr);
             if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
                 tracing::debug!(
@@ -1688,8 +1712,7 @@ impl P2pConnManager {
                         transaction = ?transaction,
                         "Inbound connection arrived without matching expectation; accepting provisionally"
                     );
-                    PeerId::new(
-                        remote_addr,
+                    PeerKeyLocation::new(
                         (*self
                             .bridge
                             .op_manager
@@ -1697,11 +1720,12 @@ impl P2pConnManager {
                             .connection_manager
                             .pub_key)
                             .clone(),
+                        remote_addr,
                     )
                 });
 
                 tracing::info!(
-                    remote = %peer_id.addr,
+                    remote = %remote_addr,
                     transient,
                     transaction = ?transaction,
                     "Inbound connection established"
@@ -1721,7 +1745,7 @@ impl P2pConnManager {
                 transient,
             } => {
                 tracing::info!(
-                    remote = %peer.addr,
+                    remote = %peer.socket_addr().expect("peer should have address"),
                     transient,
                     transaction = %transaction,
                     "Outbound connection established"
@@ -1736,7 +1760,7 @@ impl P2pConnManager {
                 transient,
             } => {
                 tracing::info!(
-                    remote = %peer.addr,
+                    remote = %peer.socket_addr().expect("peer should have address"),
                     transient,
                     transaction = %transaction,
                     ?error,
@@ -1747,16 +1771,21 @@ impl P2pConnManager {
                     .op_manager
                     .ring
                     .connection_manager
-                    .prune_in_transit_connection(&peer);
+                    .prune_in_transit_connection(
+                        peer.socket_addr().expect("peer should have address"),
+                    );
 
                 let pending_txs = state
                     .awaiting_connection_txs
-                    .remove(&peer.addr)
+                    .remove(&peer.socket_addr().expect("peer should have address"))
                     .unwrap_or_default();
 
-                if let Some(callbacks) = state.awaiting_connection.remove(&peer.addr) {
+                if let Some(callbacks) = state
+                    .awaiting_connection
+                    .remove(&peer.socket_addr().expect("peer should have address"))
+                {
                     tracing::debug!(
-                        remote = %peer.addr,
+                        remote = %peer.socket_addr().expect("peer should have address"),
                         callbacks = callbacks.len(),
                         pending_txs = ?pending_txs,
                         transient,
@@ -1769,7 +1798,7 @@ impl P2pConnManager {
                             .await
                             .inspect_err(|err| {
                                 tracing::debug!(
-                                    remote = %peer.addr,
+                                    remote = %peer.socket_addr().expect("peer should have address"),
                                     ?err,
                                     "Failed to deliver outbound failure notification"
                                 );
@@ -1781,7 +1810,7 @@ impl P2pConnManager {
                             .await
                             .inspect_err(|err| {
                                 tracing::debug!(
-                                    remote = %peer.addr,
+                                    remote = %peer.socket_addr().expect("peer should have address"),
                                     ?err,
                                     "Failed to deliver secondary outbound failure notification"
                                 );
@@ -1837,51 +1866,46 @@ impl P2pConnManager {
 
     async fn handle_successful_connection(
         &mut self,
-        peer_id: PeerId,
+        peer_id: PeerKeyLocation,
         connection: PeerConnection,
         state: &mut EventListenerState,
         remaining_checks: Option<usize>,
         is_transient: bool,
     ) -> anyhow::Result<()> {
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-        if is_transient && !connection_manager.try_register_transient(peer_id.clone(), None) {
+        let peer_addr = peer_id
+            .socket_addr()
+            .ok_or_else(|| anyhow::anyhow!("peer socket address required"))?;
+
+        if is_transient && !connection_manager.try_register_transient(peer_addr, None) {
             tracing::warn!(
-                remote = %peer_id.addr,
+                remote = %peer_addr,
                 budget = connection_manager.transient_budget(),
                 current = connection_manager.transient_count(),
                 "Transient connection budget exhausted; dropping inbound connection"
             );
-            if let Some(callbacks) = state.awaiting_connection.remove(&peer_id.addr) {
+            if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
                 for mut cb in callbacks {
                     let _ = cb.send_result(Err(())).await;
                 }
             }
-            state.awaiting_connection_txs.remove(&peer_id.addr);
+            state.awaiting_connection_txs.remove(&peer_addr);
             return Ok(());
         }
         let pending_txs = state
             .awaiting_connection_txs
-            .remove(&peer_id.addr)
+            .remove(&peer_addr)
             .unwrap_or_default();
-        if let Some(callbacks) = state.awaiting_connection.remove(&peer_id.addr) {
-            let resolved_peer_id = if let Some(peer_id) = connection_manager.get_peer_key() {
-                peer_id
-            } else {
-                let self_addr = connection
-                    .my_address()
-                    .ok_or_else(|| anyhow::anyhow!("self addr should be set"))?;
-                connection_manager.try_set_peer_key(self_addr);
-                connection_manager
-                    .get_peer_key()
-                    .expect("peer key should be set after try_set_peer_key")
-            };
+        if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
+            // The callback expects the remote peer's address (not our own)
+            let resolved_addr = peer_addr;
             tracing::debug!(
-                remote = %peer_id.addr,
+                remote = %peer_addr,
                 callbacks = callbacks.len(),
                 "handle_successful_connection: notifying waiting callbacks"
             );
             tracing::info!(
-                remote = %peer_id.addr,
+                remote = %peer_addr,
                 callbacks = callbacks.len(),
                 pending_txs = ?pending_txs,
                 remaining_checks = ?remaining_checks,
@@ -1890,20 +1914,20 @@ impl P2pConnManager {
             for mut cb in callbacks {
                 match timeout(
                     Duration::from_secs(60),
-                    cb.send_result(Ok((resolved_peer_id.clone(), remaining_checks))),
+                    cb.send_result(Ok((resolved_addr, remaining_checks))),
                 )
                 .await
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(())) => {
                         tracing::debug!(
-                            remote = %peer_id.addr,
+                            remote = %peer_addr,
                             "Callback dropped before receiving connection result"
                         );
                     }
                     Err(error) => {
                         tracing::error!(
-                            remote = %peer_id.addr,
+                            remote = %peer_addr,
                             ?error,
                             "Failed to deliver connection result"
                         );
@@ -1920,13 +1944,13 @@ impl P2pConnManager {
 
         // Only insert if connection doesn't already exist to avoid dropping existing channel
         let mut newly_inserted = false;
-        if !self.connections.contains_key(&peer_id.addr) {
+        if !self.connections.contains_key(&peer_addr) {
             if is_transient {
                 let cm = &self.bridge.op_manager.ring.connection_manager;
                 let current = cm.transient_count();
                 if current >= cm.transient_budget() {
                     tracing::warn!(
-                        remote = %peer_id.addr,
+                        remote = %peer_addr,
                         budget = cm.transient_budget(),
                         current,
                         "Transient connection budget exhausted; dropping inbound connection before insert"
@@ -1937,15 +1961,15 @@ impl P2pConnManager {
             let (tx, rx) = mpsc::channel(10);
             tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer_id, conn_map_size = self.connections.len(), "[CONN_TRACK] INSERT: OutboundConnectionSuccessful - adding to connections HashMap");
             self.connections.insert(
-                peer_id.addr,
+                peer_addr,
                 ConnectionEntry {
                     sender: tx,
-                    pub_key: Some(peer_id.pub_key.clone()),
+                    pub_key: Some(peer_id.pub_key().clone()),
                 },
             );
             // Add to reverse lookup
             self.addr_by_pub_key
-                .insert(peer_id.pub_key.clone(), peer_id.addr);
+                .insert(peer_id.pub_key().clone(), peer_addr);
             let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
                 anyhow::bail!("Connection event channel not initialized");
             };
@@ -1962,9 +1986,9 @@ impl P2pConnManager {
 
         if newly_inserted {
             tracing::info!(remote = %peer_id, is_transient, "handle_successful_connection: inserted new connection entry");
-            let pending_loc = connection_manager.prune_in_transit_connection(&peer_id);
+            let pending_loc = connection_manager.prune_in_transit_connection(peer_addr);
             if promote_to_ring {
-                let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
+                let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_addr));
                 tracing::info!(
                     remote = %peer_id,
                     %loc,
@@ -1972,7 +1996,7 @@ impl P2pConnManager {
                     "handle_successful_connection: evaluating promotion to ring"
                 );
                 // Re-apply admission logic on promotion to avoid bypassing capacity/heuristic checks.
-                let should_accept = connection_manager.should_accept(loc, &peer_id);
+                let should_accept = connection_manager.should_accept(loc, peer_addr);
                 if !should_accept {
                     tracing::warn!(
                         %peer_id,
@@ -1996,17 +2020,17 @@ impl P2pConnManager {
                 self.bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, peer_id.clone(), true)
+                    .add_connection(loc, PeerId::new(peer_addr, peer_id.pub_key().clone()), true)
                     .await;
                 if is_transient {
-                    connection_manager.drop_transient(&peer_id);
+                    connection_manager.drop_transient(peer_addr);
                 }
             } else {
-                let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_id.addr));
+                let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_addr));
                 // Evaluate whether this transient should be promoted; gateways need routable peers.
-                let should_accept = connection_manager.should_accept(loc, &peer_id);
+                let should_accept = connection_manager.should_accept(loc, peer_addr);
                 if should_accept {
-                    connection_manager.drop_transient(&peer_id);
+                    connection_manager.drop_transient(peer_addr);
                     let current = connection_manager.connection_count();
                     if current >= connection_manager.max_connections {
                         tracing::warn!(
@@ -2027,11 +2051,15 @@ impl P2pConnManager {
                     self.bridge
                         .op_manager
                         .ring
-                        .add_connection(loc, peer_id.clone(), true)
+                        .add_connection(
+                            loc,
+                            PeerId::new(peer_addr, peer_id.pub_key().clone()),
+                            true,
+                        )
                         .await;
                 } else {
                     // Keep the connection as transient; budget was reserved before any work.
-                    connection_manager.try_register_transient(peer_id.clone(), pending_loc);
+                    connection_manager.try_register_transient(peer_addr, pending_loc);
                     tracing::info!(
                         peer = %peer_id,
                         pending_loc_known = pending_loc.is_some(),
@@ -2043,10 +2071,15 @@ impl P2pConnManager {
                     let peer = peer_id.clone();
                     tokio::spawn(async move {
                         sleep(ttl).await;
-                        if cm.drop_transient(&peer).is_some() {
+                        if cm
+                            .drop_transient(peer.socket_addr().expect("peer should have address"))
+                            .is_some()
+                        {
                             tracing::info!(%peer, "Transient connection expired; dropping");
                             if let Err(err) = drop_tx
-                                .send(Right(NodeEvent::DropConnection(peer.addr)))
+                                .send(Right(NodeEvent::DropConnection(
+                                    peer.socket_addr().expect("peer should have address"),
+                                )))
                                 .await
                             {
                                 tracing::warn!(
@@ -2061,7 +2094,7 @@ impl P2pConnManager {
             }
         } else if is_transient {
             // We reserved budget earlier, but didn't take ownership of the connection.
-            connection_manager.drop_transient(&peer_id);
+            connection_manager.drop_transient(peer_addr);
         }
         Ok(())
     }
@@ -2079,17 +2112,30 @@ impl P2pConnManager {
 
                 if let Some(remote_addr) = inbound.remote_addr {
                     if let Some(sender_peer) = extract_sender_from_message(&inbound.msg) {
-                        if sender_peer.addr() == remote_addr
-                            || sender_peer.addr().ip().is_unspecified()
+                        if sender_peer
+                            .socket_addr()
+                            .map(|a| a == remote_addr)
+                            .unwrap_or(false)
+                            || sender_peer
+                                .socket_addr()
+                                .map(|a| a.ip().is_unspecified())
+                                .unwrap_or(true)
                         {
-                            let mut new_peer_id = sender_peer.peer().clone();
+                            let mut new_peer_id = PeerId::new(
+                                sender_peer.socket_addr().unwrap_or(remote_addr),
+                                sender_peer.pub_key().clone(),
+                            );
                             if new_peer_id.addr.ip().is_unspecified() {
                                 new_peer_id.addr = remote_addr;
                                 if let Some(sender_mut) =
                                     extract_sender_from_message_mut(&mut inbound.msg)
                                 {
-                                    if sender_mut.peer().addr.ip().is_unspecified() {
-                                        sender_mut.peer().addr = remote_addr;
+                                    if sender_mut
+                                        .socket_addr()
+                                        .map(|a| a.ip().is_unspecified())
+                                        .unwrap_or(true)
+                                    {
+                                        sender_mut.set_addr(remote_addr);
                                     }
                                 }
                             }
@@ -2105,16 +2151,16 @@ impl P2pConnManager {
                                     tracing::info!(
                                         remote = %remote_addr,
                                         old_pub_key = ?old_pub_key,
-                                        new_pub_key = %new_peer_id.pub_key,
+                                        new_pub_key = %&new_peer_id.pub_key,
                                         "Updating peer identity after inbound message"
                                     );
                                     // Remove old reverse lookup if it exists
                                     if let Some(old_key) = old_pub_key {
                                         self.addr_by_pub_key.remove(&old_key);
                                         // Update ring with old PeerId -> new PeerId
-                                        let old_peer = PeerId::new(remote_addr, old_key);
+                                        let old_peer_id = PeerId::new(remote_addr, old_key);
                                         self.bridge.op_manager.ring.update_connection_identity(
-                                            &old_peer,
+                                            &old_peer_id,
                                             new_peer_id.clone(),
                                         );
                                     }
@@ -2124,7 +2170,7 @@ impl P2pConnManager {
                                     }
                                     // Add new reverse lookup
                                     self.addr_by_pub_key
-                                        .insert(new_peer_id.pub_key.clone(), remote_addr);
+                                        .insert(new_peer_id.pub_key.clone().clone(), remote_addr);
                                 }
                             }
                         }
@@ -2149,13 +2195,13 @@ impl P2pConnManager {
                 );
                 // Look up the connection directly by address
                 if let Some(entry) = self.connections.remove(&remote_addr) {
-                    // Construct PeerId for prune_connection and DropConnection
+                    // Construct PeerKeyLocation for prune_connection and DropConnection
                     let peer = if let Some(ref pub_key) = entry.pub_key {
-                        PeerId::new(remote_addr, pub_key.clone())
+                        PeerKeyLocation::new(pub_key.clone(), remote_addr)
                     } else {
-                        PeerId::new(
-                            remote_addr,
+                        PeerKeyLocation::new(
                             (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
+                            remote_addr,
                         )
                     };
                     // Remove from reverse lookup
@@ -2166,7 +2212,7 @@ impl P2pConnManager {
                     self.bridge
                         .op_manager
                         .ring
-                        .prune_connection(peer.clone())
+                        .prune_connection(PeerId::new(remote_addr, peer.pub_key().clone()))
                         .await;
                     if let Err(error) = handshake_commands
                         .send(HandshakeCommand::DropConnection { peer: peer.clone() })
@@ -2197,24 +2243,19 @@ impl P2pConnManager {
             Some(Left(msg)) => {
                 // Check if message has a target peer - if so, route as outbound, otherwise process locally
                 if let Some(target) = msg.target() {
-                    let self_peer = self
-                        .bridge
-                        .op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_key()
-                        .unwrap();
+                    let self_pub_key: &TransportPublicKey =
+                        &self.bridge.op_manager.ring.connection_manager.pub_key;
 
                     tracing::debug!(
                         tx = %msg.id(),
                         msg_type = %msg,
                         target_peer = %target,
-                        self_peer = %self_peer,
-                        target_equals_self = (target.peer() == self_peer),
+                        self_peer = ?self_pub_key,
+                        target_equals_self = (target.pub_key() == self_pub_key),
                         "[ROUTING] handle_notification_msg: Checking if message targets self"
                     );
 
-                    if target.peer() != self_peer {
+                    if target.pub_key() != self_pub_key {
                         // Message targets another peer - send as outbound
                         tracing::info!(
                             tx = %msg.id(),
@@ -2350,14 +2391,14 @@ impl P2pConnManager {
 trait ConnectResultSender {
     fn send_result(
         &mut self,
-        result: Result<(PeerId, Option<usize>), ()>,
+        result: Result<(SocketAddr, Option<usize>), ()>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>>;
 }
 
-impl ConnectResultSender for mpsc::Sender<Result<(PeerId, Option<usize>), ()>> {
+impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()>> {
     fn send_result(
         &mut self,
-        result: Result<(PeerId, Option<usize>), ()>,
+        result: Result<(SocketAddr, Option<usize>), ()>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
         async move { self.send(result).await.map_err(|_| ()) }.boxed()
     }
@@ -2520,7 +2561,7 @@ async fn notify_transport_closed(
 async fn peer_connection_listener(
     mut rx: PeerConnChannelRecv,
     mut conn: PeerConnection,
-    peer_id: PeerId,
+    peer_id: PeerKeyLocation,
     conn_events: Sender<ConnEvent>,
 ) {
     const MAX_IMMEDIATE_SENDS: usize = 32;

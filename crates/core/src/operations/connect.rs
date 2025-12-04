@@ -18,7 +18,7 @@ use tokio::task::{self, JoinHandle};
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transaction};
-use crate::node::{ConnectionError, IsOperationCompleted, NetworkBridge, OpManager, PeerId};
+use crate::node::{ConnectionError, IsOperationCompleted, NetworkBridge, OpManager};
 use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::ring::{PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
@@ -188,7 +188,7 @@ pub(crate) trait RelayContext {
         &self,
         desired_location: Location,
         visited: &[SocketAddr],
-        recency: &HashMap<PeerId, Instant>,
+        recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation>;
 }
@@ -222,11 +222,7 @@ impl ConnectForwardEstimator {
         // learns, per-node, how often downstream peers accept/complete forwarded Connect
         // requests so we can bias forwarding toward peers likely to have capacity.
         let key = TransportKeypair::new();
-        let dummy_peer = PeerKeyLocation::with_location(
-            key.public().clone(),
-            "127.0.0.1:0".parse().unwrap(),
-            Location::new(0.0),
-        );
+        let dummy_peer = PeerKeyLocation::new(key.public().clone(), "127.0.0.1:0".parse().unwrap());
         let seed_events = [
             IsotonicEvent {
                 peer: dummy_peer.clone(),
@@ -246,7 +242,7 @@ impl ConnectForwardEstimator {
     }
 
     fn record(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
-        if peer.location.is_none() {
+        if peer.location().is_none() {
             return;
         }
         // Treat each downstream forward attempt as a Bernoulli outcome for this peer and
@@ -260,7 +256,7 @@ impl ConnectForwardEstimator {
     }
 
     fn estimate(&self, peer: &PeerKeyLocation, desired: Location) -> Option<f64> {
-        peer.location?;
+        peer.location()?;
         self.estimator
             .estimate_retrieval_time(peer, desired)
             .ok()
@@ -271,15 +267,17 @@ impl RelayState {
     pub(crate) fn handle_request<C: RelayContext>(
         &mut self,
         ctx: &C,
-        recency: &HashMap<PeerId, Instant>,
-        forward_attempts: &mut HashMap<PeerId, ForwardAttempt>,
+        recency: &HashMap<PeerKeyLocation, Instant>,
+        forward_attempts: &mut HashMap<PeerKeyLocation, ForwardAttempt>,
         estimator: &ConnectForwardEstimator,
     ) -> RelayActions {
         let mut actions = RelayActions::default();
         // Add upstream's address (determined from transport layer) to visited list
         push_unique_addr(&mut self.request.visited, self.upstream_addr);
         // Add our own address to visited list
-        push_unique_addr(&mut self.request.visited, ctx.self_location().addr());
+        if let Some(self_addr) = ctx.self_location().socket_addr() {
+            push_unique_addr(&mut self.request.visited, self_addr);
+        }
 
         // Fill in joiner's external address from transport layer if unknown.
         // This is the key step where the first recipient (gateway) determines the joiner's
@@ -293,9 +291,6 @@ impl RelayState {
         // This tells the joiner their external address for future connections.
         if let PeerAddr::Known(joiner_addr) = &self.request.joiner.peer_addr {
             if !self.observed_sent {
-                if self.request.joiner.location.is_none() {
-                    self.request.joiner.location = Some(Location::from_address(joiner_addr));
-                }
                 self.observed_sent = true;
                 actions.observed_address = Some((self.request.joiner.clone(), *joiner_addr));
             }
@@ -303,16 +298,14 @@ impl RelayState {
 
         if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
             self.accepted_locally = true;
-            let self_loc = ctx.self_location();
-            // Use PeerAddr::Unknown for acceptor - the acceptor doesn't know their own
-            // external address (especially behind NAT). The first recipient of the response
-            // will fill this in from the packet source address.
-            let acceptor = PeerKeyLocation {
-                pub_key: self_loc.pub_key().clone(),
-                peer_addr: PeerAddr::Unknown,
-                location: self_loc.location,
-            };
-            let dist = ring_distance(acceptor.location, self.request.joiner.location);
+            // Use self_location which already has our address set (from --public-network-address
+            // for gateways, or from observed address for peers).
+            let acceptor = ctx.self_location().clone();
+            debug_assert!(
+                acceptor.socket_addr().is_some(),
+                "ConnectResponse acceptor must have known address - joiner needs it to connect back"
+            );
+            let dist = ring_distance(acceptor.location(), self.request.joiner.location());
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
             });
@@ -322,8 +315,8 @@ impl RelayState {
             tracing::info!(
                 acceptor_pub_key = %acceptor.pub_key(),
                 joiner_pub_key = %self.request.joiner.pub_key(),
-                acceptor_loc = ?acceptor.location,
-                joiner_loc = ?self.request.joiner.location,
+                acceptor_loc = ?acceptor.location(),
+                joiner_loc = ?self.request.joiner.location(),
                 ring_distance = ?dist,
                 "connect: acceptance issued"
             );
@@ -337,23 +330,25 @@ impl RelayState {
                 estimator,
             ) {
                 Some(next) => {
-                    let dist = ring_distance(next.location, Some(self.request.desired_location));
+                    let dist = ring_distance(next.location(), Some(self.request.desired_location));
                     tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
-                        next_peer = %next.peer(),
-                        next_loc = ?next.location,
+                        next_peer = %next.pub_key(),
+                        next_loc = ?next.location(),
                         ring_distance_to_target = ?dist,
                         "connect: forwarding join request to next hop"
                     );
                     let mut forward_req = self.request.clone();
                     forward_req.ttl = forward_req.ttl.saturating_sub(1);
-                    push_unique_addr(&mut forward_req.visited, ctx.self_location().addr());
+                    if let Some(self_addr) = ctx.self_location().socket_addr() {
+                        push_unique_addr(&mut forward_req.visited, self_addr);
+                    }
                     let forward_snapshot = forward_req.clone();
                     self.forwarded_to = Some(next.clone());
                     self.request = forward_req;
                     forward_attempts.insert(
-                        next.peer().clone(),
+                        next.clone(),
                         ForwardAttempt {
                             peer: next.clone(),
                             desired: self.request.desired_location,
@@ -398,20 +393,23 @@ impl RelayContext for RelayEnv<'_> {
     }
 
     fn should_accept(&self, joiner: &PeerKeyLocation) -> bool {
+        let addr = joiner
+            .socket_addr()
+            .expect("joiner must have address to determine should_accept");
         let location = joiner
-            .location
-            .unwrap_or_else(|| Location::from_address(&joiner.addr()));
+            .location()
+            .unwrap_or_else(|| Location::from_address(&addr));
         self.op_manager
             .ring
             .connection_manager
-            .should_accept(location, &joiner.peer())
+            .should_accept(location, addr)
     }
 
     fn select_next_hop(
         &self,
         desired_location: Location,
         visited: &[SocketAddr],
-        recency: &HashMap<PeerId, Instant>,
+        recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation> {
         // Use SkipListWithSelf to explicitly exclude ourselves from candidates,
@@ -419,8 +417,7 @@ impl RelayContext for RelayEnv<'_> {
         // self wasn't added to visited by upstream callers.
         let skip = SkipListWithSelf {
             visited,
-            self_peer: &self.self_location.peer(),
-            conn_manager: &self.op_manager.ring.connection_manager,
+            self_addr: self.self_location.socket_addr(),
         };
         let router = self.op_manager.ring.router.read();
         let candidates = self.op_manager.ring.connection_manager.routing_candidates(
@@ -434,13 +431,13 @@ impl RelayContext for RelayEnv<'_> {
         let mut eligible: Vec<PeerKeyLocation> = Vec::new();
 
         for cand in candidates {
-            if let Some(ts) = recency.get(&cand.peer()) {
+            if let Some(ts) = recency.get(&cand) {
                 if now.duration_since(*ts) < RECENCY_COOLDOWN {
                     continue;
                 }
             }
 
-            if cand.location.is_some() {
+            if cand.location().is_some() {
                 if let Some(score) = estimator.estimate(&cand, desired_location) {
                     scored.push((score, cand.clone()));
                     continue;
@@ -527,14 +524,14 @@ pub(crate) struct ConnectOp {
     /// Tracks when we last forwarded this connect to a peer, to avoid hammering the same
     /// neighbors when no acceptors are available. Peers without an entry are treated as
     /// immediately eligible.
-    recency: HashMap<PeerId, Instant>,
-    forward_attempts: HashMap<PeerId, ForwardAttempt>,
+    recency: HashMap<PeerKeyLocation, Instant>,
+    forward_attempts: HashMap<PeerKeyLocation, ForwardAttempt>,
     connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
 }
 
 impl ConnectOp {
     fn record_forward_outcome(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
-        self.forward_attempts.remove(&peer.peer());
+        self.forward_attempts.remove(peer);
         self.connect_forward_estimator
             .write()
             .record(peer, desired, success);
@@ -648,8 +645,13 @@ impl ConnectOp {
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
     ) -> (Transaction, Self, ConnectMsg) {
         // Initialize visited list with addresses of ourself and the target gateway
-        let mut visited = vec![own.addr()];
-        push_unique_addr(&mut visited, target.addr());
+        let mut visited = Vec::new();
+        if let Some(own_addr) = own.socket_addr() {
+            visited.push(own_addr);
+        }
+        if let Some(target_addr) = target.socket_addr() {
+            push_unique_addr(&mut visited, target_addr);
+        }
 
         // Create joiner with PeerAddr::Unknown - the joiner doesn't know their own
         // external address (especially behind NAT). The first recipient (gateway)
@@ -667,7 +669,7 @@ impl ConnectOp {
             tx,
             desired_location,
             target_connections,
-            Some(own.addr()),
+            own.socket_addr(),
             Some(target.clone()),
             None,
             connect_forward_estimator,
@@ -691,12 +693,12 @@ impl ConnectOp {
             Some(ConnectState::WaitingForResponses(state)) => {
                 tracing::info!(
                     acceptor_pub_key = %response.acceptor.pub_key(),
-                    acceptor_loc = ?response.acceptor.location,
+                    acceptor_loc = ?response.acceptor.location(),
                     "connect: joiner received ConnectResponse"
                 );
                 let result = state.register_acceptance(response, now);
                 if let Some(new_acceptor) = &result.new_acceptor {
-                    self.recency.remove(&new_acceptor.peer.peer());
+                    self.recency.remove(&new_acceptor.peer);
                 }
                 if result.satisfied {
                     self.state = Some(ConnectState::Completed);
@@ -837,27 +839,29 @@ impl Operation for ConnectOp {
                     }
 
                     if let Some(peer) = actions.expect_connection_from {
-                        op_manager
-                            .notify_node_event(NodeEvent::ExpectPeerConnection {
-                                peer: peer.peer().clone(),
-                            })
-                            .await?;
+                        if let Some(addr) = peer.socket_addr() {
+                            op_manager
+                                .notify_node_event(NodeEvent::ExpectPeerConnection { addr })
+                                .await?;
+                        }
                     }
 
                     if let Some((next, request)) = actions.forward {
                         // Record recency for this forward to avoid hammering the same neighbor.
-                        self.recency.insert(next.peer().clone(), Instant::now());
+                        self.recency.insert(next.clone(), Instant::now());
                         let forward_msg = ConnectMsg::Request {
                             id: self.id,
                             target: next.clone(),
                             payload: request,
                         };
-                        network_bridge
-                            .send(
-                                next.addr(),
-                                NetMessage::V1(NetMessageV1::Connect(forward_msg)),
-                            )
-                            .await?;
+                        if let Some(next_addr) = next.socket_addr() {
+                            network_bridge
+                                .send(
+                                    next_addr,
+                                    NetMessage::V1(NetMessageV1::Connect(forward_msg)),
+                                )
+                                .await?;
+                        }
                     }
 
                     if let Some(response) = actions.accept_response {
@@ -905,18 +909,20 @@ impl Operation for ConnectOp {
                             }
 
                             if let Some(new_acceptor) = acceptance.new_acceptor {
-                                op_manager
-                                    .notify_node_event(
-                                        crate::message::NodeEvent::ExpectPeerConnection {
-                                            peer: new_acceptor.peer.peer().clone(),
-                                        },
-                                    )
-                                    .await?;
+                                if let Some(addr) = new_acceptor.peer.socket_addr() {
+                                    op_manager
+                                        .notify_node_event(
+                                            crate::message::NodeEvent::ExpectPeerConnection {
+                                                addr,
+                                            },
+                                        )
+                                        .await?;
+                                }
 
                                 let (callback, mut rx) = mpsc::channel(1);
                                 op_manager
                                     .notify_node_event(NodeEvent::ConnectPeer {
-                                        peer: new_acceptor.peer.peer().clone(),
+                                        peer: new_acceptor.peer.clone(),
                                         tx: self.id,
                                         callback,
                                         is_gw: false,
@@ -1015,35 +1021,30 @@ impl Operation for ConnectOp {
     }
 }
 
-/// Skip list that combines visited peers with the current node's own peer ID.
+/// Skip list that combines visited peers with the current node's own address.
 /// This ensures we never select ourselves as a forwarding target, even if
 /// self wasn't properly added to the visited list by upstream callers.
 struct SkipListWithSelf<'a> {
     visited: &'a [SocketAddr],
-    self_peer: &'a PeerId,
-    conn_manager: &'a crate::ring::ConnectionManager,
+    self_addr: Option<SocketAddr>,
 }
 
-impl Contains<PeerId> for SkipListWithSelf<'_> {
-    fn has_element(&self, target: PeerId) -> bool {
-        if &target == self.self_peer {
-            return true;
-        }
-        // Check if any visited address belongs to this peer
-        for addr in self.visited {
-            if let Some(peer_id) = self.conn_manager.get_peer_by_addr(*addr) {
-                if peer_id == target {
-                    return true;
-                }
+impl Contains<SocketAddr> for SkipListWithSelf<'_> {
+    fn has_element(&self, target: SocketAddr) -> bool {
+        // Check if target matches our own address
+        if let Some(self_addr) = self.self_addr {
+            if target == self_addr {
+                return true;
             }
         }
-        false
+        // Check if target is in the visited list
+        self.visited.contains(&target)
     }
 }
 
-impl Contains<&PeerId> for SkipListWithSelf<'_> {
-    fn has_element(&self, target: &PeerId) -> bool {
-        self.has_element(target.clone())
+impl Contains<&SocketAddr> for SkipListWithSelf<'_> {
+    fn has_element(&self, target: &SocketAddr) -> bool {
+        self.has_element(*target)
     }
 }
 
@@ -1093,15 +1094,20 @@ pub(crate) async fn join_ring_request(
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
     use crate::node::ConnectionError;
-    let location = gateway.location.ok_or_else(|| {
+    let location = gateway.location().ok_or_else(|| {
         tracing::error!("Gateway location not found, this should not be possible, report an error");
+        OpError::ConnError(ConnectionError::LocationUnknown)
+    })?;
+
+    let gateway_addr = gateway.socket_addr().ok_or_else(|| {
+        tracing::error!("Gateway address not found");
         OpError::ConnError(ConnectionError::LocationUnknown)
     })?;
 
     if !op_manager
         .ring
         .connection_manager
-        .should_accept(location, &gateway.peer())
+        .should_accept(location, gateway_addr)
     {
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
     }
@@ -1145,7 +1151,7 @@ pub(crate) async fn join_ring_request(
         op.backoff = Some(backoff);
     }
 
-    tracing::info!(gateway = %gateway.peer(), tx = %tx, "Attempting network join using connect");
+    tracing::info!(gateway = %gateway.pub_key(), tx = %tx, "Attempting network join using connect");
 
     op_manager
         .notify_op_change(
@@ -1270,7 +1276,6 @@ pub(crate) async fn initial_join_procedure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::PeerId;
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
@@ -1314,7 +1319,7 @@ mod tests {
             &self,
             _desired_location: Location,
             _visited: &[SocketAddr],
-            _recency: &HashMap<PeerId, Instant>,
+            _recency: &HashMap<PeerKeyLocation, Instant>,
             _estimator: &ConnectForwardEstimator,
         ) -> Option<PeerKeyLocation> {
             self.next_hop.clone()
@@ -1324,7 +1329,7 @@ mod tests {
     fn make_peer(port: u16) -> PeerKeyLocation {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let keypair = TransportKeypair::new();
-        PeerKeyLocation::with_location(keypair.public().clone(), addr, Location::random())
+        PeerKeyLocation::new(keypair.public().clone(), addr)
     }
 
     #[test]
@@ -1348,7 +1353,7 @@ mod tests {
         );
         let peer = make_peer(2000);
         op.forward_attempts.insert(
-            peer.peer().clone(),
+            peer.clone(),
             ForwardAttempt {
                 peer: peer.clone(),
                 desired: Location::new(0.2),
@@ -1364,7 +1369,7 @@ mod tests {
         let self_loc = make_peer(4000);
         let joiner = make_peer(5000);
         let mut state = RelayState {
-            upstream_addr: joiner.addr(), // Now uses SocketAddr
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
             request: ConnectRequest {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
@@ -1383,8 +1388,13 @@ mod tests {
         let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
 
         let response = actions.accept_response.expect("expected acceptance");
-        // Compare pub_key since acceptor's address is intentionally Unknown (NAT scenario)
+        // Verify acceptor has both correct identity and known address
         assert_eq!(response.acceptor.pub_key(), self_loc.pub_key());
+        assert_eq!(
+            response.acceptor.socket_addr(),
+            self_loc.socket_addr(),
+            "ConnectResponse acceptor must have known address for joiner to connect back"
+        );
         assert_eq!(
             actions.expect_connection_from.unwrap().pub_key(),
             joiner.pub_key()
@@ -1393,12 +1403,53 @@ mod tests {
     }
 
     #[test]
+    fn connect_response_acceptor_must_have_known_address() {
+        // Regression test: ConnectResponse.acceptor must include a known address
+        // so the joiner can establish a connection back to the acceptor.
+        // See: https://github.com/freenet/freenet-core/issues/2207
+        let self_loc = make_peer(4001);
+        let joiner = make_peer(5001);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc.clone());
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        let response = actions.accept_response.expect("expected acceptance");
+
+        // Critical invariant: acceptor address must be known
+        assert!(
+            response.acceptor.socket_addr().is_some(),
+            "ConnectResponse.acceptor must have a known address"
+        );
+        // Address should match self_location
+        assert_eq!(
+            response.acceptor.socket_addr(),
+            self_loc.socket_addr(),
+            "acceptor address should come from self_location"
+        );
+    }
+
+    #[test]
     fn relay_forwards_when_not_accepting() {
         let self_loc = make_peer(4100);
         let joiner = make_peer(5100);
         let next_hop = make_peer(6100);
         let mut state = RelayState {
-            upstream_addr: joiner.addr(), // Now uses SocketAddr
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
             request: ConnectRequest {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
@@ -1420,10 +1471,12 @@ mod tests {
 
         assert!(actions.accept_response.is_none());
         let (forward_to, request) = actions.forward.expect("expected forward");
-        assert_eq!(forward_to.peer(), next_hop.peer());
+        assert_eq!(forward_to.pub_key(), next_hop.pub_key());
         assert_eq!(request.ttl, 1);
         // visited now contains SocketAddr
-        assert!(request.visited.contains(&joiner.addr()));
+        assert!(request
+            .visited
+            .contains(&joiner.socket_addr().expect("test peer must have address")));
     }
 
     #[test]
@@ -1432,17 +1485,19 @@ mod tests {
         let joiner_base = make_peer(5050);
         let observed_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
-            joiner_base.addr().port(),
+            joiner_base
+                .socket_addr()
+                .expect("test peer must have address")
+                .port(),
         );
         // Create a joiner with the observed address (simulating what the network
         // bridge does when it fills in the address from the packet source)
-        let joiner_with_observed_addr = PeerKeyLocation::with_location(
-            joiner_base.pub_key().clone(),
-            observed_addr,
-            joiner_base.location.unwrap(),
-        );
+        let joiner_with_observed_addr =
+            PeerKeyLocation::new(joiner_base.pub_key().clone(), observed_addr);
         let mut state = RelayState {
-            upstream_addr: joiner_base.addr(), // Now uses SocketAddr
+            upstream_addr: joiner_base
+                .socket_addr()
+                .expect("test peer must have address"),
             request: ConnectRequest {
                 desired_location: Location::random(),
                 joiner: joiner_with_observed_addr.clone(),
@@ -1464,8 +1519,18 @@ mod tests {
             .observed_address
             .expect("expected observed address update");
         assert_eq!(addr, observed_addr);
-        assert_eq!(target.addr(), observed_addr);
-        assert_eq!(state.request.joiner.addr(), observed_addr);
+        assert_eq!(
+            target.socket_addr().expect("target must have address"),
+            observed_addr
+        );
+        assert_eq!(
+            state
+                .request
+                .joiner
+                .socket_addr()
+                .expect("joiner must have address"),
+            observed_addr
+        );
     }
 
     #[test]
@@ -1484,7 +1549,7 @@ mod tests {
         let result = state.register_acceptance(&response, Instant::now());
         assert!(result.satisfied);
         let new = result.new_acceptor.expect("expected new acceptor");
-        assert_eq!(new.peer.peer(), acceptor.peer());
+        assert_eq!(new.peer.pub_key(), acceptor.pub_key());
     }
 
     #[test]
@@ -1508,12 +1573,16 @@ mod tests {
                 payload,
                 ..
             } => {
-                assert_eq!(msg_target.peer(), target.peer());
+                assert_eq!(msg_target.pub_key(), target.pub_key());
                 assert_eq!(payload.desired_location, desired);
                 assert_eq!(payload.ttl, ttl);
                 // visited now contains SocketAddr, not PeerKeyLocation
-                assert!(payload.visited.contains(&own.addr()));
-                assert!(payload.visited.contains(&target.addr()));
+                if let Some(own_addr) = own.socket_addr() {
+                    assert!(payload.visited.contains(&own_addr));
+                }
+                if let Some(target_addr) = target.socket_addr() {
+                    assert!(payload.visited.contains(&target_addr));
+                }
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -1530,17 +1599,18 @@ mod tests {
         let relay_a = make_peer(8200);
         let relay_b = make_peer(8300);
 
+        let joiner_addr = joiner.socket_addr().expect("test peer must have address");
         let request = ConnectRequest {
             desired_location: Location::random(),
             joiner: joiner.clone(),
             ttl: 3,
-            visited: vec![joiner.addr()], // Now uses SocketAddr
+            visited: vec![joiner_addr],
         };
 
         let tx = Transaction::new::<ConnectMsg>();
         let mut relay_op = ConnectOp::new_relay(
             tx,
-            joiner.addr(), // Now uses SocketAddr
+            joiner_addr,
             request.clone(),
             Arc::new(RwLock::new(ConnectForwardEstimator::new())),
         );
@@ -1548,33 +1618,30 @@ mod tests {
             .accept(false)
             .next_hop(Some(relay_b.clone()));
         let estimator = ConnectForwardEstimator::new();
-        let actions = relay_op.handle_request(&ctx, joiner.addr(), request.clone(), &estimator);
+        let actions = relay_op.handle_request(&ctx, joiner_addr, request.clone(), &estimator);
 
         let (forward_target, forward_request) = actions
             .forward
             .expect("relay should forward when it declines to accept");
-        assert_eq!(forward_target.peer(), relay_b.peer());
+        assert_eq!(forward_target.pub_key(), relay_b.pub_key());
         assert_eq!(forward_request.ttl, 2);
+        let relay_a_addr = relay_a.socket_addr().expect("test peer must have address");
         assert!(
-            forward_request.visited.contains(&relay_a.addr()),
+            forward_request.visited.contains(&relay_a_addr),
             "forwarded request should record intermediate relay's address"
         );
 
         // Second hop should accept and notify the joiner.
         let mut accepting_relay = ConnectOp::new_relay(
             tx,
-            relay_a.addr(), // Now uses SocketAddr
+            relay_a_addr,
             forward_request.clone(),
             Arc::new(RwLock::new(ConnectForwardEstimator::new())),
         );
         let ctx_accept = TestRelayContext::new(relay_b.clone());
         let estimator = ConnectForwardEstimator::new();
-        let accept_actions = accepting_relay.handle_request(
-            &ctx_accept,
-            relay_a.addr(), // Now uses SocketAddr
-            forward_request,
-            &estimator,
-        );
+        let accept_actions =
+            accepting_relay.handle_request(&ctx_accept, relay_a_addr, forward_request, &estimator);
 
         let response = accept_actions
             .accept_response
@@ -1595,20 +1662,13 @@ mod tests {
         // fills in the observed public address from the packet source.
         let private_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 9000);
         let keypair = TransportKeypair::new();
-        let joiner_original = PeerKeyLocation::with_location(
-            keypair.public().clone(),
-            private_addr,
-            Location::random(),
-        );
+        let joiner_original = PeerKeyLocation::new(keypair.public().clone(), private_addr);
 
         // Gateway observes joiner's public/external address and fills it into joiner.peer_addr
         let observed_public_addr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 9000);
-        let joiner_with_observed_addr = PeerKeyLocation::with_location(
-            keypair.public().clone(),
-            observed_public_addr,
-            joiner_original.location.unwrap(),
-        );
+        let joiner_with_observed_addr =
+            PeerKeyLocation::new(keypair.public().clone(), observed_public_addr);
 
         let relay = make_peer(5000);
 
@@ -1642,7 +1702,9 @@ mod tests {
             .response_target
             .expect("response_target should be set when accepting");
         assert_eq!(
-            response_target.addr(),
+            response_target
+                .socket_addr()
+                .expect("response target must have address"),
             observed_public_addr,
             "response_target must use observed external address ({}) not private address ({})",
             observed_public_addr,
@@ -1651,7 +1713,9 @@ mod tests {
 
         // Double-check: the original joiner had the private address
         assert_eq!(
-            joiner_original.addr(),
+            joiner_original
+                .socket_addr()
+                .expect("original joiner must have address"),
             private_addr,
             "original joiner should have private address"
         );

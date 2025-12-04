@@ -380,6 +380,24 @@ impl Contains<&PeerId> for &[&PeerId] {
     }
 }
 
+impl Contains<std::net::SocketAddr> for &[std::net::SocketAddr] {
+    fn has_element(&self, target: std::net::SocketAddr) -> bool {
+        self.contains(&target)
+    }
+}
+
+impl Contains<&std::net::SocketAddr> for &[std::net::SocketAddr] {
+    fn has_element(&self, target: &std::net::SocketAddr) -> bool {
+        self.contains(target)
+    }
+}
+
+impl Contains<std::net::SocketAddr> for &Vec<std::net::SocketAddr> {
+    fn has_element(&self, target: std::net::SocketAddr) -> bool {
+        self.contains(&target)
+    }
+}
+
 impl<Q, T> Contains<Q> for &HashSet<T>
 where
     T: Borrow<Q> + Eq + Hash,

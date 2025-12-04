@@ -9,7 +9,7 @@ use crate::{
     client_events::HostResult,
     contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
-    node::{NetworkBridge, OpManager, PeerId},
+    node::{NetworkBridge, OpManager},
     ring::{Location, PeerKeyLocation, RingError},
 };
 use freenet_stdlib::{
@@ -29,7 +29,8 @@ fn subscribers_snapshot(op_manager: &OpManager, key: &ContractKey) -> Vec<String
         .subscribers_of(key)
         .map(|subs| {
             subs.iter()
-                .map(|loc| format!("{:.8}", loc.peer()))
+                .filter_map(|loc| loc.socket_addr())
+                .map(|addr| format!("{:.8}", addr))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
@@ -101,7 +102,7 @@ enum SubscribeState {
     ReceivedRequest,
     /// Awaitinh response from petition.
     AwaitingResponse {
-        skip_list: HashSet<PeerId>,
+        skip_list: HashSet<std::net::SocketAddr>,
         retries: usize,
         upstream_subscriber: Option<PeerKeyLocation>,
         current_hop: usize,
@@ -154,16 +155,19 @@ pub(crate) async fn request_subscribe(
         let own_loc = op_manager.ring.connection_manager.own_location();
         let local_has_contract = super::has_contract(op_manager, *key).await?;
 
+        let own_addr = own_loc
+            .socket_addr()
+            .expect("own location must have socket address");
         tracing::debug!(
             tx = %id,
             %key,
-            subscriber_peer = %own_loc.peer(),
+            subscriber_peer = %own_addr,
             local_has_contract,
             "subscribe: request_subscribe invoked"
         );
 
-        let mut skip_list: HashSet<PeerId> = HashSet::new();
-        skip_list.insert(own_loc.peer().clone());
+        let mut skip_list: HashSet<std::net::SocketAddr> = HashSet::new();
+        skip_list.insert(own_addr);
 
         // Use k_closest_potentially_caching to try multiple candidates
         // Try up to 3 candidates
@@ -174,11 +178,12 @@ pub(crate) async fn request_subscribe(
         if tracing::enabled!(tracing::Level::INFO) {
             let skip_display: Vec<String> = skip_list
                 .iter()
-                .map(|peer| format!("{:.8}", peer))
+                .map(|addr| format!("{:.8}", addr))
                 .collect();
             let candidate_display: Vec<String> = candidates
                 .iter()
-                .map(|cand| format!("{:.8}", cand.peer()))
+                .filter_map(|cand| cand.socket_addr())
+                .map(|addr| format!("{:.8}", addr))
                 .collect();
             tracing::info!(
                 tx = %id,
@@ -213,7 +218,8 @@ pub(crate) async fn request_subscribe(
                         .map(|subs| {
                             subs.value()
                                 .iter()
-                                .map(|loc| format!("{:.8}", loc.peer()))
+                                .filter_map(|loc| loc.socket_addr())
+                                .map(|addr| format!("{:.8}", addr))
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
@@ -236,11 +242,14 @@ pub(crate) async fn request_subscribe(
             current_hop: op_manager.ring.max_hops_to_live,
             upstream_subscriber: None,
         });
+        let target_addr = target
+            .socket_addr()
+            .expect("target must have socket address");
         tracing::debug!(
             tx = %id,
             %key,
-            target_peer = %target.peer(),
-            target_location = ?target.location,
+            target_peer = %target_addr,
+            target_location = ?target.location(),
             "subscribe: forwarding RequestSub to target peer"
         );
         // Create subscriber with PeerAddr::Unknown - the subscriber doesn't know their own
@@ -274,6 +283,9 @@ async fn complete_local_subscription(
     key: ContractKey,
 ) -> Result<(), OpError> {
     let subscriber = op_manager.ring.connection_manager.own_location();
+    let subscriber_addr = subscriber
+        .socket_addr()
+        .expect("own location must have socket address");
     // Local subscription - no upstream NAT address
     if let Err(err) = op_manager
         .ring
@@ -282,7 +294,7 @@ async fn complete_local_subscription(
         tracing::warn!(
             %key,
             tx = %id,
-            subscriber = %subscriber.peer(),
+            subscriber = %subscriber_addr,
             error = ?err,
             "Failed to register local subscriber"
         );
@@ -290,7 +302,7 @@ async fn complete_local_subscription(
         tracing::debug!(
             %key,
             tx = %id,
-            subscriber = %subscriber.peer(),
+            subscriber = %subscriber_addr,
             "Registered local subscriber"
         );
     }
@@ -425,10 +437,13 @@ impl Operation for SubscribeOp {
                         }
                     }
 
+                    let subscriber_addr = subscriber
+                        .socket_addr()
+                        .expect("subscriber must have socket address after filling");
                     tracing::debug!(
                         tx = %id,
                         %key,
-                        subscriber = %subscriber.peer(),
+                        subscriber = %subscriber_addr,
                         source_addr = ?source_addr,
                         "subscribe: processing RequestSub"
                     );
@@ -453,7 +468,7 @@ impl Operation for SubscribeOp {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            subscriber = %subscriber.peer(),
+                            subscriber = %subscriber_addr,
                             subscribers_before = ?before_direct,
                             "subscribe: handling RequestSub locally (contract available)"
                         );
@@ -467,7 +482,7 @@ impl Operation for SubscribeOp {
                             tracing::warn!(
                                 tx = %id,
                                 %key,
-                                subscriber = %subscriber.peer(),
+                                subscriber = %subscriber_addr,
                                 subscribers_before = ?before_direct,
                                 "subscribe: direct registration failed (max subscribers reached)"
                             );
@@ -488,12 +503,15 @@ impl Operation for SubscribeOp {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            subscriber = %subscriber.peer(),
+                            subscriber = %subscriber_addr,
                             subscribers_after = ?after_direct,
                             "subscribe: registered direct subscriber (RequestSub)"
                         );
 
-                        if subscriber.peer() == own_loc.peer() {
+                        let own_addr = own_loc
+                            .socket_addr()
+                            .expect("own location must have socket address");
+                        if subscriber_addr == own_addr {
                             tracing::debug!(
                                 tx = %id,
                                 %key,
@@ -536,19 +554,30 @@ impl Operation for SubscribeOp {
                         );
                     }
 
+                    let own_addr = own_loc
+                        .socket_addr()
+                        .expect("own location must have socket address");
                     let mut skip = HashSet::new();
-                    skip.insert(subscriber.peer().clone());
-                    skip.insert(own_loc.peer().clone());
+                    skip.insert(subscriber_addr);
+                    skip.insert(own_addr);
 
                     let forward_target = op_manager
                         .ring
                         .k_closest_potentially_caching(key, &skip, 3)
                         .into_iter()
-                        .find(|candidate| candidate.peer() != own_loc.peer())
+                        .find(|candidate| {
+                            candidate
+                                .socket_addr()
+                                .map(|addr| addr != own_addr)
+                                .unwrap_or(false)
+                        })
                         .ok_or(RingError::NoCachingPeers(*key))
                         .map_err(OpError::from)?;
 
-                    skip.insert(forward_target.peer().clone());
+                    let forward_target_addr = forward_target
+                        .socket_addr()
+                        .expect("forward target must have socket address");
+                    skip.insert(forward_target_addr);
 
                     new_state = self.state;
                     return_msg = Some(SubscribeMsg::SeekNode {
@@ -604,10 +633,13 @@ impl Operation for SubscribeOp {
                     };
 
                     if htl == 0 {
+                        let subscriber_addr = subscriber
+                            .socket_addr()
+                            .expect("subscriber must have socket address");
                         tracing::warn!(
                             tx = %id,
                             %key,
-                            subscriber = %subscriber.peer(),
+                            subscriber = %subscriber_addr,
                             "Dropping Subscribe SeekNode with zero HTL"
                         );
                         return Ok(return_not_subbed());
@@ -676,13 +708,21 @@ impl Operation for SubscribeOp {
                             }
 
                             let mut new_skip_list = skip_list.clone();
-                            new_skip_list.insert(target.peer().clone());
+                            if let Some(target_addr) = target.socket_addr() {
+                                new_skip_list.insert(target_addr);
+                            }
 
+                            let new_target_addr = new_target
+                                .socket_addr()
+                                .expect("new target must have socket address");
+                            let subscriber_addr = subscriber
+                                .socket_addr()
+                                .expect("subscriber must have socket address");
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                new_target = %new_target.peer(),
-                                upstream = %subscriber.peer(),
+                                new_target = %new_target_addr,
+                                upstream = %subscriber_addr,
                                 "Forward request to peer"
                             );
                             tracing::debug!(
@@ -723,10 +763,13 @@ impl Operation for SubscribeOp {
                     }
 
                     let before_direct = subscribers_snapshot(op_manager, key);
+                    let subscriber_addr = subscriber
+                        .socket_addr()
+                        .expect("subscriber must have socket address");
                     tracing::info!(
                         tx = %id,
                         %key,
-                        subscriber = %subscriber.peer(),
+                        subscriber = %subscriber_addr,
                         subscribers_before = ?before_direct,
                         "subscribe: attempting to register direct subscriber"
                     );
@@ -739,7 +782,7 @@ impl Operation for SubscribeOp {
                         tracing::warn!(
                             tx = %id,
                             %key,
-                            subscriber = %subscriber.peer(),
+                            subscriber = %subscriber_addr,
                             subscribers_before = ?before_direct,
                             "subscribe: direct registration failed (max subscribers reached)"
                         );
@@ -750,7 +793,7 @@ impl Operation for SubscribeOp {
                     tracing::info!(
                         tx = %id,
                         %key,
-                        subscriber = %subscriber.peer(),
+                        subscriber = %subscriber_addr,
                         subscribers_after = ?after_direct,
                         "subscribe: registered direct subscriber"
                     );
@@ -760,7 +803,7 @@ impl Operation for SubscribeOp {
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                subscriber = % subscriber.peer(),
+                                subscriber = %subscriber_addr,
                                 "Peer successfully subscribed to contract",
                             );
                             new_state = None;
@@ -784,10 +827,13 @@ impl Operation for SubscribeOp {
                     let sender = sender_from_addr
                         .clone()
                         .expect("ReturnSub requires source_addr");
+                    let sender_addr = sender
+                        .socket_addr()
+                        .expect("sender must have socket address");
                     tracing::warn!(
                         tx = %id,
                         %key,
-                        potential_provider = %sender.peer(),
+                        potential_provider = %sender_addr,
                         "Contract not found at potential subscription provider",
                     );
                     // will error out in case it has reached max number of retries
@@ -799,7 +845,7 @@ impl Operation for SubscribeOp {
                             current_hop,
                         }) => {
                             if retries < MAX_RETRIES {
-                                skip_list.insert(sender.peer().clone());
+                                skip_list.insert(sender_addr);
                                 // Use k_closest_potentially_caching to try multiple candidates
                                 let candidates = op_manager
                                     .ring
@@ -856,11 +902,17 @@ impl Operation for SubscribeOp {
                             .expect("ReturnSub requires source_addr");
                         fetch_contract_if_missing(op_manager, *key).await?;
 
+                        let target_addr = target
+                            .socket_addr()
+                            .expect("target must have socket address");
+                        let sender_addr = sender
+                            .socket_addr()
+                            .expect("sender must have socket address");
                         tracing::info!(
                             tx = %id,
                             %key,
-                            this_peer = %target.peer(),
-                            provider = %sender.peer(),
+                            this_peer = %target_addr,
+                            provider = %sender_addr,
                             "Subscribed to contract"
                         );
                         tracing::info!(
@@ -868,16 +920,20 @@ impl Operation for SubscribeOp {
                             %key,
                             upstream = upstream_subscriber
                                 .as_ref()
-                                .map(|loc| format!("{:.8}", loc.peer()))
+                                .and_then(|loc| loc.socket_addr())
+                                .map(|addr| format!("{:.8}", addr))
                                 .unwrap_or_else(|| "<none>".into()),
                             "Handling ReturnSub (subscribed=true)"
                         );
                         if let Some(upstream_subscriber) = upstream_subscriber.as_ref() {
                             let before_upstream = subscribers_snapshot(op_manager, key);
+                            let upstream_addr = upstream_subscriber
+                                .socket_addr()
+                                .expect("upstream subscriber must have socket address");
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                upstream = %upstream_subscriber.peer(),
+                                upstream = %upstream_addr,
                                 subscribers_before = ?before_upstream,
                                 "subscribe: attempting to register upstream link"
                             );
@@ -890,7 +946,7 @@ impl Operation for SubscribeOp {
                                 tracing::warn!(
                                     tx = %id,
                                     %key,
-                                    upstream = %upstream_subscriber.peer(),
+                                    upstream = %upstream_addr,
                                     subscribers_before = ?before_upstream,
                                     "subscribe: upstream registration failed (max subscribers reached)"
                                 );
@@ -899,7 +955,7 @@ impl Operation for SubscribeOp {
                                 tracing::info!(
                                     tx = %id,
                                     %key,
-                                    upstream = %upstream_subscriber.peer(),
+                                    upstream = %upstream_addr,
                                     subscribers_after = ?after_upstream,
                                     "subscribe: registered upstream link"
                                 );
@@ -910,7 +966,7 @@ impl Operation for SubscribeOp {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            provider = %sender.peer(),
+                            provider = %sender_addr,
                             subscribers_before = ?before_provider,
                             "subscribe: registering provider/subscription source"
                         );
@@ -932,17 +988,20 @@ impl Operation for SubscribeOp {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            provider = %sender.peer(),
+                            provider = %sender_addr,
                             subscribers_after = ?after_provider,
                             "subscribe: registered provider/subscription source"
                         );
 
                         new_state = Some(SubscribeState::Completed { key: *key });
                         if let Some(upstream_subscriber) = upstream_subscriber {
+                            let upstream_addr = upstream_subscriber
+                                .socket_addr()
+                                .expect("upstream subscriber must have socket address");
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                upstream_subscriber = %upstream_subscriber.peer(),
+                                upstream_subscriber = %upstream_addr,
                                 "Forwarding subscription to upstream subscriber"
                             );
                             return_msg = Some(SubscribeMsg::ReturnSub {
@@ -1030,7 +1089,7 @@ mod messages {
             key: ContractKey,
             target: PeerKeyLocation,
             subscriber: PeerKeyLocation,
-            skip_list: HashSet<PeerId>,
+            skip_list: HashSet<std::net::SocketAddr>,
             htl: usize,
             retries: usize,
         },

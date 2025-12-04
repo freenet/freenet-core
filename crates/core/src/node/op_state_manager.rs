@@ -25,12 +25,11 @@ use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
-    node::PeerId,
     operations::{
         connect::ConnectForwardEstimator, get::GetOp, put::PutOp, subscribe::SubscribeOp,
         update::UpdateOp, OpEnum, OpError,
     },
-    ring::{ConnectionManager, LiveTransactionTracker, Ring},
+    ring::{ConnectionManager, LiveTransactionTracker, PeerKeyLocation, Ring},
 };
 
 use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig};
@@ -379,14 +378,14 @@ impl OpManager {
     }
 
     /// Get all network subscription information
-    /// Returns a map of contract keys to lists of subscribing peers
-    pub fn get_network_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerId>)> {
+    /// Returns a map of contract keys to lists of subscribing peers (as PeerKeyLocations)
+    pub fn get_network_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
         self.ring
             .all_network_subscriptions()
             .into_iter()
             .map(|(contract_key, subscribers)| {
-                let peer_ids: Vec<PeerId> = subscribers.into_iter().map(|sub| sub.peer()).collect();
-                (contract_key, peer_ids)
+                let peers: Vec<PeerKeyLocation> = subscribers.into_iter().collect();
+                (contract_key, peers)
             })
             .collect()
     }
@@ -638,15 +637,17 @@ impl OpManager {
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
-    pub fn sending_transaction(&self, peer: &PeerId, msg: &NetMessage) {
+    pub fn sending_transaction(&self, peer: &PeerKeyLocation, msg: &NetMessage) {
         let transaction = msg.id();
         if let (Some(recipient), Some(target)) = (msg.target(), msg.requested_location()) {
             self.ring
                 .record_request(recipient.clone(), target, transaction.transaction_type());
         }
-        self.ring
-            .live_tx_tracker
-            .add_transaction(peer.addr, *transaction);
+        if let Some(peer_addr) = peer.socket_addr() {
+            self.ring
+                .live_tx_tracker
+                .add_transaction(peer_addr, *transaction);
+        }
     }
 }
 

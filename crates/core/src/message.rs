@@ -11,7 +11,6 @@ use std::{
 
 use crate::{
     client_events::{ClientId, HostResult},
-    node::PeerId,
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
@@ -330,7 +329,7 @@ pub(crate) enum NetMessageV1 {
     Unsubscribed {
         transaction: Transaction,
         key: ContractKey,
-        from: PeerId,
+        from: PeerKeyLocation,
     },
     Update(UpdateMsg),
     Aborted(Transaction),
@@ -377,16 +376,16 @@ pub trait InnerMessage: Into<NetMessage> {
 }
 
 type RemainingChecks = Option<usize>;
-type ConnectResult = Result<(PeerId, RemainingChecks), ()>;
+type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
 
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Clone)]
 pub(crate) enum NodeEvent {
     /// Drop the given peer connection by socket address.
-    DropConnection(std::net::SocketAddr),
+    DropConnection(SocketAddr),
     // Try connecting to the given peer.
     ConnectPeer {
-        peer: PeerId,
+        peer: PeerKeyLocation,
         tx: Transaction,
         callback: tokio::sync::mpsc::Sender<ConnectResult>,
         is_gw: bool,
@@ -415,7 +414,7 @@ pub(crate) enum NodeEvent {
     },
     /// Register expectation for an inbound connection from the given peer.
     ExpectPeerConnection {
-        peer: PeerId,
+        addr: SocketAddr,
     },
 }
 
@@ -432,13 +431,13 @@ pub struct NetworkDebugInfo {
     pub application_subscriptions: Vec<SubscriptionInfo>,
     /// Network-level subscriptions (nodes subscribing to contracts for routing)
     #[allow(dead_code)] // Used for debugging purposes, not exposed via stdlib API yet
-    pub network_subscriptions: Vec<(ContractKey, Vec<PeerId>)>,
-    pub connected_peers: Vec<PeerId>,
+    pub network_subscriptions: Vec<(ContractKey, Vec<SocketAddr>)>,
+    pub connected_peers: Vec<PeerKeyLocation>,
 }
 
 #[derive(Debug)]
 pub(crate) enum QueryResult {
-    Connections(Vec<PeerId>),
+    Connections(Vec<PeerKeyLocation>),
     GetResult {
         key: ContractKey,
         state: WrappedState,
@@ -493,8 +492,8 @@ impl Display for NodeEvent {
                     "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
                 )
             }
-            NodeEvent::ExpectPeerConnection { peer } => {
-                write!(f, "ExpectPeerConnection (from {peer})")
+            NodeEvent::ExpectPeerConnection { addr } => {
+                write!(f, "ExpectPeerConnection (from {addr})")
             }
         }
     }
