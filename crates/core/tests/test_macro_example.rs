@@ -209,15 +209,14 @@ async fn test_multiple_gateways(ctx: &mut TestContext) -> TestResult {
     Ok(())
 }
 
-/// Test with auto_connect_peers enabled
+/// Test with auto_connect_peers enabled (now the default)
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true,
     timeout_secs = 120,
     startup_wait_secs = 15
 )]
 async fn test_auto_connect_peers(ctx: &mut TestContext) -> TestResult {
-    // With auto_connect_peers=true, all peer nodes are configured to
+    // With auto_connect_peers=true (now default), all peer nodes are configured to
     // connect to all gateway nodes automatically
 
     let gateway = ctx.gateway()?;
@@ -238,16 +237,15 @@ async fn test_auto_connect_peers(ctx: &mut TestContext) -> TestResult {
     Ok(())
 }
 
-/// Test with multiple gateways and auto_connect_peers
+/// Test with multiple gateways and auto_connect_peers (now the default)
 #[freenet_test(
     nodes = ["gw-1", "gw-2", "peer-1", "peer-2"],
     gateways = ["gw-1", "gw-2"],
-    auto_connect_peers = true,
     timeout_secs = 120,
     startup_wait_secs = 15
 )]
 async fn test_multi_gateway_auto_connect(ctx: &mut TestContext) -> TestResult {
-    // With auto_connect_peers=true and multiple gateways,
+    // With auto_connect_peers=true (now default) and multiple gateways,
     // all peer nodes are configured to connect to ALL gateway nodes
 
     let gateways = ctx.gateways();

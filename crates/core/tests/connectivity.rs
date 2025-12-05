@@ -23,7 +23,6 @@ fn fixed_three_node_locations() -> Vec<f64> {
 /// connecting to the gateway.
 #[freenet_test(
     nodes = ["gateway", "peer"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 15,
     aggregate_events = "always",
@@ -256,7 +255,6 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
 ///
 #[freenet_test(
     nodes = ["gateway", "peer1", "peer2"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 30,
     node_locations_fn = fixed_three_node_locations,
@@ -541,7 +539,6 @@ async fn perform_put_with_retries(
 /// when promoting transients.
 #[freenet_test(
     nodes = ["gateway", "peer"],
-    auto_connect_peers = true,
     timeout_secs = 60,
     startup_wait_secs = 15,
     aggregate_events = "always",
