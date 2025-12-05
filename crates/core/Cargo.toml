@@ -95,6 +95,7 @@ serde = { version = "1.0", features = ["derive"] }
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
+criterion = { version = "0.5", features = ["async_tokio"] }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
 httptest = "0.16"
@@ -107,6 +108,10 @@ tokio-tungstenite = "0.27.0"
 ureq = { version = "3.1", features = ["json"] }
 which = "8.0"
 regex = "1"
+
+[[bench]]
+name = "transport_perf"
+harness = false
 
 [features]
 default = ["redb", "trace", "websocket"]
