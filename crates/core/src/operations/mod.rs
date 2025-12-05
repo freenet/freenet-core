@@ -20,6 +20,8 @@ pub(crate) mod connect;
 pub(crate) mod get;
 pub(crate) mod put;
 pub(crate) mod subscribe;
+#[cfg(test)]
+pub(crate) mod test_utils;
 pub(crate) mod update;
 
 pub(crate) trait Operation

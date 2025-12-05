@@ -1652,20 +1652,8 @@ mod messages {
 mod tests {
     use super::*;
     use crate::message::Transaction;
-    use crate::transport::TransportKeypair;
-    use freenet_stdlib::prelude::ContractInstanceId;
+    use crate::operations::test_utils::{make_contract_key, make_peer};
     use std::collections::HashSet;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    fn make_peer(port: u16) -> PeerKeyLocation {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-        let keypair = TransportKeypair::new();
-        PeerKeyLocation::new(keypair.public().clone(), addr)
-    }
-
-    fn make_contract_key() -> ContractKey {
-        ContractKey::from(ContractInstanceId::new([1u8; 32]))
-    }
 
     fn make_get_op(state: Option<GetState>, result: Option<GetResult>) -> GetOp {
         GetOp {
@@ -1680,7 +1668,7 @@ mod tests {
     // Tests for finalized() method
     #[test]
     fn get_op_finalized_when_finished_with_result() {
-        let key = make_contract_key();
+        let key = make_contract_key(1);
         let result = GetResult {
             key,
             state: WrappedState::new(vec![1, 2, 3]),
@@ -1695,7 +1683,7 @@ mod tests {
 
     #[test]
     fn get_op_not_finalized_when_finished_without_result() {
-        let key = make_contract_key();
+        let key = make_contract_key(1);
         let op = make_get_op(Some(GetState::Finished { key }), None);
         assert!(
             !op.finalized(),
@@ -1724,7 +1712,7 @@ mod tests {
     // Tests for to_host_result() method
     #[test]
     fn get_op_to_host_result_success_when_result_present() {
-        let key = make_contract_key();
+        let key = make_contract_key(1);
         let state_data = WrappedState::new(vec![1, 2, 3]);
         let result = GetResult {
             key,
@@ -1767,7 +1755,7 @@ mod tests {
     // Tests for outcome() method - partial coverage since full stats require complex setup
     #[test]
     fn get_op_outcome_incomplete_without_stats() {
-        let key = make_contract_key();
+        let key = make_contract_key(1);
         let result = GetResult {
             key,
             state: WrappedState::new(vec![]),
@@ -1786,7 +1774,7 @@ mod tests {
         let msg = GetMsg::RequestGet {
             id: Transaction::new::<GetMsg>(),
             target: target.clone(),
-            key: make_contract_key(),
+            key: make_contract_key(1),
             fetch_contract: false,
             skip_list: HashSet::new(),
         };
@@ -1802,7 +1790,7 @@ mod tests {
         let target = make_peer(6000);
         let msg = GetMsg::ReturnGet {
             id: Transaction::new::<GetMsg>(),
-            key: make_contract_key(),
+            key: make_contract_key(1),
             value: StoreResponse {
                 state: None,
                 contract: None,
@@ -1823,7 +1811,7 @@ mod tests {
         let msg = GetMsg::RequestGet {
             id: tx,
             target: make_peer(5000),
-            key: make_contract_key(),
+            key: make_contract_key(1),
             fetch_contract: false,
             skip_list: HashSet::new(),
         };
@@ -1835,7 +1823,7 @@ mod tests {
         let tx = Transaction::new::<GetMsg>();
         let msg = GetMsg::SeekNode {
             id: tx,
-            key: make_contract_key(),
+            key: make_contract_key(1),
             fetch_contract: false,
             target: make_peer(5000),
             htl: 5,
@@ -1862,7 +1850,7 @@ mod tests {
     #[test]
     fn get_state_display_finished() {
         let state = GetState::Finished {
-            key: make_contract_key(),
+            key: make_contract_key(1),
         };
         let display = format!("{}", state);
         assert!(

@@ -1749,19 +1749,7 @@ mod messages {
 mod tests {
     use super::*;
     use crate::message::Transaction;
-    use crate::transport::TransportKeypair;
-    use freenet_stdlib::prelude::ContractInstanceId;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    fn make_peer(port: u16) -> PeerKeyLocation {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-        let keypair = TransportKeypair::new();
-        PeerKeyLocation::new(keypair.public().clone(), addr)
-    }
-
-    fn make_contract_key() -> ContractKey {
-        ContractKey::from(ContractInstanceId::new([1u8; 32]))
-    }
+    use crate::operations::test_utils::{make_contract_key, make_peer};
 
     fn make_put_op(state: Option<PutState>) -> PutOp {
         PutOp {
@@ -1784,7 +1772,7 @@ mod tests {
     #[test]
     fn put_op_finalized_when_state_is_finished() {
         let op = make_put_op(Some(PutState::Finished {
-            key: make_contract_key(),
+            key: make_contract_key(1),
         }));
         assert!(
             op.finalized(),
@@ -1813,7 +1801,7 @@ mod tests {
     // Tests for to_host_result() method
     #[test]
     fn put_op_to_host_result_success_when_finished() {
-        let key = make_contract_key();
+        let key = make_contract_key(1);
         let op = make_put_op(Some(PutState::Finished { key }));
         let result = op.to_host_result();
         assert!(
@@ -1855,7 +1843,7 @@ mod tests {
     #[test]
     fn put_op_is_completed_when_finished() {
         let op = make_put_op(Some(PutState::Finished {
-            key: make_contract_key(),
+            key: make_contract_key(1),
         }));
         assert!(
             op.is_completed(),
@@ -1880,7 +1868,7 @@ mod tests {
         let msg = PutMsg::SuccessfulPut {
             id: Transaction::new::<PutMsg>(),
             target: target.clone(),
-            key: make_contract_key(),
+            key: make_contract_key(1),
             origin,
         };
         assert_eq!(
