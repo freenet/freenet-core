@@ -1795,6 +1795,7 @@ dependencies = [
  "hickory-resolver",
  "httptest",
  "itertools 0.14.0",
+ "libc",
  "notify",
  "once_cell",
  "opentelemetry 0.31.0",

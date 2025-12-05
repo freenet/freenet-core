@@ -1599,6 +1599,342 @@ mod experimental_syscall_batching {
 }
 
 // =============================================================================
+// Experimental: True Syscall Batching with sendmmsg (Linux only)
+// =============================================================================
+//
+// This tests ACTUAL syscall batching:
+// - send(): 1 syscall per packet (N syscalls for N packets)
+// - sendmmsg(): 1 syscall for N packets
+//
+// This is different from the async_vs_blocking test which still makes N syscalls,
+// just without async overhead between them.
+
+#[cfg(target_os = "linux")]
+mod experimental_true_sendmmsg {
+    use super::*;
+    use std::net::{SocketAddr, UdpSocket};
+    use std::os::unix::io::AsRawFd;
+
+    /// Wrapper for sendmmsg syscall
+    ///
+    /// sendmmsg sends multiple messages in a single syscall, reducing
+    /// kernel transitions from N to 1.
+    unsafe fn sendmmsg_batch(
+        fd: i32,
+        messages: &mut [libc::mmsghdr],
+    ) -> Result<usize, std::io::Error> {
+        let ret = libc::sendmmsg(
+            fd,
+            messages.as_mut_ptr(),
+            messages.len() as libc::c_uint,
+            0, // flags
+        );
+        if ret < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(ret as usize)
+        }
+    }
+
+    /// Compare N send() syscalls vs 1 sendmmsg() syscall
+    ///
+    /// This is the TRUE test of syscall batching benefit
+    pub fn bench_true_sendmmsg(c: &mut Criterion) {
+        let mut group = c.benchmark_group("experimental/true_sendmmsg/syscall_count");
+        group.sample_size(50);
+
+        const PACKET_SIZE: usize = 1400;
+
+        // Test different batch sizes
+        let batch_sizes = [1, 10, 50, 100, 500];
+
+        for &batch_size in &batch_sizes {
+            let total_bytes = (PACKET_SIZE * batch_size) as u64;
+            group.throughput(Throughput::Bytes(total_bytes));
+
+            // Create socket
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).unwrap();
+            let fd = socket.as_raw_fd();
+
+            // Pre-allocate packet buffers
+            let packets: Vec<Vec<u8>> = (0..batch_size)
+                .map(|_| vec![0xABu8; PACKET_SIZE])
+                .collect();
+
+            // ========== Baseline: N individual send() syscalls ==========
+            group.bench_with_input(
+                BenchmarkId::new("send_loop", batch_size),
+                &batch_size,
+                |b, &_n| {
+                    b.iter(|| {
+                        for packet in &packets {
+                            socket.send(packet).unwrap();
+                        }
+                    });
+                },
+            );
+
+            // ========== sendmmsg: 1 syscall for N packets ==========
+            // Prepare sockaddr
+            let sockaddr_in = match addr {
+                SocketAddr::V4(v4) => {
+                    let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                    sa.sin_family = libc::AF_INET as libc::sa_family_t;
+                    sa.sin_port = v4.port().to_be();
+                    sa.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+                    sa
+                }
+                _ => panic!("Expected IPv4"),
+            };
+
+            group.bench_with_input(
+                BenchmarkId::new("sendmmsg", batch_size),
+                &batch_size,
+                |b, &n| {
+                    // Pre-allocate iovecs and mmsghdr structures
+                    let mut iovecs: Vec<[libc::iovec; 1]> = packets
+                        .iter()
+                        .map(|p| {
+                            [libc::iovec {
+                                iov_base: p.as_ptr() as *mut libc::c_void,
+                                iov_len: p.len(),
+                            }]
+                        })
+                        .collect();
+
+                    b.iter(|| {
+                        // Build mmsghdr array
+                        let mut msgs: Vec<libc::mmsghdr> = iovecs
+                            .iter_mut()
+                            .map(|iov| {
+                                let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                                msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
+                                msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                msg.msg_hdr.msg_iov = iov.as_mut_ptr();
+                                msg.msg_hdr.msg_iovlen = 1;
+                                msg
+                            })
+                            .collect();
+
+                        // Single syscall for all packets
+                        let sent = unsafe { sendmmsg_batch(fd, &mut msgs) }.unwrap();
+                        std_black_box(sent);
+                        assert_eq!(sent, n);
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Show throughput scaling with sendmmsg
+    ///
+    /// Demonstrates how throughput increases with batch size due to
+    /// reduced syscall overhead
+    pub fn bench_sendmmsg_throughput(c: &mut Criterion) {
+        let mut group = c.benchmark_group("experimental/true_sendmmsg/throughput");
+        group.sample_size(50);
+        group.measurement_time(Duration::from_secs(5));
+
+        const PACKET_SIZE: usize = 1400;
+        const TOTAL_BYTES: usize = 1_400_000; // 1.4 MB total
+
+        // Calculate packets needed for consistent total bytes
+        let total_packets = TOTAL_BYTES / PACKET_SIZE;
+        group.throughput(Throughput::Bytes(TOTAL_BYTES as u64));
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        socket.connect(addr).unwrap();
+        let fd = socket.as_raw_fd();
+
+        let sockaddr_in = match addr {
+            SocketAddr::V4(v4) => {
+                let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                sa.sin_family = libc::AF_INET as libc::sa_family_t;
+                sa.sin_port = v4.port().to_be();
+                sa.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+                sa
+            }
+            _ => panic!("Expected IPv4"),
+        };
+
+        // Test different batch sizes (syscalls = total_packets / batch_size)
+        let batch_sizes = [1, 10, 50, 100, 500, 1000];
+
+        for &batch_size in &batch_sizes {
+            let num_batches = total_packets / batch_size;
+            let syscalls = num_batches;
+
+            // Pre-allocate packets for one batch
+            let packets: Vec<Vec<u8>> = (0..batch_size)
+                .map(|_| vec![0xABu8; PACKET_SIZE])
+                .collect();
+
+            let mut iovecs: Vec<[libc::iovec; 1]> = packets
+                .iter()
+                .map(|p| {
+                    [libc::iovec {
+                        iov_base: p.as_ptr() as *mut libc::c_void,
+                        iov_len: p.len(),
+                    }]
+                })
+                .collect();
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("batch_{}_syscalls_{}", batch_size, syscalls), batch_size),
+                &batch_size,
+                |b, &_n| {
+                    b.iter(|| {
+                        for _ in 0..num_batches {
+                            let mut msgs: Vec<libc::mmsghdr> = iovecs
+                                .iter_mut()
+                                .map(|iov| {
+                                    let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                                    msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
+                                    msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                    msg.msg_hdr.msg_iov = iov.as_mut_ptr();
+                                    msg.msg_hdr.msg_iovlen = 1;
+                                    msg
+                                })
+                                .collect();
+
+                            let sent = unsafe { sendmmsg_batch(fd, &mut msgs) }.unwrap();
+                            std_black_box(sent);
+                        }
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Integration test: sendmmsg with tokio spawn_blocking
+    ///
+    /// Shows how to use sendmmsg from within tokio
+    pub fn bench_tokio_sendmmsg_integration(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("experimental/true_sendmmsg/tokio_integration");
+        group.sample_size(30);
+
+        const PACKET_SIZE: usize = 1400;
+        const TOTAL_PACKETS: usize = 1000;
+        const BATCH_SIZE: usize = 100;
+
+        let total_bytes = (PACKET_SIZE * TOTAL_PACKETS) as u64;
+        group.throughput(Throughput::Bytes(total_bytes));
+
+        // ========== Baseline: tokio async send (N syscalls) ==========
+        let socket = rt.block_on(async {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).await.unwrap();
+            socket
+        });
+        let socket = std::sync::Arc::new(socket);
+
+        group.bench_function("tokio_async_send", |b| {
+            let socket = socket.clone();
+            let buf = vec![0xABu8; PACKET_SIZE];
+            b.to_async(&rt).iter(move || {
+                let socket = socket.clone();
+                let buf = buf.clone();
+                async move {
+                    for _ in 0..TOTAL_PACKETS {
+                        socket.send(&buf).await.unwrap();
+                    }
+                }
+            });
+        });
+
+        // ========== spawn_blocking + sendmmsg (N/BATCH_SIZE syscalls) ==========
+        group.bench_function("spawn_blocking_sendmmsg", |b| {
+            b.to_async(&rt).iter(|| async {
+                tokio::task::spawn_blocking(move || {
+                    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let addr = socket.local_addr().unwrap();
+                    socket.connect(addr).unwrap();
+                    let fd = socket.as_raw_fd();
+
+                    let sockaddr_in = match addr {
+                        SocketAddr::V4(v4) => {
+                            let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+                            sa.sin_port = v4.port().to_be();
+                            sa.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+                            sa
+                        }
+                        _ => panic!("Expected IPv4"),
+                    };
+
+                    // Pre-allocate batch
+                    let packets: Vec<Vec<u8>> = (0..BATCH_SIZE)
+                        .map(|_| vec![0xABu8; PACKET_SIZE])
+                        .collect();
+
+                    let mut iovecs: Vec<[libc::iovec; 1]> = packets
+                        .iter()
+                        .map(|p| {
+                            [libc::iovec {
+                                iov_base: p.as_ptr() as *mut libc::c_void,
+                                iov_len: p.len(),
+                            }]
+                        })
+                        .collect();
+
+                    let num_batches = TOTAL_PACKETS / BATCH_SIZE;
+                    for _ in 0..num_batches {
+                        let mut msgs: Vec<libc::mmsghdr> = iovecs
+                            .iter_mut()
+                            .map(|iov| {
+                                let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                                msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
+                                msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                msg.msg_hdr.msg_iov = iov.as_mut_ptr();
+                                msg.msg_hdr.msg_iovlen = 1;
+                                msg
+                            })
+                            .collect();
+
+                        unsafe { sendmmsg_batch(fd, &mut msgs) }.unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        group.finish();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod experimental_true_sendmmsg {
+    use super::*;
+
+    pub fn bench_true_sendmmsg(_c: &mut Criterion) {
+        eprintln!("sendmmsg benchmarks only available on Linux");
+    }
+
+    pub fn bench_sendmmsg_throughput(_c: &mut Criterion) {
+        eprintln!("sendmmsg benchmarks only available on Linux");
+    }
+
+    pub fn bench_tokio_sendmmsg_integration(_c: &mut Criterion) {
+        eprintln!("sendmmsg benchmarks only available on Linux");
+    }
+}
+
+// =============================================================================
 // Criterion Groups - Organized by noise level
 // =============================================================================
 
@@ -1704,4 +2040,17 @@ criterion_group!(
         experimental_syscall_batching::bench_syscall_reduction,
 );
 
-criterion_main!(level0, level1, level2, level3, experimental_packet, experimental_tokio, experimental_combined, experimental_batching);
+criterion_group!(
+    name = experimental_true_syscall;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(5))
+        .noise_threshold(0.10)
+        .significance_level(0.05);
+    targets =
+        experimental_true_sendmmsg::bench_true_sendmmsg,
+        experimental_true_sendmmsg::bench_sendmmsg_throughput,
+        experimental_true_sendmmsg::bench_tokio_sendmmsg_integration,
+);
+
+criterion_main!(level0, level1, level2, level3, experimental_packet, experimental_tokio, experimental_combined, experimental_batching, experimental_true_syscall);
