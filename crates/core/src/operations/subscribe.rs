@@ -309,7 +309,12 @@ async fn complete_local_subscription(
             key,
             subscribed: true,
         })
-        .await
+        .await?;
+
+    // Mark operation as completed. This will handle parent completion if this is a sub-operation.
+    op_manager.completed(id);
+
+    Ok(())
 }
 
 pub(crate) struct SubscribeOp {
