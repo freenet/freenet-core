@@ -187,11 +187,41 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
 /// Generate node configuration setup code
 fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
     let mut setup_code = Vec::new();
+    let node_count = args.nodes.len();
+    let node_count_lit = LitInt::new(&node_count.to_string(), proc_macro2::Span::call_site());
+
+    // First, generate all keypairs upfront and verify uniqueness
+    // This prevents rare RNG collisions from causing confusing test failures
+    setup_code.push(quote! {
+        // Generate all transport keypairs upfront
+        let __keypairs: Vec<freenet::dev_tool::TransportKeypair> = (0..#node_count_lit)
+            .map(|_| freenet::dev_tool::TransportKeypair::new())
+            .collect();
+
+        // Verify all public keys are unique (sanity check against RNG issues)
+        {
+            let mut seen_keys = std::collections::HashSet::new();
+            for (idx, keypair) in __keypairs.iter().enumerate() {
+                let key_str = format!("{}", keypair.public());
+                if !seen_keys.insert(key_str.clone()) {
+                    return Err(anyhow::anyhow!(
+                        "FATAL: Generated duplicate transport keypair for node {} (key: {}). \
+                         This indicates an RNG issue in the test environment. \
+                         Please report this to the Freenet developers.",
+                        idx,
+                        key_str
+                    ));
+                }
+            }
+            tracing::debug!("Verified {} unique transport keypairs", #node_count_lit);
+        }
+    });
 
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let config_var = format_ident!("config_{}", idx);
         let temp_var = format_ident!("temp_{}", idx);
         let is_gw = is_gateway(args, node_label, idx);
+        let idx_lit = LitInt::new(&idx.to_string(), proc_macro2::Span::call_site());
 
         if is_gw {
             // Gateway node configuration
@@ -203,7 +233,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                 let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
-                    let key = freenet::dev_tool::TransportKeypair::new();
+                    let key = &__keypairs[#idx_lit];
                     let transport_keypair = temp_dir.path().join("private.pem");
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
@@ -278,6 +308,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
         let config_var = format_ident!("config_{}", idx);
         let temp_var = format_ident!("temp_{}", idx);
         let is_gw = is_gateway(args, node_label, idx);
+        let idx_lit = LitInt::new(&idx.to_string(), proc_macro2::Span::call_site());
 
         if !is_gw {
             let location_expr = node_location(args, idx, node_label);
@@ -322,7 +353,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                 let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
-                    let key = freenet::dev_tool::TransportKeypair::new();
+                    let key = &__keypairs[#idx_lit];
                     let transport_keypair = temp_dir.path().join("private.pem");
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
