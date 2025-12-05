@@ -746,12 +746,16 @@ impl OpManager {
         key: &ContractKey,
         sender: &SocketAddr,
     ) -> Vec<PeerKeyLocation> {
-        let subscribers = self
+        use std::collections::HashSet;
+
+        let self_addr = self.ring.connection_manager.get_own_addr();
+        let allow_self = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
+
+        // Collect explicit subscribers (downstream interest)
+        let subscribers: HashSet<PeerKeyLocation> = self
             .ring
             .subscribers_of(key)
             .map(|subs| {
-                let self_addr = self.ring.connection_manager.get_own_addr();
-                let allow_self = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
                 subs.value()
                     .iter()
                     .filter(|pk| {
@@ -766,23 +770,51 @@ impl OpManager {
                         }
                     })
                     .cloned()
-                    .collect::<Vec<_>>()
+                    .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
 
+        // Collect proximity neighbors (nearby seeders who may not be explicitly subscribed)
+        let proximity_addrs = self.proximity_cache.neighbors_with_contract(key);
+        let mut proximity_targets: HashSet<PeerKeyLocation> = HashSet::new();
+
+        for addr in proximity_addrs {
+            // Skip sender to avoid echo
+            if &addr == sender {
+                continue;
+            }
+            // Skip self unless allowed
+            if !allow_self && self_addr.as_ref() == Some(&addr) {
+                continue;
+            }
+            // Look up the PeerKeyLocation for this address via the connection manager
+            if let Some(pkl) = self.ring.connection_manager.get_peer_by_addr(addr) {
+                proximity_targets.insert(pkl);
+            }
+        }
+
+        // Combine both sets (HashSet handles deduplication)
+        let mut all_targets: HashSet<PeerKeyLocation> = subscribers.clone();
+        let proximity_count = proximity_targets.len();
+        all_targets.extend(proximity_targets);
+
+        let targets: Vec<PeerKeyLocation> = all_targets.into_iter().collect();
+
         // Trace update propagation for debugging
-        if !subscribers.is_empty() {
+        if !targets.is_empty() {
             tracing::info!(
-                "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={}",
+                "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={} (subscribers={}, proximity={})",
                 key,
                 sender,
-                subscribers
+                targets
                     .iter()
                     .filter_map(|s| s.socket_addr())
                     .map(|addr| format!("{:.8}", addr))
                     .collect::<Vec<_>>()
                     .join(","),
-                subscribers.len()
+                targets.len(),
+                subscribers.len(),
+                proximity_count
             );
         } else {
             let own_addr = self.ring.connection_manager.get_own_addr();
@@ -804,7 +836,7 @@ impl OpManager {
             );
         }
 
-        subscribers
+        targets
     }
 }
 

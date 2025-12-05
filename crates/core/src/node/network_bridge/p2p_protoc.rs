@@ -1271,6 +1271,27 @@ impl P2pConnManager {
                                     }
                                 }
                             }
+                            NodeEvent::BroadcastProximityCache { message } => {
+                                // Broadcast ProximityCache message to all connected peers
+                                tracing::debug!(
+                                    ?message,
+                                    peer_count = ctx.connections.len(),
+                                    "Broadcasting ProximityCache message to connected peers"
+                                );
+
+                                let msg = crate::message::NetMessage::V1(
+                                    crate::message::NetMessageV1::ProximityCache {
+                                        message: message.clone(),
+                                    },
+                                );
+
+                                for peer_addr in ctx.connections.keys() {
+                                    tracing::debug!(%peer_addr, "Sending ProximityCache to peer");
+                                    if let Err(e) = ctx.bridge.send(*peer_addr, msg.clone()).await {
+                                        tracing::warn!(%peer_addr, "Failed to send ProximityCache: {e}");
+                                    }
+                                }
+                            }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
                                     "Disconnecting from network{}",

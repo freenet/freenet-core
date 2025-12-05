@@ -970,6 +970,10 @@ where
                     tracing::debug!(%addr, "ExpectPeerConnection ignored in testing impl");
                     continue;
                 }
+                NodeEvent::BroadcastProximityCache { message } => {
+                    tracing::debug!(?message, "BroadcastProximityCache ignored in testing impl");
+                    continue;
+                }
             },
             Err(err) => {
                 super::report_result(

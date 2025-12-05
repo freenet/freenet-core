@@ -367,6 +367,29 @@ impl<T> From<SendError<T>> for OpError {
     }
 }
 
+/// Announces to the proximity cache that we've cached a contract.
+/// This broadcasts to all connected peers so they know to forward UPDATEs to us.
+pub(crate) async fn announce_contract_cached(op_manager: &OpManager, key: &ContractKey) {
+    if let Some(announcement) = op_manager.proximity_cache.on_contract_cached(key) {
+        tracing::debug!(
+            %key,
+            "PROXIMITY_CACHE: Announcing contract cached to neighbors"
+        );
+        if let Err(err) = op_manager
+            .notify_node_event(crate::message::NodeEvent::BroadcastProximityCache {
+                message: announcement,
+            })
+            .await
+        {
+            tracing::warn!(
+                %key,
+                %err,
+                "PROXIMITY_CACHE: Failed to broadcast cache announcement"
+            );
+        }
+    }
+}
+
 /// Initiates a subscription as a child operation of the parent transaction.
 /// Registers the relationship for atomicity tracking and spawns the subscription
 /// task asynchronously to prevent blocking the parent operation.
