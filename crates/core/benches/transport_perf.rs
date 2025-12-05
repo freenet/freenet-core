@@ -1,195 +1,386 @@
-//! Transport Layer Performance Benchmarks
+//! Transport Layer Performance Benchmarks - Minimal Noise Edition
 //!
-//! This module provides comprehensive benchmarks for the Freenet transport layer.
-//! Run with: `cargo bench -p freenet --bench transport_perf`
+//! This module provides noise-minimized benchmarks for the Freenet transport layer.
 //!
-//! ## Benchmark Levels (from least to most OS-dependent)
+//! ## Noise Reduction Strategies
 //!
-//! - **Level 0 (Pure Logic)**: No I/O, measures raw computation (encryption, serialization)
-//!   - Completely deterministic, unaffected by OS scheduling
-//!   - Run anywhere, including CI
+//! 1. **No tracing**: Compiled out via `--no-default-features`
+//! 2. **Pre-allocation**: All buffers allocated before measurement
+//! 3. **iter_batched**: Setup separated from hot path
+//! 4. **No async in Level 0**: Pure sync code, no runtime overhead
+//! 5. **Pinned data**: Reuse buffers to avoid allocation during measurement
 //!
-//! - **Level 1 (Mock I/O)**: In-process channels, no syscalls
-//!   - Measures protocol overhead without kernel involvement
-//!   - Requires multi-threading but no network stack
+//! ## Understanding Benchmark Levels
 //!
-//! - **Level 2 (Loopback)**: Real sockets on 127.0.0.1
-//!   - Includes syscall overhead but no NIC
-//!   - Affected by kernel scheduling
+//! | Level | Measures | Use Case |
+//! |-------|----------|----------|
+//! | 0 | Absolute cost | "How fast is AES-GCM?" |
+//! | 1 | Comparative cost | "Did my change improve throughput?" |
+//! | 2 | Syscall overhead | "What's my kernel bottleneck?" |
+//! | 3 | System limits | "What's max throughput?" |
 //!
-//! - **Level 3 (Full Stack)**: Real network interfaces
-//!   - Complete measurement including hardware
-//!   - Requires controlled environment
+//! ### Level 1: Comparative/Differential Measurement
 //!
-//! ## Running Specific Levels
+//! Level 1 includes consistent tokio/OS overhead, but this is **bias not noise**.
+//! When comparing before/after code changes, the overhead cancels out:
+//!
+//! ```text
+//! Before: 150μs = your_code(X) + tokio_overhead
+//! After:  120μs = your_code(Y) + tokio_overhead
+//! Delta:  -30μs = improvement from code change
+//! ```
+//!
+//! Use Level 1 for:
+//! - A/B testing code changes
+//! - Regression detection in CI
+//! - Protocol optimization validation
+//!
+//! ## Running
 //!
 //! ```bash
-//! # Level 0 only (CI-safe)
-//! cargo bench --bench transport_perf -- "level0/"
+//! # Run without tracing feature (critical for noise-free results)
+//! cargo bench --bench transport_perf --no-default-features --features "redb,websocket"
 //!
-//! # Level 1 only (CI-safe)
-//! cargo bench --bench transport_perf -- "level1/"
+//! # Or use the helper script
+//! ./scripts/run_benchmarks.sh level0 level1
 //!
-//! # All levels (requires isolated environment)
-//! cargo bench --bench transport_perf
+//! # Compare before/after a change
+//! git stash && ./scripts/run_benchmarks.sh level1  # baseline
+//! git stash pop && ./scripts/run_benchmarks.sh level1  # with change
+//! # Criterion automatically compares to previous run
 //! ```
+//!
+//! ## Benchmark Levels
+//!
+//! - **Level 0**: Pure computation, zero I/O, zero async, zero allocation in hot path
+//! - **Level 1**: Mock I/O - measures code changes through consistent overhead
+//! - **Level 2**: Loopback sockets - includes kernel scheduling variance
+//! - **Level 3**: Stress tests - highly environment-dependent
 
 use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
+use std::hint::black_box as std_black_box;
 use std::time::Duration;
 
 // =============================================================================
-// Test Configuration
+// Configuration
 // =============================================================================
 
-/// Standard message sizes for throughput tests
-const MESSAGE_SIZES: &[usize] = &[
-    64,           // Tiny: control messages
-    512,          // Small: typical requests
-    1364,         // Max single packet payload
-    4096,         // Small stream: 3 packets
-    16384,        // Medium stream: 12 packets
-    65536,        // Large stream: ~48 packets
-    1048576,      // Very large: 1MB
+/// Payload sizes to benchmark (bytes)
+const PAYLOAD_SIZES: &[usize] = &[
+    64,      // Tiny message
+    256,     // Small message
+    1024,    // 1KB
+    1364,    // Max single packet (after overhead)
 ];
 
-/// Packet counts for batch tests
-const PACKET_COUNTS: &[usize] = &[1, 10, 100, 1000];
+/// Large payload sizes for streaming tests
+const STREAM_SIZES: &[usize] = &[
+    4096,    // 4KB - 3 packets
+    16384,   // 16KB - ~12 packets
+    65536,   // 64KB - ~48 packets
+];
 
 // =============================================================================
-// Level 0: Pure Logic (No I/O, No OS interaction)
+// Level 0: Pure Logic - ZERO noise path
 // =============================================================================
-// These benchmarks measure raw computational overhead with ZERO OS involvement.
-// Results are completely deterministic and reproducible across any environment.
+//
+// These benchmarks have:
+// - No async runtime
+// - No tracing (even disabled tracing has macro overhead)
+// - No allocation in hot path
+// - Pre-computed inputs
+// - Deterministic operations
 
 mod level0_pure_logic {
     use super::*;
-    use aes_gcm::{aead::AeadInPlace, Aes128Gcm, KeyInit};
-    use rand::Rng;
+    use aes_gcm::{
+        aead::{AeadInPlace, KeyInit},
+        Aes128Gcm,
+    };
 
-    /// Benchmark AES-GCM encryption throughput
+    /// AES-GCM encryption - the core crypto operation
+    ///
+    /// This measures ONLY the AES-GCM encrypt operation with:
+    /// - Pre-allocated buffer (reused)
+    /// - Pre-computed key and nonce
+    /// - No allocation, no branching, no logging
     pub fn bench_aes_gcm_encrypt(c: &mut Criterion) {
-        let mut group = c.benchmark_group("crypto/aes_gcm_encrypt");
+        let mut group = c.benchmark_group("level0/crypto/encrypt");
 
-        let key = rand::random::<[u8; 16]>();
+        // Pre-compute cipher once
+        let key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        ];
         let cipher = Aes128Gcm::new(&key.into());
 
-        for size in MESSAGE_SIZES.iter().filter(|&&s| s <= 1464) {
-            group.throughput(Throughput::Bytes(*size as u64));
-            group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
-                let mut buffer = vec![0u8; size + 16]; // +16 for tag
-                let nonce: [u8; 12] = rand::random();
+        // Fixed nonce (in real code this would be random, but we're measuring encrypt speed)
+        let nonce: [u8; 12] = [0u8; 12];
 
-                b.iter(|| {
-                    buffer[..size].fill(0xAB);
-                    let tag = cipher
-                        .encrypt_in_place_detached(&nonce.into(), &[], &mut buffer[..size])
-                        .unwrap();
-                    black_box(tag);
-                });
-            });
+        for &size in PAYLOAD_SIZES {
+            group.throughput(Throughput::Bytes(size as u64));
+
+            // Pre-allocate buffer with extra space for in-place encryption
+            let mut buffer = vec![0xABu8; size];
+
+            group.bench_with_input(
+                BenchmarkId::new("aes128gcm", size),
+                &size,
+                |b, &_size| {
+                    b.iter(|| {
+                        // Reset buffer (minimal overhead - just memset)
+                        buffer.fill(0xAB);
+
+                        // The actual operation we're measuring
+                        let tag = cipher
+                            .encrypt_in_place_detached(
+                                (&nonce).into(),
+                                &[],  // No AAD
+                                &mut buffer,
+                            )
+                            .expect("encryption failed");
+
+                        // Prevent dead code elimination without adding overhead
+                        std_black_box(&tag);
+                        std_black_box(&buffer);
+                    });
+                },
+            );
         }
 
         group.finish();
     }
 
-    /// Benchmark AES-GCM decryption throughput
+    /// AES-GCM decryption
     pub fn bench_aes_gcm_decrypt(c: &mut Criterion) {
-        let mut group = c.benchmark_group("crypto/aes_gcm_decrypt");
+        let mut group = c.benchmark_group("level0/crypto/decrypt");
 
-        let key = rand::random::<[u8; 16]>();
+        let key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        ];
         let cipher = Aes128Gcm::new(&key.into());
+        let nonce: [u8; 12] = [0u8; 12];
 
-        for size in MESSAGE_SIZES.iter().filter(|&&s| s <= 1464) {
-            group.throughput(Throughput::Bytes(*size as u64));
-            group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
-                // Pre-encrypt data
-                let mut plaintext = vec![0xAB_u8; size];
-                let nonce: [u8; 12] = rand::random();
-                let tag = cipher
-                    .encrypt_in_place_detached(&nonce.into(), &[], &mut plaintext)
-                    .unwrap();
+        for &size in PAYLOAD_SIZES {
+            group.throughput(Throughput::Bytes(size as u64));
 
-                let mut ciphertext = plaintext.clone();
+            // Pre-encrypt data to create valid ciphertext
+            let mut plaintext = vec![0xABu8; size];
+            let tag = cipher
+                .encrypt_in_place_detached((&nonce).into(), &[], &mut plaintext)
+                .unwrap();
+            let ciphertext_template = plaintext.clone();
 
-                b.iter(|| {
-                    ciphertext.copy_from_slice(&plaintext);
-                    cipher
-                        .decrypt_in_place_detached(&nonce.into(), &[], &mut ciphertext, &tag)
-                        .unwrap();
-                    black_box(&ciphertext);
-                });
-            });
+            // Working buffer for decryption
+            let mut buffer = vec![0u8; size];
+
+            group.bench_with_input(
+                BenchmarkId::new("aes128gcm", size),
+                &size,
+                |b, &_size| {
+                    b.iter(|| {
+                        // Copy ciphertext (simulates receiving packet)
+                        buffer.copy_from_slice(&ciphertext_template);
+
+                        // The actual operation
+                        cipher
+                            .decrypt_in_place_detached(
+                                (&nonce).into(),
+                                &[],
+                                &mut buffer,
+                                &tag,
+                            )
+                            .expect("decryption failed");
+
+                        std_black_box(&buffer);
+                    });
+                },
+            );
         }
 
         group.finish();
     }
 
-    /// Benchmark nonce generation: random vs counter
+    /// Nonce generation comparison: random vs counter
+    ///
+    /// Counter-based nonces are much faster and equally secure for our use case
     pub fn bench_nonce_generation(c: &mut Criterion) {
-        let mut group = c.benchmark_group("crypto/nonce_generation");
+        use std::sync::atomic::{AtomicU64, Ordering};
 
-        group.bench_function("random_12bytes", |b| {
+        let mut group = c.benchmark_group("level0/crypto/nonce");
+
+        // Random nonce generation
+        group.bench_function("random", |b| {
             b.iter(|| {
                 let nonce: [u8; 12] = rand::random();
-                black_box(nonce);
+                std_black_box(nonce);
             });
         });
 
-        group.bench_function("counter_12bytes", |b| {
-            let mut counter: u128 = 0;
+        // Counter-based nonce (much faster)
+        let counter = AtomicU64::new(0);
+        group.bench_function("counter", |b| {
             b.iter(|| {
-                counter = counter.wrapping_add(1);
-                let nonce: [u8; 12] = counter.to_le_bytes()[..12].try_into().unwrap();
-                black_box(nonce);
+                let val = counter.fetch_add(1, Ordering::Relaxed);
+                let mut nonce = [0u8; 12];
+                nonce[..8].copy_from_slice(&val.to_le_bytes());
+                std_black_box(nonce);
+            });
+        });
+
+        // Counter with additional entropy (connection ID in upper bytes)
+        group.bench_function("counter_with_connid", |b| {
+            let conn_id: u32 = 0x12345678;
+            b.iter(|| {
+                let val = counter.fetch_add(1, Ordering::Relaxed);
+                let mut nonce = [0u8; 12];
+                nonce[..8].copy_from_slice(&val.to_le_bytes());
+                nonce[8..].copy_from_slice(&conn_id.to_le_bytes());
+                std_black_box(nonce);
             });
         });
 
         group.finish();
     }
 
-    /// Benchmark bincode serialization
+    /// Bincode serialization - measures pure serialization overhead
     pub fn bench_serialization(c: &mut Criterion) {
         use serde::{Deserialize, Serialize};
 
-        #[derive(Serialize, Deserialize)]
-        struct TestMessage {
+        // Simplified message structure matching SymmetricMessage
+        #[derive(Serialize, Deserialize, Clone)]
+        struct BenchMessage {
             packet_id: u32,
             confirm_receipt: Vec<u32>,
+            payload_type: u8,  // Discriminant
             payload: Vec<u8>,
         }
 
-        let mut group = c.benchmark_group("serialization/bincode");
+        let mut group = c.benchmark_group("level0/serialization");
 
-        for size in MESSAGE_SIZES.iter().filter(|&&s| s <= 1364) {
-            group.throughput(Throughput::Bytes(*size as u64));
+        for &size in PAYLOAD_SIZES {
+            group.throughput(Throughput::Bytes(size as u64));
 
-            let msg = TestMessage {
+            // Pre-create message
+            let msg = BenchMessage {
                 packet_id: 12345,
                 confirm_receipt: vec![1, 2, 3, 4, 5],
-                payload: vec![0u8; *size],
+                payload_type: 1,
+                payload: vec![0xABu8; size],
             };
+
+            // Pre-allocate output buffer
+            let mut output_buf = vec![0u8; size + 100];  // Extra for headers
 
             group.bench_with_input(
                 BenchmarkId::new("serialize", size),
                 &msg,
                 |b, msg| {
                     b.iter(|| {
-                        let bytes = bincode::serialize(msg).unwrap();
-                        black_box(bytes);
+                        // Serialize into pre-allocated buffer
+                        let written = bincode::serialize_into(&mut output_buf.as_mut_slice(), msg)
+                            .is_ok();
+                        std_black_box(written);
+                        std_black_box(&output_buf);
                     });
                 },
             );
 
+            // Pre-serialize for deserialization bench
             let serialized = bincode::serialize(&msg).unwrap();
+
             group.bench_with_input(
                 BenchmarkId::new("deserialize", size),
                 &serialized,
-                |b, bytes| {
+                |b, data| {
                     b.iter(|| {
-                        let msg: TestMessage = bincode::deserialize(bytes).unwrap();
-                        black_box(msg);
+                        let msg: BenchMessage = bincode::deserialize(data).unwrap();
+                        std_black_box(msg);
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Combined encrypt + serialize (full packet creation path)
+    pub fn bench_packet_creation(c: &mut Criterion) {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        struct BenchMessage {
+            packet_id: u32,
+            confirm_receipt: Vec<u32>,
+            payload: Vec<u8>,
+        }
+
+        let mut group = c.benchmark_group("level0/packet_creation");
+
+        let key: [u8; 16] = [0x42u8; 16];
+        let cipher = Aes128Gcm::new(&key.into());
+        let nonce: [u8; 12] = [0u8; 12];
+
+        for &size in PAYLOAD_SIZES {
+            group.throughput(Throughput::Bytes(size as u64));
+
+            let msg = BenchMessage {
+                packet_id: 12345,
+                confirm_receipt: vec![1, 2, 3],
+                payload: vec![0xABu8; size],
+            };
+
+            // Max packet buffer
+            let mut packet_buf = vec![0u8; 1500];
+
+            group.bench_with_input(
+                BenchmarkId::new("serialize_then_encrypt", size),
+                &msg,
+                |b, msg| {
+                    b.iter(|| {
+                        // Step 1: Serialize
+                        let serialized_len = bincode::serialized_size(msg).unwrap() as usize;
+                        bincode::serialize_into(&mut packet_buf[..serialized_len], msg).unwrap();
+
+                        // Step 2: Encrypt in place
+                        let tag = cipher
+                            .encrypt_in_place_detached(
+                                (&nonce).into(),
+                                &[],
+                                &mut packet_buf[..serialized_len],
+                            )
+                            .unwrap();
+
+                        std_black_box(&tag);
+                        std_black_box(&packet_buf);
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Memory copy overhead (baseline for packet handling)
+    pub fn bench_memcpy(c: &mut Criterion) {
+        let mut group = c.benchmark_group("level0/memcpy");
+
+        for &size in &[64, 256, 1024, 1464, 4096] {
+            group.throughput(Throughput::Bytes(size as u64));
+
+            let src = vec![0xABu8; size];
+            let mut dst = vec![0u8; size];
+
+            group.bench_with_input(
+                BenchmarkId::from_parameter(size),
+                &size,
+                |b, &_size| {
+                    b.iter(|| {
+                        dst.copy_from_slice(&src);
+                        std_black_box(&dst);
                     });
                 },
             );
@@ -200,57 +391,67 @@ mod level0_pure_logic {
 }
 
 // =============================================================================
-// Level 1: Mock I/O (In-process channels, no syscalls)
+// Level 1: Mock I/O - Protocol logic without syscalls
 // =============================================================================
-// These benchmarks use in-process channels instead of real sockets.
-// They measure protocol overhead without kernel involvement.
-// Affected by: thread scheduling, memory allocation
-// NOT affected by: syscalls, network stack, NIC
+//
+// Uses tokio channels to simulate network I/O without actual syscalls.
+// Measures: async overhead, channel throughput, protocol state machines
 
 mod level1_mock_io {
     use super::*;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    /// Benchmark mpsc channel throughput (critical path component)
-    pub fn bench_mpsc_channel(c: &mut Criterion) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut group = c.benchmark_group("channel/mpsc");
+    /// Channel throughput - critical path for packet routing
+    ///
+    /// Tests different buffer sizes to find optimal configuration
+    pub fn bench_channel_throughput(c: &mut Criterion) {
+        // Create runtime ONCE, outside benchmark
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
 
+        let mut group = c.benchmark_group("level1/channel/throughput");
+        group.throughput(Throughput::Elements(1000));
+
+        // Test various buffer sizes
         for buffer_size in [1, 10, 100, 1000] {
-            group.throughput(Throughput::Elements(1000));
             group.bench_with_input(
                 BenchmarkId::new("buffer", buffer_size),
                 &buffer_size,
-                |b, &buffer_size| {
-                    b.to_async(&rt).iter(|| async move {
-                        let (tx, mut rx) = mpsc::channel::<Arc<[u8]>>(buffer_size);
-                        let packet: Arc<[u8]> = vec![0u8; 1492].into();
+                |b, &buf_size| {
+                    // Pre-create packet data (simulates encrypted packet)
+                    let packet: Arc<[u8]> = vec![0u8; 1492].into();
 
-                        let sender = tokio::spawn({
-                            let tx = tx.clone();
+                    b.to_async(&rt).iter_batched(
+                        // Setup: create channel (not measured)
+                        || mpsc::channel::<Arc<[u8]>>(buf_size),
+                        // Routine: send 1000 packets (measured)
+                        |(tx, mut rx)| async move {
                             let packet = packet.clone();
-                            async move {
-                                for _ in 0..1000 {
-                                    tx.send(packet.clone()).await.unwrap();
+
+                            // Spawn receiver
+                            let receiver = tokio::spawn(async move {
+                                let mut count = 0;
+                                while rx.recv().await.is_some() {
+                                    count += 1;
                                 }
-                                drop(tx);
-                            }
-                        });
+                                count
+                            });
 
-                        let receiver = tokio::spawn(async move {
-                            let mut count = 0;
-                            while rx.recv().await.is_some() {
-                                count += 1;
+                            // Send packets
+                            for _ in 0..1000 {
+                                tx.send(packet.clone()).await.unwrap();
                             }
-                            count
-                        });
+                            drop(tx);  // Close channel
 
-                        drop(tx);
-                        sender.await.unwrap();
-                        let count = receiver.await.unwrap();
-                        black_box(count);
-                    });
+                            let count = receiver.await.unwrap();
+                            std_black_box(count);
+                        },
+                        BatchSize::SmallInput,
+                    );
                 },
             );
         }
@@ -258,131 +459,205 @@ mod level1_mock_io {
         group.finish();
     }
 
-    /// Benchmark syscall overhead simulation
-    /// This measures the cost of individual socket operations
-    pub fn bench_syscall_overhead(c: &mut Criterion) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut group = c.benchmark_group("io/syscall_overhead");
+    /// try_send vs send - measures backpressure overhead
+    pub fn bench_channel_try_send(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
 
-        // Benchmark UDP socket bind
-        group.bench_function("udp_bind", |b| {
-            b.to_async(&rt).iter(|| async {
-                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                black_box(socket);
-            });
+        let mut group = c.benchmark_group("level1/channel/try_send");
+
+        // Large buffer to avoid backpressure
+        let buffer_size = 10000;
+
+        group.bench_function("try_send_success", |b| {
+            let packet: Arc<[u8]> = vec![0u8; 1492].into();
+
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (tx, rx) = mpsc::channel::<Arc<[u8]>>(buffer_size);
+                    (tx, rx, packet.clone())
+                },
+                |(tx, _rx, packet)| async move {
+                    for _ in 0..1000 {
+                        let _ = tx.try_send(packet.clone());
+                    }
+                },
+                BatchSize::SmallInput,
+            );
         });
 
-        // Benchmark loopback send/recv
-        group.bench_function("loopback_roundtrip", |b| {
-            b.to_async(&rt).iter_custom(|iters| async move {
-                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                let addr = socket.local_addr().unwrap();
-                socket.connect(addr).await.unwrap();
+        group.finish();
+    }
 
-                let send_buf = [0u8; 1400];
-                let mut recv_buf = [0u8; 1500];
+    /// Simulated packet routing (what connection_handler does)
+    pub fn bench_packet_routing(c: &mut Criterion) {
+        use std::collections::HashMap;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-                let start = std::time::Instant::now();
-                for _ in 0..iters {
-                    socket.send(&send_buf).await.unwrap();
-                    socket.recv(&mut recv_buf).await.unwrap();
-                }
-                start.elapsed()
-            });
-        });
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("level1/routing");
+
+        // Simulate routing to N peers
+        for num_peers in [10, 100, 1000] {
+            group.bench_with_input(
+                BenchmarkId::new("peers", num_peers),
+                &num_peers,
+                |b, &n| {
+                    b.to_async(&rt).iter_batched(
+                        || {
+                            // Setup: create routing table with N peers
+                            let mut routes: HashMap<SocketAddr, mpsc::Sender<Arc<[u8]>>> =
+                                HashMap::with_capacity(n);
+                            let mut receivers = Vec::with_capacity(n);
+
+                            for i in 0..n {
+                                let addr = SocketAddr::new(
+                                    IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+                                    8000 + (i as u16),
+                                );
+                                let (tx, rx) = mpsc::channel(100);
+                                routes.insert(addr, tx);
+                                receivers.push(rx);
+                            }
+
+                            // Target address (middle of range)
+                            let target = SocketAddr::new(
+                                IpAddr::V4(Ipv4Addr::new(10, 0, ((n/2) / 256) as u8, ((n/2) % 256) as u8)),
+                                8000 + (n/2) as u16,
+                            );
+
+                            (routes, receivers, target)
+                        },
+                        |(routes, _receivers, target)| async move {
+                            let packet: Arc<[u8]> = vec![0u8; 1492].into();
+
+                            // Route 100 packets
+                            for _ in 0..100 {
+                                if let Some(tx) = routes.get(&target) {
+                                    let _ = tx.try_send(packet.clone());
+                                }
+                            }
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
 
         group.finish();
     }
 }
 
 // =============================================================================
-// Level 2: Loopback (Real sockets, no NIC)
+// Level 2: Loopback - Real sockets, kernel involved
 // =============================================================================
-// These benchmarks use real UDP sockets on the loopback interface.
-// They measure syscall overhead and kernel network stack performance.
-// Affected by: syscalls, kernel scheduling, socket buffers
-// NOT affected by: NIC, physical network
+//
+// WARNING: Results vary significantly based on:
+// - Kernel version and configuration
+// - CPU frequency scaling
+// - Other system load
+// - Socket buffer sizes
 
 mod level2_loopback {
     use super::*;
 
-    /// Placeholder for full transport layer throughput benchmark
-    /// Requires actual transport module integration
-    pub fn bench_transport_throughput(c: &mut Criterion) {
-        let mut group = c.benchmark_group("e2e/throughput");
-        group.measurement_time(Duration::from_secs(10));
+    /// Raw UDP syscall overhead
+    pub fn bench_udp_syscall(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-        // TODO: Integrate with actual transport layer
-        // This requires setting up two PeerConnections and measuring
-        // actual throughput through the full stack
+        let mut group = c.benchmark_group("level2/udp/syscall");
 
-        for size in MESSAGE_SIZES {
-            group.throughput(Throughput::Bytes(*size as u64));
-            group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &_size| {
-                b.iter(|| {
-                    // Placeholder - replace with actual transport test
-                    black_box(42);
-                });
-            });
-        }
+        // Single send syscall
+        group.bench_function("send_1400b", |b| {
+            b.to_async(&rt).iter_batched(
+                || {
+                    let rt_handle = tokio::runtime::Handle::current();
+                    rt_handle.block_on(async {
+                        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                        let addr = socket.local_addr().unwrap();
+                        socket.connect(addr).await.unwrap();
+                        socket
+                    })
+                },
+                |socket| async move {
+                    let buf = [0u8; 1400];
+                    socket.send(&buf).await.unwrap();
+                },
+                BatchSize::SmallInput,
+            );
+        });
 
-        group.finish();
-    }
+        // Send + recv roundtrip
+        group.bench_function("roundtrip_1400b", |b| {
+            b.to_async(&rt).iter_batched(
+                || {
+                    let rt_handle = tokio::runtime::Handle::current();
+                    rt_handle.block_on(async {
+                        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                        let addr = socket.local_addr().unwrap();
+                        socket.connect(addr).await.unwrap();
+                        socket
+                    })
+                },
+                |socket| async move {
+                    let send_buf = [0u8; 1400];
+                    let mut recv_buf = [0u8; 1500];
 
-    /// Placeholder for latency distribution benchmark
-    pub fn bench_latency_distribution(c: &mut Criterion) {
-        let mut group = c.benchmark_group("e2e/latency");
-        group.measurement_time(Duration::from_secs(30));
-        group.sample_size(500);
-
-        // TODO: Integrate with actual transport layer
-        // Measure RTT for small messages through full stack
-
-        group.bench_function("small_message_rtt", |b| {
-            b.iter(|| {
-                // Placeholder - replace with actual transport test
-                black_box(42);
-            });
+                    socket.send(&send_buf).await.unwrap();
+                    socket.recv(&mut recv_buf).await.unwrap();
+                },
+                BatchSize::SmallInput,
+            );
         });
 
         group.finish();
     }
-}
 
-// =============================================================================
-// Level 3: Stress Tests (System limits, real conditions)
-// =============================================================================
-// These benchmarks push the system to find limits and measure behavior under load.
-// Results are highly dependent on hardware and environment configuration.
-// For meaningful results: use isolated CPUs, disable frequency scaling.
+    /// Burst send performance (no batching, sequential sends)
+    pub fn bench_udp_burst(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-mod level3_stress {
-    use super::*;
+        let mut group = c.benchmark_group("level2/udp/burst");
 
-    /// Benchmark maximum sustainable packet rate
-    pub fn bench_max_pps(c: &mut Criterion) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut group = c.benchmark_group("stress/max_pps");
-        group.measurement_time(Duration::from_secs(15));
-        group.sample_size(10);
+        for count in [10, 100, 1000] {
+            group.throughput(Throughput::Elements(count as u64));
 
-        for packet_count in PACKET_COUNTS {
-            group.throughput(Throughput::Elements(*packet_count as u64));
             group.bench_with_input(
-                BenchmarkId::from_parameter(packet_count),
-                packet_count,
-                |b, &count| {
-                    b.to_async(&rt).iter(|| async move {
-                        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                        let addr = socket.local_addr().unwrap();
-                        socket.connect(addr).await.unwrap();
-
-                        let packet = [0u8; 1400];
-                        for _ in 0..count {
-                            socket.send(&packet).await.unwrap();
-                        }
-                        black_box(count);
-                    });
+                BenchmarkId::new("packets", count),
+                &count,
+                |b, &n| {
+                    b.to_async(&rt).iter_batched(
+                        || {
+                            let rt_handle = tokio::runtime::Handle::current();
+                            rt_handle.block_on(async {
+                                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                                let addr = socket.local_addr().unwrap();
+                                socket.connect(addr).await.unwrap();
+                                socket
+                            })
+                        },
+                        |socket| async move {
+                            let buf = [0u8; 1400];
+                            for _ in 0..n {
+                                socket.send(&buf).await.unwrap();
+                            }
+                        },
+                        BatchSize::SmallInput,
+                    );
                 },
             );
         }
@@ -392,57 +667,103 @@ mod level3_stress {
 }
 
 // =============================================================================
-// Criterion Configuration
+// Level 3: Stress Tests
 // =============================================================================
 
-// Level 0: Pure computation benchmarks (CI-safe, deterministic)
+mod level3_stress {
+    use super::*;
+
+    /// Maximum sustainable send rate
+    pub fn bench_max_send_rate(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("level3/stress/send_rate");
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(10));
+
+        group.bench_function("10k_packets", |b| {
+            b.to_async(&rt).iter_batched(
+                || {
+                    let rt_handle = tokio::runtime::Handle::current();
+                    rt_handle.block_on(async {
+                        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                        let addr = socket.local_addr().unwrap();
+                        socket.connect(addr).await.unwrap();
+                        socket
+                    })
+                },
+                |socket| async move {
+                    let buf = [0u8; 1400];
+                    for _ in 0..10_000 {
+                        let _ = socket.send(&buf).await;
+                    }
+                },
+                BatchSize::PerIteration,
+            );
+        });
+
+        group.finish();
+    }
+}
+
+// =============================================================================
+// Criterion Groups - Organized by noise level
+// =============================================================================
+
 criterion_group!(
     name = level0;
     config = Criterion::default()
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(3))
-        .noise_threshold(0.02);  // 2% noise threshold - should be very stable
+        .noise_threshold(0.02)  // 2% - should be rock stable
+        .significance_level(0.01);
     targets =
         level0_pure_logic::bench_aes_gcm_encrypt,
         level0_pure_logic::bench_aes_gcm_decrypt,
         level0_pure_logic::bench_nonce_generation,
         level0_pure_logic::bench_serialization,
+        level0_pure_logic::bench_packet_creation,
+        level0_pure_logic::bench_memcpy,
 );
 
-// Level 1: Mock I/O benchmarks (CI-safe, measures protocol logic)
 criterion_group!(
     name = level1;
     config = Criterion::default()
-        .warm_up_time(Duration::from_millis(500))
+        .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(5))
-        .noise_threshold(0.05);  // 5% - some async scheduling variance
+        .noise_threshold(0.05)  // 5% - async adds some variance
+        .significance_level(0.01);
     targets =
-        level1_mock_io::bench_mpsc_channel,
-        level1_mock_io::bench_syscall_overhead,
+        level1_mock_io::bench_channel_throughput,
+        level1_mock_io::bench_channel_try_send,
+        level1_mock_io::bench_packet_routing,
 );
 
-// Level 2: Loopback benchmarks (requires controlled environment)
 criterion_group!(
     name = level2;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(10))
-        .noise_threshold(0.10);  // 10% - kernel scheduling adds variance
+        .noise_threshold(0.10)  // 10% - kernel scheduling
+        .significance_level(0.05);
     targets =
-        level2_loopback::bench_transport_throughput,
-        level2_loopback::bench_latency_distribution,
+        level2_loopback::bench_udp_syscall,
+        level2_loopback::bench_udp_burst,
 );
 
-// Level 3: Stress tests (requires isolated CPUs, bare metal preferred)
 criterion_group!(
     name = level3;
     config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
+        .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(15))
         .sample_size(10)
         .noise_threshold(0.15);  // 15% - high variance expected
     targets =
-        level3_stress::bench_max_pps,
+        level3_stress::bench_max_send_rate,
 );
 
 criterion_main!(level0, level1, level2, level3);
