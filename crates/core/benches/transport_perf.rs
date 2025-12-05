@@ -571,54 +571,48 @@ mod level2_loopback {
 
     /// Raw UDP syscall overhead
     pub fn bench_udp_syscall(c: &mut Criterion) {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
 
         let mut group = c.benchmark_group("level2/udp/syscall");
 
+        // Pre-create socket outside the benchmark
+        let socket = rt.block_on(async {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).await.unwrap();
+            socket
+        });
+        let socket = std::sync::Arc::new(socket);
+
         // Single send syscall
+        let socket_clone = socket.clone();
         group.bench_function("send_1400b", |b| {
-            b.to_async(&rt).iter_batched(
-                || {
-                    let rt_handle = tokio::runtime::Handle::current();
-                    rt_handle.block_on(async {
-                        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                        let addr = socket.local_addr().unwrap();
-                        socket.connect(addr).await.unwrap();
-                        socket
-                    })
-                },
-                |socket| async move {
+            let socket = socket_clone.clone();
+            b.to_async(&rt).iter(|| {
+                let socket = socket.clone();
+                async move {
                     let buf = [0u8; 1400];
                     socket.send(&buf).await.unwrap();
-                },
-                BatchSize::SmallInput,
-            );
+                }
+            });
         });
 
         // Send + recv roundtrip
         group.bench_function("roundtrip_1400b", |b| {
-            b.to_async(&rt).iter_batched(
-                || {
-                    let rt_handle = tokio::runtime::Handle::current();
-                    rt_handle.block_on(async {
-                        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                        let addr = socket.local_addr().unwrap();
-                        socket.connect(addr).await.unwrap();
-                        socket
-                    })
-                },
-                |socket| async move {
+            let socket = socket.clone();
+            b.to_async(&rt).iter(|| {
+                let socket = socket.clone();
+                async move {
                     let send_buf = [0u8; 1400];
                     let mut recv_buf = [0u8; 1500];
-
                     socket.send(&send_buf).await.unwrap();
                     socket.recv(&mut recv_buf).await.unwrap();
-                },
-                BatchSize::SmallInput,
-            );
+                }
+            });
         });
 
         group.finish();
@@ -626,38 +620,41 @@ mod level2_loopback {
 
     /// Burst send performance (no batching, sequential sends)
     pub fn bench_udp_burst(c: &mut Criterion) {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
 
         let mut group = c.benchmark_group("level2/udp/burst");
 
+        // Pre-create socket
+        let socket = rt.block_on(async {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).await.unwrap();
+            socket
+        });
+        let socket = std::sync::Arc::new(socket);
+
         for count in [10, 100, 1000] {
             group.throughput(Throughput::Elements(count as u64));
 
+            let socket = socket.clone();
             group.bench_with_input(
                 BenchmarkId::new("packets", count),
                 &count,
                 |b, &n| {
-                    b.to_async(&rt).iter_batched(
-                        || {
-                            let rt_handle = tokio::runtime::Handle::current();
-                            rt_handle.block_on(async {
-                                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                                let addr = socket.local_addr().unwrap();
-                                socket.connect(addr).await.unwrap();
-                                socket
-                            })
-                        },
-                        |socket| async move {
+                    let socket = socket.clone();
+                    b.to_async(&rt).iter(move || {
+                        let socket = socket.clone();
+                        async move {
                             let buf = [0u8; 1400];
                             for _ in 0..n {
                                 socket.send(&buf).await.unwrap();
                             }
-                        },
-                        BatchSize::SmallInput,
-                    );
+                        }
+                    });
                 },
             );
         }
@@ -685,25 +682,26 @@ mod level3_stress {
         group.sample_size(10);
         group.measurement_time(Duration::from_secs(10));
 
+        // Pre-create socket
+        let socket = rt.block_on(async {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).await.unwrap();
+            socket
+        });
+        let socket = std::sync::Arc::new(socket);
+
         group.bench_function("10k_packets", |b| {
-            b.to_async(&rt).iter_batched(
-                || {
-                    let rt_handle = tokio::runtime::Handle::current();
-                    rt_handle.block_on(async {
-                        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                        let addr = socket.local_addr().unwrap();
-                        socket.connect(addr).await.unwrap();
-                        socket
-                    })
-                },
-                |socket| async move {
+            let socket = socket.clone();
+            b.to_async(&rt).iter(|| {
+                let socket = socket.clone();
+                async move {
                     let buf = [0u8; 1400];
                     for _ in 0..10_000 {
                         let _ = socket.send(&buf).await;
                     }
-                },
-                BatchSize::PerIteration,
-            );
+                }
+            });
         });
 
         group.finish();
