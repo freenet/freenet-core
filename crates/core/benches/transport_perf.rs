@@ -1335,6 +1335,270 @@ mod experimental_combined {
 }
 
 // =============================================================================
+// Experimental: Syscall Batching Simulation
+// =============================================================================
+//
+// Tests hypothesis: Can batching multiple packets per syscall improve throughput?
+// Simulates the effect of sendmmsg by comparing:
+// - Tokio async (one send per await point)
+// - Blocking tight loop (simulates sendmmsg effect - no async overhead between sends)
+// - Channel-based batching (collect then send)
+
+mod experimental_syscall_batching {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::sync::Arc;
+
+    /// Compare async vs blocking send patterns
+    ///
+    /// This tests the overhead of async coordination between packet sends:
+    /// - Async: Each send() is an await point (potential context switch)
+    /// - Blocking: Tight loop with no async overhead between sends
+    pub fn bench_sendmmsg_vs_single(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("experimental/syscall_batching/async_vs_blocking");
+        group.sample_size(50);
+
+        const PACKET_SIZE: usize = 1400;
+        const TOTAL_PACKETS: usize = 1000;
+
+        let total_bytes = (PACKET_SIZE * TOTAL_PACKETS) as u64;
+        group.throughput(Throughput::Bytes(total_bytes));
+
+        // ========== Tokio async (one await per send) ==========
+        let socket = rt.block_on(async {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).await.unwrap();
+            socket
+        });
+        let socket = Arc::new(socket);
+
+        group.bench_function("tokio_async_per_packet", |b| {
+            let socket = socket.clone();
+            let buf = vec![0xABu8; PACKET_SIZE];
+            b.to_async(&rt).iter(move || {
+                let socket = socket.clone();
+                let buf = buf.clone();
+                async move {
+                    for _ in 0..TOTAL_PACKETS {
+                        socket.send(&buf).await.unwrap();
+                    }
+                }
+            });
+        });
+
+        // ========== Blocking tight loop (simulates sendmmsg effect) ==========
+        group.bench_function("blocking_tight_loop", |b| {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).unwrap();
+            let buf = vec![0xABu8; PACKET_SIZE];
+
+            b.iter(|| {
+                for _ in 0..TOTAL_PACKETS {
+                    socket.send(&buf).unwrap();
+                }
+            });
+        });
+
+        // ========== spawn_blocking (tokio + blocking I/O) ==========
+        group.bench_function("spawn_blocking_loop", |b| {
+            b.to_async(&rt).iter(|| async {
+                tokio::task::spawn_blocking(move || {
+                    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let addr = socket.local_addr().unwrap();
+                    socket.connect(addr).unwrap();
+                    let buf = vec![0xABu8; PACKET_SIZE];
+
+                    for _ in 0..TOTAL_PACKETS {
+                        socket.send(&buf).unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        group.finish();
+    }
+
+    /// Compare different batching strategies with tokio
+    ///
+    /// Tests how to integrate batching with async code
+    pub fn bench_tokio_with_sendmmsg(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("experimental/syscall_batching/batching_strategies");
+        group.sample_size(30);
+
+        const PACKET_SIZE: usize = 1400;
+        const TOTAL_PACKETS: usize = 1000;
+
+        let total_bytes = (PACKET_SIZE * TOTAL_PACKETS) as u64;
+        group.throughput(Throughput::Bytes(total_bytes));
+
+        // ========== Baseline: collect into Vec, then send all ==========
+        group.bench_function("collect_then_send_blocking", |b| {
+            b.to_async(&rt).iter(|| async {
+                // Simulate collecting packets (like a channel would)
+                let packets: Vec<Vec<u8>> = (0..TOTAL_PACKETS)
+                    .map(|_| vec![0xABu8; PACKET_SIZE])
+                    .collect();
+
+                // Then send all in spawn_blocking
+                tokio::task::spawn_blocking(move || {
+                    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let addr = socket.local_addr().unwrap();
+                    socket.connect(addr).unwrap();
+
+                    for packet in &packets {
+                        socket.send(packet).unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        // ========== Channel-based: collect batch, then flush ==========
+        group.bench_function("channel_batch_flush", |b| {
+            const BATCH_SIZE: usize = 100;
+
+            b.to_async(&rt).iter(|| async {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<[u8]>>(BATCH_SIZE);
+
+                // Sender task
+                let sender = tokio::spawn(async move {
+                    let packet: Arc<[u8]> = vec![0xABu8; PACKET_SIZE].into();
+                    for _ in 0..TOTAL_PACKETS {
+                        tx.send(packet.clone()).await.ok();
+                    }
+                });
+
+                // Receiver: batch then send
+                let receiver = tokio::task::spawn_blocking(move || {
+                    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let addr = socket.local_addr().unwrap();
+                    socket.connect(addr).unwrap();
+
+                    // We need to use a different channel type for spawn_blocking
+                    // This is a simplified simulation
+                    let rt = tokio::runtime::Handle::current();
+                    let mut batch = Vec::with_capacity(BATCH_SIZE);
+
+                    loop {
+                        // Try to receive up to BATCH_SIZE packets
+                        match rt.block_on(rx.recv()) {
+                            Some(packet) => {
+                                batch.push(packet);
+                                // Drain available packets up to batch size
+                                while batch.len() < BATCH_SIZE {
+                                    match rx.try_recv() {
+                                        Ok(p) => batch.push(p),
+                                        Err(_) => break,
+                                    }
+                                }
+                                // Send batch
+                                for packet in batch.drain(..) {
+                                    socket.send(&packet).unwrap();
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                });
+
+                sender.await.unwrap();
+                receiver.await.unwrap();
+            });
+        });
+
+        group.finish();
+    }
+
+    /// Measure the overhead of async coordination per packet
+    ///
+    /// Shows how much time is spent on async machinery vs actual I/O
+    pub fn bench_syscall_reduction(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("experimental/syscall_batching/overhead_breakdown");
+        group.sample_size(50);
+
+        const PACKET_SIZE: usize = 1400;
+
+        // Test how time per packet changes with different approaches
+        let packet_counts = [10, 100, 1000];
+
+        for &count in &packet_counts {
+            let total_bytes = (PACKET_SIZE * count) as u64;
+            group.throughput(Throughput::Bytes(total_bytes));
+
+            // Async
+            let socket = rt.block_on(async {
+                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let addr = socket.local_addr().unwrap();
+                socket.connect(addr).await.unwrap();
+                socket
+            });
+            let socket = Arc::new(socket);
+
+            group.bench_with_input(
+                BenchmarkId::new("async", count),
+                &count,
+                |b, &n| {
+                    let socket = socket.clone();
+                    let buf = vec![0xABu8; PACKET_SIZE];
+                    b.to_async(&rt).iter(move || {
+                        let socket = socket.clone();
+                        let buf = buf.clone();
+                        async move {
+                            for _ in 0..n {
+                                socket.send(&buf).await.unwrap();
+                            }
+                        }
+                    });
+                },
+            );
+
+            // Blocking
+            let std_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let addr = std_socket.local_addr().unwrap();
+            std_socket.connect(addr).unwrap();
+
+            group.bench_with_input(
+                BenchmarkId::new("blocking", count),
+                &count,
+                |b, &n| {
+                    let buf = vec![0xABu8; PACKET_SIZE];
+                    b.iter(|| {
+                        for _ in 0..n {
+                            std_socket.send(&buf).unwrap();
+                        }
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
+// =============================================================================
 // Criterion Groups - Organized by noise level
 // =============================================================================
 
@@ -1427,4 +1691,17 @@ criterion_group!(
         experimental_combined::bench_full_pipeline_by_size,
 );
 
-criterion_main!(level0, level1, level2, level3, experimental_packet, experimental_tokio, experimental_combined);
+criterion_group!(
+    name = experimental_batching;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(5))
+        .noise_threshold(0.10)
+        .significance_level(0.05);
+    targets =
+        experimental_syscall_batching::bench_sendmmsg_vs_single,
+        experimental_syscall_batching::bench_tokio_with_sendmmsg,
+        experimental_syscall_batching::bench_syscall_reduction,
+);
+
+criterion_main!(level0, level1, level2, level3, experimental_packet, experimental_tokio, experimental_combined, experimental_batching);

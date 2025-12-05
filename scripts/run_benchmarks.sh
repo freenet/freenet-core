@@ -179,6 +179,7 @@ for arg in "$@"; do
             echo "  experimental_packet   Packet size vs throughput (same syscalls)"
             echo "  experimental_tokio    Tokio vs std vs crossbeam overhead"
             echo "  experimental_combined Full pipeline with varying packet sizes"
+            echo "  experimental_batching sendmmsg syscall batching (Linux only)"
             echo ""
             echo "Examples:"
             echo "  $0                           # Run all levels"
