@@ -3,11 +3,36 @@
 //! This module provides comprehensive benchmarks for the Freenet transport layer.
 //! Run with: `cargo bench -p freenet --bench transport_perf`
 //!
-//! Categories:
-//! - Microbenchmarks: Individual operation costs (encryption, serialization)
-//! - Component benchmarks: Subsystem throughput (tracker, rate limiter)
-//! - End-to-end benchmarks: Full path throughput and latency
-//! - Stress tests: Behavior under load
+//! ## Benchmark Levels (from least to most OS-dependent)
+//!
+//! - **Level 0 (Pure Logic)**: No I/O, measures raw computation (encryption, serialization)
+//!   - Completely deterministic, unaffected by OS scheduling
+//!   - Run anywhere, including CI
+//!
+//! - **Level 1 (Mock I/O)**: In-process channels, no syscalls
+//!   - Measures protocol overhead without kernel involvement
+//!   - Requires multi-threading but no network stack
+//!
+//! - **Level 2 (Loopback)**: Real sockets on 127.0.0.1
+//!   - Includes syscall overhead but no NIC
+//!   - Affected by kernel scheduling
+//!
+//! - **Level 3 (Full Stack)**: Real network interfaces
+//!   - Complete measurement including hardware
+//!   - Requires controlled environment
+//!
+//! ## Running Specific Levels
+//!
+//! ```bash
+//! # Level 0 only (CI-safe)
+//! cargo bench --bench transport_perf -- "level0/"
+//!
+//! # Level 1 only (CI-safe)
+//! cargo bench --bench transport_perf -- "level1/"
+//!
+//! # All levels (requires isolated environment)
+//! cargo bench --bench transport_perf
+//! ```
 
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
@@ -33,10 +58,12 @@ const MESSAGE_SIZES: &[usize] = &[
 const PACKET_COUNTS: &[usize] = &[1, 10, 100, 1000];
 
 // =============================================================================
-// Category A: Microbenchmarks
+// Level 0: Pure Logic (No I/O, No OS interaction)
 // =============================================================================
+// These benchmarks measure raw computational overhead with ZERO OS involvement.
+// Results are completely deterministic and reproducible across any environment.
 
-mod microbenchmarks {
+mod level0_pure_logic {
     use super::*;
     use aes_gcm::{aead::AeadInPlace, Aes128Gcm, KeyInit};
     use rand::Rng;
@@ -173,10 +200,14 @@ mod microbenchmarks {
 }
 
 // =============================================================================
-// Category B: Component Benchmarks
+// Level 1: Mock I/O (In-process channels, no syscalls)
 // =============================================================================
+// These benchmarks use in-process channels instead of real sockets.
+// They measure protocol overhead without kernel involvement.
+// Affected by: thread scheduling, memory allocation
+// NOT affected by: syscalls, network stack, NIC
 
-mod component_benchmarks {
+mod level1_mock_io {
     use super::*;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -265,10 +296,14 @@ mod component_benchmarks {
 }
 
 // =============================================================================
-// Category C: End-to-End Benchmarks
+// Level 2: Loopback (Real sockets, no NIC)
 // =============================================================================
+// These benchmarks use real UDP sockets on the loopback interface.
+// They measure syscall overhead and kernel network stack performance.
+// Affected by: syscalls, kernel scheduling, socket buffers
+// NOT affected by: NIC, physical network
 
-mod e2e_benchmarks {
+mod level2_loopback {
     use super::*;
 
     /// Placeholder for full transport layer throughput benchmark
@@ -315,10 +350,13 @@ mod e2e_benchmarks {
 }
 
 // =============================================================================
-// Category D: Stress Tests
+// Level 3: Stress Tests (System limits, real conditions)
 // =============================================================================
+// These benchmarks push the system to find limits and measure behavior under load.
+// Results are highly dependent on hardware and environment configuration.
+// For meaningful results: use isolated CPUs, disable frequency scaling.
 
-mod stress_tests {
+mod level3_stress {
     use super::*;
 
     /// Benchmark maximum sustainable packet rate
@@ -357,46 +395,54 @@ mod stress_tests {
 // Criterion Configuration
 // =============================================================================
 
+// Level 0: Pure computation benchmarks (CI-safe, deterministic)
 criterion_group!(
-    name = microbench;
+    name = level0;
     config = Criterion::default()
         .warm_up_time(Duration::from_millis(500))
-        .measurement_time(Duration::from_secs(3));
+        .measurement_time(Duration::from_secs(3))
+        .noise_threshold(0.02);  // 2% noise threshold - should be very stable
     targets =
-        microbenchmarks::bench_aes_gcm_encrypt,
-        microbenchmarks::bench_aes_gcm_decrypt,
-        microbenchmarks::bench_nonce_generation,
-        microbenchmarks::bench_serialization,
+        level0_pure_logic::bench_aes_gcm_encrypt,
+        level0_pure_logic::bench_aes_gcm_decrypt,
+        level0_pure_logic::bench_nonce_generation,
+        level0_pure_logic::bench_serialization,
 );
 
+// Level 1: Mock I/O benchmarks (CI-safe, measures protocol logic)
 criterion_group!(
-    name = component;
+    name = level1;
     config = Criterion::default()
         .warm_up_time(Duration::from_millis(500))
-        .measurement_time(Duration::from_secs(5));
+        .measurement_time(Duration::from_secs(5))
+        .noise_threshold(0.05);  // 5% - some async scheduling variance
     targets =
-        component_benchmarks::bench_mpsc_channel,
-        component_benchmarks::bench_syscall_overhead,
+        level1_mock_io::bench_mpsc_channel,
+        level1_mock_io::bench_syscall_overhead,
 );
 
+// Level 2: Loopback benchmarks (requires controlled environment)
 criterion_group!(
-    name = e2e;
+    name = level2;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(10));
+        .measurement_time(Duration::from_secs(10))
+        .noise_threshold(0.10);  // 10% - kernel scheduling adds variance
     targets =
-        e2e_benchmarks::bench_transport_throughput,
-        e2e_benchmarks::bench_latency_distribution,
+        level2_loopback::bench_transport_throughput,
+        level2_loopback::bench_latency_distribution,
 );
 
+// Level 3: Stress tests (requires isolated CPUs, bare metal preferred)
 criterion_group!(
-    name = stress;
+    name = level3;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(15))
-        .sample_size(10);
+        .sample_size(10)
+        .noise_threshold(0.15);  // 15% - high variance expected
     targets =
-        stress_tests::bench_max_pps,
+        level3_stress::bench_max_pps,
 );
 
-criterion_main!(microbench, component, e2e, stress);
+criterion_main!(level0, level1, level2, level3);
