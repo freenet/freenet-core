@@ -1744,3 +1744,166 @@ mod messages {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Transaction;
+    use crate::operations::test_utils::{make_contract_key, make_peer};
+
+    fn make_put_op(state: Option<PutState>) -> PutOp {
+        PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state,
+            upstream_addr: None,
+        }
+    }
+
+    // Tests for finalized() method
+    #[test]
+    fn put_op_finalized_when_state_is_none() {
+        let op = make_put_op(None);
+        assert!(
+            op.finalized(),
+            "PutOp should be finalized when state is None"
+        );
+    }
+
+    #[test]
+    fn put_op_finalized_when_state_is_finished() {
+        let op = make_put_op(Some(PutState::Finished {
+            key: make_contract_key(1),
+        }));
+        assert!(
+            op.finalized(),
+            "PutOp should be finalized when state is Finished"
+        );
+    }
+
+    #[test]
+    fn put_op_not_finalized_when_received_request() {
+        let op = make_put_op(Some(PutState::ReceivedRequest));
+        assert!(
+            !op.finalized(),
+            "PutOp should not be finalized in ReceivedRequest state"
+        );
+    }
+
+    #[test]
+    fn put_op_not_finalized_when_broadcast_ongoing() {
+        let op = make_put_op(Some(PutState::BroadcastOngoing));
+        assert!(
+            !op.finalized(),
+            "PutOp should not be finalized in BroadcastOngoing state"
+        );
+    }
+
+    // Tests for to_host_result() method
+    #[test]
+    fn put_op_to_host_result_success_when_finished() {
+        let key = make_contract_key(1);
+        let op = make_put_op(Some(PutState::Finished { key }));
+        let result = op.to_host_result();
+        assert!(
+            result.is_ok(),
+            "to_host_result should return Ok for Finished state"
+        );
+
+        if let Ok(HostResponse::ContractResponse(
+            freenet_stdlib::client_api::ContractResponse::PutResponse { key: returned_key },
+        )) = result
+        {
+            assert_eq!(returned_key, key, "Returned key should match");
+        } else {
+            panic!("Expected PutResponse");
+        }
+    }
+
+    #[test]
+    fn put_op_to_host_result_error_when_not_finished() {
+        let op = make_put_op(Some(PutState::ReceivedRequest));
+        let result = op.to_host_result();
+        assert!(
+            result.is_err(),
+            "to_host_result should return Err for non-Finished state"
+        );
+    }
+
+    #[test]
+    fn put_op_to_host_result_error_when_none() {
+        let op = make_put_op(None);
+        let result = op.to_host_result();
+        assert!(
+            result.is_err(),
+            "to_host_result should return Err when state is None"
+        );
+    }
+
+    // Tests for is_completed() trait method
+    #[test]
+    fn put_op_is_completed_when_finished() {
+        let op = make_put_op(Some(PutState::Finished {
+            key: make_contract_key(1),
+        }));
+        assert!(
+            op.is_completed(),
+            "is_completed should return true for Finished state"
+        );
+    }
+
+    #[test]
+    fn put_op_is_not_completed_when_in_progress() {
+        let op = make_put_op(Some(PutState::ReceivedRequest));
+        assert!(
+            !op.is_completed(),
+            "is_completed should return false for ReceivedRequest state"
+        );
+    }
+
+    // Tests for PutMsg helper methods
+    #[test]
+    fn put_msg_target_addr_returns_socket_for_successful_put() {
+        let target = make_peer(5000);
+        let origin = make_peer(6000);
+        let msg = PutMsg::SuccessfulPut {
+            id: Transaction::new::<PutMsg>(),
+            target: target.clone(),
+            key: make_contract_key(1),
+            origin,
+        };
+        assert_eq!(
+            msg.target_addr(),
+            target.socket_addr(),
+            "target_addr should return target's socket address for SuccessfulPut"
+        );
+    }
+
+    #[test]
+    fn put_msg_target_addr_returns_none_for_await_put() {
+        let msg = PutMsg::AwaitPut {
+            id: Transaction::new::<PutMsg>(),
+        };
+        assert!(
+            msg.target_addr().is_none(),
+            "target_addr should return None for AwaitPut message"
+        );
+    }
+
+    #[test]
+    fn put_msg_id_returns_transaction() {
+        let tx = Transaction::new::<PutMsg>();
+        let msg = PutMsg::AwaitPut { id: tx };
+        assert_eq!(*msg.id(), tx, "id() should return the transaction ID");
+    }
+
+    #[test]
+    fn put_msg_display_formats_correctly() {
+        let tx = Transaction::new::<PutMsg>();
+        let msg = PutMsg::AwaitPut { id: tx };
+        let display = format!("{}", msg);
+        assert!(
+            display.contains("AwaitPut"),
+            "Display should contain message type name"
+        );
+    }
+}
