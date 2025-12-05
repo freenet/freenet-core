@@ -138,6 +138,11 @@ impl ContractStore {
         let data = code.data().to_vec();
         self.contract_cache
             .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
+        // Wait for the cache insert to be visible. Stretto uses background threads
+        // for inserts, and without wait() the value may not be immediately visible
+        // to subsequent get() calls (eventual consistency). This is critical because
+        // validate_state() needs to fetch the contract immediately after storing.
+        let _ = self.contract_cache.wait();
 
         // save on disc
         let version = APIVersion::from(contract);

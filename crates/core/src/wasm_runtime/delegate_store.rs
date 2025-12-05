@@ -117,6 +117,10 @@ impl DelegateStore {
         let code_size = data.len() as i64;
         self.delegate_cache
             .insert(*code_hash, delegate.code().clone().into_owned(), code_size);
+        // Wait for the cache insert to be visible. Stretto uses background threads
+        // for inserts, and without wait() the value may not be immediately visible
+        // to subsequent get() calls (eventual consistency).
+        let _ = self.delegate_cache.wait();
 
         // save on disc
         let version = APIVersion::from(delegate.clone());
