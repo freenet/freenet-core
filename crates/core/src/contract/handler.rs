@@ -327,6 +327,9 @@ impl ContractHandlerChannel<SenderHalve> {
             .map_err(|_| ContractError::NoEvHandlerResponse)?;
 
         // Route to session actor if session adapter is installed
+        // IMPORTANT: Use send().await (not try_send) to ensure registration completes
+        // before the operation starts. try_send can fail under backpressure, causing
+        // race conditions where responses arrive before registration, leading to timeouts.
         if let Some(session_tx) = &self.session_adapter_tx {
             // Register all Transaction variants with the session actor
             if let WaitingTransaction::Transaction(tx) = waiting_tx {
@@ -335,7 +338,7 @@ impl ContractHandlerChannel<SenderHalve> {
                     client_id,
                     request_id,
                 };
-                if let Err(e) = session_tx.try_send(msg) {
+                if let Err(e) = session_tx.send(msg).await {
                     tracing::warn!("Failed to notify session actor: {}", e);
                 } else {
                     tracing::debug!(
@@ -370,13 +373,16 @@ impl ContractHandlerChannel<SenderHalve> {
             .await
             .map_err(|_| ContractError::NoEvHandlerResponse)?;
 
+        // IMPORTANT: Use send().await (not try_send) to ensure registration completes
+        // before the operation starts. try_send can fail under backpressure, causing
+        // race conditions where responses arrive before registration, leading to timeouts.
         if let Some(session_tx) = &self.session_adapter_tx {
             let msg = SessionMessage::RegisterTransaction {
                 tx,
                 client_id,
                 request_id,
             };
-            if let Err(e) = session_tx.try_send(msg) {
+            if let Err(e) = session_tx.send(msg).await {
                 tracing::warn!("Failed to notify session actor: {}", e);
             } else {
                 tracing::debug!(

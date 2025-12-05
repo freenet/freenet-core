@@ -166,8 +166,11 @@ where
                 tracing::debug!(%id, "operation in progress");
                 if let Some(target) = target_addr {
                     tracing::debug!(%id, ?target, "sending updated op state");
-                    network_bridge.send(target, msg).await?;
+                    // CRITICAL: Push state BEFORE sending the message to prevent race condition.
+                    // The response can arrive before send() returns if the network is fast,
+                    // so the operation must already be stored when the response handler runs.
                     op_manager.push(id, updated_state).await?;
+                    network_bridge.send(target, msg).await?;
                 } else {
                     tracing::debug!(%id, "queueing op state for local processing");
                     debug_assert!(

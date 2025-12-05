@@ -579,7 +579,16 @@ impl Operation for SubscribeOp {
                         .expect("forward target must have socket address");
                     skip.insert(forward_target_addr);
 
-                    new_state = self.state;
+                    // Transition to AwaitingResponse state so we can handle the ReturnSub.
+                    // CRITICAL: Without this, when ReturnSub arrives, the state is still
+                    // ReceivedRequest which doesn't match the expected AwaitingResponse pattern,
+                    // causing invalid_transition errors.
+                    new_state = Some(SubscribeState::AwaitingResponse {
+                        skip_list: skip.clone(),
+                        retries: 0,
+                        current_hop: op_manager.ring.max_hops_to_live.max(1),
+                        upstream_subscriber: Some(subscriber.clone()),
+                    });
                     return_msg = Some(SubscribeMsg::SeekNode {
                         id: *id,
                         key: *key,
