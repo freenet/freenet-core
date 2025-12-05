@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 default = ["std"]
 std = ["chrono/default"]
 clap = ["dep:clap"]
+contract = ["freenet-stdlib/contract"]
 
 [dependencies]
 humantime = "2"

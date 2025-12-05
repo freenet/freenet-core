@@ -19,6 +19,20 @@ SKIP_TESTS=false
 DEPLOY_LOCAL=false
 DEPLOY_REMOTE=false
 
+# Release steps for state tracking (in execution order)
+RELEASE_STEPS=(
+    "PR_CREATED"
+    "PR_MERGED"
+    "TAG_CREATED"
+    "CRATES_PUBLISHED"
+    "RELEASE_CREATED"
+    "LOCAL_DEPLOYED"
+    "MATRIX_ANNOUNCED"
+)
+
+# Completed steps (populated by auto-detection)
+declare -A COMPLETED_STEPS
+
 show_help() {
     echo "Freenet Release Script"
     echo
@@ -35,6 +49,11 @@ show_help() {
     echo "  --skip-tests        Skip pre-release tests"
     echo "  --dry-run           Show what would be done without executing"
     echo "  --help              Show this help"
+    echo
+    echo "Resumption:"
+    echo "  The script automatically detects completed steps and skips them."
+    echo "  If a release fails mid-way, simply re-run with the same --version."
+    echo "  State is also saved to /tmp/release-X.Y.Z.state for inspection."
     echo
     echo "Notes:"
     echo "  • Relies on GitHub CI for testing (more reliable than local tests)"
@@ -141,6 +160,9 @@ elif [[ "$VERSION_CMP" == "1" ]]; then
     echo "Releasing new version: v$PUBLISHED_VERSION → v$VERSION"
 fi
 
+# State file for tracking progress (backup for manual inspection)
+STATE_FILE="/tmp/release-${VERSION}.state"
+
 # Get current fdev version and increment patch version
 CURRENT_FDEV_VERSION=$(grep "^version" "$PROJECT_ROOT/crates/fdev/Cargo.toml" 2>/dev/null | cut -d'"' -f2)
 if [[ -n "$CURRENT_FDEV_VERSION" ]]; then
@@ -155,7 +177,176 @@ else
     FDEV_VERSION="0.3.1"
 fi
 
-# Helper functions
+# ============================================================================
+# State Management Functions
+# ============================================================================
+
+# Save current state to file
+save_state() {
+    local step="$1"
+    COMPLETED_STEPS["$step"]=1
+
+    # Write all completed steps to state file
+    {
+        echo "# Release state for v$VERSION"
+        echo "# Generated: $(date -Iseconds)"
+        echo "VERSION=$VERSION"
+        echo "FDEV_VERSION=$FDEV_VERSION"
+        for s in "${!COMPLETED_STEPS[@]}"; do
+            echo "COMPLETED_$s=1"
+        done
+    } > "$STATE_FILE"
+}
+
+# Load state from file (for inspection, auto-detect is primary)
+load_state_file() {
+    if [[ -f "$STATE_FILE" ]]; then
+        echo "  Found existing state file: $STATE_FILE"
+        while IFS='=' read -r key value; do
+            if [[ "$key" =~ ^COMPLETED_ ]]; then
+                local step="${key#COMPLETED_}"
+                COMPLETED_STEPS["$step"]=1
+            fi
+        done < "$STATE_FILE"
+    fi
+}
+
+# Check if a step is completed
+is_step_completed() {
+    local step="$1"
+    [[ "${COMPLETED_STEPS[$step]:-}" == "1" ]]
+}
+
+# Mark step completed and save state
+mark_completed() {
+    local step="$1"
+    save_state "$step"
+    echo "  ✓ [$step] completed"
+}
+
+# ============================================================================
+# Auto-Detection Functions
+# ============================================================================
+
+# Detect release PR state
+detect_pr_state() {
+    local branch_name="release/v$VERSION"
+
+    # Check for existing PR
+    local pr_info=$(gh pr list --head "$branch_name" --state all --limit 1 \
+        --json number,state 2>/dev/null | jq -r '.[0] | "\(.number)|\(.state)"' 2>/dev/null || echo "")
+
+    if [[ -z "$pr_info" || "$pr_info" == "null|null" ]]; then
+        return  # No PR exists
+    fi
+
+    local pr_number=$(echo "$pr_info" | cut -d'|' -f1)
+    local pr_state=$(echo "$pr_info" | cut -d'|' -f2)
+
+    if [[ -n "$pr_number" && "$pr_number" != "null" ]]; then
+        COMPLETED_STEPS["PR_CREATED"]=1
+
+        if [[ "$pr_state" == "MERGED" ]]; then
+            COMPLETED_STEPS["PR_MERGED"]=1
+        fi
+    fi
+}
+
+# Detect if tag exists
+detect_tag_state() {
+    # Check local tags
+    if git tag -l | grep -q "^v$VERSION$"; then
+        COMPLETED_STEPS["TAG_CREATED"]=1
+        return
+    fi
+
+    # Check remote tags
+    if git ls-remote --tags origin 2>/dev/null | grep -q "refs/tags/v$VERSION$"; then
+        COMPLETED_STEPS["TAG_CREATED"]=1
+    fi
+}
+
+# Detect if crates are published
+detect_crates_state() {
+    # Check if freenet is published at this version
+    if cargo search freenet --limit 1 2>/dev/null | grep -q "freenet = \"$VERSION\""; then
+        COMPLETED_STEPS["CRATES_PUBLISHED"]=1
+    fi
+}
+
+# Detect if GitHub release exists
+detect_release_state() {
+    if gh release view "v$VERSION" &>/dev/null; then
+        COMPLETED_STEPS["RELEASE_CREATED"]=1
+    fi
+}
+
+# Run all auto-detection
+auto_detect_state() {
+    echo "Detecting release state for v$VERSION:"
+
+    # First load any saved state file
+    load_state_file
+
+    # Then run auto-detection (may update/override)
+    echo -n "  Checking PR status... "
+    detect_pr_state
+    if is_step_completed "PR_MERGED"; then
+        echo "merged ✓"
+    elif is_step_completed "PR_CREATED"; then
+        echo "exists (not merged)"
+    else
+        echo "not found"
+    fi
+
+    echo -n "  Checking tag v$VERSION... "
+    detect_tag_state
+    if is_step_completed "TAG_CREATED"; then
+        echo "exists ✓"
+    else
+        echo "not found"
+    fi
+
+    echo -n "  Checking crates.io... "
+    detect_crates_state
+    if is_step_completed "CRATES_PUBLISHED"; then
+        echo "published ✓"
+    else
+        echo "not published"
+    fi
+
+    echo -n "  Checking GitHub release... "
+    detect_release_state
+    if is_step_completed "RELEASE_CREATED"; then
+        echo "exists ✓"
+    else
+        echo "not found"
+    fi
+
+    # Print summary of what will be skipped
+    local skipped=()
+    local pending=()
+    for step in "${RELEASE_STEPS[@]}"; do
+        if is_step_completed "$step"; then
+            skipped+=("$step")
+        else
+            pending+=("$step")
+        fi
+    done
+
+    echo
+    if [[ ${#skipped[@]} -gt 0 ]]; then
+        echo "Steps to skip: ${skipped[*]}"
+    fi
+    if [[ ${#pending[@]} -gt 0 ]]; then
+        echo "Steps to execute: ${pending[*]}"
+    fi
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
 run_cmd() {
     local desc="$1"
     shift
@@ -178,28 +369,6 @@ run_cmd() {
         echo "💡 Tip: You can fix the issue and re-run the script - it will skip completed steps"
         exit 1
     fi
-}
-
-# Check if a step was already completed
-step_completed() {
-    local step="$1"
-    case "$step" in
-        "version_update")
-            # Check if version is already updated in Cargo.toml
-            grep -q "version = \"$VERSION\"" "$PROJECT_ROOT/crates/core/Cargo.toml" 2>/dev/null
-            ;;
-        "github_release")
-            # Check if tag already exists
-            git tag | grep -q "^v$VERSION$" 2>/dev/null
-            ;;
-        "crates_published")
-            # Check if version exists on crates.io (simple check)
-            cargo search freenet --limit 1 | grep -q "freenet = \"$VERSION\"" 2>/dev/null
-            ;;
-        *)
-            return 1
-            ;;
-    esac
 }
 
 check_prerequisites() {
@@ -256,7 +425,14 @@ check_prerequisites() {
 update_versions() {
     echo "Updating versions:"
 
-    if step_completed "version_update"; then
+    # If PR is merged, versions are already in main
+    if is_step_completed "PR_MERGED"; then
+        echo "  ✓ Versions already in main (PR merged)"
+        return 0
+    fi
+
+    # Check if version is already updated in Cargo.toml
+    if grep -q "^version = \"$VERSION\"" "$PROJECT_ROOT/crates/core/Cargo.toml" 2>/dev/null; then
         echo "  ✓ Versions already updated (skipping)"
         return 0
     fi
@@ -337,6 +513,17 @@ create_release_pr() {
 
     local branch_name="release/v$VERSION"
 
+    # Skip if PR is already merged
+    if is_step_completed "PR_MERGED"; then
+        echo "  ✓ [PR_MERGED] Release PR already merged (skipping)"
+        # Ensure we're on main with latest
+        if [[ $(git branch --show-current) != "main" ]]; then
+            run_cmd "Switching to main branch" git checkout main
+        fi
+        run_cmd "Pulling latest changes" git pull origin main
+        return 0
+    fi
+
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "  [DRY RUN] Would create branch $branch_name"
         echo "  [DRY RUN] Would create auto-merge PR"
@@ -346,7 +533,7 @@ create_release_pr() {
 
     # Check if a release PR for this version already exists or was merged
     echo -n "  Checking for existing release PR... "
-    local existing_pr=$(gh pr list --search "Release $VERSION OR 🚀 Release $VERSION" --state all --limit 1 --json number,state,title --jq '.[] | "\(.number)|\(.state)|\(.title)"' 2>/dev/null || echo "")
+    local existing_pr=$(gh pr list --head "$branch_name" --state all --limit 1 --json number,state,title --jq '.[] | "\(.number)|\(.state)|\(.title)"' 2>/dev/null || echo "")
 
     if [[ -n "$existing_pr" ]]; then
         local pr_number=$(echo "$existing_pr" | cut -d'|' -f1)
@@ -355,6 +542,8 @@ create_release_pr() {
         echo "found #$pr_number ($pr_state)"
 
         if [[ "$pr_state" == "MERGED" ]]; then
+            mark_completed "PR_CREATED"
+            mark_completed "PR_MERGED"
             echo "  ✓ Release PR #$pr_number already merged, skipping PR creation"
 
             # Make sure we're on main with the merged changes
@@ -370,6 +559,7 @@ create_release_pr() {
 
             return 0
         elif [[ "$pr_state" == "OPEN" ]]; then
+            mark_completed "PR_CREATED"
             echo "  ℹ️  Release PR #$pr_number already exists and is open"
             echo "     Monitoring existing PR instead of creating a new one..."
             # Continue with the existing PR monitoring logic below
@@ -401,7 +591,7 @@ create_release_pr() {
         run_cmd "Creating release branch" git checkout -b "$branch_name"
     fi
 
-    run_cmd "Committing version bump" git commit -m "chore: bump versions to $VERSION
+    run_cmd "Committing version bump" git commit -m "build: bump versions to $VERSION
 
 - freenet: → $VERSION
 - fdev: → $FDEV_VERSION
@@ -412,10 +602,10 @@ create_release_pr() {
     
     echo -n "  Creating auto-merge PR... "
     pr_number=$(gh pr create \
-        --title "🚀 Release $VERSION" \
+        --title "build: release $VERSION" \
         --body "**Automated release PR**
 
-- freenet: → **$VERSION**  
+- freenet: → **$VERSION**
 - fdev: → **$FDEV_VERSION**
 
 This PR will auto-merge once GitHub CI passes.
@@ -424,14 +614,17 @@ Generated by: \`scripts/release.sh\`" \
         --head "$branch_name" \
         --assignee @me 2>/dev/null | grep -o '[0-9]\+$')
     echo "✓ (#$pr_number)"
-    
+    mark_completed "PR_CREATED"
+
     echo -n "  Enabling auto-merge... "
     gh pr merge "$pr_number" --squash --auto >/dev/null 2>&1
     echo "✓"
-    
+
     echo "  ⏳ Waiting for GitHub CI and auto-merge..."
     echo "     You can monitor at: https://github.com/freenet/freenet-core/pull/$pr_number"
-    
+    echo "     💡 Note: You can manually merge the PR if needed - the script will detect it and continue"
+    echo
+
     # Monitor CI with enhanced failure reporting
     local wait_time=30
     local total_wait=0
@@ -455,6 +648,7 @@ Generated by: \`scripts/release.sh\`" \
         
         case "$pr_state" in
             "MERGED")
+                mark_completed "PR_MERGED"
                 echo "  ✓ PR merged successfully!"
                 break
                 ;;
@@ -494,15 +688,16 @@ Generated by: \`scripts/release.sh\`" \
                 else
                     # Show status for pending/in-progress checks
                     pending_checks=$(echo "$checks_output" | grep -E "pending|in_progress" | wc -l)
+                    passed_checks=$(echo "$checks_output" | grep -E "pass" | wc -l)
                     if [[ $pending_checks -gt 0 ]]; then
-                        echo "  ⏳ Waiting... ($pending_checks checks in progress)"
+                        echo "  ⏳ Waiting... ($passed_checks checks passed, $pending_checks in progress, ${total_wait}s elapsed)"
                     else
-                        echo "  ⏳ Waiting for auto-merge..."
+                        echo "  ⏳ All checks passed, waiting for auto-merge... (${total_wait}s elapsed)"
                     fi
                 fi
                 ;;
         esac
-        
+
         sleep $wait_time
         total_wait=$((total_wait + wait_time))
     done
@@ -602,20 +797,31 @@ See commit history for detailed changes.
 publish_crates() {
     echo "Publishing to crates.io:"
 
+    # Skip if already completed
+    if is_step_completed "CRATES_PUBLISHED"; then
+        echo "  ✓ [CRATES_PUBLISHED] Crates already published (skipping)"
+        return 0
+    fi
+
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "  [DRY RUN] Would publish freenet $VERSION"
         echo "  [DRY RUN] Would publish fdev $FDEV_VERSION"
         return 0
     fi
 
+    local freenet_published=false
+    local fdev_published=false
+
     # Check if freenet is already published
     echo -n "  Checking if freenet $VERSION is already published... "
     if cargo search freenet --limit 1 2>/dev/null | grep -q "freenet = \"$VERSION\""; then
         echo "yes"
         echo "  ✓ freenet $VERSION already published to crates.io"
+        freenet_published=true
     else
         echo "no"
         run_cmd "Publishing freenet $VERSION" cargo publish -p freenet
+        freenet_published=true
 
         # Wait a bit for crates.io to propagate
         echo -n "  Waiting for crates.io propagation... "
@@ -628,14 +834,31 @@ publish_crates() {
     if cargo search fdev --limit 1 2>/dev/null | grep -q "fdev = \"$FDEV_VERSION\""; then
         echo "yes"
         echo "  ✓ fdev $FDEV_VERSION already published to crates.io"
+        fdev_published=true
     else
         echo "no"
         run_cmd "Publishing fdev $FDEV_VERSION" cargo publish -p fdev
+        fdev_published=true
+    fi
+
+    # Mark complete if both are published
+    if [[ "$freenet_published" == "true" && "$fdev_published" == "true" ]]; then
+        mark_completed "CRATES_PUBLISHED"
     fi
 }
 
 create_github_release() {
     echo "Creating GitHub release:"
+
+    # Skip if already completed
+    if is_step_completed "RELEASE_CREATED"; then
+        echo "  ✓ [RELEASE_CREATED] GitHub release already exists (skipping)"
+        release_url=$(gh release view "v$VERSION" --json url --jq '.url' 2>/dev/null || echo "")
+        if [[ -n "$release_url" ]]; then
+            echo "  Release URL: $release_url"
+        fi
+        return 0
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "  [DRY RUN] Would create tag v$VERSION"
@@ -647,6 +870,8 @@ create_github_release() {
     echo -n "  Checking if release v$VERSION already exists... "
     if gh release view "v$VERSION" &>/dev/null; then
         echo "yes"
+        mark_completed "TAG_CREATED"
+        mark_completed "RELEASE_CREATED"
         echo "  ✓ GitHub release v$VERSION already exists"
         release_url=$(gh release view "v$VERSION" --json url --jq '.url')
         echo "  Release URL: $release_url"
@@ -658,6 +883,7 @@ create_github_release() {
     # Check if tag already exists
     if git tag | grep -q "^v$VERSION$"; then
         echo "  ℹ️  Tag v$VERSION already exists locally"
+        mark_completed "TAG_CREATED"
     else
         run_cmd "Creating tag v$VERSION" git tag -a "v$VERSION" -m "Release v$VERSION"
     fi
@@ -665,8 +891,10 @@ create_github_release() {
     # Check if tag exists on remote
     if git ls-remote --tags origin | grep -q "refs/tags/v$VERSION$"; then
         echo "  ℹ️  Tag v$VERSION already exists on remote"
+        mark_completed "TAG_CREATED"
     else
         run_cmd "Pushing tag" git push origin "v$VERSION"
+        mark_completed "TAG_CREATED"
     fi
 
     echo -n "  Generating release notes... "
@@ -676,6 +904,7 @@ create_github_release() {
     echo -n "  Creating GitHub release... "
     release_url=$(gh release create "v$VERSION" --title "v$VERSION" --notes "$release_notes")
     echo "✓"
+    mark_completed "RELEASE_CREATED"
 
     echo "  Release created: $release_url"
 }
@@ -688,6 +917,12 @@ deploy_gateways() {
     # Skip if no deployment requested
     if [[ "$DEPLOY_LOCAL" == "false" ]] && [[ "$DEPLOY_REMOTE" == "false" ]]; then
         echo "Skipping gateway deployment (use --deploy-local or --deploy-remote to enable)"
+        return 0
+    fi
+
+    # Skip if already deployed (only check if local deployment was requested)
+    if [[ "$DEPLOY_LOCAL" == "true" ]] && is_step_completed "LOCAL_DEPLOYED"; then
+        echo "  ✓ [LOCAL_DEPLOYED] Local gateway already deployed (skipping)"
         return 0
     fi
 
@@ -708,6 +943,7 @@ deploy_gateways() {
             else
                 if "$deploy_script" --binary "$PROJECT_ROOT/target/release/freenet"; then
                     echo "  ✓ Local gateway deployed successfully"
+                    mark_completed "LOCAL_DEPLOYED"
                 else
                     echo "  ⚠️  Local gateway deployment failed (non-fatal)"
                     echo "     You can deploy manually with: $deploy_script"
@@ -744,6 +980,12 @@ deploy_gateways() {
 announce_to_matrix() {
     echo "Announcing release to Matrix:"
 
+    # Skip if already announced
+    if is_step_completed "MATRIX_ANNOUNCED"; then
+        echo "  ✓ [MATRIX_ANNOUNCED] Matrix announcement already sent (skipping)"
+        return 0
+    fi
+
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "  [DRY RUN] Would announce to #freenet-locutus:matrix.org"
         return 0
@@ -761,15 +1003,15 @@ announce_to_matrix() {
     local feature_count=$(echo "$release_notes" | grep -c "^- \*\*#.*Features" || echo "0")
 
     # Extract key highlights (first 3 fixes or features)
-    local highlights=$(echo "$release_notes" | grep "^- \*\*#" | head -3 | sed 's/^- /  • /')
+    local highlights=$(echo "$release_notes" | grep "^- \*\*#" | head -3 | sed 's/^- /  - /')
 
-    local announcement="🎉 **Freenet v$VERSION Released!**
+    local announcement="Freenet v$VERSION Released!
 
-📦 Published to crates.io:
-  • freenet v$VERSION
-  • fdev v$FDEV_VERSION
+Published to crates.io:
+  - freenet v$VERSION
+  - fdev v$FDEV_VERSION
 
-🔗 Release: https://github.com/freenet/freenet-core/releases/tag/v$VERSION
+Release: https://github.com/freenet/freenet-core/releases/tag/v$VERSION
 
 Key highlights:
 $highlights
@@ -779,8 +1021,10 @@ Full changelog available at the release link above.
 [AI-assisted release announcement]"
 
     echo -n "  Sending announcement to Matrix... "
-    if matrix-commander -r '#freenet-locutus:matrix.org' -m "$announcement" &>/dev/null; then
+    # Use room ID instead of alias for reliability, add timeout
+    if timeout 30 matrix-commander -r '!ygHfYcXtXmivTbOwjX:matrix.org' -m "$announcement" &>/dev/null; then
         echo "✓"
+        mark_completed "MATRIX_ANNOUNCED"
     else
         echo "✗"
         echo "  ⚠️  Failed to send Matrix announcement (non-critical)"
@@ -792,6 +1036,11 @@ echo "Freenet Release Script"
 echo "======================"
 echo "Target version: freenet $VERSION, fdev $FDEV_VERSION"
 echo "Project root: $PROJECT_ROOT"
+echo "State file: $STATE_FILE"
+echo
+
+# Auto-detect what's already completed
+auto_detect_state
 echo
 
 check_prerequisites
@@ -836,3 +1085,6 @@ elif [[ "$DEPLOY_REMOTE" == "false" ]]; then
 fi
 
 echo "- Update any dependent projects to use the new version"
+echo
+echo "State file: $STATE_FILE"
+echo "  (Can be deleted now that release is complete)"

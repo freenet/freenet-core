@@ -17,7 +17,7 @@ use rand::SeedableRng;
 use testresult::TestResult;
 use tokio::{select, time::sleep, time::timeout};
 use tokio_tungstenite::connect_async;
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::{span, Instrument, Level};
 
 use common::{
     base_node_test_config, base_node_test_config_with_rng, gw_config_from_path,
@@ -171,10 +171,8 @@ async fn collect_node_diagnostics(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_node_diagnostics_query() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-
     // Setup network sockets for the gateway and client node
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
@@ -463,10 +461,8 @@ async fn test_node_diagnostics_query() -> TestResult {
 }
 
 #[ignore = "this test currently fails and we are workign on fixing it"]
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_multi_node() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-
     // Setup network sockets for the gateway
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
 
@@ -1092,10 +1088,8 @@ async fn test_ping_multi_node() -> TestResult {
 }
 
 #[ignore = "this test currently fails and we are workign on fixing it"]
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_application_loop() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
-
     // Setup network sockets for the gateway
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
 
@@ -1519,8 +1513,8 @@ async fn test_ping_application_loop() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "Test has never worked - gateway nodes fail on startup with channel closed errors"]
+#[cfg(feature = "manual-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_partially_connected_network() -> TestResult {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
@@ -1551,8 +1545,6 @@ async fn test_ping_partially_connected_network() -> TestResult {
     const NUM_REGULAR_NODES: usize = 7;
     const CONNECTIVITY_RATIO: f64 = 0.5; // Controls connectivity between regular nodes
 
-    // Configure logging
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     tracing::info!(
         "Starting test with {} gateways and {} regular nodes (connectivity ratio: {})",
         NUM_GATEWAYS,
@@ -1750,15 +1742,18 @@ async fn test_ping_partially_connected_network() -> TestResult {
                           i, NUM_GATEWAYS, num_connections);
         }
 
-        // Load the ping contract
+        // Load the ping contract. Compile once to determine the code hash, then again with proper options.
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
         tracing::info!(path=%path_to_code.display(), "loading contract code");
-        let code = std::fs::read(path_to_code)
-            .ok()
-            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
-        let code_hash = CodeHash::from_code(&code);
-
-        // Create ping contract options
+        let temp_options = PingContractOptions {
+            frequency: Duration::from_secs(3),
+            ttl: Duration::from_secs(60),
+            tag: APP_TAG.to_string(),
+            code_key: String::new(),
+        };
+        let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
+        let temp_container = common::load_contract(&path_to_code, temp_params)?;
+        let code_hash = CodeHash::from_code(temp_container.data());
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(60),
@@ -1767,7 +1762,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         };
 
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = ContractContainer::try_from((code, &params))?;
+        let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
         // Choose a node to publish the contract

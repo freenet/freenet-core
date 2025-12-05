@@ -2,8 +2,7 @@ name: Build and Cross-Compile
 
 on:
   workflow_dispatch:
-  pull_request:
-  merge_group:
+  # Skip PRs - only build on main and releases to reduce CI costs
   push:
     branches: [main]
     tags: ['v*']
@@ -15,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         # with:
         #   submodules: true
 
@@ -33,13 +32,13 @@ jobs:
         run: cargo build --release
 
       - name: Upload freenet binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: binaries-x86_64-freenet
           path: target/release/freenet
 
       - name: Upload fdev binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: binaries-x86_64-fdev
           path: target/release/fdev
@@ -50,7 +49,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         # with:
         #   submodules: true
 
@@ -65,13 +64,13 @@ jobs:
         run: cargo build --release
 
       - name: Upload freenet binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: binaries-arm64-freenet
           path: target/release/freenet
 
       - name: Upload fdev binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: binaries-arm64-fdev
           path: target/release/fdev
@@ -87,39 +86,39 @@ jobs:
 
     steps:
       - name: Download x86_64 freenet binary
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: binaries-x86_64-freenet
           path: artifacts/x86_64-freenet
 
       - name: Download x86_64 fdev binary
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: binaries-x86_64-fdev
           path: artifacts/x86_64-fdev
 
       - name: Download ARM64 freenet binary
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: binaries-arm64-freenet
           path: artifacts/arm64-freenet
 
       - name: Download ARM64 fdev binary
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: binaries-arm64-fdev
           path: artifacts/arm64-fdev
 
       - name: Prepare release assets
         run: |
-          # Create zip files for each binary with appropriate naming
-          cd artifacts/x86_64-freenet && zip ../../freenet-x86_64-linux.zip freenet && cd ../..
-          cd artifacts/x86_64-fdev && zip ../../fdev-x86_64-linux.zip fdev && cd ../..
-          cd artifacts/arm64-freenet && zip ../../freenet-aarch64-linux.zip freenet && cd ../..
-          cd artifacts/arm64-fdev && zip ../../fdev-aarch64-linux.zip fdev && cd ../..
+          # Create tar.gz files for each binary with binstall-compatible naming
+          cd artifacts/x86_64-freenet && tar -czvf ../../freenet-x86_64-unknown-linux-gnu.tar.gz freenet && cd ../..
+          cd artifacts/x86_64-fdev && tar -czvf ../../fdev-x86_64-unknown-linux-gnu.tar.gz fdev && cd ../..
+          cd artifacts/arm64-freenet && tar -czvf ../../freenet-aarch64-unknown-linux-gnu.tar.gz freenet && cd ../..
+          cd artifacts/arm64-fdev && tar -czvf ../../fdev-aarch64-unknown-linux-gnu.tar.gz fdev && cd ../..
 
           # Display the created files
-          ls -lh *.zip
+          ls -lh *.tar.gz
 
       - name: Upload binaries to release
         env:
@@ -128,11 +127,11 @@ jobs:
           # Extract the tag name (e.g., v0.1.30)
           TAG_NAME="${GITHUB_REF#refs/tags/}"
 
-          # Upload all zip files to the release
+          # Upload all tar.gz files to the release
           gh release upload "$TAG_NAME" \
-            freenet-x86_64-linux.zip \
-            fdev-x86_64-linux.zip \
-            freenet-aarch64-linux.zip \
-            fdev-aarch64-linux.zip \
+            freenet-x86_64-unknown-linux-gnu.tar.gz \
+            fdev-x86_64-unknown-linux-gnu.tar.gz \
+            freenet-aarch64-unknown-linux-gnu.tar.gz \
+            fdev-aarch64-unknown-linux-gnu.tar.gz \
             --repo ${{ github.repository }} \
             --clobber

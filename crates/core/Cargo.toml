@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.1.31"
+version = "0.1.41"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -8,6 +8,11 @@ description = "Freenet core software"
 license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet-core"
 readme = "README.md"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "freenet"
 
 [[bin]]
 name = "freenet"
@@ -44,6 +49,7 @@ pav_regression = "0.6.1"
 parking_lot = "0.12"
 pin-project = "1"
 rand = { features = ["small_rng"], workspace = true }
+once_cell = "1"
 redb = { optional = true, version = "3" }
 serde = { features = ["derive", "rc"], workspace = true }
 serde_json = { workspace = true }
@@ -64,29 +70,33 @@ xz2 = { version = "0.1" }
 reqwest = { version = "0.12", features = ["json"] }
 rsa = { version = "0.9", features = ["serde", "pem"] }
 pkcs8 = { version = "0.10", features = ["std", "pem"] }
+sha2 = "0.10"
 
 # Tracing deps
 opentelemetry = "0.31"
 opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.22" }
 tracing = { version = "0.1" }
 tracing-opentelemetry = { optional = true, version = "0.32.0" }
-tracing-subscriber = { optional = true, version = "0.3" }
+tracing-subscriber = { optional = true, version = "0.3", features = ["json"] }
 opentelemetry-otlp = { optional = true, version = "0.31.0" }
 opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"] }
 
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
-console-subscriber = { version = "0.4.1", optional = true }
+console-subscriber = { version = "0.5.0", optional = true }
+tokio-stream = "0.1.17"
+freenet-test-network = { version = "0.1.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["sysinfoapi"] }
-wmi = "0.17.3"
+wmi = "0.18.0"
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }
 chrono = { features = ["arbitrary"], workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
+freenet-macros = { path = "../freenet-macros" }
 httptest = "0.16"
 statrs = "0.18"
 tempfile = "3"
@@ -96,6 +106,7 @@ tokio-tungstenite = "0.27.0"
 # console-subscriber = { version = "0.4" }
 ureq = { version = "3.1", features = ["json"] }
 which = "8.0"
+regex = "1"
 
 [features]
 default = ["redb", "trace", "websocket"]
@@ -105,3 +116,4 @@ trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelem
 websocket = ["axum/ws"]
 testing = ["freenet-stdlib/testing"]
 console-subscriber = ["dep:console-subscriber"]
+test-network = ["dep:freenet-test-network"]

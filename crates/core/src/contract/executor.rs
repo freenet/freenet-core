@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blake3::traits::digest::generic_array::GenericArray;
 use either::Either;
 use freenet_stdlib::client_api::{
     ClientError as WsClientError, ClientRequest, ContractError as StdContractError,

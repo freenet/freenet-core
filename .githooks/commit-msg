@@ -1,0 +1,41 @@
+#!/bin/bash
+# Commit message hook that validates Conventional Commits format
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Get the commit message file path (passed as first argument)
+COMMIT_MSG_FILE=$1
+
+if [ ! -f "$COMMIT_MSG_FILE" ]; then
+    echo -e "${RED}Error: Commit message file not found${NC}"
+    exit 1
+fi
+
+# Get the first line of the commit message
+FIRST_LINE=$(head -n1 "$COMMIT_MSG_FILE")
+
+# Conventional Commits pattern: type(scope): description OR type: description
+# type must be lowercase and from allowed list
+# type can optionally be followed by ! for breaking changes
+CONVENTIONAL_PATTERN="^(feat|fix|docs|style|refactor|perf|test|build|ci)(\([a-z0-9_-]+\))?!?: .+"
+
+if echo "$FIRST_LINE" | grep -qE "$CONVENTIONAL_PATTERN"; then
+    exit 0
+else
+    echo -e "${RED}✗ Commit message doesn't follow Conventional Commits format${NC}"
+    echo -e "${YELLOW}First line must match pattern: type(scope): description${NC}"
+    echo -e "${YELLOW}Allowed types: feat, fix, docs, style, refactor, perf, test, build, ci${NC}"
+    echo -e "${YELLOW}Type must be lowercase. Examples:${NC}"
+    echo -e "  ${GREEN}fix: resolve WebSocket connection timeout${NC}"
+    echo -e "  ${GREEN}feat(network): add peer reputation scoring${NC}"
+    echo -e "  ${GREEN}build(deps): bump tokio from 1.0 to 1.1${NC}"
+    echo -e "  ${GREEN}fix!: breaking change to API${NC}"
+    echo ""
+    echo -e "${RED}Your commit message:${NC}"
+    echo -e "${YELLOW}$FIRST_LINE${NC}"
+    exit 1
+fi

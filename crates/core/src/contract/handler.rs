@@ -337,8 +337,63 @@ impl ContractHandlerChannel<SenderHalve> {
                 };
                 if let Err(e) = session_tx.try_send(msg) {
                     tracing::warn!("Failed to notify session actor: {}", e);
+                } else {
+                    tracing::debug!(
+                        %tx,
+                        %client_id,
+                        %request_id,
+                        "Session adapter registered transaction with session actor"
+                    );
                 }
             }
+        } else {
+            tracing::warn!(
+                %client_id,
+                %request_id,
+                "Session adapter not installed; session actor will not track transaction"
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn waiting_for_subscription_result(
+        &self,
+        tx: Transaction,
+        contract_key: ContractInstanceId,
+        client_id: ClientId,
+        request_id: RequestId,
+    ) -> Result<(), ContractError> {
+        self.end
+            .wait_for_res_tx
+            .send((client_id, WaitingTransaction::Subscription { contract_key }))
+            .await
+            .map_err(|_| ContractError::NoEvHandlerResponse)?;
+
+        if let Some(session_tx) = &self.session_adapter_tx {
+            let msg = SessionMessage::RegisterTransaction {
+                tx,
+                client_id,
+                request_id,
+            };
+            if let Err(e) = session_tx.try_send(msg) {
+                tracing::warn!("Failed to notify session actor: {}", e);
+            } else {
+                tracing::debug!(
+                    %tx,
+                    %client_id,
+                    %request_id,
+                    contract = %contract_key,
+                    "Session adapter registered subscription transaction with session actor"
+                );
+            }
+        } else {
+            tracing::warn!(
+                %client_id,
+                %request_id,
+                contract = %contract_key,
+                "Session adapter not installed; subscription transaction not registered with session actor"
+            );
         }
 
         Ok(())

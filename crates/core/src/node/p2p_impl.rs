@@ -1,6 +1,7 @@
 use std::{collections::HashSet, convert::Infallible, sync::Arc, time::Duration};
 
 use futures::{future::BoxFuture, FutureExt};
+use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use super::{
@@ -20,9 +21,12 @@ use crate::{
         self, ContractHandler, ContractHandlerChannel, ExecutorToEventLoopChannel,
         NetworkEventListenerHalve, WaitingResolution,
     },
-    message::{NetMessage, NodeEvent, Transaction},
+    message::{NetMessage, NetMessageV1, NodeEvent},
     node::NodeConfig,
-    operations::{connect, OpEnum},
+    operations::{
+        connect::{self, ConnectOp},
+        OpEnum,
+    },
 };
 
 use super::OpManager;
@@ -41,6 +45,7 @@ pub(crate) struct NodeP2P {
     should_try_connect: bool,
     client_events_task: BoxFuture<'static, anyhow::Error>,
     contract_executor_task: BoxFuture<'static, anyhow::Error>,
+    initial_join_task: Option<JoinHandle<()>>,
 }
 
 impl NodeP2P {
@@ -131,10 +136,7 @@ impl NodeP2P {
 
     /// Trigger the connection maintenance task to actively look for more peers
     async fn trigger_connection_maintenance(&self) -> anyhow::Result<()> {
-        // Send a connect request to find more peers
-        use crate::operations::connect;
         let ideal_location = Location::random();
-        let tx = Transaction::new::<connect::ConnectMsg>();
 
         // Find a connected peer to query
         let query_target = {
@@ -142,40 +144,54 @@ impl NodeP2P {
             self.op_manager.ring.connection_manager.routing(
                 ideal_location,
                 None,
-                &HashSet::<PeerId>::new(),
+                &HashSet::<std::net::SocketAddr>::new(),
                 &router,
             )
         };
 
         if let Some(query_target) = query_target {
             let joiner = self.op_manager.ring.connection_manager.own_location();
-            let msg = connect::ConnectMsg::Request {
-                id: tx,
-                target: query_target.clone(),
-                msg: connect::ConnectRequest::FindOptimalPeer {
-                    query_target,
-                    ideal_location,
-                    joiner,
-                    max_hops_to_live: self.op_manager.ring.max_hops_to_live,
-                    skip_connections: HashSet::new(),
-                    skip_forwards: HashSet::new(),
-                },
-            };
+            let ttl = self
+                .op_manager
+                .ring
+                .max_hops_to_live
+                .max(1)
+                .min(u8::MAX as usize) as u8;
+            let target_connections = self.op_manager.ring.connection_manager.min_connections;
 
+            let (tx, op, msg) = ConnectOp::initiate_join_request(
+                joiner,
+                query_target.clone(),
+                ideal_location,
+                ttl,
+                target_connections,
+                self.op_manager.connect_forward_estimator.clone(),
+            );
+
+            tracing::debug!(
+                %tx,
+                query_peer = %query_target,
+                %ideal_location,
+                "Triggering connection maintenance connect request"
+            );
             self.op_manager
                 .notify_op_change(
-                    NetMessage::from(msg),
-                    OpEnum::Connect(Box::new(connect::ConnectOp::new(tx, None, None, None))),
+                    NetMessage::V1(NetMessageV1::Connect(msg)),
+                    OpEnum::Connect(Box::new(op)),
                 )
                 .await?;
         }
 
         Ok(())
     }
-    pub(super) async fn run_node(self) -> anyhow::Result<Infallible> {
+    pub(super) async fn run_node(mut self) -> anyhow::Result<Infallible> {
         if self.should_try_connect {
-            connect::initial_join_procedure(self.op_manager.clone(), &self.conn_manager.gateways)
-                .await?;
+            let join_handle = connect::initial_join_procedure(
+                self.op_manager.clone(),
+                &self.conn_manager.gateways,
+            )
+            .await?;
+            self.initial_join_task = Some(join_handle);
 
             // After connecting to gateways, aggressively try to reach min_connections
             // This is important for fast startup and avoiding on-demand connection delays
@@ -190,7 +206,8 @@ impl NodeP2P {
             self.node_controller,
         );
 
-        tokio::select!(
+        let join_task = self.initial_join_task.take();
+        let result = tokio::select!(
             r = f => {
                let Err(e) = r;
                tracing::error!("Network event listener exited: {}", e);
@@ -204,7 +221,13 @@ impl NodeP2P {
                 tracing::error!("Contract executor task exited: {:?}", e);
                 Err(e)
             }
-        )
+        );
+
+        if let Some(handle) = join_task {
+            handle.abort();
+        }
+
+        result
     }
 
     pub(crate) async fn build<CH, const CLIENTS: usize, ER>(
@@ -259,6 +282,7 @@ impl NodeP2P {
             connection_manager,
             result_router_tx,
         )?);
+        op_manager.ring.attach_op_manager(&op_manager);
         let (executor_listener, executor_sender) = contract::executor_channel(op_manager.clone());
         let contract_handler = CH::build(ch_inbound, executor_sender, ch_builder)
             .await
@@ -328,11 +352,12 @@ impl NodeP2P {
             executor_listener,
             node_controller: node_controller_rx,
             should_try_connect: config.should_connect,
-            peer_id: config.peer_id,
+            peer_id: None, // PeerId removed - using PeerKeyLocation instead
             is_gateway: config.is_gateway,
             location: config.location,
             client_events_task,
             contract_executor_task,
+            initial_join_task: None,
         })
     }
 }

@@ -2,6 +2,7 @@
 use std::{
     collections::HashMap,
     io::Cursor,
+    net::SocketAddr,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
@@ -10,11 +11,12 @@ use crossbeam::channel::{self, Receiver, Sender};
 use rand::{prelude::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use tokio::sync::Mutex;
 
-use super::{ConnectionError, NetworkBridge, PeerId};
+use super::{ConnectionError, NetworkBridge};
 use crate::{
     config::GlobalExecutor,
     message::NetMessage,
-    node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager},
+    node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager, PeerId},
+    ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
 
@@ -60,17 +62,23 @@ impl MemoryConnManager {
 }
 
 impl NetworkBridge for MemoryConnManager {
-    async fn send(&self, target: &PeerId, msg: NetMessage) -> super::ConnResult<()> {
+    async fn send(&self, target_addr: SocketAddr, msg: NetMessage) -> super::ConnResult<()> {
         self.log_register
             .register_events(NetEventLog::from_outbound_msg(&msg, &self.op_manager.ring))
             .await;
-        self.op_manager.sending_transaction(target, &msg);
+        // Create a temporary PeerId for in-memory transport (still uses PeerId internally)
+        let target_peer_id =
+            PeerId::new(target_addr, self.transport.interface_peer.pub_key.clone());
+        // Create PeerKeyLocation for op_manager tracking
+        let target_peer =
+            PeerKeyLocation::new(self.transport.interface_peer.pub_key.clone(), target_addr);
+        self.op_manager.sending_transaction(&target_peer, &msg);
         let msg = bincode::serialize(&msg)?;
-        self.transport.send(target.clone(), msg);
+        self.transport.send(target_peer_id, msg);
         Ok(())
     }
 
-    async fn drop_connection(&mut self, _peer: &PeerId) -> super::ConnResult<()> {
+    async fn drop_connection(&mut self, _peer_addr: SocketAddr) -> super::ConnResult<()> {
         Ok(())
     }
 }

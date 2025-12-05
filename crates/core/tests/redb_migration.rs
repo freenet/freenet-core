@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use tempfile::TempDir;
+use tracing::info;
 
 /// Test that verifies automatic migration from redb v2 to v3 format
 ///
@@ -38,8 +39,8 @@ async fn test_automatic_migration_from_v2_to_v3() -> Result<(), Box<dyn std::err
     let db_path = temp_dir.path().join("db");
     std::fs::copy(&v2_db_path, &db_path)?;
 
-    println!("Copied v2 database to test directory: {:?}", db_path);
-    println!("This should trigger automatic migration...");
+    info!("Copied v2 database to test directory: {:?}", db_path);
+    info!("This should trigger automatic migration...");
 
     // Attempt to open with v3 - this should trigger migration
     let result = ReDb::new(temp_dir.path()).await;
@@ -76,8 +77,8 @@ async fn test_automatic_migration_from_v2_to_v3() -> Result<(), Box<dyn std::err
     // creates a fresh database. This is expected behavior - the backup is for
     // user reference only.
 
-    println!("✓ Migration completed successfully");
-    println!("✓ Backup created: {:?}", backups[0].file_name());
+    info!("✓ Migration completed successfully");
+    info!("✓ Backup created: {:?}", backups[0].file_name());
 
     Ok(())
 }

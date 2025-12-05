@@ -1,37 +1,28 @@
-use crate::{message::Transaction, node::PeerId};
+use crate::message::{Transaction, TransactionType};
 use dashmap::DashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync;
 
+/// Tracks live transactions per peer address.
+///
+/// Uses `SocketAddr` as the key since transactions are tied to network connections,
+/// not cryptographic identities.
 #[derive(Clone)]
 pub struct LiveTransactionTracker {
-    tx_per_peer: Arc<DashMap<PeerId, Vec<Transaction>>>,
-    missing_candidate_sender: sync::mpsc::Sender<PeerId>,
+    tx_per_peer: Arc<DashMap<SocketAddr, Vec<Transaction>>>,
 }
 
 impl LiveTransactionTracker {
-    /// The given peer does not have (good) candidates for acquiring new connections.
-    pub async fn missing_candidate_peers(&self, peer: PeerId) {
-        let _ = self
-            .missing_candidate_sender
-            .send(peer)
-            .await
-            .map_err(|error| {
-                tracing::debug!(%error, "live transaction tracker channel closed");
-                error
-            });
-    }
-
-    pub fn add_transaction(&self, peer: PeerId, tx: Transaction) {
-        self.tx_per_peer.entry(peer).or_default().push(tx);
+    pub fn add_transaction(&self, peer_addr: SocketAddr, tx: Transaction) {
+        self.tx_per_peer.entry(peer_addr).or_default().push(tx);
     }
 
     pub fn remove_finished_transaction(&self, tx: Transaction) {
-        let keys_to_remove: Vec<PeerId> = self
+        let keys_to_remove: Vec<SocketAddr> = self
             .tx_per_peer
             .iter()
             .filter(|entry| entry.value().iter().any(|otx| otx == &tx))
-            .map(|entry| entry.key().clone())
+            .map(|entry| *entry.key())
             .collect();
 
         for k in keys_to_remove {
@@ -42,26 +33,139 @@ impl LiveTransactionTracker {
         }
     }
 
-    pub(crate) fn new() -> (Self, sync::mpsc::Receiver<PeerId>) {
-        let (missing_peer, rx) = sync::mpsc::channel(10);
-        (
-            Self {
-                tx_per_peer: Arc::new(DashMap::default()),
-                missing_candidate_sender: missing_peer,
-            },
-            rx,
-        )
+    pub(crate) fn new() -> Self {
+        Self {
+            tx_per_peer: Arc::new(DashMap::default()),
+        }
     }
 
-    pub(crate) fn prune_transactions_from_peer(&self, peer: &PeerId) {
-        self.tx_per_peer.remove(peer);
+    pub(crate) fn prune_transactions_from_peer(&self, peer_addr: SocketAddr) {
+        self.tx_per_peer.remove(&peer_addr);
     }
 
-    pub(crate) fn has_live_connection(&self, peer: &PeerId) -> bool {
-        self.tx_per_peer.contains_key(peer)
+    pub(crate) fn has_live_connection(&self, peer_addr: SocketAddr) -> bool {
+        self.tx_per_peer.contains_key(&peer_addr)
     }
 
-    pub(crate) fn still_alive(&self, tx: &Transaction) -> bool {
-        self.tx_per_peer.iter().any(|e| e.value().contains(tx))
+    pub(crate) fn len(&self) -> usize {
+        self.tx_per_peer.len()
+    }
+
+    /// Returns the total number of active transactions across all peers.
+    #[cfg(test)]
+    pub(crate) fn active_transaction_count(&self) -> usize {
+        self.tx_per_peer
+            .iter()
+            .map(|entry| entry.value().len())
+            .sum()
+    }
+
+    /// Returns the number of active Connect transactions across all peers.
+    /// Used to limit concurrent connection acquisition attempts.
+    pub(crate) fn active_connect_transaction_count(&self) -> usize {
+        self.tx_per_peer
+            .iter()
+            .map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .filter(|tx| tx.transaction_type() == TransactionType::Connect)
+                    .count()
+            })
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::connect::ConnectMsg;
+    use crate::operations::get::GetMsg;
+    use crate::operations::put::PutMsg;
+
+    #[test]
+    fn active_transaction_count_empty() {
+        let tracker = LiveTransactionTracker::new();
+        assert_eq!(tracker.active_transaction_count(), 0);
+    }
+
+    #[test]
+    fn active_transaction_count_single_peer() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+        assert_eq!(tracker.active_transaction_count(), 1);
+
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+        assert_eq!(tracker.active_transaction_count(), 2);
+    }
+
+    #[test]
+    fn active_transaction_count_multiple_peers() {
+        let tracker = LiveTransactionTracker::new();
+        let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        tracker.add_transaction(addr1, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(addr1, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(addr2, Transaction::new::<ConnectMsg>());
+
+        assert_eq!(tracker.active_transaction_count(), 3);
+    }
+
+    #[test]
+    fn active_transaction_count_after_removal() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        let tx1 = Transaction::new::<ConnectMsg>();
+        let tx2 = Transaction::new::<ConnectMsg>();
+
+        tracker.add_transaction(addr, tx1);
+        tracker.add_transaction(addr, tx2);
+        assert_eq!(tracker.active_transaction_count(), 2);
+
+        tracker.remove_finished_transaction(tx1);
+        assert_eq!(tracker.active_transaction_count(), 1);
+
+        tracker.remove_finished_transaction(tx2);
+        assert_eq!(tracker.active_transaction_count(), 0);
+    }
+
+    #[test]
+    fn active_connect_transaction_count_filters_by_type() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // Add mixed transaction types
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(addr, Transaction::new::<GetMsg>());
+        tracker.add_transaction(addr, Transaction::new::<PutMsg>());
+        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
+
+        // Total count should be 4
+        assert_eq!(tracker.active_transaction_count(), 4);
+        // Connect count should only be 2
+        assert_eq!(tracker.active_connect_transaction_count(), 2);
+    }
+
+    #[test]
+    fn active_connect_transaction_count_empty() {
+        let tracker = LiveTransactionTracker::new();
+        assert_eq!(tracker.active_connect_transaction_count(), 0);
+    }
+
+    #[test]
+    fn active_connect_transaction_count_no_connects() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // Add only non-connect transactions
+        tracker.add_transaction(addr, Transaction::new::<GetMsg>());
+        tracker.add_transaction(addr, Transaction::new::<PutMsg>());
+
+        assert_eq!(tracker.active_transaction_count(), 2);
+        assert_eq!(tracker.active_connect_transaction_count(), 0);
     }
 }

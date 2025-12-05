@@ -4,11 +4,12 @@
 //! network message processing from client notification logic, enabling
 //! pure network processing when the actor system is enabled.
 
+use crate::client_events::HostResult;
 use crate::contract::SessionMessage;
 use crate::message::Transaction;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error};
+use tracing::debug;
 
 /// Errors that can occur during message processing
 #[derive(Debug, thiserror::Error)]
@@ -35,50 +36,43 @@ impl MessageProcessor {
     pub async fn handle_network_result(
         &self,
         tx: Transaction,
-        op_result: Result<Option<crate::operations::OpEnum>, crate::node::OpError>,
+        host_result: Option<HostResult>,
     ) -> Result<(), ProcessingError> {
         // Pure result forwarding to SessionActor
-        self.route_to_session_actor(tx, op_result).await
+        self.route_to_session_actor(tx, host_result).await
     }
 
     /// Route network result to SessionActor - no client parameters needed
     async fn route_to_session_actor(
         &self,
         tx: Transaction,
-        op_result: Result<Option<crate::operations::OpEnum>, crate::node::OpError>,
+        host_result: Option<HostResult>,
     ) -> Result<(), ProcessingError> {
-        // Convert operation result to host result
-        let host_result = match op_result {
-            Ok(Some(op_res)) => {
-                debug!("Converting network result for transaction {}", tx);
-                Arc::new(op_res.to_host_result())
-            }
-            Ok(None) => {
-                debug!("No result to forward for transaction {}", tx);
-                return Ok(()); // No result to forward
-            }
-            Err(e) => {
-                error!("Network operation error for transaction {}: {}", tx, e);
-                // Create a generic client error for operation failures
-                use freenet_stdlib::client_api::{ClientError, ErrorKind};
-                Arc::new(Err(ClientError::from(ErrorKind::OperationError {
-                    cause: e.to_string().into(),
-                })))
-            }
+        let status = match &host_result {
+            Some(Ok(_)) => "op_result",
+            Some(Err(_)) => "error",
+            None => "no_result",
+        };
+        tracing::debug!(%tx, status, "Routing network result to SessionActor");
+
+        let Some(host_result) = host_result else {
+            debug!("No result to forward for transaction {}", tx);
+            return Ok(());
         };
 
         // Create session message for pure actor routing
         // The SessionActor will handle all client correlation internally
         let session_msg = SessionMessage::DeliverHostResponse {
             tx,
-            response: host_result,
+            response: Arc::new(host_result),
         };
 
         // Send to SessionActor - it handles all client concerns
         if let Err(e) = self.result_tx.send(session_msg).await {
-            error!(
+            tracing::error!(
                 "Failed to send result to SessionActor for transaction {}: {}",
-                tx, e
+                tx,
+                e
             );
             return Err(ProcessingError::ActorCommunication(e));
         }
@@ -94,7 +88,8 @@ impl MessageProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::{get, OpEnum};
+    use crate::operations::get;
+    use crate::operations::OpEnum;
     use freenet_stdlib::prelude::ContractKey;
     use tokio::sync::mpsc;
 
@@ -102,29 +97,22 @@ mod tests {
         Transaction::new::<crate::operations::get::GetMsg>()
     }
 
-    fn create_success_op_result() -> Result<Option<OpEnum>, crate::node::OpError> {
-        // Create a GetOp using the proper constructor
+    fn create_success_host_result() -> Option<HostResult> {
         use freenet_stdlib::prelude::ContractInstanceId;
         let key = ContractKey::from(ContractInstanceId::new([1u8; 32]));
         let get_op = get::start_op(key, false, false);
-        Ok(Some(OpEnum::Get(get_op)))
+        Some(OpEnum::Get(get_op).to_host_result())
     }
 
-    fn create_none_op_result() -> Result<Option<OpEnum>, crate::node::OpError> {
-        Ok(None)
+    fn create_none_host_result() -> Option<HostResult> {
+        None
     }
 
-    fn create_error_op_result() -> Result<Option<OpEnum>, crate::node::OpError> {
-        let tx = create_test_transaction();
-        Err(crate::node::OpError::InvalidStateTransition {
-            tx,
-            #[cfg(debug_assertions)]
-            state: Some(
-                Box::new("test_state".to_string()) as Box<dyn std::fmt::Debug + Send + Sync>
-            ),
-            #[cfg(debug_assertions)]
-            trace: std::backtrace::Backtrace::capture(),
-        })
+    fn create_error_host_result() -> Option<HostResult> {
+        use freenet_stdlib::client_api::{ClientError, ErrorKind};
+        Some(Err(ClientError::from(ErrorKind::OperationError {
+            cause: "test_state".into(),
+        })))
     }
 
     #[tokio::test]
@@ -143,7 +131,7 @@ mod tests {
         let tx = create_test_transaction();
 
         let result = processor
-            .handle_network_result(tx, create_success_op_result())
+            .handle_network_result(tx, create_success_host_result())
             .await;
 
         assert!(result.is_ok());
@@ -168,7 +156,7 @@ mod tests {
         let tx = create_test_transaction();
 
         let result = processor
-            .handle_network_result(tx, create_none_op_result())
+            .handle_network_result(tx, create_none_host_result())
             .await;
 
         assert!(result.is_ok());
@@ -191,7 +179,7 @@ mod tests {
         let tx = create_test_transaction();
 
         let result = processor
-            .handle_network_result(tx, create_error_op_result())
+            .handle_network_result(tx, create_error_host_result())
             .await;
 
         assert!(result.is_ok());
@@ -221,7 +209,7 @@ mod tests {
         drop(session_rx);
 
         let result = processor
-            .handle_network_result(tx, create_success_op_result())
+            .handle_network_result(tx, create_success_host_result())
             .await;
 
         assert!(result.is_err());

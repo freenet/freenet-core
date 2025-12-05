@@ -23,10 +23,19 @@ use crate::{
 pub(crate) use opentelemetry_tracer::OTEventRegister;
 pub(crate) use test::TestEventListener;
 
+// Re-export for use in tests
+pub use event_aggregator::{
+    AOFEventSource, EventLogAggregator, EventSource, RoutingPath, TransactionFlowEvent,
+    WebSocketEventCollector,
+};
+
 use crate::node::OpManager;
 
 /// An append-only log for network events.
 mod aof;
+
+/// Event aggregation across multiple nodes for debugging and testing.
+pub mod event_aggregator;
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -116,7 +125,13 @@ pub(crate) struct NetEventLog<'a> {
 
 impl<'a> NetEventLog<'a> {
     pub fn route_event(tx: &'a Transaction, ring: &'a Ring, route_event: &RouteEvent) -> Self {
-        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key,
+        );
         NetEventLog {
             tx,
             peer_id,
@@ -124,23 +139,34 @@ impl<'a> NetEventLog<'a> {
         }
     }
 
-    pub fn connected(ring: &'a Ring, peer: PeerId, location: Location) -> Self {
-        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
+    pub fn connected(ring: &'a Ring, peer: PeerId, _location: Location) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        let connected = PeerKeyLocation::new(peer.pub_key.clone(), peer.addr);
+        // Note: location is computed from address, so we don't need to set it separately
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
             kind: EventKind::Connect(ConnectEvent::Connected {
                 this: ring.connection_manager.own_location(),
-                connected: PeerKeyLocation {
-                    peer,
-                    location: Some(location),
-                },
+                connected,
             }),
         }
     }
 
     pub fn disconnected(ring: &'a Ring, from: &'a PeerId) -> Self {
-        let peer_id = ring.connection_manager.get_peer_key().unwrap().clone();
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
@@ -149,29 +175,20 @@ impl<'a> NetEventLog<'a> {
     }
 
     pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
-        let Some(peer_id) = ring.connection_manager.get_peer_key() else {
+        let own_loc = ring.connection_manager.own_location();
+        let Some(own_addr) = own_loc.socket_addr() else {
             return Either::Right(vec![]);
         };
+        let peer_id = PeerId::new(own_addr, own_loc.pub_key().clone());
         let kind = match msg {
             NetMessage::V1(NetMessageV1::Connect(connect::ConnectMsg::Response {
-                msg:
-                    connect::ConnectResponse::AcceptedBy {
-                        accepted, acceptor, ..
-                    },
-                ..
+                target, ..
             })) => {
                 let this_peer = ring.connection_manager.own_location();
-                if *accepted {
-                    EventKind::Connect(ConnectEvent::Connected {
-                        this: this_peer,
-                        connected: PeerKeyLocation {
-                            peer: acceptor.peer.clone(),
-                            location: acceptor.location,
-                        },
-                    })
-                } else {
-                    EventKind::Ignored
-                }
+                EventKind::Connect(ConnectEvent::Connected {
+                    this: this_peer,
+                    connected: target.clone(),
+                })
             }
             _ => EventKind::Ignored,
         };
@@ -188,27 +205,35 @@ impl<'a> NetEventLog<'a> {
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
             NetMessageV1::Connect(connect::ConnectMsg::Response {
-                msg:
-                    connect::ConnectResponse::AcceptedBy {
-                        acceptor,
-                        accepted,
-                        joiner,
-                        ..
-                    },
-                ..
+                target, payload, ..
             }) => {
-                let this_peer = &op_manager.ring.connection_manager.get_peer_key().unwrap();
-                let mut events = vec![];
-                if *accepted {
-                    events.push(NetEventLog {
+                let acceptor = payload.acceptor.clone();
+                // Skip event if addresses are unknown (e.g., gateway behind NAT without public address)
+                let (Some(acceptor_addr), Some(target_addr)) =
+                    (acceptor.socket_addr(), target.socket_addr())
+                else {
+                    return Either::Right(vec![]);
+                };
+                let acceptor_peer = PeerId::new(acceptor_addr, acceptor.pub_key().clone());
+                let target_peer = PeerId::new(target_addr, target.pub_key().clone());
+                let events = vec![
+                    NetEventLog {
                         tx: msg.id(),
-                        peer_id: this_peer.clone(),
-                        kind: EventKind::Connect(ConnectEvent::Finished {
-                            initiator: joiner.clone(),
-                            location: acceptor.location.unwrap(),
+                        peer_id: acceptor_peer.clone(),
+                        kind: EventKind::Connect(ConnectEvent::Connected {
+                            this: acceptor.clone(),
+                            connected: target.clone(),
                         }),
-                    });
-                }
+                    },
+                    NetEventLog {
+                        tx: msg.id(),
+                        peer_id: target_peer,
+                        kind: EventKind::Connect(ConnectEvent::Connected {
+                            this: target.clone(),
+                            connected: acceptor,
+                        }),
+                    },
+                ];
                 return Either::Right(events);
             }
             NetMessageV1::Put(PutMsg::RequestPut {
@@ -231,10 +256,10 @@ impl<'a> NetEventLog<'a> {
                 id,
                 target,
                 key,
-                sender,
+                origin,
             }) => EventKind::Put(PutEvent::PutSuccess {
                 id: *id,
-                requester: sender.clone(),
+                requester: origin.clone(),
                 target: target.clone(),
                 key: *key,
                 timestamp: chrono::Utc::now().timestamp() as u64,
@@ -246,7 +271,7 @@ impl<'a> NetEventLog<'a> {
                 key,
                 id,
                 upstream,
-                sender,
+                origin,
                 ..
             }) => EventKind::Put(PutEvent::BroadcastEmitted {
                 id: *id,
@@ -255,11 +280,11 @@ impl<'a> NetEventLog<'a> {
                 broadcasted_to: *broadcasted_to,
                 key: *key,
                 value: new_value.clone(),
-                sender: sender.clone(),
+                sender: origin.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Put(PutMsg::BroadcastTo {
-                sender,
+                origin,
                 new_value,
                 key,
                 target,
@@ -267,7 +292,7 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => EventKind::Put(PutEvent::BroadcastReceived {
                 id: *id,
-                requester: sender.clone(),
+                requester: origin.clone(),
                 key: *key,
                 value: new_value.clone(),
                 target: target.clone(),
@@ -277,7 +302,6 @@ impl<'a> NetEventLog<'a> {
                 id,
                 key,
                 value: StoreResponse { state: Some(_), .. },
-                sender,
                 target,
                 ..
             }) => EventKind::Get {
@@ -285,18 +309,19 @@ impl<'a> NetEventLog<'a> {
                 key: *key,
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 requester: target.clone(),
-                target: sender.clone(),
+                // Note: sender no longer embedded in message - use connection-based routing
+                target: target.clone(), // Placeholder - actual sender from source_addr
             },
             NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
                 id,
                 subscribed: true,
                 key,
-                sender,
                 target,
             }) => EventKind::Subscribed {
                 id: *id,
                 key: *key,
-                at: sender.clone(),
+                // Note: sender no longer embedded in message - use connection-based routing
+                at: target.clone(), // Placeholder - actual sender from source_addr
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 requester: target.clone(),
             },
@@ -312,19 +337,6 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Update(UpdateMsg::SuccessfulUpdate {
-                id,
-                target,
-                sender,
-                key,
-                ..
-            }) => EventKind::Update(UpdateEvent::UpdateSuccess {
-                id: *id,
-                requester: sender.clone(),
-                target: target.clone(),
-                key: *key,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
             NetMessageV1::Update(UpdateMsg::Broadcasting {
                 new_value,
                 broadcast_to,
@@ -332,8 +344,6 @@ impl<'a> NetEventLog<'a> {
                 key,
                 id,
                 upstream,
-                sender,
-                ..
             }) => EventKind::Update(UpdateEvent::BroadcastEmitted {
                 id: *id,
                 upstream: upstream.clone(),
@@ -341,46 +351,48 @@ impl<'a> NetEventLog<'a> {
                 broadcasted_to: *broadcasted_to,
                 key: *key,
                 value: new_value.clone(),
-                sender: sender.clone(),
+                // Note: sender no longer embedded in message - use connection-based routing
+                sender: upstream.clone(), // Placeholder - actual sender from source_addr
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Update(UpdateMsg::BroadcastTo {
-                sender,
                 new_value,
                 key,
                 target,
                 id,
-                ..
             }) => EventKind::Update(UpdateEvent::BroadcastReceived {
                 id: *id,
                 requester: target.clone(),
                 key: *key,
                 value: new_value.clone(),
-                target: sender.clone(),
+                // Note: sender no longer embedded in message - use connection-based routing
+                target: target.clone(), // Placeholder - actual sender from source_addr
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             _ => EventKind::Ignored,
         };
+        let own_loc = op_manager.ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
         Either::Left(NetEventLog {
             tx: msg.id(),
-            peer_id: op_manager
-                .ring
-                .connection_manager
-                .get_peer_key()
-                .unwrap()
-                .clone(),
+            peer_id,
             kind,
         })
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-struct NetLogMessage {
-    tx: Transaction,
-    datetime: DateTime<Utc>,
-    peer_id: PeerId,
-    kind: EventKind,
+pub struct NetLogMessage {
+    pub tx: Transaction,
+    pub datetime: DateTime<Utc>,
+    pub peer_id: PeerId,
+    pub kind: EventKind,
 }
 
 impl NetLogMessage {
@@ -453,10 +465,36 @@ impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
     }
 }
 
+// Internal message type for the event logger
+#[allow(clippy::large_enum_variant)]
+enum EventLogCommand {
+    Log(NetLogMessage),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Handle for flushing an EventRegister (can be stored separately for testing)
 #[derive(Clone)]
+pub struct EventFlushHandle {
+    sender: mpsc::Sender<EventLogCommand>,
+}
+
+impl EventFlushHandle {
+    /// Request a flush and wait for completion
+    pub async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.sender.send(EventLogCommand::Flush(tx)).await.is_ok() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+        }
+    }
+}
+
 pub(crate) struct EventRegister {
     log_file: Arc<PathBuf>,
-    log_sender: mpsc::Sender<NetLogMessage>,
+    log_sender: mpsc::Sender<EventLogCommand>,
+    // Track the number of clones to know when to flush
+    clone_count: Arc<std::sync::atomic::AtomicUsize>,
+    // Handle for external flushing
+    flush_handle: EventFlushHandle,
 }
 
 /// Records from a new session must have higher than this ts.
@@ -468,16 +506,28 @@ impl EventRegister {
     pub fn new(event_log_path: PathBuf) -> Self {
         let (log_sender, log_recv) = mpsc::channel(1000);
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
-        let log_file = Arc::new(event_log_path);
+        let log_file = Arc::new(event_log_path.clone());
         GlobalExecutor::spawn(Self::record_logs(log_recv, log_file.clone()));
+
+        let flush_handle = EventFlushHandle {
+            sender: log_sender.clone(),
+        };
+
         Self {
             log_sender,
-            log_file,
+            log_file: Arc::new(event_log_path),
+            clone_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            flush_handle,
         }
     }
 
+    /// Get a handle for flushing this EventRegister (for testing)
+    pub fn flush_handle(&self) -> EventFlushHandle {
+        self.flush_handle.clone()
+    }
+
     async fn record_logs(
-        mut log_recv: mpsc::Receiver<NetLogMessage>,
+        mut log_recv: mpsc::Receiver<EventLogCommand>,
         event_log_path: Arc<PathBuf>,
     ) {
         use futures::StreamExt;
@@ -500,12 +550,22 @@ impl EventRegister {
                 futures::future::pending().boxed()
             };
             tokio::select! {
-                log = log_recv.recv() => {
-                    let Some(log) = log else { break; };
-                    if let Some(ws) = ws.as_mut() {
-                        send_to_metrics_server(ws, &log).await;
+                cmd = log_recv.recv() => {
+                    let Some(cmd) = cmd else { break; };
+                    match cmd {
+                        EventLogCommand::Log(log) => {
+                            if let Some(ws) = ws.as_mut() {
+                                send_to_metrics_server(ws, &log).await;
+                            }
+                            event_log.persist_log(log).await;
+                        }
+                        EventLogCommand::Flush(reply) => {
+                            // Flush any remaining events in the batch
+                            Self::flush_batch(&mut event_log).await;
+                            // Signal completion
+                            let _ = reply.send(());
+                        }
                     }
-                    event_log.persist_log(log).await;
                 }
                 ws_msg = ws_recv => {
                     if let Some((ws, ws_msg)) = ws.as_mut().zip(ws_msg) {
@@ -515,21 +575,59 @@ impl EventRegister {
             }
         }
 
-        // store remaining logs
+        // store remaining logs on channel close
+        Self::flush_batch(&mut event_log).await;
+    }
+
+    async fn flush_batch(event_log: &mut aof::LogFile) {
         let moved_batch = std::mem::replace(&mut event_log.batch, aof::Batch::new(aof::BATCH_SIZE));
         let batch_writes = moved_batch.num_writes;
+        if batch_writes == 0 {
+            return;
+        }
         match aof::LogFile::encode_batch(&moved_batch) {
             Ok(batch_serialized_data) => {
                 if !batch_serialized_data.is_empty()
                     && event_log.write_all(&batch_serialized_data).await.is_err()
                 {
-                    panic!("Failed writting event log");
+                    tracing::error!("Failed writing remaining event log batch");
                 }
                 event_log.update_recs(batch_writes);
             }
             Err(err) => {
                 tracing::error!("Failed encode batch: {err}");
             }
+        }
+    }
+}
+
+impl Clone for EventRegister {
+    fn clone(&self) -> Self {
+        // Increment the reference count when cloning
+        self.clone_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            log_file: self.log_file.clone(),
+            log_sender: self.log_sender.clone(),
+            clone_count: self.clone_count.clone(),
+            flush_handle: self.flush_handle.clone(),
+        }
+    }
+}
+
+impl Drop for EventRegister {
+    fn drop(&mut self) {
+        // Decrement the reference count
+        let prev_count = self
+            .clone_count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+        // If this was the last instance (count was 1, now 0), the sender will be dropped
+        // and the channel will close, triggering the flush in record_logs
+        if prev_count == 1 {
+            tracing::debug!(
+                "Last EventRegister instance dropped, channel will close and trigger flush"
+            );
         }
     }
 }
@@ -541,7 +639,7 @@ impl NetEventRegister for EventRegister {
     ) -> BoxFuture<'a, ()> {
         async {
             for log_msg in NetLogMessage::to_log_message(logs) {
-                let _ = self.log_sender.send(log_msg).await;
+                let _ = self.log_sender.send(EventLogCommand::Log(log_msg)).await;
             }
         }
         .boxed()
@@ -585,23 +683,34 @@ async fn send_to_metrics_server(
 
     let res = match &send_msg.kind {
         EventKind::Connect(ConnectEvent::Connected {
-            this:
-                PeerKeyLocation {
-                    peer: from_peer,
-                    location: Some(from_loc),
-                },
-            connected:
-                PeerKeyLocation {
-                    peer: to_peer,
-                    location: Some(to_loc),
-                },
+            this: this_peer,
+            connected: connected_peer,
         }) => {
-            let msg = PeerChange::added_connection_msg(
-                (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
-                (from_peer.clone().to_string(), from_loc.as_f64()),
-                (to_peer.clone().to_string(), to_loc.as_f64()),
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            // Both peers must have known locations to send to metrics server
+            if let (Some(from_loc), Some(to_loc)) =
+                (this_peer.location(), connected_peer.location())
+            {
+                let this_id = PeerId::new(
+                    this_peer
+                        .socket_addr()
+                        .expect("this peer should have address"),
+                    this_peer.pub_key().clone(),
+                );
+                let connected_id = PeerId::new(
+                    connected_peer
+                        .socket_addr()
+                        .expect("connected peer should have address"),
+                    connected_peer.pub_key().clone(),
+                );
+                let msg = PeerChange::added_connection_msg(
+                    (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
+                    (this_id.to_string(), from_loc.as_f64()),
+                    (connected_id.to_string(), to_loc.as_f64()),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Disconnected { from } => {
             let msg = PeerChange::removed_connection_msg(
@@ -617,17 +726,21 @@ async fn send_to_metrics_server(
             timestamp,
             ..
         }) => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-            let msg = ContractChange::put_request_msg(
-                send_msg.tx.to_string(),
-                key.to_string(),
-                requester.to_string(),
-                target.peer.to_string(),
-                *timestamp,
-                contract_location.as_f64(),
-            );
-
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let Some(target_addr) = target.socket_addr() {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let msg = ContractChange::put_request_msg(
+                    send_msg.tx.to_string(),
+                    key.to_string(),
+                    requester.to_string(),
+                    target_id.to_string(),
+                    *timestamp,
+                    contract_location.as_f64(),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Put(PutEvent::PutSuccess {
             requester,
@@ -636,17 +749,21 @@ async fn send_to_metrics_server(
             timestamp,
             ..
         }) => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-
-            let msg = ContractChange::put_success_msg(
-                send_msg.tx.to_string(),
-                key.to_string(),
-                requester.to_string(),
-                target.peer.to_string(),
-                *timestamp,
-                contract_location.as_f64(),
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let Some(target_addr) = target.socket_addr() {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let msg = ContractChange::put_success_msg(
+                    send_msg.tx.to_string(),
+                    key.to_string(),
+                    requester.to_string(),
+                    target_id.to_string(),
+                    *timestamp,
+                    contract_location.as_f64(),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Put(PutEvent::BroadcastEmitted {
             id,
@@ -716,17 +833,22 @@ async fn send_to_metrics_server(
             timestamp,
             requester,
         } => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-            let msg = ContractChange::subscribed_msg(
-                requester.to_string(),
-                id.to_string(),
-                key.to_string(),
-                contract_location.as_f64(),
-                at.peer.to_string(),
-                at.location.unwrap().as_f64(),
-                *timestamp,
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let (Some(at_addr), Some(at_loc)) = (at.socket_addr(), at.location()) {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let at_id = PeerId::new(at_addr, at.pub_key().clone());
+                let msg = ContractChange::subscribed_msg(
+                    requester.to_string(),
+                    id.to_string(),
+                    key.to_string(),
+                    contract_location.as_f64(),
+                    at_id.to_string(),
+                    at_loc.as_f64(),
+                    *timestamp,
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
 
         EventKind::Update(UpdateEvent::Request {
@@ -736,16 +858,21 @@ async fn send_to_metrics_server(
             target,
             timestamp,
         }) => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-            let msg = ContractChange::update_request_msg(
-                id.to_string(),
-                key.to_string(),
-                requester.to_string(),
-                target.peer.to_string(),
-                *timestamp,
-                contract_location.as_f64(),
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let Some(target_addr) = target.socket_addr() {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let msg = ContractChange::update_request_msg(
+                    id.to_string(),
+                    key.to_string(),
+                    requester.to_string(),
+                    target_id.to_string(),
+                    *timestamp,
+                    contract_location.as_f64(),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Update(UpdateEvent::UpdateSuccess {
             id,
@@ -754,16 +881,21 @@ async fn send_to_metrics_server(
             key,
             timestamp,
         }) => {
-            let contract_location = Location::from_contract_key(key.as_bytes());
-            let msg = ContractChange::update_success_msg(
-                id.to_string(),
-                key.to_string(),
-                requester.to_string(),
-                target.peer.to_string(),
-                *timestamp,
-                contract_location.as_f64(),
-            );
-            ws_stream.send(Message::Binary(msg.into())).await
+            if let Some(target_addr) = target.socket_addr() {
+                let contract_location = Location::from_contract_key(key.as_bytes());
+                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let msg = ContractChange::update_success_msg(
+                    id.to_string(),
+                    key.to_string(),
+                    requester.to_string(),
+                    target_id.to_string(),
+                    *timestamp,
+                    contract_location.as_f64(),
+                );
+                ws_stream.send(Message::Binary(msg.into())).await
+            } else {
+                Ok(())
+            }
         }
         EventKind::Update(UpdateEvent::BroadcastEmitted {
             id,
@@ -1101,8 +1233,9 @@ mod opentelemetry_tracer {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
+#[allow(private_interfaces)]
 // todo: make this take by ref instead, probably will need an owned version
-enum EventKind {
+pub enum EventKind {
     Connect(ConnectEvent),
     Put(PutEvent),
     // todo: make this a sequence like Put
@@ -1270,7 +1403,7 @@ pub(crate) mod tracer {
         {
             if std::env::var("TOKIO_CONSOLE").is_ok() {
                 console_subscriber::init();
-                println!(
+                tracing::info!(
                     "Tokio console subscriber initialized. Connect with 'tokio-console' command."
                 );
                 return Ok(());
@@ -1294,17 +1427,64 @@ pub(crate) mod tracer {
 
         let disabled_logs = std::env::var("FREENET_DISABLE_LOGS").is_ok();
         let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
+        let use_json = std::env::var("FREENET_LOG_FORMAT")
+            .map(|v| v.to_lowercase() == "json")
+            .unwrap_or(false);
+
         let layers = {
-            let fmt_layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
-            let fmt_layer = if cfg!(any(test, debug_assertions)) {
-                fmt_layer.with_file(true).with_line_number(true)
+            // Create the base layer with either pretty or JSON formatting
+            let fmt_layer = if use_json {
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .json()
+                    .boxed()
+            } else {
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .pretty()
+                    .boxed()
+            };
+
+            // Apply file/line number configuration for test/debug builds
+            let fmt_layer = if cfg!(any(test, debug_assertions)) && !use_json {
+                // For pretty format, we can add file/line info
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .pretty()
+                    .with_file(true)
+                    .with_line_number(true)
+                    .boxed()
+            } else if cfg!(any(test, debug_assertions)) && use_json {
+                // For JSON format, file/line are automatically included
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .json()
+                    .with_file(true)
+                    .with_line_number(true)
+                    .boxed()
             } else {
                 fmt_layer
             };
-            let fmt_layer = if to_stderr {
-                fmt_layer.with_writer(std::io::stderr).boxed()
+
+            // Apply stderr writer configuration
+            let fmt_layer = if to_stderr && use_json {
+                tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .json()
+                    .with_file(cfg!(any(test, debug_assertions)))
+                    .with_line_number(cfg!(any(test, debug_assertions)))
+                    .with_writer(std::io::stderr)
+                    .boxed()
+            } else if to_stderr && !use_json {
+                let layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
+                let layer = if cfg!(any(test, debug_assertions)) {
+                    layer.with_file(true).with_line_number(true)
+                } else {
+                    layer
+                };
+                layer.with_writer(std::io::stderr).boxed()
             } else {
-                fmt_layer.boxed()
+                fmt_layer
             };
             #[cfg(not(feature = "trace-ot"))]
             {
@@ -1319,7 +1499,7 @@ pub(crate) mod tracer {
                 } else {
                     "freenet-core".to_string()
                 };
-                println!("setting OT collector with identifier: {identifier}");
+                tracing::info!("setting OT collector with identifier: {identifier}");
                 // TODO: Fix OpenTelemetry version conflicts and API changes
                 // The code below needs to be updated to work with the new OpenTelemetry API
                 // For now, we'll just use the fmt_layer without OpenTelemetry tracing
@@ -1372,7 +1552,7 @@ pub(super) mod test {
     pub(crate) struct TestEventListener {
         node_labels: Arc<DashMap<NodeLabel, TransportPublicKey>>,
         tx_log: Arc<DashMap<Transaction, Vec<ListenerLogId>>>,
-        logs: Arc<tokio::sync::Mutex<Vec<NetLogMessage>>>,
+        pub(crate) logs: Arc<tokio::sync::Mutex<Vec<NetLogMessage>>>,
         network_metrics_server:
             Arc<tokio::sync::Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
     }
@@ -1426,14 +1606,18 @@ pub(super) mod test {
                 .filter_map(|l| {
                     if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = &l.kind
                     {
+                        let connected_id =
+                            PeerId::new(connected.socket_addr()?, connected.pub_key().clone());
                         let disconnected = disconnects
-                            .get(&connected.peer)
+                            .get(&connected_id)
                             .iter()
                             .flat_map(|dcs| dcs.iter())
                             .any(|dc| dc > &l.datetime);
-                        if let Some((this_loc, conn_loc)) = this.location.zip(connected.location) {
-                            if &this.peer.pub_key == key && !disconnected {
-                                return Some((connected.peer.clone(), conn_loc.distance(this_loc)));
+                        if let Some((this_loc, conn_loc)) =
+                            this.location().zip(connected.location())
+                        {
+                            if this.pub_key() == key && !disconnected {
+                                return Some((connected_id, conn_loc.distance(this_loc)));
                             }
                         }
                     }
@@ -1509,43 +1693,34 @@ pub(super) mod test {
 
     #[tokio::test]
     async fn test_get_connections() -> anyhow::Result<()> {
-        use crate::ring::Location;
         let peer_id = PeerId::random();
-        let loc = Location::try_from(0.5)?;
         let tx = Transaction::new::<connect::ConnectMsg>();
-        let locations = [
-            (PeerId::random(), Location::try_from(0.5)?),
-            (PeerId::random(), Location::try_from(0.75)?),
-            (PeerId::random(), Location::try_from(0.25)?),
-        ];
+        // Create other peers - location is now computed from their addresses
+        let other_peers = [PeerId::random(), PeerId::random(), PeerId::random()];
 
         let listener = TestEventListener::new().await;
-        let futs = futures::stream::FuturesUnordered::from_iter(locations.iter().map(
-            |(other, location)| {
-                listener.register_events(Either::Left(NetEventLog {
-                    tx: &tx,
-                    peer_id: peer_id.clone(),
-                    kind: EventKind::Connect(ConnectEvent::Connected {
-                        this: PeerKeyLocation {
-                            peer: peer_id.clone(),
-                            location: Some(loc),
-                        },
-                        connected: PeerKeyLocation {
-                            peer: other.clone(),
-                            location: Some(*location),
-                        },
-                    }),
-                }))
-            },
-        ));
+        let futs = futures::stream::FuturesUnordered::from_iter(other_peers.iter().map(|other| {
+            listener.register_events(Either::Left(NetEventLog {
+                tx: &tx,
+                peer_id: peer_id.clone(),
+                kind: EventKind::Connect(ConnectEvent::Connected {
+                    this: PeerKeyLocation::new(peer_id.pub_key.clone(), peer_id.addr),
+                    connected: PeerKeyLocation::new(other.pub_key.clone(), other.addr),
+                }),
+            }))
+        }));
 
         futures::future::join_all(futs).await;
 
         let distances: Vec<_> = listener.connections(&peer_id.pub_key).collect();
-        assert!(distances.len() == 3);
-        assert!(
-            (distances.iter().map(|(_, l)| l.as_f64()).sum::<f64>() - 0.5f64).abs() < f64::EPSILON
-        );
+        assert_eq!(distances.len(), 3, "Should have 3 connections");
+        // Verify each distance is valid (between 0 and 0.5 on the ring)
+        for (_, dist) in &distances {
+            assert!(
+                dist.as_f64() >= 0.0 && dist.as_f64() <= 0.5,
+                "Distance should be valid ring distance"
+            );
+        }
         Ok(())
     }
 }

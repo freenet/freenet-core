@@ -37,10 +37,7 @@ use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::{Address, GatewayConfig, WebsocketApiConfig},
-    contract::{
-        Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler,
-        WaitingTransaction,
-    },
+    contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, Transaction, TransactionType},
     operations::{
@@ -117,7 +114,8 @@ pub struct NodeConfig {
     pub network_listener_ip: IpAddr,
     /// socket port to bind to the network listener.
     pub network_listener_port: u16,
-    pub(crate) peer_id: Option<PeerId>,
+    /// Our own external socket address, if known (set for gateways, learned for peers).
+    pub(crate) own_addr: Option<SocketAddr>,
     pub(crate) config: Arc<Config>,
     /// At least one gateway is required for joining the network.
     /// Not necessary if this is an initial node.
@@ -131,6 +129,8 @@ pub struct NodeConfig {
     pub(crate) max_upstream_bandwidth: Option<Rate>,
     pub(crate) max_downstream_bandwidth: Option<Rate>,
     pub(crate) blocked_addresses: Option<HashSet<SocketAddr>>,
+    pub(crate) transient_budget: usize,
+    pub(crate) transient_ttl: Duration,
 }
 
 impl NodeConfig {
@@ -167,37 +167,39 @@ impl NodeConfig {
             }
 
             let address = Self::parse_socket_addr(address).await?;
-            let peer_id = PeerId::new(address, transport_pub_key);
+            let peer_key_location = PeerKeyLocation::new(transport_pub_key, address);
             let location = location
                 .map(Location::new)
                 .unwrap_or_else(|| Location::from_address(&address));
-            gateways.push(InitPeerNode::new(peer_id, location));
+            gateways.push(InitPeerNode::new(peer_key_location, location));
         }
         tracing::info!(
             "Node will be listening at {}:{} internal address",
             config.network_api.address,
             config.network_api.port
         );
-        if let Some(peer_id) = &config.peer_id {
-            tracing::info!("Node external address: {}", peer_id.addr);
+        if let Some(own_addr) = &config.peer_id {
+            tracing::info!("Node external address: {}", own_addr.addr);
         }
         Ok(NodeConfig {
             should_connect: true,
             is_gateway: config.is_gateway,
             key_pair: config.transport_keypair().clone(),
             gateways,
-            peer_id: config.peer_id.clone(),
+            own_addr: config.peer_id.clone().map(|p| p.addr),
             network_listener_ip: config.network_api.address,
             network_listener_port: config.network_api.port,
             location: config.location.map(Location::new),
             config: Arc::new(config.clone()),
             max_hops_to_live: None,
             rnd_if_htl_above: None,
-            max_number_conn: None,
-            min_number_conn: None,
+            max_number_conn: Some(config.network_api.max_connections),
+            min_number_conn: Some(config.network_api.min_connections),
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,
             blocked_addresses: config.network_api.blocked_addresses.clone(),
+            transient_budget: config.network_api.transient_budget,
+            transient_ttl: Duration::from_secs(config.network_api.transient_ttl_secs),
         })
     }
 
@@ -299,8 +301,8 @@ impl NodeConfig {
         self
     }
 
-    pub fn with_peer_id(&mut self, peer_id: PeerId) -> &mut Self {
-        self.peer_id = Some(peer_id);
+    pub fn with_own_addr(&mut self, addr: SocketAddr) -> &mut Self {
+        self.own_addr = Some(addr);
         self
     }
 
@@ -320,18 +322,31 @@ impl NodeConfig {
         self,
         clients: [BoxedClient; CLIENTS],
     ) -> anyhow::Result<Node> {
-        let event_register = {
+        let (node, _flush_handle) = self.build_with_flush_handle(clients).await?;
+        Ok(node)
+    }
+
+    /// Builds a node and returns flush handle for event aggregation (for testing).
+    pub async fn build_with_flush_handle<const CLIENTS: usize>(
+        self,
+        clients: [BoxedClient; CLIENTS],
+    ) -> anyhow::Result<(Node, crate::tracing::EventFlushHandle)> {
+        let (event_register, flush_handle) = {
             #[cfg(feature = "trace-ot")]
             {
                 use super::tracing::{CombinedRegister, OTEventRegister};
-                CombinedRegister::new([
-                    Box::new(EventRegister::new(self.config.event_log())),
-                    Box::new(OTEventRegister::new()),
-                ])
+                let event_reg = EventRegister::new(self.config.event_log());
+                let flush_handle = event_reg.flush_handle();
+                (
+                    CombinedRegister::new([Box::new(event_reg), Box::new(OTEventRegister::new())]),
+                    flush_handle,
+                )
             }
             #[cfg(not(feature = "trace-ot"))]
             {
-                EventRegister::new(self.config.event_log())
+                let event_reg = EventRegister::new(self.config.event_log());
+                let flush_handle = event_reg.flush_handle();
+                (event_reg, flush_handle)
             }
         };
         let cfg = self.config.clone();
@@ -342,11 +357,11 @@ impl NodeConfig {
             cfg,
         )
         .await?;
-        Ok(Node(node))
+        Ok((Node(node), flush_handle))
     }
 
-    pub fn get_peer_id(&self) -> Option<PeerId> {
-        self.peer_id.clone()
+    pub fn get_own_addr(&self) -> Option<SocketAddr> {
+        self.own_addr
     }
 
     /// Returns all specified gateways for this peer. Returns an error if the peer is not a gateway
@@ -355,10 +370,7 @@ impl NodeConfig {
         let gateways: Vec<PeerKeyLocation> = self
             .gateways
             .iter()
-            .map(|node| PeerKeyLocation {
-                peer: node.peer_id.clone(),
-                location: Some(node.location),
-            })
+            .map(|node| node.peer_key_location.clone())
             .collect();
 
         if !self.is_gateway && gateways.is_empty() {
@@ -374,13 +386,16 @@ impl NodeConfig {
 /// Gateway node to use for joining the network.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct InitPeerNode {
-    peer_id: PeerId,
+    peer_key_location: PeerKeyLocation,
     location: Location,
 }
 
 impl InitPeerNode {
-    pub fn new(peer_id: PeerId, location: Location) -> Self {
-        Self { peer_id, location }
+    pub fn new(peer_key_location: PeerKeyLocation, location: Location) -> Self {
+        Self {
+            peer_key_location,
+            location,
+        }
     }
 }
 
@@ -522,11 +537,7 @@ async fn report_result(
                             second_trace_lines.join("\n")
                         })
                         .unwrap_or_default();
-                    let peer = &op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_key()
-                        .expect("Peer key not found");
+                    let peer = op_manager.ring.connection_manager.own_location();
                     let log = format!(
                         "Transaction ({tx} @ {peer}) error trace:\n {trace} \nstate:\n {state:?}\n"
                     );
@@ -534,11 +545,7 @@ async fn report_result(
                 }
                 #[cfg(not(debug_assertions))]
                 {
-                    let peer = &op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_key()
-                        .expect("Peer key not found");
+                    let peer = op_manager.ring.connection_manager.own_location();
                     let log = format!("Transaction ({tx} @ {peer}) error\n");
                     std::io::stderr().write_all(log.as_bytes()).unwrap();
                 }
@@ -603,9 +610,10 @@ pub(super) async fn process_message<CB>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_message_decoupled<CB>(
     msg: NetMessage,
+    source_addr: Option<std::net::SocketAddr>,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
-    event_listener: Box<dyn NetEventRegister>,
+    mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     message_processor: std::sync::Arc<MessageProcessor>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
@@ -617,16 +625,40 @@ pub(crate) async fn process_message_decoupled<CB>(
     // Pure network message processing - no client types involved
     let op_result = handle_pure_network_message(
         msg,
+        source_addr,
         op_manager.clone(),
         conn_manager,
-        event_listener,
-        executor_callback,
+        event_listener.as_mut(),
         pending_op_result,
     )
     .await;
 
+    // Prepare host result for session actor routing
+    let host_result = match &op_result {
+        Ok(Some(op_res)) => Some(op_res.to_host_result()),
+        Ok(None) => None,
+        Err(e) => Some(Err(freenet_stdlib::client_api::ClientError::from(
+            freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: e.to_string().into(),
+            },
+        ))),
+    };
+
+    // Report operation completion for telemetry/result routing
+    report_result(
+        Some(tx),
+        op_result,
+        &op_manager,
+        executor_callback,
+        &mut *event_listener,
+    )
+    .await;
+
     // Delegate to MessageProcessor - it handles all client concerns internally
-    if let Err(e) = message_processor.handle_network_result(tx, op_result).await {
+    if let Err(e) = message_processor
+        .handle_network_result(tx, host_result)
+        .await
+    {
         tracing::error!(
             "Failed to handle network result for transaction {}: {}",
             tx,
@@ -639,10 +671,10 @@ pub(crate) async fn process_message_decoupled<CB>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message<CB>(
     msg: NetMessage,
+    source_addr: Option<std::net::SocketAddr>,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
-    event_listener: Box<dyn NetEventRegister>,
-    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    event_listener: &mut dyn NetEventRegister,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
 where
@@ -652,10 +684,10 @@ where
         NetMessage::V1(msg_v1) => {
             handle_pure_network_message_v1(
                 msg_v1,
+                source_addr,
                 op_manager,
                 conn_manager,
                 event_listener,
-                executor_callback,
                 pending_op_result,
             )
             .await
@@ -690,8 +722,9 @@ async fn process_message_v1<CB>(
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
+                // Legacy path - no source_addr available
                 let op_result =
-                    handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
+                    handle_op_request::<ConnectOp, _>(&op_manager, &mut conn_manager, op, None)
                         .instrument(span)
                         .await;
 
@@ -706,8 +739,10 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Put(ref op) => {
+                // Legacy path - no source_addr available
                 let op_result =
-                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
+                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op, None)
+                        .await;
 
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
@@ -732,8 +767,10 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Get(ref op) => {
+                // Legacy path - no source_addr available
                 let op_result =
-                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
+                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op, None)
+                        .await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
                         let tx_id = *op.id();
@@ -754,10 +791,12 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Subscribe(ref op) => {
+                // Legacy path - no source_addr available
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                     &op_manager,
                     &mut conn_manager,
                     op,
+                    None,
                 )
                 .await;
                 if is_operation_completed(&op_result) {
@@ -780,9 +819,14 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Update(ref op) => {
-                let op_result =
-                    handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
-                        .await;
+                // Legacy path - no source_addr available
+                let op_result = handle_op_request::<update::UpdateOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    None,
+                )
+                .await;
                 if is_operation_completed(&op_result) {
                     if let Some(ref op_execution_callback) = pending_op_result {
                         let tx_id = *op.id();
@@ -802,10 +846,22 @@ async fn process_message_v1<CB>(
                 )
                 .await;
             }
-            NetMessageV1::Unsubscribed { ref key, .. } => {
-                if let Err(error) = subscribe(op_manager, *key, None).await {
-                    tracing::error!(%error, "Failed to subscribe to contract");
-                }
+            NetMessageV1::Unsubscribed {
+                ref key, ref from, ..
+            } => {
+                tracing::debug!(
+                    "Received Unsubscribed message for contract {} from peer {}",
+                    key,
+                    from
+                );
+                // Convert PeerKeyLocation to PeerId for remove_subscriber
+                let peer_id = PeerId {
+                    addr: from
+                        .socket_addr()
+                        .expect("from peer should have socket address"),
+                    pub_key: from.pub_key().clone(),
+                };
+                op_manager.ring.remove_subscriber(key, &peer_id);
                 break;
             }
             _ => break, // Exit the loop if no applicable message type is found
@@ -817,10 +873,10 @@ async fn process_message_v1<CB>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message_v1<CB>(
     msg: NetMessageV1,
+    source_addr: Option<std::net::SocketAddr>,
     op_manager: Arc<OpManager>,
     mut conn_manager: CB,
-    mut event_listener: Box<dyn NetEventRegister>,
-    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
+    event_listener: &mut dyn NetEventRegister,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
 where
@@ -845,10 +901,14 @@ where
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
-                let op_result =
-                    handle_op_request::<connect::ConnectOp, _>(&op_manager, &mut conn_manager, op)
-                        .instrument(span)
-                        .await;
+                let op_result = handle_op_request::<ConnectOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .instrument(span)
+                .await;
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -864,12 +924,10 @@ where
                     }
                 }
 
-                // Pure network result processing - no client handling
                 return handle_pure_network_result(
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
@@ -879,8 +937,13 @@ where
                     tx = %op.id(),
                     "handle_pure_network_message_v1: Processing PUT message"
                 );
-                let op_result =
-                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op).await;
+                let op_result = handle_op_request::<put::PutOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .await;
                 tracing::debug!(
                     tx = %op.id(),
                     op_result_ok = op_result.is_ok(),
@@ -916,14 +979,18 @@ where
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
             }
             NetMessageV1::Get(ref op) => {
-                let op_result =
-                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op).await;
+                let op_result = handle_op_request::<get::GetOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .await;
 
                 // Handle pending operation results (network concern)
                 if is_operation_completed(&op_result) {
@@ -954,15 +1021,18 @@ where
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
             }
             NetMessageV1::Update(ref op) => {
-                let op_result =
-                    handle_op_request::<update::UpdateOp, _>(&op_manager, &mut conn_manager, op)
-                        .await;
+                let op_result = handle_op_request::<update::UpdateOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .await;
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -982,7 +1052,6 @@ where
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
@@ -992,6 +1061,7 @@ where
                     &op_manager,
                     &mut conn_manager,
                     op,
+                    source_addr,
                 )
                 .await;
 
@@ -1013,15 +1083,26 @@ where
                     tx,
                     op_result,
                     &op_manager,
-                    executor_callback,
                     &mut *event_listener,
                 )
                 .await;
             }
-            NetMessageV1::Unsubscribed { ref key, .. } => {
-                if let Err(error) = subscribe(op_manager, *key, None).await {
-                    tracing::error!(%error, "Failed to subscribe to contract");
-                }
+            NetMessageV1::Unsubscribed {
+                ref key, ref from, ..
+            } => {
+                tracing::debug!(
+                    "Received Unsubscribed message for contract {} from peer {}",
+                    key,
+                    from
+                );
+                // Convert PeerKeyLocation to PeerId for remove_subscriber
+                let peer_id = PeerId {
+                    addr: from
+                        .socket_addr()
+                        .expect("from peer should have socket address"),
+                    pub_key: from.pub_key().clone(),
+                };
+                op_manager.ring.remove_subscriber(key, &peer_id);
                 break;
             }
             _ => break, // Exit the loop if no applicable message type is found
@@ -1037,7 +1118,6 @@ async fn handle_pure_network_result(
     tx: Option<Transaction>,
     op_result: Result<Option<crate::operations::OpEnum>, OpError>,
     _op_manager: &Arc<OpManager>,
-    _executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     _event_listener: &mut dyn NetEventRegister,
 ) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError> {
     tracing::debug!("Pure network result handling for transaction: {:?}", tx);
@@ -1057,10 +1137,6 @@ async fn handle_pure_network_result(
             }
 
             // TODO: Handle executor callbacks (network concern)
-            // Executor callback functionality needs to be restored with proper types
-            if let Some(_callback) = _executor_callback {
-                tracing::debug!("Executor callback available for transaction {:?} but not implemented in pure network processing", tx);
-            }
         }
         Ok(None) => {
             tracing::debug!("Network operation returned no result");
@@ -1082,6 +1158,7 @@ async fn handle_pure_network_result(
 }
 
 /// Attempts to subscribe to a contract
+#[allow(dead_code)]
 pub async fn subscribe(
     op_manager: Arc<OpManager>,
     key: ContractKey,
@@ -1108,13 +1185,7 @@ pub async fn subscribe_with_id(
         let request_id = RequestId::new();
         let _ = op_manager
             .ch_outbound
-            .waiting_for_transaction_result(
-                WaitingTransaction::Subscription {
-                    contract_key: *key.id(),
-                },
-                client_id,
-                request_id,
-            )
+            .waiting_for_subscription_result(id, *key.id(), client_id, request_id)
             .await;
     }
     // Initialize a subscribe op.
@@ -1133,36 +1204,51 @@ async fn handle_aborted_op(
     gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError> {
     use crate::util::IterExt;
-    if let TransactionType::Connect = tx.transaction_type() {
-        // attempt to establish a connection failed, this could be a fatal error since the node
-        // is useless without connecting to the network, we will retry with exponential backoff
-        // if necessary
-        match op_manager.pop(&tx) {
-            // only keep attempting to connect if the node hasn't got enough connections yet
-            Ok(Some(OpEnum::Connect(op)))
-                if op.has_backoff()
-                    && op_manager.ring.open_connections()
-                        < op_manager.ring.connection_manager.min_connections =>
-            {
-                let ConnectOp {
-                    gateway, backoff, ..
-                } = *op;
-                if let Some(gateway) = gateway {
-                    tracing::warn!("Retry connecting to gateway {}", gateway.peer);
-                    connect::join_ring_request(backoff, &gateway, op_manager).await?;
+    match tx.transaction_type() {
+        TransactionType::Connect => {
+            // attempt to establish a connection failed, this could be a fatal error since the node
+            // is useless without connecting to the network, we will retry with exponential backoff
+            // if necessary
+            match op_manager.pop(&tx) {
+                Ok(Some(OpEnum::Connect(op)))
+                    if op.has_backoff()
+                        && op_manager.ring.open_connections()
+                            < op_manager.ring.connection_manager.min_connections =>
+                {
+                    let gateway = op.gateway().cloned();
+                    if let Some(gateway) = gateway {
+                        tracing::warn!("Retry connecting to gateway {}", gateway);
+                        connect::join_ring_request(None, &gateway, op_manager).await?;
+                    }
                 }
+                Ok(Some(OpEnum::Connect(_))) => {
+                    if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
+                        tracing::warn!("Retrying joining the ring with an other gateway");
+                        if let Some(gateway) = gateways.iter().shuffle().next() {
+                            connect::join_ring_request(None, gateway, op_manager).await?
+                        }
+                    }
+                }
+                Ok(Some(other)) => {
+                    op_manager.push(tx, other).await?;
+                }
+                _ => {}
             }
-            Ok(Some(OpEnum::Connect(_))) => {
-                // if no connections were achieved just fail
-                if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
-                    tracing::warn!("Retrying joining the ring with an other gateway");
-                    if let Some(gateway) = gateways.iter().shuffle().next() {
-                        connect::join_ring_request(None, gateway, op_manager).await?
+        }
+        TransactionType::Get => match op_manager.pop(&tx) {
+            Ok(Some(OpEnum::Get(op))) => {
+                if let Err(err) = op.handle_abort(op_manager).await {
+                    if !matches!(err, OpError::StatePushed) {
+                        return Err(err);
                     }
                 }
             }
+            Ok(Some(other)) => {
+                op_manager.push(tx, other).await?;
+            }
             _ => {}
-        }
+        },
+        _ => {}
     }
     Ok(())
 }
@@ -1241,9 +1327,11 @@ impl<'a> arbitrary::Arbitrary<'a> for PeerId {
 impl PeerId {
     pub fn random() -> Self {
         use rand::Rng;
+        let mut rng = rand::rng();
         let mut addr = [0; 4];
-        rand::rng().fill(&mut addr[..]);
-        let port = crate::util::get_free_port().unwrap();
+        rng.fill(&mut addr[..]);
+        // Use random port instead of get_free_port() for speed - tests don't actually bind
+        let port: u16 = rng.random_range(1024..65535);
 
         let pub_key = PEER_ID.with(|peer_id| {
             let mut peer_id = peer_id.borrow_mut();
@@ -1408,7 +1496,7 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
             .then(|| {
                 node.0
                     .peer_id
-                    .clone()
+                    .as_ref()
                     .map(|id| Location::from_address(&id.addr))
             })
             .flatten()

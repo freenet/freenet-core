@@ -186,8 +186,12 @@ async fn create_peer_config(
             ignore_protocol_checking: true,
             address: Some(peer_ip.into()),
             network_port: Some(network_port),
+            min_connections: None,
+            max_connections: None,
             bandwidth_limit: None,
             blocked_addresses: None,
+            transient_budget: None,
+            transient_ttl_secs: None,
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),
@@ -255,11 +259,9 @@ async fn verify_network_topology(
 }
 
 /// Simplified test with just gateway + 1 peer to verify basic PUT operations work
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore] // Waker registration fix verified working - test fails due to unrelated connection issues
 async fn test_basic_room_creation() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
-
     info!("=== Basic Room Creation Test ===");
     info!("Testing minimal setup: 1 gateway + 1 peer");
 
@@ -386,8 +388,6 @@ async fn test_basic_room_creation() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires fixes still in progress"]
 async fn test_app_ubertest() -> anyhow::Result<()> {
-    freenet::config::set_logger(Some(tracing::level_filters::LevelFilter::DEBUG), None);
-
     info!("=== Freenet Application Ubertest ===");
     info!("Testing River as reference application");
 

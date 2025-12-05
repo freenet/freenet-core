@@ -68,7 +68,7 @@ pub fn set_cleanup_on_exit(config: Arc<ConfigPaths>) -> Result<(), ctrlc::Error>
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Backoff {
     attempt: usize,
     max_attempts: usize,
@@ -77,7 +77,7 @@ pub struct Backoff {
     strategy: BackoffStrategy,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BackoffStrategy {
     Exponential,
     Logarithmic { interval_reduction_factor: f64 },
@@ -376,6 +376,24 @@ impl Contains<PeerId> for &[&PeerId] {
 
 impl Contains<&PeerId> for &[&PeerId] {
     fn has_element(&self, target: &PeerId) -> bool {
+        self.contains(&target)
+    }
+}
+
+impl Contains<std::net::SocketAddr> for &[std::net::SocketAddr] {
+    fn has_element(&self, target: std::net::SocketAddr) -> bool {
+        self.contains(&target)
+    }
+}
+
+impl Contains<&std::net::SocketAddr> for &[std::net::SocketAddr] {
+    fn has_element(&self, target: &std::net::SocketAddr) -> bool {
+        self.contains(target)
+    }
+}
+
+impl Contains<std::net::SocketAddr> for &Vec<std::net::SocketAddr> {
+    fn has_element(&self, target: std::net::SocketAddr) -> bool {
         self.contains(&target)
     }
 }

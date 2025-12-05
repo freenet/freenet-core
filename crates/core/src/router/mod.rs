@@ -1,8 +1,8 @@
 mod isotonic_estimator;
 mod util;
 
-use crate::ring::{Location, PeerKeyLocation};
-use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
+use crate::ring::{Distance, Location, PeerKeyLocation};
+pub(crate) use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use util::{Mean, TransferSpeed};
@@ -162,9 +162,12 @@ impl Router {
 
         let mut peer_distances: Vec<_> = peers
             .into_iter()
-            .filter_map(|peer| {
-                peer.location
-                    .map(|loc| (peer, target_location.distance(loc)))
+            .map(|peer| {
+                let distance = peer
+                    .location()
+                    .map(|loc| target_location.distance(loc))
+                    .unwrap_or_else(|| Distance::new(0.5));
+                (peer, distance)
             })
             .collect();
 
@@ -203,8 +206,10 @@ impl Router {
             let mut peer_distances: Vec<_> = peers
                 .into_iter()
                 .filter_map(|peer| {
-                    peer.location
-                        .map(|loc| (peer, target_location.distance(loc)))
+                    peer.location().map(|loc| {
+                        let distance = target_location.distance(loc);
+                        (peer, distance)
+                    })
                 })
                 .collect();
 
@@ -355,11 +360,11 @@ mod tests {
             let contract_location = Location::random();
             // Pass a reference to the `peers` vector
             let best = router.select_peer(&peers, contract_location).unwrap();
-            let best_distance = best.location.unwrap().distance(contract_location);
+            let best_distance = best.location().unwrap().distance(contract_location);
             for peer in &peers {
                 // Dereference `best` when making the comparison
                 if *peer != *best {
-                    let distance = peer.location.unwrap().distance(contract_location);
+                    let distance = peer.location().unwrap().distance(contract_location);
                     assert!(distance >= best_distance);
                 }
             }
@@ -517,7 +522,7 @@ mod tests {
         peer: PeerKeyLocation,
         target_location: Location,
     ) -> RoutingPrediction {
-        let distance = peer.location.unwrap().distance(target_location);
+        let distance = peer.location().unwrap().distance(target_location);
         let time_to_response_start = 2.0 * distance.as_f64();
         let failure_prob = distance.as_f64();
         let transfer_speed = 100.0 - (100.0 * distance.as_f64());
@@ -543,7 +548,7 @@ mod tests {
     {
         let mut closest: Vec<&'a PeerKeyLocation> = peers.into_iter().collect();
         closest.sort_by_key(|&peer| {
-            if let Some(location) = peer.location {
+            if let Some(location) = peer.location() {
                 target_location.distance(location)
             } else {
                 Distance::new(f64::MAX)

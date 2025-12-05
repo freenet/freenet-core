@@ -300,6 +300,12 @@ impl ContractExecutor for Executor<Runtime> {
                 if updated_state.as_ref() == current_state.as_ref() {
                     Ok(UpsertResult::NoChange)
                 } else {
+                    // Persist the updated state before returning
+                    self.state_store
+                        .update(&key, updated_state.clone())
+                        .await
+                        .map_err(ExecutorError::other)?;
+
                     // todo: forward delta like we are doing with puts
                     tracing::warn!("Delta updates are not yet supported");
                     Ok(UpsertResult::Updated(updated_state))
@@ -367,9 +373,9 @@ impl ContractExecutor for Executor<Runtime> {
             } => {
                 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
                 let key = delegate.key().clone();
-                let arr = GenericArray::from_slice(&cipher);
+                let arr = (&cipher).into();
                 let cipher = XChaCha20Poly1305::new(arr);
-                let nonce = GenericArray::from_slice(&nonce).to_owned();
+                let nonce = nonce.into();
                 if let Some(contract) = attested_contract {
                     self.delegate_attested_ids
                         .entry(key.clone())
@@ -653,9 +659,9 @@ impl Executor<Runtime> {
             } => {
                 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
                 let key = delegate.key().clone();
-                let arr = GenericArray::from_slice(&cipher);
+                let arr = (&cipher).into();
                 let cipher = XChaCha20Poly1305::new(arr);
-                let nonce = GenericArray::from_slice(&nonce).to_owned();
+                let nonce = nonce.into();
                 if let Some(contract) = attested_contract {
                     self.delegate_attested_ids
                         .entry(key.clone())
@@ -864,6 +870,11 @@ impl Executor<Runtime> {
             .update(key, new_state.clone())
             .await
             .map_err(ExecutorError::other)?;
+
+        tracing::info!(
+            "Contract state updated for {key}, new_size_bytes={}",
+            new_state.as_ref().len()
+        );
 
         if let Err(err) = self
             .send_update_notification(key, parameters, &new_state)

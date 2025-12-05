@@ -1,0 +1,19 @@
+[package]
+name = "freenet-macros"
+version = "0.1.0"
+edition = "2021"
+authors = ["Freenet Contributors"]
+description = "Procedural macros for Freenet"
+license = "MIT OR Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full", "extra-traits", "parsing"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+darling = "0.21"  # For easier attribute parsing
+
+[dev-dependencies]
+trybuild = "1.0"  # For testing macro expansions

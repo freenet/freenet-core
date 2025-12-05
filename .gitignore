@@ -41,8 +41,6 @@ rustc-ice*.txt
 aider.conf.yaml
 
 # Claude-specific files
-CLAUDE.md
-**/CLAUDE.md
 CI_STATUS.md
 claude_notes/
 .claude/**

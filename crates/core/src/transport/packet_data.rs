@@ -1,10 +1,7 @@
 use std::marker::PhantomData;
 use std::{cell::RefCell, sync::Arc};
 
-use aes_gcm::{
-    aead::{generic_array::GenericArray, AeadInPlace},
-    Aes128Gcm,
-};
+use aes_gcm::{aead::AeadInPlace, Aes128Gcm};
 use rand::{prelude::SmallRng, rng, Rng, SeedableRng};
 
 use crate::transport::crypto::TransportPublicKey;
@@ -80,9 +77,9 @@ fn internal_sym_decryption<const N: usize>(
 ) -> Result<([u8; N], usize), aes_gcm::Error> {
     debug_assert!(data.len() >= NONCE_SIZE + TAG_SIZE);
 
-    let nonce = GenericArray::from_slice(&data[..NONCE_SIZE]);
+    let nonce = (&data[..NONCE_SIZE]).into();
     // Adjusted to extract the tag from the end of the encrypted data
-    let tag = GenericArray::from_slice(&data[size - TAG_SIZE..size]);
+    let tag = (&data[size - TAG_SIZE..size]).into();
     let encrypted_data = &data[NONCE_SIZE..size - TAG_SIZE];
     let mut buffer = [0u8; N];
     let buffer_len = encrypted_data.len();
@@ -169,22 +166,11 @@ impl<const N: usize> PacketData<Plaintext, N> {
 
         // Append the tag to the buffer
         buffer[NONCE_SIZE + payload_length..NONCE_SIZE + payload_length + TAG_SIZE]
-            .copy_from_slice(tag.as_slice());
+            .copy_from_slice(&tag);
 
         PacketData {
             data: buffer,
             size: NONCE_SIZE + payload_length + TAG_SIZE,
-            data_type: PhantomData,
-        }
-    }
-}
-
-#[cfg(test)]
-impl<const N: usize> PacketData<SymmetricAES, N> {
-    pub fn into_unknown(self) -> PacketData<UnknownEncryption, N> {
-        PacketData {
-            data: self.data,
-            size: self.size,
             data_type: PhantomData,
         }
     }
@@ -271,7 +257,7 @@ mod tests {
         rand::rng().fill(&mut key);
 
         // Create a key object for AES-GCM
-        let key = GenericArray::from_slice(&key);
+        let key = (&key).into();
 
         // Create a new AES-128-GCM instance
         let cipher = Aes128Gcm::new(key);
@@ -292,7 +278,7 @@ mod tests {
         rand::rng().fill(&mut key);
 
         // Create a key object for AES-GCM
-        let key = GenericArray::from_slice(&key);
+        let key = (&key).into();
 
         // Create a new AES-128-GCM instance
         let cipher = Aes128Gcm::new(key);
@@ -300,8 +286,9 @@ mod tests {
         let unencrypted_packet = PacketData::<_, 1000>::from_buf_plain(data);
         let mut encrypted_packet = unencrypted_packet.encrypt_symmetric(&cipher);
 
-        // Corrupt the packet data
-        encrypted_packet.data[encrypted_packet.size / 2] = 0;
+        // Corrupt the packet data by flipping bits at a deterministic position.
+        let mid = encrypted_packet.size / 2;
+        encrypted_packet.data[mid] ^= 0xFF;
 
         // Ensure decryption fails
         match encrypted_packet.decrypt(&cipher) {

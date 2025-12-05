@@ -48,7 +48,7 @@ use common::{
     base_node_test_config, get_all_ping_states, gw_config_from_path, ping_states_equal, APP_TAG,
     PACKAGE_DIR, PATH_TO_CONTRACT,
 };
-use freenet::{config::set_logger, local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_gateway};
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
@@ -61,7 +61,7 @@ use futures::FutureExt;
 use testresult::TestResult;
 use tokio::{select, time::sleep};
 use tokio_tungstenite::connect_async;
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::{span, Instrument, Level};
 
 /// Configuration for blocked peers test variants
 #[derive(Debug, Clone)]
@@ -98,7 +98,6 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
             "debug,freenet::operations::subscribe=trace,freenet::contract=trace",
         );
     }
-    set_logger(Some(LevelFilter::DEBUG), None);
 
     tracing::info!("Starting {} blocked peers test...", config.test_name);
 
@@ -244,15 +243,21 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         let (stream_node2, _) = connect_async(&uri_node2).await?;
         let mut client_node2 = WebApi::start(stream_node2);
 
-        // Load contract code
+        // Compile/load contract code (same helper used by other app tests)
         let path_to_code = std::path::PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
-        tracing::info!(path=%path_to_code.display(), "Loading contract code");
-        let code = std::fs::read(path_to_code)
-            .ok()
-            .ok_or_else(|| anyhow!("Failed to read contract code"))?;
-        let code_hash = CodeHash::from_code(&code);
+        tracing::info!(path = %path_to_code.display(), "Loading contract code");
 
-        // Define contract options
+        // First compile to compute the code hash, then rebuild options with the correct code_key
+        let temp_options = PingContractOptions {
+            frequency: Duration::from_secs(3),
+            ttl: Duration::from_secs(30),
+            tag: APP_TAG.to_string(),
+            code_key: String::new(),
+        };
+        let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
+        let temp_container = common::load_contract(&path_to_code, temp_params)?;
+        let code_hash = CodeHash::from_code(temp_container.data());
+
         let ping_options = PingContractOptions {
             frequency: Duration::from_secs(3),
             ttl: Duration::from_secs(30),
@@ -260,7 +265,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
             code_key: code_hash.to_string(),
         };
         let params = Parameters::from(serde_json::to_vec(&ping_options).unwrap());
-        let container = ContractContainer::try_from((code, &params))?;
+        let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
         // Gateway puts the contract
@@ -782,7 +787,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 }
 
 /// Standard blocked peers test (baseline)
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore]
 async fn test_ping_blocked_peers() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
@@ -802,7 +807,7 @@ async fn test_ping_blocked_peers() -> TestResult {
 }
 
 /// Simple blocked peers test
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore]
 async fn test_ping_blocked_peers_simple() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
@@ -825,8 +830,12 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
 // as they only varied in non-functional aspects like timeouts and logging
 
 /// Solution/reference implementation for blocked peers
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "fix me"]
+// TODO-MUST-FIX: WebSocket connection reset during teardown - see issue #2108
+// Test passes functionally (PUT/GET/Subscribe/state propagation all work) but
+// fails with "Connection reset without closing handshake" during cleanup.
+// Likely a test teardown race rather than functional bug.
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore]
 async fn test_ping_blocked_peers_solution() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "solution",

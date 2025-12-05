@@ -3,12 +3,13 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub(crate) use self::messages::SubscribeMsg;
-use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
+    contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
-    node::{NetworkBridge, OpManager, PeerId},
+    node::{NetworkBridge, OpManager},
     ring::{Location, PeerKeyLocation, RingError},
 };
 use freenet_stdlib::{
@@ -16,9 +17,80 @@ use freenet_stdlib::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
+use tokio::time::{sleep, Duration};
 
 const MAX_RETRIES: usize = 10;
+const LOCAL_FETCH_TIMEOUT_MS: u64 = 1_500;
+const LOCAL_FETCH_POLL_INTERVAL_MS: u64 = 25;
 
+fn subscribers_snapshot(op_manager: &OpManager, key: &ContractKey) -> Vec<String> {
+    op_manager
+        .ring
+        .subscribers_of(key)
+        .map(|subs| {
+            subs.iter()
+                .filter_map(|loc| loc.socket_addr())
+                .map(|addr| format!("{:.8}", addr))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Poll local storage for a short period until the fetched contract becomes available.
+async fn wait_for_local_contract(
+    op_manager: &OpManager,
+    key: ContractKey,
+) -> Result<bool, OpError> {
+    let mut elapsed = 0;
+    while elapsed < LOCAL_FETCH_TIMEOUT_MS {
+        if super::has_contract(op_manager, key).await? {
+            return Ok(true);
+        }
+        sleep(Duration::from_millis(LOCAL_FETCH_POLL_INTERVAL_MS)).await;
+        elapsed += LOCAL_FETCH_POLL_INTERVAL_MS;
+    }
+    Ok(false)
+}
+
+async fn fetch_contract_if_missing(
+    op_manager: &OpManager,
+    key: ContractKey,
+) -> Result<(), OpError> {
+    if has_contract_with_code(op_manager, key).await? {
+        return Ok(());
+    }
+
+    let get_op = get::start_op(key, true, false);
+    get::request_get(op_manager, get_op, HashSet::new()).await?;
+
+    if wait_for_local_contract(op_manager, key).await?
+        && has_contract_with_code(op_manager, key).await?
+    {
+        Ok(())
+    } else {
+        Err(RingError::NoCachingPeers(key).into())
+    }
+}
+
+async fn has_contract_with_code(op_manager: &OpManager, key: ContractKey) -> Result<bool, OpError> {
+    match op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            key,
+            return_contract_code: true,
+        })
+        .await?
+    {
+        ContractHandlerEvent::GetResponse {
+            response:
+                Ok(StoreResponse {
+                    state: Some(_),
+                    contract: Some(_),
+                }),
+            ..
+        } => Ok(true),
+        _ => Ok(false),
+    }
+}
 #[derive(Debug)]
 enum SubscribeState {
     /// Prepare the request to subscribe.
@@ -30,7 +102,7 @@ enum SubscribeState {
     ReceivedRequest,
     /// Awaitinh response from petition.
     AwaitingResponse {
-        skip_list: HashSet<PeerId>,
+        skip_list: HashSet<std::net::SocketAddr>,
         retries: usize,
         upstream_subscriber: Option<PeerKeyLocation>,
         current_hop: usize,
@@ -57,13 +129,21 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
 pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     let id = Transaction::new::<SubscribeMsg>();
     let state = Some(SubscribeState::PrepareRequest { id, key });
-    SubscribeOp { id, state }
+    SubscribeOp {
+        id,
+        state,
+        upstream_addr: None, // Local operation, no upstream peer
+    }
 }
 
 /// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
 pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp {
     let state = Some(SubscribeState::PrepareRequest { id, key });
-    SubscribeOp { id, state }
+    SubscribeOp {
+        id,
+        state,
+        upstream_addr: None, // Local operation, no upstream peer
+    }
 }
 
 /// Request to subscribe to value changes from a contract.
@@ -72,44 +152,84 @@ pub(crate) async fn request_subscribe(
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
     if let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state {
+        let own_loc = op_manager.ring.connection_manager.own_location();
+        let local_has_contract = super::has_contract(op_manager, *key).await?;
+
+        let own_addr = own_loc
+            .socket_addr()
+            .expect("own location must have socket address");
+        tracing::debug!(
+            tx = %id,
+            %key,
+            subscriber_peer = %own_addr,
+            local_has_contract,
+            "subscribe: request_subscribe invoked"
+        );
+
+        let mut skip_list: HashSet<std::net::SocketAddr> = HashSet::new();
+        skip_list.insert(own_addr);
+
         // Use k_closest_potentially_caching to try multiple candidates
-        const EMPTY: &[PeerId] = &[];
         // Try up to 3 candidates
-        let candidates = op_manager.ring.k_closest_potentially_caching(key, EMPTY, 3);
+        let candidates = op_manager
+            .ring
+            .k_closest_potentially_caching(key, &skip_list, 3);
+
+        if tracing::enabled!(tracing::Level::INFO) {
+            let skip_display: Vec<String> = skip_list
+                .iter()
+                .map(|addr| format!("{:.8}", addr))
+                .collect();
+            let candidate_display: Vec<String> = candidates
+                .iter()
+                .filter_map(|cand| cand.socket_addr())
+                .map(|addr| format!("{:.8}", addr))
+                .collect();
+            tracing::info!(
+                tx = %id,
+                %key,
+                skip = ?skip_display,
+                candidates = ?candidate_display,
+                "subscribe: k_closest_potentially_caching results"
+            );
+        }
 
         let target = match candidates.first() {
             Some(peer) => peer.clone(),
             None => {
-                // No remote peers available - check if we have the contract locally
-                tracing::debug!(%key, "No remote peers available for subscription, checking locally");
+                // No remote peers available - rely on local contract if present.
+                tracing::debug!(
+                    %key,
+                    "No remote peers available for subscription, checking locally"
+                );
 
-                if super::has_contract(op_manager, *key).await? {
-                    // We have the contract locally - complete operation immediately
-                    // Following Nacho's suggestion: use notify_node_event to tap into
-                    // result router directly without state transitions
-                    tracing::info!(%key, tx = %id, "Contract available locally, completing subscription via result router");
-
-                    // Use notify_node_event to deliver SubscribeResponse directly to client
-                    // This avoids the problem with notify_op_change overwriting the operation
-                    match op_manager
-                        .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
-                            tx: *id,
-                            key: *key,
-                            subscribed: true,
-                        })
-                        .await
-                    {
-                        Ok(()) => {
-                            tracing::info!(%key, tx = %id, "Successfully sent LocalSubscribeComplete event")
-                        }
-                        Err(e) => {
-                            tracing::error!(%key, tx = %id, error = %e, "Failed to send LocalSubscribeComplete event")
-                        }
-                    }
-
-                    return Ok(());
+                if local_has_contract {
+                    tracing::info!(
+                        %key,
+                        tx = %id,
+                        "No remote peers, fulfilling subscription locally"
+                    );
+                    return complete_local_subscription(op_manager, *id, *key).await;
                 } else {
-                    tracing::debug!(%key, "Contract not available locally and no remote peers");
+                    let connection_count = op_manager.ring.connection_manager.num_connections();
+                    let subscribers = op_manager
+                        .ring
+                        .subscribers_of(key)
+                        .map(|subs| {
+                            subs.value()
+                                .iter()
+                                .filter_map(|loc| loc.socket_addr())
+                                .map(|addr| format!("{:.8}", addr))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        %key,
+                        tx = %id,
+                        connection_count,
+                        subscribers = ?subscribers,
+                        "Contract not available locally and no remote peers"
+                    );
                     return Err(RingError::NoCachingPeers(*key).into());
                 }
             }
@@ -117,19 +237,35 @@ pub(crate) async fn request_subscribe(
 
         // Forward to remote peer
         let new_state = Some(SubscribeState::AwaitingResponse {
-            skip_list: vec![].into_iter().collect(),
+            skip_list,
             retries: 0,
             current_hop: op_manager.ring.max_hops_to_live,
             upstream_subscriber: None,
         });
+        let target_addr = target
+            .socket_addr()
+            .expect("target must have socket address");
+        tracing::debug!(
+            tx = %id,
+            %key,
+            target_peer = %target_addr,
+            target_location = ?target.location(),
+            "subscribe: forwarding RequestSub to target peer"
+        );
+        // Create subscriber with PeerAddr::Unknown - the subscriber doesn't know their own
+        // external address (especially behind NAT). The first recipient (gateway)
+        // will fill this in from the packet source address.
+        let subscriber = PeerKeyLocation::with_unknown_addr(own_loc.pub_key().clone());
         let msg = SubscribeMsg::RequestSub {
             id: *id,
             key: *key,
             target,
+            subscriber,
         };
         let op = SubscribeOp {
             id: *id,
             state: new_state,
+            upstream_addr: sub_op.upstream_addr,
         };
         op_manager
             .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
@@ -141,9 +277,51 @@ pub(crate) async fn request_subscribe(
     Ok(())
 }
 
+async fn complete_local_subscription(
+    op_manager: &OpManager,
+    id: Transaction,
+    key: ContractKey,
+) -> Result<(), OpError> {
+    let subscriber = op_manager.ring.connection_manager.own_location();
+    let subscriber_addr = subscriber
+        .socket_addr()
+        .expect("own location must have socket address");
+    // Local subscription - no upstream NAT address
+    if let Err(err) = op_manager
+        .ring
+        .add_subscriber(&key, subscriber.clone(), None)
+    {
+        tracing::warn!(
+            %key,
+            tx = %id,
+            subscriber = %subscriber_addr,
+            error = ?err,
+            "Failed to register local subscriber"
+        );
+    } else {
+        tracing::debug!(
+            %key,
+            tx = %id,
+            subscriber = %subscriber_addr,
+            "Registered local subscriber"
+        );
+    }
+
+    op_manager
+        .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
+            tx: id,
+            key,
+            subscribed: true,
+        })
+        .await
+}
+
 pub(crate) struct SubscribeOp {
     pub id: Transaction,
     state: Option<SubscribeState>,
+    /// The address we received this operation's message from.
+    /// Used for connection-based routing: responses are sent back to this address.
+    upstream_addr: Option<std::net::SocketAddr>,
 }
 
 impl SubscribeOp {
@@ -179,11 +357,8 @@ impl Operation for SubscribeOp {
     async fn load_or_init<'a>(
         op_manager: &'a OpManager,
         msg: &'a Self::Message,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Result<OpInitialization<Self>, OpError> {
-        let mut sender: Option<PeerId> = None;
-        if let Some(peer_key_loc) = msg.sender().cloned() {
-            sender = Some(peer_key_loc.peer);
-        };
         let id = *msg.id();
 
         match op_manager.pop(msg.id()) {
@@ -191,7 +366,7 @@ impl Operation for SubscribeOp {
                 // was an existing operation, the other peer messaged back
                 Ok(OpInitialization {
                     op: subscribe_op,
-                    sender,
+                    source_addr,
                 })
             }
             Ok(Some(op)) => {
@@ -199,13 +374,14 @@ impl Operation for SubscribeOp {
                 Err(OpError::OpNotPresent(id))
             }
             Ok(None) => {
-                // new request to subcribe to a contract, initialize the machine
+                // new request to subscribe to a contract, initialize the machine
                 Ok(OpInitialization {
                     op: Self {
                         state: Some(SubscribeState::ReceivedRequest),
                         id,
+                        upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                     },
-                    sender,
+                    source_addr,
                 })
             }
             Err(err) => Err(err.into()),
@@ -221,27 +397,196 @@ impl Operation for SubscribeOp {
         _conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
+            // Look up sender's PeerKeyLocation from source address for logging/routing
+            // This replaces the sender field that was previously embedded in messages
+            let sender_from_addr = source_addr.and_then(|addr| {
+                op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_location_by_addr(addr)
+            });
+
             let return_msg;
             let new_state;
 
             match input {
-                SubscribeMsg::RequestSub { id, key, target } => {
-                    // fast tracked from the request_sub func
-                    debug_assert!(matches!(
+                SubscribeMsg::RequestSub {
+                    id,
+                    key,
+                    target: _,
+                    subscriber,
+                } => {
+                    // Fill in subscriber's external address from transport layer if unknown.
+                    // This is the key step where the first recipient (gateway) determines the
+                    // subscriber's external address from the actual packet source address.
+                    // IMPORTANT: Must fill address BEFORE any .peer() calls to avoid panic.
+                    let mut subscriber = subscriber.clone();
+
+                    if subscriber.peer_addr.is_unknown() {
+                        if let Some(addr) = source_addr {
+                            subscriber.set_addr(addr);
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                subscriber_addr = %addr,
+                                "subscribe: filled subscriber address from source_addr"
+                            );
+                        }
+                    }
+
+                    let subscriber_addr = subscriber
+                        .socket_addr()
+                        .expect("subscriber must have socket address after filling");
+                    tracing::debug!(
+                        tx = %id,
+                        %key,
+                        subscriber = %subscriber_addr,
+                        source_addr = ?source_addr,
+                        "subscribe: processing RequestSub"
+                    );
+                    let own_loc = op_manager.ring.connection_manager.own_location();
+
+                    if !matches!(
                         self.state,
                         Some(SubscribeState::AwaitingResponse { .. })
-                    ));
-                    let sender = op_manager.ring.connection_manager.own_location();
+                            | Some(SubscribeState::ReceivedRequest)
+                    ) {
+                        tracing::warn!(
+                            tx = %id,
+                            %key,
+                            state = ?self.state,
+                            "subscribe: RequestSub received in unexpected state"
+                        );
+                        return Err(OpError::invalid_transition(self.id));
+                    }
+
+                    if super::has_contract(op_manager, *key).await? {
+                        let before_direct = subscribers_snapshot(op_manager, key);
+                        tracing::info!(
+                            tx = %id,
+                            %key,
+                            subscriber = %subscriber_addr,
+                            subscribers_before = ?before_direct,
+                            "subscribe: handling RequestSub locally (contract available)"
+                        );
+
+                        // Local registration - no upstream NAT address
+                        if op_manager
+                            .ring
+                            .add_subscriber(key, subscriber.clone(), None)
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                tx = %id,
+                                %key,
+                                subscriber = %subscriber_addr,
+                                subscribers_before = ?before_direct,
+                                "subscribe: direct registration failed (max subscribers reached)"
+                            );
+                            let return_msg = SubscribeMsg::ReturnSub {
+                                id: *id,
+                                key: *key,
+                                target: subscriber.clone(),
+                                subscribed: false,
+                            };
+                            return Ok(OperationResult {
+                                target_addr: return_msg.target_addr(),
+                                return_msg: Some(NetMessage::from(return_msg)),
+                                state: None,
+                            });
+                        }
+
+                        let after_direct = subscribers_snapshot(op_manager, key);
+                        tracing::info!(
+                            tx = %id,
+                            %key,
+                            subscriber = %subscriber_addr,
+                            subscribers_after = ?after_direct,
+                            "subscribe: registered direct subscriber (RequestSub)"
+                        );
+
+                        let own_addr = own_loc
+                            .socket_addr()
+                            .expect("own location must have socket address");
+                        if subscriber_addr == own_addr {
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                "RequestSub originated locally; sending LocalSubscribeComplete"
+                            );
+                            if let Err(err) = op_manager
+                                .notify_node_event(
+                                    crate::message::NodeEvent::LocalSubscribeComplete {
+                                        tx: *id,
+                                        key: *key,
+                                        subscribed: true,
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    %key,
+                                    error = %err,
+                                    "Failed to send LocalSubscribeComplete event for RequestSub"
+                                );
+                                return Err(err);
+                            }
+
+                            return build_op_result(self.id, None, None, self.upstream_addr);
+                        }
+
+                        let return_msg = SubscribeMsg::ReturnSub {
+                            id: *id,
+                            key: *key,
+                            target: subscriber.clone(),
+                            subscribed: true,
+                        };
+
+                        return build_op_result(
+                            self.id,
+                            None,
+                            Some(return_msg),
+                            self.upstream_addr,
+                        );
+                    }
+
+                    let own_addr = own_loc
+                        .socket_addr()
+                        .expect("own location must have socket address");
+                    let mut skip = HashSet::new();
+                    skip.insert(subscriber_addr);
+                    skip.insert(own_addr);
+
+                    let forward_target = op_manager
+                        .ring
+                        .k_closest_potentially_caching(key, &skip, 3)
+                        .into_iter()
+                        .find(|candidate| {
+                            candidate
+                                .socket_addr()
+                                .map(|addr| addr != own_addr)
+                                .unwrap_or(false)
+                        })
+                        .ok_or(RingError::NoCachingPeers(*key))
+                        .map_err(OpError::from)?;
+
+                    let forward_target_addr = forward_target
+                        .socket_addr()
+                        .expect("forward target must have socket address");
+                    skip.insert(forward_target_addr);
+
                     new_state = self.state;
                     return_msg = Some(SubscribeMsg::SeekNode {
                         id: *id,
                         key: *key,
-                        target: target.clone(),
-                        subscriber: sender.clone(),
-                        skip_list: HashSet::from([sender.peer]),
-                        htl: op_manager.ring.max_hops_to_live,
+                        target: forward_target,
+                        subscriber: subscriber.clone(),
+                        skip_list: skip.clone(),
+                        htl: op_manager.ring.max_hops_to_live.max(1),
                         retries: 0,
                     });
                 }
@@ -254,19 +599,51 @@ impl Operation for SubscribeOp {
                     htl,
                     retries,
                 } => {
+                    // Fill in subscriber's external address from transport layer if unknown.
+                    // This is the key step where the recipient determines the subscriber's
+                    // external address from the actual packet source address.
+                    let mut subscriber = subscriber.clone();
+                    if subscriber.peer_addr.is_unknown() {
+                        if let Some(addr) = source_addr {
+                            subscriber.set_addr(addr);
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                subscriber_addr = %addr,
+                                "subscribe: filled SeekNode subscriber address from source_addr"
+                            );
+                        }
+                    }
+
+                    let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
+                    let htl = (*htl).min(ring_max_htl);
                     let this_peer = op_manager.ring.connection_manager.own_location();
                     let return_not_subbed = || -> OperationResult {
+                        let return_msg = SubscribeMsg::ReturnSub {
+                            key: *key,
+                            id: *id,
+                            subscribed: false,
+                            target: subscriber.clone(),
+                        };
                         OperationResult {
-                            return_msg: Some(NetMessage::from(SubscribeMsg::ReturnSub {
-                                key: *key,
-                                id: *id,
-                                subscribed: false,
-                                sender: this_peer.clone(),
-                                target: subscriber.clone(),
-                            })),
+                            target_addr: return_msg.target_addr(),
+                            return_msg: Some(NetMessage::from(return_msg)),
                             state: None,
                         }
                     };
+
+                    if htl == 0 {
+                        let subscriber_addr = subscriber
+                            .socket_addr()
+                            .expect("subscriber must have socket address");
+                        tracing::warn!(
+                            tx = %id,
+                            %key,
+                            subscriber = %subscriber_addr,
+                            "Dropping Subscribe SeekNode with zero HTL"
+                        );
+                        return Ok(return_not_subbed());
+                    }
 
                     if !super::has_contract(op_manager, *key).await? {
                         tracing::debug!(tx = %id, %key, "Contract not found, trying other peer");
@@ -275,65 +652,162 @@ impl Operation for SubscribeOp {
                         let candidates = op_manager
                             .ring
                             .k_closest_potentially_caching(key, skip_list, 3);
-                        let Some(new_target) = candidates.first() else {
-                            tracing::warn!(tx = %id, %key, "No remote peer available for forwarding");
-                            return Ok(return_not_subbed());
-                        };
-                        let new_target = new_target.clone();
-                        let new_htl = htl - 1;
+                        if candidates.is_empty() {
+                            let connection_count =
+                                op_manager.ring.connection_manager.num_connections();
+                            tracing::warn!(
+                                tx = %id,
+                                %key,
+                                skip = ?skip_list,
+                                connection_count,
+                                "No remote peer available for forwarding"
+                            );
+                            tracing::info!(
+                                tx = %id,
+                                %key,
+                                "Attempting to fetch contract locally before aborting subscribe"
+                            );
 
-                        if new_htl == 0 {
-                            tracing::debug!(tx = %id, %key, "Max number of hops reached while trying to get contract");
-                            return Ok(return_not_subbed());
+                            let get_op = get::start_op(*key, true, false);
+                            if let Err(fetch_err) =
+                                get::request_get(op_manager, get_op, HashSet::new()).await
+                            {
+                                tracing::warn!(
+                                    tx = %id,
+                                    %key,
+                                    error = %fetch_err,
+                                    "Failed to fetch contract locally while handling subscribe"
+                                );
+                                return Ok(return_not_subbed());
+                            }
+
+                            if wait_for_local_contract(op_manager, *key).await? {
+                                tracing::info!(
+                                    tx = %id,
+                                    %key,
+                                    "Fetched contract locally while handling subscribe"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    tx = %id,
+                                    %key,
+                                    "Contract still unavailable locally after fetch attempt"
+                                );
+                                return Ok(return_not_subbed());
+                            }
+                        } else {
+                            let Some(new_target) = candidates.first() else {
+                                return Ok(return_not_subbed());
+                            };
+                            let new_target = new_target.clone();
+                            let new_htl = htl.saturating_sub(1);
+
+                            if new_htl == 0 {
+                                tracing::debug!(tx = %id, %key, "Max number of hops reached while trying to get contract");
+                                return Ok(return_not_subbed());
+                            }
+
+                            let mut new_skip_list = skip_list.clone();
+                            if let Some(target_addr) = target.socket_addr() {
+                                new_skip_list.insert(target_addr);
+                            }
+
+                            let new_target_addr = new_target
+                                .socket_addr()
+                                .expect("new target must have socket address");
+                            let subscriber_addr = subscriber
+                                .socket_addr()
+                                .expect("subscriber must have socket address");
+                            tracing::info!(
+                                tx = %id,
+                                %key,
+                                new_target = %new_target_addr,
+                                upstream = %subscriber_addr,
+                                "Forward request to peer"
+                            );
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                candidates = ?candidates,
+                                skip = ?new_skip_list,
+                                "Forwarding seek to next candidate"
+                            );
+                            // Retry seek node when the contract to subscribe has not been found in this node
+                            return build_op_result(
+                                *id,
+                                Some(SubscribeState::AwaitingResponse {
+                                    skip_list: new_skip_list.clone(),
+                                    retries: *retries,
+                                    current_hop: new_htl,
+                                    upstream_subscriber: Some(subscriber.clone()),
+                                }),
+                                // Use PeerAddr::Unknown - the subscriber doesn't know their own
+                                // external address (especially behind NAT). The recipient will
+                                // fill this in from the packet source address.
+                                (SubscribeMsg::SeekNode {
+                                    id: *id,
+                                    key: *key,
+                                    subscriber: PeerKeyLocation::with_unknown_addr(
+                                        this_peer.pub_key().clone(),
+                                    ),
+                                    target: new_target,
+                                    skip_list: new_skip_list,
+                                    htl: new_htl,
+                                    retries: *retries,
+                                })
+                                .into(),
+                                self.upstream_addr,
+                            );
                         }
-
-                        let mut new_skip_list = skip_list.clone();
-                        new_skip_list.insert(target.peer.clone());
-
-                        tracing::debug!(tx = %id, new_target = %new_target.peer, "Forward request to peer");
-                        // Retry seek node when the contract to subscribe has not been found in this node
-                        return build_op_result(
-                            *id,
-                            Some(SubscribeState::AwaitingResponse {
-                                skip_list: new_skip_list.clone(),
-                                retries: *retries,
-                                current_hop: new_htl,
-                                upstream_subscriber: Some(subscriber.clone()),
-                            }),
-                            (SubscribeMsg::SeekNode {
-                                id: *id,
-                                key: *key,
-                                subscriber: this_peer,
-                                target: new_target,
-                                skip_list: new_skip_list,
-                                htl: new_htl,
-                                retries: *retries,
-                            })
-                            .into(),
-                        );
+                        // After fetch attempt we should now have the contract locally.
                     }
 
+                    let before_direct = subscribers_snapshot(op_manager, key);
+                    let subscriber_addr = subscriber
+                        .socket_addr()
+                        .expect("subscriber must have socket address");
+                    tracing::info!(
+                        tx = %id,
+                        %key,
+                        subscriber = %subscriber_addr,
+                        subscribers_before = ?before_direct,
+                        "subscribe: attempting to register direct subscriber"
+                    );
+                    // Local registration - no upstream NAT address
                     if op_manager
                         .ring
-                        .add_subscriber(key, subscriber.clone())
+                        .add_subscriber(key, subscriber.clone(), None)
                         .is_err()
                     {
-                        tracing::debug!(tx = %id, %key, "Max number of subscribers reached for contract");
+                        tracing::warn!(
+                            tx = %id,
+                            %key,
+                            subscriber = %subscriber_addr,
+                            subscribers_before = ?before_direct,
+                            "subscribe: direct registration failed (max subscribers reached)"
+                        );
                         // max number of subscribers for this contract reached
                         return Ok(return_not_subbed());
                     }
+                    let after_direct = subscribers_snapshot(op_manager, key);
+                    tracing::info!(
+                        tx = %id,
+                        %key,
+                        subscriber = %subscriber_addr,
+                        subscribers_after = ?after_direct,
+                        "subscribe: registered direct subscriber"
+                    );
 
                     match self.state {
                         Some(SubscribeState::ReceivedRequest) => {
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                subscriber = % subscriber.peer,
+                                subscriber = %subscriber_addr,
                                 "Peer successfully subscribed to contract",
                             );
                             new_state = None;
                             return_msg = Some(SubscribeMsg::ReturnSub {
-                                sender: target.clone(),
                                 target: subscriber.clone(),
                                 id: *id,
                                 key: *key,
@@ -346,14 +820,20 @@ impl Operation for SubscribeOp {
                 SubscribeMsg::ReturnSub {
                     subscribed: false,
                     key,
-                    sender,
                     target: _,
                     id,
                 } => {
+                    // Get sender from connection-based routing for skip list and logging
+                    let sender = sender_from_addr
+                        .clone()
+                        .expect("ReturnSub requires source_addr");
+                    let sender_addr = sender
+                        .socket_addr()
+                        .expect("sender must have socket address");
                     tracing::warn!(
                         tx = %id,
                         %key,
-                        potential_provider = %sender.peer,
+                        potential_provider = %sender_addr,
                         "Contract not found at potential subscription provider",
                     );
                     // will error out in case it has reached max number of retries
@@ -365,14 +845,19 @@ impl Operation for SubscribeOp {
                             current_hop,
                         }) => {
                             if retries < MAX_RETRIES {
-                                skip_list.insert(sender.peer.clone());
+                                skip_list.insert(sender_addr);
                                 // Use k_closest_potentially_caching to try multiple candidates
                                 let candidates = op_manager
                                     .ring
                                     .k_closest_potentially_caching(key, &skip_list, 3);
                                 if let Some(target) = candidates.first() {
-                                    let subscriber =
-                                        op_manager.ring.connection_manager.own_location();
+                                    // Use PeerAddr::Unknown - the subscriber doesn't know their own
+                                    // external address (especially behind NAT). The recipient will
+                                    // fill this in from the packet source address.
+                                    let own_loc = op_manager.ring.connection_manager.own_location();
+                                    let subscriber = PeerKeyLocation::with_unknown_addr(
+                                        own_loc.pub_key().clone(),
+                                    );
                                     return_msg = Some(SubscribeMsg::SeekNode {
                                         id: *id,
                                         key: *key,
@@ -404,23 +889,93 @@ impl Operation for SubscribeOp {
                 SubscribeMsg::ReturnSub {
                     subscribed: true,
                     key,
-                    sender,
                     id,
                     target,
-                    ..
                 } => match self.state {
                     Some(SubscribeState::AwaitingResponse {
                         upstream_subscriber,
                         ..
                     }) => {
+                        // Get sender from connection-based routing for logging
+                        let sender = sender_from_addr
+                            .clone()
+                            .expect("ReturnSub requires source_addr");
+                        fetch_contract_if_missing(op_manager, *key).await?;
+
+                        let target_addr = target
+                            .socket_addr()
+                            .expect("target must have socket address");
+                        let sender_addr = sender
+                            .socket_addr()
+                            .expect("sender must have socket address");
                         tracing::info!(
                             tx = %id,
                             %key,
-                            this_peer = %target.peer,
-                            provider = %sender.peer,
+                            this_peer = %target_addr,
+                            provider = %sender_addr,
                             "Subscribed to contract"
                         );
-                        if op_manager.ring.add_subscriber(key, sender.clone()).is_err() {
+                        tracing::info!(
+                            tx = %id,
+                            %key,
+                            upstream = upstream_subscriber
+                                .as_ref()
+                                .and_then(|loc| loc.socket_addr())
+                                .map(|addr| format!("{:.8}", addr))
+                                .unwrap_or_else(|| "<none>".into()),
+                            "Handling ReturnSub (subscribed=true)"
+                        );
+                        if let Some(upstream_subscriber) = upstream_subscriber.as_ref() {
+                            let before_upstream = subscribers_snapshot(op_manager, key);
+                            let upstream_addr = upstream_subscriber
+                                .socket_addr()
+                                .expect("upstream subscriber must have socket address");
+                            tracing::info!(
+                                tx = %id,
+                                %key,
+                                upstream = %upstream_addr,
+                                subscribers_before = ?before_upstream,
+                                "subscribe: attempting to register upstream link"
+                            );
+                            // Local registration - no upstream NAT address
+                            if op_manager
+                                .ring
+                                .add_subscriber(key, upstream_subscriber.clone(), None)
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    tx = %id,
+                                    %key,
+                                    upstream = %upstream_addr,
+                                    subscribers_before = ?before_upstream,
+                                    "subscribe: upstream registration failed (max subscribers reached)"
+                                );
+                            } else {
+                                let after_upstream = subscribers_snapshot(op_manager, key);
+                                tracing::info!(
+                                    tx = %id,
+                                    %key,
+                                    upstream = %upstream_addr,
+                                    subscribers_after = ?after_upstream,
+                                    "subscribe: registered upstream link"
+                                );
+                            }
+                        }
+
+                        let before_provider = subscribers_snapshot(op_manager, key);
+                        tracing::info!(
+                            tx = %id,
+                            %key,
+                            provider = %sender_addr,
+                            subscribers_before = ?before_provider,
+                            "subscribe: registering provider/subscription source"
+                        );
+                        // Local registration - no upstream NAT address
+                        if op_manager
+                            .ring
+                            .add_subscriber(key, sender.clone(), None)
+                            .is_err()
+                        {
                             // concurrently it reached max number of subscribers for this contract
                             tracing::debug!(
                                 tx = %id,
@@ -429,19 +984,29 @@ impl Operation for SubscribeOp {
                             );
                             return Err(OpError::UnexpectedOpState);
                         }
+                        let after_provider = subscribers_snapshot(op_manager, key);
+                        tracing::info!(
+                            tx = %id,
+                            %key,
+                            provider = %sender_addr,
+                            subscribers_after = ?after_provider,
+                            "subscribe: registered provider/subscription source"
+                        );
 
                         new_state = Some(SubscribeState::Completed { key: *key });
                         if let Some(upstream_subscriber) = upstream_subscriber {
+                            let upstream_addr = upstream_subscriber
+                                .socket_addr()
+                                .expect("upstream subscriber must have socket address");
                             tracing::debug!(
                                 tx = %id,
                                 %key,
-                                upstream_subscriber = %upstream_subscriber.peer,
+                                upstream_subscriber = %upstream_addr,
                                 "Forwarding subscription to upstream subscriber"
                             );
                             return_msg = Some(SubscribeMsg::ReturnSub {
                                 id: *id,
                                 key: *key,
-                                sender: target.clone(),
                                 target: upstream_subscriber,
                                 subscribed: true,
                             });
@@ -461,7 +1026,7 @@ impl Operation for SubscribeOp {
                 _ => return Err(OpError::UnexpectedOpState),
             }
 
-            build_op_result(self.id, new_state, return_msg)
+            build_op_result(self.id, new_state, return_msg, self.upstream_addr)
         })
     }
 }
@@ -470,13 +1035,25 @@ fn build_op_result(
     id: Transaction,
     state: Option<SubscribeState>,
     msg: Option<SubscribeMsg>,
+    upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<OperationResult, OpError> {
+    // For response messages (ReturnSub), use upstream_addr directly for routing.
+    // This is more reliable than extracting from the message's target field, which
+    // may have been looked up from connection_manager (subject to race conditions).
+    // For forward messages (SeekNode, RequestSub, FetchRouting), use the message's target.
+    let target_addr = match &msg {
+        Some(SubscribeMsg::ReturnSub { .. }) => upstream_addr,
+        _ => msg.as_ref().and_then(|m| m.target_addr()),
+    };
+
     let output_op = state.map(|state| SubscribeOp {
         id,
         state: Some(state),
+        upstream_addr,
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
+        target_addr,
         state: output_op.map(OpEnum::Subscribe),
     })
 }
@@ -505,20 +1082,20 @@ mod messages {
             id: Transaction,
             key: ContractKey,
             target: PeerKeyLocation,
+            subscriber: PeerKeyLocation,
         },
         SeekNode {
             id: Transaction,
             key: ContractKey,
             target: PeerKeyLocation,
             subscriber: PeerKeyLocation,
-            skip_list: HashSet<PeerId>,
+            skip_list: HashSet<std::net::SocketAddr>,
             htl: usize,
             retries: usize,
         },
         ReturnSub {
             id: Transaction,
             key: ContractKey,
-            sender: PeerKeyLocation,
             target: PeerKeyLocation,
             subscribed: bool,
         },
@@ -536,6 +1113,7 @@ mod messages {
 
         fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
             match self {
+                Self::RequestSub { target, .. } => Some(target),
                 Self::SeekNode { target, .. } => Some(target),
                 Self::ReturnSub { target, .. } => Some(target),
                 _ => None,
@@ -553,10 +1131,16 @@ mod messages {
     }
 
     impl SubscribeMsg {
-        pub fn sender(&self) -> Option<&PeerKeyLocation> {
+        // sender() method removed - use connection-based routing via source_addr instead
+
+        /// Returns the socket address of the target peer for routing.
+        /// Used by OperationResult to determine where to send the message.
+        pub fn target_addr(&self) -> Option<std::net::SocketAddr> {
             match self {
-                Self::ReturnSub { sender, .. } => Some(sender),
-                _ => None,
+                Self::FetchRouting { target, .. }
+                | Self::RequestSub { target, .. }
+                | Self::SeekNode { target, .. }
+                | Self::ReturnSub { target, .. } => target.socket_addr(),
             }
         }
     }

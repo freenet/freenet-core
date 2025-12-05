@@ -47,6 +47,7 @@ pub(crate) struct RemoteConnection {
     pub(super) inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
     pub(super) inbound_symmetric_key: Aes128Gcm,
     pub(super) inbound_symmetric_key_bytes: [u8; 16],
+    #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
     pub(super) transport_secret_key: TransportSecretKey,
     pub(super) bandwidth_limit: Option<usize>,
@@ -121,20 +122,6 @@ impl Drop for PeerConnection {
         }
     }
 }
-
-#[cfg(test)]
-type PeerConnectionMock = (
-    PeerConnection,
-    mpsc::Sender<PacketData<UnknownEncryption>>,
-    mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
-);
-
-#[cfg(test)]
-type RemoteConnectionMock = (
-    RemoteConnection,
-    mpsc::Sender<PacketData<UnknownEncryption>>,
-    mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
-);
 
 impl PeerConnection {
     pub(super) fn new(remote_conn: RemoteConnection) -> Self {
@@ -249,69 +236,6 @@ impl PeerConnection {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_test(
-        remote_addr: SocketAddr,
-        my_address: SocketAddr,
-        outbound_symmetric_key: Aes128Gcm,
-        inbound_symmetric_key: Aes128Gcm,
-    ) -> PeerConnectionMock {
-        use crate::transport::crypto::TransportKeypair;
-        use parking_lot::Mutex;
-        let (outbound_packets, outbound_packets_recv) = mpsc::channel(100);
-        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(100);
-        let keypair = TransportKeypair::new();
-        let remote = RemoteConnection {
-            outbound_packets,
-            outbound_symmetric_key,
-            remote_addr,
-            sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
-            last_packet_id: Arc::new(AtomicU32::new(0)),
-            inbound_packet_recv,
-            inbound_symmetric_key,
-            inbound_symmetric_key_bytes: [1; 16],
-            my_address: Some(my_address),
-            transport_secret_key: keypair.secret,
-            bandwidth_limit: None,
-        };
-        (
-            Self::new(remote),
-            inbound_packet_sender,
-            outbound_packets_recv,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_remote_test(
-        remote_addr: SocketAddr,
-        my_address: SocketAddr,
-        outbound_symmetric_key: Aes128Gcm,
-        inbound_symmetric_key: Aes128Gcm,
-    ) -> RemoteConnectionMock {
-        use crate::transport::crypto::TransportKeypair;
-        use parking_lot::Mutex;
-        let (outbound_packets, outbound_packets_recv) = mpsc::channel(100);
-        let (inbound_packet_sender, inbound_packet_recv) = mpsc::channel(100);
-        let keypair = TransportKeypair::new();
-        (
-            RemoteConnection {
-                outbound_packets,
-                outbound_symmetric_key,
-                remote_addr,
-                sent_tracker: Arc::new(Mutex::new(SentPacketTracker::new())),
-                last_packet_id: Arc::new(AtomicU32::new(0)),
-                inbound_packet_recv,
-                inbound_symmetric_key,
-                inbound_symmetric_key_bytes: [1; 16],
-                my_address: Some(my_address),
-                transport_secret_key: keypair.secret,
-                bandwidth_limit: None,
-            },
-            inbound_packet_sender,
-            outbound_packets_recv,
-        )
-    }
-
     #[instrument(name = "peer_connection", skip_all)]
     pub async fn send<T>(&mut self, data: T) -> Result
     where
@@ -335,7 +259,7 @@ impl PeerConnection {
         // listen for incoming messages or receipts or wait until is time to do anything else again
         let mut resend_check = Some(tokio::time::sleep(tokio::time::Duration::from_millis(10)));
 
-        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(30);
+        const KILL_CONNECTION_AFTER: Duration = Duration::from_secs(120);
         let mut last_received = std::time::Instant::now();
 
         // Check for timeout periodically
@@ -620,6 +544,7 @@ impl PeerConnection {
     }
 
     /// Returns the external address of the peer holding this connection.
+    #[allow(dead_code)]
     pub fn my_address(&self) -> Option<SocketAddr> {
         self.remote_conn.my_address
     }

@@ -14,13 +14,14 @@ const MIN_POINTS_FOR_REGRESSION: usize = 5;
 /// outcome of the peer's previous requests.
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct IsotonicEstimator {
+pub(crate) struct IsotonicEstimator {
     pub global_regression: IsotonicRegression<f64>,
     pub peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
 }
 
 impl IsotonicEstimator {
-    // Define a constant for the adjustment prior size.
+    // Minimum sample size before we apply per-peer adjustments; keeps peer curves from being
+    // dominated by sparse/noisy data.
     const ADJUSTMENT_PRIOR_SIZE: u64 = 10;
 
     /// Creates a new `PeerOutcomeEstimator` from a list of historical events.
@@ -48,9 +49,9 @@ impl IsotonicEstimator {
         }
         .expect("Failed to create isotonic regression");
 
-        let adjustment_prior_size = 20;
+        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
         let global_regression_big_enough_to_estimate_peer_adjustments =
-            global_regression.len() >= adjustment_prior_size;
+            global_regression.len() >= adjustment_prior_size as usize;
 
         let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
 
@@ -95,9 +96,9 @@ impl IsotonicEstimator {
 
         self.global_regression.add_points(&[point]);
 
-        let adjustment_prior_size = 20;
+        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
         let global_regression_big_enough_to_estimate_peer_adjustments =
-            self.global_regression.len() >= adjustment_prior_size;
+            self.global_regression.len() >= adjustment_prior_size as usize;
 
         if global_regression_big_enough_to_estimate_peer_adjustments {
             let adjustment = event.result
@@ -126,9 +127,13 @@ impl IsotonicEstimator {
             return Err(EstimationError::InsufficientData);
         }
 
-        let distance: f64 = contract_location.distance(peer.location.unwrap()).as_f64();
+        let peer_location = peer.location().ok_or(EstimationError::InsufficientData)?;
+        let distance: f64 = contract_location.distance(peer_location).as_f64();
 
-        let global_estimate = self.global_regression.interpolate(distance).unwrap();
+        let global_estimate = self
+            .global_regression
+            .interpolate(distance)
+            .ok_or(EstimationError::InsufficientData)?;
 
         // Regression can sometimes produce negative estimates
         let global_estimate = global_estimate.max(0.0);
@@ -153,7 +158,7 @@ impl IsotonicEstimator {
     }
 }
 
-pub(super) enum EstimatorType {
+pub(crate) enum EstimatorType {
     /// Where the estimated value is expected to increase as distance increases
     Positive,
     /// Where the estimated value is expected to decrease as distance increases
@@ -161,7 +166,7 @@ pub(super) enum EstimatorType {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub(super) enum EstimationError {
+pub(crate) enum EstimationError {
     #[error("Insufficient data for estimation")]
     InsufficientData,
 }
@@ -169,7 +174,7 @@ pub(super) enum EstimationError {
 /// A routing event is a single request to a peer for a contract, and some value indicating
 /// the result of the request, such as the time it took to retrieve the contract.
 #[derive(Debug, Clone)]
-pub(super) struct IsotonicEvent {
+pub(crate) struct IsotonicEvent {
     pub peer: PeerKeyLocation,
     pub contract_location: Location,
     /// The result of the routing event, which is used to train the estimator, typically the time
@@ -180,12 +185,17 @@ pub(super) struct IsotonicEvent {
 
 impl IsotonicEvent {
     fn route_distance(&self) -> Distance {
-        self.contract_location.distance(self.peer.location.unwrap())
+        let peer_location = self
+            .peer
+            .location()
+            .ok_or(EstimationError::InsufficientData)
+            .expect("IsotonicEvent should always carry a peer location");
+        self.contract_location.distance(peer_location)
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct Adjustment {
+pub(crate) struct Adjustment {
     sum: f64,
     count: u64,
 }
@@ -217,6 +227,7 @@ impl Adjustment {
 mod tests {
 
     use super::*;
+    use tracing::debug;
 
     // This test `test_peer_time_estimator` checks the accuracy of the `RoutingOutcomeEstimator` struct's
     // `estimate_retrieval_time()` method. It generates a list of 100 random events, where each event
@@ -238,8 +249,8 @@ mod tests {
         let mut events = Vec::new();
         for _ in 0..100 {
             let peer = PeerKeyLocation::random();
-            if peer.location.is_none() {
-                println!("Peer location is none for {peer:?}");
+            if peer.location().is_none() {
+                debug!("Peer location is none for {peer:?}");
             }
             let contract_location = Location::random();
             events.push(simulate_positive_request(peer, contract_location));
@@ -265,7 +276,7 @@ mod tests {
 
         // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
-        println!("Average error: {average_error}");
+        debug!("Average error: {average_error}");
         assert!(average_error < 0.01);
     }
 
@@ -275,8 +286,8 @@ mod tests {
         let mut events = Vec::new();
         for _ in 0..100 {
             let peer = PeerKeyLocation::random();
-            if peer.location.is_none() {
-                println!("Peer location is none for {peer:?}");
+            if peer.location().is_none() {
+                debug!("Peer location is none for {peer:?}");
             }
             let contract_location = Location::random();
             events.push(simulate_negative_request(peer, contract_location));
@@ -302,7 +313,7 @@ mod tests {
 
         // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
-        println!("Average error: {average_error}");
+        debug!("Average error: {average_error}");
         assert!(average_error < 0.01);
     }
 
@@ -310,9 +321,20 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
+        let distance: f64 = peer
+            .location()
+            .unwrap()
+            .distance(contract_location)
+            .as_f64();
 
-        let result = distance.powf(0.5) + peer.peer.clone().to_bytes()[0] as f64;
+        // Use the hash of the public key for deterministic but random-like variation
+        let key_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{}", peer.pub_key()).hash(&mut hasher);
+            hasher.finish()
+        };
+        let result = distance.powf(0.5) + (key_hash as u8) as f64;
         IsotonicEvent {
             peer,
             contract_location,
@@ -324,9 +346,20 @@ mod tests {
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer.location.unwrap().distance(contract_location).as_f64();
+        let distance: f64 = peer
+            .location()
+            .unwrap()
+            .distance(contract_location)
+            .as_f64();
 
-        let result = (100.0 - distance).powf(0.5) + peer.peer.clone().to_bytes()[0] as f64;
+        // Use the hash of the public key for deterministic but random-like variation
+        let key_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{}", peer.pub_key()).hash(&mut hasher);
+            hasher.finish()
+        };
+        let result = (100.0 - distance).powf(0.5) + (key_hash as u8) as f64;
         IsotonicEvent {
             peer,
             contract_location,

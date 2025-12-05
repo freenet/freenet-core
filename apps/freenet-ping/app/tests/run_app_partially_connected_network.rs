@@ -28,14 +28,13 @@ use futures::FutureExt;
 use testresult::TestResult;
 use tokio::{select, time::timeout};
 use tokio_tungstenite::connect_async;
-use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use tracing::{span, Instrument, Level};
 
 use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
 
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "Test has never worked - nodes fail on startup with channel closed errors"]
 async fn test_ping_partially_connected_network() -> TestResult {
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     /*
      * This test verifies how subscription propagation works in a partially connected network.
      *
@@ -68,8 +67,6 @@ async fn test_ping_partially_connected_network() -> TestResult {
     const NUM_REGULAR_NODES: usize = 7;
     const CONNECTIVITY_RATIO: f64 = 0.3; // Controls connectivity between regular nodes
 
-    // Configure logging
-    freenet::config::set_logger(Some(LevelFilter::DEBUG), None);
     println!(
         "Starting test with {NUM_GATEWAYS} gateways and {NUM_REGULAR_NODES} regular nodes (connectivity ratio: {CONNECTIVITY_RATIO})"
     );

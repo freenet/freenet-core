@@ -45,6 +45,9 @@ pub(crate) const PCK_VERSION: &str = env!("CARGO_PKG_VERSION");
 // Initialize the executor once.
 static ASYNC_RT: LazyLock<Option<Runtime>> = LazyLock::new(GlobalExecutor::initialize_async_rt);
 
+const DEFAULT_TRANSIENT_BUDGET: usize = 2048;
+const DEFAULT_TRANSIENT_TTL_SECS: u64 = 30;
+
 const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
@@ -97,6 +100,10 @@ impl Default for ConfigArgs {
                 location: None,
                 bandwidth_limit: Some(3_000_000), // 3 MB/s default for streaming transfers only
                 blocked_addresses: None,
+                transient_budget: Some(DEFAULT_TRANSIENT_BUDGET),
+                transient_ttl_secs: Some(DEFAULT_TRANSIENT_TTL_SECS),
+                min_connections: None,
+                max_connections: None,
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -238,6 +245,38 @@ impl ConfigArgs {
             self.ws_api
                 .token_cleanup_interval_seconds
                 .get_or_insert(cfg.ws_api.token_cleanup_interval_seconds);
+            self.network_api
+                .address
+                .get_or_insert(cfg.network_api.address);
+            self.network_api
+                .network_port
+                .get_or_insert(cfg.network_api.port);
+            if let Some(addr) = cfg.network_api.public_address {
+                self.network_api.public_address.get_or_insert(addr);
+            }
+            if let Some(port) = cfg.network_api.public_port {
+                self.network_api.public_port.get_or_insert(port);
+            }
+            if let Some(limit) = cfg.network_api.bandwidth_limit {
+                self.network_api.bandwidth_limit.get_or_insert(limit);
+            }
+            if let Some(addrs) = cfg.network_api.blocked_addresses {
+                self.network_api
+                    .blocked_addresses
+                    .get_or_insert_with(|| addrs.into_iter().collect());
+            }
+            self.network_api
+                .transient_budget
+                .get_or_insert(cfg.network_api.transient_budget);
+            self.network_api
+                .transient_ttl_secs
+                .get_or_insert(cfg.network_api.transient_ttl_secs);
+            self.network_api
+                .min_connections
+                .get_or_insert(cfg.network_api.min_connections);
+            self.network_api
+                .max_connections
+                .get_or_insert(cfg.network_api.max_connections);
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
         }
@@ -361,6 +400,22 @@ impl ConfigArgs {
                     .network_api
                     .blocked_addresses
                     .map(|addrs| addrs.into_iter().collect()),
+                transient_budget: self
+                    .network_api
+                    .transient_budget
+                    .unwrap_or(DEFAULT_TRANSIENT_BUDGET),
+                transient_ttl_secs: self
+                    .network_api
+                    .transient_ttl_secs
+                    .unwrap_or(DEFAULT_TRANSIENT_TTL_SECS),
+                min_connections: self
+                    .network_api
+                    .min_connections
+                    .unwrap_or(DEFAULT_MIN_CONNECTIONS),
+                max_connections: self
+                    .network_api
+                    .max_connections
+                    .unwrap_or(DEFAULT_MAX_CONNECTIONS),
             },
             ws_api: WebsocketApiConfig {
                 // the websocket API is always local
@@ -542,6 +597,32 @@ pub struct NetworkArgs {
     /// List of IP:port addresses to refuse connections to/from.
     #[arg(long, num_args = 0..)]
     pub blocked_addresses: Option<Vec<SocketAddr>>,
+
+    /// Maximum number of concurrent transient connections accepted by a gateway.
+    #[arg(long, env = "TRANSIENT_BUDGET")]
+    #[serde(rename = "transient-budget", skip_serializing_if = "Option::is_none")]
+    pub transient_budget: Option<usize>,
+
+    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    #[arg(long, env = "TRANSIENT_TTL_SECS")]
+    #[serde(rename = "transient-ttl-secs", skip_serializing_if = "Option::is_none")]
+    pub transient_ttl_secs: Option<u64>,
+
+    /// Minimum desired connections for the ring topology. Defaults to 10.
+    #[arg(long = "min-number-of-connections", env = "MIN_NUMBER_OF_CONNECTIONS")]
+    #[serde(
+        rename = "min-number-of-connections",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_connections: Option<usize>,
+
+    /// Maximum allowed connections for the ring topology. Defaults to 20.
+    #[arg(long = "max-number-of-connections", env = "MAX_NUMBER_OF_CONNECTIONS")]
+    #[serde(
+        rename = "max-number-of-connections",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_connections: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +689,28 @@ pub struct NetworkApiConfig {
     /// List of IP:port addresses to refuse connections to/from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_addresses: Option<HashSet<SocketAddr>>,
+
+    /// Maximum number of concurrent transient connections accepted by a gateway.
+    #[serde(default = "default_transient_budget", rename = "transient-budget")]
+    pub transient_budget: usize,
+
+    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    #[serde(default = "default_transient_ttl_secs", rename = "transient-ttl-secs")]
+    pub transient_ttl_secs: u64,
+
+    /// Minimum desired connections for the ring topology.
+    #[serde(
+        default = "default_min_connections",
+        rename = "min-number-of-connections"
+    )]
+    pub min_connections: usize,
+
+    /// Maximum allowed connections for the ring topology.
+    #[serde(
+        default = "default_max_connections",
+        rename = "max-number-of-connections"
+    )]
+    pub max_connections: usize,
 }
 
 mod port_allocation;
@@ -615,6 +718,22 @@ use port_allocation::find_available_port;
 
 pub fn default_network_api_port() -> u16 {
     find_available_port().unwrap_or(31337) // Fallback to 31337 if we can't find a random port
+}
+
+fn default_transient_budget() -> usize {
+    DEFAULT_TRANSIENT_BUDGET
+}
+
+fn default_transient_ttl_secs() -> u64 {
+    DEFAULT_TRANSIENT_TTL_SECS
+}
+
+fn default_min_connections() -> usize {
+    DEFAULT_MIN_CONNECTIONS
+}
+
+fn default_max_connections() -> usize {
+    DEFAULT_MAX_CONNECTIONS
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
@@ -1138,8 +1257,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_serde_config_args() {
+        // Use tempfile for a guaranteed-writable directory (avoids CI permission issues on /tmp)
+        let temp_dir = tempfile::tempdir().unwrap();
         let args = ConfigArgs {
             mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+            },
             ..Default::default()
         };
         let cfg = args.build().await.unwrap();

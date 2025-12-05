@@ -41,12 +41,43 @@ impl<T: TimeSource> PacketRateLimiter<T> {
     ) {
         tracing::info!("Rate limiter task started");
         while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
+            tracing::debug!(
+                target: "freenet_core::transport::send_debug",
+                dest_addr = %socket_addr,
+                packet_len = packet.len(),
+                "Dequeued packet for sending"
+            );
             // tracing::trace!(%socket_addr, packet_len = %packet.len(), "Sending outbound packet");
             if let Some(bandwidth_limit) = bandwidth_limit {
                 self.rate_limiting(bandwidth_limit, &*socket, packet, socket_addr)
                     .await;
             } else {
-                let _ = socket.send_to(&packet, socket_addr).await;
+                tracing::debug!(
+                    target: "freenet_core::transport::send_debug",
+                    dest_addr = %socket_addr,
+                    packet_len = packet.len(),
+                    "Sending packet without bandwidth limit"
+                );
+                match socket.send_to(&packet, socket_addr).await {
+                    Ok(bytes_sent) => {
+                        tracing::debug!(
+                            target: "freenet_core::transport::send_debug",
+                            dest_addr = %socket_addr,
+                            bytes_sent,
+                            expected_len = packet.len(),
+                            "Socket send_to completed (no rate limit)"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            target: "freenet_core::transport::send_debug",
+                            dest_addr = %socket_addr,
+                            error = %error,
+                            error_kind = ?error.kind(),
+                            "Socket send_to failed (no rate limit)"
+                        );
+                    }
+                }
             }
         }
         tracing::debug!("Rate limiter task ended unexpectedly");

@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.3.9"
+version = "0.3.19"
 edition = "2021"
 rust-version = "1.80"
 publish = true
@@ -9,8 +9,13 @@ license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet-core"
 readme = "README.md"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/fdev-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "fdev"
+
 [dependencies]
-bytesize = "2.0"
+bytesize = "2.3"
 anyhow = "1"
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
 bincode = "1"
@@ -36,10 +41,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 xz2 = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", features = ["json"] }
-http = "1.2"
+http = "1.4"
 
 # internal
-freenet = { path = "../core", version = "0.1.31" }
+freenet = { path = "../core", version = "0.1.41" }
 freenet-stdlib = { workspace = true }
 
 [features]

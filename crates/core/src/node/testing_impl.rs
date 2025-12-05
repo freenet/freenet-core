@@ -110,7 +110,7 @@ impl<'a> From<&'a str> for NodeLabel {
 #[derive(Clone)]
 struct GatewayConfig {
     label: NodeLabel,
-    id: PeerId,
+    peer_key_location: PeerKeyLocation,
     location: Location,
 }
 
@@ -377,7 +377,8 @@ impl SimNetwork {
             let label = NodeLabel::gateway(node_no);
             let port = crate::util::get_free_port().unwrap();
             let keypair = crate::transport::TransportKeypair::new();
-            let id = PeerId::new((Ipv6Addr::LOCALHOST, port).into(), keypair.public().clone());
+            let addr = (Ipv6Addr::LOCALHOST, port).into();
+            let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
             let location = Location::random();
 
             let config_args = ConfigArgs {
@@ -392,7 +393,7 @@ impl SimNetwork {
             config.key_pair = keypair;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.network_listener_port = port;
-            config.with_peer_id(id.clone());
+            config.with_own_addr(addr);
             config
                 .with_location(location)
                 .max_hops_to_live(self.ring_max_htl)
@@ -406,7 +407,7 @@ impl SimNetwork {
                 config,
                 GatewayConfig {
                     label,
-                    id,
+                    peer_key_location,
                     location,
                 },
             ));
@@ -415,11 +416,15 @@ impl SimNetwork {
 
         let gateways: Vec<_> = configs.iter().map(|(_, gw)| gw.clone()).collect();
         for (mut this_node, this_config) in configs {
-            for GatewayConfig { id, location, .. } in gateways
+            for GatewayConfig {
+                peer_key_location,
+                location,
+                ..
+            } in gateways
                 .iter()
                 .filter(|config| this_config.label != config.label)
             {
-                this_node.add_gateway(InitPeerNode::new(id.clone(), *location));
+                this_node.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
             }
             let event_listener = {
                 #[cfg(feature = "trace-ot")]
@@ -465,8 +470,13 @@ impl SimNetwork {
             let mut config = NodeConfig::new(config_args.build().await.unwrap())
                 .await
                 .unwrap();
-            for GatewayConfig { id, location, .. } in &gateways {
-                config.add_gateway(InitPeerNode::new(id.clone(), *location));
+            for GatewayConfig {
+                peer_key_location,
+                location,
+                ..
+            } in &gateways
+            {
+                config.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
             }
             let port = crate::util::get_free_port().unwrap();
             config.network_listener_port = port;
@@ -762,7 +772,7 @@ where
     NB: NetworkBridge,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
-    peer_key: PeerId,
+    peer_key: PeerKeyLocation,
     parent_span: Option<tracing::Span>,
     op_manager: Arc<OpManager>,
     conn_manager: NB,
@@ -780,7 +790,8 @@ where
     NB: NetworkBridge + NetworkBridgeExt,
     UsrEv: ClientEventsProxy + Send + 'static,
 {
-    connect::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
+    let join_task =
+        connect::initial_join_procedure(config.op_manager.clone(), &config.gateways).await?;
     let (client_responses, _cli_response_sender) = contract::client_responses_channel();
     let span = {
         config
@@ -811,9 +822,13 @@ where
         .parent_span
         .clone()
         .unwrap_or_else(|| tracing::info_span!("event_listener", peer = %config.peer_key));
-    run_event_listener(node_controller_rx, config)
+    let result = run_event_listener(node_controller_rx, config)
         .instrument(parent_span)
-        .await
+        .await;
+
+    join_task.abort();
+    let _ = join_task.await;
+    result
 }
 
 /// Starts listening to incoming events. Will attempt to join the ring if any gateways have been provided.
@@ -894,15 +909,31 @@ where
         let msg = match msg {
             Ok(Either::Left(msg)) => msg,
             Ok(Either::Right(action)) => match action {
-                NodeEvent::DropConnection(peer) => {
-                    tracing::info!("Dropping connection to {peer}");
-                    event_register
-                        .register_events(Either::Left(crate::tracing::NetEventLog::disconnected(
-                            &op_manager.ring,
-                            &peer,
-                        )))
-                        .await;
-                    op_manager.ring.prune_connection(peer).await;
+                NodeEvent::DropConnection(peer_addr) => {
+                    tracing::info!("Dropping connection to {peer_addr}");
+                    // Look up the peer by address in the ring
+                    if let Some(peer_loc) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(peer_addr)
+                    {
+                        // Convert PeerKeyLocation to PeerId for the disconnect/prune operations
+                        let peer_id = PeerId::new(
+                            peer_loc
+                                .socket_addr()
+                                .expect("peer should have socket address"),
+                            peer_loc.pub_key().clone(),
+                        );
+                        event_register
+                            .register_events(Either::Left(
+                                crate::tracing::NetEventLog::disconnected(
+                                    &op_manager.ring,
+                                    &peer_id,
+                                ),
+                            ))
+                            .await;
+                        op_manager.ring.prune_connection(peer_id).await;
+                    }
                     continue;
                 }
                 NodeEvent::ConnectPeer { peer, .. } => {
@@ -935,9 +966,8 @@ where
                 NodeEvent::QueryNodeDiagnostics { .. } => {
                     unimplemented!()
                 }
-                NodeEvent::SendMessage { target, msg } => {
-                    tracing::debug!(tx = %msg.id(), %target, "SendMessage event in testing_impl");
-                    conn_manager.send(&target, *msg).await?;
+                NodeEvent::ExpectPeerConnection { addr } => {
+                    tracing::debug!(%addr, "ExpectPeerConnection ignored in testing impl");
                     continue;
                 }
             },

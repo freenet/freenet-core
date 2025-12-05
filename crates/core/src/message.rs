@@ -5,12 +5,12 @@
 use std::{
     borrow::{Borrow, Cow},
     fmt::Display,
+    net::SocketAddr,
     time::{Duration, SystemTime},
 };
 
 use crate::{
     client_events::{ClientId, HostResult},
-    node::PeerId,
     operations::{
         connect::ConnectMsg, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg,
     },
@@ -35,16 +35,39 @@ use ulid::Ulid;
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Transaction {
     id: Ulid,
+    /// Parent transaction ID for child operations spawned by this transaction.
+    /// Enables atomicity tracking for composite operations (e.g., PUT with SUBSCRIBE).
+    parent: Option<Ulid>,
 }
 
 impl Transaction {
-    pub const NULL: &'static Transaction = &Transaction { id: Ulid(0) };
+    pub const NULL: &'static Transaction = &Transaction {
+        id: Ulid(0),
+        parent: None,
+    };
 
     pub(crate) fn new<T: TxType>() -> Self {
         let ty = <T as TxType>::tx_type_id();
         let id = Ulid::new();
-        Self::update(ty.0, id)
-        // Self { id }
+        Self::update(ty.0, id, None)
+    }
+
+    /// Creates a child transaction with the specified type, linked to the parent
+    /// for atomicity tracking in composite operations.
+    pub(crate) fn new_child_of<T: TxType>(parent: &Transaction) -> Self {
+        let ty = <T as TxType>::tx_type_id();
+        let id = Ulid::new();
+        Self::update(ty.0, id, Some(parent.id))
+    }
+
+    /// Returns the parent transaction ID for child operations.
+    pub fn parent_id(&self) -> Option<&Ulid> {
+        self.parent.as_ref()
+    }
+
+    /// Returns true if this transaction is a child operation.
+    pub fn is_sub_operation(&self) -> bool {
+        self.parent.is_some()
     }
 
     pub(crate) fn transaction_type(&self) -> TransactionType {
@@ -100,10 +123,13 @@ impl Transaction {
         // Clear the ts significant bits of the ULID and replace them with the new cutoff ts.
         const TIMESTAMP_MASK: u128 = 0x00000000000000000000FFFFFFFFFFFFFFFF;
         let new_ulid = (id.0 & TIMESTAMP_MASK) | ((ttl_epoch as u128) << 80);
-        Self { id: Ulid(new_ulid) }
+        Self {
+            id: Ulid(new_ulid),
+            parent: None,
+        }
     }
 
-    fn update(ty: TransactionType, id: Ulid) -> Self {
+    fn update(ty: TransactionType, id: Ulid, parent: Option<Ulid>) -> Self {
         const TYPE_MASK: u128 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00u128;
         // Clear the last byte
         let cleared = id.0 & TYPE_MASK;
@@ -111,7 +137,10 @@ impl Transaction {
         let updated = cleared | (ty as u8) as u128;
 
         // 2 words size for 64-bits platforms
-        Self { id: Ulid(updated) }
+        Self {
+            id: Ulid(updated),
+            parent,
+        }
     }
 }
 
@@ -120,7 +149,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Transaction {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let ty: TransactionTypeId = u.arbitrary()?;
         let bytes: u128 = Ulid::new().0;
-        Ok(Self::update(ty.0, Ulid(bytes)))
+        Ok(Self::update(ty.0, Ulid(bytes), None))
     }
 }
 
@@ -164,6 +193,7 @@ where
 
 mod sealed_msg_type {
     use super::*;
+    use crate::operations::connect::ConnectMsg;
 
     pub trait SealedTxType {
         fn tx_type_id() -> TransactionTypeId;
@@ -237,6 +267,54 @@ pub(crate) trait MessageStats {
     fn requested_location(&self) -> Option<Location>;
 }
 
+/// Wrapper for inbound messages that carries the source address from the transport layer.
+/// This separates routing concerns from message content - the source address is determined by
+/// the network layer (from the packet), not embedded in the serialized message.
+///
+/// Generic over the message type so it can wrap:
+/// - `NetMessage` at the network layer (p2p_protoc.rs)
+/// - Specific operation messages (GetMsg, PutMsg, etc.) at the operation layer
+///
+/// Note: Currently unused but prepared for Phase 4 of #2164.
+/// Will be used to thread source addresses to operations for routing.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct InboundMessage<M> {
+    /// The message content
+    pub msg: M,
+    /// The socket address this message was received from (from UDP packet source)
+    pub source_addr: SocketAddr,
+}
+
+#[allow(dead_code)]
+impl<M> InboundMessage<M> {
+    /// Create a new inbound message wrapper
+    pub fn new(msg: M, source_addr: SocketAddr) -> Self {
+        Self { msg, source_addr }
+    }
+
+    /// Transform the inner message while preserving source_addr
+    pub fn map<N>(self, f: impl FnOnce(M) -> N) -> InboundMessage<N> {
+        InboundMessage {
+            msg: f(self.msg),
+            source_addr: self.source_addr,
+        }
+    }
+
+    /// Get a reference to the inner message
+    pub fn inner(&self) -> &M {
+        &self.msg
+    }
+}
+
+#[allow(dead_code)]
+impl InboundMessage<NetMessage> {
+    /// Get the transaction ID from the wrapped network message
+    pub fn id(&self) -> &Transaction {
+        self.msg.id()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum NetMessage {
     V1(NetMessageV1),
@@ -251,7 +329,7 @@ pub(crate) enum NetMessageV1 {
     Unsubscribed {
         transaction: Transaction,
         key: ContractKey,
-        from: PeerId,
+        from: PeerKeyLocation,
     },
     Update(UpdateMsg),
     Aborted(Transaction),
@@ -272,7 +350,7 @@ impl Versioned for NetMessage {
 impl Versioned for NetMessageV1 {
     fn version(&self) -> semver::Version {
         match self {
-            NetMessageV1::Connect(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::Connect(_) => semver::Version::new(1, 1, 0),
             NetMessageV1::Put(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Get(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Subscribe(_) => semver::Version::new(1, 0, 0),
@@ -298,16 +376,16 @@ pub trait InnerMessage: Into<NetMessage> {
 }
 
 type RemainingChecks = Option<usize>;
-type ConnectResult = Result<(PeerId, RemainingChecks), ()>;
+type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
 
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Clone)]
 pub(crate) enum NodeEvent {
-    /// Drop the given peer connection.
-    DropConnection(PeerId),
+    /// Drop the given peer connection by socket address.
+    DropConnection(SocketAddr),
     // Try connecting to the given peer.
     ConnectPeer {
-        peer: PeerId,
+        peer: PeerKeyLocation,
         tx: Transaction,
         callback: tokio::sync::mpsc::Sender<ConnectResult>,
         is_gw: bool,
@@ -334,10 +412,9 @@ pub(crate) enum NodeEvent {
         key: ContractKey,
         subscribed: bool,
     },
-    /// Send a message to a peer over the network
-    SendMessage {
-        target: PeerId,
-        msg: Box<NetMessage>,
+    /// Register expectation for an inbound connection from the given peer.
+    ExpectPeerConnection {
+        addr: SocketAddr,
     },
 }
 
@@ -354,13 +431,13 @@ pub struct NetworkDebugInfo {
     pub application_subscriptions: Vec<SubscriptionInfo>,
     /// Network-level subscriptions (nodes subscribing to contracts for routing)
     #[allow(dead_code)] // Used for debugging purposes, not exposed via stdlib API yet
-    pub network_subscriptions: Vec<(ContractKey, Vec<PeerId>)>,
-    pub connected_peers: Vec<PeerId>,
+    pub network_subscriptions: Vec<(ContractKey, Vec<SocketAddr>)>,
+    pub connected_peers: Vec<PeerKeyLocation>,
 }
 
 #[derive(Debug)]
 pub(crate) enum QueryResult {
-    Connections(Vec<PeerId>),
+    Connections(Vec<PeerKeyLocation>),
     GetResult {
         key: ContractKey,
         state: WrappedState,
@@ -415,8 +492,8 @@ impl Display for NodeEvent {
                     "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
                 )
             }
-            NodeEvent::SendMessage { target, msg } => {
-                write!(f, "SendMessage (to {target}, tx: {})", msg.id())
+            NodeEvent::ExpectPeerConnection { addr } => {
+                write!(f, "ExpectPeerConnection (from {addr})")
             }
         }
     }
@@ -457,7 +534,7 @@ impl MessageStats for NetMessageV1 {
 
     fn target(&self) -> Option<PeerKeyLocation> {
         match self {
-            NetMessageV1::Connect(op) => op.target().as_ref().map(|b| b.borrow().clone()),
+            NetMessageV1::Connect(op) => op.target().cloned(),
             NetMessageV1::Put(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Get(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Subscribe(op) => op.target().as_ref().map(|b| b.borrow().clone()),
@@ -509,9 +586,9 @@ mod tests {
     fn pack_transaction_type() {
         let ts_0 = Ulid::new();
         std::thread::sleep(Duration::from_millis(1));
-        let tx = Transaction::update(TransactionType::Connect, Ulid::new());
+        let tx = Transaction::update(TransactionType::Connect, Ulid::new(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Connect);
-        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new());
+        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Subscribe);
         std::thread::sleep(Duration::from_millis(1));
         let ts_1 = Ulid::new();

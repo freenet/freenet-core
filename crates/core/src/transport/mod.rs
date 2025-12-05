@@ -25,14 +25,35 @@ type MessagePayload = Vec<u8>;
 
 type PacketId = u32;
 
+/// A wrapper around SocketAddr that represents an address observed at the transport layer.
+/// This is the "ground truth" for NAT scenarios - it's the actual address we see
+/// at the network layer, not what the peer claims in protocol messages.
+///
+/// Using a newtype instead of raw `SocketAddr` makes the address semantics explicit
+/// and prevents accidental confusion with advertised/claimed addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObservedAddr(SocketAddr);
+
+impl ObservedAddr {
+    /// Get the underlying socket address.
+    pub fn socket_addr(&self) -> SocketAddr {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ObservedAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<SocketAddr> for ObservedAddr {
+    fn from(addr: SocketAddr) -> Self {
+        Self(addr)
+    }
+}
+
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
-#[cfg(test)]
-pub(crate) use self::{
-    connection_handler::ConnectionEvent,
-    packet_data::{PacketData, UnknownEncryption},
-    peer_connection::RemoteConnection,
-    symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
-};
 pub(crate) use self::{
     connection_handler::{
         create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
