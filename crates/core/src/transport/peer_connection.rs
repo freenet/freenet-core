@@ -589,7 +589,7 @@ impl PeerConnection {
                         .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                     tracing::trace!(%stream_id, %fragment_number, "fragment pushed to existing stream");
                 } else {
-                    let (sender, receiver) = mpsc::channel(1);
+                    let (sender, receiver) = mpsc::channel(64);
                     tracing::trace!(%stream_id, %fragment_number, "new stream");
                     self.inbound_streams.insert(stream_id, sender);
                     let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
