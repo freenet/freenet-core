@@ -337,4 +337,78 @@ mod tests {
         // Should not panic when removing from non-existent contract
         seeding_manager.remove_subscriber_by_peer(&contract_key, &peer);
     }
+
+    /// Test that validates the broadcast target filtering logic used by
+    /// `get_broadcast_targets_update` in update.rs.
+    ///
+    /// **Architecture Note (Issue #2075):**
+    /// After decoupling local from network subscriptions, `get_broadcast_targets_update`
+    /// simply filters out the sender from the subscriber list. This test validates
+    /// that the seeding_manager correctly stores and retrieves network subscribers,
+    /// which is the foundation for UPDATE broadcast targeting.
+    #[test]
+    fn test_subscribers_for_broadcast_targeting() {
+        let seeding_manager = SeedingManager::new();
+        let contract_key = ContractKey::from(ContractInstanceId::new([3u8; 32]));
+
+        // Create network peers (not local clients)
+        let peer1 = test_peer_id(1);
+        let peer2 = test_peer_id(2);
+        let peer3 = test_peer_id(3);
+
+        let peer_loc1 = PeerKeyLocation::new(peer1.pub_key.clone(), peer1.addr);
+        let peer_loc2 = PeerKeyLocation::new(peer2.pub_key.clone(), peer2.addr);
+        let peer_loc3 = PeerKeyLocation::new(peer3.pub_key.clone(), peer3.addr);
+
+        // Register network subscribers
+        seeding_manager
+            .add_subscriber(&contract_key, peer_loc1.clone(), None)
+            .expect("should add peer1");
+        seeding_manager
+            .add_subscriber(&contract_key, peer_loc2.clone(), None)
+            .expect("should add peer2");
+        seeding_manager
+            .add_subscriber(&contract_key, peer_loc3.clone(), None)
+            .expect("should add peer3");
+
+        // Retrieve subscribers (as get_broadcast_targets_update would)
+        let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
+
+        // All network peers should be in the list
+        assert_eq!(subs.len(), 3, "Should have 3 network subscribers");
+
+        // Simulate filtering out the sender (as get_broadcast_targets_update does)
+        // If peer1 is the sender of an UPDATE, it should be filtered out
+        let sender_addr = peer1.addr;
+        let broadcast_targets: Vec<_> = subs
+            .iter()
+            .filter(|pk| pk.socket_addr().as_ref() != Some(&sender_addr))
+            .cloned()
+            .collect();
+
+        // Only peer2 and peer3 should receive the broadcast
+        assert_eq!(
+            broadcast_targets.len(),
+            2,
+            "Should exclude sender from broadcast targets"
+        );
+        assert!(
+            broadcast_targets
+                .iter()
+                .any(|p| p.socket_addr() == Some(peer2.addr)),
+            "peer2 should be in broadcast targets"
+        );
+        assert!(
+            broadcast_targets
+                .iter()
+                .any(|p| p.socket_addr() == Some(peer3.addr)),
+            "peer3 should be in broadcast targets"
+        );
+        assert!(
+            !broadcast_targets
+                .iter()
+                .any(|p| p.socket_addr() == Some(peer1.addr)),
+            "sender (peer1) should NOT be in broadcast targets"
+        );
+    }
 }
