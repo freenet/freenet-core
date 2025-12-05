@@ -57,9 +57,7 @@
 //! - **Level 2**: Loopback sockets - includes kernel scheduling variance
 //! - **Level 3**: Stress tests - highly environment-dependent
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box as std_black_box;
 use std::time::Duration;
 
@@ -418,20 +416,22 @@ mod level1_mock_io {
 
         // Test various buffer sizes
         for buffer_size in [1, 10, 100, 1000] {
+            // Pre-create packet data outside the benchmark loop
+            let packet: Arc<[u8]> = vec![0u8; 1492].into();
+
             group.bench_with_input(
                 BenchmarkId::new("buffer", buffer_size),
                 &buffer_size,
                 |b, &buf_size| {
-                    // Pre-create packet data (simulates encrypted packet)
-                    let packet: Arc<[u8]> = vec![0u8; 1492].into();
-
+                    let packet = packet.clone();
                     b.to_async(&rt).iter_batched(
-                        // Setup: create channel (not measured)
-                        || mpsc::channel::<Arc<[u8]>>(buf_size),
+                        // Setup: create channel and clone packet (not measured)
+                        || {
+                            let p = packet.clone();
+                            (mpsc::channel::<Arc<[u8]>>(buf_size), p)
+                        },
                         // Routine: send 1000 packets (measured)
-                        |(tx, mut rx)| async move {
-                            let packet = packet.clone();
-
+                        |((tx, mut rx), packet)| async move {
                             // Spawn receiver
                             let receiver = tokio::spawn(async move {
                                 let mut count = 0;
@@ -471,10 +471,10 @@ mod level1_mock_io {
 
         // Large buffer to avoid backpressure
         let buffer_size = 10000;
+        let packet: Arc<[u8]> = vec![0u8; 1492].into();
 
         group.bench_function("try_send_success", |b| {
-            let packet: Arc<[u8]> = vec![0u8; 1492].into();
-
+            let packet = packet.clone();
             b.to_async(&rt).iter_batched(
                 || {
                     let (tx, rx) = mpsc::channel::<Arc<[u8]>>(buffer_size);
