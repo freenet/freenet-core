@@ -636,14 +636,13 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
     Ok(())
 }
 
-// This test is disabled due to race conditions in subscription propagation logic.
-// The test expects multiple clients across different nodes to receive subscription updates,
-// but the PUT caching refactor (commits 2cd337b5-0d432347) changed the subscription semantics.
-// Re-enabled after recent fixes to subscription logic - previously exhibited race conditions.
-// If this test becomes flaky again, see issue #1798 for historical context.
-// Ignored again due to recurring flakiness - fails intermittently with timeout waiting for
-// cross-node subscription notifications (Client 3 timeout). See issue #1798.
-#[ignore]
+// This test validates cross-node subscription propagation: when a client on node-b subscribes
+// to a contract PUT on node-a, UPDATE notifications should reach node-b's clients.
+// Issue #2220 fixed the root cause where intermediate nodes replaced the original subscriber's
+// pub_key with their own when forwarding SeekNode messages.
+// Note: This test exhibits timing-related flakiness in CI due to multi-node startup and connection
+// timing. When the test infrastructure succeeds in establishing connections, cross-node
+// subscriptions work correctly. Consider using --test-threads=1 if flaky in CI.
 #[freenet_test(
     nodes = ["gateway", "node-a", "node-b"],
     auto_connect_peers = true,

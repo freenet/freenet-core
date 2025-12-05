@@ -617,7 +617,6 @@ impl Operation for SubscribeOp {
 
                     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
                     let htl = (*htl).min(ring_max_htl);
-                    let this_peer = op_manager.ring.connection_manager.own_location();
                     let return_not_subbed = || -> OperationResult {
                         let return_msg = SubscribeMsg::ReturnSub {
                             key: *key,
@@ -732,7 +731,10 @@ impl Operation for SubscribeOp {
                                 skip = ?new_skip_list,
                                 "Forwarding seek to next candidate"
                             );
-                            // Retry seek node when the contract to subscribe has not been found in this node
+                            // Retry seek node when the contract to subscribe has not been found in this node.
+                            // IMPORTANT: Preserve the original subscriber's identity (pub_key) so
+                            // the final contract holder registers the correct peer as the subscriber.
+                            // The recipient will fill in our address from the packet source.
                             return build_op_result(
                                 *id,
                                 Some(SubscribeState::AwaitingResponse {
@@ -741,14 +743,15 @@ impl Operation for SubscribeOp {
                                     current_hop: new_htl,
                                     upstream_subscriber: Some(subscriber.clone()),
                                 }),
-                                // Use PeerAddr::Unknown - the subscriber doesn't know their own
-                                // external address (especially behind NAT). The recipient will
-                                // fill this in from the packet source address.
                                 (SubscribeMsg::SeekNode {
                                     id: *id,
                                     key: *key,
+                                    // Keep the original subscriber's pub_key but reset the address
+                                    // to Unknown - the next hop will fill it from source_addr.
+                                    // This ensures the chain of intermediate peers each forward
+                                    // the original subscriber's identity toward the contract holder.
                                     subscriber: PeerKeyLocation::with_unknown_addr(
-                                        this_peer.pub_key().clone(),
+                                        subscriber.pub_key().clone(),
                                     ),
                                     target: new_target,
                                     skip_list: new_skip_list,
@@ -851,13 +854,22 @@ impl Operation for SubscribeOp {
                                     .ring
                                     .k_closest_potentially_caching(key, &skip_list, 3);
                                 if let Some(target) = candidates.first() {
-                                    // Use PeerAddr::Unknown - the subscriber doesn't know their own
-                                    // external address (especially behind NAT). The recipient will
-                                    // fill this in from the packet source address.
-                                    let own_loc = op_manager.ring.connection_manager.own_location();
-                                    let subscriber = PeerKeyLocation::with_unknown_addr(
-                                        own_loc.pub_key().clone(),
-                                    );
+                                    // Preserve the original subscriber's identity when retrying.
+                                    // If we have an upstream_subscriber (we're an intermediate node),
+                                    // use their pub_key. Otherwise, we're the originating node.
+                                    let subscriber_pub_key =
+                                        if let Some(ref upstream) = upstream_subscriber {
+                                            upstream.pub_key().clone()
+                                        } else {
+                                            op_manager
+                                                .ring
+                                                .connection_manager
+                                                .own_location()
+                                                .pub_key()
+                                                .clone()
+                                        };
+                                    let subscriber =
+                                        PeerKeyLocation::with_unknown_addr(subscriber_pub_key);
                                     return_msg = Some(SubscribeMsg::SeekNode {
                                         id: *id,
                                         key: *key,
