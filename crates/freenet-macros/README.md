@@ -29,19 +29,18 @@ async fn test_basic_gateway(ctx: &mut TestContext) -> TestResult {
 }
 ```
 
-### Multi-Node Test with Auto-Connect
+### Multi-Node Test
 
 ```rust
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true,
     aggregate_events = "on_failure"
 )]
 async fn test_network_operations(ctx: &mut TestContext) -> TestResult {
     let gateway = ctx.gateway()?;
     let peers = ctx.peers();
 
-    // All peers are automatically configured to connect to the gateway
+    // All peers automatically connect to the gateway (default behavior)
     assert_eq!(peers.len(), 2);
 
     // Your test logic here...
@@ -88,8 +87,7 @@ Set explicit ring locations for nodes (order must match the `nodes` list). This 
 ```rust
 #[freenet_test(
     nodes = ["gateway", "peer-a", "peer-b"],
-    node_locations = [0.2, 0.6, 0.85], // gateway, peer-a, peer-b
-    auto_connect_peers = true
+    node_locations = [0.2, 0.6, 0.85] // gateway, peer-a, peer-b
 )]
 async fn test_with_locations(ctx: &mut TestContext) -> TestResult {
     // Test logic here...
@@ -113,8 +111,7 @@ fn my_locations() -> Vec<f64> {
 
 #[freenet_test(
     nodes = ["gateway", "peer-a", "peer-b"],
-    node_locations_fn = my_locations,
-    auto_connect_peers = true
+    node_locations_fn = my_locations
 )]
 ```
 
@@ -147,17 +144,21 @@ async fn test_with_node_configs(ctx: &mut TestContext) -> TestResult {
 #### `auto_connect_peers`
 Automatically configure all peer nodes to connect to all gateway nodes.
 
+**Behavior:**
+- When `true` (default): Peers are pre-configured with gateway connection info
+- When `false`: You must manually configure peer connections
+- Works with multiple gateways (peers connect to all gateways)
+
 ```rust
+// Default behavior - peers auto-connect to gateways
+#[freenet_test(nodes = ["gateway", "peer-1", "peer-2"])]
+
+// Disable auto-connect for manual connection setup
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true  // Peers auto-connect to gateway
+    auto_connect_peers = false
 )]
 ```
-
-**Behavior:**
-- When `true`: Peers are pre-configured with gateway connection info
-- When `false` (default): You must manually configure peer connections
-- Works with multiple gateways (peers connect to all gateways)
 
 #### `aggregate_events`
 Control when event aggregation reports are generated.
@@ -324,7 +325,6 @@ use freenet_stdlib::prelude::*;
 
 #[freenet_test(
     nodes = ["gateway", "peer-1", "peer-2"],
-    auto_connect_peers = true,
     timeout_secs = 180,
     startup_wait_secs = 15,
     aggregate_events = "on_failure",
@@ -474,7 +474,6 @@ EVENT LOG SUMMARY
 #[freenet_test(
     nodes = ["gw-1", "gw-2", "peer-1", "peer-2", "peer-3", "peer-4"],
     gateways = ["gw-1", "gw-2"],
-    auto_connect_peers = true,
     startup_wait_secs = 20  // More time for connections to establish
 )]
 ```
@@ -561,9 +560,10 @@ Each approach has significant trade-offs. Using `Result`-based errors is the idi
 **Problem:** Peers don't connect to gateway
 
 **Solutions:**
-1. Use `auto_connect_peers = true` to handle connection setup automatically
-2. Increase `startup_wait_secs` to allow more time for connections
-3. Check gateway network port is set correctly
+1. `auto_connect_peers` is `true` by default, so connection setup is automatic
+2. If using `auto_connect_peers = false`, ensure manual connection setup is correct
+3. Increase `startup_wait_secs` to allow more time for connections
+4. Check gateway network port is set correctly
 
 ### Multi-Gateway Tests Fail
 
