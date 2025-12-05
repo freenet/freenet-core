@@ -790,12 +790,22 @@ impl OpManager {
             // Look up the PeerKeyLocation for this address via the connection manager
             if let Some(pkl) = self.ring.connection_manager.get_peer_by_addr(addr) {
                 proximity_targets.insert(pkl);
+            } else {
+                // Neighbor is in proximity cache but no longer connected
+                // This is normal during connection churn - the proximity cache
+                // will be cleaned up when the disconnect is processed
+                tracing::debug!(
+                    peer = %addr,
+                    contract = %key,
+                    "PROXIMITY_CACHE: Skipping disconnected neighbor in UPDATE targets"
+                );
             }
         }
 
         // Combine both sets (HashSet handles deduplication)
-        let mut all_targets: HashSet<PeerKeyLocation> = subscribers.clone();
+        let subscriber_count = subscribers.len();
         let proximity_count = proximity_targets.len();
+        let mut all_targets: HashSet<PeerKeyLocation> = subscribers;
         all_targets.extend(proximity_targets);
 
         let targets: Vec<PeerKeyLocation> = all_targets.into_iter().collect();
@@ -813,7 +823,7 @@ impl OpManager {
                     .collect::<Vec<_>>()
                     .join(","),
                 targets.len(),
-                subscribers.len(),
+                subscriber_count,
                 proximity_count
             );
         } else {

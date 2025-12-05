@@ -4,6 +4,24 @@
 //! subscribed. When a peer caches a contract (via PUT or GET), it announces this to
 //! its neighbors. Neighbors track this information and include known seeders in
 //! UPDATE broadcast targets.
+//!
+//! # Design Note: Two Independent Mechanisms
+//!
+//! Freenet uses two complementary mechanisms for UPDATE propagation:
+//!
+//! 1. **Subscription Tree** (existing): Propagates updates to peers with downstream
+//!    interest (users/peers subscribed through them). Tree structure rooted at
+//!    contract location, extending toward clients. Tracked via `SeedingManager.subscribers`.
+//!
+//! 2. **Proximity Cache** (this module): Propagates updates to nearby seeders who
+//!    cache the contract but may not be explicitly subscribed. Mesh structure among
+//!    peers near the contract's location. Tracked via `ProximityCacheManager.neighbor_caches`.
+//!
+//! These mechanisms are kept independent because they have different lifecycles
+//! (subscriptions are explicit; seeding follows cache eviction) and different data
+//! structures. They are combined at the broadcast targeting point in
+//! `OpManager::get_broadcast_targets_update()`, where HashSet naturally deduplicates
+//! any overlap.
 
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
@@ -104,15 +122,18 @@ impl ProximityCacheManager {
     ) -> Option<ProximityCacheMessage> {
         match message {
             ProximityCacheMessage::CacheAnnounce { added, removed } => {
-                self.neighbor_caches
-                    .entry(from)
-                    .and_modify(|contracts| {
-                        contracts.extend(added.iter().copied());
-                        for id in &removed {
-                            contracts.remove(id);
-                        }
-                    })
-                    .or_insert_with(|| added.into_iter().collect());
+                // Update existing entry if we have one
+                if let Some(mut entry) = self.neighbor_caches.get_mut(&from) {
+                    entry.extend(added.iter().copied());
+                    for id in &removed {
+                        entry.remove(id);
+                    }
+                } else if !added.is_empty() {
+                    // Only create new entry if there are contracts to add
+                    // (avoid creating empty entries for remove-only announcements)
+                    self.neighbor_caches
+                        .insert(from, added.into_iter().collect());
+                }
 
                 let neighbor_contracts = self
                     .neighbor_caches
@@ -183,7 +204,6 @@ impl ProximityCacheManager {
     }
 
     /// Handle peer disconnection by removing their cache state.
-    #[allow(dead_code)]
     pub fn on_peer_disconnected(&self, addr: &SocketAddr) {
         if let Some((_, removed_cache)) = self.neighbor_caches.remove(addr) {
             debug!(

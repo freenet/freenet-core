@@ -799,6 +799,12 @@ impl P2pConnManager {
                                             peer.pub_key().clone(),
                                         ))
                                         .await;
+
+                                    // Clean up proximity cache for disconnected peer
+                                    ctx.bridge
+                                        .op_manager
+                                        .proximity_cache
+                                        .on_peer_disconnected(&peer_addr);
                                     if let Some(conn) = ctx.connections.remove(&peer_addr) {
                                         // Also remove from reverse lookup
                                         if let Some(pub_key) = pub_key_to_remove {
