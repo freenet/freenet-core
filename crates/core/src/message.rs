@@ -406,7 +406,18 @@ pub(crate) enum NodeEvent {
     TransactionTimedOut(Transaction),
     /// Transaction completed successfully - cleanup client subscription
     TransactionCompleted(Transaction),
-    /// Local subscription completed - deliver SubscribeResponse to client via result router
+    /// Local subscription completed - deliver SubscribeResponse to client via result router.
+    ///
+    /// **Architecture Note (Issue #2075):**
+    /// This event is part of the decoupled subscription architecture. Local client subscriptions
+    /// are handled separately from network peer subscriptions:
+    /// - This event notifies the client layer that a subscription request has been processed
+    /// - Subsequent contract updates are delivered via the executor's `update_notifications`
+    ///   channels (see `send_update_notification` in runtime.rs)
+    /// - Network peer subscriptions use the `seeding_manager.subscribers` for UPDATE propagation
+    ///
+    /// This separation keeps the ops/ module (network operations) independent from the
+    /// client_events/ module (local WebSocket client handling).
     LocalSubscribeComplete {
         tx: Transaction,
         key: ContractKey,

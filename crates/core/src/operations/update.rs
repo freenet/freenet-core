@@ -741,6 +741,15 @@ async fn try_to_broadcast(
 }
 
 impl OpManager {
+    /// Get the list of network subscribers to broadcast an UPDATE to.
+    ///
+    /// **Architecture Note (Issue #2075):**
+    /// This function returns only **network peer** subscribers, not local client subscriptions.
+    /// Local clients receive updates through a separate path via the contract executor's
+    /// `update_notifications` channels (see `send_update_notification` in runtime.rs).
+    ///
+    /// This clean separation eliminates the previous `allow_self` workaround that was needed
+    /// when local subscriptions were mixed with network subscriptions.
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
@@ -750,21 +759,10 @@ impl OpManager {
             .ring
             .subscribers_of(key)
             .map(|subs| {
-                let self_addr = self.ring.connection_manager.get_own_addr();
-                let allow_self = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
                 subs.value()
                     .iter()
-                    .filter(|pk| {
-                        // Allow the sender (or ourselves) to stay in the broadcast list when we're
-                        // originating the UPDATE so local auto-subscribes still receive events.
-                        let is_sender = pk.socket_addr().as_ref() == Some(sender);
-                        let is_self = self_addr.as_ref() == pk.socket_addr().as_ref();
-                        if is_sender || is_self {
-                            allow_self
-                        } else {
-                            true
-                        }
-                    })
+                    // Filter out the sender to avoid sending the update back to where it came from
+                    .filter(|pk| pk.socket_addr().as_ref() != Some(sender))
                     .cloned()
                     .collect::<Vec<_>>()
             })
