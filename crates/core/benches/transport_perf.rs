@@ -685,6 +685,656 @@ mod level3_stress {
 }
 
 // =============================================================================
+// Experimental: Packet Size Performance
+// =============================================================================
+//
+// Tests hypothesis: Does larger packet size improve throughput for the same
+// number of syscalls? This is critical for understanding whether we should
+// pursue jumbo frames or packet coalescing strategies.
+
+mod experimental_packet_size {
+    use super::*;
+
+    /// Compare throughput for same syscall count but different packet sizes
+    ///
+    /// Hypothesis: Larger packets = higher throughput for same syscall overhead
+    /// This tests MTU sizes from standard (1400) to jumbo frames (9000)
+    pub fn bench_packet_size_throughput(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("experimental/packet_size/throughput");
+        group.sample_size(50);
+        group.measurement_time(Duration::from_secs(5));
+
+        // Test different packet sizes with SAME syscall count
+        // This isolates the effect of packet size on throughput
+        const SYSCALL_COUNT: usize = 1000;
+
+        // Packet sizes to test (bytes)
+        // 512: Small packets
+        // 1400: Standard MTU (typical internet)
+        // 4096: 4KB (larger than MTU, would fragment on real network)
+        // 8192: 8KB (jumbo-ish, for local/datacenter)
+        // Note: On loopback, we can exceed MTU since no fragmentation occurs
+        let packet_sizes = [512, 1024, 1400, 2048, 4096, 8192];
+
+        for &packet_size in &packet_sizes {
+            // Total data transferred = packet_size * SYSCALL_COUNT
+            let total_bytes = (packet_size * SYSCALL_COUNT) as u64;
+            group.throughput(Throughput::Bytes(total_bytes));
+
+            let socket = rt.block_on(async {
+                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let addr = socket.local_addr().unwrap();
+                socket.connect(addr).await.unwrap();
+                socket
+            });
+            let socket = std::sync::Arc::new(socket);
+
+            group.bench_with_input(
+                BenchmarkId::new("size_bytes", packet_size),
+                &packet_size,
+                |b, &size| {
+                    let socket = socket.clone();
+                    let buf = vec![0xABu8; size];
+                    b.to_async(&rt).iter(move || {
+                        let socket = socket.clone();
+                        let buf = buf.clone();
+                        async move {
+                            for _ in 0..SYSCALL_COUNT {
+                                socket.send(&buf).await.unwrap();
+                            }
+                        }
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Measure syscall overhead as a function of packet size
+    ///
+    /// Shows how much of the send time is syscall overhead vs data transfer
+    pub fn bench_syscall_overhead_vs_size(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("experimental/packet_size/syscall_overhead");
+
+        let packet_sizes = [64, 256, 512, 1024, 1400, 2048, 4096, 8192];
+
+        let socket = rt.block_on(async {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).await.unwrap();
+            socket
+        });
+        let socket = std::sync::Arc::new(socket);
+
+        for &packet_size in &packet_sizes {
+            // Measure time per syscall (not throughput)
+            let socket = socket.clone();
+            group.bench_with_input(
+                BenchmarkId::new("single_send", packet_size),
+                &packet_size,
+                |b, &size| {
+                    let socket = socket.clone();
+                    let buf = vec![0xABu8; size];
+                    b.to_async(&rt).iter(move || {
+                        let socket = socket.clone();
+                        let buf = buf.clone();
+                        async move {
+                            socket.send(&buf).await.unwrap();
+                        }
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Compare send+recv roundtrip for different packet sizes
+    pub fn bench_roundtrip_by_size(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("experimental/packet_size/roundtrip");
+
+        let packet_sizes = [64, 512, 1400, 4096, 8192];
+
+        for &packet_size in &packet_sizes {
+            let (socket1, socket2) = rt.block_on(async {
+                let s1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let s2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let addr1 = s1.local_addr().unwrap();
+                let addr2 = s2.local_addr().unwrap();
+                s1.connect(addr2).await.unwrap();
+                s2.connect(addr1).await.unwrap();
+                (s1, s2)
+            });
+            let socket1 = std::sync::Arc::new(socket1);
+            let socket2 = std::sync::Arc::new(socket2);
+
+            group.bench_with_input(
+                BenchmarkId::new("bytes", packet_size),
+                &packet_size,
+                |b, &size| {
+                    let s1 = socket1.clone();
+                    let s2 = socket2.clone();
+                    let send_buf = vec![0xABu8; size];
+                    b.to_async(&rt).iter(move || {
+                        let s1 = s1.clone();
+                        let s2 = s2.clone();
+                        let send_buf = send_buf.clone();
+                        async move {
+                            let mut recv_buf = vec![0u8; size + 100];
+                            s1.send(&send_buf).await.unwrap();
+                            s2.recv(&mut recv_buf).await.unwrap();
+                        }
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
+// =============================================================================
+// Experimental: Tokio Overhead Comparison
+// =============================================================================
+//
+// Tests hypothesis: Can we reduce async runtime overhead by using alternatives
+// to tokio channels or by using a different threading model?
+
+mod experimental_tokio_overhead {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Compare tokio::sync::mpsc vs std::sync::mpsc vs crossbeam
+    ///
+    /// This helps quantify the overhead of tokio's async channels
+    pub fn bench_channel_comparison(c: &mut Criterion) {
+        let mut group = c.benchmark_group("experimental/tokio_overhead/channels");
+        group.throughput(Throughput::Elements(10000));
+
+        let packet_size = 1492;
+        let packet_count = 10000;
+
+        // ========== std::sync::mpsc (blocking) ==========
+        group.bench_function("std_mpsc", |b| {
+            b.iter_batched(
+                || {
+                    let (tx, rx) = std::sync::mpsc::channel::<Arc<[u8]>>();
+                    let packet: Arc<[u8]> = vec![0u8; packet_size].into();
+                    (tx, rx, packet)
+                },
+                |(tx, rx, packet)| {
+                    let receiver = std::thread::spawn(move || {
+                        let mut count = 0;
+                        while rx.recv().is_ok() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    for _ in 0..packet_count {
+                        tx.send(packet.clone()).unwrap();
+                    }
+                    drop(tx);
+
+                    let count = receiver.join().unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // ========== std::sync::mpsc with sync_channel (bounded) ==========
+        group.bench_function("std_sync_channel_100", |b| {
+            b.iter_batched(
+                || {
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<[u8]>>(100);
+                    let packet: Arc<[u8]> = vec![0u8; packet_size].into();
+                    (tx, rx, packet)
+                },
+                |(tx, rx, packet)| {
+                    let receiver = std::thread::spawn(move || {
+                        let mut count = 0;
+                        while rx.recv().is_ok() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    for _ in 0..packet_count {
+                        tx.send(packet.clone()).unwrap();
+                    }
+                    drop(tx);
+
+                    let count = receiver.join().unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // ========== crossbeam unbounded ==========
+        group.bench_function("crossbeam_unbounded", |b| {
+            b.iter_batched(
+                || {
+                    let (tx, rx) = crossbeam::channel::unbounded::<Arc<[u8]>>();
+                    let packet: Arc<[u8]> = vec![0u8; packet_size].into();
+                    (tx, rx, packet)
+                },
+                |(tx, rx, packet)| {
+                    let receiver = std::thread::spawn(move || {
+                        let mut count = 0;
+                        while rx.recv().is_ok() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    for _ in 0..packet_count {
+                        tx.send(packet.clone()).unwrap();
+                    }
+                    drop(tx);
+
+                    let count = receiver.join().unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // ========== crossbeam bounded ==========
+        group.bench_function("crossbeam_bounded_100", |b| {
+            b.iter_batched(
+                || {
+                    let (tx, rx) = crossbeam::channel::bounded::<Arc<[u8]>>(100);
+                    let packet: Arc<[u8]> = vec![0u8; packet_size].into();
+                    (tx, rx, packet)
+                },
+                |(tx, rx, packet)| {
+                    let receiver = std::thread::spawn(move || {
+                        let mut count = 0;
+                        while rx.recv().is_ok() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    for _ in 0..packet_count {
+                        tx.send(packet.clone()).unwrap();
+                    }
+                    drop(tx);
+
+                    let count = receiver.join().unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // ========== tokio::sync::mpsc (async) ==========
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        group.bench_function("tokio_mpsc_100", |b| {
+            let packet: Arc<[u8]> = vec![0u8; packet_size].into();
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Arc<[u8]>>(100);
+                    (tx, rx, packet.clone())
+                },
+                |(tx, mut rx, packet)| async move {
+                    let receiver = tokio::spawn(async move {
+                        let mut count = 0;
+                        while rx.recv().await.is_some() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    for _ in 0..packet_count {
+                        tx.send(packet.clone()).await.unwrap();
+                    }
+                    drop(tx);
+
+                    let count = receiver.await.unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.finish();
+    }
+
+    /// Compare tokio UdpSocket vs std UdpSocket with dedicated threads
+    ///
+    /// This tests whether tokio's async I/O adds significant overhead
+    pub fn bench_socket_overhead(c: &mut Criterion) {
+        let mut group = c.benchmark_group("experimental/tokio_overhead/sockets");
+        group.sample_size(50);
+
+        let packet_size = 1400;
+        const BURST_SIZE: usize = 1000;
+
+        group.throughput(Throughput::Elements(BURST_SIZE as u64));
+
+        // ========== std::net::UdpSocket (blocking, dedicated thread) ==========
+        group.bench_function("std_udp_blocking", |b| {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).unwrap();
+
+            let buf = vec![0xABu8; packet_size];
+            b.iter(|| {
+                for _ in 0..BURST_SIZE {
+                    socket.send(&buf).unwrap();
+                }
+            });
+        });
+
+        // ========== tokio::net::UdpSocket (async) ==========
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let socket = rt.block_on(async {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).await.unwrap();
+            socket
+        });
+        let socket = std::sync::Arc::new(socket);
+
+        group.bench_function("tokio_udp_async", |b| {
+            let socket = socket.clone();
+            let buf = vec![0xABu8; packet_size];
+            b.to_async(&rt).iter(move || {
+                let socket = socket.clone();
+                let buf = buf.clone();
+                async move {
+                    for _ in 0..BURST_SIZE {
+                        socket.send(&buf).await.unwrap();
+                    }
+                }
+            });
+        });
+
+        // ========== tokio current_thread runtime (single-threaded) ==========
+        let rt_single = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let socket_single = rt_single.block_on(async {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            socket.connect(addr).await.unwrap();
+            socket
+        });
+        let socket_single = std::sync::Arc::new(socket_single);
+
+        group.bench_function("tokio_udp_single_thread", |b| {
+            let socket = socket_single.clone();
+            let buf = vec![0xABu8; packet_size];
+            b.to_async(&rt_single).iter(move || {
+                let socket = socket.clone();
+                let buf = buf.clone();
+                async move {
+                    for _ in 0..BURST_SIZE {
+                        socket.send(&buf).await.unwrap();
+                    }
+                }
+            });
+        });
+
+        group.finish();
+    }
+
+    /// Thread-per-core model vs tokio work-stealing
+    ///
+    /// Tests a simplified thread-per-core approach where each "peer" has its own
+    /// dedicated thread, vs tokio's work-stealing scheduler
+    pub fn bench_threading_model(c: &mut Criterion) {
+        let mut group = c.benchmark_group("experimental/tokio_overhead/threading");
+        group.sample_size(20);
+        group.measurement_time(Duration::from_secs(10));
+
+        let packet_size = 1400;
+        let packets_per_peer = 1000;
+        let num_peers = 4; // Simulate 4 concurrent peer connections
+
+        group.throughput(Throughput::Elements((packets_per_peer * num_peers) as u64));
+
+        // ========== Thread-per-peer model (dedicated threads) ==========
+        group.bench_function("thread_per_peer", |b| {
+            b.iter(|| {
+                let handles: Vec<_> = (0..num_peers)
+                    .map(|_| {
+                        std::thread::spawn(move || {
+                            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                            let addr = socket.local_addr().unwrap();
+                            socket.connect(addr).unwrap();
+                            let buf = vec![0xABu8; packet_size];
+
+                            for _ in 0..packets_per_peer {
+                                socket.send(&buf).unwrap();
+                            }
+                        })
+                    })
+                    .collect();
+
+                for h in handles {
+                    h.join().unwrap();
+                }
+            });
+        });
+
+        // ========== Tokio work-stealing model ==========
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        group.bench_function("tokio_work_stealing", |b| {
+            b.to_async(&rt).iter(|| async {
+                let handles: Vec<_> = (0..num_peers)
+                    .map(|_| {
+                        tokio::spawn(async move {
+                            let socket =
+                                tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                            let addr = socket.local_addr().unwrap();
+                            socket.connect(addr).await.unwrap();
+                            let buf = vec![0xABu8; packet_size];
+
+                            for _ in 0..packets_per_peer {
+                                socket.send(&buf).await.unwrap();
+                            }
+                        })
+                    })
+                    .collect();
+
+                for h in handles {
+                    h.await.unwrap();
+                }
+            });
+        });
+
+        // ========== Tokio spawn_blocking (hybrid) ==========
+        group.bench_function("tokio_spawn_blocking", |b| {
+            b.to_async(&rt).iter(|| async {
+                let handles: Vec<_> = (0..num_peers)
+                    .map(|_| {
+                        tokio::task::spawn_blocking(move || {
+                            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                            let addr = socket.local_addr().unwrap();
+                            socket.connect(addr).unwrap();
+                            let buf = vec![0xABu8; packet_size];
+
+                            for _ in 0..packets_per_peer {
+                                socket.send(&buf).unwrap();
+                            }
+                        })
+                    })
+                    .collect();
+
+                for h in handles {
+                    h.await.unwrap();
+                }
+            });
+        });
+
+        group.finish();
+    }
+}
+
+// =============================================================================
+// Experimental: Combined Packet Size + Channel Overhead
+// =============================================================================
+//
+// Tests the combined effect of packet size and channel overhead to simulate
+// the real transport layer behavior
+
+mod experimental_combined {
+    use super::*;
+    use aes_gcm::{aead::AeadInPlace, aead::KeyInit, Aes128Gcm};
+    use std::sync::Arc;
+
+    /// Full pipeline: serialize -> encrypt -> channel -> socket
+    /// Compares different packet sizes through the full pipeline
+    pub fn bench_full_pipeline_by_size(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("experimental/combined/full_pipeline");
+        group.sample_size(30);
+        group.measurement_time(Duration::from_secs(10));
+
+        const PACKET_COUNT: usize = 1000;
+
+        // Test different payload sizes
+        let payload_sizes = [256, 512, 1024, 1364, 2048, 4096];
+
+        let key: [u8; 16] = [0x42u8; 16];
+        let cipher = Aes128Gcm::new(&key.into());
+
+        for &payload_size in &payload_sizes {
+            let total_bytes = (payload_size * PACKET_COUNT) as u64;
+            group.throughput(Throughput::Bytes(total_bytes));
+
+            let cipher = cipher.clone();
+
+            group.bench_with_input(
+                BenchmarkId::new("payload_bytes", payload_size),
+                &payload_size,
+                |b, &size| {
+                    let cipher = cipher.clone();
+                    b.to_async(&rt).iter_batched(
+                        || {
+                            // Setup: create channel and socket
+                            let (tx, rx) =
+                                tokio::sync::mpsc::channel::<Arc<[u8]>>(100);
+
+                            let socket_future = async {
+                                let socket =
+                                    tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                                let addr = socket.local_addr().unwrap();
+                                socket.connect(addr).await.unwrap();
+                                Arc::new(socket)
+                            };
+
+                            let socket = tokio::runtime::Handle::current()
+                                .block_on(socket_future);
+
+                            (tx, rx, socket, cipher.clone())
+                        },
+                        |(tx, mut rx, socket, cipher)| async move {
+                            // Spawn receiver that sends to socket
+                            let socket_clone = socket.clone();
+                            let receiver = tokio::spawn(async move {
+                                let mut count = 0;
+                                while let Some(packet) = rx.recv().await {
+                                    socket_clone.send(&packet).await.ok();
+                                    count += 1;
+                                }
+                                count
+                            });
+
+                            // Sender: serialize, encrypt, send to channel
+                            let mut nonce_counter = 0u64;
+                            for _ in 0..PACKET_COUNT {
+                                // Allocate buffer for packet
+                                let mut packet = vec![0u8; size + 28]; // +28 for nonce+tag
+
+                                // Create nonce
+                                let mut nonce = [0u8; 12];
+                                nonce[4..].copy_from_slice(&nonce_counter.to_le_bytes());
+                                nonce_counter += 1;
+
+                                // Copy nonce to packet
+                                packet[..12].copy_from_slice(&nonce);
+
+                                // Fill payload with data
+                                packet[12..12 + size].fill(0xAB);
+
+                                // Encrypt in place
+                                let tag = cipher
+                                    .encrypt_in_place_detached(
+                                        (&nonce).into(),
+                                        &[],
+                                        &mut packet[12..12 + size],
+                                    )
+                                    .unwrap();
+
+                                // Append tag
+                                packet[12 + size..12 + size + 16].copy_from_slice(&tag);
+
+                                // Send to channel
+                                let packet_arc: Arc<[u8]> = packet.into();
+                                tx.send(packet_arc).await.ok();
+                            }
+                            drop(tx);
+
+                            let count = receiver.await.unwrap();
+                            std_black_box(count);
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
+// =============================================================================
 // Criterion Groups - Organized by noise level
 // =============================================================================
 
@@ -740,4 +1390,41 @@ criterion_group!(
         level3_stress::bench_max_send_rate,
 );
 
-criterion_main!(level0, level1, level2, level3);
+criterion_group!(
+    name = experimental_packet;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(5))
+        .noise_threshold(0.10)
+        .significance_level(0.05);
+    targets =
+        experimental_packet_size::bench_packet_size_throughput,
+        experimental_packet_size::bench_syscall_overhead_vs_size,
+        experimental_packet_size::bench_roundtrip_by_size,
+);
+
+criterion_group!(
+    name = experimental_tokio;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(5))
+        .noise_threshold(0.10)
+        .significance_level(0.05);
+    targets =
+        experimental_tokio_overhead::bench_channel_comparison,
+        experimental_tokio_overhead::bench_socket_overhead,
+        experimental_tokio_overhead::bench_threading_model,
+);
+
+criterion_group!(
+    name = experimental_combined;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(2))
+        .measurement_time(Duration::from_secs(10))
+        .sample_size(20)
+        .noise_threshold(0.15);
+    targets =
+        experimental_combined::bench_full_pipeline_by_size,
+);
+
+criterion_main!(level0, level1, level2, level3, experimental_packet, experimental_tokio, experimental_combined);

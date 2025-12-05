@@ -175,14 +175,21 @@ for arg in "$@"; do
             echo "  level2          Loopback benchmarks (real sockets, kernel involved)"
             echo "  level3          Stress tests (high load, environment sensitive)"
             echo ""
+            echo "Experimental (hypothesis testing):"
+            echo "  experimental_packet   Packet size vs throughput (same syscalls)"
+            echo "  experimental_tokio    Tokio vs std vs crossbeam overhead"
+            echo "  experimental_combined Full pipeline with varying packet sizes"
+            echo ""
             echo "Examples:"
-            echo "  $0                      # Run all levels"
-            echo "  $0 level0              # Run only Level 0"
-            echo "  $0 --validate level0   # Validate env, then run Level 0"
-            echo "  $0 level0 level1       # Run Level 0 and Level 1"
+            echo "  $0                           # Run all levels"
+            echo "  $0 level0                    # Run only Level 0"
+            echo "  $0 --validate level0         # Validate env, then run Level 0"
+            echo "  $0 level0 level1             # Run Level 0 and Level 1"
+            echo "  $0 experimental_packet       # Run packet size experiments"
+            echo "  $0 experimental_tokio        # Run Tokio overhead experiments"
             exit 0
             ;;
-        level*)
+        level*|experimental*)
             LEVELS="$LEVELS $arg"
             ;;
         *)

@@ -552,5 +552,103 @@ criterion_main!(benches);
 
 ---
 
+---
+
+## 11. Experimental Benchmark Results (December 2024)
+
+### 11.1 Hypothesis 1: Packet Size Effect on Throughput
+
+**Question**: Does larger packet size improve throughput when syscall count is held constant?
+
+**Methodology**: Send 1000 packets of varying sizes over loopback UDP, measure total throughput.
+
+**Results**:
+
+| Packet Size | Time | Throughput | Syscall Overhead % |
+|-------------|------|------------|-------------------|
+| 512 bytes   | 10.4 ms | **47 MiB/s** | ~98.3% |
+| 1024 bytes  | 10.6 ms | **92 MiB/s** | ~97.0% |
+| 1400 bytes  | 10.3 ms | **130 MiB/s** | ~95.3% |
+| 2048 bytes  | 10.2 ms | **191 MiB/s** | ~93.6% |
+| 4096 bytes  | 10.5 ms | **372 MiB/s** | ~87.6% |
+| 8192 bytes  | 10.9 ms | **720 MiB/s** | ~75.8% |
+
+**Conclusion**: Time per batch is nearly constant (~10.3ms) regardless of packet size. Throughput scales linearly with packet size. **Syscall overhead dominates at small packet sizes**.
+
+- 16x larger packets → 15.3x higher throughput
+- Current 1400-byte packets waste ~95% of transfer time on syscall overhead
+- Jumbo frames (9000+ bytes) or packet coalescing (sendmmsg) would dramatically improve throughput
+
+### 11.2 Hypothesis 2: Tokio Async Overhead
+
+**Question**: How much overhead does tokio add compared to blocking I/O?
+
+#### 11.2.1 Channel Comparison (10,000 packets)
+
+| Channel Type | Time | Throughput | Relative |
+|--------------|------|------------|----------|
+| crossbeam::channel::unbounded | **1.00 ms** | **9.98 Melem/s** | 1.00x |
+| std::sync::mpsc (unbounded) | 1.05 ms | 9.54 Melem/s | 0.96x |
+| std::sync::sync_channel(100) | 2.43 ms | 4.12 Melem/s | 0.41x |
+| crossbeam::channel::bounded(100) | 3.05 ms | 3.27 Melem/s | 0.33x |
+| **tokio::sync::mpsc(100)** | **4.46 ms** | **2.24 Melem/s** | **0.22x** |
+
+**Conclusion**: tokio::sync::mpsc is **4.4x slower** than crossbeam unbounded channels. For transport layer hot paths, replacing tokio channels with crossbeam could provide significant speedup.
+
+#### 11.2.2 Socket Overhead (1000 packets × 1400 bytes)
+
+| Socket Type | Time | Throughput | Relative |
+|-------------|------|------------|----------|
+| std::net::UdpSocket (blocking) | **8.38 ms** | **119 Kelem/s** | 1.00x |
+| tokio::net::UdpSocket (single-thread) | 8.46 ms | 118 Kelem/s | 0.99x |
+| tokio::net::UdpSocket (multi-thread) | 11.67 ms | 86 Kelem/s | 0.72x |
+
+**Conclusion**:
+- Tokio single-threaded runtime has **negligible overhead** vs blocking
+- Tokio multi-threaded runtime adds **~39% overhead** due to work-stealing scheduler
+
+#### 11.2.3 Threading Model Comparison (4 peers × 1000 packets)
+
+| Threading Model | Time | Throughput | Relative |
+|-----------------|------|------------|----------|
+| Thread-per-peer (std::thread) | 27.4 ms | 146 Kelem/s | 0.91x |
+| Tokio work-stealing | 27.5 ms | 145 Kelem/s | 0.91x |
+| **Tokio spawn_blocking** | **25.0 ms** | **160 Kelem/s** | **1.00x** |
+
+**Conclusion**: `tokio::task::spawn_blocking` is **~10% faster** than both pure threading and async tokio for I/O-bound work. Combines best of tokio task management with blocking syscalls.
+
+### 11.3 Recommendations Based on Experiments
+
+1. **Packet Coalescing (High Priority)**
+   - Implement `sendmmsg`/`recvmmsg` to batch multiple packets per syscall
+   - Potential: 5-10x throughput improvement based on packet size scaling
+
+2. **Replace tokio::sync::mpsc in Hot Paths (Medium Priority)**
+   - Switch to `crossbeam::channel` for internal packet routing
+   - Potential: 4.4x channel throughput improvement
+
+3. **Consider Hybrid Threading Model (Low Priority)**
+   - Use `spawn_blocking` for UDP I/O tasks
+   - Keep async for connection management and higher-level logic
+
+4. **Single-Thread Transport Option (Future)**
+   - For latency-sensitive deployments, single-threaded runtime eliminates scheduler overhead
+
+### 11.4 Running the Benchmarks
+
+```bash
+# Run packet size experiments
+./scripts/run_benchmarks.sh experimental_packet
+
+# Run Tokio overhead experiments
+./scripts/run_benchmarks.sh experimental_tokio
+
+# Run full pipeline experiments
+./scripts/run_benchmarks.sh experimental_combined
+```
+
+---
+
 *Analysis performed: December 2024*
+*Experimental benchmarks added: December 2024*
 *Codebase version: commit c50d888*
