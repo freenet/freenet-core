@@ -1649,3 +1649,215 @@ mod messages {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Transaction;
+    use crate::operations::test_utils::{make_contract_key, make_peer};
+    use std::collections::HashSet;
+
+    fn make_get_op(state: Option<GetState>, result: Option<GetResult>) -> GetOp {
+        GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state,
+            result,
+            stats: None,
+            upstream_addr: None,
+        }
+    }
+
+    // Tests for finalized() method
+    #[test]
+    fn get_op_finalized_when_finished_with_result() {
+        let key = make_contract_key(1);
+        let result = GetResult {
+            key,
+            state: WrappedState::new(vec![1, 2, 3]),
+            contract: None,
+        };
+        let op = make_get_op(Some(GetState::Finished { key }), Some(result));
+        assert!(
+            op.finalized(),
+            "GetOp should be finalized when state is Finished and result is present"
+        );
+    }
+
+    #[test]
+    fn get_op_not_finalized_when_finished_without_result() {
+        let key = make_contract_key(1);
+        let op = make_get_op(Some(GetState::Finished { key }), None);
+        assert!(
+            !op.finalized(),
+            "GetOp should not be finalized when state is Finished but result is None"
+        );
+    }
+
+    #[test]
+    fn get_op_not_finalized_when_received_request() {
+        let op = make_get_op(Some(GetState::ReceivedRequest { requester: None }), None);
+        assert!(
+            !op.finalized(),
+            "GetOp should not be finalized in ReceivedRequest state"
+        );
+    }
+
+    #[test]
+    fn get_op_not_finalized_when_state_is_none() {
+        let op = make_get_op(None, None);
+        assert!(
+            !op.finalized(),
+            "GetOp should not be finalized when state is None"
+        );
+    }
+
+    // Tests for to_host_result() method
+    #[test]
+    fn get_op_to_host_result_success_when_result_present() {
+        let key = make_contract_key(1);
+        let state_data = WrappedState::new(vec![1, 2, 3]);
+        let result = GetResult {
+            key,
+            state: state_data.clone(),
+            contract: None,
+        };
+        let op = make_get_op(Some(GetState::Finished { key }), Some(result));
+        let host_result = op.to_host_result();
+
+        assert!(
+            host_result.is_ok(),
+            "to_host_result should return Ok when result is present"
+        );
+
+        if let Ok(HostResponse::ContractResponse(
+            freenet_stdlib::client_api::ContractResponse::GetResponse {
+                key: returned_key,
+                state: returned_state,
+                ..
+            },
+        )) = host_result
+        {
+            assert_eq!(returned_key, key, "Returned key should match");
+            assert_eq!(returned_state, state_data, "Returned state should match");
+        } else {
+            panic!("Expected GetResponse");
+        }
+    }
+
+    #[test]
+    fn get_op_to_host_result_error_when_no_result() {
+        let op = make_get_op(Some(GetState::ReceivedRequest { requester: None }), None);
+        let result = op.to_host_result();
+        assert!(
+            result.is_err(),
+            "to_host_result should return Err when result is None"
+        );
+    }
+
+    // Tests for outcome() method - partial coverage since full stats require complex setup
+    #[test]
+    fn get_op_outcome_incomplete_without_stats() {
+        let key = make_contract_key(1);
+        let result = GetResult {
+            key,
+            state: WrappedState::new(vec![]),
+            contract: None,
+        };
+        let op = make_get_op(Some(GetState::Finished { key }), Some(result));
+        let outcome = op.outcome();
+
+        assert!(matches!(outcome, OpOutcome::Incomplete));
+    }
+
+    // Tests for GetMsg helper methods
+    #[test]
+    fn get_msg_target_addr_returns_socket_for_request_get() {
+        let target = make_peer(5000);
+        let msg = GetMsg::RequestGet {
+            id: Transaction::new::<GetMsg>(),
+            target: target.clone(),
+            key: make_contract_key(1),
+            fetch_contract: false,
+            skip_list: HashSet::new(),
+        };
+        assert_eq!(
+            msg.target_addr(),
+            target.socket_addr(),
+            "target_addr should return target's socket address for RequestGet"
+        );
+    }
+
+    #[test]
+    fn get_msg_target_addr_returns_socket_for_return_get() {
+        let target = make_peer(6000);
+        let msg = GetMsg::ReturnGet {
+            id: Transaction::new::<GetMsg>(),
+            key: make_contract_key(1),
+            value: StoreResponse {
+                state: None,
+                contract: None,
+            },
+            target: target.clone(),
+            skip_list: HashSet::new(),
+        };
+        assert_eq!(
+            msg.target_addr(),
+            target.socket_addr(),
+            "target_addr should return target's socket address for ReturnGet"
+        );
+    }
+
+    #[test]
+    fn get_msg_id_returns_transaction() {
+        let tx = Transaction::new::<GetMsg>();
+        let msg = GetMsg::RequestGet {
+            id: tx,
+            target: make_peer(5000),
+            key: make_contract_key(1),
+            fetch_contract: false,
+            skip_list: HashSet::new(),
+        };
+        assert_eq!(*msg.id(), tx, "id() should return the transaction ID");
+    }
+
+    #[test]
+    fn get_msg_display_formats_correctly() {
+        let tx = Transaction::new::<GetMsg>();
+        let msg = GetMsg::SeekNode {
+            id: tx,
+            key: make_contract_key(1),
+            fetch_contract: false,
+            target: make_peer(5000),
+            htl: 5,
+            skip_list: HashSet::new(),
+        };
+        let display = format!("{}", msg);
+        assert!(
+            display.contains("SeekNode"),
+            "Display should contain message type name"
+        );
+    }
+
+    // Tests for GetState Display
+    #[test]
+    fn get_state_display_received_request() {
+        let state = GetState::ReceivedRequest { requester: None };
+        let display = format!("{}", state);
+        assert!(
+            display.contains("ReceivedRequest"),
+            "Display should contain state name"
+        );
+    }
+
+    #[test]
+    fn get_state_display_finished() {
+        let state = GetState::Finished {
+            key: make_contract_key(1),
+        };
+        let display = format!("{}", state);
+        assert!(
+            display.contains("Finished"),
+            "Display should contain state name"
+        );
+    }
+}
