@@ -306,6 +306,21 @@ impl ContractExecutor for Executor<Runtime> {
                         .await
                         .map_err(ExecutorError::other)?;
 
+                    // Notify local subscribers of the state change.
+                    // This is critical for cross-node subscriptions: when a BroadcastTo
+                    // update arrives from another node, local WebSocket clients that
+                    // subscribed to this contract need to receive the update notification.
+                    if let Err(err) = self
+                        .send_update_notification(&key, &params, &updated_state)
+                        .await
+                    {
+                        tracing::error!(
+                            "Failed while sending notifications for contract {}: {}",
+                            key,
+                            err
+                        );
+                    }
+
                     // todo: forward delta like we are doing with puts
                     tracing::warn!("Delta updates are not yet supported");
                     Ok(UpsertResult::Updated(updated_state))
