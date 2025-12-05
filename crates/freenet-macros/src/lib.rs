@@ -45,7 +45,7 @@ use parser::FreenetTestArgs;
 ///
 /// - `nodes` (required): Array of node labels
 /// - `gateways` (optional): Array of nodes that should be gateways. If not specified, the first node is a gateway.
-/// - `auto_connect_peers` (optional): If true, peer nodes are configured to connect to all gateway nodes (default: false)
+/// - `auto_connect_peers` (optional): If true, peer nodes are configured to connect to all gateway nodes (default: true)
 /// - `timeout_secs` (optional): Test timeout in seconds (default: 180)
 /// - `startup_wait_secs` (optional): Node startup wait in seconds (default: 15)
 /// - `aggregate_events` (optional): When to aggregate events:
@@ -86,18 +86,18 @@ use parser::FreenetTestArgs;
 /// }
 /// ```
 ///
-/// ## Auto-Connect Peers to Gateways
+/// ## Disabling Auto-Connect (peers connect to gateways by default)
 /// ```ignore
 /// #[freenet_test(
 ///     nodes = ["gateway", "peer-1", "peer-2"],
-///     auto_connect_peers = true,  // Peers will connect to gateway
+///     auto_connect_peers = false,  // Disable automatic peer-to-gateway connections
 ///     timeout_secs = 120
 /// )]
-/// async fn test_with_connections(ctx: &mut TestContext) -> TestResult {
-///     // Peers are configured to discover and connect to the gateway
+/// async fn test_manual_connections(ctx: &mut TestContext) -> TestResult {
+///     // Peers must manually discover and connect to the gateway
 ///     let gateway = ctx.gateway()?;
 ///     let peers = ctx.peers();
-///     // Test peer-gateway interactions...
+///     // Set up manual connections...
 ///     Ok(())
 /// }
 /// ```

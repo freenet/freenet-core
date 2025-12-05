@@ -50,7 +50,7 @@ impl syn::parse::Parse for FreenetTestArgs {
         let mut gateways = None;
         let mut node_locations = None;
         let mut node_locations_fn = None;
-        let mut auto_connect_peers = false;
+        let mut auto_connect_peers = true;
         let mut timeout_secs = 180;
         let mut startup_wait_secs = 15;
         let mut aggregate_events = AggregateEventsMode::OnFailure;
