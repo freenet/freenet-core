@@ -1764,7 +1764,7 @@ mod tests {
         let op = make_get_op(Some(GetState::Finished { key }), Some(result));
         let outcome = op.outcome();
 
-        matches!(outcome, OpOutcome::Incomplete);
+        assert!(matches!(outcome, OpOutcome::Incomplete));
     }
 
     // Tests for GetMsg helper methods
