@@ -47,7 +47,7 @@ pub(crate) struct NodeP2P {
 
 impl NodeP2P {
     /// Aggressively wait for connections during startup to avoid on-demand delays.
-    /// This is a static method that can be spawned as a task to run concurrently
+    /// This is an associated function that can be spawned as a task to run concurrently
     /// with the event listener. Without the event listener running, connection
     /// handshakes won't be processed.
     async fn aggressive_initial_connections_impl(
