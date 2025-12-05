@@ -67,17 +67,18 @@ use std::time::Duration;
 
 /// Payload sizes to benchmark (bytes)
 const PAYLOAD_SIZES: &[usize] = &[
-    64,      // Tiny message
-    256,     // Small message
-    1024,    // 1KB
-    1364,    // Max single packet (after overhead)
+    64,   // Tiny message
+    256,  // Small message
+    1024, // 1KB
+    1364, // Max single packet (after overhead)
 ];
 
 /// Large payload sizes for streaming tests
+#[allow(dead_code)] // Reserved for future streaming benchmarks
 const STREAM_SIZES: &[usize] = &[
-    4096,    // 4KB - 3 packets
-    16384,   // 16KB - ~12 packets
-    65536,   // 64KB - ~48 packets
+    4096,  // 4KB - 3 packets
+    16384, // 16KB - ~12 packets
+    65536, // 64KB - ~48 packets
 ];
 
 // =============================================================================
@@ -109,8 +110,8 @@ mod level0_pure_logic {
 
         // Pre-compute cipher once
         let key: [u8; 16] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
         ];
         let cipher = Aes128Gcm::new(&key.into());
 
@@ -123,29 +124,25 @@ mod level0_pure_logic {
             // Pre-allocate buffer with extra space for in-place encryption
             let mut buffer = vec![0xABu8; size];
 
-            group.bench_with_input(
-                BenchmarkId::new("aes128gcm", size),
-                &size,
-                |b, &_size| {
-                    b.iter(|| {
-                        // Reset buffer (minimal overhead - just memset)
-                        buffer.fill(0xAB);
+            group.bench_with_input(BenchmarkId::new("aes128gcm", size), &size, |b, &_size| {
+                b.iter(|| {
+                    // Reset buffer (minimal overhead - just memset)
+                    buffer.fill(0xAB);
 
-                        // The actual operation we're measuring
-                        let tag = cipher
-                            .encrypt_in_place_detached(
-                                (&nonce).into(),
-                                &[],  // No AAD
-                                &mut buffer,
-                            )
-                            .expect("encryption failed");
+                    // The actual operation we're measuring
+                    let tag = cipher
+                        .encrypt_in_place_detached(
+                            (&nonce).into(),
+                            &[], // No AAD
+                            &mut buffer,
+                        )
+                        .expect("encryption failed");
 
-                        // Prevent dead code elimination without adding overhead
-                        std_black_box(&tag);
-                        std_black_box(&buffer);
-                    });
-                },
-            );
+                    // Prevent dead code elimination without adding overhead
+                    std_black_box(&tag);
+                    std_black_box(&buffer);
+                });
+            });
         }
 
         group.finish();
@@ -156,8 +153,8 @@ mod level0_pure_logic {
         let mut group = c.benchmark_group("level0/crypto/decrypt");
 
         let key: [u8; 16] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
         ];
         let cipher = Aes128Gcm::new(&key.into());
         let nonce: [u8; 12] = [0u8; 12];
@@ -175,28 +172,19 @@ mod level0_pure_logic {
             // Working buffer for decryption
             let mut buffer = vec![0u8; size];
 
-            group.bench_with_input(
-                BenchmarkId::new("aes128gcm", size),
-                &size,
-                |b, &_size| {
-                    b.iter(|| {
-                        // Copy ciphertext (simulates receiving packet)
-                        buffer.copy_from_slice(&ciphertext_template);
+            group.bench_with_input(BenchmarkId::new("aes128gcm", size), &size, |b, &_size| {
+                b.iter(|| {
+                    // Copy ciphertext (simulates receiving packet)
+                    buffer.copy_from_slice(&ciphertext_template);
 
-                        // The actual operation
-                        cipher
-                            .decrypt_in_place_detached(
-                                (&nonce).into(),
-                                &[],
-                                &mut buffer,
-                                &tag,
-                            )
-                            .expect("decryption failed");
+                    // The actual operation
+                    cipher
+                        .decrypt_in_place_detached((&nonce).into(), &[], &mut buffer, &tag)
+                        .expect("decryption failed");
 
-                        std_black_box(&buffer);
-                    });
-                },
-            );
+                    std_black_box(&buffer);
+                });
+            });
         }
 
         group.finish();
@@ -253,7 +241,7 @@ mod level0_pure_logic {
         struct BenchMessage {
             packet_id: u32,
             confirm_receipt: Vec<u32>,
-            payload_type: u8,  // Discriminant
+            payload_type: u8, // Discriminant
             payload: Vec<u8>,
         }
 
@@ -271,21 +259,16 @@ mod level0_pure_logic {
             };
 
             // Pre-allocate output buffer
-            let mut output_buf = vec![0u8; size + 100];  // Extra for headers
+            let mut output_buf = vec![0u8; size + 100]; // Extra for headers
 
-            group.bench_with_input(
-                BenchmarkId::new("serialize", size),
-                &msg,
-                |b, msg| {
-                    b.iter(|| {
-                        // Serialize into pre-allocated buffer
-                        let written = bincode::serialize_into(&mut output_buf.as_mut_slice(), msg)
-                            .is_ok();
-                        std_black_box(written);
-                        std_black_box(&output_buf);
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("serialize", size), &msg, |b, msg| {
+                b.iter(|| {
+                    // Serialize into pre-allocated buffer
+                    let written = bincode::serialize_into(output_buf.as_mut_slice(), msg).is_ok();
+                    std_black_box(written);
+                    std_black_box(&output_buf);
+                });
+            });
 
             // Pre-serialize for deserialization bench
             let serialized = bincode::serialize(&msg).unwrap();
@@ -372,16 +355,12 @@ mod level0_pure_logic {
             let src = vec![0xABu8; size];
             let mut dst = vec![0u8; size];
 
-            group.bench_with_input(
-                BenchmarkId::from_parameter(size),
-                &size,
-                |b, &_size| {
-                    b.iter(|| {
-                        dst.copy_from_slice(&src);
-                        std_black_box(&dst);
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &_size| {
+                b.iter(|| {
+                    dst.copy_from_slice(&src);
+                    std_black_box(&dst);
+                });
+            });
         }
 
         group.finish();
@@ -445,7 +424,7 @@ mod level1_mock_io {
                             for _ in 0..1000 {
                                 tx.send(packet.clone()).await.unwrap();
                             }
-                            drop(tx);  // Close channel
+                            drop(tx); // Close channel
 
                             let count = receiver.await.unwrap();
                             std_black_box(count);
@@ -507,49 +486,50 @@ mod level1_mock_io {
 
         // Simulate routing to N peers
         for num_peers in [10, 100, 1000] {
-            group.bench_with_input(
-                BenchmarkId::new("peers", num_peers),
-                &num_peers,
-                |b, &n| {
-                    b.to_async(&rt).iter_batched(
-                        || {
-                            // Setup: create routing table with N peers
-                            let mut routes: HashMap<SocketAddr, mpsc::Sender<Arc<[u8]>>> =
-                                HashMap::with_capacity(n);
-                            let mut receivers = Vec::with_capacity(n);
+            group.bench_with_input(BenchmarkId::new("peers", num_peers), &num_peers, |b, &n| {
+                b.to_async(&rt).iter_batched(
+                    || {
+                        // Setup: create routing table with N peers
+                        let mut routes: HashMap<SocketAddr, mpsc::Sender<Arc<[u8]>>> =
+                            HashMap::with_capacity(n);
+                        let mut receivers = Vec::with_capacity(n);
 
-                            for i in 0..n {
-                                let addr = SocketAddr::new(
-                                    IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
-                                    8000 + (i as u16),
-                                );
-                                let (tx, rx) = mpsc::channel(100);
-                                routes.insert(addr, tx);
-                                receivers.push(rx);
-                            }
-
-                            // Target address (middle of range)
-                            let target = SocketAddr::new(
-                                IpAddr::V4(Ipv4Addr::new(10, 0, ((n/2) / 256) as u8, ((n/2) % 256) as u8)),
-                                8000 + (n/2) as u16,
+                        for i in 0..n {
+                            let addr = SocketAddr::new(
+                                IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+                                8000 + (i as u16),
                             );
+                            let (tx, rx) = mpsc::channel(100);
+                            routes.insert(addr, tx);
+                            receivers.push(rx);
+                        }
 
-                            (routes, receivers, target)
-                        },
-                        |(routes, _receivers, target)| async move {
-                            let packet: Arc<[u8]> = vec![0u8; 1492].into();
+                        // Target address (middle of range)
+                        let target = SocketAddr::new(
+                            IpAddr::V4(Ipv4Addr::new(
+                                10,
+                                0,
+                                ((n / 2) / 256) as u8,
+                                ((n / 2) % 256) as u8,
+                            )),
+                            8000 + (n / 2) as u16,
+                        );
 
-                            // Route 100 packets
-                            for _ in 0..100 {
-                                if let Some(tx) = routes.get(&target) {
-                                    let _ = tx.try_send(packet.clone());
-                                }
+                        (routes, receivers, target)
+                    },
+                    |(routes, _receivers, target)| async move {
+                        let packet: Arc<[u8]> = vec![0u8; 1492].into();
+
+                        // Route 100 packets
+                        for _ in 0..100 {
+                            if let Some(tx) = routes.get(&target) {
+                                let _ = tx.try_send(packet.clone());
                             }
-                        },
-                        BatchSize::SmallInput,
-                    );
-                },
-            );
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
         }
 
         group.finish();
@@ -641,22 +621,18 @@ mod level2_loopback {
             group.throughput(Throughput::Elements(count as u64));
 
             let socket = socket.clone();
-            group.bench_with_input(
-                BenchmarkId::new("packets", count),
-                &count,
-                |b, &n| {
+            group.bench_with_input(BenchmarkId::new("packets", count), &count, |b, &n| {
+                let socket = socket.clone();
+                b.to_async(&rt).iter(move || {
                     let socket = socket.clone();
-                    b.to_async(&rt).iter(move || {
-                        let socket = socket.clone();
-                        async move {
-                            let buf = [0u8; 1400];
-                            for _ in 0..n {
-                                socket.send(&buf).await.unwrap();
-                            }
+                    async move {
+                        let buf = [0u8; 1400];
+                        for _ in 0..n {
+                            socket.send(&buf).await.unwrap();
                         }
-                    });
-                },
-            );
+                    }
+                });
+            });
         }
 
         group.finish();
