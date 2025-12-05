@@ -102,7 +102,15 @@ impl SeedingManager {
         self.seeding_contract.contains_key(key)
     }
 
+    /// Add a **network peer** subscriber for contract update propagation.
+    ///
     /// Will return an error in case the max number of subscribers has been added.
+    ///
+    /// **Architecture Note (Issue #2075):**
+    /// This method is exclusively for **network peer** subscriptions used in peer-to-peer
+    /// UPDATE message propagation. Local client subscriptions are handled separately by the
+    /// contract executor's `update_notifications` channels, which deliver updates directly
+    /// to WebSocket clients without going through the network broadcast path.
     ///
     /// The `upstream_addr` parameter is the transport-level address from which the subscribe
     /// message was received. This is used instead of the address embedded in `subscriber`
