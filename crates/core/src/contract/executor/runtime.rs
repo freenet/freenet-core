@@ -1186,6 +1186,28 @@ impl Executor<Runtime> {
         Ok(())
     }
 
+    /// Delivers update notifications to LOCAL client subscriptions via websocket channels.
+    ///
+    /// # Architecture: Local vs Network Subscriptions
+    ///
+    /// Freenet uses two distinct subscription delivery mechanisms:
+    ///
+    /// 1. **Local subscriptions** (handled here): Clients connected to this node's websocket
+    ///    API register via `register_contract_notifier()`. Updates are delivered directly
+    ///    through executor notification channels stored in `self.update_notifications`.
+    ///    This path is triggered by `LocalSubscribeComplete` events (see `message.rs`).
+    ///
+    /// 2. **Network subscriptions** (handled in `operations/update.rs`): Remote peers
+    ///    subscribe via `ring.seeding_manager.subscribers`. Updates propagate through
+    ///    the network via `get_broadcast_targets_update()` which filters network peers
+    ///    to receive UPDATE messages.
+    ///
+    /// This separation allows local clients to receive updates immediately without
+    /// network round-trips, while network subscriptions follow the peer-to-peer protocol.
+    ///
+    /// See also:
+    /// - `operations/subscribe.rs::complete_local_subscription()` - triggers LocalSubscribeComplete
+    /// - `operations/update.rs::get_broadcast_targets_update()` - network subscription routing
     async fn send_update_notification(
         &mut self,
         key: &ContractKey,
