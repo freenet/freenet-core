@@ -10,7 +10,7 @@ manual-tests = []
 [dependencies]
 anyhow = "1.0"
 chrono = { workspace = true, features = ["default"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 freenet-stdlib = { version = "0.1.24", features = ["net"] }
 freenet-ping-types = { path = "../types", features = ["std", "clap"] }
 futures = "0.3.31"
