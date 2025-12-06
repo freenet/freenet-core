@@ -649,6 +649,126 @@ criterion_main!(benches);
 
 ---
 
+## 12. Packet Size × Batch Size Interaction Analysis
+
+This section analyzes the **multiplicative effect** of combining larger packet sizes with syscall batching (sendmmsg). The key question: Are these optimizations independent, or do they have diminishing returns when combined?
+
+### 12.1 Experimental Design
+
+**Matrix tested:**
+- Packet sizes: 512, 1400, 4096, 8192 bytes
+- Batch sizes: 1, 10, 50, 100, 500 packets
+
+**Hypothesis:**
+- For small packets: syscall overhead dominates → batching helps significantly
+- For large packets: data transfer time dominates → batching helps less (relatively)
+
+### 12.2 Results: Size × Batch Matrix
+
+#### 12.2.1 Throughput by Packet Size and Batch Size
+
+| Packet Size | Batch 1 | Batch 10 | Batch 50 | Batch 100 | Batch 500 |
+|-------------|---------|----------|----------|-----------|-----------|
+| 512 bytes   | 47 MiB/s | 59 MiB/s | 81 MiB/s | 88 MiB/s | 92 MiB/s |
+| 1400 bytes  | 135 MiB/s | 163 MiB/s | 221 MiB/s | 235 MiB/s | 245 MiB/s |
+| 4096 bytes  | 369 MiB/s | 464 MiB/s | 640 MiB/s | 677 MiB/s | 716 MiB/s |
+| 8192 bytes  | 718 MiB/s | 926 MiB/s | 1.20 GiB/s | 1.30 GiB/s | 1.39 GiB/s |
+
+#### 12.2.2 Time per Syscall (batch=1) - Confirms Constant Overhead
+
+| Packet Size | Time per send() | Throughput |
+|-------------|-----------------|------------|
+| 512 bytes   | 10.3 µs | 47 MiB/s |
+| 1400 bytes  | 9.9 µs | 135 MiB/s |
+| 4096 bytes  | 10.5 µs | 369 MiB/s |
+| 8192 bytes  | 10.9 µs | 718 MiB/s |
+
+**Key finding**: Time per syscall is **constant (~10 µs)** regardless of packet size. Throughput scales linearly with size.
+
+#### 12.2.3 Time per Batch (batch=500) - Also Constant
+
+| Packet Size | Time per sendmmsg(500) | Throughput |
+|-------------|------------------------|------------|
+| 512 bytes   | 2.65 ms | 92 MiB/s |
+| 1400 bytes  | 2.73 ms | 245 MiB/s |
+| 4096 bytes  | 2.73 ms | 716 MiB/s |
+| 8192 bytes  | 2.74 ms | 1.39 GiB/s |
+
+**Key finding**: Time per batch is also **constant (~2.7 ms)** for 500 packets, regardless of packet size.
+
+### 12.3 Direct Comparison: Single vs Batched (100 packets)
+
+| Packet Size | Single send()×100 | sendmmsg(100) | Speedup |
+|-------------|-------------------|---------------|---------|
+| 512 bytes   | 48 MiB/s | 87 MiB/s | **1.81x** |
+| 1400 bytes  | 139 MiB/s | 232 MiB/s | **1.67x** |
+| 4096 bytes  | 385 MiB/s | 675 MiB/s | **1.75x** |
+| 8192 bytes  | 730 MiB/s | 1.28 GiB/s | **1.75x** |
+
+**Key finding**: Batching improvement is **consistent (~1.75x)** across all packet sizes.
+
+### 12.4 Key Insights
+
+#### The Optimizations Are Multiplicative!
+
+1. **Packet size scaling**: 16x larger packets → ~15x higher throughput (same syscall overhead)
+2. **Batching scaling**: 100x fewer syscalls → ~1.75x higher throughput
+3. **Combined effect**: These improvements **stack multiplicatively**
+
+#### Quantified Improvement
+
+| Optimization | Throughput | Improvement vs Baseline |
+|--------------|------------|-------------------------|
+| Baseline (512 bytes, single) | 47 MiB/s | 1.0x |
+| Large packets only (8192 bytes) | 718 MiB/s | 15.3x |
+| Batching only (512 bytes, batch-500) | 92 MiB/s | 1.96x |
+| **Both combined (8192 + batch-500)** | **1.39 GiB/s** | **29.6x** |
+
+### 12.5 Why Batching Helps Equally at All Sizes
+
+The constant ~1.75x improvement from batching, regardless of packet size, reveals that:
+
+1. **Syscall overhead is fixed** (~10 µs per call)
+2. **Data copy time is negligible** at loopback - kernel doesn't care if it's 512 or 8192 bytes
+3. **The kernel batches internally** - sendmmsg allows amortizing syscall entry/exit overhead
+
+This means:
+- **Small packets**: Syscall overhead is 100% of the time → batching helps a lot in absolute terms
+- **Large packets**: Syscall overhead is still 100% of the time (data copy is instant) → batching helps the same amount
+
+### 12.6 Practical Recommendations
+
+1. **Maximize Packet Size First**
+   - Use the largest MTU your network supports (1500 standard, 9000 jumbo)
+   - This is the biggest lever: 16x improvement for 16x larger packets
+
+2. **Implement Batching Second**
+   - Use sendmmsg/recvmmsg for ~1.75x additional improvement
+   - Works equally well at all packet sizes
+
+3. **Sweet Spot**
+   - Batch size of 50-100 captures most benefit (diminishing returns beyond)
+   - With 1400-byte packets and batch-100: 235 MiB/s (vs 135 MiB/s baseline = 1.74x)
+
+4. **For Maximum Throughput**
+   - 8192-byte packets + batch-500: **1.39 GiB/s**
+   - This is **29.6x faster** than 512-byte single-send baseline
+
+### 12.7 Running These Benchmarks
+
+```bash
+# Run full size×batch matrix
+./scripts/run_benchmarks.sh experimental_size_batch
+
+# Individual benchmark groups
+cargo bench --bench transport_perf -- experimental_size_batch_matrix
+cargo bench --bench transport_perf -- experimental_batch_improvement
+cargo bench --bench transport_perf -- experimental_throughput_ceiling
+```
+
+---
+
 *Analysis performed: December 2024*
 *Experimental benchmarks added: December 2024*
+*Size×batch interaction analysis: December 2024*
 *Codebase version: commit c50d888*

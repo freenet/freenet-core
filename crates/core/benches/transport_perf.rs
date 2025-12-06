@@ -1935,6 +1935,310 @@ mod experimental_true_sendmmsg {
 }
 
 // =============================================================================
+// EXPERIMENTAL: Packet Size × Batch Size Interaction
+// =============================================================================
+// Tests the multiplicative effect of combining large packets with syscall batching.
+// Hypothesis: For small packets, syscall overhead dominates (batching helps a lot).
+//             For large packets, data transfer dominates (batching helps less relatively).
+
+#[cfg(target_os = "linux")]
+mod experimental_size_batch_interaction {
+    use super::*;
+    use std::net::{SocketAddr, UdpSocket};
+    use std::os::unix::io::AsRawFd;
+
+    /// Direct sendmmsg wrapper using libc
+    unsafe fn sendmmsg_batch(
+        fd: i32,
+        messages: &mut [libc::mmsghdr],
+    ) -> Result<usize, std::io::Error> {
+        let ret = libc::sendmmsg(
+            fd,
+            messages.as_mut_ptr(),
+            messages.len() as libc::c_uint,
+            0,
+        );
+        if ret < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(ret as usize)
+        }
+    }
+
+    /// Set socket buffer size using setsockopt
+    fn set_socket_buffer_size(fd: i32, send_size: i32, recv_size: i32) {
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &send_size as *const i32 as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &recv_size as *const i32 as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+        }
+    }
+
+    /// Core benchmark: Test all combinations of packet size and batch size
+    pub fn bench_size_batch_matrix(c: &mut Criterion) {
+        let mut group = c.benchmark_group("experimental_size_batch_matrix");
+        group.sample_size(50);
+
+        // Packet sizes to test
+        let packet_sizes = [512, 1400, 4096, 8192];
+        // Batch sizes to test
+        let batch_sizes = [1, 10, 50, 100];
+
+        let send_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target_addr = recv_socket.local_addr().unwrap();
+        send_socket.set_nonblocking(true).unwrap();
+        recv_socket.set_nonblocking(true).unwrap();
+
+        let fd = send_socket.as_raw_fd();
+        let recv_fd = recv_socket.as_raw_fd();
+
+        // Increase buffer sizes for large bursts
+        set_socket_buffer_size(fd, 16 * 1024 * 1024, 0);
+        set_socket_buffer_size(recv_fd, 0, 16 * 1024 * 1024);
+
+        for &packet_size in &packet_sizes {
+            let data: Vec<u8> = (0..packet_size).map(|i| (i % 256) as u8).collect();
+
+            for &batch_size in &batch_sizes {
+                let total_bytes = packet_size * batch_size;
+
+                group.throughput(Throughput::Bytes(total_bytes as u64));
+                group.bench_function(
+                    BenchmarkId::new(
+                        format!("size_{}_batch_{}", packet_size, batch_size),
+                        total_bytes
+                    ),
+                    |b| {
+                        // Pre-allocate iovecs and message headers
+                        let mut iovecs: Vec<libc::iovec> = (0..batch_size)
+                            .map(|_| libc::iovec {
+                                iov_base: data.as_ptr() as *mut libc::c_void,
+                                iov_len: data.len(),
+                            })
+                            .collect();
+
+                        // Build sockaddr_in
+                        let addr_v4 = match target_addr {
+                            SocketAddr::V4(a) => a,
+                            _ => panic!("Expected IPv4"),
+                        };
+                        let sockaddr_in = libc::sockaddr_in {
+                            sin_family: libc::AF_INET as libc::sa_family_t,
+                            sin_port: addr_v4.port().to_be(),
+                            sin_addr: libc::in_addr {
+                                s_addr: u32::from_ne_bytes(addr_v4.ip().octets()),
+                            },
+                            sin_zero: [0; 8],
+                        };
+
+                        b.iter(|| {
+                            let mut msgs: Vec<libc::mmsghdr> = iovecs
+                                .iter_mut()
+                                .map(|iov| {
+                                    let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                                    msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
+                                    msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                    msg.msg_hdr.msg_iov = iov as *mut libc::iovec;
+                                    msg.msg_hdr.msg_iovlen = 1;
+                                    msg
+                                })
+                                .collect();
+
+                            unsafe { sendmmsg_batch(fd, &mut msgs) }.unwrap()
+                        });
+                    },
+                );
+            }
+        }
+
+        group.finish();
+    }
+
+    /// Measure relative improvement: What's the speedup from batching at each packet size?
+    pub fn bench_batching_improvement_by_size(c: &mut Criterion) {
+        let mut group = c.benchmark_group("experimental_batch_improvement");
+        group.sample_size(50);
+
+        let packet_sizes = [512, 1400, 4096, 8192];
+        let batch_size = 100; // Compare single-send vs batch-100
+
+        let send_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target_addr = recv_socket.local_addr().unwrap();
+        send_socket.set_nonblocking(true).unwrap();
+
+        let fd = send_socket.as_raw_fd();
+        let recv_fd = recv_socket.as_raw_fd();
+
+        // Increase buffer sizes for large bursts
+        set_socket_buffer_size(fd, 16 * 1024 * 1024, 0);
+        set_socket_buffer_size(recv_fd, 0, 16 * 1024 * 1024);
+
+        for &packet_size in &packet_sizes {
+            let data: Vec<u8> = (0..packet_size).map(|i| (i % 256) as u8).collect();
+            let total_bytes = (packet_size * batch_size) as u64;
+
+            // Baseline: 100 individual send() calls
+            group.throughput(Throughput::Bytes(total_bytes));
+            group.bench_function(
+                BenchmarkId::new(format!("single_sends_{}", packet_size), batch_size),
+                |b| {
+                    b.iter(|| {
+                        for _ in 0..batch_size {
+                            let _ = send_socket.send_to(&data, target_addr);
+                        }
+                    });
+                },
+            );
+
+            // Optimized: 1 sendmmsg call with 100 packets
+            group.bench_function(
+                BenchmarkId::new(format!("batched_100_{}", packet_size), batch_size),
+                |b| {
+                    let mut iovecs: Vec<libc::iovec> = (0..batch_size)
+                        .map(|_| libc::iovec {
+                            iov_base: data.as_ptr() as *mut libc::c_void,
+                            iov_len: data.len(),
+                        })
+                        .collect();
+
+                    let addr_v4 = match target_addr {
+                        SocketAddr::V4(a) => a,
+                        _ => panic!("Expected IPv4"),
+                    };
+                    let sockaddr_in = libc::sockaddr_in {
+                        sin_family: libc::AF_INET as libc::sa_family_t,
+                        sin_port: addr_v4.port().to_be(),
+                        sin_addr: libc::in_addr {
+                            s_addr: u32::from_ne_bytes(addr_v4.ip().octets()),
+                        },
+                        sin_zero: [0; 8],
+                    };
+
+                    b.iter(|| {
+                        let mut msgs: Vec<libc::mmsghdr> = iovecs
+                            .iter_mut()
+                            .map(|iov| {
+                                let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                                msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
+                                msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                msg.msg_hdr.msg_iov = iov as *mut libc::iovec;
+                                msg.msg_hdr.msg_iovlen = 1;
+                                msg
+                            })
+                            .collect();
+
+                        unsafe { sendmmsg_batch(fd, &mut msgs) }.unwrap()
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Measure throughput ceiling at each packet size with maximum batching
+    pub fn bench_throughput_ceiling(c: &mut Criterion) {
+        let mut group = c.benchmark_group("experimental_throughput_ceiling");
+        group.sample_size(30);
+
+        // Fixed large batch size to saturate syscall efficiency
+        let batch_size = 500;
+        let packet_sizes = [512, 1400, 4096, 8192];
+
+        let send_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target_addr = recv_socket.local_addr().unwrap();
+        send_socket.set_nonblocking(true).unwrap();
+
+        let fd = send_socket.as_raw_fd();
+        let recv_fd = recv_socket.as_raw_fd();
+
+        // Increase buffer sizes for large bursts
+        set_socket_buffer_size(fd, 32 * 1024 * 1024, 0);
+        set_socket_buffer_size(recv_fd, 0, 32 * 1024 * 1024);
+
+        for &packet_size in &packet_sizes {
+            let data: Vec<u8> = (0..packet_size).map(|i| (i % 256) as u8).collect();
+            let total_bytes = (packet_size * batch_size) as u64;
+
+            group.throughput(Throughput::Bytes(total_bytes));
+            group.bench_function(
+                BenchmarkId::new("max_throughput", packet_size),
+                |b| {
+                    let mut iovecs: Vec<libc::iovec> = (0..batch_size)
+                        .map(|_| libc::iovec {
+                            iov_base: data.as_ptr() as *mut libc::c_void,
+                            iov_len: data.len(),
+                        })
+                        .collect();
+
+                    let addr_v4 = match target_addr {
+                        SocketAddr::V4(a) => a,
+                        _ => panic!("Expected IPv4"),
+                    };
+                    let sockaddr_in = libc::sockaddr_in {
+                        sin_family: libc::AF_INET as libc::sa_family_t,
+                        sin_port: addr_v4.port().to_be(),
+                        sin_addr: libc::in_addr {
+                            s_addr: u32::from_ne_bytes(addr_v4.ip().octets()),
+                        },
+                        sin_zero: [0; 8],
+                    };
+
+                    b.iter(|| {
+                        let mut msgs: Vec<libc::mmsghdr> = iovecs
+                            .iter_mut()
+                            .map(|iov| {
+                                let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                                msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
+                                msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                msg.msg_hdr.msg_iov = iov as *mut libc::iovec;
+                                msg.msg_hdr.msg_iovlen = 1;
+                                msg
+                            })
+                            .collect();
+
+                        unsafe { sendmmsg_batch(fd, &mut msgs) }.unwrap()
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod experimental_size_batch_interaction {
+    use super::*;
+
+    pub fn bench_size_batch_matrix(_c: &mut Criterion) {
+        eprintln!("size×batch interaction benchmarks only available on Linux");
+    }
+
+    pub fn bench_batching_improvement_by_size(_c: &mut Criterion) {
+        eprintln!("size×batch interaction benchmarks only available on Linux");
+    }
+
+    pub fn bench_throughput_ceiling(_c: &mut Criterion) {
+        eprintln!("size×batch interaction benchmarks only available on Linux");
+    }
+}
+
+// =============================================================================
 // Criterion Groups - Organized by noise level
 // =============================================================================
 
@@ -2053,4 +2357,17 @@ criterion_group!(
         experimental_true_sendmmsg::bench_tokio_sendmmsg_integration,
 );
 
-criterion_main!(level0, level1, level2, level3, experimental_packet, experimental_tokio, experimental_combined, experimental_batching, experimental_true_syscall);
+criterion_group!(
+    name = experimental_size_batch;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(5))
+        .noise_threshold(0.10)
+        .significance_level(0.05);
+    targets =
+        experimental_size_batch_interaction::bench_size_batch_matrix,
+        experimental_size_batch_interaction::bench_batching_improvement_by_size,
+        experimental_size_batch_interaction::bench_throughput_ceiling,
+);
+
+criterion_main!(level0, level1, level2, level3, experimental_packet, experimental_tokio, experimental_combined, experimental_batching, experimental_true_syscall, experimental_size_batch);
