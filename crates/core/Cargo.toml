@@ -99,6 +99,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
 httptest = "0.16"
+libc = "0.2"  # For sendmmsg syscall batching benchmarks
 statrs = "0.18"
 tempfile = "3"
 test-log = "0.2"
