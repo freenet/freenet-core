@@ -199,17 +199,18 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
             .collect();
 
         // Verify all public keys are unique (sanity check against RNG issues)
+        // Note: We use the full public key for comparison (via its Hash impl),
+        // NOT the Display string which only captures 12 bytes of the DER encoding.
         {
-            let mut seen_keys = std::collections::HashSet::new();
+            let mut seen_keys = std::collections::HashSet::<freenet::dev_tool::TransportPublicKey>::new();
             for (idx, keypair) in __keypairs.iter().enumerate() {
-                let key_str = format!("{}", keypair.public());
-                if !seen_keys.insert(key_str.clone()) {
+                if !seen_keys.insert(keypair.public().clone()) {
                     return Err(anyhow::anyhow!(
                         "FATAL: Generated duplicate transport keypair for node {} (key: {}). \
                          This indicates an RNG issue in the test environment. \
                          Please report this to the Freenet developers.",
                         idx,
-                        key_str
+                        keypair.public()
                     ));
                 }
             }

@@ -479,8 +479,7 @@ impl Operation for PutOp {
                         // Start subscription
                         // Note: skip_list is no longer used here as subscriptions handle their own routing
 
-                        let child_tx =
-                            super::start_subscription_request_internal(op_manager, *id, key, false);
+                        let child_tx = super::start_subscription_request(op_manager, *id, key);
                         tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                         op_manager.ring.seed_contract(key);
                         super::announce_contract_cached(op_manager, &key).await;
@@ -758,9 +757,8 @@ impl Operation for PutOp {
                                         %key,
                                         "starting child subscription for PUT operation"
                                     );
-                                    let child_tx = super::start_subscription_request_internal(
-                                        op_manager, *id, key, false,
-                                    );
+                                    let child_tx =
+                                        super::start_subscription_request(op_manager, *id, key);
                                     tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                                 } else {
                                     tracing::warn!(
@@ -907,9 +905,7 @@ impl Operation for PutOp {
 
                         // Start subscription and handle dropped contracts
                         let (dropped_contract, old_subscribers) = {
-                            let child_tx = super::start_subscription_request_internal(
-                                op_manager, *id, key, false,
-                            );
+                            let child_tx = super::start_subscription_request(op_manager, *id, key);
                             tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                             let result = op_manager.ring.seed_contract(key);
                             super::announce_contract_cached(op_manager, &key).await;
@@ -1443,7 +1439,11 @@ async fn put_contract(
     {
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Ok(new_val),
-        }) => Ok(new_val),
+        }) => {
+            // Notify any waiters that this contract has been stored
+            op_manager.notify_contract_stored(&key);
+            Ok(new_val)
+        }
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Err(err),
         }) => {

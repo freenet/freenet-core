@@ -22,6 +22,46 @@ use tokio::time::{sleep, Duration};
 const MAX_RETRIES: usize = 10;
 const LOCAL_FETCH_TIMEOUT_MS: u64 = 1_500;
 const LOCAL_FETCH_POLL_INTERVAL_MS: u64 = 25;
+/// Timeout for waiting on contract storage notification.
+/// Used when a subscription arrives before the contract has been propagated via PUT.
+const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
+
+/// Wait for a contract to become available, using channel-based notification.
+///
+/// This handles the race condition where a subscription arrives before the contract
+/// has been propagated via PUT. The flow is:
+/// 1. Fast path: check if contract already exists
+/// 2. Register notification waiter
+/// 3. Check again (handles race between step 1 and 2)
+/// 4. Wait for notification or timeout
+/// 5. Final verification of actual state
+async fn wait_for_contract_with_timeout(
+    op_manager: &OpManager,
+    key: ContractKey,
+    timeout_ms: u64,
+) -> Result<bool, OpError> {
+    // Fast path - contract already exists
+    if super::has_contract(op_manager, key).await? {
+        return Ok(true);
+    }
+
+    // Register waiter BEFORE second check to avoid race condition
+    let notifier = op_manager.wait_for_contract(key);
+
+    // Check again - contract may have arrived between first check and registration
+    if super::has_contract(op_manager, key).await? {
+        return Ok(true);
+    }
+
+    // Wait for notification or timeout (we don't care which triggers first)
+    tokio::select! {
+        _ = notifier => {}
+        _ = sleep(Duration::from_millis(timeout_ms)) => {}
+    };
+
+    // Always verify actual state - don't trust notification alone
+    super::has_contract(op_manager, key).await
+}
 
 fn subscribers_snapshot(op_manager: &OpManager, key: &ContractKey) -> Vec<String> {
     op_manager
@@ -309,7 +349,10 @@ async fn complete_local_subscription(
             key,
             subscribed: true,
         })
-        .await
+        .await?;
+
+    op_manager.completed(id);
+    Ok(())
 }
 
 pub(crate) struct SubscribeOp {
@@ -550,6 +593,63 @@ impl Operation for SubscribeOp {
                         );
                     }
 
+                    // Contract not found locally. Wait briefly in case a PUT is in flight.
+                    tracing::debug!(
+                        tx = %id,
+                        %key,
+                        "subscribe: contract not found, waiting for possible in-flight PUT"
+                    );
+
+                    // Wait for contract with timeout (handles race conditions internally)
+                    if wait_for_contract_with_timeout(op_manager, *key, CONTRACT_WAIT_TIMEOUT_MS)
+                        .await?
+                    {
+                        tracing::info!(
+                            tx = %id,
+                            %key,
+                            "subscribe: contract arrived, handling locally"
+                        );
+
+                        // Contract exists, register subscription
+                        if op_manager
+                            .ring
+                            .add_subscriber(key, subscriber.clone(), None)
+                            .is_err()
+                        {
+                            let return_msg = SubscribeMsg::ReturnSub {
+                                id: *id,
+                                key: *key,
+                                target: subscriber.clone(),
+                                subscribed: false,
+                            };
+                            return Ok(OperationResult {
+                                target_addr: return_msg.target_addr(),
+                                return_msg: Some(NetMessage::from(return_msg)),
+                                state: None,
+                            });
+                        }
+
+                        let return_msg = SubscribeMsg::ReturnSub {
+                            id: *id,
+                            key: *key,
+                            target: subscriber.clone(),
+                            subscribed: true,
+                        };
+                        return build_op_result(
+                            self.id,
+                            None,
+                            Some(return_msg),
+                            self.upstream_addr,
+                        );
+                    }
+
+                    // Contract still not found after waiting, try to forward
+                    tracing::debug!(
+                        tx = %id,
+                        %key,
+                        "subscribe: contract not found after waiting, attempting to forward"
+                    );
+
                     let own_addr = own_loc
                         .socket_addr()
                         .expect("own location must have socket address");
@@ -566,9 +666,31 @@ impl Operation for SubscribeOp {
                                 .socket_addr()
                                 .map(|addr| addr != own_addr)
                                 .unwrap_or(false)
-                        })
-                        .ok_or(RingError::NoCachingPeers(*key))
-                        .map_err(OpError::from)?;
+                        });
+
+                    // If no forward target available, send ReturnSub(subscribed: false) back
+                    // This allows the subscriber to complete locally if they have the contract
+                    let forward_target = match forward_target {
+                        Some(target) => target,
+                        None => {
+                            tracing::warn!(
+                                tx = %id,
+                                %key,
+                                "subscribe: no forward target available, returning unsubscribed"
+                            );
+                            let return_msg = SubscribeMsg::ReturnSub {
+                                id: *id,
+                                key: *key,
+                                target: subscriber.clone(),
+                                subscribed: false,
+                            };
+                            return Ok(OperationResult {
+                                target_addr: return_msg.target_addr(),
+                                return_msg: Some(NetMessage::from(return_msg)),
+                                state: None,
+                            });
+                        }
+                    };
 
                     let forward_target_addr = forward_target
                         .socket_addr()
@@ -864,6 +986,20 @@ impl Operation for SubscribeOp {
                                         retries: retries + 1,
                                     });
                                 } else {
+                                    // No more candidates - try to complete locally as fallback
+                                    if super::has_contract(op_manager, *key).await? {
+                                        tracing::info!(
+                                            tx = %id,
+                                            %key,
+                                            "No remote peers, completing subscription locally as fallback"
+                                        );
+                                        complete_local_subscription(op_manager, *id, *key).await?;
+                                        return Ok(OperationResult {
+                                            return_msg: None,
+                                            target_addr: None,
+                                            state: None,
+                                        });
+                                    }
                                     return Err(RingError::NoCachingPeers(*key).into());
                                 }
                                 new_state = Some(SubscribeState::AwaitingResponse {

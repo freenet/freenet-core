@@ -203,6 +203,47 @@ pub trait ClientEventsProxy {
     ) -> BoxFuture<'_, Result<(), ClientError>>;
 }
 
+/// Helper function to register a subscription listener for GET/PUT operations with auto-subscribe
+async fn register_subscription_listener(
+    op_manager: &OpManager,
+    key: ContractKey,
+    client_id: ClientId,
+    subscription_listener: UnboundedSender<HostResult>,
+    operation_type: &str,
+) -> Result<(), Error> {
+    tracing::debug!(%client_id, %key, "Registering subscription for {} with auto-subscribe", operation_type);
+    let register_listener = op_manager
+        .notify_contract_handler(ContractHandlerEvent::RegisterSubscriberListener {
+            key,
+            client_id,
+            summary: None, // No summary for GET/PUT-based subscriptions
+            subscriber_listener: subscription_listener,
+        })
+        .await
+        .inspect_err(|err| {
+            tracing::error!(
+                %client_id, %key,
+                "Register subscriber listener error for {}: {}", operation_type, err
+            );
+        });
+    match register_listener {
+        Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
+            tracing::debug!(
+                %client_id, %key,
+                "Subscriber listener registered successfully for {}", operation_type
+            );
+            Ok(())
+        }
+        _ => {
+            tracing::error!(
+                %client_id, %key,
+                "Subscriber listener registration failed for {}", operation_type
+            );
+            Err(Error::Op(OpError::UnexpectedOpState))
+        }
+    }
+}
+
 /// Process client events.
 ///
 /// # Architecture: Dual-Mode Client Handling
@@ -221,7 +262,6 @@ pub async fn client_event_handling<ClientEv>(
 where
     ClientEv: ClientEventsProxy + Send + 'static,
 {
-    // Create RequestRouter for centralized request deduplication
     let request_router = Some(std::sync::Arc::new(crate::node::RequestRouter::new()));
     let mut results = FuturesUnordered::new();
     loop {
@@ -613,39 +653,14 @@ async fn process_open_request(
                         // Register subscription listener if subscribe=true
                         if subscribe {
                             if let Some(subscription_listener) = subscription_listener {
-                                tracing::debug!(%client_id, %contract_key, "Registering subscription for PUT with auto-subscribe");
-                                let register_listener = op_manager
-                                    .notify_contract_handler(
-                                        ContractHandlerEvent::RegisterSubscriberListener {
-                                            key: contract_key,
-                                            client_id,
-                                            summary: None, // No summary for PUT-based subscriptions
-                                            subscriber_listener: subscription_listener,
-                                        },
-                                    )
-                                    .await
-                                    .inspect_err(|err| {
-                                        tracing::error!(
-                                            %client_id, %contract_key,
-                                            "Register subscriber listener error for PUT: {}", err
-                                        );
-                                    });
-                                match register_listener {
-                                    Ok(
-                                        ContractHandlerEvent::RegisterSubscriberListenerResponse,
-                                    ) => {
-                                        tracing::debug!(
-                                            %client_id, %contract_key,
-                                            "Subscriber listener registered successfully for PUT"
-                                        );
-                                    }
-                                    _ => {
-                                        tracing::error!(
-                                            %client_id, %contract_key,
-                                            "Subscriber listener registration failed for PUT"
-                                        );
-                                    }
-                                }
+                                register_subscription_listener(
+                                    &op_manager,
+                                    contract_key,
+                                    client_id,
+                                    subscription_listener,
+                                    "PUT",
+                                )
+                                .await?;
                             } else {
                                 tracing::warn!(%client_id, %contract_key, "PUT with subscribe=true but no subscription_listener");
                             }
@@ -761,24 +776,28 @@ async fn process_open_request(
                                     "Request-Transaction correlation"
                                 );
 
-                                if let Err(err) = update::request_update(&op_manager, op).await {
-                                    tracing::error!("request update error {}", err);
+                                match update::request_update(&op_manager, op).await {
+                                    Ok(()) | Err(OpError::StatePushed) => {}
+                                    Err(err) => {
+                                        tracing::error!("request update error {}", err);
 
-                                    // Notify client of error via result router
-                                    let error_response = Err(ErrorKind::OperationError {
-                                        cause: format!("UPDATE operation failed: {}", err).into(),
-                                    }
-                                    .into());
+                                        // Notify client of error via result router
+                                        let error_response = Err(ErrorKind::OperationError {
+                                            cause: format!("UPDATE operation failed: {}", err)
+                                                .into(),
+                                        }
+                                        .into());
 
-                                    if let Err(e) = op_manager
-                                        .result_router_tx
-                                        .send((transaction_id, error_response))
-                                        .await
-                                    {
-                                        tracing::error!(
-                                            "Failed to send UPDATE error to result router: {}. Transaction: {}",
-                                            e, transaction_id
-                                        );
+                                        if let Err(e) = op_manager
+                                            .result_router_tx
+                                            .send((transaction_id, error_response))
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                "Failed to send UPDATE error to result router: {}. Transaction: {}",
+                                                e, transaction_id
+                                            );
+                                        }
                                     }
                                 }
                             } else {
@@ -889,37 +908,14 @@ async fn process_open_request(
                                 // Handle subscription for locally found contracts
                                 if subscribe {
                                     if let Some(subscription_listener) = subscription_listener {
-                                        tracing::debug!(%client_id, %key, "Subscribing to locally found contract");
-                                        let register_listener = op_manager
-                                            .notify_contract_handler(
-                                                ContractHandlerEvent::RegisterSubscriberListener {
-                                                    key,
-                                                    client_id,
-                                                    summary: None, // No summary for GET-based subscriptions
-                                                    subscriber_listener: subscription_listener,
-                                                },
-                                            )
-                                            .await
-                                            .inspect_err(|err| {
-                                                tracing::error!(
-                                                    %client_id, %key,
-                                                    "Register subscriber listener error for local GET: {}", err
-                                                );
-                                            });
-                                        match register_listener {
-                                            Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
-                                                tracing::debug!(
-                                                    %client_id, %key,
-                                                    "Subscriber listener registered successfully for local GET"
-                                                );
-                                            }
-                                            _ => {
-                                                tracing::error!(
-                                                    %client_id, %key,
-                                                    "Subscriber listener registration failed for local GET"
-                                                );
-                                            }
-                                        }
+                                        register_subscription_listener(
+                                            &op_manager,
+                                            key,
+                                            client_id,
+                                            subscription_listener,
+                                            "local GET",
+                                        )
+                                        .await?;
                                     } else {
                                         tracing::warn!(%client_id, %key, "GET with subscribe=true but no subscription_listener");
                                     }
@@ -1010,6 +1006,22 @@ async fn process_open_request(
                                     "Reusing existing GET operation via RequestRouter - client registered for result",
                                 );
                             }
+
+                            // Register subscription listener if subscribe=true
+                            if subscribe {
+                                if let Some(subscription_listener) = subscription_listener {
+                                    register_subscription_listener(
+                                        &op_manager,
+                                        key,
+                                        client_id,
+                                        subscription_listener,
+                                        "network GET",
+                                    )
+                                    .await?;
+                                } else {
+                                    tracing::warn!(%client_id, %key, "GET with subscribe=true but no subscription_listener");
+                                }
+                            }
                         } else {
                             tracing::debug!(
                                 this_peer = %peer_id,
@@ -1048,6 +1060,22 @@ async fn process_open_request(
                                         "Failed to send GET error to result router: {}. Transaction: {}",
                                         e, op_id
                                     );
+                                }
+                            }
+
+                            // Register subscription listener if subscribe=true
+                            if subscribe {
+                                if let Some(subscription_listener) = subscription_listener {
+                                    register_subscription_listener(
+                                        &op_manager,
+                                        key,
+                                        client_id,
+                                        subscription_listener,
+                                        "legacy GET",
+                                    )
+                                    .await?;
+                                } else {
+                                    tracing::warn!(%client_id, %key, "GET with subscribe=true but no subscription_listener");
                                 }
                             }
                         }

@@ -1173,6 +1173,9 @@ async fn handle_pure_network_result(
         Ok(None) => {
             tracing::debug!("Network operation returned no result");
         }
+        Err(OpError::StatePushed) => {
+            return Ok(None);
+        }
         Err(e) => {
             tracing::error!("Network operation failed: {}", e);
             // TODO: Register error event properly

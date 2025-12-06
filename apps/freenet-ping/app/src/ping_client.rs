@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use freenet_ping_types::chrono::{DateTime, Utc};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,

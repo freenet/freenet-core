@@ -112,14 +112,23 @@ impl std::fmt::Display for TransportPublicKey {
         use pkcs8::EncodePublicKey;
 
         let encoded = self.0.to_public_key_der().map_err(|_| std::fmt::Error)?;
-        if encoded.as_bytes().len() >= 16 {
-            let bytes = encoded.as_bytes();
-            let first_six = &bytes[..6];
-            let last_six = &bytes[bytes.len() - 6..];
-            let to_encode = [first_six, last_six].concat();
+        let bytes = encoded.as_bytes();
+
+        // For RSA 2048-bit keys, DER encoding is ~294 bytes:
+        // - Bytes 0-~22: DER structure headers (same for all 2048-bit keys)
+        // - Bytes ~23-~279: Modulus (256 bytes of random data)
+        // - Bytes ~280-~293: Exponent (typically 65537, same for all keys)
+        //
+        // To create a short but unique display string, we use 12 bytes from
+        // the middle of the modulus where the actual random data lives.
+        if bytes.len() >= 150 {
+            // Take 12 bytes from the middle of the modulus (around byte 100-112)
+            let mid_start = 100;
+            let to_encode = &bytes[mid_start..mid_start + 12];
             write!(f, "{}", bs58::encode(to_encode).into_string())
         } else {
-            write!(f, "{}", bs58::encode(encoded.as_bytes()).into_string())
+            // Fallback for smaller keys
+            write!(f, "{}", bs58::encode(bytes).into_string())
         }
     }
 }
@@ -161,4 +170,28 @@ fn key_sizes_and_decryption() {
     );
     let bytes = pair.secret.decrypt(&encrypted).unwrap();
     assert_eq!(bytes, sym_key_bytes.as_slice());
+}
+
+#[cfg(test)]
+mod display_uniqueness_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn display_produces_unique_strings_for_100_keys() {
+        // Verify the Display impl produces unique strings by checking 100 keys.
+        // This test was added after discovering the original Display impl only
+        // had ~1 byte of entropy (see PR #2233 for details).
+        let mut seen = HashSet::new();
+        for i in 0..100 {
+            let keypair = TransportKeypair::new();
+            let display_str = format!("{}", keypair.public());
+            assert!(
+                seen.insert(display_str.clone()),
+                "Duplicate display string found at key {}: {}",
+                i,
+                display_str
+            );
+        }
+    }
 }
