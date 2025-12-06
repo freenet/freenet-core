@@ -39,6 +39,7 @@ mod location;
 mod peer_key_location;
 mod score;
 mod seeding;
+mod seeding_cache;
 
 use self::score::Score;
 
