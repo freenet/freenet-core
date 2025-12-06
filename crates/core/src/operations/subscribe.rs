@@ -54,7 +54,7 @@ async fn wait_for_contract_with_timeout(
     }
 
     // Wait for notification or timeout (we don't care which triggers first)
-    let _ = tokio::select! {
+    tokio::select! {
         _ = notifier => {}
         _ = sleep(Duration::from_millis(timeout_ms)) => {}
     };
