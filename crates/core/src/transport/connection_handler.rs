@@ -457,47 +457,30 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
 
-                                // Issue #2235: Clean up stale connections from the same IP but different port.
+                                // Issue #2235: Clean up stale CLOSED connections from the same IP but different port.
                                 // When a peer reconnects (e.g., after restart), it may get a new ephemeral port.
                                 // The old connection's crypto state is stale and will cause AEAD decryption
-                                // failures if we try to reuse it. Remove any existing connections from the
-                                // same IP to ensure we start fresh.
+                                // failures if we try to reuse it.
+                                //
+                                // IMPORTANT: We only remove connections where the channel is closed, to avoid
+                                // breaking scenarios where multiple legitimate peers are behind the same NAT
+                                // (sharing the same public IP but using different source ports).
                                 let remote_ip = remote_addr.ip();
                                 let stale_addrs: Vec<_> = self.remote_connections
-                                    .keys()
-                                    .filter(|addr| addr.ip() == remote_ip && **addr != remote_addr)
-                                    .cloned()
+                                    .iter()
+                                    .filter(|(addr, conn)| {
+                                        addr.ip() == remote_ip
+                                            && **addr != remote_addr
+                                            && conn.inbound_packet_sender.is_closed()
+                                    })
+                                    .map(|(addr, _)| *addr)
                                     .collect();
                                 for stale_addr in stale_addrs {
-                                    if let Some(stale_conn) = self.remote_connections.remove(&stale_addr) {
-                                        if stale_conn.inbound_packet_sender.is_closed() {
-                                            tracing::debug!(
-                                                %stale_addr,
-                                                %remote_addr,
-                                                "removed stale closed connection from same IP"
-                                            );
-                                        } else {
-                                            tracing::info!(
-                                                %stale_addr,
-                                                %remote_addr,
-                                                "removing stale connection from same IP (peer likely reconnected with new port)"
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Also clean up any ongoing gateway connections from the same IP
-                                let stale_gw_addrs: Vec<_> = ongoing_gw_connections
-                                    .keys()
-                                    .filter(|addr| addr.ip() == remote_ip && **addr != remote_addr)
-                                    .cloned()
-                                    .collect();
-                                for stale_addr in stale_gw_addrs {
-                                    ongoing_gw_connections.remove(&stale_addr);
+                                    self.remote_connections.remove(&stale_addr);
                                     tracing::debug!(
                                         %stale_addr,
                                         %remote_addr,
-                                        "removed stale ongoing gateway connection from same IP"
+                                        "removed stale closed connection from same IP"
                                     );
                                 }
 
@@ -2139,8 +2122,15 @@ mod test {
         let (_peer_b_pub, mut peer_b, peer_b_addr) =
             set_peer_connection(Default::default(), channels.clone()).await?;
 
+        // Verify this is testing the same-IP-different-port scenario
+        assert_eq!(
+            peer_a_addr.ip(),
+            peer_b_addr.ip(),
+            "Test requires both peers to have same IP (simulating reconnection)"
+        );
         assert_ne!(
-            peer_a_addr, peer_b_addr,
+            peer_a_addr.port(),
+            peer_b_addr.port(),
             "Peer B should have different port than peer A"
         );
         tracing::info!(
@@ -2187,10 +2177,120 @@ mod test {
             elapsed
         );
 
-        // Also verify we can use the gateway's outbound handler for new connections
+        // Cleanup
         drop(peer_b_conn);
         drop(peer_b);
         drop(gw_outbound);
+
+        Ok(())
+    }
+
+    /// Test that multiple peers behind the same NAT (same IP, different ports) can
+    /// connect simultaneously without interfering with each other.
+    ///
+    /// This verifies that the stale connection cleanup (issue #2235) doesn't break
+    /// legitimate multi-peer scenarios where multiple devices share the same public IP.
+    #[tokio::test]
+    async fn multiple_peers_behind_same_nat() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+
+        // Create the gateway
+        let (gw_pub, (_gw_outbound, mut gw_conn), gw_addr) =
+            set_gateway_connection(Default::default(), channels.clone()).await?;
+
+        // Create peer A (first device behind NAT)
+        let (_peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+
+        // Create peer B (second device behind NAT, same IP different port)
+        let (_peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+
+        // Verify both peers have same IP but different ports (simulating NAT)
+        assert_eq!(
+            peer_a_addr.ip(),
+            peer_b_addr.ip(),
+            "Both peers should have same IP (behind same NAT)"
+        );
+        assert_ne!(
+            peer_a_addr.port(),
+            peer_b_addr.port(),
+            "Peers should have different ports"
+        );
+
+        tracing::info!(
+            "Testing multiple peers behind same NAT: Peer A at {}, Peer B at {}",
+            peer_a_addr,
+            peer_b_addr
+        );
+
+        // Step 1: Peer A connects to gateway
+        let gw_task_a = tokio::spawn(async move {
+            let conn = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("gateway: no connection from peer A"))?;
+            tracing::info!(
+                "Gateway received connection from peer A: {}",
+                conn.remote_addr()
+            );
+            Ok::<_, anyhow::Error>((gw_conn, conn))
+        });
+
+        let peer_a_conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            peer_a.connect(gw_pub.clone(), gw_addr).await,
+        )
+        .await??;
+        tracing::info!("Peer A connected successfully");
+
+        let (mut gw_conn, gw_peer_a_conn) = gw_task_a.await??;
+
+        // Step 2: Peer B connects to gateway (while peer A is still connected)
+        let gw_task_b = tokio::spawn(async move {
+            let conn = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("gateway: no connection from peer B"))?;
+            tracing::info!(
+                "Gateway received connection from peer B: {}",
+                conn.remote_addr()
+            );
+            Ok::<_, anyhow::Error>((gw_conn, conn))
+        });
+
+        let peer_b_conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            peer_b.connect(gw_pub.clone(), gw_addr).await,
+        )
+        .await??;
+        tracing::info!("Peer B connected successfully");
+
+        let (_gw_conn, gw_peer_b_conn) = gw_task_b.await??;
+
+        // Step 3: Verify BOTH connections are still valid
+        // The critical check: peer A's connection should NOT have been disrupted
+        // when peer B connected from the same IP
+        assert_eq!(
+            peer_a_conn.remote_addr(),
+            gw_addr,
+            "Peer A connection should still be valid"
+        );
+        assert_eq!(
+            peer_b_conn.remote_addr(),
+            gw_addr,
+            "Peer B connection should be valid"
+        );
+        assert_eq!(
+            gw_peer_a_conn.remote_addr(),
+            peer_a_addr,
+            "Gateway should still have peer A's connection"
+        );
+        assert_eq!(
+            gw_peer_b_conn.remote_addr(),
+            peer_b_addr,
+            "Gateway should have peer B's connection"
+        );
+
+        tracing::info!("Both peers successfully connected and remain active");
 
         Ok(())
     }
