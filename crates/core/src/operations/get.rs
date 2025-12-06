@@ -1278,6 +1278,7 @@ impl Operation for GetOp {
                             if !op_manager.ring.is_seeding_contract(&key) {
                                 tracing::debug!(tx = %id, %key, "Marking contract as seeded");
                                 op_manager.ring.seed_contract(key);
+                                super::announce_contract_cached(op_manager, &key).await;
                                 let child_tx =
                                     super::start_subscription_request(op_manager, id, key);
                                 tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
@@ -1303,6 +1304,7 @@ impl Operation for GetOp {
                                     if !is_subscribed_contract {
                                         tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Contract not cached @ peer, caching");
                                         op_manager.ring.seed_contract(key);
+                                        super::announce_contract_cached(op_manager, &key).await;
 
                                         let child_tx =
                                             super::start_subscription_request(op_manager, id, key);

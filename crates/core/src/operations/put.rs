@@ -271,6 +271,7 @@ impl Operation for PutOp {
                         // Mark as seeded locally if not already
                         if !is_already_seeding {
                             op_manager.ring.seed_contract(key);
+                            super::announce_contract_cached(op_manager, &key).await;
                             tracing::debug!(
                                 tx = %id,
                                 %key,
@@ -482,6 +483,7 @@ impl Operation for PutOp {
                             super::start_subscription_request_internal(op_manager, *id, key, false);
                         tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                         op_manager.ring.seed_contract(key);
+                        super::announce_contract_cached(op_manager, &key).await;
 
                         true
                     } else {
@@ -729,6 +731,7 @@ impl Operation for PutOp {
                                     "Adding contract to local seed list"
                                 );
                                 op_manager.ring.seed_contract(key);
+                                super::announce_contract_cached(op_manager, &key).await;
                             } else {
                                 tracing::debug!(
                                     tx = %id,
@@ -908,7 +911,9 @@ impl Operation for PutOp {
                                 op_manager, *id, key, false,
                             );
                             tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
-                            op_manager.ring.seed_contract(key)
+                            let result = op_manager.ring.seed_contract(key);
+                            super::announce_contract_cached(op_manager, &key).await;
+                            result
                         };
 
                         // Notify subscribers of dropped contracts
@@ -1277,6 +1282,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
             "Adding contract to local seed list"
         );
         op_manager.ring.seed_contract(key);
+        super::announce_contract_cached(op_manager, &key).await;
 
         // Determine which peers need to be notified and broadcast the update
         let broadcast_to = op_manager.get_broadcast_targets(&key, &own_location);
