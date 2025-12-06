@@ -16,7 +16,9 @@ use crate::{
     },
     ring::{Location, PeerKeyLocation},
 };
-use freenet_stdlib::prelude::{ContractContainer, ContractKey, DelegateKey, WrappedState};
+use freenet_stdlib::prelude::{
+    ContractContainer, ContractInstanceId, ContractKey, DelegateKey, WrappedState,
+};
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -333,6 +335,30 @@ pub(crate) enum NetMessageV1 {
     },
     Update(UpdateMsg),
     Aborted(Transaction),
+    /// Proximity cache protocol message for tracking which neighbors cache which contracts.
+    ProximityCache {
+        message: ProximityCacheMessage,
+    },
+}
+
+/// Messages for the proximity cache protocol.
+///
+/// This protocol allows neighbors to inform each other which contracts they have cached,
+/// enabling UPDATE forwarding to seeders who may not be explicitly subscribed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names)]
+pub enum ProximityCacheMessage {
+    /// Announce changes to our cached contracts.
+    CacheAnnounce {
+        /// Contracts we've started caching.
+        added: Vec<ContractInstanceId>,
+        /// Contracts we've stopped caching.
+        removed: Vec<ContractInstanceId>,
+    },
+    /// Request a neighbor's full cache state (used on new connections).
+    CacheStateRequest,
+    /// Response with the neighbor's full cache state.
+    CacheStateResponse { contracts: Vec<ContractInstanceId> },
 }
 
 trait Versioned {
@@ -357,6 +383,7 @@ impl Versioned for NetMessageV1 {
             NetMessageV1::Unsubscribed { .. } => semver::Version::new(1, 0, 0),
             NetMessageV1::Update(_) => semver::Version::new(1, 0, 0),
             NetMessageV1::Aborted(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::ProximityCache { .. } => semver::Version::new(1, 0, 0),
         }
     }
 }
@@ -426,6 +453,10 @@ pub(crate) enum NodeEvent {
     /// Register expectation for an inbound connection from the given peer.
     ExpectPeerConnection {
         addr: SocketAddr,
+    },
+    /// Broadcast a proximity cache message to all connected peers.
+    BroadcastProximityCache {
+        message: ProximityCacheMessage,
     },
 }
 
@@ -506,6 +537,9 @@ impl Display for NodeEvent {
             NodeEvent::ExpectPeerConnection { addr } => {
                 write!(f, "ExpectPeerConnection (from {addr})")
             }
+            NodeEvent::BroadcastProximityCache { message } => {
+                write!(f, "BroadcastProximityCache ({message:?})")
+            }
         }
     }
 }
@@ -540,6 +574,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Update(op) => op.id(),
             NetMessageV1::Aborted(tx) => tx,
             NetMessageV1::Unsubscribed { transaction, .. } => transaction,
+            NetMessageV1::ProximityCache { .. } => Transaction::NULL,
         }
     }
 
@@ -552,6 +587,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Update(op) => op.target().as_ref().map(|b| b.borrow().clone()),
             NetMessageV1::Aborted(_) => None,
             NetMessageV1::Unsubscribed { .. } => None,
+            NetMessageV1::ProximityCache { .. } => None,
         }
     }
 
@@ -564,6 +600,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Update(op) => op.requested_location(),
             NetMessageV1::Aborted(_) => None,
             NetMessageV1::Unsubscribed { .. } => None,
+            NetMessageV1::ProximityCache { .. } => None,
         }
     }
 }
@@ -582,6 +619,9 @@ impl Display for NetMessage {
                 Aborted(msg) => msg.fmt(f)?,
                 Unsubscribed { key, from, .. } => {
                     write!(f, "Unsubscribed {{  key: {key}, from: {from} }}")?;
+                }
+                ProximityCache { message } => {
+                    write!(f, "ProximityCache {{ {message:?} }}")?;
                 }
             },
         };

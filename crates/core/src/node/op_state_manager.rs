@@ -32,7 +32,10 @@ use crate::{
     ring::{ConnectionManager, LiveTransactionTracker, PeerKeyLocation, Ring},
 };
 
-use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig};
+use super::{
+    network_bridge::EventLoopNotificationsSender, proximity_cache::ProximityCacheManager,
+    NetEventRegister, NodeConfig,
+};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -216,6 +219,8 @@ pub(crate) struct OpManager {
     /// Waiters for contract storage notification.
     /// Operations can register to be notified when a specific contract is stored.
     contract_waiters: Arc<Mutex<std::collections::HashMap<ContractKey, Vec<oneshot::Sender<()>>>>>,
+    /// Proximity cache manager for tracking neighbor contract caches
+    pub proximity_cache: Arc<ProximityCacheManager>,
 }
 
 impl Clone for OpManager {
@@ -232,6 +237,7 @@ impl Clone for OpManager {
             is_gateway: self.is_gateway,
             sub_op_tracker: self.sub_op_tracker.clone(),
             contract_waiters: self.contract_waiters.clone(),
+            proximity_cache: self.proximity_cache.clone(),
         }
     }
 }
@@ -288,6 +294,8 @@ impl OpManager {
             tracing::debug!("Regular peer node: peer_ready will be set after first handshake");
         }
 
+        let proximity_cache = Arc::new(ProximityCacheManager::new());
+
         Ok(Self {
             ring,
             ops,
@@ -300,6 +308,7 @@ impl OpManager {
             is_gateway,
             sub_op_tracker,
             contract_waiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            proximity_cache,
         })
     }
 

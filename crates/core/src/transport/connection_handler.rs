@@ -58,6 +58,12 @@ type GatewayConnectionFuture = BoxFuture<
 type TraverseNatFuture =
     BoxFuture<'static, Result<(RemoteConnection, InboundRemoteConnection), TransportError>>;
 
+/// Maximum retries for socket binding in case of transient port conflicts.
+/// This handles race conditions in test environments where ports are released
+/// and rebound quickly.
+const SOCKET_BIND_MAX_RETRIES: usize = 5;
+const SOCKET_BIND_RETRY_DELAY_MS: u64 = 50;
+
 pub(crate) async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
     listen_host: IpAddr,
@@ -65,7 +71,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     is_gateway: bool,
     bandwidth_limit: Option<usize>,
 ) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
-    // Bind the UDP socket to the specified port
+    // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
     tracing::info!(
         target: "freenet_core::transport::send_debug",
@@ -73,7 +79,9 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         is_gateway,
         "Binding UDP socket"
     );
-    let socket = S::bind(bind_addr).await?;
+
+    let socket = bind_socket_with_retry::<S>(bind_addr, SOCKET_BIND_MAX_RETRIES).await?;
+
     tracing::info!(
         target: "freenet_core::transport::send_debug",
         %bind_addr,
@@ -93,6 +101,42 @@ pub(crate) async fn create_connection_handler<S: Socket>(
             new_connection_notifier,
         },
     ))
+}
+
+/// Bind a socket with retry logic for transient "Address in use" errors.
+///
+/// In test environments with parallel tests, there can be a brief window between
+/// releasing a reserved port and rebinding where another process grabs it.
+/// This retry logic handles such transient conflicts gracefully.
+async fn bind_socket_with_retry<S: Socket>(
+    addr: SocketAddr,
+    max_retries: usize,
+) -> Result<S, TransportError> {
+    let mut last_err = None;
+
+    for attempt in 0..max_retries {
+        match S::bind(addr).await {
+            Ok(socket) => return Ok(socket),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt + 1 < max_retries => {
+                tracing::debug!(
+                    %addr,
+                    attempt = attempt + 1,
+                    max_retries,
+                    "Socket bind failed with AddrInUse, retrying after delay"
+                );
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(
+                    SOCKET_BIND_RETRY_DELAY_MS * (1 << attempt), // exponential backoff
+                ))
+                .await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Err(last_err
+        .map(TransportError::from)
+        .unwrap_or_else(|| TransportError::IO(std::io::ErrorKind::AddrInUse.into())))
 }
 
 /// Receives  new inbound connections from the network.

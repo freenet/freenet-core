@@ -799,6 +799,12 @@ impl P2pConnManager {
                                             peer.pub_key().clone(),
                                         ))
                                         .await;
+
+                                    // Clean up proximity cache for disconnected peer
+                                    ctx.bridge
+                                        .op_manager
+                                        .proximity_cache
+                                        .on_peer_disconnected(&peer_addr);
                                     if let Some(conn) = ctx.connections.remove(&peer_addr) {
                                         // Also remove from reverse lookup
                                         if let Some(pub_key) = pub_key_to_remove {
@@ -1268,6 +1274,27 @@ impl P2pConnManager {
                                         Err(e) => {
                                             tracing::error!(%tx, error = %e, "failed to send subscribe response")
                                         }
+                                    }
+                                }
+                            }
+                            NodeEvent::BroadcastProximityCache { message } => {
+                                // Broadcast ProximityCache message to all connected peers
+                                tracing::debug!(
+                                    ?message,
+                                    peer_count = ctx.connections.len(),
+                                    "Broadcasting ProximityCache message to connected peers"
+                                );
+
+                                let msg = crate::message::NetMessage::V1(
+                                    crate::message::NetMessageV1::ProximityCache {
+                                        message: message.clone(),
+                                    },
+                                );
+
+                                for peer_addr in ctx.connections.keys() {
+                                    tracing::debug!(%peer_addr, "Sending ProximityCache to peer");
+                                    if let Err(e) = ctx.bridge.send(*peer_addr, msg.clone()).await {
+                                        tracing::warn!(%peer_addr, "Failed to send ProximityCache: {e}");
                                     }
                                 }
                             }

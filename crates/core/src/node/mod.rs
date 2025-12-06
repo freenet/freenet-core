@@ -68,6 +68,7 @@ mod message_processor;
 mod network_bridge;
 mod op_state_manager;
 mod p2p_impl;
+pub(crate) mod proximity_cache;
 mod request_router;
 pub(crate) mod testing_impl;
 
@@ -864,6 +865,13 @@ async fn process_message_v1<CB>(
                 op_manager.ring.remove_subscriber(key, &peer_id);
                 break;
             }
+            NetMessageV1::ProximityCache { .. } => {
+                // Legacy path doesn't have source_addr - ProximityCache requires connection-based routing
+                tracing::warn!(
+                    "ProximityCache message received via legacy path (no source address)"
+                );
+                break;
+            }
             _ => break, // Exit the loop if no applicable message type is found
         }
     }
@@ -1103,6 +1111,30 @@ where
                     pub_key: from.pub_key().clone(),
                 };
                 op_manager.ring.remove_subscriber(key, &peer_id);
+                break;
+            }
+            NetMessageV1::ProximityCache { ref message } => {
+                let Some(source) = source_addr else {
+                    tracing::warn!(
+                        "Received ProximityCache message without source address (pure network)"
+                    );
+                    break;
+                };
+                tracing::debug!(
+                    from = %source,
+                    "Processing ProximityCache message (pure network)"
+                );
+                if let Some(response) = op_manager
+                    .proximity_cache
+                    .handle_message(source, message.clone())
+                {
+                    // Send response back to sender
+                    let response_msg =
+                        NetMessage::V1(NetMessageV1::ProximityCache { message: response });
+                    if let Err(err) = conn_manager.send(source, response_msg).await {
+                        tracing::error!(%err, %source, "Failed to send ProximityCache response");
+                    }
+                }
                 break;
             }
             _ => break, // Exit the loop if no applicable message type is found
