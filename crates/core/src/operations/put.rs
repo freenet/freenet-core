@@ -17,7 +17,7 @@ use crate::node::IsOperationCompleted;
 use crate::{
     client_events::HostResult,
     contract::ContractHandlerEvent,
-    message::{InnerMessage, NetMessage, NetMessageV1, Transaction},
+    message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
     ring::{Location, PeerKeyLocation},
 };
@@ -220,15 +220,8 @@ impl Operation for PutOp {
                         _ => false,
                     };
 
-                    // Check if we're the initiator of this PUT operation
-                    // We only cache locally when either WE initiate the PUT, or when forwarding just of the peer should be seeding
-                    let should_seed = match &self.state {
-                        Some(PutState::PrepareRequest { .. }) => true,
-                        Some(PutState::AwaitingResponse { upstream, .. }) => {
-                            upstream.is_none() || op_manager.ring.should_seed(&key)
-                        }
-                        _ => op_manager.ring.should_seed(&key),
-                    };
+                    // Always cache contracts we encounter - LRU will handle eviction
+                    let should_seed = true;
 
                     let modified_value = if should_seed {
                         // Cache locally when initiating a PUT. This ensures:
@@ -270,7 +263,7 @@ impl Operation for PutOp {
 
                         // Mark as seeded locally if not already
                         if !is_already_seeding {
-                            op_manager.ring.seed_contract(key);
+                            op_manager.ring.seed_contract(key, value.size() as u64);
                             tracing::debug!(
                                 tx = %id,
                                 %key,
@@ -414,8 +407,8 @@ impl Operation for PutOp {
                     // Get the contract key and check if we should handle it
                     let key = contract.key();
                     let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
-                    let should_seed = op_manager.ring.should_seed(&key);
-                    let should_handle_locally = !is_subscribed_contract && should_seed;
+                    // Always cache contracts - LRU handles eviction
+                    let should_handle_locally = !is_subscribed_contract;
 
                     tracing::debug!(
                         tx = %id,
@@ -481,7 +474,7 @@ impl Operation for PutOp {
                         let child_tx =
                             super::start_subscription_request_internal(op_manager, *id, key, false);
                         tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
-                        op_manager.ring.seed_contract(key);
+                        op_manager.ring.seed_contract(key, value.size() as u64);
 
                         true
                     } else {
@@ -728,7 +721,7 @@ impl Operation for PutOp {
                                     peer = %op_manager.ring.connection_manager.own_location(),
                                     "Adding contract to local seed list"
                                 );
-                                op_manager.ring.seed_contract(key);
+                                op_manager.ring.seed_contract(key, state.size() as u64);
                             } else {
                                 tracing::debug!(
                                     tx = %id,
@@ -835,8 +828,8 @@ impl Operation for PutOp {
                     let key = contract.key();
                     let peer_loc = op_manager.ring.connection_manager.own_location();
                     let is_seeding_contract = op_manager.ring.is_seeding_contract(&key);
-                    let should_seed = op_manager.ring.should_seed(&key);
-                    let should_handle_locally = should_seed && !is_seeding_contract;
+                    // Always cache contracts - LRU handles eviction
+                    let should_handle_locally = !is_seeding_contract;
 
                     tracing::debug!(
                         tx = %id,
@@ -902,35 +895,12 @@ impl Operation for PutOp {
                             .await?;
                         }
 
-                        // Start subscription and handle dropped contracts
-                        let (dropped_contract, old_subscribers) = {
-                            let child_tx = super::start_subscription_request_internal(
-                                op_manager, *id, key, false,
-                            );
-                            tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
-                            op_manager.ring.seed_contract(key)
-                        };
-
-                        // Notify subscribers of dropped contracts
-                        if let Some(dropped_key) = dropped_contract {
-                            for subscriber in old_subscribers {
-                                if let Some(addr) = subscriber.socket_addr() {
-                                    conn_manager
-                                        .send(
-                                            addr,
-                                            NetMessage::V1(NetMessageV1::Unsubscribed {
-                                                transaction: Transaction::new::<PutMsg>(),
-                                                key: dropped_key,
-                                                from: op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .own_location(),
-                                            }),
-                                        )
-                                        .await?;
-                                }
-                            }
-                        }
+                        // Start subscription and record cache access
+                        let child_tx =
+                            super::start_subscription_request_internal(op_manager, *id, key, false);
+                        tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
+                        let _evicted = op_manager.ring.seed_contract(key, new_value.size() as u64);
+                        // Note: Evicted contracts are handled by SeedingManager (subscribers cleaned up internally)
                     } else if last_hop && !already_put {
                         // Last hop but not handling locally, still need to put
                         put_contract(
@@ -1276,7 +1246,9 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
             peer = %op_manager.ring.connection_manager.own_location(),
             "Adding contract to local seed list"
         );
-        op_manager.ring.seed_contract(key);
+        op_manager
+            .ring
+            .seed_contract(key, updated_value.size() as u64);
 
         // Determine which peers need to be notified and broadcast the update
         let broadcast_to = op_manager.get_broadcast_targets(&key, &own_location);

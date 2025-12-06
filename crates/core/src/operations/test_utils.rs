@@ -136,20 +136,23 @@ impl MockRing {
         &self.own_location
     }
 
-    pub fn should_seed(&self, _key: &ContractKey) -> bool {
-        // In tests, always willing to seed
-        true
-    }
-
     pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
         self.seeding_contracts.lock().unwrap().contains(key)
     }
 
-    pub fn seed_contract(&self, key: ContractKey) {
+    pub fn seed_contract(&self, key: ContractKey, _size_bytes: u64) {
         let mut seeding = self.seeding_contracts.lock().unwrap();
         if !seeding.contains(&key) {
             seeding.push(key);
         }
+    }
+
+    pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) {
+        self.seed_contract(key, size_bytes);
+    }
+
+    pub fn record_subscribe_access(&self, key: ContractKey, size_bytes: u64) {
+        self.seed_contract(key, size_bytes);
     }
 
     /// Simulates k_closest_potentially_caching
@@ -274,7 +277,7 @@ mod tests {
         let key = make_contract_key(1);
         assert!(!ring.is_seeding_contract(&key));
 
-        ring.seed_contract(key);
+        ring.seed_contract(key, 100);
         assert!(ring.is_seeding_contract(&key));
     }
 

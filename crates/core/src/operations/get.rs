@@ -1235,12 +1235,8 @@ impl Operation for GetOp {
                             false
                         };
 
-                    // Determine if we should put the contract locally
-                    let should_put = if is_original_requester && subscribe_requested {
-                        true
-                    } else {
-                        op_manager.ring.should_seed(&key)
-                    };
+                    // Always cache contracts we encounter - LRU will handle eviction
+                    let should_put = true;
 
                     // Put contract locally if needed
                     if should_put {
@@ -1277,7 +1273,7 @@ impl Operation for GetOp {
                             // State already cached and identical, mark as seeded if needed
                             if !op_manager.ring.is_seeding_contract(&key) {
                                 tracing::debug!(tx = %id, %key, "Marking contract as seeded");
-                                op_manager.ring.seed_contract(key);
+                                op_manager.ring.record_get_access(key, value.size() as u64);
                                 let child_tx =
                                     super::start_subscription_request(op_manager, id, key);
                                 tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
@@ -1302,7 +1298,7 @@ impl Operation for GetOp {
                                     // Start subscription if not already seeding
                                     if !is_subscribed_contract {
                                         tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Contract not cached @ peer, caching");
-                                        op_manager.ring.seed_contract(key);
+                                        op_manager.ring.record_get_access(key, value.size() as u64);
 
                                         let child_tx =
                                             super::start_subscription_request(op_manager, id, key);

@@ -1284,15 +1284,13 @@ mod experimental_combined {
                             });
 
                             // Sender: serialize, encrypt, send to channel
-                            let mut nonce_counter = 0u64;
-                            for _ in 0..PACKET_COUNT {
+                            for nonce_counter in 0u64..PACKET_COUNT as u64 {
                                 // Allocate buffer for packet
                                 let mut packet = vec![0u8; size + 28]; // +28 for nonce+tag
 
                                 // Create nonce
                                 let mut nonce = [0u8; 12];
                                 nonce[4..].copy_from_slice(&nonce_counter.to_le_bytes());
-                                nonce_counter += 1;
 
                                 // Copy nonce to packet
                                 packet[..12].copy_from_slice(&nonce);
@@ -1493,24 +1491,18 @@ mod experimental_syscall_batching {
                     let rt = tokio::runtime::Handle::current();
                     let mut batch = Vec::with_capacity(BATCH_SIZE);
 
-                    loop {
-                        // Try to receive up to BATCH_SIZE packets
-                        match rt.block_on(rx.recv()) {
-                            Some(packet) => {
-                                batch.push(packet);
-                                // Drain available packets up to batch size
-                                while batch.len() < BATCH_SIZE {
-                                    match rx.try_recv() {
-                                        Ok(p) => batch.push(p),
-                                        Err(_) => break,
-                                    }
-                                }
-                                // Send batch
-                                for packet in batch.drain(..) {
-                                    socket.send(&packet).unwrap();
-                                }
+                    while let Some(packet) = rt.block_on(rx.recv()) {
+                        batch.push(packet);
+                        // Drain available packets up to batch size
+                        while batch.len() < BATCH_SIZE {
+                            match rx.try_recv() {
+                                Ok(p) => batch.push(p),
+                                Err(_) => break,
                             }
-                            None => break,
+                        }
+                        // Send batch
+                        for packet in batch.drain(..) {
+                            socket.send(&packet).unwrap();
                         }
                     }
                 });

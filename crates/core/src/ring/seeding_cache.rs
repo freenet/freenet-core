@@ -30,12 +30,11 @@ use crate::util::time_source::TimeSource;
 ///
 /// UPDATE is explicitly excluded because contract creators control when updates happen,
 /// which could be abused to keep contracts cached indefinitely.
-// TODO: Remove allow(dead_code) once integrated with SeedingManager
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessType {
     Get,
     Put,
+    #[allow(dead_code)] // Reserved for future direct subscribe tracking
     Subscribe,
 }
 
@@ -59,8 +58,6 @@ pub struct CachedContract {
 /// for the network even after local subscribers have left. The cache has a byte
 /// budget rather than a simple count limit, allowing it to fairly handle contracts
 /// of varying sizes.
-// TODO: Remove allow(dead_code) once integrated with SeedingManager
-#[allow(dead_code)]
 pub struct SeedingCache<T: TimeSource> {
     /// Maximum bytes to use for cached contracts
     budget_bytes: u64,
@@ -74,8 +71,6 @@ pub struct SeedingCache<T: TimeSource> {
     time_source: T,
 }
 
-// TODO: Remove allow(dead_code) once integrated with SeedingManager
-#[allow(dead_code)]
 impl<T: TimeSource> SeedingCache<T> {
     /// Create a new seeding cache with the given byte budget.
     pub fn new(budget_bytes: u64, time_source: T) -> Self {
@@ -160,6 +155,7 @@ impl<T: TimeSource> SeedingCache<T> {
     }
 
     /// Get metadata about a cached contract.
+    #[allow(dead_code)] // Public API for introspection
     pub fn get(&self, key: &ContractKey) -> Option<&CachedContract> {
         self.contracts.get(key)
     }
@@ -178,21 +174,25 @@ impl<T: TimeSource> SeedingCache<T> {
     }
 
     /// Get the current number of cached contracts.
+    #[allow(dead_code)] // Public API for introspection
     pub fn len(&self) -> usize {
         self.contracts.len()
     }
 
     /// Check if the cache is empty.
+    #[allow(dead_code)] // Public API for introspection
     pub fn is_empty(&self) -> bool {
         self.contracts.is_empty()
     }
 
     /// Get the current bytes used.
+    #[allow(dead_code)] // Public API for introspection
     pub fn current_bytes(&self) -> u64 {
         self.current_bytes
     }
 
     /// Get the budget in bytes.
+    #[allow(dead_code)] // Public API for introspection
     pub fn budget_bytes(&self) -> u64 {
         self.budget_bytes
     }
