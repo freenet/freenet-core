@@ -207,7 +207,7 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
         };
 
         // Start the gateway server (which spawns the cleanup task)
-        let (gw, _ws_proxy) = serve_gateway_for_test(config).await;
+        let (gw, _ws_proxy) = serve_gateway_for_test(config).await?;
 
         // Access the attested_contracts map via the test-only method
         let attested_contracts = gw.attested_contracts();

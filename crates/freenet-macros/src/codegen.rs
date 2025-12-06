@@ -449,7 +449,7 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
             let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
             #connection_tuning
             let (#node_var, #flush_handle_var) = node_config
-                .build_with_flush_handle(freenet::server::serve_gateway(built_config.ws_api).await)
+                .build_with_flush_handle(freenet::server::serve_gateway(built_config.ws_api).await?)
                 .await?;
         });
     }

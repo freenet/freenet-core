@@ -31,7 +31,9 @@ async fn run_local(config: Config) -> anyhow::Result<()> {
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
-    let clients = serve_gateway(config.ws_api).await;
+    let clients = serve_gateway(config.ws_api)
+        .await
+        .with_context(|| "failed to start HTTP/WebSocket gateway")?;
     tracing::info!("Initializing node configuration");
 
     let node_config = NodeConfig::new(config)

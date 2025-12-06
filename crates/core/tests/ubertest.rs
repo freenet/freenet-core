@@ -301,7 +301,7 @@ async fn test_basic_room_creation() -> anyhow::Result<()> {
         let config = gw_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -313,7 +313,7 @@ async fn test_basic_room_creation() -> anyhow::Result<()> {
         let config = peer_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -416,7 +416,7 @@ async fn test_app_ubertest() -> anyhow::Result<()> {
         let config = gw_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -463,7 +463,7 @@ async fn test_app_ubertest() -> anyhow::Result<()> {
             let config = peer_config.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
-                .build(serve_gateway(config.ws_api).await)
+                .build(serve_gateway(config.ws_api).await?)
                 .await?;
             node.run().await
         }

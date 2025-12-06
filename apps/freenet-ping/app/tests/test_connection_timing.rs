@@ -65,7 +65,7 @@ async fn test_connection_timing() -> TestResult {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -76,7 +76,7 @@ async fn test_connection_timing() -> TestResult {
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }

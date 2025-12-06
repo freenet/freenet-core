@@ -90,7 +90,7 @@ async fn test_small_network_get_failure() -> TestResult {
         node_config.min_number_of_connections(2);
         node_config.max_number_of_connections(10);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -103,7 +103,7 @@ async fn test_small_network_get_failure() -> TestResult {
         node_config.min_number_of_connections(2);
         node_config.max_number_of_connections(10);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -116,7 +116,7 @@ async fn test_small_network_get_failure() -> TestResult {
         node_config.min_number_of_connections(2);
         node_config.max_number_of_connections(10);
         let node = node_config
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }

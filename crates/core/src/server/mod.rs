@@ -66,14 +66,28 @@ pub(crate) enum HostCallbackResult {
     },
 }
 
-fn serve(socket: SocketAddr, router: axum::Router) {
+async fn serve(socket: SocketAddr, router: axum::Router) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(socket).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "Port {} is already in use. Another freenet process may be running. \
+                     Use 'pkill freenet' to stop it, or specify a different port with --gateway-port.",
+                    socket.port()
+                ),
+            )
+        } else {
+            e
+        }
+    })?;
+    tracing::info!("HTTP gateway listening on {}", socket);
     tokio::spawn(async move {
-        tracing::info!("HTTP gateway listening on {}", socket);
-        let listener = tokio::net::TcpListener::bind(socket).await.unwrap();
         axum::serve(listener, router).await.map_err(|e| {
             tracing::error!("Error while running HTTP gateway server: {e}");
         })
     });
+    Ok(())
 }
 
 pub mod local_node {
@@ -101,7 +115,7 @@ pub mod local_node {
         let (mut gw, gw_router) = HttpGateway::as_router(&socket);
         let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
 
-        serve(socket, ws_router.layer(TraceLayer::new_for_http()));
+        serve(socket, ws_router.layer(TraceLayer::new_for_http())).await?;
 
         // TODO: use combinator instead
         // let mut all_clients =
@@ -199,23 +213,25 @@ pub mod local_node {
     }
 }
 
-pub async fn serve_gateway(config: WebsocketApiConfig) -> [BoxedClient; 2] {
-    let (gw, ws_proxy) = serve_gateway_in(config).await;
-    [Box::new(gw), Box::new(ws_proxy)]
+pub async fn serve_gateway(config: WebsocketApiConfig) -> std::io::Result<[BoxedClient; 2]> {
+    let (gw, ws_proxy) = serve_gateway_in(config).await?;
+    Ok([Box::new(gw), Box::new(ws_proxy)])
 }
 
 /// Serves the gateway and returns the concrete types (for integration testing).
 /// This allows tests to access internal state like the attested_contracts map.
 pub async fn serve_gateway_for_test(
     config: WebsocketApiConfig,
-) -> (
+) -> std::io::Result<(
     http_gateway::HttpGateway,
     crate::client_events::websocket::WebSocketProxy,
-) {
+)> {
     serve_gateway_in(config).await
 }
 
-pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway, WebSocketProxy) {
+pub(crate) async fn serve_gateway_in(
+    config: WebsocketApiConfig,
+) -> std::io::Result<(HttpGateway, WebSocketProxy)> {
     let ws_socket = (config.address, config.port).into();
 
     // Create a shared attested_contracts map with token expiration support
@@ -234,8 +250,8 @@ pub(crate) async fn serve_gateway_in(config: WebsocketApiConfig) -> (HttpGateway
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
 
-    serve(ws_socket, ws_router.layer(TraceLayer::new_for_http()));
-    (gw, ws_proxy)
+    serve(ws_socket, ws_router.layer(TraceLayer::new_for_http())).await?;
+    Ok((gw, ws_proxy))
 }
 
 /// Spawns a background task that periodically removes expired authentication tokens.
