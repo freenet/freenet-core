@@ -26,6 +26,43 @@ const LOCAL_FETCH_POLL_INTERVAL_MS: u64 = 25;
 /// Used when a subscription arrives before the contract has been propagated via PUT.
 const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
 
+/// Wait for a contract to become available, using channel-based notification.
+///
+/// This handles the race condition where a subscription arrives before the contract
+/// has been propagated via PUT. The flow is:
+/// 1. Fast path: check if contract already exists
+/// 2. Register notification waiter
+/// 3. Check again (handles race between step 1 and 2)
+/// 4. Wait for notification or timeout
+/// 5. Final verification of actual state
+async fn wait_for_contract_with_timeout(
+    op_manager: &OpManager,
+    key: ContractKey,
+    timeout_ms: u64,
+) -> Result<bool, OpError> {
+    // Fast path - contract already exists
+    if super::has_contract(op_manager, key).await? {
+        return Ok(true);
+    }
+
+    // Register waiter BEFORE second check to avoid race condition
+    let notifier = op_manager.wait_for_contract(key);
+
+    // Check again - contract may have arrived between first check and registration
+    if super::has_contract(op_manager, key).await? {
+        return Ok(true);
+    }
+
+    // Wait for notification or timeout (we don't care which triggers first)
+    let _ = tokio::select! {
+        _ = notifier => {}
+        _ = sleep(Duration::from_millis(timeout_ms)) => {}
+    };
+
+    // Always verify actual state - don't trust notification alone
+    super::has_contract(op_manager, key).await
+}
+
 fn subscribers_snapshot(op_manager: &OpManager, key: &ContractKey) -> Vec<String> {
     op_manager
         .ring
@@ -557,37 +594,23 @@ impl Operation for SubscribeOp {
                     }
 
                     // Contract not found locally. Wait briefly in case a PUT is in flight.
-                    // This handles race conditions where subscription arrives before the contract.
-                    // Uses channel-based notification instead of polling for efficiency.
                     tracing::debug!(
                         tx = %id,
                         %key,
                         "subscribe: contract not found, waiting for possible in-flight PUT"
                     );
 
-                    // Register to be notified when the contract is stored
-                    let contract_notifier = op_manager.wait_for_contract(*key);
-
-                    // Wait for either notification or timeout
-                    let contract_arrived = tokio::select! {
-                        _ = contract_notifier => {
-                            // Notification received - contract was stored
-                            true
-                        }
-                        _ = sleep(Duration::from_millis(CONTRACT_WAIT_TIMEOUT_MS)) => {
-                            // Timeout - check one final time in case of race
-                            super::has_contract(op_manager, *key).await.unwrap_or(false)
-                        }
-                    };
-
-                    if contract_arrived {
+                    // Wait for contract with timeout (handles race conditions internally)
+                    if wait_for_contract_with_timeout(op_manager, *key, CONTRACT_WAIT_TIMEOUT_MS)
+                        .await?
+                    {
                         tracing::info!(
                             tx = %id,
                             %key,
-                            "subscribe: contract arrived via notification, handling locally"
+                            "subscribe: contract arrived, handling locally"
                         );
 
-                        // Contract arrived, register subscription
+                        // Contract exists, register subscription
                         if op_manager
                             .ring
                             .add_subscriber(key, subscriber.clone(), None)

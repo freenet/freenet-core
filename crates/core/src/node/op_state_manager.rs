@@ -668,12 +668,16 @@ impl OpManager {
 
     /// Notify all waiters that a contract has been stored.
     /// Called after successful contract storage in PUT operations.
+    ///
+    /// Note: Stale waiters (from timed-out operations) are automatically cleaned up
+    /// here when we remove all senders for the key. The send() will fail silently
+    /// for dropped receivers, which is harmless.
     pub fn notify_contract_stored(&self, key: &ContractKey) {
         let mut waiters = self.contract_waiters.lock();
         if let Some(senders) = waiters.remove(key) {
             let count = senders.len();
             for sender in senders {
-                // Ignore errors if receiver was dropped
+                // Ignore errors if receiver was dropped (e.g., operation timed out)
                 let _ = sender.send(());
             }
             if count > 0 {
