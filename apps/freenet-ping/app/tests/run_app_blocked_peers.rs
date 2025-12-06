@@ -133,6 +133,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         let path = preset.temp_dir.path().to_path_buf();
         (cfg, preset, gw_config_from_path(public_port, &path)?)
     };
+
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure Node1 (blocks Node2)
@@ -167,7 +168,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
     tracing::info!("Node 1 blocks: {:?}", node2_network_addr);
     tracing::info!("Node 2 blocks: {:?}", node1_network_addr);
 
-    // Free socket resources
+    // Free socket resources before starting nodes
     std::mem::drop(network_socket_gw);
     std::mem::drop(ws_api_port_socket_gw);
     std::mem::drop(network_socket_node1);
@@ -788,17 +789,16 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
 
 /// Standard blocked peers test (baseline)
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore]
 async fn test_ping_blocked_peers() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "baseline",
-        initial_wait: Duration::from_secs(10),
-        operation_timeout: Duration::from_secs(20),
+        initial_wait: Duration::from_secs(25),
+        operation_timeout: Duration::from_secs(45),
         update_rounds: 3,
         update_wait: Duration::from_secs(5),
-        propagation_wait: Duration::from_secs(8),
+        propagation_wait: Duration::from_secs(15),
         verbose_logging: false,
-        check_interval: None,
+        check_interval: Some(Duration::from_secs(4)),
         send_refresh_updates: false,
         send_final_updates: true,
         subscribe_immediately: false,
@@ -808,26 +808,22 @@ async fn test_ping_blocked_peers() -> TestResult {
 
 /// Simple blocked peers test
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore]
 async fn test_ping_blocked_peers_simple() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "simple",
-        initial_wait: Duration::from_secs(10),
-        operation_timeout: Duration::from_secs(15),
-        update_rounds: 1, // Only one round of updates
-        update_wait: Duration::from_secs(3),
-        propagation_wait: Duration::from_secs(10), // Longer wait for simpler flow
+        initial_wait: Duration::from_secs(25),
+        operation_timeout: Duration::from_secs(45),
+        update_rounds: 1,
+        update_wait: Duration::from_secs(5),
+        propagation_wait: Duration::from_secs(15),
         verbose_logging: false,
-        check_interval: None,
+        check_interval: Some(Duration::from_secs(4)),
         send_refresh_updates: false,
         send_final_updates: false,
-        subscribe_immediately: true,
+        subscribe_immediately: false,
     })
     .await
 }
-
-// Note: Redundant tests (optimized, improved, debug, reliable) were removed
-// as they only varied in non-functional aspects like timeouts and logging
 
 /// Solution/reference implementation for blocked peers
 // TODO-MUST-FIX: WebSocket connection reset during teardown - see issue #2108
@@ -835,17 +831,16 @@ async fn test_ping_blocked_peers_simple() -> TestResult {
 // fails with "Connection reset without closing handshake" during cleanup.
 // Likely a test teardown race rather than functional bug.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore]
 async fn test_ping_blocked_peers_solution() -> TestResult {
     run_blocked_peers_test(BlockedPeersConfig {
         test_name: "solution",
-        initial_wait: Duration::from_secs(12),
-        operation_timeout: Duration::from_secs(25),
+        initial_wait: Duration::from_secs(25),
+        operation_timeout: Duration::from_secs(60),
         update_rounds: 2,
-        update_wait: Duration::from_secs(4),
-        propagation_wait: Duration::from_secs(12),
+        update_wait: Duration::from_secs(6),
+        propagation_wait: Duration::from_secs(20),
         verbose_logging: false,
-        check_interval: Some(Duration::from_secs(3)), // Regular check intervals
+        check_interval: Some(Duration::from_secs(5)),
         send_refresh_updates: true,
         send_final_updates: true,
         subscribe_immediately: true,

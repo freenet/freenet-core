@@ -1491,6 +1491,7 @@ mod experimental_syscall_batching {
                     let rt = tokio::runtime::Handle::current();
                     let mut batch = Vec::with_capacity(BATCH_SIZE);
 
+                    // Try to receive up to BATCH_SIZE packets
                     while let Some(packet) = rt.block_on(rx.recv()) {
                         batch.push(packet);
                         // Drain available packets up to batch size
