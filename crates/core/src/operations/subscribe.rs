@@ -277,36 +277,32 @@ pub(crate) async fn request_subscribe(
     Ok(())
 }
 
+/// Complete a local subscription by notifying the client layer.
+///
+/// **Architecture Note (Issue #2075):**
+/// Local client subscriptions are deliberately kept separate from network subscriptions:
+/// - **Network subscriptions** are stored in `ring.seeding_manager.subscribers` and are used
+///   for peer-to-peer UPDATE propagation between nodes
+/// - **Local subscriptions** are managed by the contract executor via `update_notifications`
+///   channels, which deliver `UpdateNotification` directly to WebSocket clients
+///
+/// This separation eliminates the need for workarounds like the previous `allow_self` hack
+/// in `get_broadcast_targets_update()`, and ensures clean architectural boundaries between
+/// the network layer (ops/) and the client layer (client_events/).
 async fn complete_local_subscription(
     op_manager: &OpManager,
     id: Transaction,
     key: ContractKey,
 ) -> Result<(), OpError> {
-    let subscriber = op_manager.ring.connection_manager.own_location();
-    let subscriber_addr = subscriber
-        .socket_addr()
-        .expect("own location must have socket address");
-    // Local subscription - no upstream NAT address
-    if let Err(err) = op_manager
-        .ring
-        .add_subscriber(&key, subscriber.clone(), None)
-    {
-        tracing::warn!(
-            %key,
-            tx = %id,
-            subscriber = %subscriber_addr,
-            error = ?err,
-            "Failed to register local subscriber"
-        );
-    } else {
-        tracing::debug!(
-            %key,
-            tx = %id,
-            subscriber = %subscriber_addr,
-            "Registered local subscriber"
-        );
-    }
+    tracing::debug!(
+        %key,
+        tx = %id,
+        "Local subscription completed - client will receive updates via executor notification channel"
+    );
 
+    // Notify client layer that subscription is complete.
+    // The actual update delivery happens through the executor's update_notifications
+    // when contract state changes, not through network broadcast targets.
     op_manager
         .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
             tx: id,
