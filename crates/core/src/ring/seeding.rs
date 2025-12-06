@@ -1,8 +1,15 @@
-use super::{Location, PeerKeyLocation, Score};
+use super::seeding_cache::{AccessType, SeedingCache};
+use super::{Location, PeerKeyLocation};
 use crate::transport::ObservedAddr;
+use crate::util::time_source::InstantTimeSrc;
 use dashmap::{mapref::one::Ref as DmRef, DashMap};
 use freenet_stdlib::prelude::ContractKey;
+use parking_lot::RwLock;
 use tracing::{info, warn};
+
+/// Default seeding cache budget: 100MB
+/// This can be made configurable via node configuration in the future.
+const DEFAULT_SEEDING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
 
 pub(crate) struct SeedingManager {
     /// The container for subscriber is a vec instead of something like a hashset
@@ -11,8 +18,8 @@ pub(crate) struct SeedingManager {
     /// of subscribers more often than inserting, and anyways is a relatively short sequence
     /// then is more optimal to just use a vector for it's compact memory layout.
     subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
-    /// Contracts this peer is seeding.
-    seeding_contract: DashMap<ContractKey, Score>,
+    /// LRU cache of contracts this peer is seeding, with byte-budget awareness.
+    seeding_cache: RwLock<SeedingCache<InstantTimeSrc>>,
 }
 
 impl SeedingManager {
@@ -22,84 +29,64 @@ impl SeedingManager {
     /// All subscribers, including the upstream subscriber.
     const TOTAL_MAX_SUBSCRIPTIONS: usize = Self::MAX_SUBSCRIBERS + 1;
 
-    /// Max number of seeding contracts.
-    const MAX_SEEDING_CONTRACTS: usize = 100;
-
-    /// Min number of seeding contracts.
-    const MIN_SEEDING_CONTRACTS: usize = Self::MAX_SEEDING_CONTRACTS / 4;
-
     pub fn new() -> Self {
         Self {
             subscribers: DashMap::new(),
-            seeding_contract: DashMap::new(),
+            seeding_cache: RwLock::new(SeedingCache::new(
+                DEFAULT_SEEDING_BUDGET_BYTES,
+                InstantTimeSrc::new(),
+            )),
         }
     }
 
-    /// Return if a contract is within appropiate seeding distance.
-    pub fn should_seed(&self, key: &ContractKey, own_location: Location) -> bool {
-        const CACHING_DISTANCE: f64 = 0.05;
-        let caching_distance = super::Distance::new(CACHING_DISTANCE);
-        if self.seeding_contract.len() < Self::MIN_SEEDING_CONTRACTS {
-            return true;
-        }
-        let key_loc = Location::from(key);
-        if self.seeding_contract.len() < Self::MAX_SEEDING_CONTRACTS {
-            return own_location.distance(key_loc) <= caching_distance;
-        }
-
-        let contract_score = self.calculate_seed_score(key, own_location);
-        let r = self
-            .seeding_contract
-            .iter()
-            .min_by_key(|v| *v.value())
-            .unwrap();
-        let min_score = *r.value();
-        contract_score > min_score
-    }
-
-    /// Add a new subscription for this peer.
-    pub fn seed_contract(
+    /// Record an access to a contract (GET, PUT, or SUBSCRIBE).
+    ///
+    /// This adds the contract to the seeding cache if not present, or refreshes
+    /// its LRU position if already cached. Returns the list of evicted contracts
+    /// that need cleanup (unsubscription, state removal, etc.).
+    ///
+    /// The `size_bytes` should be the size of the contract state.
+    ///
+    /// # Eviction handling
+    ///
+    /// Currently, eviction only removes local subscriber tracking. Full subscription
+    /// tree pruning (sending Unsubscribed to upstream peers) requires tracking
+    /// upstream->downstream relationships per contract, which is planned for #2164.
+    pub fn record_contract_access(
         &self,
         key: ContractKey,
-        own_location: Location,
-    ) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
-        let seed_score = self.calculate_seed_score(&key, own_location);
-        let mut old_subscribers = vec![];
-        let mut contract_to_drop = None;
+        size_bytes: u64,
+        access_type: AccessType,
+    ) -> Vec<ContractKey> {
+        let evicted = self
+            .seeding_cache
+            .write()
+            .record_access(key, size_bytes, access_type);
 
-        // FIXME: reproduce this condition in tests
-        if self.seeding_contract.len() >= Self::MAX_SEEDING_CONTRACTS {
-            if let Some(dropped_contract) = self
-                .seeding_contract
-                .iter()
-                .min_by_key(|v| *v.value())
-                .map(|entry| *entry.key())
-            {
-                self.seeding_contract.remove(&dropped_contract);
-                if let Some((_, mut subscribers_of_contract)) =
-                    self.subscribers.remove(&dropped_contract)
-                {
-                    std::mem::swap(&mut subscribers_of_contract, &mut old_subscribers);
-                }
-                contract_to_drop = Some(dropped_contract);
-            }
+        // Clean up subscribers for evicted contracts
+        for evicted_key in &evicted {
+            self.subscribers.remove(evicted_key);
         }
 
-        self.seeding_contract.insert(key, seed_score);
-        (contract_to_drop, old_subscribers)
+        evicted
     }
 
-    fn calculate_seed_score(&self, key: &ContractKey, own_location: Location) -> Score {
-        let key_loc = Location::from(key);
-        let distance = key_loc.distance(own_location);
-        let score = 0.5 - distance.as_f64();
-        Score(score)
-    }
-
-    /// Whether this node already is seeding to this contract or not.
+    /// Whether this node is currently caching/seeding this contract.
     #[inline]
     pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
-        self.seeding_contract.contains_key(key)
+        self.seeding_cache.read().contains(key)
+    }
+
+    /// Remove a contract from the seeding cache (for future use in cleanup paths).
+    ///
+    /// Returns true if the contract was present and removed.
+    #[allow(dead_code)]
+    pub fn remove_seeded_contract(&self, key: &ContractKey) -> bool {
+        let removed = self.seeding_cache.write().remove(key).is_some();
+        if removed {
+            self.subscribers.remove(key);
+        }
+        removed
     }
 
     /// Will return an error in case the max number of subscribers has been added.
@@ -335,76 +322,79 @@ mod tests {
     }
 
     #[test]
-    fn test_should_seed_always_true_below_min() {
+    fn test_record_contract_access_adds_to_cache() {
+        use super::super::seeding_cache::AccessType;
+
         let seeding_manager = SeedingManager::new();
-        let own_location = Location::new(0.5);
+        let key = make_contract_key(1);
 
-        // With no contracts seeded, should always return true regardless of distance
-        assert!(seeding_manager.should_seed(&make_contract_key(1), own_location));
+        // Initially not seeding
+        assert!(!seeding_manager.is_seeding_contract(&key));
 
-        // Add contracts up to MIN_SEEDING_CONTRACTS - 1 (which is 24)
-        for i in 0..24 {
-            seeding_manager
-                .seeding_contract
-                .insert(make_contract_key(i), Score(0.1));
-        }
+        // Record access
+        let evicted = seeding_manager.record_contract_access(key, 1000, AccessType::Get);
 
-        // Should still be true because we're below MIN (25)
-        assert_eq!(seeding_manager.seeding_contract.len(), 24);
-        assert!(seeding_manager.should_seed(&make_contract_key(200), own_location));
+        // Now seeding
+        assert!(seeding_manager.is_seeding_contract(&key));
+        assert!(evicted.is_empty()); // No eviction needed for small contract
     }
 
     #[test]
-    fn test_should_seed_distance_check_between_min_and_max() {
+    fn test_record_contract_access_evicts_when_over_budget() {
+        use super::super::seeding_cache::AccessType;
+
         let seeding_manager = SeedingManager::new();
 
-        // Seed MIN_SEEDING_CONTRACTS (25) contracts
-        for i in 0..25 {
-            seeding_manager
-                .seeding_contract
-                .insert(make_contract_key(i), Score(0.1));
-        }
-        assert_eq!(seeding_manager.seeding_contract.len(), 25);
+        // Add a contract that takes up most of the budget (100MB default)
+        let large_key = make_contract_key(1);
+        let evicted = seeding_manager.record_contract_access(
+            large_key,
+            90 * 1024 * 1024, // 90MB
+            AccessType::Get,
+        );
+        assert!(evicted.is_empty());
+        assert!(seeding_manager.is_seeding_contract(&large_key));
 
-        // Now distance check applies - we need a contract location close to own_location
-        // Location::from(contract_key) gives a deterministic location based on key hash
-        let test_key = make_contract_key(100);
-        let key_location = Location::from(&test_key);
+        // Add another large contract that should cause eviction
+        let another_large_key = make_contract_key(2);
+        let evicted = seeding_manager.record_contract_access(
+            another_large_key,
+            20 * 1024 * 1024, // 20MB - total would be 110MB, over 100MB budget
+            AccessType::Put,
+        );
 
-        // Own location very close to the key location should return true
-        let close_location = Location::new(key_location.as_f64());
-        assert!(seeding_manager.should_seed(&test_key, close_location));
-
-        // Own location far from the key location should return false
-        // Adding 0.5 to wrap around (locations are on a ring 0.0-1.0)
-        let far_away = (key_location.as_f64() + 0.5).rem_euclid(1.0);
-        let far_location = Location::new(far_away);
-        assert!(!seeding_manager.should_seed(&test_key, far_location));
+        // The first contract should have been evicted
+        assert!(!evicted.is_empty());
+        assert!(evicted.contains(&large_key));
+        assert!(!seeding_manager.is_seeding_contract(&large_key));
+        assert!(seeding_manager.is_seeding_contract(&another_large_key));
     }
 
     #[test]
-    fn test_seed_contract_no_drop_below_max() {
+    fn test_eviction_clears_subscribers() {
+        use super::super::seeding_cache::AccessType;
+
         let seeding_manager = SeedingManager::new();
-        let own_location = Location::new(0.5);
 
-        // Add less than MAX contracts
-        for i in 0..50 {
-            seeding_manager
-                .seeding_contract
-                .insert(make_contract_key(i), Score(0.1));
-        }
+        // Add a contract and a subscriber
+        let key = make_contract_key(1);
+        seeding_manager.record_contract_access(key, 90 * 1024 * 1024, AccessType::Get);
 
-        let new_key = make_contract_key(200);
-        let (dropped_contract, old_subscribers) =
-            seeding_manager.seed_contract(new_key, own_location);
+        let peer = PeerKeyLocation::new(
+            TransportKeypair::new().public().clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000),
+        );
+        seeding_manager.add_subscriber(&key, peer, None).unwrap();
+        assert!(seeding_manager.subscribers_of(&key).is_some());
 
-        // No contract should be dropped when below max
-        assert!(dropped_contract.is_none());
-        assert!(old_subscribers.is_empty());
+        // Force eviction with another large contract
+        let new_key = make_contract_key(2);
+        let evicted =
+            seeding_manager.record_contract_access(new_key, 20 * 1024 * 1024, AccessType::Get);
 
-        // New contract should be added
-        assert!(seeding_manager.is_seeding_contract(&new_key));
-        assert_eq!(seeding_manager.seeding_contract.len(), 51);
+        // Original contract should be evicted and subscribers cleared
+        assert!(evicted.contains(&key));
+        assert!(seeding_manager.subscribers_of(&key).is_none());
     }
 
     #[test]
@@ -563,12 +553,14 @@ mod tests {
 
     #[test]
     fn test_is_seeding_contract() {
+        use super::super::seeding_cache::AccessType;
+
         let seeding_manager = SeedingManager::new();
         let key = make_contract_key(1);
 
         assert!(!seeding_manager.is_seeding_contract(&key));
 
-        seeding_manager.seeding_contract.insert(key, Score(0.1));
+        seeding_manager.record_contract_access(key, 1000, AccessType::Get);
 
         assert!(seeding_manager.is_seeding_contract(&key));
     }

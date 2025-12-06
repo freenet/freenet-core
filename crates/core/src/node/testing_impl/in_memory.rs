@@ -104,6 +104,7 @@ where
         use crate::contract::ContractHandlerEvent;
         for (contract, state, subscription) in contracts {
             let key: ContractKey = contract.key();
+            let state_size = state.size() as u64;
             self.op_manager
                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
                     key,
@@ -122,7 +123,7 @@ where
                     .unwrap()
             );
             if subscription {
-                self.op_manager.ring.seed_contract(key);
+                self.op_manager.ring.seed_contract(key, state_size);
             }
             if let Some(subscribers) = contract_subscribers.get(&key) {
                 // add contract subscribers (test setup - no upstream_addr)
