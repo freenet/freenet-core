@@ -897,8 +897,7 @@ impl Operation for PutOp {
                         }
 
                         // Start subscription and record cache access
-                        let child_tx =
-                            super::start_subscription_request_internal(op_manager, *id, key, false);
+                        let child_tx = super::start_subscription_request(op_manager, *id, key);
                         tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                         let _evicted = op_manager.ring.seed_contract(key, new_value.size() as u64);
                         super::announce_contract_cached(op_manager, &key).await;
