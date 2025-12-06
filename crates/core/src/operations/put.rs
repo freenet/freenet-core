@@ -264,6 +264,7 @@ impl Operation for PutOp {
                         // Mark as seeded locally if not already
                         if !is_already_seeding {
                             op_manager.ring.seed_contract(key, value.size() as u64);
+                            super::announce_contract_cached(op_manager, &key).await;
                             tracing::debug!(
                                 tx = %id,
                                 %key,
@@ -475,6 +476,7 @@ impl Operation for PutOp {
                             super::start_subscription_request_internal(op_manager, *id, key, false);
                         tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                         op_manager.ring.seed_contract(key, value.size() as u64);
+                        super::announce_contract_cached(op_manager, &key).await;
 
                         true
                     } else {
@@ -722,6 +724,7 @@ impl Operation for PutOp {
                                     "Adding contract to local seed list"
                                 );
                                 op_manager.ring.seed_contract(key, state.size() as u64);
+                                super::announce_contract_cached(op_manager, &key).await;
                             } else {
                                 tracing::debug!(
                                     tx = %id,
@@ -900,6 +903,7 @@ impl Operation for PutOp {
                             super::start_subscription_request_internal(op_manager, *id, key, false);
                         tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                         let _evicted = op_manager.ring.seed_contract(key, new_value.size() as u64);
+                        super::announce_contract_cached(op_manager, &key).await;
                         // Note: Evicted contracts are handled by SeedingManager (subscribers cleaned up internally)
                     } else if last_hop && !already_put {
                         // Last hop but not handling locally, still need to put
@@ -1249,6 +1253,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, mut put_op: PutOp) -> Re
         op_manager
             .ring
             .seed_contract(key, updated_value.size() as u64);
+        super::announce_contract_cached(op_manager, &key).await;
 
         // Determine which peers need to be notified and broadcast the update
         let broadcast_to = op_manager.get_broadcast_targets(&key, &own_location);

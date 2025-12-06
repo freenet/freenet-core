@@ -32,7 +32,10 @@ use crate::{
     ring::{ConnectionManager, LiveTransactionTracker, PeerKeyLocation, Ring},
 };
 
-use super::{network_bridge::EventLoopNotificationsSender, NetEventRegister, NodeConfig};
+use super::{
+    network_bridge::EventLoopNotificationsSender, proximity_cache::ProximityCacheManager,
+    NetEventRegister, NodeConfig,
+};
 
 #[cfg(debug_assertions)]
 macro_rules! check_id_op {
@@ -213,6 +216,8 @@ pub(crate) struct OpManager {
     pub is_gateway: bool,
     /// Sub-operation tracking for atomic operation execution
     sub_op_tracker: SubOperationTracker,
+    /// Proximity cache manager for tracking neighbor contract caches
+    pub proximity_cache: Arc<ProximityCacheManager>,
 }
 
 impl Clone for OpManager {
@@ -228,6 +233,7 @@ impl Clone for OpManager {
             peer_ready: self.peer_ready.clone(),
             is_gateway: self.is_gateway,
             sub_op_tracker: self.sub_op_tracker.clone(),
+            proximity_cache: self.proximity_cache.clone(),
         }
     }
 }
@@ -284,6 +290,8 @@ impl OpManager {
             tracing::debug!("Regular peer node: peer_ready will be set after first handshake");
         }
 
+        let proximity_cache = Arc::new(ProximityCacheManager::new());
+
         Ok(Self {
             ring,
             ops,
@@ -295,6 +303,7 @@ impl OpManager {
             peer_ready,
             is_gateway,
             sub_op_tracker,
+            proximity_cache,
         })
     }
 
