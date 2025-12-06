@@ -37,10 +37,8 @@ mod connection;
 mod live_tx;
 mod location;
 mod peer_key_location;
-mod score;
 mod seeding;
-
-use self::score::Score;
+mod seeding_cache;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
@@ -182,36 +180,45 @@ impl Ring {
         }
     }
 
-    /// Return if a contract is within appropiate seeding distance.
-    pub fn should_seed(&self, key: &ContractKey) -> bool {
-        match self.connection_manager.own_location().location() {
-            Some(own_loc) => self.seeding_manager.should_seed(key, own_loc),
-            None => {
-                tracing::debug!(
-                    "should_seed: own location not yet available; deferring seeding decision"
-                );
-                false
-            }
-        }
+    /// Record an access to a contract (GET, PUT, or SUBSCRIBE).
+    ///
+    /// This adds the contract to the seeding cache if not present, or refreshes
+    /// its LRU position if already cached. Returns the list of evicted contracts
+    /// that need cleanup (unsubscription, state removal, etc.).
+    ///
+    /// The `size_bytes` should be the size of the contract state.
+    pub fn seed_contract(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
+        use seeding_cache::AccessType;
+        self.seeding_manager
+            .record_contract_access(key, size_bytes, AccessType::Put)
     }
 
-    /// Add a new subscription for this peer.
-    pub fn seed_contract(&self, key: ContractKey) -> (Option<ContractKey>, Vec<PeerKeyLocation>) {
-        match self.connection_manager.own_location().location() {
-            Some(own_loc) => self.seeding_manager.seed_contract(key, own_loc),
-            None => {
-                tracing::debug!(
-                    "seed_contract: own location not yet available; skipping seeding for now"
-                );
-                (None, Vec::new())
-            }
-        }
+    /// Record a GET access to a contract.
+    pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
+        use seeding_cache::AccessType;
+        self.seeding_manager
+            .record_contract_access(key, size_bytes, AccessType::Get)
+    }
+
+    /// Record a subscribe access for a contract (for future use when subscribe
+    /// operations directly record access rather than delegating to GET).
+    #[allow(dead_code)]
+    pub fn record_subscribe_access(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
+        use seeding_cache::AccessType;
+        self.seeding_manager
+            .record_contract_access(key, size_bytes, AccessType::Subscribe)
     }
 
     /// Whether this node already is seeding to this contract or not.
     #[inline]
     pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
         self.seeding_manager.is_seeding_contract(key)
+    }
+
+    /// Remove a contract from the seeding cache (for future use in cleanup paths).
+    #[allow(dead_code)]
+    pub fn remove_seeded_contract(&self, key: &ContractKey) -> bool {
+        self.seeding_manager.remove_seeded_contract(key)
     }
 
     pub fn record_request(
