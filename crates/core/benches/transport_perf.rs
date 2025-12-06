@@ -1164,8 +1164,7 @@ mod experimental_tokio_overhead {
                 let handles: Vec<_> = (0..num_peers)
                     .map(|_| {
                         tokio::spawn(async move {
-                            let socket =
-                                tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
                             let addr = socket.local_addr().unwrap();
                             socket.connect(addr).await.unwrap();
                             let buf = vec![0xABu8; packet_size];
@@ -1258,8 +1257,7 @@ mod experimental_combined {
                     b.to_async(&rt).iter_batched(
                         || {
                             // Setup: create channel and socket
-                            let (tx, rx) =
-                                tokio::sync::mpsc::channel::<Arc<[u8]>>(100);
+                            let (tx, rx) = tokio::sync::mpsc::channel::<Arc<[u8]>>(100);
 
                             let socket_future = async {
                                 let socket =
@@ -1269,8 +1267,7 @@ mod experimental_combined {
                                 Arc::new(socket)
                             };
 
-                            let socket = tokio::runtime::Handle::current()
-                                .block_on(socket_future);
+                            let socket = tokio::runtime::Handle::current().block_on(socket_future);
 
                             (tx, rx, socket, cipher.clone())
                         },
@@ -1557,41 +1554,33 @@ mod experimental_syscall_batching {
             });
             let socket = Arc::new(socket);
 
-            group.bench_with_input(
-                BenchmarkId::new("async", count),
-                &count,
-                |b, &n| {
+            group.bench_with_input(BenchmarkId::new("async", count), &count, |b, &n| {
+                let socket = socket.clone();
+                let buf = vec![0xABu8; PACKET_SIZE];
+                b.to_async(&rt).iter(move || {
                     let socket = socket.clone();
-                    let buf = vec![0xABu8; PACKET_SIZE];
-                    b.to_async(&rt).iter(move || {
-                        let socket = socket.clone();
-                        let buf = buf.clone();
-                        async move {
-                            for _ in 0..n {
-                                socket.send(&buf).await.unwrap();
-                            }
+                    let buf = buf.clone();
+                    async move {
+                        for _ in 0..n {
+                            socket.send(&buf).await.unwrap();
                         }
-                    });
-                },
-            );
+                    }
+                });
+            });
 
             // Blocking
             let std_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
             let addr = std_socket.local_addr().unwrap();
             std_socket.connect(addr).unwrap();
 
-            group.bench_with_input(
-                BenchmarkId::new("blocking", count),
-                &count,
-                |b, &n| {
-                    let buf = vec![0xABu8; PACKET_SIZE];
-                    b.iter(|| {
-                        for _ in 0..n {
-                            std_socket.send(&buf).unwrap();
-                        }
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("blocking", count), &count, |b, &n| {
+                let buf = vec![0xABu8; PACKET_SIZE];
+                b.iter(|| {
+                    for _ in 0..n {
+                        std_socket.send(&buf).unwrap();
+                    }
+                });
+            });
         }
 
         group.finish();
@@ -1659,9 +1648,8 @@ mod experimental_true_sendmmsg {
             let fd = socket.as_raw_fd();
 
             // Pre-allocate packet buffers
-            let packets: Vec<Vec<u8>> = (0..batch_size)
-                .map(|_| vec![0xABu8; PACKET_SIZE])
-                .collect();
+            let packets: Vec<Vec<u8>> =
+                (0..batch_size).map(|_| vec![0xABu8; PACKET_SIZE]).collect();
 
             // ========== Baseline: N individual send() syscalls ==========
             group.bench_with_input(
@@ -1710,8 +1698,10 @@ mod experimental_true_sendmmsg {
                             .iter_mut()
                             .map(|iov| {
                                 let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                                msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
-                                msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                msg.msg_hdr.msg_name =
+                                    &sockaddr_in as *const _ as *mut libc::c_void;
+                                msg.msg_hdr.msg_namelen =
+                                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
                                 msg.msg_hdr.msg_iov = iov.as_mut_ptr();
                                 msg.msg_hdr.msg_iovlen = 1;
                                 msg
@@ -1770,9 +1760,8 @@ mod experimental_true_sendmmsg {
             let syscalls = num_batches;
 
             // Pre-allocate packets for one batch
-            let packets: Vec<Vec<u8>> = (0..batch_size)
-                .map(|_| vec![0xABu8; PACKET_SIZE])
-                .collect();
+            let packets: Vec<Vec<u8>> =
+                (0..batch_size).map(|_| vec![0xABu8; PACKET_SIZE]).collect();
 
             let mut iovecs: Vec<[libc::iovec; 1]> = packets
                 .iter()
@@ -1785,7 +1774,10 @@ mod experimental_true_sendmmsg {
                 .collect();
 
             group.bench_with_input(
-                BenchmarkId::new(format!("batch_{}_syscalls_{}", batch_size, syscalls), batch_size),
+                BenchmarkId::new(
+                    format!("batch_{}_syscalls_{}", batch_size, syscalls),
+                    batch_size,
+                ),
                 &batch_size,
                 |b, &_n| {
                     b.iter(|| {
@@ -1794,8 +1786,10 @@ mod experimental_true_sendmmsg {
                                 .iter_mut()
                                 .map(|iov| {
                                     let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                                    msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
-                                    msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                    msg.msg_hdr.msg_name =
+                                        &sockaddr_in as *const _ as *mut libc::c_void;
+                                    msg.msg_hdr.msg_namelen =
+                                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
                                     msg.msg_hdr.msg_iov = iov.as_mut_ptr();
                                     msg.msg_hdr.msg_iovlen = 1;
                                     msg
@@ -1877,9 +1871,8 @@ mod experimental_true_sendmmsg {
                     };
 
                     // Pre-allocate batch
-                    let packets: Vec<Vec<u8>> = (0..BATCH_SIZE)
-                        .map(|_| vec![0xABu8; PACKET_SIZE])
-                        .collect();
+                    let packets: Vec<Vec<u8>> =
+                        (0..BATCH_SIZE).map(|_| vec![0xABu8; PACKET_SIZE]).collect();
 
                     let mut iovecs: Vec<[libc::iovec; 1]> = packets
                         .iter()
@@ -1897,8 +1890,10 @@ mod experimental_true_sendmmsg {
                             .iter_mut()
                             .map(|iov| {
                                 let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                                msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
-                                msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                msg.msg_hdr.msg_name =
+                                    &sockaddr_in as *const _ as *mut libc::c_void;
+                                msg.msg_hdr.msg_namelen =
+                                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
                                 msg.msg_hdr.msg_iov = iov.as_mut_ptr();
                                 msg.msg_hdr.msg_iovlen = 1;
                                 msg
@@ -1952,12 +1947,7 @@ mod experimental_size_batch_interaction {
         fd: i32,
         messages: &mut [libc::mmsghdr],
     ) -> Result<usize, std::io::Error> {
-        let ret = libc::sendmmsg(
-            fd,
-            messages.as_mut_ptr(),
-            messages.len() as libc::c_uint,
-            0,
-        );
+        let ret = libc::sendmmsg(fd, messages.as_mut_ptr(), messages.len() as libc::c_uint, 0);
         if ret < 0 {
             Err(std::io::Error::last_os_error())
         } else {
@@ -2018,7 +2008,7 @@ mod experimental_size_batch_interaction {
                 group.bench_function(
                     BenchmarkId::new(
                         format!("size_{}_batch_{}", packet_size, batch_size),
-                        total_bytes
+                        total_bytes,
                     ),
                     |b| {
                         // Pre-allocate iovecs and message headers
@@ -2048,8 +2038,10 @@ mod experimental_size_batch_interaction {
                                 .iter_mut()
                                 .map(|iov| {
                                     let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                                    msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
-                                    msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                    msg.msg_hdr.msg_name =
+                                        &sockaddr_in as *const _ as *mut libc::c_void;
+                                    msg.msg_hdr.msg_namelen =
+                                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
                                     msg.msg_hdr.msg_iov = iov as *mut libc::iovec;
                                     msg.msg_hdr.msg_iovlen = 1;
                                     msg
@@ -2132,8 +2124,10 @@ mod experimental_size_batch_interaction {
                             .iter_mut()
                             .map(|iov| {
                                 let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                                msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
-                                msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                                msg.msg_hdr.msg_name =
+                                    &sockaddr_in as *const _ as *mut libc::c_void;
+                                msg.msg_hdr.msg_namelen =
+                                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
                                 msg.msg_hdr.msg_iov = iov as *mut libc::iovec;
                                 msg.msg_hdr.msg_iovlen = 1;
                                 msg
@@ -2175,46 +2169,44 @@ mod experimental_size_batch_interaction {
             let total_bytes = (packet_size * batch_size) as u64;
 
             group.throughput(Throughput::Bytes(total_bytes));
-            group.bench_function(
-                BenchmarkId::new("max_throughput", packet_size),
-                |b| {
-                    let mut iovecs: Vec<libc::iovec> = (0..batch_size)
-                        .map(|_| libc::iovec {
-                            iov_base: data.as_ptr() as *mut libc::c_void,
-                            iov_len: data.len(),
+            group.bench_function(BenchmarkId::new("max_throughput", packet_size), |b| {
+                let mut iovecs: Vec<libc::iovec> = (0..batch_size)
+                    .map(|_| libc::iovec {
+                        iov_base: data.as_ptr() as *mut libc::c_void,
+                        iov_len: data.len(),
+                    })
+                    .collect();
+
+                let addr_v4 = match target_addr {
+                    SocketAddr::V4(a) => a,
+                    _ => panic!("Expected IPv4"),
+                };
+                let sockaddr_in = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: addr_v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(addr_v4.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+
+                b.iter(|| {
+                    let mut msgs: Vec<libc::mmsghdr> = iovecs
+                        .iter_mut()
+                        .map(|iov| {
+                            let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                            msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
+                            msg.msg_hdr.msg_namelen =
+                                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                            msg.msg_hdr.msg_iov = iov as *mut libc::iovec;
+                            msg.msg_hdr.msg_iovlen = 1;
+                            msg
                         })
                         .collect();
 
-                    let addr_v4 = match target_addr {
-                        SocketAddr::V4(a) => a,
-                        _ => panic!("Expected IPv4"),
-                    };
-                    let sockaddr_in = libc::sockaddr_in {
-                        sin_family: libc::AF_INET as libc::sa_family_t,
-                        sin_port: addr_v4.port().to_be(),
-                        sin_addr: libc::in_addr {
-                            s_addr: u32::from_ne_bytes(addr_v4.ip().octets()),
-                        },
-                        sin_zero: [0; 8],
-                    };
-
-                    b.iter(|| {
-                        let mut msgs: Vec<libc::mmsghdr> = iovecs
-                            .iter_mut()
-                            .map(|iov| {
-                                let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                                msg.msg_hdr.msg_name = &sockaddr_in as *const _ as *mut libc::c_void;
-                                msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-                                msg.msg_hdr.msg_iov = iov as *mut libc::iovec;
-                                msg.msg_hdr.msg_iovlen = 1;
-                                msg
-                            })
-                            .collect();
-
-                        unsafe { sendmmsg_batch(fd, &mut msgs) }.unwrap()
-                    });
-                },
-            );
+                    unsafe { sendmmsg_batch(fd, &mut msgs) }.unwrap()
+                });
+            });
         }
 
         group.finish();
@@ -2370,4 +2362,15 @@ criterion_group!(
         experimental_size_batch_interaction::bench_throughput_ceiling,
 );
 
-criterion_main!(level0, level1, level2, level3, experimental_packet, experimental_tokio, experimental_combined, experimental_batching, experimental_true_syscall, experimental_size_batch);
+criterion_main!(
+    level0,
+    level1,
+    level2,
+    level3,
+    experimental_packet,
+    experimental_tokio,
+    experimental_combined,
+    experimental_batching,
+    experimental_true_syscall,
+    experimental_size_batch
+);

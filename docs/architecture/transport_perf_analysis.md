@@ -554,7 +554,7 @@ criterion_main!(benches);
 
 ---
 
-## 11. Experimental Benchmark Results (December 2024)
+## 11. Experimental Benchmark Results (December 2025)
 
 ### 11.1 Hypothesis 1: Packet Size Effect on Throughput
 
@@ -768,7 +768,7 @@ cargo bench --bench transport_perf -- experimental_throughput_ceiling
 
 ---
 
-*Analysis performed: December 2024*
-*Experimental benchmarks added: December 2024*
-*Size×batch interaction analysis: December 2024*
+*Analysis performed: December 2025*
+*Experimental benchmarks added: December 2025*
+*Size×batch interaction analysis: December 2025*
 *Codebase version: commit c50d888*
