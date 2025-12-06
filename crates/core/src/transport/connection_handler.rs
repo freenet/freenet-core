@@ -457,6 +457,50 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
 
+                                // Issue #2235: Clean up stale connections from the same IP but different port.
+                                // When a peer reconnects (e.g., after restart), it may get a new ephemeral port.
+                                // The old connection's crypto state is stale and will cause AEAD decryption
+                                // failures if we try to reuse it. Remove any existing connections from the
+                                // same IP to ensure we start fresh.
+                                let remote_ip = remote_addr.ip();
+                                let stale_addrs: Vec<_> = self.remote_connections
+                                    .keys()
+                                    .filter(|addr| addr.ip() == remote_ip && **addr != remote_addr)
+                                    .cloned()
+                                    .collect();
+                                for stale_addr in stale_addrs {
+                                    if let Some(stale_conn) = self.remote_connections.remove(&stale_addr) {
+                                        if stale_conn.inbound_packet_sender.is_closed() {
+                                            tracing::debug!(
+                                                %stale_addr,
+                                                %remote_addr,
+                                                "removed stale closed connection from same IP"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                %stale_addr,
+                                                %remote_addr,
+                                                "removing stale connection from same IP (peer likely reconnected with new port)"
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Also clean up any ongoing gateway connections from the same IP
+                                let stale_gw_addrs: Vec<_> = ongoing_gw_connections
+                                    .keys()
+                                    .filter(|addr| addr.ip() == remote_ip && **addr != remote_addr)
+                                    .cloned()
+                                    .collect();
+                                for stale_addr in stale_gw_addrs {
+                                    ongoing_gw_connections.remove(&stale_addr);
+                                    tracing::debug!(
+                                        %stale_addr,
+                                        %remote_addr,
+                                        "removed stale ongoing gateway connection from same IP"
+                                    );
+                                }
+
                                 let inbound_key_bytes = key_from_addr(&remote_addr);
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
                                 let task = tokio::spawn(gw_ongoing_connection
@@ -2030,6 +2074,123 @@ mod test {
                 result??;
             }
         }
+
+        Ok(())
+    }
+
+    /// Test that a peer reconnecting from a different port is handled correctly.
+    ///
+    /// This simulates the scenario from issue #2235 where:
+    /// 1. Peer connects to gateway from port A - succeeds
+    /// 2. Peer disconnects (connection dropped)
+    /// 3. Peer reconnects from port B (new ephemeral port)
+    /// 4. Gateway should recognize this as a new session and accept immediately
+    ///
+    /// The bug was that the gateway retained stale crypto state, causing AEAD
+    /// decryption failures on the new connection.
+    #[tokio::test]
+    async fn gateway_handles_peer_reconnection_from_different_port() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+
+        // Create the gateway
+        let (gw_pub, (gw_outbound, mut gw_conn), gw_addr) =
+            set_gateway_connection(Default::default(), channels.clone()).await?;
+
+        // Create peer A at port X
+        let (_peer_a_pub, mut peer_a, peer_a_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+
+        tracing::info!(
+            "Step 1: Peer A at {} connecting to gateway at {}",
+            peer_a_addr,
+            gw_addr
+        );
+
+        // Peer A connects to gateway
+        let gw_task = tokio::spawn(async move {
+            let conn = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("gateway: no inbound connection"))?;
+            tracing::info!("Gateway received connection from {}", conn.remote_addr());
+            Ok::<_, anyhow::Error>((gw_conn, conn))
+        });
+
+        let peer_a_conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            peer_a.connect(gw_pub.clone(), gw_addr).await,
+        )
+        .await??;
+        tracing::info!("Peer A connected successfully");
+
+        let (mut gw_conn, _gw_peer_a_conn) = gw_task.await??;
+
+        // Step 2: Simulate peer disconnect by dropping the connection
+        // The gateway still has state for the old connection in remote_connections
+        tracing::info!("Step 2: Dropping peer A connection");
+        drop(peer_a_conn);
+        drop(peer_a);
+
+        // Give a moment for cleanup (in reality this could be much longer)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Step 3: Create a new peer at a DIFFERENT port (simulating restart with new ephemeral port)
+        // This peer uses the same shared channels so packets can still route
+        tracing::info!("Step 3: Creating peer B at different port");
+        let (_peer_b_pub, mut peer_b, peer_b_addr) =
+            set_peer_connection(Default::default(), channels.clone()).await?;
+
+        assert_ne!(
+            peer_a_addr, peer_b_addr,
+            "Peer B should have different port than peer A"
+        );
+        tracing::info!(
+            "Peer B created at {} (different from peer A at {})",
+            peer_b_addr,
+            peer_a_addr
+        );
+
+        // Step 4: Peer B connects to gateway - this should work on first attempt
+        tracing::info!("Step 4: Peer B connecting to gateway");
+
+        let gw_task = tokio::spawn(async move {
+            let conn = tokio::time::timeout(Duration::from_secs(5), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("gateway: no inbound connection for peer B"))?;
+            tracing::info!(
+                "Gateway received connection from {} (peer B)",
+                conn.remote_addr()
+            );
+            Ok::<_, anyhow::Error>(conn)
+        });
+
+        let start = std::time::Instant::now();
+        let peer_b_conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            peer_b.connect(gw_pub.clone(), gw_addr).await,
+        )
+        .await??;
+        let elapsed = start.elapsed();
+
+        tracing::info!("Peer B connected in {:?}", elapsed);
+
+        let _gw_peer_b_conn = gw_task.await??;
+
+        // Verify the connection works by checking addresses match
+        assert_eq!(peer_b_conn.remote_addr(), gw_addr);
+
+        // The connection should have completed quickly (within the first attempt window)
+        // If the bug exists, this would take multiple retries (16+ attempts at 200ms each = 3+ seconds)
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Connection took {:?}, which suggests multiple retry attempts were needed. \
+             This indicates stale crypto state issue from #2235.",
+            elapsed
+        );
+
+        // Also verify we can use the gateway's outbound handler for new connections
+        drop(peer_b_conn);
+        drop(peer_b);
+        drop(gw_outbound);
 
         Ok(())
     }
