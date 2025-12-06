@@ -552,5 +552,223 @@ criterion_main!(benches);
 
 ---
 
-*Analysis performed: December 2024*
+---
+
+## 11. Experimental Benchmark Results (December 2025)
+
+### 11.1 Hypothesis 1: Packet Size Effect on Throughput
+
+**Question**: Does larger packet size improve throughput when syscall count is held constant?
+
+**Methodology**: Send 1000 packets of varying sizes over loopback UDP, measure total throughput.
+
+**Results**:
+
+| Packet Size | Time | Throughput | Syscall Overhead % |
+|-------------|------|------------|-------------------|
+| 512 bytes   | 10.4 ms | **47 MiB/s** | ~98.3% |
+| 1024 bytes  | 10.6 ms | **92 MiB/s** | ~97.0% |
+| 1400 bytes  | 10.3 ms | **130 MiB/s** | ~95.3% |
+| 2048 bytes  | 10.2 ms | **191 MiB/s** | ~93.6% |
+| 4096 bytes  | 10.5 ms | **372 MiB/s** | ~87.6% |
+| 8192 bytes  | 10.9 ms | **720 MiB/s** | ~75.8% |
+
+**Conclusion**: Time per batch is nearly constant (~10.3ms) regardless of packet size. Throughput scales linearly with packet size. **Syscall overhead dominates at small packet sizes**.
+
+- 16x larger packets → 15.3x higher throughput
+- Current 1400-byte packets waste ~95% of transfer time on syscall overhead
+- Jumbo frames (9000+ bytes) or packet coalescing (sendmmsg) would dramatically improve throughput
+
+### 11.2 Hypothesis 2: Tokio Async Overhead
+
+**Question**: How much overhead does tokio add compared to blocking I/O?
+
+#### 11.2.1 Channel Comparison (10,000 packets)
+
+| Channel Type | Time | Throughput | Relative |
+|--------------|------|------------|----------|
+| crossbeam::channel::unbounded | **1.00 ms** | **9.98 Melem/s** | 1.00x |
+| std::sync::mpsc (unbounded) | 1.05 ms | 9.54 Melem/s | 0.96x |
+| std::sync::sync_channel(100) | 2.43 ms | 4.12 Melem/s | 0.41x |
+| crossbeam::channel::bounded(100) | 3.05 ms | 3.27 Melem/s | 0.33x |
+| **tokio::sync::mpsc(100)** | **4.46 ms** | **2.24 Melem/s** | **0.22x** |
+
+**Conclusion**: tokio::sync::mpsc is **4.4x slower** than crossbeam unbounded channels. For transport layer hot paths, replacing tokio channels with crossbeam could provide significant speedup.
+
+#### 11.2.2 Socket Overhead (1000 packets × 1400 bytes)
+
+| Socket Type | Time | Throughput | Relative |
+|-------------|------|------------|----------|
+| std::net::UdpSocket (blocking) | **8.38 ms** | **119 Kelem/s** | 1.00x |
+| tokio::net::UdpSocket (single-thread) | 8.46 ms | 118 Kelem/s | 0.99x |
+| tokio::net::UdpSocket (multi-thread) | 11.67 ms | 86 Kelem/s | 0.72x |
+
+**Conclusion**:
+- Tokio single-threaded runtime has **negligible overhead** vs blocking
+- Tokio multi-threaded runtime adds **~39% overhead** due to work-stealing scheduler
+
+#### 11.2.3 Threading Model Comparison (4 peers × 1000 packets)
+
+| Threading Model | Time | Throughput | Relative |
+|-----------------|------|------------|----------|
+| Thread-per-peer (std::thread) | 27.4 ms | 146 Kelem/s | 0.91x |
+| Tokio work-stealing | 27.5 ms | 145 Kelem/s | 0.91x |
+| **Tokio spawn_blocking** | **25.0 ms** | **160 Kelem/s** | **1.00x** |
+
+**Conclusion**: `tokio::task::spawn_blocking` is **~10% faster** than both pure threading and async tokio for I/O-bound work. Combines best of tokio task management with blocking syscalls.
+
+### 11.3 Recommendations Based on Experiments
+
+1. **Packet Coalescing (High Priority)**
+   - Implement `sendmmsg`/`recvmmsg` to batch multiple packets per syscall
+   - Potential: 5-10x throughput improvement based on packet size scaling
+
+2. **Replace tokio::sync::mpsc in Hot Paths (Medium Priority)**
+   - Switch to `crossbeam::channel` for internal packet routing
+   - Potential: 4.4x channel throughput improvement
+
+3. **Consider Hybrid Threading Model (Low Priority)**
+   - Use `spawn_blocking` for UDP I/O tasks
+   - Keep async for connection management and higher-level logic
+
+4. **Single-Thread Transport Option (Future)**
+   - For latency-sensitive deployments, single-threaded runtime eliminates scheduler overhead
+
+### 11.4 Running the Benchmarks
+
+```bash
+# Run packet size experiments
+./scripts/run_benchmarks.sh experimental_packet
+
+# Run Tokio overhead experiments
+./scripts/run_benchmarks.sh experimental_tokio
+
+# Run full pipeline experiments
+./scripts/run_benchmarks.sh experimental_combined
+```
+
+---
+
+## 12. Packet Size × Batch Size Interaction Analysis
+
+This section analyzes the **multiplicative effect** of combining larger packet sizes with syscall batching (sendmmsg). The key question: Are these optimizations independent, or do they have diminishing returns when combined?
+
+### 12.1 Experimental Design
+
+**Matrix tested:**
+- Packet sizes: 512, 1400, 4096, 8192 bytes
+- Batch sizes: 1, 10, 50, 100, 500 packets
+
+**Hypothesis:**
+- For small packets: syscall overhead dominates → batching helps significantly
+- For large packets: data transfer time dominates → batching helps less (relatively)
+
+### 12.2 Results: Size × Batch Matrix
+
+#### 12.2.1 Throughput by Packet Size and Batch Size
+
+| Packet Size | Batch 1 | Batch 10 | Batch 50 | Batch 100 | Batch 500 |
+|-------------|---------|----------|----------|-----------|-----------|
+| 512 bytes   | 47 MiB/s | 59 MiB/s | 81 MiB/s | 88 MiB/s | 92 MiB/s |
+| 1400 bytes  | 135 MiB/s | 163 MiB/s | 221 MiB/s | 235 MiB/s | 245 MiB/s |
+| 4096 bytes  | 369 MiB/s | 464 MiB/s | 640 MiB/s | 677 MiB/s | 716 MiB/s |
+| 8192 bytes  | 718 MiB/s | 926 MiB/s | 1.20 GiB/s | 1.30 GiB/s | 1.39 GiB/s |
+
+#### 12.2.2 Time per Syscall (batch=1) - Confirms Constant Overhead
+
+| Packet Size | Time per send() | Throughput |
+|-------------|-----------------|------------|
+| 512 bytes   | 10.3 µs | 47 MiB/s |
+| 1400 bytes  | 9.9 µs | 135 MiB/s |
+| 4096 bytes  | 10.5 µs | 369 MiB/s |
+| 8192 bytes  | 10.9 µs | 718 MiB/s |
+
+**Key finding**: Time per syscall is **constant (~10 µs)** regardless of packet size. Throughput scales linearly with size.
+
+#### 12.2.3 Time per Batch (batch=500) - Also Constant
+
+| Packet Size | Time per sendmmsg(500) | Throughput |
+|-------------|------------------------|------------|
+| 512 bytes   | 2.65 ms | 92 MiB/s |
+| 1400 bytes  | 2.73 ms | 245 MiB/s |
+| 4096 bytes  | 2.73 ms | 716 MiB/s |
+| 8192 bytes  | 2.74 ms | 1.39 GiB/s |
+
+**Key finding**: Time per batch is also **constant (~2.7 ms)** for 500 packets, regardless of packet size.
+
+### 12.3 Direct Comparison: Single vs Batched (100 packets)
+
+| Packet Size | Single send()×100 | sendmmsg(100) | Speedup |
+|-------------|-------------------|---------------|---------|
+| 512 bytes   | 48 MiB/s | 87 MiB/s | **1.81x** |
+| 1400 bytes  | 139 MiB/s | 232 MiB/s | **1.67x** |
+| 4096 bytes  | 385 MiB/s | 675 MiB/s | **1.75x** |
+| 8192 bytes  | 730 MiB/s | 1.28 GiB/s | **1.75x** |
+
+**Key finding**: Batching improvement is **consistent (~1.75x)** across all packet sizes.
+
+### 12.4 Key Insights
+
+#### The Optimizations Are Multiplicative!
+
+1. **Packet size scaling**: 16x larger packets → ~15x higher throughput (same syscall overhead)
+2. **Batching scaling**: 100x fewer syscalls → ~1.75x higher throughput
+3. **Combined effect**: These improvements **stack multiplicatively**
+
+#### Quantified Improvement
+
+| Optimization | Throughput | Improvement vs Baseline |
+|--------------|------------|-------------------------|
+| Baseline (512 bytes, single) | 47 MiB/s | 1.0x |
+| Large packets only (8192 bytes) | 718 MiB/s | 15.3x |
+| Batching only (512 bytes, batch-500) | 92 MiB/s | 1.96x |
+| **Both combined (8192 + batch-500)** | **1.39 GiB/s** | **29.6x** |
+
+### 12.5 Why Batching Helps Equally at All Sizes
+
+The constant ~1.75x improvement from batching, regardless of packet size, reveals that:
+
+1. **Syscall overhead is fixed** (~10 µs per call)
+2. **Data copy time is negligible** at loopback - kernel doesn't care if it's 512 or 8192 bytes
+3. **The kernel batches internally** - sendmmsg allows amortizing syscall entry/exit overhead
+
+This means:
+- **Small packets**: Syscall overhead is 100% of the time → batching helps a lot in absolute terms
+- **Large packets**: Syscall overhead is still 100% of the time (data copy is instant) → batching helps the same amount
+
+### 12.6 Practical Recommendations
+
+1. **Maximize Packet Size First**
+   - Use the largest MTU your network supports (1500 standard, 9000 jumbo)
+   - This is the biggest lever: 16x improvement for 16x larger packets
+
+2. **Implement Batching Second**
+   - Use sendmmsg/recvmmsg for ~1.75x additional improvement
+   - Works equally well at all packet sizes
+
+3. **Sweet Spot**
+   - Batch size of 50-100 captures most benefit (diminishing returns beyond)
+   - With 1400-byte packets and batch-100: 235 MiB/s (vs 135 MiB/s baseline = 1.74x)
+
+4. **For Maximum Throughput**
+   - 8192-byte packets + batch-500: **1.39 GiB/s**
+   - This is **29.6x faster** than 512-byte single-send baseline
+
+### 12.7 Running These Benchmarks
+
+```bash
+# Run full size×batch matrix
+./scripts/run_benchmarks.sh experimental_size_batch
+
+# Individual benchmark groups
+cargo bench --bench transport_perf -- experimental_size_batch_matrix
+cargo bench --bench transport_perf -- experimental_batch_improvement
+cargo bench --bench transport_perf -- experimental_throughput_ceiling
+```
+
+---
+
+*Analysis performed: December 2025*
+*Experimental benchmarks added: December 2025*
+*Size×batch interaction analysis: December 2025*
 *Codebase version: commit c50d888*
