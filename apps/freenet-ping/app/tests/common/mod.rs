@@ -38,7 +38,6 @@ use serde::{Deserialize, Serialize};
 
 const TARGET_DIR_VAR: &str = "CARGO_TARGET_DIR";
 
-
 #[derive(Debug)]
 pub struct PresetConfig {
     pub temp_dir: tempfile::TempDir,
