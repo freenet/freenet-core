@@ -104,11 +104,26 @@ impl<T: TimeSource> SeedingCache<T> {
         let mut evicted = Vec::new();
 
         if let Some(existing) = self.contracts.get_mut(&key) {
-            // Already cached - refresh position
+            // Already cached - update size if changed and refresh position
+            if existing.size_bytes != size_bytes {
+                // Adjust byte accounting for size change
+                if size_bytes > existing.size_bytes {
+                    self.current_bytes = self
+                        .current_bytes
+                        .saturating_add(size_bytes - existing.size_bytes);
+                } else {
+                    self.current_bytes = self
+                        .current_bytes
+                        .saturating_sub(existing.size_bytes - size_bytes);
+                }
+                existing.size_bytes = size_bytes;
+            }
             existing.last_accessed = now;
             existing.last_access_type = access_type;
 
             // Move to back of LRU (most recently used)
+            // Note: This is O(n) which is acceptable for typical cache sizes (dozens to hundreds).
+            // For thousands of contracts, consider using the `lru` crate or a linked list.
             self.lru_order.retain(|k| k != &key);
             self.lru_order.push_back(key);
         } else {
@@ -133,7 +148,7 @@ impl<T: TimeSource> SeedingCache<T> {
             };
             self.contracts.insert(key, contract);
             self.lru_order.push_back(key);
-            self.current_bytes += size_bytes;
+            self.current_bytes = self.current_bytes.saturating_add(size_bytes);
         }
 
         evicted
@@ -391,14 +406,16 @@ mod tests {
         let mut cache = make_cache(0);
         let key = make_key(1);
 
-        // With zero budget, any contract should be immediately evicted
-        // Actually, this means we can never cache anything
+        // Edge case: With zero budget, the eviction loop condition
+        // `current_bytes + size_bytes > budget_bytes` is true (0 + 100 > 0),
+        // but there's nothing to evict since the cache is empty.
+        // The contract gets added anyway, exceeding the budget.
+        // This documents that budget is a soft limit when the cache is empty.
         let evicted = cache.record_access(key, 100, AccessType::Get);
 
-        // With zero budget, the contract is added but we can't evict anything
-        // (nothing to evict). This is a pathological edge case.
-        let _ = evicted; // Mark as intentionally unused
-        assert!(cache.is_empty() || cache.current_bytes() == 100);
+        assert!(evicted.is_empty()); // Nothing was evicted
+        assert!(cache.contains(&key)); // Contract was added
+        assert_eq!(cache.current_bytes(), 100); // Budget exceeded
     }
 
     #[test]
@@ -427,9 +444,64 @@ mod tests {
         let evicted = cache.record_access(large, 150, AccessType::Get);
 
         assert_eq!(evicted, vec![small]);
-        // Large contract is still added even though it exceeds budget
-        // This is intentional - we don't want to refuse to cache things
+        // Design decision: Large contracts are still added even if they exceed budget.
+        // The budget is a soft limit - we evict as much as possible but don't refuse
+        // to cache. This prevents contracts from becoming unfindable just because
+        // they're large. The cache will naturally evict oversized contracts when
+        // new contracts arrive, as they'll be displaced first.
         assert!(cache.contains(&large));
         assert_eq!(cache.current_bytes(), 150);
+    }
+
+    #[test]
+    fn test_contract_size_change_increases() {
+        let mut cache = make_cache(1000);
+        let key = make_key(1);
+
+        // Add contract with initial size
+        cache.record_access(key, 100, AccessType::Get);
+        assert_eq!(cache.current_bytes(), 100);
+        assert_eq!(cache.get(&key).unwrap().size_bytes, 100);
+
+        // Contract state grows (e.g., through PUT operation)
+        cache.record_access(key, 200, AccessType::Put);
+        assert_eq!(cache.current_bytes(), 200);
+        assert_eq!(cache.get(&key).unwrap().size_bytes, 200);
+    }
+
+    #[test]
+    fn test_contract_size_change_decreases() {
+        let mut cache = make_cache(1000);
+        let key = make_key(1);
+
+        // Add contract with initial size
+        cache.record_access(key, 200, AccessType::Get);
+        assert_eq!(cache.current_bytes(), 200);
+
+        // Contract state shrinks
+        cache.record_access(key, 150, AccessType::Put);
+        assert_eq!(cache.current_bytes(), 150);
+        assert_eq!(cache.get(&key).unwrap().size_bytes, 150);
+    }
+
+    #[test]
+    fn test_contract_size_change_triggers_no_eviction() {
+        // Size changes to existing contracts don't trigger eviction
+        // (only new contracts can trigger eviction)
+        let mut cache = make_cache(200);
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+
+        // Add two contracts at 100 bytes each
+        cache.record_access(key1, 100, AccessType::Get);
+        cache.record_access(key2, 100, AccessType::Get);
+        assert_eq!(cache.current_bytes(), 200);
+
+        // key1 grows to 150 bytes - exceeds budget but doesn't evict key2
+        // because we're updating an existing contract, not adding a new one
+        cache.record_access(key1, 150, AccessType::Put);
+        assert_eq!(cache.current_bytes(), 250); // Over budget
+        assert!(cache.contains(&key1));
+        assert!(cache.contains(&key2)); // key2 NOT evicted
     }
 }
