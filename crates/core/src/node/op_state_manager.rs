@@ -16,8 +16,8 @@ use std::{
 use dashmap::{DashMap, DashSet};
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
-use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use parking_lot::{Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::{
@@ -213,6 +213,9 @@ pub(crate) struct OpManager {
     pub is_gateway: bool,
     /// Sub-operation tracking for atomic operation execution
     sub_op_tracker: SubOperationTracker,
+    /// Waiters for contract storage notification.
+    /// Operations can register to be notified when a specific contract is stored.
+    contract_waiters: Arc<Mutex<std::collections::HashMap<ContractKey, Vec<oneshot::Sender<()>>>>>,
 }
 
 impl Clone for OpManager {
@@ -228,6 +231,7 @@ impl Clone for OpManager {
             peer_ready: self.peer_ready.clone(),
             is_gateway: self.is_gateway,
             sub_op_tracker: self.sub_op_tracker.clone(),
+            contract_waiters: self.contract_waiters.clone(),
         }
     }
 }
@@ -295,6 +299,7 @@ impl OpManager {
             peer_ready,
             is_gateway,
             sub_op_tracker,
+            contract_waiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -647,6 +652,37 @@ impl OpManager {
             self.ring
                 .live_tx_tracker
                 .add_transaction(peer_addr, *transaction);
+        }
+    }
+
+    /// Register to be notified when a contract is stored.
+    /// Returns a receiver that will be signaled when the contract is stored.
+    /// This is used to handle race conditions where a subscription arrives before
+    /// the contract has been propagated via PUT.
+    pub fn wait_for_contract(&self, key: ContractKey) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let mut waiters = self.contract_waiters.lock();
+        waiters.entry(key).or_default().push(tx);
+        rx
+    }
+
+    /// Notify all waiters that a contract has been stored.
+    /// Called after successful contract storage in PUT operations.
+    pub fn notify_contract_stored(&self, key: &ContractKey) {
+        let mut waiters = self.contract_waiters.lock();
+        if let Some(senders) = waiters.remove(key) {
+            let count = senders.len();
+            for sender in senders {
+                // Ignore errors if receiver was dropped
+                let _ = sender.send(());
+            }
+            if count > 0 {
+                tracing::debug!(
+                    %key,
+                    count,
+                    "Notified waiters that contract has been stored"
+                );
+            }
         }
     }
 }

@@ -1433,7 +1433,11 @@ async fn put_contract(
     {
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Ok(new_val),
-        }) => Ok(new_val),
+        }) => {
+            // Notify any waiters that this contract has been stored
+            op_manager.notify_contract_stored(&key);
+            Ok(new_val)
+        }
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Err(err),
         }) => {
