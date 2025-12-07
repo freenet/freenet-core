@@ -298,14 +298,13 @@ impl RelayState {
 
         if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
             self.accepted_locally = true;
-            // Use self_location which already has our address set (from --public-network-address
-            // for gateways, or from observed address for peers).
-            let acceptor = ctx.self_location().clone();
-            debug_assert!(
-                acceptor.socket_addr().is_some(),
-                "ConnectResponse acceptor must have known address - joiner needs it to connect back"
-            );
-            let dist = ring_distance(acceptor.location(), self.request.joiner.location());
+            // Use unknown address for the acceptor - the acceptor doesn't know their own
+            // external address (especially behind NAT). The first relay that receives this
+            // response will fill in the address from the packet source, similar to how
+            // joiner addresses are filled in for ConnectRequest.
+            let self_loc = ctx.self_location();
+            let acceptor = PeerKeyLocation::with_unknown_addr(self_loc.pub_key().clone());
+            let dist = ring_distance(self_loc.location(), self.request.joiner.location());
             actions.accept_response = Some(ConnectResponse {
                 acceptor: acceptor.clone(),
             });
@@ -313,12 +312,12 @@ impl RelayState {
             // Use the joiner with updated observed address for response routing
             actions.response_target = Some(self.request.joiner.clone());
             tracing::info!(
-                acceptor_pub_key = %acceptor.pub_key(),
+                acceptor_pub_key = %self_loc.pub_key(),
                 joiner_pub_key = %self.request.joiner.pub_key(),
-                acceptor_loc = ?acceptor.location(),
+                acceptor_loc = ?self_loc.location(),
                 joiner_loc = ?self.request.joiner.location(),
                 ring_distance = ?dist,
-                "connect: acceptance issued"
+                "connect: acceptance issued (acceptor addr will be filled by relay)"
             );
         }
 
@@ -1774,4 +1773,66 @@ mod tests {
     // Note: The SkipListWithSelf test has been removed as it now requires a ConnectionManager
     // to look up peers by address. The skip list behavior is tested via integration tests
     // and the self-exclusion logic is straightforward.
+
+    /// Regression test: ConnectResponse acceptor must have Unknown address initially.
+    /// The relay that first receives the response fills in the acceptor's address from
+    /// the packet source. This is critical for NAT traversal - the acceptor (behind NAT)
+    /// doesn't know its own external address.
+    ///
+    /// Bug scenario this prevents:
+    /// 1. Peer1 (behind NAT at 192.168.1.x) accepts joiner and creates ConnectResponse
+    /// 2. If acceptor uses self_location(), it has 127.0.0.1 or private IP
+    /// 3. Joiner receives response with wrong address, can't connect back
+    /// 4. NAT hole-punching fails - joiner sends to wrong address
+    ///
+    /// Correct behavior:
+    /// 1. Peer1 creates ConnectResponse with acceptor.peer_addr = Unknown
+    /// 2. First relay receives response, fills in acceptor address from UDP source
+    /// 3. Joiner receives response with correct external address
+    /// 4. NAT hole-punching works - both peers have each other's external addresses
+    #[test]
+    fn connect_response_acceptor_has_unknown_address() {
+        let joiner = make_peer(9100);
+        let acceptor_peer = make_peer(9200);
+
+        let joiner_addr = joiner.socket_addr().expect("test peer must have address");
+        let request = ConnectRequest {
+            desired_location: Location::random(),
+            joiner: joiner.clone(),
+            ttl: 3,
+            visited: vec![joiner_addr],
+        };
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut relay_op = ConnectOp::new_relay(
+            tx,
+            joiner_addr,
+            request.clone(),
+            Arc::new(RwLock::new(ConnectForwardEstimator::new())),
+        );
+
+        // Acceptor context - this peer will accept the joiner
+        let ctx = TestRelayContext::new(acceptor_peer.clone());
+        let estimator = ConnectForwardEstimator::new();
+        let actions = relay_op.handle_request(&ctx, joiner_addr, request.clone(), &estimator);
+
+        // Verify acceptance was issued
+        let response = actions
+            .accept_response
+            .expect("acceptor should issue ConnectResponse");
+
+        // CRITICAL: acceptor's address must be Unknown, not the acceptor's local address
+        assert!(
+            response.acceptor.peer_addr.is_unknown(),
+            "acceptor address should be Unknown for NAT traversal. Got: {:?}",
+            response.acceptor.peer_addr
+        );
+
+        // The pub_key should be set correctly
+        assert_eq!(
+            response.acceptor.pub_key(),
+            acceptor_peer.pub_key(),
+            "acceptor pub_key should match"
+        );
+    }
 }
