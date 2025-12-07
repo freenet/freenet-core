@@ -226,10 +226,16 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
         if is_gw {
             // Gateway node configuration
+            // Use varied loopback IPs for public_address so each node gets a unique ring location
+            // (Location is derived from IP address, masking the last byte)
+            // Actual socket binding is on 127.0.0.1 (LOCALHOST)
             let location_expr = node_location(args, idx, node_label);
             let network_port_var = format_ident!("network_port_{}", idx);
             let ws_port_var_local = format_ident!("ws_port_{}", idx);
+            let node_ip_var = format_ident!("node_ip_{}", idx);
             setup_code.push(quote! {
+                // Use varied loopback IPs (127.x.y.1) for public_address (location calculation)
+                let #node_ip_var = freenet::test_utils::test_ip_for_node(#idx_lit);
                 let #network_port_var = freenet::test_utils::reserve_local_port()?;
                 let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
@@ -241,24 +247,28 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
                     let network_port = #network_port_var;
                     let ws_port = #ws_port_var_local;
+                    let node_ip = #node_ip_var;
 
                     let location: f64 = #location_expr;
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
+                            // Bind to localhost (127.0.0.1) for actual sockets
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
                             ws_api_port: Some(ws_port),
                             token_ttl_seconds: None,
                             token_cleanup_interval_seconds: None,
                         },
                         network_api: freenet::config::NetworkArgs {
-                            public_address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                            // Use varied IP for public_address (affects location calculation)
+                            public_address: Some(node_ip.into()),
                             public_port: Some(network_port),
                             is_gateway: true,
                             skip_load_from_network: true,
                             gateways: Some(vec![]),
                             location: Some(location),
                             ignore_protocol_checking: true,
+                            // Bind to localhost (127.0.0.1) for actual sockets
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
                             network_port: Some(network_port),
                             min_connections: None,
@@ -287,6 +297,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
     // Second pass: Generate gateway info variables
     // We need these for both auto_connect_peers and backward compatibility
+    // Note: address is LOCALHOST for actual connectivity, but public_address (varied IP) affects location
     for (idx, node_label) in args.nodes.iter().enumerate() {
         let is_gw = is_gateway(args, node_label, idx);
         if is_gw {
@@ -296,6 +307,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
             setup_code.push(quote! {
                 let #gateway_info_var = freenet::config::InlineGwConfig {
+                    // Use LOCALHOST for actual connectivity
                     address: (std::net::Ipv4Addr::LOCALHOST, #config_var.network_api.public_port.unwrap()).into(),
                     location: #config_var.network_api.location,
                     public_key_path: #temp_var.path().join("public.pem"),
@@ -347,9 +359,14 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
             };
 
             // Peer node configuration
+            // Use varied loopback IPs for public_address so each node gets a unique ring location
+            // (Location is derived from IP address, masking the last byte)
+            // Actual socket binding is on 127.0.0.1 (LOCALHOST)
             let network_port_var = format_ident!("network_port_{}", idx);
             let ws_port_var_local = format_ident!("ws_port_{}", idx);
+            let node_ip_var = format_ident!("node_ip_{}", idx);
             setup_code.push(quote! {
+                let #node_ip_var = freenet::test_utils::test_ip_for_node(#idx_lit);
                 let #network_port_var = freenet::test_utils::reserve_local_port()?;
                 let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
@@ -359,6 +376,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                     key.save(&transport_keypair)?;
                     key.public().save(temp_dir.path().join("public.pem"))?;
 
+                    let node_ip = #node_ip_var;
                     let network_port = #network_port_var;
                     let ws_port = #ws_port_var_local;
 
@@ -366,19 +384,22 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
+                            // Bind to localhost (127.0.0.1) for actual sockets
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
                             ws_api_port: Some(ws_port),
                             token_ttl_seconds: None,
                             token_cleanup_interval_seconds: None,
                         },
                         network_api: freenet::config::NetworkArgs {
-                            public_address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                            // Use varied IP for public_address (affects location calculation)
+                            public_address: Some(node_ip.into()),
                             public_port: Some(network_port),
                             is_gateway: false,
                             skip_load_from_network: true,
                             gateways: #gateways_config,
                             location: Some(location),
                             ignore_protocol_checking: true,
+                            // Bind to localhost (127.0.0.1) for actual sockets
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
                             network_port: Some(network_port),
                             min_connections: None,

@@ -847,31 +847,38 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let mut sent_tracker = SentPacketTracker::new();
 
-            while attempts < NAT_TRAVERSAL_MAX_ATTEMPTS && start_time.elapsed() < overall_deadline {
-                match state {
-                    ConnectionState::StartOutbound => {
-                        tracing::debug!(%remote_addr, "sending protocol version and inbound key");
-                        outbound_packets
-                            .send((remote_addr, outbound_intro_packet.data().into()))
-                            .await
-                            .map_err(|_| TransportError::ChannelClosed)?;
-                        attempts += 1;
-                    }
-                    ConnectionState::RemoteInbound { .. } => {
-                        tracing::debug!(%remote_addr, "sending back protocol version and inbound key to remote");
-                        let our_inbound = SymmetricMessage::ack_ok(
-                            outbound_sym_key.as_ref().expect("should be set"),
-                            inbound_sym_key_bytes,
-                            remote_addr,
-                        )?;
-                        outbound_packets
-                            .send((remote_addr, our_inbound.data().into()))
-                            .await
-                            .map_err(|_| TransportError::ChannelClosed)?;
-                        sent_tracker.report_sent_packet(
-                            SymmetricMessage::FIRST_PACKET_ID,
-                            our_inbound.data().into(),
-                        );
+            // NAT traversal: keep sending packets throughout the deadline to maintain NAT bindings.
+            // The acceptor may start hole-punching well before the joiner, so we must keep
+            // sending until the deadline expires, not just until we've sent MAX_ATTEMPTS packets.
+            while start_time.elapsed() < overall_deadline {
+                // Send a packet if we haven't exceeded the max attempts
+                if attempts < NAT_TRAVERSAL_MAX_ATTEMPTS {
+                    match state {
+                        ConnectionState::StartOutbound => {
+                            tracing::debug!(%remote_addr, "sending protocol version and inbound key");
+                            outbound_packets
+                                .send((remote_addr, outbound_intro_packet.data().into()))
+                                .await
+                                .map_err(|_| TransportError::ChannelClosed)?;
+                            attempts += 1;
+                        }
+                        ConnectionState::RemoteInbound { .. } => {
+                            tracing::debug!(%remote_addr, "sending back protocol version and inbound key to remote");
+                            let our_inbound = SymmetricMessage::ack_ok(
+                                outbound_sym_key.as_ref().expect("should be set"),
+                                inbound_sym_key_bytes,
+                                remote_addr,
+                            )?;
+                            outbound_packets
+                                .send((remote_addr, our_inbound.data().into()))
+                                .await
+                                .map_err(|_| TransportError::ChannelClosed)?;
+                            sent_tracker.report_sent_packet(
+                                SymmetricMessage::FIRST_PACKET_ID,
+                                our_inbound.data().into(),
+                            );
+                            attempts += 1;
+                        }
                     }
                 }
                 let next_inbound =
