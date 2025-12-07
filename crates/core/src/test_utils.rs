@@ -820,6 +820,52 @@ static RESERVED_PORTS: Lazy<DashSet<u16>> = Lazy::new(DashSet::new);
 static RESERVED_SOCKETS: Lazy<DashMap<u16, (std::net::UdpSocket, std::net::TcpListener)>> =
     Lazy::new(DashMap::new);
 
+/// Generate a unique loopback IP address for test node at given index.
+///
+/// Location is computed from IP address (masking last byte), so we need different
+/// 2nd and 3rd octets to get different locations. Format: 127.{(idx/254)+1}.{(idx%254)+1}.1
+///
+/// This supports up to 254*254 = 64,516 unique test nodes.
+pub fn test_ip_for_node(node_idx: usize) -> std::net::Ipv4Addr {
+    // Avoid 0 in octets (127.0.x.x might have special handling on some systems)
+    // and avoid 255 (broadcast). Use range 1-254 for each octet.
+    let second_octet = ((node_idx / 254) % 254) + 1;
+    let third_octet = (node_idx % 254) + 1;
+    std::net::Ipv4Addr::new(127, second_octet as u8, third_octet as u8, 1)
+}
+
+/// Reserve a unique TCP port for tests on a specific IP address.
+///
+/// Similar to [`reserve_local_port`] but binds to the specified IP.
+pub fn reserve_local_port_on_ip(ip: std::net::Ipv4Addr) -> anyhow::Result<u16> {
+    const MAX_ATTEMPTS: usize = 128;
+    for _ in 0..MAX_ATTEMPTS {
+        // Bind UDP first since that's what Freenet nodes primarily use
+        let udp_socket = std::net::UdpSocket::bind((ip, 0))
+            .map_err(|e| anyhow::anyhow!("failed to bind ephemeral UDP port on {ip}: {e}"))?;
+        let port = udp_socket
+            .local_addr()
+            .map_err(|e| anyhow::anyhow!("failed to read ephemeral port address: {e}"))?
+            .port();
+
+        // Also bind TCP on the same port for WebSocket listeners
+        let tcp_listener = match std::net::TcpListener::bind((ip, port)) {
+            Ok(l) => l,
+            Err(_) => continue, // Port available for UDP but not TCP, try another
+        };
+
+        if RESERVED_PORTS.insert(port) {
+            // Keep sockets alive to prevent OS from reassigning the port
+            RESERVED_SOCKETS.insert(port, (udp_socket, tcp_listener));
+            return Ok(port);
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to reserve a unique local port on {ip} after {MAX_ATTEMPTS} attempts"
+    ))
+}
+
 /// Reserve a unique localhost TCP port for tests.
 ///
 /// Ports are allocated by binding to both UDP and TCP on an ephemeral port to
