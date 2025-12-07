@@ -401,10 +401,10 @@ impl Operation for PutOp {
                         }
                     }
 
-                    // Get sender from connection-based routing
-                    let sender = sender_from_addr
-                        .clone()
-                        .expect("SeekNode requires source_addr");
+                    // Use origin (from message) instead of sender_from_addr (from connection lookup).
+                    // The origin has the correct pub_key and its address is filled from source_addr.
+                    // Connection lookup can fail or return wrong identity due to race conditions.
+                    let sender = origin.clone();
                     // Get the contract key and check if we should handle it
                     let key = contract.key();
                     let is_subscribed_contract = op_manager.ring.is_seeding_contract(&key);
