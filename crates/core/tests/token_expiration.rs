@@ -198,6 +198,8 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
 
         let ws_socket = TcpListener::bind("127.0.0.1:0")?;
         let ws_port = ws_socket.local_addr()?.port();
+        // Drop the socket to release the port before the gateway binds to it
+        drop(ws_socket);
 
         let config = WebsocketApiConfig {
             address: Ipv4Addr::LOCALHOST.into(),
