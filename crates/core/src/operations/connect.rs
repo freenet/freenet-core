@@ -1437,12 +1437,13 @@ mod tests {
         let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
 
         let response = actions.accept_response.expect("expected acceptance");
-        // Verify acceptor has both correct identity and known address
+        // Verify acceptor has correct identity
         assert_eq!(response.acceptor.pub_key(), self_loc.pub_key());
-        assert_eq!(
-            response.acceptor.socket_addr(),
-            self_loc.socket_addr(),
-            "ConnectResponse acceptor must have known address for joiner to connect back"
+        // Acceptor address should be Unknown - relay fills it in from packet source
+        // This is critical for NAT traversal: acceptor doesn't know its external address
+        assert!(
+            response.acceptor.peer_addr.is_unknown(),
+            "ConnectResponse acceptor should have Unknown address for NAT traversal"
         );
         assert_eq!(
             actions.expect_connection_from.unwrap().pub_key(),
@@ -1452,10 +1453,11 @@ mod tests {
     }
 
     #[test]
-    fn connect_response_acceptor_must_have_known_address() {
-        // Regression test: ConnectResponse.acceptor must include a known address
-        // so the joiner can establish a connection back to the acceptor.
-        // See: https://github.com/freenet/freenet-core/issues/2207
+    fn connect_response_acceptor_starts_with_unknown_address() {
+        // Updated from #2207: ConnectResponse.acceptor now starts with Unknown address.
+        // The first relay that receives the response fills in the address from the
+        // packet source. This is critical for NAT traversal - the acceptor (behind NAT)
+        // doesn't know its own external address.
         let self_loc = make_peer(4001);
         let joiner = make_peer(5001);
         let mut state = RelayState {
@@ -1479,16 +1481,17 @@ mod tests {
 
         let response = actions.accept_response.expect("expected acceptance");
 
-        // Critical invariant: acceptor address must be known
+        // Critical invariant: acceptor address must be Unknown initially
+        // Relay will fill it in from the packet source address
         assert!(
-            response.acceptor.socket_addr().is_some(),
-            "ConnectResponse.acceptor must have a known address"
+            response.acceptor.peer_addr.is_unknown(),
+            "ConnectResponse.acceptor must have Unknown address for NAT traversal"
         );
-        // Address should match self_location
+        // pub_key should still match
         assert_eq!(
-            response.acceptor.socket_addr(),
-            self_loc.socket_addr(),
-            "acceptor address should come from self_location"
+            response.acceptor.pub_key(),
+            self_loc.pub_key(),
+            "acceptor pub_key should come from self_location"
         );
     }
 
