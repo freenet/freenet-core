@@ -2682,11 +2682,16 @@ async fn peer_connection_listener(
         %peer_addr,
         "[CONN_LIFECYCLE] Starting peer_connection_listener task"
     );
+
+    // Track last activity to detect blocked listeners (see issue #2241)
+    let mut last_activity = std::time::Instant::now();
+
     loop {
         let mut drained = 0;
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
+                    last_activity = std::time::Instant::now();
                     if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
                         tracing::debug!(
                             to = %remote_addr,
@@ -2718,8 +2723,30 @@ async fn peer_connection_listener(
             }
         }
 
+        // Detect if this listener has been idle with pending messages (potential bug indicator)
+        // See issue #2241 - messages can be queued but never processed if recv() blocks
+        let pending_msgs = rx.len();
+        let idle_secs = last_activity.elapsed().as_secs();
+        if pending_msgs > 0 && idle_secs >= 5 {
+            tracing::warn!(
+                to = %remote_addr,
+                pending_msgs,
+                idle_secs,
+                "[CONN_LIFECYCLE] peer_connection_listener has {} pending messages after {}s idle - possible stall",
+                pending_msgs,
+                idle_secs
+            );
+        }
+
         tokio::select! {
+            // IMPORTANT: Use biased selection to prioritize outbound messages.
+            // Without this, tokio::select! randomly chooses which branch to poll first,
+            // which can cause outbound messages to starve if conn.recv() is slow or blocking.
+            // See issue #2241 for context on why this matters.
+            biased;
+
             msg = rx.recv() => {
+                last_activity = std::time::Instant::now();
                 let Some(msg) = msg else {
                     tracing::warn!(
                         to = %conn.remote_addr(),
@@ -2744,6 +2771,7 @@ async fn peer_connection_listener(
                 }
             }
             msg = conn.recv() => {
+                last_activity = std::time::Instant::now();
                 match msg {
                     Ok(msg) => {
                         match decode_msg(&msg) {
