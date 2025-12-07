@@ -2219,7 +2219,7 @@ async fn test_gateway_packet_size_change_after_60s() -> TestResult {
         let config = config_gw1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -2230,7 +2230,7 @@ async fn test_gateway_packet_size_change_after_60s() -> TestResult {
         let config = config_gw2.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -2241,7 +2241,7 @@ async fn test_gateway_packet_size_change_after_60s() -> TestResult {
         let config = config_client.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -2420,7 +2420,7 @@ async fn test_production_decryption_error_scenario() -> TestResult {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -2430,7 +2430,7 @@ async fn test_production_decryption_error_scenario() -> TestResult {
         let config = config_client.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
