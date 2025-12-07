@@ -2677,7 +2677,8 @@ async fn peer_connection_listener(
 ) {
     const MAX_IMMEDIATE_SENDS: usize = 32;
     let remote_addr = conn.remote_addr();
-    tracing::debug!(
+    // Use INFO level so it appears in CI logs (issue #2241)
+    tracing::info!(
         to = %remote_addr,
         %peer_addr,
         "[CONN_LIFECYCLE] Starting peer_connection_listener task"
@@ -2685,12 +2686,19 @@ async fn peer_connection_listener(
 
     // Track last activity to detect blocked listeners (see issue #2241)
     let mut last_activity = std::time::Instant::now();
+    let mut loop_iteration: u64 = 0;
 
     loop {
+        loop_iteration += 1;
         let mut drained = 0;
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
+                    tracing::info!(
+                        to = %remote_addr,
+                        loop_iteration,
+                        "[CONN_LIFECYCLE] peer_connection_listener received outbound msg via try_recv"
+                    );
                     last_activity = std::time::Instant::now();
                     if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
                         tracing::debug!(
@@ -2728,13 +2736,26 @@ async fn peer_connection_listener(
         let pending_msgs = rx.len();
         let idle_secs = last_activity.elapsed().as_secs();
         if pending_msgs > 0 && idle_secs >= 5 {
-            tracing::warn!(
+            // Use ERROR level to ensure visibility in CI with FREENET_LOG=error
+            tracing::error!(
                 to = %remote_addr,
                 pending_msgs,
                 idle_secs,
+                loop_iteration,
                 "[CONN_LIFECYCLE] peer_connection_listener has {} pending messages after {}s idle - possible stall",
                 pending_msgs,
                 idle_secs
+            );
+        }
+
+        // Log periodic health check (every 100 iterations)
+        if loop_iteration % 100 == 1 {
+            tracing::info!(
+                to = %remote_addr,
+                loop_iteration,
+                pending_msgs,
+                idle_secs = last_activity.elapsed().as_secs(),
+                "[CONN_LIFECYCLE] peer_connection_listener health check"
             );
         }
 
@@ -2746,6 +2767,11 @@ async fn peer_connection_listener(
             biased;
 
             msg = rx.recv() => {
+                tracing::info!(
+                    to = %remote_addr,
+                    loop_iteration,
+                    "[CONN_LIFECYCLE] peer_connection_listener received outbound msg via select rx.recv()"
+                );
                 last_activity = std::time::Instant::now();
                 let Some(msg) = msg else {
                     tracing::warn!(
@@ -2771,13 +2797,18 @@ async fn peer_connection_listener(
                 }
             }
             msg = conn.recv() => {
+                tracing::info!(
+                    to = %remote_addr,
+                    loop_iteration,
+                    "[CONN_LIFECYCLE] peer_connection_listener conn.recv() returned"
+                );
                 last_activity = std::time::Instant::now();
                 match msg {
                     Ok(msg) => {
                         match decode_msg(&msg) {
                             Ok(net_message) => {
                                 let tx = *net_message.id();
-                                tracing::debug!(
+                                tracing::info!(
                                     from = %conn.remote_addr(),
                                     %tx,
                                     tx_type = ?tx.transaction_type(),
