@@ -942,7 +942,31 @@ impl Operation for ConnectOp {
                 }
                 ConnectMsg::Response { payload, .. } => {
                     if self.gateway.is_some() {
-                        if let Some(acceptance) = self.handle_response(payload, Instant::now()) {
+                        // Fill in acceptor's external address from source_addr if unknown.
+                        // This handles the case where the acceptor sent the response directly
+                        // to us (no intermediate relay to fill it in).
+                        let payload = if payload.acceptor.peer_addr.is_unknown() {
+                            if let Some(acceptor_addr) = source_addr {
+                                let mut updated = payload.clone();
+                                updated.acceptor.peer_addr = PeerAddr::Known(acceptor_addr);
+                                tracing::debug!(
+                                    acceptor_pub_key = %updated.acceptor.pub_key(),
+                                    acceptor_addr = %acceptor_addr,
+                                    "connect: filled acceptor address from source_addr (joiner path)"
+                                );
+                                updated
+                            } else {
+                                tracing::warn!(
+                                    acceptor_pub_key = %payload.acceptor.pub_key(),
+                                    "connect: joiner received response without source_addr, cannot fill acceptor address"
+                                );
+                                payload.clone()
+                            }
+                        } else {
+                            payload.clone()
+                        };
+
+                        if let Some(acceptance) = self.handle_response(&payload, Instant::now()) {
                             if acceptance.assigned_location {
                                 if let Some(location) = self.take_desired_location() {
                                     tracing::info!(
