@@ -941,31 +941,33 @@ impl Operation for ConnectOp {
                     Ok(store_operation_state(&mut self))
                 }
                 ConnectMsg::Response { payload, .. } => {
-                    if self.gateway.is_some() {
-                        // Fill in acceptor's external address from source_addr if unknown.
-                        // This handles the case where the acceptor sent the response directly
-                        // to us (no intermediate relay to fill it in).
-                        let payload = if payload.acceptor.peer_addr.is_unknown() {
-                            if let Some(acceptor_addr) = source_addr {
-                                let mut updated = payload.clone();
-                                updated.acceptor.peer_addr = PeerAddr::Known(acceptor_addr);
-                                tracing::debug!(
-                                    acceptor_pub_key = %updated.acceptor.pub_key(),
-                                    acceptor_addr = %acceptor_addr,
-                                    "connect: filled acceptor address from source_addr (joiner path)"
-                                );
-                                updated
-                            } else {
-                                tracing::warn!(
-                                    acceptor_pub_key = %payload.acceptor.pub_key(),
-                                    "connect: joiner received response without source_addr, cannot fill acceptor address"
-                                );
-                                payload.clone()
-                            }
+                    // Fill in acceptor's external address from source_addr if unknown.
+                    // The acceptor doesn't know their own external address (especially behind NAT),
+                    // so the first peer that receives the response fills it in from the
+                    // transport layer's source address.
+                    let payload = if payload.acceptor.peer_addr.is_unknown() {
+                        if let Some(acceptor_addr) = source_addr {
+                            let mut updated = payload.clone();
+                            updated.acceptor.peer_addr = PeerAddr::Known(acceptor_addr);
+                            tracing::debug!(
+                                acceptor_pub_key = %updated.acceptor.pub_key(),
+                                acceptor_addr = %acceptor_addr,
+                                "connect: filled acceptor address from source_addr"
+                            );
+                            updated
                         } else {
+                            tracing::warn!(
+                                acceptor_pub_key = %payload.acceptor.pub_key(),
+                                "connect: response received without source_addr, cannot fill acceptor address"
+                            );
                             payload.clone()
-                        };
+                        }
+                    } else {
+                        payload.clone()
+                    };
 
+                    if let Some(ConnectState::WaitingForResponses(_)) = &self.state {
+                        // Joiner: process the response and connect to acceptor
                         if let Some(acceptance) = self.handle_response(&payload, Instant::now()) {
                             if acceptance.assigned_location {
                                 if let Some(location) = self.take_desired_location() {
@@ -1025,6 +1027,7 @@ impl Operation for ConnectOp {
 
                         Ok(store_operation_state(&mut self))
                     } else if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
+                        // Relay: forward response toward joiner
                         let (forwarded, desired, upstream_addr, joiner) = {
                             let st = state;
                             (
@@ -1038,41 +1041,16 @@ impl Operation for ConnectOp {
                             self.record_forward_outcome(&fwd, desired, true);
                         }
 
-                        // Fill in acceptor's external address from source_addr if unknown.
-                        // The acceptor doesn't know their own external address (especially behind NAT),
-                        // so the first relay peer that receives the response fills it in from the
-                        // transport layer's source address.
-                        let forward_payload = if payload.acceptor.peer_addr.is_unknown() {
-                            if let Some(acceptor_addr) = source_addr {
-                                let mut updated_payload = payload.clone();
-                                updated_payload.acceptor.peer_addr = PeerAddr::Known(acceptor_addr);
-                                tracing::debug!(
-                                    acceptor_pub_key = %updated_payload.acceptor.pub_key(),
-                                    acceptor_addr = %acceptor_addr,
-                                    "connect: filled acceptor address from source_addr"
-                                );
-                                updated_payload
-                            } else {
-                                tracing::warn!(
-                                    acceptor_pub_key = %payload.acceptor.pub_key(),
-                                    "connect: response received without source_addr, cannot fill acceptor address"
-                                );
-                                payload.clone()
-                            }
-                        } else {
-                            payload.clone()
-                        };
-
                         tracing::debug!(
                             upstream_addr = %upstream_addr,
-                            acceptor_pub_key = %forward_payload.acceptor.pub_key(),
+                            acceptor_pub_key = %payload.acceptor.pub_key(),
                             "connect: forwarding response towards joiner"
                         );
                         // Forward response toward the joiner via upstream
                         let forward_msg = ConnectMsg::Response {
                             id: self.id,
                             target: joiner,
-                            payload: forward_payload,
+                            payload,
                         };
                         network_bridge
                             .send(
@@ -1082,6 +1060,11 @@ impl Operation for ConnectOp {
                             .await?;
                         Ok(store_operation_state(&mut self))
                     } else {
+                        tracing::warn!(
+                            tx = %self.id,
+                            state = ?self.state,
+                            "connect: received Response but not in WaitingForResponses or Relaying state"
+                        );
                         Ok(store_operation_state(&mut self))
                     }
                 }
