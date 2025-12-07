@@ -379,7 +379,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         let config = gateway_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -391,7 +391,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         let config = peer_config.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
 
         // Run node until we receive shutdown signal

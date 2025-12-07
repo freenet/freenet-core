@@ -200,7 +200,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
-                .build(serve_gateway(config.ws_api).await)
+                .build(serve_gateway(config.ws_api).await?)
                 .await?;
             node.run().await
         }
@@ -218,7 +218,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
-                .build(serve_gateway(config.ws_api).await)
+                .build(serve_gateway(config.ws_api).await?)
                 .await?;
             node.run().await
         }

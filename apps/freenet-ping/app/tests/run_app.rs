@@ -237,7 +237,7 @@ async fn test_node_diagnostics_query() -> TestResult {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -248,7 +248,7 @@ async fn test_node_diagnostics_query() -> TestResult {
         let config = config_node.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -592,7 +592,7 @@ async fn test_ping_multi_node() -> TestResult {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -603,7 +603,7 @@ async fn test_ping_multi_node() -> TestResult {
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -614,7 +614,7 @@ async fn test_ping_multi_node() -> TestResult {
         let config = config_node2.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -1187,7 +1187,7 @@ async fn test_ping_application_loop() -> TestResult {
         let config = config_gw.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -1198,7 +1198,7 @@ async fn test_ping_application_loop() -> TestResult {
         let config = config_node1.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -1209,7 +1209,7 @@ async fn test_ping_application_loop() -> TestResult {
         let config = config_node2.build().await?;
         let node = NodeConfig::new(config.clone())
             .await?
-            .build(serve_gateway(config.ws_api).await)
+            .build(serve_gateway(config.ws_api).await?)
             .await?;
         node.run().await
     }
@@ -1678,7 +1678,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
-                .build(serve_gateway(config.ws_api).await)
+                .build(serve_gateway(config.ws_api).await?)
                 .await?;
             node.run().await
         }
@@ -1693,7 +1693,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             let config = config.build().await?;
             let node = NodeConfig::new(config.clone())
                 .await?
-                .build(serve_gateway(config.ws_api).await)
+                .build(serve_gateway(config.ws_api).await?)
                 .await?;
             node.run().await
         }

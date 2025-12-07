@@ -1418,7 +1418,7 @@ pub async fn run_local_node(
         _ => {}
     }
 
-    let (mut gw, mut ws_proxy) = crate::server::serve_gateway_in(socket).await;
+    let (mut gw, mut ws_proxy) = crate::server::serve_gateway_in(socket).await?;
 
     // TODO: use combinator instead
     // let mut all_clients =

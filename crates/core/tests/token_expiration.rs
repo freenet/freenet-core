@@ -198,6 +198,8 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
 
         let ws_socket = TcpListener::bind("127.0.0.1:0")?;
         let ws_port = ws_socket.local_addr()?.port();
+        // Drop the socket to release the port before the gateway binds to it
+        drop(ws_socket);
 
         let config = WebsocketApiConfig {
             address: Ipv4Addr::LOCALHOST.into(),
@@ -207,7 +209,7 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
         };
 
         // Start the gateway server (which spawns the cleanup task)
-        let (gw, _ws_proxy) = serve_gateway_for_test(config).await;
+        let (gw, _ws_proxy) = serve_gateway_for_test(config).await?;
 
         // Access the attested_contracts map via the test-only method
         let attested_contracts = gw.attested_contracts();
