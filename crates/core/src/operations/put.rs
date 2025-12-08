@@ -195,6 +195,9 @@ impl Operation for PutOp {
                         "Processing PUT Request"
                     );
 
+                    // Check if we're already subscribed to this contract BEFORE storing
+                    let was_seeding = op_manager.ring.is_seeding_contract(&key);
+
                     // Step 1: Store contract locally (all nodes cache)
                     let merged_value = put_contract(
                         op_manager,
@@ -206,9 +209,21 @@ impl Operation for PutOp {
                     .await?;
 
                     // Mark as seeding if not already
-                    if !op_manager.ring.is_seeding_contract(&key) {
+                    if !was_seeding {
                         op_manager.ring.seed_contract(key, value.size() as u64);
                         super::announce_contract_cached(op_manager, &key).await;
+                    }
+
+                    // If we were already subscribed and the merged value differs from input,
+                    // trigger an Update to propagate the change to other subscribers
+                    let state_changed = merged_value.as_ref() != value.as_ref();
+                    if was_seeding && state_changed {
+                        tracing::debug!(
+                            tx = %id,
+                            %key,
+                            "PUT on subscribed contract resulted in state change, triggering Update"
+                        );
+                        start_update_after_put(op_manager, id, key, merged_value.clone()).await;
                     }
 
                     // Step 2: Determine if we should forward or respond
@@ -366,6 +381,9 @@ async fn start_subscription_after_put(
     parent_tx: Transaction,
     key: ContractKey,
 ) {
+    // Note: This failed_parents check may be unnecessary since we only spawn the subscription
+    // at PUT completion, so there's no earlier child operation that could have failed.
+    // Keeping it as defensive check in case of race conditions not currently understood.
     if !op_manager.failed_parents().contains(&parent_tx) {
         let child_tx = super::start_subscription_request(op_manager, parent_tx, key);
         tracing::debug!(
@@ -381,6 +399,47 @@ async fn start_subscription_after_put(
             "Not starting subscription for failed parent PUT operation"
         );
     }
+}
+
+/// Helper to start an Update operation when a PUT on a subscribed contract results in state change.
+/// This propagates the merged state to other subscribers.
+async fn start_update_after_put(
+    op_manager: &OpManager,
+    parent_tx: Transaction,
+    key: ContractKey,
+    new_state: WrappedState,
+) {
+    use super::update;
+
+    let child_tx = Transaction::new_child_of::<update::UpdateMsg>(&parent_tx);
+    op_manager.expect_and_register_sub_operation(parent_tx, child_tx);
+
+    tracing::debug!(
+        tx = %parent_tx,
+        %child_tx,
+        %key,
+        "Starting Update as child operation after PUT changed subscribed contract state"
+    );
+
+    let op_manager_cloned = op_manager.clone();
+
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+
+        let update_op =
+            update::start_op_with_id(key, new_state, RelatedContracts::default(), child_tx);
+
+        match update::request_update(&op_manager_cloned, update_op).await {
+            Ok(_) => {
+                tracing::debug!(%child_tx, %parent_tx, %key, "child Update completed");
+            }
+            Err(error) => {
+                tracing::error!(%parent_tx, %child_tx, %key, %error, "child Update failed");
+                // Note: We don't propagate this failure to the parent PUT since the PUT itself
+                // succeeded - the Update is best-effort propagation to subscribers
+            }
+        }
+    });
 }
 
 pub(crate) fn start_op(
@@ -578,6 +637,10 @@ mod messages {
     /// The PUT operation stores a contract and its initial state in the network.
     /// It uses hop-by-hop routing: each node forwards toward the contract location
     /// and remembers where the request came from to route the response back.
+    ///
+    /// If a PUT reaches a node that is already subscribed to the contract and the
+    /// merged state differs from the input, an Update operation is triggered to
+    /// propagate the change to other subscribers.
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum PutMsg {
         /// Request to store a contract. Forwarded hop-by-hop toward contract location.
