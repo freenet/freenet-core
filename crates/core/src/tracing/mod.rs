@@ -252,26 +252,22 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Put(PutMsg::SuccessfulPut {
-                id,
-                target,
-                key,
-                origin,
-            }) => EventKind::Put(PutEvent::PutSuccess {
-                id: *id,
-                requester: origin.clone(),
-                target: target.clone(),
-                key: *key,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
+            NetMessageV1::Put(PutMsg::SuccessfulPut { id, target, key }) => {
+                EventKind::Put(PutEvent::PutSuccess {
+                    id: *id,
+                    requester: target.clone(), // Now using target as requester since origin was removed
+                    target: target.clone(),
+                    key: *key,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
             NetMessageV1::Put(PutMsg::Broadcasting {
                 new_value,
                 broadcast_to,
-                broadcasted_to, // broadcasted_to n peers
+                broadcasted_to,
                 key,
                 id,
                 upstream,
-                origin,
                 ..
             }) => EventKind::Put(PutEvent::BroadcastEmitted {
                 id: *id,
@@ -280,11 +276,10 @@ impl<'a> NetEventLog<'a> {
                 broadcasted_to: *broadcasted_to,
                 key: *key,
                 value: new_value.clone(),
-                sender: origin.clone(),
+                sender: upstream.clone(), // Using upstream as sender since origin was removed
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
             NetMessageV1::Put(PutMsg::BroadcastTo {
-                origin,
                 new_value,
                 key,
                 target,
@@ -292,7 +287,7 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => EventKind::Put(PutEvent::BroadcastReceived {
                 id: *id,
-                requester: origin.clone(),
+                requester: target.clone(), // Using target since origin was removed
                 key: *key,
                 value: new_value.clone(),
                 target: target.clone(),
