@@ -452,9 +452,7 @@ async fn test_subscription_validates_k_closest_usage() {
     {
         let op = SubscribeOp {
             id: transaction_id,
-            state: Some(SubscribeState::AwaitingResponse {
-                current_target: None,
-            }),
+            state: Some(SubscribeState::AwaitingResponse { next_hop: None }),
             upstream_addr: None,
         };
 

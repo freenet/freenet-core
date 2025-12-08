@@ -53,9 +53,10 @@ where
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
     pub return_msg: Option<NetMessage>,
-    /// Where to send the return message. Required if return_msg is Some.
-    /// This replaces the old pattern of embedding target in the message itself.
-    pub target_addr: Option<SocketAddr>,
+    /// The next hop to send the message to. Required if return_msg is Some.
+    /// For responses, this is upstream_addr (back toward originator).
+    /// For forwarded requests, this is the next peer toward the contract location.
+    pub next_hop: Option<SocketAddr>,
     /// None if the operation has been completed.
     pub state: Option<OpEnum>,
 }
@@ -117,7 +118,7 @@ where
         }
         Ok(OperationResult {
             return_msg: None,
-            target_addr: _,
+            next_hop: _,
             state: Some(final_state),
         }) if final_state.finalized() => {
             if op_manager.failed_parents().remove(&tx_id).is_some() {
@@ -151,14 +152,14 @@ where
         }
         Ok(OperationResult {
             return_msg: Some(msg),
-            target_addr,
+            next_hop,
             state: Some(updated_state),
         }) => {
             if updated_state.finalized() {
                 let id = *msg.id();
                 tracing::debug!(%id, "operation finalized with outgoing message");
                 op_manager.completed(id);
-                if let Some(target) = target_addr {
+                if let Some(target) = next_hop {
                     tracing::debug!(%id, ?target, "sending final message to target");
                     network_bridge.send(target, msg).await?;
                 }
@@ -166,7 +167,7 @@ where
             } else {
                 let id = *msg.id();
                 tracing::debug!(%id, "operation in progress");
-                if let Some(target) = target_addr {
+                if let Some(target) = next_hop {
                     tracing::debug!(%id, ?target, "sending updated op state");
                     network_bridge.send(target, msg).await?;
                     op_manager.push(id, updated_state).await?;
@@ -189,7 +190,7 @@ where
 
         Ok(OperationResult {
             return_msg: None,
-            target_addr: _,
+            next_hop: _,
             state: Some(updated_state),
         }) => {
             let id = *updated_state.id();
@@ -197,19 +198,19 @@ where
         }
         Ok(OperationResult {
             return_msg: Some(msg),
-            target_addr,
+            next_hop,
             state: None,
         }) => {
             op_manager.completed(tx_id);
 
-            if let Some(target) = target_addr {
+            if let Some(target) = next_hop {
                 tracing::debug!(%tx_id, ?target, "sending back message to target");
                 network_bridge.send(target, msg).await?;
             }
         }
         Ok(OperationResult {
             return_msg: None,
-            target_addr: _,
+            next_hop: _,
             state: None,
         }) => {
             op_manager.completed(tx_id);

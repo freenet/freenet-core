@@ -83,7 +83,7 @@ enum SubscribeState {
     /// Awaiting response from downstream peer.
     AwaitingResponse {
         /// The target we're sending to (for hop-by-hop routing)
-        current_target: Option<std::net::SocketAddr>,
+        next_hop: Option<std::net::SocketAddr>,
     },
     /// Subscription completed.
     Completed { key: ContractKey },
@@ -180,7 +180,7 @@ pub(crate) async fn request_subscribe(
     let op = SubscribeOp {
         id: *id,
         state: Some(SubscribeState::AwaitingResponse {
-            current_target: Some(target_addr),
+            next_hop: Some(target_addr),
         }),
         upstream_addr: None, // We're the originator
     };
@@ -267,7 +267,7 @@ impl SubscribeOp {
     /// an outbound message. Used for hop-by-hop routing.
     pub(crate) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
-            Some(SubscribeState::AwaitingResponse { current_target }) => *current_target,
+            Some(SubscribeState::AwaitingResponse { next_hop }) => *next_hop,
             _ => None,
         }
     }
@@ -302,7 +302,7 @@ impl Operation for SubscribeOp {
                     op: Self {
                         id,
                         state: Some(SubscribeState::AwaitingResponse {
-                            current_target: None, // Will be determined during processing
+                            next_hop: None, // Will be determined during processing
                         }),
                         upstream_addr: source_addr, // Store who sent us this request
                     },
@@ -366,7 +366,7 @@ impl Operation for SubscribeOp {
                                     key: *key,
                                     subscribed: true,
                                 })),
-                                target_addr: Some(upstream_addr),
+                                next_hop: Some(upstream_addr),
                                 state: None,
                             });
                         } else {
@@ -374,7 +374,7 @@ impl Operation for SubscribeOp {
                             complete_local_subscription(op_manager, *id, *key).await?;
                             return Ok(OperationResult {
                                 return_msg: None,
-                                target_addr: None,
+                                next_hop: None,
                                 state: None,
                             });
                         }
@@ -404,14 +404,14 @@ impl Operation for SubscribeOp {
                                     key: *key,
                                     subscribed: true,
                                 })),
-                                target_addr: Some(upstream_addr),
+                                next_hop: Some(upstream_addr),
                                 state: None,
                             });
                         } else {
                             complete_local_subscription(op_manager, *id, *key).await?;
                             return Ok(OperationResult {
                                 return_msg: None,
-                                target_addr: None,
+                                next_hop: None,
                                 state: None,
                             });
                         }
@@ -427,7 +427,7 @@ impl Operation for SubscribeOp {
                                     key: *key,
                                     subscribed: false,
                                 })),
-                                target_addr: Some(upstream_addr),
+                                next_hop: Some(upstream_addr),
                                 state: None,
                             });
                         }
@@ -461,7 +461,7 @@ impl Operation for SubscribeOp {
                                     key: *key,
                                     subscribed: false,
                                 })),
-                                target_addr: Some(upstream_addr),
+                                next_hop: Some(upstream_addr),
                                 state: None,
                             });
                         }
@@ -480,11 +480,11 @@ impl Operation for SubscribeOp {
                             htl: htl.saturating_sub(1),
                             skip_list: new_skip_list,
                         })),
-                        target_addr: Some(next_addr),
+                        next_hop: Some(next_addr),
                         state: Some(OpEnum::Subscribe(SubscribeOp {
                             id: *id,
                             state: Some(SubscribeState::AwaitingResponse {
-                                current_target: None, // Already routing via target_addr in OperationResult
+                                next_hop: None, // Already routing via next_hop in OperationResult
                             }),
                             upstream_addr: self.upstream_addr,
                         })),
@@ -519,7 +519,7 @@ impl Operation for SubscribeOp {
                                 key: *key,
                                 subscribed: *subscribed,
                             })),
-                            target_addr: Some(upstream_addr),
+                            next_hop: Some(upstream_addr),
                             state: Some(OpEnum::Subscribe(SubscribeOp {
                                 id,
                                 state: Some(SubscribeState::Completed { key: *key }),
@@ -531,7 +531,7 @@ impl Operation for SubscribeOp {
                         tracing::info!(tx = %msg_id, %key, subscribed, "Subscribe completed (originator)");
                         Ok(OperationResult {
                             return_msg: None,
-                            target_addr: None,
+                            next_hop: None,
                             state: Some(OpEnum::Subscribe(SubscribeOp {
                                 id,
                                 state: Some(SubscribeState::Completed { key: *key }),

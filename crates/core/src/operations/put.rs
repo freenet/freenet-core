@@ -281,7 +281,7 @@ impl Operation for PutOp {
 
                         Ok(OperationResult {
                             return_msg: Some(NetMessage::from(forward_msg)),
-                            target_addr: Some(next_addr),
+                            next_hop: Some(next_addr),
                             state: Some(OpEnum::Put(PutOp {
                                 id,
                                 state: new_state,
@@ -305,7 +305,7 @@ impl Operation for PutOp {
 
                             Ok(OperationResult {
                                 return_msg: None,
-                                target_addr: None,
+                                next_hop: None,
                                 state: Some(OpEnum::Put(PutOp {
                                     id,
                                     state: Some(PutState::Finished { key }),
@@ -320,7 +320,7 @@ impl Operation for PutOp {
 
                             Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(response)),
-                                target_addr: Some(upstream),
+                                next_hop: Some(upstream),
                                 state: None, // Operation complete for this node
                             })
                         }
@@ -351,7 +351,7 @@ impl Operation for PutOp {
 
                         Ok(OperationResult {
                             return_msg: None,
-                            target_addr: None,
+                            next_hop: None,
                             state: Some(OpEnum::Put(PutOp {
                                 id,
                                 state: Some(PutState::Finished { key: *key }),
@@ -373,7 +373,7 @@ impl Operation for PutOp {
 
                         Ok(OperationResult {
                             return_msg: Some(NetMessage::from(response)),
-                            target_addr: Some(upstream),
+                            next_hop: Some(upstream),
                             state: None, // Operation complete for this node
                         })
                     }

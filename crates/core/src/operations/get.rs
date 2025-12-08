@@ -211,7 +211,7 @@ pub(crate) async fn request_get(
                 requester: None,
                 current_hop: op_manager.ring.max_hops_to_live,
                 subscribe,
-                current_target: target.clone(),
+                next_hop: target.clone(),
                 tried_peers,
                 alternatives: candidates,
                 attempts_at_hop: 1,
@@ -273,7 +273,7 @@ enum GetState {
         /// Note: With connection-based routing, this is only used for state tracking,
         /// not for response routing (which uses upstream_addr instead).
         #[allow(dead_code)]
-        current_target: PeerKeyLocation,
+        next_hop: PeerKeyLocation,
         /// Peers we've already tried at this hop level
         tried_peers: HashSet<std::net::SocketAddr>,
         /// Alternative peers we could still try at this hop
@@ -391,7 +391,7 @@ impl GetOp {
     pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
         if let Some(GetState::AwaitingResponse {
             key,
-            current_target: _,
+            next_hop: _,
             skip_list: _,
             ..
         }) = &self.state
@@ -449,7 +449,7 @@ impl GetOp {
     /// an outbound message. Used for hop-by-hop routing.
     pub(crate) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
-            Some(GetState::AwaitingResponse { current_target, .. }) => current_target.socket_addr(),
+            Some(GetState::AwaitingResponse { next_hop, .. }) => next_hop.socket_addr(),
             _ => None,
         }
     }
@@ -812,7 +812,7 @@ impl Operation for GetOp {
                             mut tried_peers,
                             mut alternatives,
                             attempts_at_hop,
-                            current_target: _,
+                            next_hop: _,
                             skip_list,
                             ..
                         }) => {
@@ -863,7 +863,7 @@ impl Operation for GetOp {
                                     alternatives,
                                     attempts_at_hop: attempts_at_hop + 1,
                                     key,
-                                    current_target: next_target,
+                                    next_hop: next_target,
                                     // Preserve the accumulated skip_list so future candidate
                                     // selection still avoids already-specified peers; tried_peers
                                     // tracks attempts at this hop.
@@ -919,7 +919,7 @@ impl Operation for GetOp {
                                         alternatives: new_candidates,
                                         attempts_at_hop: 1,
                                         key,
-                                        current_target: target,
+                                        next_hop: target,
                                         skip_list: new_skip_list.clone(),
                                     });
                                 } else if let Some(requester_peer) = requester.clone() {
@@ -1295,13 +1295,13 @@ fn build_op_result(
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<OperationResult, OpError> {
-    // Determine the target address for sending the message:
+    // Determine the next hop for sending the message:
     // - For Response messages: route back to upstream_addr (who sent us the request)
-    // - For Request messages being forwarded: use current_target from state
-    let target_addr = match (&msg, &state) {
+    // - For Request messages being forwarded: use next_hop from state
+    let next_hop = match (&msg, &state) {
         (Some(GetMsg::Response { .. }), _) => upstream_addr,
-        (Some(GetMsg::Request { .. }), Some(GetState::AwaitingResponse { current_target, .. })) => {
-            current_target.socket_addr()
+        (Some(GetMsg::Request { .. }), Some(GetState::AwaitingResponse { next_hop, .. })) => {
+            next_hop.socket_addr()
         }
         _ => None,
     };
@@ -1315,7 +1315,7 @@ fn build_op_result(
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
-        target_addr,
+        next_hop,
         state: output_op.map(OpEnum::Get),
     })
 }
@@ -1393,7 +1393,7 @@ async fn try_forward_or_return(
                 fetch_contract,
                 current_hop: new_htl,
                 subscribe: false,
-                current_target: target.clone(),
+                next_hop: target.clone(),
                 tried_peers,
                 alternatives,
                 attempts_at_hop: 1,

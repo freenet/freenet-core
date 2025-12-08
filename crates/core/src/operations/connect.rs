@@ -1080,10 +1080,10 @@ fn store_operation_state(op: &mut ConnectOp) -> OperationResult {
 fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -> OperationResult {
     let state_clone = op.state.clone();
     // Hop-by-hop routing: messages are sent directly via network_bridge.send() with
-    // explicit target addresses. No target_addr is embedded in the message.
+    // explicit target addresses. No next_hop is embedded in the result.
     OperationResult {
         return_msg: msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m))),
-        target_addr: None,
+        next_hop: None,
         state: state_clone.map(|state| {
             OpEnum::Connect(Box::new(ConnectOp {
                 id: op.id,
