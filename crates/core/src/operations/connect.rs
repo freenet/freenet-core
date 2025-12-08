@@ -33,23 +33,23 @@ const RECENCY_COOLDOWN: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum ConnectMsg {
     /// Join request that travels *towards* the target location.
+    /// Routing is determined by `payload.desired_location`, not an embedded target.
     /// The sender is determined from the transport layer's source address.
     Request {
         id: Transaction,
-        target: PeerKeyLocation,
         payload: ConnectRequest,
     },
     /// Join acceptance that travels back along the discovered path.
+    /// Routing uses hop-by-hop via `upstream_addr` stored in operation state.
     /// The sender is determined from the transport layer's source address.
     Response {
         id: Transaction,
-        target: PeerKeyLocation,
         payload: ConnectResponse,
     },
     /// Informational packet letting the joiner know the address a peer observed.
+    /// Routing uses hop-by-hop via `upstream_addr` stored in operation state.
     ObservedAddress {
         id: Transaction,
-        target: PeerKeyLocation,
         address: SocketAddr,
     },
 }
@@ -60,15 +60,6 @@ impl InnerMessage for ConnectMsg {
             ConnectMsg::Request { id, .. }
             | ConnectMsg::Response { id, .. }
             | ConnectMsg::ObservedAddress { id, .. } => id,
-        }
-    }
-
-    #[allow(refining_impl_trait)]
-    fn target(&self) -> Option<&PeerKeyLocation> {
-        match self {
-            ConnectMsg::Request { target, .. }
-            | ConnectMsg::Response { target, .. }
-            | ConnectMsg::ObservedAddress { target, .. } => Some(target),
         }
     }
 
@@ -83,40 +74,17 @@ impl InnerMessage for ConnectMsg {
 impl fmt::Display for ConnectMsg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConnectMsg::Request {
-                target, payload, ..
-            } => write!(
+            ConnectMsg::Request { payload, .. } => write!(
                 f,
-                "ConnectRequest {{ target: {target}, desired: {}, ttl: {}, joiner: {} }}",
+                "ConnectRequest {{ desired: {}, ttl: {}, joiner: {} }}",
                 payload.desired_location, payload.ttl, payload.joiner
             ),
-            ConnectMsg::Response {
-                target, payload, ..
-            } => write!(
-                f,
-                "ConnectResponse {{ target: {target}, acceptor: {} }}",
-                payload.acceptor,
-            ),
-            ConnectMsg::ObservedAddress {
-                target, address, ..
-            } => {
-                write!(
-                    f,
-                    "ObservedAddress {{ target: {target}, address: {address} }}"
-                )
+            ConnectMsg::Response { payload, .. } => {
+                write!(f, "ConnectResponse {{ acceptor: {} }}", payload.acceptor,)
             }
-        }
-    }
-}
-
-impl ConnectMsg {
-    /// Returns the socket address of the target peer for routing.
-    /// Used by OperationResult to determine where to send the message.
-    pub fn target_addr(&self) -> Option<SocketAddr> {
-        match self {
-            ConnectMsg::Request { target, .. }
-            | ConnectMsg::Response { target, .. }
-            | ConnectMsg::ObservedAddress { target, .. } => target.socket_addr(),
+            ConnectMsg::ObservedAddress { address, .. } => {
+                write!(f, "ObservedAddress {{ address: {address} }}")
+            }
         }
     }
 }
@@ -200,8 +168,6 @@ pub(crate) struct RelayActions {
     pub expect_connection_from: Option<PeerKeyLocation>,
     pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
     pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
-    /// The target to send the ConnectResponse to (with observed external address).
-    pub response_target: Option<PeerKeyLocation>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,8 +275,7 @@ impl RelayState {
                 acceptor: acceptor.clone(),
             });
             actions.expect_connection_from = Some(self.request.joiner.clone());
-            // Use the joiner with updated observed address for response routing
-            actions.response_target = Some(self.request.joiner.clone());
+            // Response is routed hop-by-hop via upstream_addr, no target embedded in message
             tracing::info!(
                 acceptor_pub_key = %self_loc.pub_key(),
                 joiner_pub_key = %self.request.joiner.pub_key(),
@@ -632,6 +597,12 @@ impl ConnectOp {
         self.gateway.as_deref()
     }
 
+    /// Get the target address if this operation is in a state that needs to send
+    /// an outbound message. For Connect, this is the gateway we're connecting to.
+    pub(crate) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
+        self.gateway.as_deref().and_then(|g| g.socket_addr())
+    }
+
     fn take_desired_location(&mut self) -> Option<Location> {
         self.desired_location.take()
     }
@@ -677,7 +648,6 @@ impl ConnectOp {
 
         let msg = ConnectMsg::Request {
             id: tx,
-            target,
             payload: request,
         };
 
@@ -824,14 +794,12 @@ impl Operation for ConnectOp {
                     let actions =
                         self.handle_request(&env, upstream_addr, payload.clone(), &estimator);
 
-                    if let Some((target, address)) = actions.observed_address {
+                    if let Some((_target, address)) = actions.observed_address {
                         let msg = ConnectMsg::ObservedAddress {
                             id: self.id,
-                            target: target.clone(),
                             address,
                         };
-                        // Route through upstream (where the request came from) since we may
-                        // not have a direct connection to the target.
+                        // Route through upstream (where the request came from) using hop-by-hop routing.
                         // Note: upstream_addr is already validated from source_addr at the start of this match arm.
                         network_bridge
                             .send(upstream_addr, NetMessage::V1(NetMessageV1::Connect(msg)))
@@ -900,7 +868,6 @@ impl Operation for ConnectOp {
                         self.recency.insert(next.clone(), Instant::now());
                         let forward_msg = ConnectMsg::Request {
                             id: self.id,
-                            target: next.clone(),
                             payload: request,
                         };
                         if let Some(next_addr) = next.socket_addr() {
@@ -914,20 +881,12 @@ impl Operation for ConnectOp {
                     }
 
                     if let Some(response) = actions.accept_response {
-                        // response_target has the joiner's address (filled in from packet source)
-                        let response_target = actions.response_target.ok_or_else(|| {
-                            OpError::from(ConnectionError::TransportError(
-                                "ConnectMsg::Request: accept_response but no response_target"
-                                    .into(),
-                            ))
-                        })?;
                         let response_msg = ConnectMsg::Response {
                             id: self.id,
-                            target: response_target,
                             payload: response,
                         };
                         // Route the response through upstream (where the request came from)
-                        // since we may not have a direct connection to the joiner.
+                        // using hop-by-hop routing. We don't embed target in the message.
                         // Note: upstream_addr is already validated from source_addr at the start of this match arm.
                         network_bridge
                             .send(
@@ -1027,14 +986,13 @@ impl Operation for ConnectOp {
 
                         Ok(store_operation_state(&mut self))
                     } else if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
-                        // Relay: forward response toward joiner
-                        let (forwarded, desired, upstream_addr, joiner) = {
+                        // Relay: forward response toward joiner via hop-by-hop routing
+                        let (forwarded, desired, upstream_addr) = {
                             let st = state;
                             (
                                 st.forwarded_to.clone(),
                                 st.request.desired_location,
                                 st.upstream_addr,
-                                st.request.joiner.clone(),
                             )
                         };
                         if let Some(fwd) = forwarded {
@@ -1046,10 +1004,9 @@ impl Operation for ConnectOp {
                             acceptor_pub_key = %payload.acceptor.pub_key(),
                             "connect: forwarding response towards joiner"
                         );
-                        // Forward response toward the joiner via upstream
+                        // Forward response toward the joiner via upstream using hop-by-hop routing
                         let forward_msg = ConnectMsg::Response {
                             id: self.id,
-                            target: joiner,
                             payload,
                         };
                         network_bridge
@@ -1116,11 +1073,11 @@ fn store_operation_state(op: &mut ConnectOp) -> OperationResult {
 
 fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -> OperationResult {
     let state_clone = op.state.clone();
-    // Extract target address from the message for routing
-    let target_addr = msg.as_ref().and_then(|m| m.target_addr());
+    // Hop-by-hop routing: messages are sent directly via network_bridge.send() with
+    // explicit target addresses. No target_addr is embedded in the message.
     OperationResult {
         return_msg: msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m))),
-        target_addr,
+        target_addr: None,
         state: state_clone.map(|state| {
             OpEnum::Connect(Box::new(ConnectOp {
                 id: op.id,
@@ -1627,12 +1584,7 @@ mod tests {
         );
 
         match msg {
-            ConnectMsg::Request {
-                target: msg_target,
-                payload,
-                ..
-            } => {
-                assert_eq!(msg_target.pub_key(), target.pub_key());
+            ConnectMsg::Request { payload, .. } => {
                 assert_eq!(payload.desired_location, desired);
                 assert_eq!(payload.ttl, ttl);
                 // visited now contains SocketAddr, not PeerKeyLocation
@@ -1713,10 +1665,10 @@ mod tests {
         assert_eq!(expect_conn.pub_key(), joiner.pub_key());
     }
 
-    /// Regression test for issue #2141: ConnectResponse must be sent to the joiner's
-    /// observed external address, not the original private/NAT address.
+    /// Regression test for issue #2141: expect_connection_from must have the joiner's
+    /// observed external address for NAT hole-punching to work.
     #[test]
-    fn connect_response_uses_observed_address_not_private() {
+    fn connect_expect_connection_uses_observed_address() {
         // Joiner behind NAT: original creation used private address, but the network bridge
         // fills in the observed public address from the packet source.
         let private_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 9000);
@@ -1756,16 +1708,17 @@ mod tests {
             "relay should accept joiner"
         );
 
-        // Critical: response_target must have the observed public address, not private
-        let response_target = actions
-            .response_target
-            .expect("response_target should be set when accepting");
+        // Critical: expect_connection_from must have the observed public address
+        // so the acceptor can initiate hole-punching to the correct address
+        let expect_conn = actions
+            .expect_connection_from
+            .expect("expect_connection_from should be set when accepting");
         assert_eq!(
-            response_target
+            expect_conn
                 .socket_addr()
-                .expect("response target must have address"),
+                .expect("expect_connection_from must have address"),
             observed_public_addr,
-            "response_target must use observed external address ({}) not private address ({})",
+            "expect_connection_from must use observed external address ({}) not private address ({})",
             observed_public_addr,
             private_addr
         );

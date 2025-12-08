@@ -155,7 +155,6 @@ impl Operation for UpdateOp {
                 UpdateMsg::RequestUpdate {
                     id,
                     key,
-                    target,
                     related_contracts,
                     value,
                 } => {
@@ -164,44 +163,26 @@ impl Operation for UpdateOp {
                         .clone()
                         .expect("RequestUpdate requires source_addr");
                     let self_location = op_manager.ring.connection_manager.own_location();
-
                     let executing_addr = self_location.socket_addr();
-                    let request_sender_addr = request_sender.socket_addr();
-                    let target_addr_opt = target.socket_addr();
 
                     tracing::debug!(
                         tx = %id,
                         %key,
                         executing_peer = ?executing_addr,
-                        request_sender = ?request_sender_addr,
-                        target_peer = ?target_addr_opt,
-                        "UPDATE RequestUpdate: executing_peer received request from sender targeting peer"
+                        request_sender = ?request_sender.socket_addr(),
+                        "UPDATE RequestUpdate: processing request"
                     );
 
-                    // If target is not us, this message is meant for another peer
-                    // This can happen when the initiator processes its own message before sending to network
-                    if target_addr_opt != executing_addr {
-                        tracing::debug!(
-                            tx = %id,
-                            %key,
-                            our_peer = ?executing_addr,
-                            target_peer = ?target_addr_opt,
-                            "RequestUpdate target is not us - message will be routed to target"
-                        );
-                        // Keep current state, message will be sent to target peer via network
-                        return_msg = None;
-                        new_state = self.state;
+                    // With hop-by-hop routing, if we receive the message, we process it.
+                    // Determine if this is a local request (from our own client) or remote request
+                    let is_local_request =
+                        matches!(&self.state, Some(UpdateState::PrepareRequest { .. }));
+                    let upstream = if is_local_request {
+                        None // No upstream - we are the initiator
                     } else {
-                        // Target is us - process the request
-                        // Determine if this is a local request (from our own client) or remote request
-                        let is_local_request =
-                            matches!(&self.state, Some(UpdateState::PrepareRequest { .. }));
-                        let upstream = if is_local_request {
-                            None // No upstream - we are the initiator
-                        } else {
-                            Some(request_sender.clone()) // Upstream is the peer that sent us this request
-                        };
-
+                        Some(request_sender.clone()) // Upstream is the peer that sent us this request
+                    };
+                    {
                         // First check if we have the contract locally
                         let has_contract = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
@@ -336,7 +317,6 @@ impl Operation for UpdateOp {
                                 // Create a SeekNode message to forward to the next hop
                                 return_msg = Some(UpdateMsg::SeekNode {
                                     id: *id,
-                                    target: forward_target,
                                     value: value.clone(),
                                     key: *key,
                                     related_contracts: related_contracts.clone(),
@@ -383,7 +363,6 @@ impl Operation for UpdateOp {
                     value,
                     key,
                     related_contracts,
-                    target: _,
                 } => {
                     // Get sender from connection-based routing
                     let sender = sender_from_addr
@@ -507,7 +486,6 @@ impl Operation for UpdateOp {
                             // Forward SeekNode to the next peer
                             return_msg = Some(UpdateMsg::SeekNode {
                                 id: *id,
-                                target: forward_target,
                                 value: value.clone(),
                                 key: *key,
                                 related_contracts: related_contracts.clone(),
@@ -548,12 +526,7 @@ impl Operation for UpdateOp {
                         }
                     }
                 }
-                UpdateMsg::BroadcastTo {
-                    id,
-                    key,
-                    new_value,
-                    target: _,
-                } => {
+                UpdateMsg::BroadcastTo { id, key, new_value } => {
                     // Get sender from connection-based routing
                     let sender = sender_from_addr
                         .clone()
@@ -620,7 +593,6 @@ impl Operation for UpdateOp {
                     broadcasted_to,
                     key,
                     new_value,
-                    upstream: _upstream,
                     ..
                 } => {
                     let mut broadcasted_to = *broadcasted_to;
@@ -632,7 +604,6 @@ impl Operation for UpdateOp {
                             id: *id,
                             key: *key,
                             new_value: new_value.clone(),
-                            target: peer.clone(),
                         };
                         let peer_addr = peer
                             .socket_addr()
@@ -692,7 +663,7 @@ async fn try_to_broadcast(
     last_hop: bool,
     _op_manager: &OpManager,
     state: Option<UpdateState>,
-    (broadcast_to, upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
+    (broadcast_to, _upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
     key: ContractKey,
     new_value: WrappedState,
     is_from_a_broadcasted_to_peer: bool,
@@ -727,7 +698,6 @@ async fn try_to_broadcast(
                     broadcasted_to: 0,
                     broadcast_to,
                     key,
-                    upstream,
                 });
             } else {
                 new_state = None;
@@ -857,8 +827,9 @@ fn build_op_result(
     stats: Option<UpdateStats>,
     upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<super::OperationResult, OpError> {
-    // Extract target address from the message for routing
-    let target_addr = return_msg.as_ref().and_then(|m| m.target_addr());
+    // With hop-by-hop routing, target_addr is None - routing uses upstream_addr for responses
+    // and explicit addresses for broadcasts
+    let target_addr = None;
 
     let output_op = state.map(|op| UpdateOp {
         id,
@@ -1252,7 +1223,6 @@ pub(crate) async fn request_update(
         id,
         key,
         related_contracts,
-        target,
         value: updated_value, // Send the updated value, not the original
     };
 
@@ -1332,7 +1302,7 @@ impl IsOperationCompleted for UpdateOp {
 }
 
 mod messages {
-    use std::{borrow::Borrow, fmt::Display};
+    use std::fmt::Display;
 
     use freenet_stdlib::prelude::{ContractKey, RelatedContracts, WrappedState};
     use serde::{Deserialize, Serialize};
@@ -1343,88 +1313,63 @@ mod messages {
     };
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
+    /// Update operation messages.
+    ///
+    /// Uses hop-by-hop routing for request/response. Broadcasting to subscribers
+    /// uses explicit addresses since there are multiple targets.
     pub(crate) enum UpdateMsg {
+        /// Initial request to update a contract state. Forwarded hop-by-hop toward contract location.
         RequestUpdate {
             id: Transaction,
             key: ContractKey,
-            target: PeerKeyLocation,
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
             value: WrappedState,
         },
-        AwaitUpdate {
-            id: Transaction,
-        },
+        /// Waiting for update to complete (internal state message).
+        AwaitUpdate { id: Transaction },
+        /// Forward update request to next hop closer to contract location.
         SeekNode {
             id: Transaction,
-            target: PeerKeyLocation,
             value: WrappedState,
             key: ContractKey,
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
         },
-        /// Internal node instruction that  a change (either a first time insert or an update).
+        /// Internal node instruction to track broadcasting progress.
         Broadcasting {
             id: Transaction,
             broadcasted_to: usize,
             broadcast_to: Vec<PeerKeyLocation>,
             key: ContractKey,
             new_value: WrappedState,
-            //contract: ContractContainer,
-            upstream: PeerKeyLocation,
         },
-        /// Broadcasting a change to a peer, which then will relay the changes to other peers.
+        /// Broadcasting a change to a specific subscriber.
         BroadcastTo {
             id: Transaction,
             key: ContractKey,
             new_value: WrappedState,
-            target: PeerKeyLocation,
         },
     }
 
     impl InnerMessage for UpdateMsg {
         fn id(&self) -> &Transaction {
             match self {
-                UpdateMsg::RequestUpdate { id, .. } => id,
-                UpdateMsg::AwaitUpdate { id, .. } => id,
-                UpdateMsg::SeekNode { id, .. } => id,
-                UpdateMsg::Broadcasting { id, .. } => id,
-                UpdateMsg::BroadcastTo { id, .. } => id,
-            }
-        }
-
-        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
-            match self {
-                UpdateMsg::RequestUpdate { target, .. } => Some(target),
-                UpdateMsg::SeekNode { target, .. } => Some(target),
-                UpdateMsg::BroadcastTo { target, .. } => Some(target),
-                _ => None,
+                UpdateMsg::RequestUpdate { id, .. }
+                | UpdateMsg::AwaitUpdate { id, .. }
+                | UpdateMsg::SeekNode { id, .. }
+                | UpdateMsg::Broadcasting { id, .. }
+                | UpdateMsg::BroadcastTo { id, .. } => id,
             }
         }
 
         fn requested_location(&self) -> Option<crate::ring::Location> {
             match self {
-                UpdateMsg::RequestUpdate { key, .. } => Some(Location::from(key.id())),
-                UpdateMsg::SeekNode { key, .. } => Some(Location::from(key.id())),
-                UpdateMsg::Broadcasting { key, .. } => Some(Location::from(key.id())),
-                UpdateMsg::BroadcastTo { key, .. } => Some(Location::from(key.id())),
-                _ => None,
-            }
-        }
-    }
-
-    impl UpdateMsg {
-        // sender() method removed - use connection-based routing via source_addr instead
-
-        /// Returns the socket address of the target peer for routing.
-        /// Used by OperationResult to determine where to send the message.
-        pub fn target_addr(&self) -> Option<std::net::SocketAddr> {
-            match self {
-                Self::RequestUpdate { target, .. }
-                | Self::SeekNode { target, .. }
-                | Self::BroadcastTo { target, .. } => target.socket_addr(),
-                // AwaitUpdate and Broadcasting are internal messages, no network target
-                Self::AwaitUpdate { .. } | Self::Broadcasting { .. } => None,
+                UpdateMsg::RequestUpdate { key, .. }
+                | UpdateMsg::SeekNode { key, .. }
+                | UpdateMsg::Broadcasting { key, .. }
+                | UpdateMsg::BroadcastTo { key, .. } => Some(Location::from(key.id())),
+                UpdateMsg::AwaitUpdate { .. } => None,
             }
         }
     }

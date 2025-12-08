@@ -76,6 +76,14 @@ impl PutOp {
             .into())
         }
     }
+
+    /// Get the target address if this operation is in a state that needs to send
+    /// an outbound message. PUT messages from originators are processed locally first
+    /// (to store the contract), then routing is determined in process_message.
+    /// Returns None since PUT doesn't store a pre-determined target.
+    pub(super) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
 }
 
 impl IsOperationCompleted for PutOp {
@@ -624,13 +632,13 @@ async fn put_contract(
 }
 
 mod messages {
-    use std::{borrow::Borrow, collections::HashSet, fmt::Display};
+    use std::{collections::HashSet, fmt::Display};
 
     use freenet_stdlib::prelude::*;
     use serde::{Deserialize, Serialize};
 
     use crate::message::{InnerMessage, Transaction};
-    use crate::ring::{Location, PeerKeyLocation};
+    use crate::ring::Location;
 
     /// PUT operation messages.
     ///
@@ -669,11 +677,6 @@ mod messages {
             match self {
                 Self::Request { id, .. } | Self::Response { id, .. } => id,
             }
-        }
-
-        fn target(&self) -> Option<impl Borrow<PeerKeyLocation>> {
-            // No embedded target - routing is done via upstream_addr and next-hop selection
-            None::<&PeerKeyLocation>
         }
 
         fn requested_location(&self) -> Option<Location> {

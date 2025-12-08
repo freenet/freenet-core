@@ -653,9 +653,11 @@ impl OpManager {
     /// Notify the operation manager that a transaction is being transacted over the network.
     pub fn sending_transaction(&self, peer: &PeerKeyLocation, msg: &NetMessage) {
         let transaction = msg.id();
-        if let (Some(recipient), Some(target)) = (msg.target(), msg.requested_location()) {
+        // With hop-by-hop routing, record the request using the peer we're sending to
+        // and the message's requested location (contract location)
+        if let Some(target_loc) = msg.requested_location() {
             self.ring
-                .record_request(recipient.clone(), target, transaction.transaction_type());
+                .record_request(peer.clone(), target_loc, transaction.transaction_type());
         }
         if let Some(peer_addr) = peer.socket_addr() {
             self.ring
