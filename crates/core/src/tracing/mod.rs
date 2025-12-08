@@ -236,63 +236,27 @@ impl<'a> NetEventLog<'a> {
                 ];
                 return Either::Right(events);
             }
-            NetMessageV1::Put(PutMsg::RequestPut {
-                contract,
-                target,
-                id,
-                ..
-            }) => {
+            NetMessageV1::Put(PutMsg::Request { contract, id, .. }) => {
                 let this_peer = &op_manager.ring.connection_manager.own_location();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
                     requester: this_peer.clone(),
-                    target: target.clone(),
+                    target: this_peer.clone(), // No embedded target - use own location
                     key,
                     id: *id,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Put(PutMsg::SuccessfulPut { id, target, key }) => {
+            NetMessageV1::Put(PutMsg::Response { id, key }) => {
+                let this_peer = &op_manager.ring.connection_manager.own_location();
                 EventKind::Put(PutEvent::PutSuccess {
                     id: *id,
-                    requester: target.clone(), // Now using target as requester since origin was removed
-                    target: target.clone(),
+                    requester: this_peer.clone(),
+                    target: this_peer.clone(),
                     key: *key,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Put(PutMsg::Broadcasting {
-                new_value,
-                broadcast_to,
-                broadcasted_to,
-                key,
-                id,
-                upstream,
-                ..
-            }) => EventKind::Put(PutEvent::BroadcastEmitted {
-                id: *id,
-                upstream: upstream.clone(),
-                broadcast_to: broadcast_to.clone(),
-                broadcasted_to: *broadcasted_to,
-                key: *key,
-                value: new_value.clone(),
-                sender: upstream.clone(), // Using upstream as sender since origin was removed
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
-            NetMessageV1::Put(PutMsg::BroadcastTo {
-                new_value,
-                key,
-                target,
-                id,
-                ..
-            }) => EventKind::Put(PutEvent::BroadcastReceived {
-                id: *id,
-                requester: target.clone(), // Using target since origin was removed
-                key: *key,
-                value: new_value.clone(),
-                target: target.clone(),
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
             NetMessageV1::Get(GetMsg::ReturnGet {
                 id,
                 key,

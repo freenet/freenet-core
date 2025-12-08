@@ -481,7 +481,6 @@ impl ComposeNetworkMessage<operations::put::PutOp> for PutContract {
             related_contracts,
             state,
             op_manager.ring.max_hops_to_live,
-            false,
         )
     }
 

@@ -463,7 +463,6 @@ async fn test_subscription_validates_k_closest_usage() {
             state: Some(SubscribeState::AwaitingResponse {
                 skip_list: skip_list.clone(),
                 retries: 2,
-                upstream_subscriber: None,
                 current_hop: 5,
             }),
             upstream_addr: None,
