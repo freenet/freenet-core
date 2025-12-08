@@ -97,7 +97,8 @@ jobs:
     env:
       FREENET_LOG: error
       # Enable debug logging for transport layer to diagnose packet delivery issues
-      RUST_LOG: "error,freenet::transport::peer_connection=debug,freenet_core::transport::peer_connection=debug"
+      # Also allow info level for test_utils so logger capture tests work
+      RUST_LOG: "error,freenet::transport::peer_connection=debug,freenet_core::transport::peer_connection=debug,freenet::test_utils=info,freenet_core::test_utils=info"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
