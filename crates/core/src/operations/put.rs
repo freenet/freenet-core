@@ -167,6 +167,13 @@ impl Operation for PutOp {
             let upstream_addr = self.upstream_addr;
             let is_originator = upstream_addr.is_none();
 
+            // Extract subscribe flag from state (only relevant for originator)
+            let subscribe = match &self.state {
+                Some(PutState::PrepareRequest { subscribe, .. }) => *subscribe,
+                Some(PutState::AwaitingResponse { subscribe }) => *subscribe,
+                _ => false,
+            };
+
             match input {
                 PutMsg::Request {
                     id: _msg_id,
@@ -184,6 +191,7 @@ impl Operation for PutOp {
                         %key,
                         htl,
                         is_originator,
+                        subscribe,
                         "Processing PUT Request"
                     );
 
@@ -245,9 +253,8 @@ impl Operation for PutOp {
                             skip_list: new_skip_list,
                         };
 
-                        // If we're the originator, transition to AwaitingResponse
-                        // Otherwise, we're a forwarder and need to wait for response
-                        let new_state = Some(PutState::AwaitingResponse);
+                        // Transition to AwaitingResponse, preserving subscribe flag for originator
+                        let new_state = Some(PutState::AwaitingResponse { subscribe });
 
                         Ok(OperationResult {
                             return_msg: Some(NetMessage::from(forward_msg)),
@@ -268,6 +275,11 @@ impl Operation for PutOp {
 
                         if is_originator {
                             // We're both originator and final destination
+                            // Start subscription if requested
+                            if subscribe {
+                                start_subscription_after_put(op_manager, id, key).await;
+                            }
+
                             Ok(OperationResult {
                                 return_msg: None,
                                 target_addr: None,
@@ -297,6 +309,7 @@ impl Operation for PutOp {
                         tx = %id,
                         %key,
                         is_originator,
+                        subscribe,
                         "Processing PUT Response"
                     );
 
@@ -307,6 +320,11 @@ impl Operation for PutOp {
                             %key,
                             "PUT operation completed successfully"
                         );
+
+                        // Start subscription if requested
+                        if subscribe {
+                            start_subscription_after_put(op_manager, id, *key).await;
+                        }
 
                         Ok(OperationResult {
                             return_msg: None,
@@ -342,11 +360,35 @@ impl Operation for PutOp {
     }
 }
 
+/// Helper to start subscription after PUT completes (only for originator)
+async fn start_subscription_after_put(
+    op_manager: &OpManager,
+    parent_tx: Transaction,
+    key: ContractKey,
+) {
+    if !op_manager.failed_parents().contains(&parent_tx) {
+        let child_tx = super::start_subscription_request(op_manager, parent_tx, key);
+        tracing::debug!(
+            tx = %parent_tx,
+            %child_tx,
+            %key,
+            "Started subscription as child operation after PUT"
+        );
+    } else {
+        tracing::warn!(
+            tx = %parent_tx,
+            %key,
+            "Not starting subscription for failed parent PUT operation"
+        );
+    }
+}
+
 pub(crate) fn start_op(
     contract: ContractContainer,
     related_contracts: RelatedContracts<'static>,
     value: WrappedState,
     htl: usize,
+    subscribe: bool,
 ) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
@@ -358,6 +400,7 @@ pub(crate) fn start_op(
         related_contracts,
         value,
         htl,
+        subscribe,
     });
 
     PutOp {
@@ -373,6 +416,7 @@ pub(crate) fn start_op_with_id(
     related_contracts: RelatedContracts<'static>,
     value: WrappedState,
     htl: usize,
+    subscribe: bool,
     id: Transaction,
 ) -> PutOp {
     let key = contract.key();
@@ -384,6 +428,7 @@ pub(crate) fn start_op_with_id(
         related_contracts,
         value,
         htl,
+        subscribe,
     });
 
     PutOp {
@@ -407,9 +452,14 @@ pub enum PutState {
         related_contracts: RelatedContracts<'static>,
         value: WrappedState,
         htl: usize,
+        /// If true, start a subscription after PUT completes
+        subscribe: bool,
     },
     /// Waiting for response from downstream node.
-    AwaitingResponse,
+    AwaitingResponse {
+        /// If true, start a subscription after PUT completes (originator only)
+        subscribe: bool,
+    },
     /// Operation completed successfully.
     Finished { key: ContractKey },
 }
@@ -417,18 +467,20 @@ pub enum PutState {
 /// Request to insert/update a value into a contract.
 /// Called when a client initiates a PUT operation.
 pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result<(), OpError> {
-    let (id, contract, value, related_contracts, htl) = match &put_op.state {
+    let (id, contract, value, related_contracts, htl, subscribe) = match &put_op.state {
         Some(PutState::PrepareRequest {
             contract,
             value,
             related_contracts,
             htl,
+            subscribe,
         }) => (
             put_op.id,
             contract.clone(),
             value.clone(),
             related_contracts.clone(),
             *htl,
+            *subscribe,
         ),
         _ => {
             tracing::error!(
@@ -442,7 +494,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
 
     let key = contract.key();
 
-    tracing::info!(tx = %id, %key, htl, "Starting PUT operation");
+    tracing::info!(tx = %id, %key, htl, subscribe, "Starting PUT operation");
 
     // Build initial skip list with our own address
     let mut skip_list = HashSet::new();
@@ -464,7 +516,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
     // Note: upstream_addr is None because we're the originator
     let new_op = PutOp {
         id,
-        state: Some(PutState::AwaitingResponse),
+        state: Some(PutState::AwaitingResponse { subscribe }),
         upstream_addr: None,
     };
 
@@ -628,7 +680,7 @@ mod tests {
 
     #[test]
     fn put_op_not_finalized_when_awaiting_response() {
-        let op = make_put_op(Some(PutState::AwaitingResponse));
+        let op = make_put_op(Some(PutState::AwaitingResponse { subscribe: false }));
         assert!(
             !op.finalized(),
             "PutOp should not be finalized in AwaitingResponse state"
@@ -658,7 +710,7 @@ mod tests {
 
     #[test]
     fn put_op_to_host_result_error_when_not_finished() {
-        let op = make_put_op(Some(PutState::AwaitingResponse));
+        let op = make_put_op(Some(PutState::AwaitingResponse { subscribe: false }));
         let result = op.to_host_result();
         assert!(
             result.is_err(),
@@ -690,7 +742,7 @@ mod tests {
 
     #[test]
     fn put_op_is_not_completed_when_in_progress() {
-        let op = make_put_op(Some(PutState::AwaitingResponse));
+        let op = make_put_op(Some(PutState::AwaitingResponse { subscribe: false }));
         assert!(
             !op.is_completed(),
             "is_completed should return false for AwaitingResponse state"

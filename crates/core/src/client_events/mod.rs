@@ -476,13 +476,12 @@ async fn process_open_request(
 
                             // Start a local PUT operation without going through the router
                             // This avoids the race condition while still providing proper result delivery
-                            // Note: subscribe is handled separately via Subscribe operation
-                            let _ = subscribe;
                             let op = put::start_op(
                                 contract.clone(),
                                 related_contracts.clone(),
                                 state.clone(),
                                 op_manager.ring.max_hops_to_live,
+                                subscribe,
                             );
                             let op_id = op.id;
 
@@ -568,13 +567,12 @@ async fn process_open_request(
                                     "Starting new PUT network operation via RequestRouter",
                                 );
 
-                                // Note: subscribe is handled separately via Subscribe operation
-                                let _ = subscribe;
                                 let op = put::start_op_with_id(
                                     contract.clone(),
                                     related_contracts.clone(),
                                     state.clone(),
                                     op_manager.ring.max_hops_to_live,
+                                    subscribe,
                                     transaction_id,
                                 );
 
@@ -613,13 +611,12 @@ async fn process_open_request(
                             );
 
                             // Legacy mode: direct operation without deduplication
-                            // Note: subscribe is handled separately via Subscribe operation
-                            let _ = subscribe;
                             let op = put::start_op(
                                 contract.clone(),
                                 related_contracts.clone(),
                                 state.clone(),
                                 op_manager.ring.max_hops_to_live,
+                                subscribe,
                             );
                             let op_id = op.id;
 
