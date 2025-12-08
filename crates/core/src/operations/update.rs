@@ -33,6 +33,15 @@ impl UpdateOp {
         matches!(self.state, None | Some(UpdateState::Finished { .. }))
     }
 
+    /// Get the target address for hop-by-hop routing.
+    /// For UPDATE, this extracts the socket address from the stats.target field.
+    pub fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stats
+            .as_ref()
+            .and_then(|s| s.target.as_ref())
+            .and_then(|t| t.socket_addr())
+    }
+
     pub(super) fn to_host_result(&self) -> HostResult {
         if let Some(UpdateState::Finished { key, summary }) = &self.state {
             tracing::debug!(
@@ -150,6 +159,8 @@ impl Operation for UpdateOp {
             let return_msg;
             let new_state;
             let stats = self.stats;
+            // Track the next hop when forwarding RequestUpdate to another peer
+            let mut forward_hop: Option<SocketAddr> = None;
 
             match input {
                 UpdateMsg::RequestUpdate {
@@ -322,6 +333,8 @@ impl Operation for UpdateOp {
                                     value: value.clone(),
                                 });
                                 new_state = None;
+                                // Track where to forward this message
+                                forward_hop = Some(forward_addr);
                             } else {
                                 // No peers available and we don't have the contract - capture context
                                 let subscribers = op_manager
@@ -483,7 +496,14 @@ impl Operation for UpdateOp {
                 }
             }
 
-            build_op_result(self.id, new_state, return_msg, stats, self.upstream_addr)
+            build_op_result(
+                self.id,
+                new_state,
+                return_msg,
+                stats,
+                self.upstream_addr,
+                forward_hop,
+            )
         })
     }
 }
@@ -657,10 +677,13 @@ fn build_op_result(
     return_msg: Option<UpdateMsg>,
     stats: Option<UpdateStats>,
     upstream_addr: Option<std::net::SocketAddr>,
+    forward_hop: Option<std::net::SocketAddr>,
 ) -> Result<super::OperationResult, OpError> {
-    // With hop-by-hop routing, next_hop is None - routing uses upstream_addr for responses
-    // and explicit addresses for broadcasts
-    let next_hop = None;
+    // With hop-by-hop routing:
+    // - forward_hop is set when forwarding RequestUpdate to the next peer
+    // - Broadcasting messages have next_hop = None (they're processed locally)
+    // - BroadcastTo uses explicit addresses via conn_manager.send()
+    let next_hop = forward_hop;
 
     let output_op = state.map(|op| UpdateOp {
         id,
@@ -1049,7 +1072,6 @@ pub(crate) async fn request_update(
         stats.target = Some(target.clone());
     }
 
-    deliver_update_result(op_manager, id, key, summary.clone()).await?;
     let msg = UpdateMsg::RequestUpdate {
         id,
         key,
@@ -1057,19 +1079,31 @@ pub(crate) async fn request_update(
         value: updated_value, // Send the updated value, not the original
     };
 
+    // Create operation state with target for hop-by-hop routing.
+    // This allows peek_target_addr to find the target address when
+    // handle_notification_msg routes the outbound message.
+    let op_state = UpdateOp {
+        id,
+        state: Some(UpdateState::ReceivedRequest),
+        stats: Some(UpdateStats {
+            target: Some(target),
+        }),
+        upstream_addr: None, // We're the originator
+    };
+
+    // Use notify_op_change to:
+    // 1. Register the operation state (so peek_target_addr can find the target)
+    // 2. Send the message via the event loop (which routes via network bridge)
+    // NOTE: This must be called BEFORE deliver_update_result, because deliver_update_result
+    // marks the operation as completed, which would prevent peek_target_addr from finding it.
     op_manager
-        .to_event_listener
-        .notifications_sender()
-        .send(Either::Left(NetMessage::from(msg)))
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                tx = %id,
-                %error,
-                "Failed to enqueue UPDATE RequestUpdate message"
-            );
-            OpError::NotificationError
-        })?;
+        .notify_op_change(NetMessage::from(msg), OpEnum::Update(op_state))
+        .await?;
+
+    // Deliver the result to the client. This is done AFTER sending the network message
+    // so the operation state is available for routing. The operation will be marked
+    // as completed by deliver_update_result.
+    deliver_update_result(op_manager, id, key, summary.clone()).await?;
 
     Ok(())
 }

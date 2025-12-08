@@ -140,18 +140,21 @@ pub(crate) async fn request_subscribe(
     tracing::debug!(tx = %id, %key, "subscribe: request_subscribe invoked");
 
     // Check if we already have the contract locally
-    if super::has_contract(op_manager, *key).await? {
-        tracing::info!(tx = %id, %key, "Contract available locally, completing subscription");
-        return complete_local_subscription(op_manager, *id, *key).await;
-    }
+    let has_contract_locally = super::has_contract(op_manager, *key).await?;
 
-    // Find a peer to forward the request to
+    // Find a peer to forward the request to (needed even if we have contract locally)
     let mut skip_list: HashSet<std::net::SocketAddr> = HashSet::new();
     skip_list.insert(own_addr);
 
     let candidates = op_manager
         .ring
         .k_closest_potentially_caching(key, &skip_list, 3);
+
+    // If we have the contract locally but no remote peers, complete locally only
+    if has_contract_locally && candidates.is_empty() {
+        tracing::info!(tx = %id, %key, "Contract available locally, no remote peers, completing subscription locally");
+        return complete_local_subscription(op_manager, *id, *key).await;
+    }
 
     let Some(target) = candidates.first() else {
         tracing::warn!(tx = %id, %key, "No remote peers available for subscription");

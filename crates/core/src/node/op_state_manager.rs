@@ -495,7 +495,7 @@ impl OpManager {
                 .subscribe
                 .get(id)
                 .and_then(|op| op.get_target_addr()),
-            TransactionType::Update => None, // Updates don't have a single target
+            TransactionType::Update => self.ops.update.get(id).and_then(|op| op.get_target_addr()),
         }
     }
 
