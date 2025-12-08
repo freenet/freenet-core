@@ -462,35 +462,6 @@ impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeCont
     }
 }
 
-#[allow(unused)]
-struct PutContract {
-    contract: ContractContainer,
-    state: WrappedState,
-    related_contracts: RelatedContracts<'static>,
-}
-
-impl ComposeNetworkMessage<operations::put::PutOp> for PutContract {
-    fn initiate_op(self, op_manager: &OpManager) -> operations::put::PutOp {
-        let PutContract {
-            contract,
-            state,
-            related_contracts,
-        } = self;
-        operations::put::start_op(
-            contract,
-            related_contracts,
-            state,
-            op_manager.ring.max_hops_to_live,
-            false, // Don't subscribe when PUT is initiated from executor
-        )
-    }
-
-    async fn resume_op(op: operations::put::PutOp, op_manager: &OpManager) -> Result<(), OpError> {
-        operations::put::request_put(op_manager, op).await
-    }
-}
-
-#[allow(unused)]
 struct UpdateContract {
     key: ContractKey,
     new_state: WrappedState,
