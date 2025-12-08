@@ -39,7 +39,7 @@ use crate::{
         ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
         WaitingResolution,
     },
-    message::{MessageStats, NetMessage, NodeEvent, Transaction},
+    message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
         handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager,
         PeerId,
@@ -2275,12 +2275,19 @@ impl P2pConnManager {
                 // Try to get target from operation state for initial outbound requests
                 // Uses peek methods to avoid pop/push overhead
                 if let Some(target_addr) = self.bridge.op_manager.peek_target_addr(&tx) {
-                    tracing::info!(
+                    tracing::debug!(
                         tx = %msg.id(),
                         msg_type = %msg,
                         target_addr = %target_addr,
                         "handle_notification_msg: Found target in operation state, routing as OutboundMessageWithTarget"
                     );
+                    // For UPDATE operations only: mark complete after routing because UPDATE
+                    // uses fire-and-forget semantics (client result already sent).
+                    // Other operations (GET, PUT, Subscribe, Connect) expect responses and
+                    // must remain in the state map until their response handling completes.
+                    if tx.transaction_type() == TransactionType::Update {
+                        self.bridge.op_manager.completed(tx);
+                    }
                     return EventResult::Event(
                         ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
                     );
