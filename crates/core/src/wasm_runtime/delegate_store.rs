@@ -184,7 +184,7 @@ mod test {
         let temp_dir = tempfile::tempdir()?;
         let cdelegate_dir = temp_dir.path().join("delegates-store-test");
         std::fs::create_dir_all(&cdelegate_dir)?;
-        let mut store = DelegateStore::new(cdelegate_dir, 10_000)?;
+        let mut store = DelegateStore::new(cdelegate_dir.clone(), 10_000)?;
         let delegate = {
             let delegate = Delegate::from((&vec![0, 1, 2].into(), &vec![].into()));
             DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate))
@@ -192,6 +192,8 @@ mod test {
         store.store_delegate(delegate.clone())?;
         let f = store.fetch_delegate(delegate.key(), &vec![].into());
         assert!(f.is_some());
+        // Clean up after test
+        let _ = std::fs::remove_dir_all(&cdelegate_dir);
         Ok(())
     }
 }

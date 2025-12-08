@@ -254,7 +254,7 @@ mod test {
         let secrets_dir = temp_dir.path().join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
 
-        let mut store = SecretsStore::new(secrets_dir, Default::default())?;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default())?;
 
         let delegate = Delegate::from((&vec![0, 1, 2].into(), &vec![].into()));
 
@@ -268,6 +268,8 @@ mod test {
         let f = store.get_secret(delegate.key(), &secret_id);
 
         assert!(f.is_ok());
+        // Clean up after test
+        let _ = std::fs::remove_dir_all(&secrets_dir);
         Ok(())
     }
 }
