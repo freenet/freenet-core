@@ -81,7 +81,7 @@ impl PutOp {
     /// an outbound message. PUT messages from originators are processed locally first
     /// (to store the contract), then routing is determined in process_message.
     /// Returns None since PUT doesn't store a pre-determined target.
-    pub(super) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
+    pub(crate) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
         None
     }
 }

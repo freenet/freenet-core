@@ -447,7 +447,7 @@ impl GetOp {
 
     /// Get the target address if this operation is in a state that needs to send
     /// an outbound message. Used for hop-by-hop routing.
-    pub(super) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
+    pub(crate) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
             Some(GetState::AwaitingResponse { current_target, .. }) => current_target.socket_addr(),
             _ => None,

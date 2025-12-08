@@ -450,15 +450,148 @@ impl P2pConnManager {
                                     }
                                 }
                                 None => {
-                                    // No existing connection - this is unexpected for hop-by-hop routing
-                                    // since we should have the connection from the original request
-                                    tracing::error!(
-                                        tx = %msg.id(),
+                                    // No existing connection - need to establish one first.
+                                    // This happens for initial Connect requests to a gateway.
+                                    let tx = *msg.id();
+
+                                    // Try to get full peer info from operation state (needed for handshake)
+                                    // Uses peek method to avoid pop/push overhead
+                                    let target_peer = ctx.bridge.op_manager.peek_target_peer(&tx);
+
+                                    let Some(target_peer) = target_peer else {
+                                        // Can't establish connection without peer info
+                                        // This shouldn't happen for hop-by-hop routing since
+                                        // we should have the connection from a previous request
+                                        tracing::error!(
+                                            tx = %tx,
+                                            target_addr = %target_addr,
+                                            connections = ?ctx.connections.keys().collect::<Vec<_>>(),
+                                            "No connection and no peer info available - cannot establish connection"
+                                        );
+                                        ctx.bridge.op_manager.completed(tx);
+                                        continue;
+                                    };
+
+                                    tracing::warn!(
+                                        tx = %tx,
                                         target_addr = %target_addr,
+                                        target_peer = %target_peer,
                                         connections = ?ctx.connections.keys().collect::<Vec<_>>(),
-                                        "No connection found for target address - hop-by-hop routing failed"
+                                        "No existing connection, establishing connection first"
                                     );
-                                    ctx.bridge.op_manager.completed(*msg.id());
+
+                                    // Queue the message for sending after connection is established
+                                    let (callback, mut result) = mpsc::channel(10);
+                                    let msg_clone = msg.clone();
+                                    let bridge_sender = ctx.bridge.ev_listener_tx.clone();
+                                    let op_manager = ctx.bridge.op_manager.clone();
+                                    let gateways = ctx.gateways.clone();
+
+                                    // Initiate connection to the peer
+                                    ctx.bridge
+                                        .ev_listener_tx
+                                        .send(Right(NodeEvent::ConnectPeer {
+                                            peer: target_peer.clone(),
+                                            tx,
+                                            callback,
+                                            is_gw: false,
+                                        }))
+                                        .await?;
+
+                                    tracing::info!(
+                                        tx = %tx,
+                                        target_addr = %target_addr,
+                                        "Dispatched ConnectPeer, waiting asynchronously for connection"
+                                    );
+
+                                    // Spawn a task to wait for connection and then send the message
+                                    let target_peer_for_resend = target_peer.clone();
+                                    tokio::spawn(async move {
+                                        match timeout(Duration::from_secs(20), result.recv()).await
+                                        {
+                                            Ok(Some(Ok((connected_addr, _)))) => {
+                                                tracing::info!(
+                                                    tx = %tx,
+                                                    target_addr = %target_addr,
+                                                    connected_addr = %connected_addr,
+                                                    "Connection established, rescheduling message send"
+                                                );
+                                                // Construct PeerKeyLocation with the connected address
+                                                // and the original public key
+                                                let connected_peer = PeerKeyLocation::new(
+                                                    target_peer_for_resend.pub_key().clone(),
+                                                    connected_addr,
+                                                );
+                                                // Re-send via P2pBridge which will route correctly
+                                                if let Err(e) = bridge_sender
+                                                    .send(Left((
+                                                        connected_peer,
+                                                        Box::new(msg_clone),
+                                                    )))
+                                                    .await
+                                                {
+                                                    tracing::error!(
+                                                        tx = %tx,
+                                                        target_addr = %target_addr,
+                                                        "Failed to reschedule message after connection: {:?}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                            Ok(Some(Err(e))) => {
+                                                tracing::error!(
+                                                    tx = %tx,
+                                                    target_addr = %target_addr,
+                                                    "Connection attempt failed: {:?}",
+                                                    e
+                                                );
+                                                if let Err(err) =
+                                                    handle_aborted_op(tx, &op_manager, &gateways)
+                                                        .await
+                                                {
+                                                    tracing::warn!(
+                                                        tx = %tx,
+                                                        ?err,
+                                                        "Failed to propagate aborted operation"
+                                                    );
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                tracing::error!(
+                                                    tx = %tx,
+                                                    target_addr = %target_addr,
+                                                    "Response channel closed before connection result"
+                                                );
+                                                if let Err(err) =
+                                                    handle_aborted_op(tx, &op_manager, &gateways)
+                                                        .await
+                                                {
+                                                    tracing::warn!(
+                                                        tx = %tx,
+                                                        ?err,
+                                                        "Failed to propagate aborted operation"
+                                                    );
+                                                }
+                                            }
+                                            Err(_) => {
+                                                tracing::error!(
+                                                    tx = %tx,
+                                                    target_addr = %target_addr,
+                                                    "Timeout waiting for connection result"
+                                                );
+                                                if let Err(err) =
+                                                    handle_aborted_op(tx, &op_manager, &gateways)
+                                                        .await
+                                                {
+                                                    tracing::warn!(
+                                                        tx = %tx,
+                                                        ?err,
+                                                        "Failed to propagate aborted operation"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -2135,29 +2268,22 @@ impl P2pConnManager {
         match msg {
             Some(Left(msg)) => {
                 // With hop-by-hop routing, messages no longer embed target.
-                // For initial requests (GET, PUT, Subscribe), extract target from operation state.
+                // For initial requests (GET, PUT, Subscribe, Connect), extract target from operation state.
                 // For other messages, process locally (they'll be routed through network_bridge.send()).
                 let tx = *msg.id();
 
                 // Try to get target from operation state for initial outbound requests
-                if let Ok(Some(op)) = self.bridge.op_manager.pop(&tx) {
-                    if let Some(target_addr) = op.get_target_addr() {
-                        // Put the operation back since we only peeked at it
-                        let _ = futures::executor::block_on(self.bridge.op_manager.push(tx, op));
-
-                        tracing::info!(
-                            tx = %msg.id(),
-                            msg_type = %msg,
-                            target_addr = %target_addr,
-                            "handle_notification_msg: Found target in operation state, routing as OutboundMessageWithTarget"
-                        );
-                        return EventResult::Event(
-                            ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
-                        );
-                    } else {
-                        // Put the operation back
-                        let _ = futures::executor::block_on(self.bridge.op_manager.push(tx, op));
-                    }
+                // Uses peek methods to avoid pop/push overhead
+                if let Some(target_addr) = self.bridge.op_manager.peek_target_addr(&tx) {
+                    tracing::info!(
+                        tx = %msg.id(),
+                        msg_type = %msg,
+                        target_addr = %target_addr,
+                        "handle_notification_msg: Found target in operation state, routing as OutboundMessageWithTarget"
+                    );
+                    return EventResult::Event(
+                        ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
+                    );
                 }
 
                 // Message has no target or couldn't get from op state - process locally

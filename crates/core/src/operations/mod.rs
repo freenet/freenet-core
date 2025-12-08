@@ -242,19 +242,6 @@ impl OpEnum {
             pub fn to_host_result(&self) -> HostResult;
         }
     }
-
-    /// Get the target address for this operation if it's in a state that needs to send
-    /// an initial outbound message. Used by hop-by-hop routing to extract the target
-    /// from operation state since messages no longer embed targets.
-    pub fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
-        match self {
-            OpEnum::Get(op) => op.get_target_addr(),
-            OpEnum::Put(op) => op.get_target_addr(),
-            OpEnum::Subscribe(op) => op.get_target_addr(),
-            OpEnum::Connect(op) => op.get_target_addr(),
-            OpEnum::Update(_) => None, // Updates don't have a single target
-        }
-    }
 }
 
 macro_rules! try_from_op_enum {

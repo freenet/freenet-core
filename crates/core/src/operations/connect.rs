@@ -603,6 +603,12 @@ impl ConnectOp {
         self.gateway.as_deref().and_then(|g| g.socket_addr())
     }
 
+    /// Get the full target peer (including public key) for connection establishment.
+    /// For Connect operations, this returns the gateway peer.
+    pub(crate) fn get_target_peer(&self) -> Option<crate::ring::PeerKeyLocation> {
+        self.gateway.as_deref().cloned()
+    }
+
     fn take_desired_location(&mut self) -> Option<Location> {
         self.desired_location.take()
     }
