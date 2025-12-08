@@ -1295,14 +1295,15 @@ fn build_op_result(
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
 ) -> Result<OperationResult, OpError> {
-    // For response messages (Response), use upstream_addr directly for routing.
-    // This is more reliable than extracting from the message's target field, which
-    // may have been looked up from connection_manager (subject to race conditions).
-    // For forward messages (Request), use the message's target.
-    // For Response, route back to upstream. For forward messages, target_addr is passed explicitly.
-    let target_addr = match &msg {
-        Some(GetMsg::Response { .. }) => upstream_addr,
-        _ => None, // Forward messages have explicit target_addr passed to OperationResult
+    // Determine the target address for sending the message:
+    // - For Response messages: route back to upstream_addr (who sent us the request)
+    // - For Request messages being forwarded: use current_target from state
+    let target_addr = match (&msg, &state) {
+        (Some(GetMsg::Response { .. }), _) => upstream_addr,
+        (Some(GetMsg::Request { .. }), Some(GetState::AwaitingResponse { current_target, .. })) => {
+            current_target.socket_addr()
+        }
+        _ => None,
     };
 
     let output_op = state.map(|state| GetOp {
