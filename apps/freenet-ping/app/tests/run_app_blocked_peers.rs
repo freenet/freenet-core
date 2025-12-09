@@ -91,8 +91,58 @@ struct BlockedPeersConfig {
     subscribe_immediately: bool,
 }
 
-/// Runs a blocked peers test with the provided configuration
+/// Maximum number of retries when port allocation fails
+const MAX_PORT_RETRY_ATTEMPTS: usize = 5;
+
+/// Runs a blocked peers test with the provided configuration.
+/// Wraps the test in a retry loop to handle port allocation race conditions.
 async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=MAX_PORT_RETRY_ATTEMPTS {
+        match run_blocked_peers_test_inner(&config, attempt).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let error_str = format!("{:#}", e);
+                // Check if this is a port collision error (EADDRINUSE)
+                if error_str.contains("Address already in use")
+                    || error_str.contains("os error 98")
+                    || error_str.contains("os error 48")
+                {
+                    // macOS: 48, Linux: 98
+                    tracing::warn!(
+                        attempt,
+                        MAX_PORT_RETRY_ATTEMPTS,
+                        "Port collision detected, retrying with new ports: {}",
+                        error_str
+                    );
+                    last_error = Some(e);
+                    // Small delay before retry to let ports be released
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                // Non-retryable error - convert to TestResult which will panic
+                return Err(e.into());
+            }
+        }
+    }
+
+    // All retries exhausted
+    Err(last_error
+        .unwrap_or_else(|| {
+            anyhow!(
+                "Port allocation failed after {} attempts",
+                MAX_PORT_RETRY_ATTEMPTS
+            )
+        })
+        .into())
+}
+
+/// Inner implementation of blocked peers test (returns anyhow::Result for error inspection)
+async fn run_blocked_peers_test_inner(
+    config: &BlockedPeersConfig,
+    attempt: usize,
+) -> anyhow::Result<()> {
     if config.verbose_logging {
         std::env::set_var(
             "RUST_LOG",
@@ -100,9 +150,14 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         );
     }
 
-    tracing::info!("Starting {} blocked peers test...", config.test_name);
+    tracing::info!(
+        "Starting {} blocked peers test (attempt {}/{})...",
+        config.test_name,
+        attempt,
+        MAX_PORT_RETRY_ATTEMPTS
+    );
 
-    // Network setup
+    // Network setup - get all ports upfront
     let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
     let gw_network_port = network_socket_gw.local_addr()?.port();
 
@@ -118,14 +173,20 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
     let node2_network_port = network_socket_node2.local_addr()?.port();
     let node2_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), node2_network_port);
 
-    // Configure gateway
+    // Configure gateway - include attempt number in dir suffix for isolation
+    let dir_suffix = if attempt > 1 {
+        format!("{}_{}", config.test_name, attempt)
+    } else {
+        config.test_name.to_string()
+    };
+
     let (config_gw, preset_cfg_gw, config_gw_info) = {
         let (cfg, preset) = base_node_test_config(
             true, // is_gateway
             vec![],
             Some(gw_network_port),
             ws_api_port_socket_gw.local_addr()?.port(),
-            &format!("gw_{}", config.test_name),
+            &format!("gw_{}", dir_suffix),
             None,
             None, // Gateway doesn't block any peers
         )
@@ -143,7 +204,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         Some(node1_network_port),
         ws_api_port_socket_node1.local_addr()?.port(),
-        &format!("node1_{}", config.test_name),
+        &format!("node1_{}", dir_suffix),
         None,
         Some(vec![node2_network_addr]), // Node1 blocks Node2
     )
@@ -156,7 +217,7 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         vec![serde_json::to_string(&config_gw_info)?],
         Some(node2_network_port),
         ws_api_port_socket_node2.local_addr()?.port(),
-        &format!("node2_{}", config.test_name),
+        &format!("node2_{}", dir_suffix),
         None,
         Some(vec![node1_network_addr]), // Node2 blocks Node1
     )
@@ -170,6 +231,8 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
     tracing::info!("Node 2 blocks: {:?}", node1_network_addr);
 
     // Free socket resources before starting nodes
+    // NOTE: There's a race window here where another process could grab the port.
+    // This is handled by the retry loop in run_blocked_peers_test().
     std::mem::drop(network_socket_gw);
     std::mem::drop(ws_api_port_socket_gw);
     std::mem::drop(network_socket_node1);
@@ -761,15 +824,15 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
     select! {
         gw = gateway_node => {
             let Err(gw) = gw;
-            Err(anyhow!("Gateway node failed: {}", gw).into())
+            Err(anyhow!("Gateway node failed: {}", gw))
         }
         n1 = node1 => {
             let Err(n1) = n1;
-            Err(anyhow!("Node 1 failed: {}", n1).into())
+            Err(anyhow!("Node 1 failed: {}", n1))
         }
         n2 = node2 => {
             let Err(n2) = n2;
-            Err(anyhow!("Node 2 failed: {}", n2).into())
+            Err(anyhow!("Node 2 failed: {}", n2))
         }
         t = test => {
             match t {
@@ -779,11 +842,11 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Test failed: {}", e);
-                    Err(e.into())
+                    Err(e)
                 }
                 Err(_) => {
                     tracing::error!("Test timed out!");
-                    Err(anyhow!("Test timed out").into())
+                    Err(anyhow!("Test timed out"))
                 }
             }
         }
