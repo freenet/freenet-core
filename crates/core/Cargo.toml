@@ -85,7 +85,7 @@ opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"]
 freenet-stdlib = { features = ["net"], workspace = true }
 console-subscriber = { version = "0.5.0", optional = true }
 tokio-stream = "0.1.17"
-freenet-test-network = { version = "0.1.8", optional = true }
+freenet-test-network = { version = "0.1.11", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["sysinfoapi"] }
