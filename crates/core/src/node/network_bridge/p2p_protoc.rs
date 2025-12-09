@@ -2719,6 +2719,12 @@ async fn peer_connection_listener(
         }
 
         tokio::select! {
+            // Bias toward receiving from channel first to ensure outbound messages
+            // are sent before checking for inbound messages. This prevents a race
+            // where a transport error could cause us to exit before processing
+            // queued outbound messages.
+            biased;
+
             msg = rx.recv() => {
                 let Some(msg) = msg else {
                     tracing::warn!(
@@ -2773,6 +2779,8 @@ async fn peer_connection_listener(
                                 let transport_error = TransportError::Other(anyhow!(
                                     "Failed to deserialize inbound message from {remote_addr}: {error:?}"
                                 ));
+                                // Before terminating, drain any pending outbound messages
+                                drain_pending_messages(&mut rx, &mut conn, remote_addr).await;
                                 notify_transport_closed(
                                     &conn_events,
                                     remote_addr,
@@ -2789,12 +2797,56 @@ async fn peer_connection_listener(
                             ?error,
                             "[CONN_LIFECYCLE] peer_connection_listener terminating after recv error"
                         );
+                        // Before terminating, drain any pending outbound messages
+                        // This prevents a race where messages are queued but lost
+                        // because the transport error is processed first
+                        drain_pending_messages(&mut rx, &mut conn, remote_addr).await;
                         notify_transport_closed(&conn_events, remote_addr, error).await;
                         return;
                     }
                 }
             }
         }
+    }
+}
+
+/// Drain any pending outbound messages from the channel before closing.
+/// This prevents message loss when transport errors race with queued sends.
+async fn drain_pending_messages(
+    rx: &mut PeerConnChannelRecv,
+    conn: &mut PeerConnection,
+    remote_addr: SocketAddr,
+) {
+    let mut drained = 0;
+    while let Ok(msg) = rx.try_recv() {
+        // Attempt to send even if connection is degraded - the send may still succeed
+        // for messages already in flight
+        if let Err(e) = handle_peer_channel_message(conn, msg).await {
+            tracing::debug!(
+                to = %remote_addr,
+                ?e,
+                drained,
+                "[CONN_LIFECYCLE] Failed to drain message during shutdown"
+            );
+            break;
+        }
+        drained += 1;
+        // Limit how many we drain to avoid blocking shutdown indefinitely
+        if drained >= 32 {
+            tracing::debug!(
+                to = %remote_addr,
+                drained,
+                "[CONN_LIFECYCLE] Reached drain limit during shutdown"
+            );
+            break;
+        }
+    }
+    if drained > 0 {
+        tracing::debug!(
+            to = %remote_addr,
+            drained,
+            "[CONN_LIFECYCLE] Drained pending messages before shutdown"
+        );
     }
 }
 
