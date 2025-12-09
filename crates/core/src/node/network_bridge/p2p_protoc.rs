@@ -2148,6 +2148,11 @@ impl P2pConnManager {
             tokio::spawn(async move {
                 peer_connection_listener(rx, connection, peer_addr, conn_events).await;
             });
+            // Yield to allow the spawned peer_connection_listener task to start.
+            // This is important because on some runtimes (especially in tests with boxed_local
+            // futures), spawned tasks may not be scheduled immediately, causing messages
+            // sent to the channel to pile up without being processed.
+            tokio::task::yield_now().await;
             newly_inserted = true;
         } else {
             tracing::debug!(
