@@ -16,12 +16,12 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use rand::SeedableRng;
 use testresult::TestResult;
 use tokio::{select, time::sleep, time::timeout};
-use tokio_tungstenite::connect_async;
 use tracing::{span, Instrument, Level};
 
 use common::{
-    base_node_test_config, base_node_test_config_with_rng, gw_config_from_path,
-    gw_config_from_path_with_rng, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    base_node_test_config, base_node_test_config_with_rng, connect_async_with_config,
+    gw_config_from_path, gw_config_from_path_with_rng, ws_config, APP_TAG, PACKAGE_DIR,
+    PATH_TO_CONTRACT,
 };
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
@@ -267,8 +267,9 @@ async fn test_node_diagnostics_query() -> TestResult {
             "ws://127.0.0.1:{ws_api_port_node}/v1/contract/command?encodingProtocol=native"
         );
 
-        let (stream_gw, _) = connect_async(&uri_gw).await?;
-        let (stream_node, _) = connect_async(&uri_node).await?;
+        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
+        let (stream_node, _) =
+            connect_async_with_config(&uri_node, Some(ws_config()), false).await?;
 
         let mut client_gw = WebApi::start(stream_gw);
         let mut client_node = WebApi::start(stream_node);
@@ -636,9 +637,11 @@ async fn test_ping_multi_node() -> TestResult {
             "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
-        let (stream_gw, _) = connect_async(&uri_gw).await?;
-        let (stream_node1, _) = connect_async(&uri_node1).await?;
-        let (stream_node2, _) = connect_async(&uri_node2).await?;
+        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
+        let (stream_node1, _) =
+            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
+        let (stream_node2, _) =
+            connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
 
         let mut client_gw = WebApi::start(stream_gw);
         let mut client_node1 = WebApi::start(stream_node1);
@@ -1230,9 +1233,11 @@ async fn test_ping_application_loop() -> TestResult {
             "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
-        let (stream_gw, _) = connect_async(&uri_gw).await?;
-        let (stream_node1, _) = connect_async(&uri_node1).await?;
-        let (stream_node2, _) = connect_async(&uri_node2).await?;
+        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
+        let (stream_node1, _) =
+            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
+        let (stream_node2, _) =
+            connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
 
         let mut client_gw = WebApi::start(stream_gw);
         let mut client_node1 = WebApi::start(stream_node1);
@@ -1718,7 +1723,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
             let uri = format!(
                 "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
-            let (stream, _) = connect_async(&uri).await?;
+            let (stream, _) =
+                connect_async_with_config(&uri, Some(ws_config()), false).await?;
             let client = WebApi::start(stream);
             gateway_clients.push(client);
             tracing::info!("Connected to gateway {}", i);
@@ -1729,7 +1735,8 @@ async fn test_ping_partially_connected_network() -> TestResult {
             let uri = format!(
                 "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
-            let (stream, _) = connect_async(&uri).await?;
+            let (stream, _) =
+                connect_async_with_config(&uri, Some(ws_config()), false).await?;
             let client = WebApi::start(stream);
             node_clients.push(client);
             tracing::info!("Connected to regular node {}", i);

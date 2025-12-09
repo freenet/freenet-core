@@ -27,10 +27,12 @@ use freenet_stdlib::{
 use futures::FutureExt;
 use testresult::TestResult;
 use tokio::{select, time::timeout};
-use tokio_tungstenite::connect_async;
 use tracing::{span, Instrument, Level};
 
-use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
+use common::{
+    base_node_test_config, connect_async_with_config, gw_config_from_path, ws_config, APP_TAG,
+    PACKAGE_DIR, PATH_TO_CONTRACT,
+};
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "Test has never worked - nodes fail on startup with channel closed errors"]
@@ -236,9 +238,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
             let uri = format!(
                 "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
-            let (stream, _) = connect_async(&uri).await.inspect_err(|err| {
-                println!("Failed to connect to gateway ws {i}: {err}");
-            })?;
+            let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false)
+                .await
+                .inspect_err(|err| {
+                    println!("Failed to connect to gateway ws {i}: {err}");
+                })?;
             let client = WebApi::start(stream);
             gateway_clients.push(client);
             println!("Connected to gateway {i}");
@@ -249,9 +253,11 @@ async fn test_ping_partially_connected_network() -> TestResult {
             let uri = format!(
                 "ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native"
             );
-            let (stream, _) = connect_async(&uri).await.inspect_err(|err| {
-                println!("Failed to connect to regular node ws {i}: {err}");
-            })?;
+            let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false)
+                .await
+                .inspect_err(|err| {
+                    println!("Failed to connect to regular node ws {i}: {err}");
+                })?;
             let client = WebApi::start(stream);
             node_clients.push(client);
             println!("Connected to regular node {i}");

@@ -31,7 +31,7 @@ use std::{
 /// Global lock to prevent concurrent contract compilation which causes race conditions
 static COMPILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 use tokio::{select, time::sleep};
-use tokio_tungstenite::connect_async;
+pub use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
 use tracing::{info, span, Instrument, Level};
 
 use serde::{Deserialize, Serialize};
@@ -185,9 +185,16 @@ pub const PATH_TO_CONTRACT: &str = "../contracts/ping";
 const WASM_FILE_NAME: &str = "freenet-ping-contract";
 pub const APP_TAG: &str = "ping-app";
 
+/// WebSocket configuration with increased message size limit to match server (100MB)
+pub fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(100 * 1024 * 1024)) // 100MB to match server
+        .max_frame_size(Some(16 * 1024 * 1024)) // 16MB frames
+}
+
 pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
     let uri = format!("ws://127.0.0.1:{ws_port}/v1/contract/command?encodingProtocol=native");
-    let (stream, _) = connect_async(&uri).await?;
+    let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false).await?;
     Ok(WebApi::start(stream))
 }
 

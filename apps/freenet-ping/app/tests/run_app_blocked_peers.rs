@@ -60,8 +60,9 @@ use freenet_stdlib::{
 use futures::FutureExt;
 use testresult::TestResult;
 use tokio::{select, time::sleep};
-use tokio_tungstenite::connect_async;
 use tracing::{span, Instrument, Level};
+
+use common::{connect_async_with_config, ws_config};
 
 /// Configuration for blocked peers test variants
 #[derive(Debug, Clone)]
@@ -233,15 +234,17 @@ async fn run_blocked_peers_test(config: BlockedPeersConfig) -> TestResult {
         );
 
         tracing::info!("Connecting to Gateway at {}", uri_gw);
-        let (stream_gw, _) = connect_async(&uri_gw).await?;
+        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
         let mut client_gw = WebApi::start(stream_gw);
 
         tracing::info!("Connecting to Node1 at {}", uri_node1);
-        let (stream_node1, _) = connect_async(&uri_node1).await?;
+        let (stream_node1, _) =
+            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
         let mut client_node1 = WebApi::start(stream_node1);
 
         tracing::info!("Connecting to Node2 at {}", uri_node2);
-        let (stream_node2, _) = connect_async(&uri_node2).await?;
+        let (stream_node2, _) =
+            connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
         let mut client_node2 = WebApi::start(stream_node2);
 
         // Compile/load contract code (same helper used by other app tests)
