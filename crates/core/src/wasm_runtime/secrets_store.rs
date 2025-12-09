@@ -250,9 +250,8 @@ mod test {
 
     #[test]
     fn store_and_load() -> Result<(), Box<dyn std::error::Error>> {
-        let secrets_dir = std::env::temp_dir()
-            .join("freenet-test")
-            .join("secrets-store-test");
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
 
         let mut store = SecretsStore::new(secrets_dir, Default::default())?;
