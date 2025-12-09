@@ -165,15 +165,25 @@ pub async fn wait_for_subscribe_response(
     }
 }
 
+/// WebSocket configuration with increased message size limit to match server (100MB)
+fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(100 * 1024 * 1024)) // 100MB to match server
+        .max_frame_size(Some(16 * 1024 * 1024)) // 16MB frames
+}
+
 // Create a new ping client by connecting to the given host
 pub async fn connect_to_host(
     host: &str,
 ) -> Result<WebApi, Box<dyn std::error::Error + Send + Sync + 'static>> {
     let uri = format!("ws://{host}/v1/contract/command?encodingProtocol=native");
-    let (stream, _resp) = tokio_tungstenite::connect_async(&uri).await.map_err(|e| {
-        tracing::error!(err=%e);
-        e
-    })?;
+    let (stream, _resp) =
+        tokio_tungstenite::connect_async_with_config(&uri, Some(ws_config()), false)
+            .await
+            .map_err(|e| {
+                tracing::error!(err=%e);
+                e
+            })?;
     Ok(WebApi::start(stream))
 }
 

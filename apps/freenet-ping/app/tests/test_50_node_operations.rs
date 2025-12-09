@@ -19,9 +19,11 @@ use futures::FutureExt;
 use std::{net::TcpListener, path::PathBuf, time::Duration};
 use testresult::TestResult;
 use tokio::{select, time::timeout};
-use tokio_tungstenite::connect_async;
 
-use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
+use common::{
+    base_node_test_config, connect_async_with_config, gw_config_from_path, ws_config, APP_TAG,
+    PACKAGE_DIR, PATH_TO_CONTRACT,
+};
 
 const NUM_GATEWAYS: usize = 3; // Multiple gateways to distribute load
 const NUM_REGULAR_NODES: usize = 47; // 3 + 47 = 50 total
@@ -216,7 +218,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
             let uri = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
-            let (stream, _) = connect_async(&uri).await?;
+            let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false).await?;
             let client = WebApi::start(stream);
             gateway_clients.push(client);
             println!("📡 Connected to gateway {i}");
@@ -231,7 +233,7 @@ async fn setup_50_node_network() -> TestResult<(Vec<WebApi>, Vec<WebApi>, Contra
         let mut node_clients = Vec::with_capacity(NUM_REGULAR_NODES);
         for (i, port) in ws_api_ports_nodes.iter().enumerate() {
             let uri = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
-            let (stream, _) = connect_async(&uri).await?;
+            let (stream, _) = connect_async_with_config(&uri, Some(ws_config()), false).await?;
             let client = WebApi::start(stream);
             node_clients.push(client);
 

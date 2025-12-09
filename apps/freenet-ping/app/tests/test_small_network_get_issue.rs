@@ -12,10 +12,12 @@ use freenet_stdlib::{
 use futures::FutureExt;
 use testresult::TestResult;
 use tokio::{select, time::timeout};
-use tokio_tungstenite::connect_async;
 use tracing::{span, Instrument, Level};
 
-use common::{base_node_test_config, gw_config_from_path, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT};
+use common::{
+    base_node_test_config, connect_async_with_config, gw_config_from_path, ws_config, APP_TAG,
+    PACKAGE_DIR, PATH_TO_CONTRACT,
+};
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_small_network_get_failure() -> TestResult {
@@ -137,19 +139,21 @@ async fn test_small_network_get_failure() -> TestResult {
 
         let uri_gw =
             format!("ws://127.0.0.1:{_ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
-        let (stream_gw, _) = connect_async(&uri_gw).await?;
+        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
         let mut client_gw = WebApi::start(stream_gw);
 
         let uri_node1 = format!(
             "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
-        let (stream_node1, _) = connect_async(&uri_node1).await?;
+        let (stream_node1, _) =
+            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
         let mut client_node1 = WebApi::start(stream_node1);
 
         let uri_node2 = format!(
             "ws://127.0.0.1:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
-        let (stream_node2, _) = connect_async(&uri_node2).await?;
+        let (stream_node2, _) =
+            connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
         let mut client_node2 = WebApi::start(stream_node2);
 
         let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);

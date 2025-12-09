@@ -11,10 +11,9 @@ use freenet_stdlib::client_api::WebApi;
 use futures::FutureExt;
 use testresult::TestResult;
 use tokio::{select, time::timeout};
-use tokio_tungstenite::connect_async;
 use tracing::{span, Instrument, Level};
 
-use common::{base_node_test_config, gw_config_from_path};
+use common::{base_node_test_config, connect_async_with_config, gw_config_from_path, ws_config};
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_connection_timing() -> TestResult {
@@ -93,7 +92,7 @@ async fn test_connection_timing() -> TestResult {
         let ws_start = Instant::now();
         let uri_gw =
             format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
-        let (stream_gw, _) = connect_async(&uri_gw).await?;
+        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
         let _client_gw = WebApi::start(stream_gw);
         println!(
             "   ✓ Gateway WebSocket connected in {}ms",
@@ -104,7 +103,8 @@ async fn test_connection_timing() -> TestResult {
         let uri_node1 = format!(
             "ws://127.0.0.1:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
-        let (stream_node1, _) = connect_async(&uri_node1).await?;
+        let (stream_node1, _) =
+            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
         let _client_node1 = WebApi::start(stream_node1);
         println!(
             "   ✓ Node1 WebSocket connected in {}ms",
