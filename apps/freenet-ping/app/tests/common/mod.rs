@@ -330,14 +330,16 @@ fn compile_contract(contract_path: &PathBuf) -> anyhow::Result<Vec<u8>> {
         &BuildToolConfig {
             features: None,
             package_type: PackageType::Contract,
-            debug: true,
+            // Use release builds - debug WASM is ~12MB vs ~186KB for release,
+            // which exceeds WebSocket message size limits when serialized
+            debug: false,
         },
         contract_path,
     )?;
 
     let output_file = Path::new(&target)
         .join(WASM_TARGET)
-        .join("debug")
+        .join("release")
         .join(WASM_FILE_NAME.replace('-', "_"))
         .with_extension("wasm");
     println!("output file: {output_file:?}");
