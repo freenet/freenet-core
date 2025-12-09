@@ -7,13 +7,14 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
@@ -144,6 +145,78 @@ impl NetworkBridge for P2pBridge {
 
 type PeerConnChannelSender = Sender<Either<NetMessage, ConnEvent>>;
 type PeerConnChannelRecv = Receiver<Either<NetMessage, ConnEvent>>;
+
+/// Event from the peer connection priority select.
+/// Priority is: OutboundMessage > InboundMessage (ensures sends complete before handling errors)
+#[derive(Debug)]
+enum PeerConnectionEvent {
+    /// Outbound message from channel (Priority 1 - highest)
+    /// Boxed to reduce enum size (NetMessage is large)
+    OutboundMessage(Option<Box<Either<NetMessage, ConnEvent>>>),
+    /// Inbound message from transport (Priority 2)
+    InboundMessage(Result<Vec<u8>, TransportError>),
+}
+
+/// Polls both the outbound channel and inbound transport with priority ordering.
+/// This is a Future that resolves to the next event, ensuring outbound messages
+/// are always processed before inbound messages/errors.
+///
+/// This eliminates the race condition where a transport error could cause queued
+/// outbound messages to be lost.
+struct PeerConnectionPriorityPoll<'a> {
+    rx: &'a mut PeerConnChannelRecv,
+    conn: &'a mut PeerConnection,
+}
+
+impl<'a> PeerConnectionPriorityPoll<'a> {
+    fn new(rx: &'a mut PeerConnChannelRecv, conn: &'a mut PeerConnection) -> Self {
+        Self { rx, conn }
+    }
+}
+
+impl<'a> Future for PeerConnectionPriorityPoll<'a> {
+    type Output = PeerConnectionEvent;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+
+        // Track if we found a lower-priority ready item
+        let mut pending_inbound: Option<PeerConnectionEvent> = None;
+
+        // Priority 1: Check outbound channel first (highest priority)
+        match Pin::new(&mut *this.rx).poll_recv(cx) {
+            Poll::Ready(Some(msg)) => {
+                return Poll::Ready(PeerConnectionEvent::OutboundMessage(Some(Box::new(msg))));
+            }
+            Poll::Ready(None) => {
+                // Channel closed - but check inbound too before returning
+                pending_inbound = Some(PeerConnectionEvent::OutboundMessage(None));
+            }
+            Poll::Pending => {}
+        }
+
+        // Priority 2: Check inbound transport
+        let recv_fut = this.conn.recv();
+        tokio::pin!(recv_fut);
+        match recv_fut.poll(cx) {
+            Poll::Ready(result) => {
+                // If we have a pending channel closure, return that first (higher priority)
+                if let Some(event) = pending_inbound {
+                    return Poll::Ready(event);
+                }
+                return Poll::Ready(PeerConnectionEvent::InboundMessage(result));
+            }
+            Poll::Pending => {}
+        }
+
+        // If channel closed but inbound is pending, return the closure
+        if let Some(event) = pending_inbound {
+            return Poll::Ready(event);
+        }
+
+        Poll::Pending
+    }
+}
 
 /// Entry in the connections HashMap, keyed by SocketAddr.
 /// The pub_key is learned from the first message received on this connection.
@@ -2669,77 +2742,35 @@ async fn notify_transport_closed(
     }
 }
 
+/// Listens for messages on a peer connection using priority-based polling.
+///
+/// Uses `PeerConnectionPriorityPoll` to ensure outbound messages from the channel
+/// are always processed before inbound messages/errors from the transport. This
+/// eliminates the race condition where a transport error could cause queued
+/// outbound messages to be lost.
+///
+/// The priority-based approach guarantees that:
+/// 1. Outbound messages are checked first on every poll
+/// 2. Both sources have their wakers properly registered
+/// 3. No messages are lost due to poll ordering
 async fn peer_connection_listener(
     mut rx: PeerConnChannelRecv,
     mut conn: PeerConnection,
     peer_addr: SocketAddr,
     conn_events: Sender<ConnEvent>,
 ) {
-    const MAX_IMMEDIATE_SENDS: usize = 32;
     let remote_addr = conn.remote_addr();
     tracing::debug!(
         to = %remote_addr,
         %peer_addr,
         "[CONN_LIFECYCLE] Starting peer_connection_listener task"
     );
+
     loop {
-        let mut drained = 0;
-        loop {
-            match rx.try_recv() {
-                Ok(msg) => {
-                    if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
-                        tracing::debug!(
-                            to = %remote_addr,
-                            ?error,
-                            "[CONN_LIFECYCLE] Shutting down connection after send failure"
-                        );
-                        notify_transport_closed(&conn_events, remote_addr, error).await;
-                        return;
-                    }
-                    drained += 1;
-                    if drained >= MAX_IMMEDIATE_SENDS {
-                        break;
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    tracing::warn!(
-                        to = %conn.remote_addr(),
-                        "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
-                    );
-                    notify_transport_closed(
-                        &conn_events,
-                        remote_addr,
-                        TransportError::ConnectionClosed(remote_addr),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        }
-
-        tokio::select! {
-            // Bias toward receiving from channel first to ensure outbound messages
-            // are sent before checking for inbound messages. This prevents a race
-            // where a transport error could cause us to exit before processing
-            // queued outbound messages.
-            biased;
-
-            msg = rx.recv() => {
-                let Some(msg) = msg else {
-                    tracing::warn!(
-                        to = %conn.remote_addr(),
-                        "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
-                    );
-                    notify_transport_closed(
-                        &conn_events,
-                        remote_addr,
-                        TransportError::ConnectionClosed(remote_addr),
-                    )
-                    .await;
-                    return;
-                };
-                if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
+        let event = PeerConnectionPriorityPoll::new(&mut rx, &mut conn).await;
+        match event {
+            PeerConnectionEvent::OutboundMessage(Some(msg)) => {
+                if let Err(error) = handle_peer_channel_message(&mut conn, *msg).await {
                     tracing::debug!(
                         to = %remote_addr,
                         ?error,
@@ -2749,104 +2780,67 @@ async fn peer_connection_listener(
                     return;
                 }
             }
-            msg = conn.recv() => {
-                match msg {
-                    Ok(msg) => {
-                        match decode_msg(&msg) {
-                            Ok(net_message) => {
-                                let tx = *net_message.id();
-                                tracing::debug!(
-                                    from = %conn.remote_addr(),
-                                    %tx,
-                                    tx_type = ?tx.transaction_type(),
-                                    msg_type = %net_message,
-                                    "[CONN_LIFECYCLE] Received inbound NetMessage from peer"
-                                );
-                                if conn_events.send(ConnEvent::InboundMessage(IncomingMessage::with_remote(net_message, remote_addr))).await.is_err() {
-                                    tracing::debug!(
-                                        from = %remote_addr,
-                                        "[CONN_LIFECYCLE] conn_events receiver dropped; stopping listener"
-                                    );
-                                    return;
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    from = %conn.remote_addr(),
-                                    ?error,
-                                    "[CONN_LIFECYCLE] Failed to deserialize inbound message; closing connection"
-                                );
-                                let transport_error = TransportError::Other(anyhow!(
-                                    "Failed to deserialize inbound message from {remote_addr}: {error:?}"
-                                ));
-                                // Before terminating, drain any pending outbound messages
-                                drain_pending_messages(&mut rx, &mut conn, remote_addr).await;
-                                notify_transport_closed(
-                                    &conn_events,
-                                    remote_addr,
-                                    transport_error,
-                                )
-                                .await;
-                                return;
-                            }
-                        }
-                    }
-                    Err(error) => {
+            PeerConnectionEvent::OutboundMessage(None) => {
+                tracing::warn!(
+                    to = %remote_addr,
+                    "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
+                );
+                notify_transport_closed(
+                    &conn_events,
+                    remote_addr,
+                    TransportError::ConnectionClosed(remote_addr),
+                )
+                .await;
+                return;
+            }
+            PeerConnectionEvent::InboundMessage(Ok(msg)) => match decode_msg(&msg) {
+                Ok(net_message) => {
+                    let tx = *net_message.id();
+                    tracing::debug!(
+                        from = %remote_addr,
+                        %tx,
+                        tx_type = ?tx.transaction_type(),
+                        msg_type = %net_message,
+                        "[CONN_LIFECYCLE] Received inbound NetMessage from peer"
+                    );
+                    if conn_events
+                        .send(ConnEvent::InboundMessage(IncomingMessage::with_remote(
+                            net_message,
+                            remote_addr,
+                        )))
+                        .await
+                        .is_err()
+                    {
                         tracing::debug!(
-                            from = %conn.remote_addr(),
-                            ?error,
-                            "[CONN_LIFECYCLE] peer_connection_listener terminating after recv error"
+                            from = %remote_addr,
+                            "[CONN_LIFECYCLE] conn_events receiver dropped; stopping listener"
                         );
-                        // Before terminating, drain any pending outbound messages
-                        // This prevents a race where messages are queued but lost
-                        // because the transport error is processed first
-                        drain_pending_messages(&mut rx, &mut conn, remote_addr).await;
-                        notify_transport_closed(&conn_events, remote_addr, error).await;
                         return;
                     }
                 }
+                Err(error) => {
+                    tracing::error!(
+                        from = %remote_addr,
+                        ?error,
+                        "[CONN_LIFECYCLE] Failed to deserialize inbound message; closing connection"
+                    );
+                    let transport_error = TransportError::Other(anyhow!(
+                        "Failed to deserialize inbound message from {remote_addr}: {error:?}"
+                    ));
+                    notify_transport_closed(&conn_events, remote_addr, transport_error).await;
+                    return;
+                }
+            },
+            PeerConnectionEvent::InboundMessage(Err(error)) => {
+                tracing::debug!(
+                    from = %remote_addr,
+                    ?error,
+                    "[CONN_LIFECYCLE] peer_connection_listener terminating after recv error"
+                );
+                notify_transport_closed(&conn_events, remote_addr, error).await;
+                return;
             }
         }
-    }
-}
-
-/// Drain any pending outbound messages from the channel before closing.
-/// This prevents message loss when transport errors race with queued sends.
-async fn drain_pending_messages(
-    rx: &mut PeerConnChannelRecv,
-    conn: &mut PeerConnection,
-    remote_addr: SocketAddr,
-) {
-    let mut drained = 0;
-    while let Ok(msg) = rx.try_recv() {
-        // Attempt to send even if connection is degraded - the send may still succeed
-        // for messages already in flight
-        if let Err(e) = handle_peer_channel_message(conn, msg).await {
-            tracing::debug!(
-                to = %remote_addr,
-                ?e,
-                drained,
-                "[CONN_LIFECYCLE] Failed to drain message during shutdown"
-            );
-            break;
-        }
-        drained += 1;
-        // Limit how many we drain to avoid blocking shutdown indefinitely
-        if drained >= 32 {
-            tracing::debug!(
-                to = %remote_addr,
-                drained,
-                "[CONN_LIFECYCLE] Reached drain limit during shutdown"
-            );
-            break;
-        }
-    }
-    if drained > 0 {
-        tracing::debug!(
-            to = %remote_addr,
-            drained,
-            "[CONN_LIFECYCLE] Drained pending messages before shutdown"
-        );
     }
 }
 

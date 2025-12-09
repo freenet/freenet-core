@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use futures::future::BoxFuture;
@@ -138,40 +141,128 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
     }
 }
 
+/// Event from the client combinator priority select.
+/// Priority is: HostMessage > ClientMessage (ensures responses are sent before handling disconnect)
+enum ClientCombinatorEvent {
+    /// Response from host to send to client (Priority 1 - highest)
+    HostMessage(Option<(ClientId, HostResult)>),
+    /// Request from client to forward to host (Priority 2)
+    ClientMessage(Result<OpenRequest<'static>, ClientError>),
+}
+
+/// Polls both the host response channel and client request source with priority ordering.
+/// This ensures host responses are always processed before client errors/disconnects.
+struct ClientCombinatorPriorityPoll<'a> {
+    rx: &'a mut Receiver<(ClientId, HostResult)>,
+    client: &'a mut BoxedClient,
+}
+
+impl<'a> ClientCombinatorPriorityPoll<'a> {
+    fn new(rx: &'a mut Receiver<(ClientId, HostResult)>, client: &'a mut BoxedClient) -> Self {
+        Self { rx, client }
+    }
+}
+
+impl<'a> Future for ClientCombinatorPriorityPoll<'a> {
+    type Output = ClientCombinatorEvent;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+
+        // Track if we found a lower-priority ready item
+        let mut pending_client_msg: Option<ClientCombinatorEvent> = None;
+
+        // Priority 1: Check host response channel first (highest priority)
+        match Pin::new(&mut *this.rx).poll_recv(cx) {
+            Poll::Ready(Some(msg)) => {
+                return Poll::Ready(ClientCombinatorEvent::HostMessage(Some(msg)));
+            }
+            Poll::Ready(None) => {
+                // Channel closed - but check client too before returning
+                pending_client_msg = Some(ClientCombinatorEvent::HostMessage(None));
+            }
+            Poll::Pending => {}
+        }
+
+        // Priority 2: Check client requests
+        let client_fut = this.client.recv();
+        tokio::pin!(client_fut);
+        match client_fut.poll(cx) {
+            Poll::Ready(result) => {
+                // If we have a pending host channel closure, return that first (higher priority)
+                if let Some(event) = pending_client_msg {
+                    return Poll::Ready(event);
+                }
+                return Poll::Ready(ClientCombinatorEvent::ClientMessage(result));
+            }
+            Poll::Pending => {}
+        }
+
+        // If host channel closed but client is pending, return the closure
+        if let Some(event) = pending_client_msg {
+            return Poll::Ready(event);
+        }
+
+        Poll::Pending
+    }
+}
+
+/// Handles bidirectional communication between a client and the host.
+///
+/// Uses `ClientCombinatorPriorityPoll` to ensure host responses are always
+/// processed before client disconnect errors, preventing lost responses.
 async fn client_fn(
     mut client: BoxedClient,
     mut rx: Receiver<(ClientId, HostResult)>,
     tx_host: Sender<Result<OpenRequest<'static>, ClientError>>,
 ) {
     loop {
-        tokio::select! {
-            host_msg = rx.recv() => {
-                if let Some((client_id, response)) = host_msg {
-                    if client.send(client_id, response).await.is_err() {
-                        break;
-                    }
-                } else {
-                    tracing::debug!("disconnected host");
+        let event = ClientCombinatorPriorityPoll::new(&mut rx, &mut client).await;
+        match event {
+            ClientCombinatorEvent::HostMessage(Some((client_id, response))) => {
+                if client.send(client_id, response).await.is_err() {
                     break;
                 }
             }
-            client_msg = client.recv() => {
-                match client_msg {
-                    Ok(OpenRequest { client_id, request_id, request, notification_channel, token, attested_contract }) => {
-                        tracing::debug!("received msg @ combinator from external id {client_id}, msg: {request}");
-                        if tx_host.send(Ok(OpenRequest { client_id, request_id, request, notification_channel, token, attested_contract })).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) =>{
-                        tracing::debug!("disconnected client");
-                        let _ = tx_host.send(Err(err)).await;
-                        break;
-                    }
-                    Err(err) => {
-                        panic!("Error of kind: {err} not handled");
-                    }
+            ClientCombinatorEvent::HostMessage(None) => {
+                tracing::debug!("disconnected host");
+                break;
+            }
+            ClientCombinatorEvent::ClientMessage(Ok(OpenRequest {
+                client_id,
+                request_id,
+                request,
+                notification_channel,
+                token,
+                attested_contract,
+            })) => {
+                tracing::debug!(
+                    "received msg @ combinator from external id {client_id}, msg: {request}"
+                );
+                if tx_host
+                    .send(Ok(OpenRequest {
+                        client_id,
+                        request_id,
+                        request,
+                        notification_channel,
+                        token,
+                        attested_contract,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
+            }
+            ClientCombinatorEvent::ClientMessage(Err(err))
+                if matches!(err.kind(), ErrorKind::ChannelClosed) =>
+            {
+                tracing::debug!("disconnected client");
+                let _ = tx_host.send(Err(err)).await;
+                break;
+            }
+            ClientCombinatorEvent::ClientMessage(Err(err)) => {
+                panic!("Error of kind: {err} not handled");
             }
         }
     }
