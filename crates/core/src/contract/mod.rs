@@ -63,7 +63,8 @@ where
                     Err(err) => {
                         tracing::warn!("Error while executing get contract query: {err}");
                         if err.is_fatal() {
-                            todo!("Handle fatal error; reset executor");
+                            tracing::error!(%key, %err, "Fatal executor error during get query");
+                            return Err(ContractError::FatalExecutorError { key, error: err });
                         }
                         contract_handler
                             .channel()
@@ -125,12 +126,13 @@ where
                     },
                     Err(err) => {
                         if err.is_fatal() {
-                            todo!("Handle fatal error; reset executor");
+                            tracing::error!(%key, %err, "Fatal executor error during put query");
+                            return Err(ContractError::FatalExecutorError { key, error: err });
                         }
                         ContractHandlerEvent::PutResponse {
                             new_value: Err(err),
                         }
-                    } // UpsertResult::NotAvailable is not used in this path
+                    }
                 };
 
                 contract_handler
@@ -189,7 +191,8 @@ where
                     },
                     Err(err) => {
                         if err.is_fatal() {
-                            todo!("Handle fatal error; reset executor");
+                            tracing::error!(%key, %err, "Fatal executor error during update query");
+                            return Err(ContractError::FatalExecutorError { key, error: err });
                         }
                         ContractHandlerEvent::UpdateResponse {
                             new_value: Err(err),
@@ -301,4 +304,9 @@ pub(crate) enum ContractError {
     IOError(#[from] std::io::Error),
     #[error("no response received from handler")]
     NoEvHandlerResponse,
+    #[error("fatal executor error for contract {key}: {error}")]
+    FatalExecutorError {
+        key: ContractKey,
+        error: ExecutorError,
+    },
 }

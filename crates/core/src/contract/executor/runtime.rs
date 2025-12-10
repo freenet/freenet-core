@@ -1,8 +1,7 @@
 use super::*;
 use super::{
-    ContractExecutor, ContractInitState, ContractRequest, ContractResponse, ExecutorError,
-    ExecutorHalve, ExecutorToEventLoopChannel, QueuedOperation, RequestError, Response,
-    StateStoreError,
+    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
+    ExecutorToEventLoopChannel, InitCheckResult, RequestError, Response, StateStoreError,
 };
 
 impl ContractExecutor for Executor<Runtime> {
@@ -41,41 +40,29 @@ impl ContractExecutor for Executor<Runtime> {
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
         // Check if this contract is currently being initialized
-        if let Some(ContractInitState::Initializing { .. }) = self.contract_init_state.get(&key) {
-            // If we're trying to PUT while already initializing, that's an error
-            if code.is_some() {
+        match self.init_tracker.check_and_maybe_queue(
+            &key,
+            code.is_some(),
+            update.clone(),
+            related_contracts.clone(),
+        ) {
+            InitCheckResult::NotInitializing => {
+                // Continue with normal processing below
+            }
+            InitCheckResult::PutDuringInit => {
                 return Err(ExecutorError::request(StdContractError::Put {
                     key,
                     cause: "contract is already being initialized".into(),
                 }));
             }
-
-            // This is an UPDATE arriving during initialization - queue it
-            tracing::info!(
-                contract = %key,
-                "Operation arrived during contract initialization - queueing for later processing"
-            );
-
-            if let Some(ContractInitState::Initializing {
-                ref mut queued_ops, ..
-            }) = self.contract_init_state.get_mut(&key)
-            {
-                queued_ops.push(QueuedOperation {
-                    update: update.clone(),
-                    related_contracts: related_contracts.clone(),
-                    queued_at: std::time::Instant::now(),
-                });
-
-                // Return a placeholder response indicating the operation is queued
-                // The caller should retry later once initialization is complete
-                tracing::debug!(
+            InitCheckResult::Queued { queue_size } => {
+                tracing::info!(
                     contract = %key,
-                    queued_count = queued_ops.len(),
-                    "Operation queued, initialization still in progress"
+                    queue_size,
+                    "Operation queued during contract initialization"
                 );
-
-                // For now, return NoChange to indicate the operation didn't fail but also didn't complete
-                // In the future, we might want a specific QueuedResult variant
+                // Return NoChange to indicate the operation didn't fail but also didn't complete
+                // The caller should retry later once initialization is complete
                 return Ok(UpsertResult::NoChange);
             }
         }
@@ -143,14 +130,7 @@ impl ContractExecutor for Executor<Runtime> {
                 contract = %key,
                 "Starting contract initialization - queueing subsequent operations"
             );
-
-            self.contract_init_state.insert(
-                key,
-                ContractInitState::Initializing {
-                    queued_ops: Vec::new(),
-                    started_at: std::time::Instant::now(),
-                },
-            );
+            self.init_tracker.start_initialization(key);
         }
 
         let mut updates = match update {
@@ -178,26 +158,18 @@ impl ContractExecutor for Executor<Runtime> {
                                 .map_err(ExecutorError::other)?;
 
                             // Contract initialization complete - mark as ready and get queued ops
-                            let queued_ops = if let Some(ContractInitState::Initializing {
-                                queued_ops,
-                                started_at,
-                            }) = self.contract_init_state.remove(&key)
+                            if let Some(completion_info) =
+                                self.init_tracker.complete_initialization(&key)
                             {
-                                let init_duration = started_at.elapsed();
                                 tracing::info!(
                                     contract = %key,
-                                    queued_operations = queued_ops.len(),
-                                    init_duration_ms = init_duration.as_millis(),
+                                    queued_operations = completion_info.queued_ops.len(),
+                                    init_duration_ms = completion_info.init_duration.as_millis(),
                                     "Contract initialization complete, will process queued operations"
                                 );
-                                queued_ops
-                            } else {
-                                Vec::new()
-                            };
 
-                            // Log details about queued operations
-                            if !queued_ops.is_empty() {
-                                for op in &queued_ops {
+                                // Log details about queued operations
+                                for op in &completion_info.queued_ops {
                                     let queue_time = op.queued_at.elapsed();
                                     tracing::info!(
                                         contract = %key,
@@ -216,12 +188,10 @@ impl ContractExecutor for Executor<Runtime> {
                     }
                     ValidateResult::Invalid => {
                         // Validation failed - clear any queued operations
-                        if let Some(ContractInitState::Initializing { queued_ops, .. }) =
-                            self.contract_init_state.remove(&key)
-                        {
+                        if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
                             tracing::warn!(
                                 contract = %key,
-                                dropped_operations = queued_ops.len(),
+                                dropped_operations = dropped_count,
                                 "Contract validation failed, dropping queued operations"
                             );
                         }
@@ -229,12 +199,10 @@ impl ContractExecutor for Executor<Runtime> {
                     }
                     ValidateResult::RequestRelated(mut related) => {
                         // Clear any queued operations since we're missing related contracts
-                        if let Some(ContractInitState::Initializing { queued_ops, .. }) =
-                            self.contract_init_state.remove(&key)
-                        {
+                        if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
                             tracing::warn!(
                                 contract = %key,
-                                dropped_operations = queued_ops.len(),
+                                dropped_operations = dropped_count,
                                 "Missing related contracts, dropping queued operations"
                             );
                         }

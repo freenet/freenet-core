@@ -39,8 +39,11 @@ use crate::{
     operations::{self, Operation},
 };
 
+pub(super) mod init_tracker;
 pub(super) mod mock_runtime;
 pub(super) mod runtime;
+
+pub(crate) use init_tracker::{ContractInitTracker, InitCheckResult};
 
 #[derive(Debug)]
 pub struct ExecutorError {
@@ -550,30 +553,6 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 }
 
-/// A WASM executor which will run any contracts, delegates, etc. registered.
-///
-/// This executor will monitor the store directories and databases to detect state changes.
-/// Represents an operation that's waiting for a contract to finish initializing
-#[derive(Debug)]
-struct QueuedOperation {
-    update: Either<WrappedState, StateDelta<'static>>,
-    related_contracts: RelatedContracts<'static>,
-    /// When this operation was queued
-    queued_at: std::time::Instant,
-}
-
-/// Tracks the initialization state of a contract
-#[derive(Debug)]
-enum ContractInitState {
-    /// Contract is currently being initialized (validation in progress)
-    Initializing {
-        /// Operations waiting for initialization to complete
-        queued_ops: Vec<QueuedOperation>,
-        /// When initialization started
-        started_at: std::time::Instant,
-    },
-}
-
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
 pub struct Executor<R = Runtime> {
@@ -587,7 +566,7 @@ pub struct Executor<R = Runtime> {
     /// Attested contract instances for a given delegate.
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
     /// Tracks contracts that are being initialized and operations queued for them
-    contract_init_state: HashMap<ContractKey, ContractInitState>,
+    init_tracker: ContractInitTracker,
 
     event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
 }
@@ -609,7 +588,7 @@ impl<R> Executor<R> {
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
             delegate_attested_ids: HashMap::default(),
-            contract_init_state: HashMap::default(),
+            init_tracker: ContractInitTracker::new(),
             event_loop_channel,
         })
     }
@@ -695,5 +674,166 @@ impl<R> Executor<R> {
             }
         }
         subscriptions
+    }
+}
+
+/// Test fixtures for creating contract-related test data.
+///
+/// These helpers make it easier to write unit tests for contract module code
+/// by providing convenient constructors for common types.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use freenet_stdlib::prelude::*;
+
+    /// Create a test contract key with arbitrary but consistent data
+    pub fn make_contract_key() -> ContractKey {
+        let code = ContractCode::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let params = Parameters::from(vec![10, 20, 30, 40]);
+        ContractKey::from_params_and_code(&params, &code)
+    }
+
+    /// Create a test contract key with custom code bytes
+    pub fn make_contract_key_with_code(code_bytes: &[u8]) -> ContractKey {
+        let code = ContractCode::from(code_bytes.to_vec());
+        let params = Parameters::from(vec![10, 20, 30, 40]);
+        ContractKey::from_params_and_code(&params, &code)
+    }
+
+    /// Create a test wrapped state from raw bytes
+    pub fn make_state(data: &[u8]) -> WrappedState {
+        WrappedState::new(data.to_vec())
+    }
+
+    /// Create test parameters from raw bytes
+    pub fn make_params(data: &[u8]) -> Parameters<'static> {
+        Parameters::from(data.to_vec())
+    }
+
+    /// Create a test state delta from raw bytes
+    pub fn make_delta(data: &[u8]) -> StateDelta<'static> {
+        StateDelta::from(data.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod executor_error_tests {
+        use super::*;
+
+        #[test]
+        fn test_executor_error_other_is_not_request() {
+            let err = ExecutorError::other(anyhow::anyhow!("some error"));
+            assert!(!err.is_request());
+            assert!(!err.is_fatal());
+        }
+
+        #[test]
+        fn test_executor_error_request_is_request() {
+            let err = ExecutorError::request(StdContractError::Put {
+                key: test_fixtures::make_contract_key(),
+                cause: "test".into(),
+            });
+            assert!(err.is_request());
+            assert!(!err.is_fatal());
+        }
+
+        #[test]
+        fn test_executor_error_internal_error() {
+            let err = ExecutorError::internal_error();
+            assert!(!err.is_request());
+            assert!(!err.is_fatal());
+            assert!(err.to_string().contains("internal error"));
+        }
+
+        #[test]
+        fn test_executor_error_display_left() {
+            let err = ExecutorError::request(StdContractError::Put {
+                key: test_fixtures::make_contract_key(),
+                cause: "test cause".into(),
+            });
+            let display = err.to_string();
+            assert!(display.contains("test cause") || display.contains("Put"));
+        }
+
+        #[test]
+        fn test_executor_error_display_right() {
+            let err = ExecutorError::other(anyhow::anyhow!("custom error message"));
+            assert!(err.to_string().contains("custom error message"));
+        }
+
+        #[test]
+        fn test_executor_error_from_request_error() {
+            let request_err = RequestError::ContractError(StdContractError::Put {
+                key: test_fixtures::make_contract_key(),
+                cause: "from conversion".into(),
+            });
+            let err: ExecutorError = request_err.into();
+            assert!(err.is_request());
+        }
+
+        #[test]
+        fn test_executor_error_from_boxed_request_error() {
+            let request_err = Box::new(RequestError::ContractError(StdContractError::Put {
+                key: test_fixtures::make_contract_key(),
+                cause: "boxed".into(),
+            }));
+            let err: ExecutorError = request_err.into();
+            assert!(err.is_request());
+        }
+
+        #[test]
+        fn test_unwrap_request_succeeds_for_request_error() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::Put {
+                key,
+                cause: "unwrap test".into(),
+            });
+            let _unwrapped = err.unwrap_request(); // Should not panic
+        }
+
+        #[test]
+        #[should_panic]
+        fn test_unwrap_request_panics_for_other_error() {
+            let err = ExecutorError::other(anyhow::anyhow!("not a request"));
+            let _unwrapped = err.unwrap_request(); // Should panic
+        }
+    }
+
+    mod test_fixtures_tests {
+        use super::*;
+
+        #[test]
+        fn test_make_contract_key_is_consistent() {
+            let key1 = test_fixtures::make_contract_key();
+            let key2 = test_fixtures::make_contract_key();
+            assert_eq!(key1, key2);
+        }
+
+        #[test]
+        fn test_make_contract_key_with_different_code() {
+            let key1 = test_fixtures::make_contract_key_with_code(&[1, 2, 3]);
+            let key2 = test_fixtures::make_contract_key_with_code(&[4, 5, 6]);
+            assert_ne!(key1, key2);
+        }
+
+        #[test]
+        fn test_make_state() {
+            let state = test_fixtures::make_state(&[1, 2, 3, 4]);
+            assert_eq!(state.as_ref(), &[1, 2, 3, 4]);
+        }
+
+        #[test]
+        fn test_make_params() {
+            let params = test_fixtures::make_params(&[10, 20]);
+            assert_eq!(params.as_ref(), &[10, 20]);
+        }
+
+        #[test]
+        fn test_make_delta() {
+            let delta = test_fixtures::make_delta(&[100, 200]);
+            assert_eq!(delta.as_ref(), &[100, 200]);
+        }
     }
 }
