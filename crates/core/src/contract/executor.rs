@@ -240,7 +240,7 @@ pub(crate) fn executor_channel(
     let listener_halve = ExecutorToEventLoopChannel {
         op_manager: op_manager.clone(),
         end: NetworkEventListenerHalve {
-            waiting_for_op_rx,
+            waiting_for_op_rx: Some(waiting_for_op_rx),
             response_for_tx,
         },
     };
@@ -343,18 +343,23 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
 impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
     pub async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
         tracing::trace!("Waiting to receive transaction from executor channel");
-        let tx = self
+        let rx = self
             .end
             .waiting_for_op_rx
-            .recv()
-            .await
-            .ok_or_else(|| {
-                tracing::error!("Executor channel closed - all senders have been dropped");
-                tracing::error!("This typically happens when: 1) The executor task panicked/exited, 2) Network timeout cascaded to channel closure, 3) Resource constraints in CI");
-                anyhow::anyhow!("channel closed")
-            })?;
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("receiver already taken"))?;
+        let tx = rx.recv().await.ok_or_else(|| {
+            tracing::error!("Executor channel closed - all senders have been dropped");
+            tracing::error!("This typically happens when: 1) The executor task panicked/exited, 2) Network timeout cascaded to channel closure, 3) Resource constraints in CI");
+            anyhow::anyhow!("channel closed")
+        })?;
         tracing::trace!("Successfully received transaction from executor channel");
         Ok(tx)
+    }
+
+    /// Take the underlying receiver for streaming. Returns None if already taken.
+    pub fn take_waiting_for_op_receiver(&mut self) -> Option<mpsc::Receiver<Transaction>> {
+        self.end.waiting_for_op_rx.take()
     }
 
     pub(crate) fn callback(&self) -> ExecutorToEventLoopChannel<Callback> {
@@ -383,7 +388,7 @@ pub(crate) struct Callback {
 pub(crate) struct NetworkEventListenerHalve {
     /// this is the receiver end of the Executor halve, which will be sent from the executor
     /// when a callback is expected for a given transaction
-    waiting_for_op_rx: mpsc::Receiver<Transaction>,
+    waiting_for_op_rx: Option<mpsc::Receiver<Transaction>>,
     /// this is the sender end of the Executor halve receiver, which will communicate
     /// back responses to the executor, it's cloned each tiome a new callback halve is created
     response_for_tx: mpsc::Sender<OpEnum>,

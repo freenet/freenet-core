@@ -227,7 +227,7 @@ impl From<Transaction> for WaitingTransaction {
 /// Communicates that a client is waiting for a transaction resolution
 /// to continue processing this event.
 pub(crate) struct WaitingResolution {
-    wait_for_res_rx: mpsc::Receiver<(ClientId, WaitingTransaction)>,
+    wait_for_res_rx: Option<mpsc::Receiver<(ClientId, WaitingTransaction)>>,
 }
 
 mod sealed {
@@ -261,7 +261,9 @@ pub(crate) fn contract_handler_channel() -> (
             session_adapter_tx: None,
         },
         ContractHandlerChannel {
-            end: WaitingResolution { wait_for_res_rx },
+            end: WaitingResolution {
+                wait_for_res_rx: Some(wait_for_res_rx),
+            },
             session_adapter_tx: None,
         },
     )
@@ -273,11 +275,21 @@ impl ContractHandlerChannel<WaitingResolution> {
     pub async fn relay_transaction_result_to_client(
         &mut self,
     ) -> anyhow::Result<(ClientId, WaitingTransaction)> {
-        self.end
+        let rx = self
+            .end
             .wait_for_res_rx
-            .recv()
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("receiver already taken"))?;
+        rx.recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("channel dropped"))
+    }
+
+    /// Take the underlying receiver for streaming. Returns None if already taken.
+    pub fn take_wait_for_res_receiver(
+        &mut self,
+    ) -> Option<mpsc::Receiver<(ClientId, WaitingTransaction)>> {
+        self.end.wait_for_res_rx.take()
     }
 }
 
