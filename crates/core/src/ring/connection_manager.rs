@@ -700,19 +700,70 @@ impl ConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::Router;
     use crate::topology::rate::Rate;
     use crate::transport::TransportKeypair;
+    use std::collections::HashSet;
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
+    fn make_connection_manager(
+        own_addr: Option<SocketAddr>,
+        min_conn: usize,
+        max_conn: usize,
+        is_gateway: bool,
+    ) -> ConnectionManager {
+        let keypair = TransportKeypair::new();
+        let own_location = if let Some(addr) = own_addr {
+            AtomicU64::new(u64::from_le_bytes(
+                Location::from_address(&addr).as_f64().to_le_bytes(),
+            ))
+        } else {
+            AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes()))
+        };
+
+        ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            min_conn,
+            max_conn,
+            7,
+            (keypair.public().clone(), own_addr, own_location),
+            is_gateway,
+            10,
+            Duration::from_secs(60),
+        )
+    }
+
+    fn make_addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    // ============ Basic ConnectionManager tests ============
+
+    #[test]
+    fn test_connection_manager_initial_state() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+
+        assert_eq!(cm.connection_count(), 0);
+        assert_eq!(cm.get_own_addr(), Some(make_addr(8000)));
+        assert!(!cm.is_gateway());
+        assert_eq!(cm.min_connections, 5);
+        assert_eq!(cm.max_connections, 20);
+    }
+
+    #[test]
+    fn test_connection_manager_gateway_mode() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, true);
+        assert!(cm.is_gateway());
+    }
+
     #[test]
     fn rejects_self_connection() {
-        // Create a peer id for our node
         let keypair = TransportKeypair::new();
         let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
-        // Create connection manager with this address
         let cm = ConnectionManager::init(
             Rate::new_per_second(1_000_000.0),
             Rate::new_per_second(1_000_000.0),
@@ -729,10 +780,7 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        // Verify the connection manager has our address set
         assert_eq!(cm.get_own_addr(), Some(addr));
-
-        // Attempt to accept a connection from ourselves - should be rejected
         let location = Location::new(0.5);
         let accepted = cm.should_accept(location, addr);
         assert!(!accepted, "should_accept must reject self-connection");
@@ -740,11 +788,9 @@ mod tests {
 
     #[test]
     fn accepts_connection_from_different_peer() {
-        // Create our node's address
         let own_keypair = TransportKeypair::new();
         let own_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
-        // Create connection manager with our address
         let cm = ConnectionManager::init(
             Rate::new_per_second(1_000_000.0),
             Rate::new_per_second(1_000_000.0),
@@ -761,15 +807,448 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        // Create a different peer
         let other_addr: SocketAddr = "127.0.0.2:8001".parse().unwrap();
-
-        // Attempt to accept a connection from a different peer - should be accepted
         let location = Location::new(0.6);
         let accepted = cm.should_accept(location, other_addr);
         assert!(
             accepted,
             "should_accept must accept connection from different peer"
         );
+    }
+
+    // ============ should_accept tests ============
+
+    #[test]
+    fn test_should_accept_below_min_connections() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);
+
+        // First connection should always be accepted
+        let addr1 = make_addr(8001);
+        let loc1 = Location::new(0.1);
+        assert!(cm.should_accept(loc1, addr1));
+
+        // Below min connections, should accept more
+        let addr2 = make_addr(8002);
+        let loc2 = Location::new(0.2);
+        assert!(cm.should_accept(loc2, addr2));
+    }
+
+    #[test]
+    fn test_should_accept_at_max_connections() {
+        // The should_accept logic calculates total_conn = reserved_before + 1 + open
+        // It rejects when total_conn >= max_connections
+        // So with max=4 and 3 open connections: total_conn = 0 + 1 + 3 = 4 >= 4, rejected
+        // Therefore we can only have max_connections - 1 open before the next is rejected
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 4, false);
+        let keypair = TransportKeypair::new();
+
+        // Accept and add first connection (open=1, next attempt: 0+1+1=2 < 4)
+        let addr1 = make_addr(8001);
+        let loc1 = Location::new(0.1);
+        assert!(cm.should_accept(loc1, addr1));
+        cm.add_connection(loc1, addr1, keypair.public().clone(), true);
+
+        // Accept and add second connection (open=2, next attempt: 0+1+2=3 < 4)
+        let addr2 = make_addr(8002);
+        let loc2 = Location::new(0.2);
+        assert!(cm.should_accept(loc2, addr2));
+        cm.add_connection(loc2, addr2, keypair.public().clone(), true);
+
+        // Accept and add third connection (open=3, next attempt: 0+1+3=4 >= 4)
+        let addr3 = make_addr(8003);
+        let loc3 = Location::new(0.3);
+        assert!(cm.should_accept(loc3, addr3));
+        cm.add_connection(loc3, addr3, keypair.public().clone(), true);
+
+        // Fourth connection should be rejected (open=3, total_conn=4 >= max=4)
+        let addr4 = make_addr(8004);
+        let loc4 = Location::new(0.4);
+        assert!(!cm.should_accept(loc4, addr4));
+    }
+
+    #[test]
+    fn test_should_accept_already_connected_peer() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.1);
+
+        // Accept and add connection
+        assert!(cm.should_accept(loc, addr));
+        cm.add_connection(loc, addr, keypair.public().clone(), true);
+
+        // Same peer should still return true (already connected)
+        assert!(cm.should_accept(loc, addr));
+    }
+
+    // ============ add_connection / prune_connection tests ============
+
+    #[test]
+    fn test_add_connection() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+
+        assert_eq!(cm.connection_count(), 0);
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        assert_eq!(cm.connection_count(), 1);
+    }
+
+    #[test]
+    fn test_prune_alive_connection() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        assert_eq!(cm.connection_count(), 1);
+
+        let pruned_loc = cm.prune_alive_connection(addr);
+        assert_eq!(pruned_loc, Some(loc));
+        assert_eq!(cm.connection_count(), 0);
+    }
+
+    #[test]
+    fn test_prune_nonexistent_connection() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+
+        let addr = make_addr(9999);
+        let pruned_loc = cm.prune_alive_connection(addr);
+        assert!(pruned_loc.is_none());
+    }
+
+    // ============ Transient connection tests ============
+
+    #[test]
+    fn test_transient_connection_registration() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+
+        let addr = make_addr(8001);
+        assert_eq!(cm.transient_count(), 0);
+        assert!(!cm.is_transient(addr));
+
+        // Register transient
+        assert!(cm.try_register_transient(addr, Some(Location::new(0.5))));
+        assert_eq!(cm.transient_count(), 1);
+        assert!(cm.is_transient(addr));
+    }
+
+    #[test]
+    fn test_transient_connection_budget_enforcement() {
+        // Create manager with budget of 2
+        let keypair = TransportKeypair::new();
+        let own_addr = make_addr(8000);
+        let cm = ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            1,
+            10,
+            7,
+            (
+                keypair.public().clone(),
+                Some(own_addr),
+                AtomicU64::new(u64::from_le_bytes(0.5f64.to_le_bytes())),
+            ),
+            false,
+            2, // transient_budget = 2
+            Duration::from_secs(60),
+        );
+
+        // First two should succeed
+        assert!(cm.try_register_transient(make_addr(8001), None));
+        assert!(cm.try_register_transient(make_addr(8002), None));
+        assert_eq!(cm.transient_count(), 2);
+
+        // Third should fail (over budget)
+        assert!(!cm.try_register_transient(make_addr(8003), None));
+        assert_eq!(cm.transient_count(), 2);
+    }
+
+    #[test]
+    fn test_transient_connection_update_existing() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+
+        let addr = make_addr(8001);
+        assert!(cm.try_register_transient(addr, None));
+        assert_eq!(cm.transient_count(), 1);
+
+        // Updating existing should succeed without incrementing count
+        assert!(cm.try_register_transient(addr, Some(Location::new(0.3))));
+        assert_eq!(cm.transient_count(), 1);
+    }
+
+    #[test]
+    fn test_drop_transient() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+
+        let addr = make_addr(8001);
+        cm.try_register_transient(addr, Some(Location::new(0.5)));
+        assert_eq!(cm.transient_count(), 1);
+
+        let entry = cm.drop_transient(addr);
+        assert!(entry.is_some());
+        assert_eq!(cm.transient_count(), 0);
+        assert!(!cm.is_transient(addr));
+    }
+
+    #[test]
+    fn test_drop_nonexistent_transient() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+
+        let entry = cm.drop_transient(make_addr(9999));
+        assert!(entry.is_none());
+    }
+
+    // ============ update_location tests ============
+
+    #[test]
+    fn test_update_location() {
+        let cm = make_connection_manager(None, 1, 10, false);
+
+        // Initially no location
+        cm.update_location(Some(Location::new(0.5)));
+        // Location should be updated (we can't directly read it, but it shouldn't panic)
+    }
+
+    #[test]
+    fn test_update_location_to_none() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        cm.update_location(None);
+        // Should not panic
+    }
+
+    // ============ try_set_own_addr tests ============
+
+    #[test]
+    fn test_try_set_own_addr_when_unset() {
+        let cm = make_connection_manager(None, 1, 10, false);
+
+        let addr = make_addr(8000);
+        let result = cm.try_set_own_addr(addr);
+        assert!(result.is_none()); // Returns None when successfully set
+        assert_eq!(cm.get_own_addr(), Some(addr));
+    }
+
+    #[test]
+    fn test_try_set_own_addr_when_already_set() {
+        let original_addr = make_addr(8000);
+        let cm = make_connection_manager(Some(original_addr), 1, 10, false);
+
+        let new_addr = make_addr(9000);
+        let result = cm.try_set_own_addr(new_addr);
+        assert_eq!(result, Some(original_addr)); // Returns existing when already set
+        assert_eq!(cm.get_own_addr(), Some(original_addr)); // Unchanged
+    }
+
+    // ============ update_peer_identity tests ============
+
+    #[test]
+    fn test_update_peer_identity() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+        let new_keypair = TransportKeypair::new();
+
+        let old_addr = make_addr(8001);
+        let new_addr = make_addr(8002);
+        let loc = Location::new(0.5);
+
+        // Add initial connection
+        cm.add_connection(loc, old_addr, keypair.public().clone(), false);
+        assert_eq!(cm.connection_count(), 1);
+
+        // Update peer identity
+        let updated = cm.update_peer_identity(old_addr, new_addr, new_keypair.public().clone());
+        assert!(updated);
+        assert_eq!(cm.connection_count(), 1);
+
+        // Old address should no longer be connected
+        let connections = cm.get_connections_by_location();
+        let conns = connections.get(&loc).unwrap();
+        assert_eq!(conns[0].location.socket_addr(), Some(new_addr));
+    }
+
+    #[test]
+    fn test_update_peer_identity_same_addr() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+
+        // Same address should return false
+        let updated = cm.update_peer_identity(addr, addr, keypair.public().clone());
+        assert!(!updated);
+    }
+
+    #[test]
+    fn test_update_peer_identity_nonexistent() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        let old_addr = make_addr(9999);
+        let new_addr = make_addr(9998);
+
+        let updated = cm.update_peer_identity(old_addr, new_addr, keypair.public().clone());
+        assert!(!updated);
+    }
+
+    // ============ routing tests ============
+
+    #[test]
+    fn test_routing_empty_connections() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let router = Router::new(&[]);
+
+        let empty_set: HashSet<SocketAddr> = HashSet::new();
+        let result = cm.routing(Location::new(0.5), None, &empty_set, &router);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_routing_with_connections() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+        let router = Router::new(&[]);
+
+        // Add a connection
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+
+        let empty_set: HashSet<SocketAddr> = HashSet::new();
+        let result = cm.routing(Location::new(0.5), None, &empty_set, &router);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_routing_skips_requester() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+        let router = Router::new(&[]);
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+
+        // Request from the same address should not route back to itself
+        let empty_set: HashSet<SocketAddr> = HashSet::new();
+        let result = cm.routing(Location::new(0.5), Some(addr), &empty_set, &router);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_routing_skips_skip_list() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+        let router = Router::new(&[]);
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+
+        // Put peer in skip list
+        let mut skip_list = HashSet::new();
+        skip_list.insert(addr);
+
+        let result = cm.routing(Location::new(0.5), None, &skip_list, &router);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_routing_skips_transient() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+        let router = Router::new(&[]);
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+        cm.add_connection(loc, addr, keypair.public().clone(), false);
+
+        // Mark as transient
+        cm.try_register_transient(addr, Some(loc));
+
+        let empty_set: HashSet<SocketAddr> = HashSet::new();
+        let result = cm.routing(Location::new(0.5), None, &empty_set, &router);
+        assert!(result.is_none());
+    }
+
+    // ============ get_connections_by_location tests ============
+
+    #[test]
+    fn test_get_connections_by_location() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        let addr1 = make_addr(8001);
+        let addr2 = make_addr(8002);
+        let loc1 = Location::new(0.3);
+        let loc2 = Location::new(0.7);
+
+        cm.add_connection(loc1, addr1, keypair.public().clone(), false);
+        cm.add_connection(loc2, addr2, keypair.public().clone(), false);
+
+        let connections = cm.get_connections_by_location();
+        assert_eq!(connections.len(), 2);
+        assert!(connections.contains_key(&loc1));
+        assert!(connections.contains_key(&loc2));
+    }
+
+    // ============ has_connection_or_pending tests ============
+
+    #[test]
+    fn test_has_connection_or_pending() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+
+        assert!(!cm.has_connection_or_pending(addr));
+
+        // After accepting (but not adding), should be pending
+        cm.should_accept(loc, addr);
+        assert!(cm.has_connection_or_pending(addr));
+
+        // After adding, should still return true
+        cm.add_connection(loc, addr, keypair.public().clone(), true);
+        assert!(cm.has_connection_or_pending(addr));
+    }
+
+    // ============ record_pending_location tests ============
+
+    #[test]
+    fn test_record_pending_location() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+
+        let addr = make_addr(8001);
+        let loc = Location::new(0.5);
+
+        cm.record_pending_location(addr, loc);
+
+        // Location should be recorded
+        assert!(cm.location_for_peer.read().contains_key(&addr));
+    }
+
+    #[test]
+    fn test_record_pending_location_already_exists() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
+
+        let addr = make_addr(8001);
+        let loc1 = Location::new(0.5);
+        let loc2 = Location::new(0.7);
+
+        cm.record_pending_location(addr, loc1);
+        cm.record_pending_location(addr, loc2);
+
+        // Should keep original location
+        let locations = cm.location_for_peer.read();
+        assert_eq!(locations.get(&addr), Some(&loc1));
     }
 }

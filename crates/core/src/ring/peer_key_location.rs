@@ -216,3 +216,254 @@ impl<'a> arbitrary::Arbitrary<'a> for PeerKeyLocation {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::TransportKeypair;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn make_pub_key() -> TransportPublicKey {
+        TransportKeypair::new().public().clone()
+    }
+
+    // ============ PeerAddr tests ============
+
+    #[test]
+    fn test_peer_addr_unknown() {
+        let addr = PeerAddr::Unknown;
+        assert!(addr.is_unknown());
+        assert!(!addr.is_known());
+        assert!(addr.as_known().is_none());
+    }
+
+    #[test]
+    fn test_peer_addr_known() {
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let addr = PeerAddr::Known(socket);
+        assert!(addr.is_known());
+        assert!(!addr.is_unknown());
+        assert_eq!(addr.as_known(), Some(&socket));
+    }
+
+    #[test]
+    fn test_peer_addr_from_socket_addr() {
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let addr: PeerAddr = socket.into();
+        assert!(addr.is_known());
+        assert_eq!(addr.as_known(), Some(&socket));
+    }
+
+    #[test]
+    fn test_peer_addr_display() {
+        let unknown = PeerAddr::Unknown;
+        assert_eq!(format!("{}", unknown), "<unknown>");
+
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9000);
+        let known = PeerAddr::Known(socket);
+        assert_eq!(format!("{}", known), "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_peer_addr_equality() {
+        let socket1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 1000);
+        let socket2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 1000);
+        let socket3 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 2000);
+
+        assert_eq!(PeerAddr::Known(socket1), PeerAddr::Known(socket2));
+        assert_ne!(PeerAddr::Known(socket1), PeerAddr::Known(socket3));
+        assert_eq!(PeerAddr::Unknown, PeerAddr::Unknown);
+        assert_ne!(PeerAddr::Unknown, PeerAddr::Known(socket1));
+    }
+
+    // ============ PeerKeyLocation tests ============
+
+    #[test]
+    fn test_peer_key_location_new() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 8000);
+        let pkl = PeerKeyLocation::new(pub_key.clone(), addr);
+
+        assert_eq!(pkl.pub_key(), &pub_key);
+        assert_eq!(pkl.socket_addr(), Some(addr));
+        assert!(pkl.location().is_some());
+    }
+
+    #[test]
+    fn test_peer_key_location_with_unknown_addr() {
+        let pub_key = make_pub_key();
+        let pkl = PeerKeyLocation::with_unknown_addr(pub_key.clone());
+
+        assert_eq!(pkl.pub_key(), &pub_key);
+        assert!(pkl.socket_addr().is_none());
+        assert!(pkl.location().is_none());
+    }
+
+    #[test]
+    fn test_peer_key_location_set_addr() {
+        let pub_key = make_pub_key();
+        let mut pkl = PeerKeyLocation::with_unknown_addr(pub_key.clone());
+
+        // Initially unknown
+        assert!(pkl.socket_addr().is_none());
+        assert!(pkl.location().is_none());
+
+        // Set address
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 12345);
+        pkl.set_addr(addr);
+
+        // Now known
+        assert_eq!(pkl.socket_addr(), Some(addr));
+        assert!(pkl.location().is_some());
+    }
+
+    #[test]
+    fn test_peer_key_location_location_computation() {
+        let pub_key = make_pub_key();
+        // Use addresses in different /24 subnets since last byte is masked for sybil mitigation
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)), 5000);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)), 5000);
+
+        let pkl1 = PeerKeyLocation::new(pub_key.clone(), addr1);
+        let pkl2 = PeerKeyLocation::new(pub_key.clone(), addr2);
+
+        // Different /24 subnets should produce different locations
+        let loc1 = pkl1.location().unwrap();
+        let loc2 = pkl2.location().unwrap();
+        assert_ne!(loc1, loc2);
+    }
+
+    #[test]
+    fn test_peer_key_location_ordering_both_known() {
+        let pub_key = make_pub_key();
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5000);
+
+        let pkl1 = PeerKeyLocation::new(pub_key.clone(), addr1);
+        let pkl2 = PeerKeyLocation::new(pub_key.clone(), addr2);
+
+        // Ordering should follow address ordering
+        assert!(pkl1 < pkl2);
+        assert!(pkl2 > pkl1);
+    }
+
+    #[test]
+    fn test_peer_key_location_ordering_unknown_last() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+
+        let known = PeerKeyLocation::new(pub_key.clone(), addr);
+        let unknown = PeerKeyLocation::with_unknown_addr(pub_key.clone());
+
+        // Known addresses should sort before unknown
+        assert!(known < unknown);
+        assert!(unknown > known);
+    }
+
+    #[test]
+    fn test_peer_key_location_ordering_both_unknown() {
+        let pub_key1 = make_pub_key();
+        let pub_key2 = make_pub_key();
+
+        let unknown1 = PeerKeyLocation::with_unknown_addr(pub_key1);
+        let unknown2 = PeerKeyLocation::with_unknown_addr(pub_key2);
+
+        // Two unknowns should be equal in ordering (regardless of pub_key)
+        assert_eq!(unknown1.cmp(&unknown2), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_peer_key_location_sorting() {
+        let pub_key = make_pub_key();
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), 5000);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let addr3 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5000);
+
+        let mut peers = vec![
+            PeerKeyLocation::with_unknown_addr(pub_key.clone()),
+            PeerKeyLocation::new(pub_key.clone(), addr1),
+            PeerKeyLocation::new(pub_key.clone(), addr2),
+            PeerKeyLocation::with_unknown_addr(pub_key.clone()),
+            PeerKeyLocation::new(pub_key.clone(), addr3),
+        ];
+
+        peers.sort();
+
+        // Known addresses first (sorted), then unknowns
+        assert_eq!(peers[0].socket_addr(), Some(addr2)); // 10.0.0.1
+        assert_eq!(peers[1].socket_addr(), Some(addr3)); // 10.0.0.2
+        assert_eq!(peers[2].socket_addr(), Some(addr1)); // 10.0.0.3
+        assert!(peers[3].socket_addr().is_none()); // unknown
+        assert!(peers[4].socket_addr().is_none()); // unknown
+    }
+
+    #[test]
+    fn test_peer_key_location_display_with_known_addr() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9000);
+        let pkl = PeerKeyLocation::new(pub_key, addr);
+
+        let display = format!("{}", pkl);
+        // Should contain the address and location
+        assert!(display.contains("127.0.0.1:9000"));
+        assert!(display.contains("@")); // location marker
+    }
+
+    #[test]
+    fn test_peer_key_location_display_with_unknown_addr() {
+        let pub_key = make_pub_key();
+        let pkl = PeerKeyLocation::with_unknown_addr(pub_key);
+
+        let display = format!("{}", pkl);
+        assert!(display.contains("<unknown>"));
+    }
+
+    #[test]
+    fn test_peer_key_location_equality() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+
+        let pkl1 = PeerKeyLocation::new(pub_key.clone(), addr);
+        let pkl2 = PeerKeyLocation::new(pub_key.clone(), addr);
+
+        assert_eq!(pkl1, pkl2);
+    }
+
+    #[test]
+    fn test_peer_key_location_clone() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)), 5555);
+        let pkl = PeerKeyLocation::new(pub_key, addr);
+        let cloned = pkl.clone();
+
+        assert_eq!(pkl, cloned);
+        assert_eq!(pkl.socket_addr(), cloned.socket_addr());
+    }
+
+    #[test]
+    fn test_peer_key_location_random() {
+        // Test that random() generates valid PeerKeyLocations
+        let pkl1 = PeerKeyLocation::random();
+        let pkl2 = PeerKeyLocation::random();
+
+        // Both should have known addresses
+        assert!(pkl1.socket_addr().is_some());
+        assert!(pkl2.socket_addr().is_some());
+
+        // Addresses should differ (with very high probability)
+        assert_ne!(pkl1.socket_addr(), pkl2.socket_addr());
+    }
+
+    #[test]
+    fn test_peer_key_location_with_ipv6() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            8080,
+        );
+        let pkl = PeerKeyLocation::new(pub_key, addr);
+
+        assert_eq!(pkl.socket_addr(), Some(addr));
+        assert!(pkl.location().is_some());
+    }
+}
