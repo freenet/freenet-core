@@ -483,7 +483,8 @@ impl JoinerState {
 pub(crate) struct ConnectOp {
     pub(crate) id: Transaction,
     pub(crate) state: Option<ConnectState>,
-    pub(crate) gateway: Option<Box<PeerKeyLocation>>,
+    /// The peer we sent/forwarded the connect request to (first hop from joiner's perspective).
+    pub(crate) first_hop: Option<Box<PeerKeyLocation>>,
     pub(crate) backoff: Option<Backoff>,
     pub(crate) desired_location: Option<Location>,
     /// Tracks when we last forwarded this connect to a peer, to avoid hammering the same
@@ -535,7 +536,7 @@ impl ConnectOp {
         Self {
             id,
             state: Some(state),
-            gateway: gateway.map(Box::new),
+            first_hop: gateway.map(Box::new),
             backoff,
             desired_location: Some(desired_location),
             recency: HashMap::new(),
@@ -560,7 +561,7 @@ impl ConnectOp {
         Self {
             id,
             state: Some(state),
-            gateway: None,
+            first_hop: None,
             backoff: None,
             desired_location: None,
             recency: HashMap::new(),
@@ -594,19 +595,19 @@ impl ConnectOp {
     }
 
     pub(crate) fn gateway(&self) -> Option<&PeerKeyLocation> {
-        self.gateway.as_deref()
+        self.first_hop.as_deref()
     }
 
-    /// Get the target address if this operation is in a state that needs to send
-    /// an outbound message. For Connect, this is the gateway we're connecting to.
-    pub(crate) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
-        self.gateway.as_deref().and_then(|g| g.socket_addr())
+    /// Get the next hop address if this operation is in a state that needs to send
+    /// an outbound message. For Connect, this is the first hop peer we're connecting through.
+    pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
+        self.first_hop.as_deref().and_then(|g| g.socket_addr())
     }
 
     /// Get the full target peer (including public key) for connection establishment.
     /// For Connect operations, this returns the gateway peer.
     pub(crate) fn get_target_peer(&self) -> Option<crate::ring::PeerKeyLocation> {
-        self.gateway.as_deref().cloned()
+        self.first_hop.as_deref().cloned()
     }
 
     fn take_desired_location(&mut self) -> Option<Location> {
@@ -1088,7 +1089,7 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
             OpEnum::Connect(Box::new(ConnectOp {
                 id: op.id,
                 state: Some(state),
-                gateway: op.gateway.clone(),
+                first_hop: op.first_hop.clone(),
                 backoff: op.backoff.clone(),
                 desired_location: op.desired_location,
                 recency: op.recency.clone(),
@@ -1165,7 +1166,7 @@ pub(crate) async fn join_ring_request(
         op_manager.connect_forward_estimator.clone(),
     );
 
-    op.gateway = Some(Box::new(gateway.clone()));
+    op.first_hop = Some(Box::new(gateway.clone()));
     if let Some(backoff) = backoff {
         op.backoff = Some(backoff);
     }

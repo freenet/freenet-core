@@ -2268,18 +2268,18 @@ impl P2pConnManager {
         match msg {
             Some(Left(msg)) => {
                 // With hop-by-hop routing, messages no longer embed target.
-                // For initial requests (GET, PUT, Subscribe, Connect), extract target from operation state.
+                // For initial requests (GET, PUT, Subscribe, Connect), extract next hop from operation state.
                 // For other messages, process locally (they'll be routed through network_bridge.send()).
                 let tx = *msg.id();
 
-                // Try to get target from operation state for initial outbound requests
+                // Try to get next hop from operation state for initial outbound requests
                 // Uses peek methods to avoid pop/push overhead
-                if let Some(target_addr) = self.bridge.op_manager.peek_target_addr(&tx) {
+                if let Some(next_hop_addr) = self.bridge.op_manager.peek_next_hop_addr(&tx) {
                     tracing::debug!(
                         tx = %msg.id(),
                         msg_type = %msg,
-                        target_addr = %target_addr,
-                        "handle_notification_msg: Found target in operation state, routing as OutboundMessageWithTarget"
+                        next_hop = %next_hop_addr,
+                        "handle_notification_msg: Found next hop in operation state, routing as OutboundMessage"
                     );
                     // For UPDATE operations only: mark complete after routing because UPDATE
                     // uses fire-and-forget semantics (client result already sent).
@@ -2289,15 +2289,19 @@ impl P2pConnManager {
                         self.bridge.op_manager.completed(tx);
                     }
                     return EventResult::Event(
-                        ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
+                        ConnEvent::OutboundMessageWithTarget {
+                            target_addr: next_hop_addr,
+                            msg,
+                        }
+                        .into(),
                     );
                 }
 
-                // Message has no target or couldn't get from op state - process locally
+                // Message has no next hop or couldn't get from op state - process locally
                 tracing::debug!(
                     tx = %msg.id(),
                     msg_type = %msg,
-                    "handle_notification_msg: No target found, processing locally"
+                    "handle_notification_msg: No next hop found, processing locally"
                 );
                 EventResult::Event(ConnEvent::InboundMessage(msg.into()).into())
             }

@@ -33,9 +33,9 @@ impl UpdateOp {
         matches!(self.state, None | Some(UpdateState::Finished { .. }))
     }
 
-    /// Get the target address for hop-by-hop routing.
+    /// Get the next hop address for hop-by-hop routing.
     /// For UPDATE, this extracts the socket address from the stats.target field.
-    pub fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
+    pub fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
         self.stats
             .as_ref()
             .and_then(|s| s.target.as_ref())
@@ -1092,7 +1092,7 @@ pub(crate) async fn request_update(
     };
 
     // Create operation state with target for hop-by-hop routing.
-    // This allows peek_target_addr to find the target address when
+    // This allows peek_next_hop_addr to find the next hop address when
     // handle_notification_msg routes the outbound message.
     let op_state = UpdateOp {
         id,
@@ -1104,7 +1104,7 @@ pub(crate) async fn request_update(
     };
 
     // Use notify_op_change to:
-    // 1. Register the operation state (so peek_target_addr can find the target)
+    // 1. Register the operation state (so peek_next_hop_addr can find the next hop)
     // 2. Send the message via the event loop (which routes via network bridge)
     op_manager
         .notify_op_change(NetMessage::from(msg), OpEnum::Update(op_state))
@@ -1112,7 +1112,7 @@ pub(crate) async fn request_update(
 
     // Deliver the UPDATE result to the client (fire-and-forget semantics).
     // NOTE: We do NOT call op_manager.completed() here because the operation
-    // needs to remain in the state map until peek_target_addr can route it.
+    // needs to remain in the state map until peek_next_hop_addr can route it.
     // The operation will be marked complete later when the message is processed.
     let op = UpdateOp {
         id,

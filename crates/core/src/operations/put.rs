@@ -77,11 +77,11 @@ impl PutOp {
         }
     }
 
-    /// Get the target address if this operation is in a state that needs to send
+    /// Get the next hop address if this operation is in a state that needs to send
     /// an outbound message. PUT messages from originators are processed locally first
     /// (to store the contract), then routing is determined in process_message.
-    /// Returns None since PUT doesn't store a pre-determined target.
-    pub(crate) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
+    /// Returns None since PUT doesn't store a pre-determined next hop.
+    pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
         None
     }
 }

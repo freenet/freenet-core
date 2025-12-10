@@ -266,9 +266,9 @@ impl SubscribeOp {
         }
     }
 
-    /// Get the target address if this operation is in a state that needs to send
+    /// Get the next hop address if this operation is in a state that needs to send
     /// an outbound message. Used for hop-by-hop routing.
-    pub(crate) fn get_target_addr(&self) -> Option<std::net::SocketAddr> {
+    pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
             Some(SubscribeState::AwaitingResponse { next_hop }) => *next_hop,
             _ => None,

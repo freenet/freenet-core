@@ -477,25 +477,31 @@ impl OpManager {
         Ok(())
     }
 
-    /// Peek at the target address for an operation without removing it.
+    /// Peek at the next hop address for an operation without removing it.
     /// Used by hop-by-hop routing to determine where to send initial outbound messages.
-    /// Returns None if the operation doesn't exist or doesn't have a target address.
-    pub fn peek_target_addr(&self, id: &Transaction) -> Option<std::net::SocketAddr> {
+    /// Returns None if the operation doesn't exist or doesn't have a next hop address.
+    pub fn peek_next_hop_addr(&self, id: &Transaction) -> Option<std::net::SocketAddr> {
         if self.ops.completed.contains(id) || self.ops.under_progress.contains(id) {
             return None;
         }
         match id.transaction_type() {
-            TransactionType::Connect => {
-                self.ops.connect.get(id).and_then(|op| op.get_target_addr())
-            }
-            TransactionType::Put => self.ops.put.get(id).and_then(|op| op.get_target_addr()),
-            TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_target_addr()),
+            TransactionType::Connect => self
+                .ops
+                .connect
+                .get(id)
+                .and_then(|op| op.get_next_hop_addr()),
+            TransactionType::Put => self.ops.put.get(id).and_then(|op| op.get_next_hop_addr()),
+            TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_next_hop_addr()),
             TransactionType::Subscribe => self
                 .ops
                 .subscribe
                 .get(id)
-                .and_then(|op| op.get_target_addr()),
-            TransactionType::Update => self.ops.update.get(id).and_then(|op| op.get_target_addr()),
+                .and_then(|op| op.get_next_hop_addr()),
+            TransactionType::Update => self
+                .ops
+                .update
+                .get(id)
+                .and_then(|op| op.get_next_hop_addr()),
         }
     }
 
