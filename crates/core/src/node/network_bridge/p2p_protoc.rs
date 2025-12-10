@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
 use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
@@ -2711,8 +2711,8 @@ async fn peer_connection_listener(
                         return;
                     }
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
                     tracing::warn!(
                         to = %remote_addr,
                         "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
