@@ -1591,6 +1591,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+    use crate::operations::OpError;
 
     #[tokio::test]
     async fn test_hostname_resolution() {
@@ -1611,5 +1612,161 @@ mod tests {
         let addr = Address::Hostname("google.com:8080".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         assert_eq!(socket_addr.port(), 8080);
+    }
+
+    #[tokio::test]
+    async fn test_hostname_resolution_with_trailing_dot() {
+        // DNS names with trailing dot should be handled
+        let addr = Address::Hostname("localhost.".to_string());
+        let result = NodeConfig::parse_socket_addr(&addr).await;
+        // This should either succeed or fail gracefully
+        if let Ok(socket_addr) = result {
+            assert!(
+                socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                    || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hostname_resolution_direct_socket_addr() {
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let addr = Address::HostAddress(socket);
+        let resolved = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert_eq!(resolved, socket);
+    }
+
+    #[tokio::test]
+    async fn test_hostname_resolution_invalid_port() {
+        let addr = Address::Hostname("localhost:not_a_port".to_string());
+        let result = NodeConfig::parse_socket_addr(&addr).await;
+        assert!(result.is_err());
+    }
+
+    // PeerId tests
+    #[test]
+    fn test_peer_id_equality_based_on_addr() {
+        let keypair1 = TransportKeypair::new();
+        let keypair2 = TransportKeypair::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        let peer1 = PeerId::new(addr, keypair1.public().clone());
+        let peer2 = PeerId::new(addr, keypair2.public().clone());
+
+        // PeerId equality is based on address, not public key
+        assert_eq!(peer1, peer2);
+    }
+
+    #[test]
+    fn test_peer_id_inequality_different_addr() {
+        let keypair = TransportKeypair::new();
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081);
+
+        let peer1 = PeerId::new(addr1, keypair.public().clone());
+        let peer2 = PeerId::new(addr2, keypair.public().clone());
+
+        assert_ne!(peer1, peer2);
+    }
+
+    #[test]
+    fn test_peer_id_ordering() {
+        let keypair = TransportKeypair::new();
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081);
+
+        let peer1 = PeerId::new(addr1, keypair.public().clone());
+        let peer2 = PeerId::new(addr2, keypair.public().clone());
+
+        // Ordering should be consistent
+        assert!(peer1 < peer2);
+        assert!(peer2 > peer1);
+    }
+
+    #[test]
+    fn test_peer_id_hash_consistency() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let keypair1 = TransportKeypair::new();
+        let keypair2 = TransportKeypair::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        let peer1 = PeerId::new(addr, keypair1.public().clone());
+        let peer2 = PeerId::new(addr, keypair2.public().clone());
+
+        let mut hasher1 = DefaultHasher::new();
+        let mut hasher2 = DefaultHasher::new();
+        peer1.hash(&mut hasher1);
+        peer2.hash(&mut hasher2);
+
+        // Same address should produce same hash
+        assert_eq!(hasher1.finish(), hasher2.finish());
+    }
+
+    #[test]
+    fn test_peer_id_random_produces_unique() {
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+
+        // Random peers should have different addresses (with high probability)
+        assert_ne!(peer1.addr, peer2.addr);
+    }
+
+    #[test]
+    fn test_peer_id_serialization() {
+        let peer = PeerId::random();
+        let bytes = peer.clone().to_bytes();
+        assert!(!bytes.is_empty());
+
+        // Should be deserializable
+        let deserialized: PeerId = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(peer.addr, deserialized.addr);
+    }
+
+    #[test]
+    fn test_peer_id_display() {
+        let peer = PeerId::random();
+        let display = format!("{}", peer);
+        let debug = format!("{:?}", peer);
+
+        // Display and Debug should produce the same output
+        assert_eq!(display, debug);
+        // Should not be empty
+        assert!(!display.is_empty());
+    }
+
+    // InitPeerNode tests
+    #[test]
+    fn test_init_peer_node_construction() {
+        let keypair = TransportKeypair::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
+        let location = Location::new(0.5);
+
+        let init_peer = InitPeerNode::new(peer_key_location.clone(), location);
+
+        assert_eq!(init_peer.peer_key_location, peer_key_location);
+        assert_eq!(init_peer.location, location);
+    }
+
+    // is_operation_completed tests
+    #[test]
+    fn test_is_operation_completed_with_none() {
+        let result: Result<Option<OpEnum>, OpError> = Ok(None);
+        assert!(!is_operation_completed(&result));
+    }
+
+    #[test]
+    fn test_is_operation_completed_with_error() {
+        let result: Result<Option<OpEnum>, OpError> =
+            Err(OpError::OpNotAvailable(super::OpNotAvailable::Running));
+        assert!(!is_operation_completed(&result));
+    }
+
+    #[test]
+    fn test_is_operation_completed_with_state_pushed_error() {
+        let result: Result<Option<OpEnum>, OpError> = Err(OpError::StatePushed);
+        assert!(!is_operation_completed(&result));
     }
 }
