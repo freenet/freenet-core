@@ -37,12 +37,8 @@ mod connection;
 mod live_tx;
 mod location;
 mod peer_key_location;
-mod score;
 mod seeding;
 mod seeding_cache;
-
-#[allow(unused_imports)] // Score will be used as refactoring progresses
-pub use score::Score;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
