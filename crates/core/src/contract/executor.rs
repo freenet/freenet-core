@@ -6,8 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use futures::Stream;
 
 use either::Either;
 use freenet_stdlib::client_api::{
@@ -357,17 +361,24 @@ impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
         Ok(tx)
     }
 
-    /// Take the underlying receiver for streaming. Returns None if already taken.
-    pub fn take_waiting_for_op_receiver(&mut self) -> Option<mpsc::Receiver<Transaction>> {
-        self.end.waiting_for_op_rx.take()
-    }
-
     pub(crate) fn callback(&self) -> ExecutorToEventLoopChannel<Callback> {
         ExecutorToEventLoopChannel {
             op_manager: self.op_manager.clone(),
             end: Callback {
                 response_for_tx: self.end.response_for_tx.clone(),
             },
+        }
+    }
+}
+
+impl Stream for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
+    type Item = Transaction;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(rx) = self.end.waiting_for_op_rx.as_mut() {
+            Pin::new(rx).poll_recv(cx)
+        } else {
+            Poll::Ready(None)
         }
     }
 }
