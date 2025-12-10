@@ -2674,17 +2674,13 @@ async fn notify_transport_closed(
     }
 }
 
-/// Listens for messages on a peer connection using biased tokio::select! for priority.
+/// Listens for messages on a peer connection using drain-then-select pattern.
 ///
-/// Uses `tokio::select! { biased; ... }` to ensure outbound messages from the channel
-/// are always processed before inbound messages/errors from the transport. This
-/// eliminates the race condition where a transport error could cause queued
-/// outbound messages to be lost.
-///
-/// The biased select guarantees that:
-/// 1. Outbound messages are checked first on every poll
-/// 2. Both futures maintain their waker registrations across polls
-/// 3. No messages are lost due to poll ordering or future recreation
+/// On each iteration, drains all pending outbound messages via `try_recv()` before
+/// waiting for either new outbound or inbound messages. This approach:
+/// 1. Ensures queued outbound messages are sent promptly
+/// 2. Avoids starving inbound (which would happen with biased select)
+/// 3. No messages are lost due to poll ordering
 async fn peer_connection_listener(
     mut rx: PeerConnChannelRecv,
     mut conn: PeerConnection,
@@ -2699,12 +2695,41 @@ async fn peer_connection_listener(
     );
 
     loop {
-        // Use biased select to prioritize outbound messages over inbound.
-        // This ensures that if both are ready, outbound is always processed first.
-        tokio::select! {
-            biased;
+        // Drain all pending outbound messages first before checking inbound.
+        // This ensures queued outbound messages are sent promptly without starving
+        // the inbound channel (which would happen with biased select).
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
+                        tracing::debug!(
+                            to = %remote_addr,
+                            ?error,
+                            "[CONN_LIFECYCLE] Connection closed after channel command"
+                        );
+                        notify_transport_closed(&conn_events, remote_addr, error).await;
+                        return;
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    tracing::warn!(
+                        to = %remote_addr,
+                        "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
+                    );
+                    notify_transport_closed(
+                        &conn_events,
+                        remote_addr,
+                        TransportError::ConnectionClosed(remote_addr),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
 
-            // Priority 1: Outbound messages from channel (highest priority)
+        // Now wait for either new outbound or inbound messages fairly
+        tokio::select! {
             msg = rx.recv() => {
                 match msg {
                     Some(msg) => {
@@ -2734,7 +2759,6 @@ async fn peer_connection_listener(
                 }
             }
 
-            // Priority 2: Inbound messages from transport
             msg = conn.recv() => {
                 match msg {
                     Ok(msg) => match decode_msg(&msg) {
