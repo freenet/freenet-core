@@ -244,7 +244,7 @@ pub(crate) fn executor_channel(
     let listener_halve = ExecutorToEventLoopChannel {
         op_manager: op_manager.clone(),
         end: NetworkEventListenerHalve {
-            waiting_for_op_rx: Some(waiting_for_op_rx),
+            waiting_for_op_rx,
             response_for_tx,
         },
     };
@@ -347,12 +347,7 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
 impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
     pub async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
         tracing::trace!("Waiting to receive transaction from executor channel");
-        let rx = self
-            .end
-            .waiting_for_op_rx
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("receiver already taken"))?;
-        let tx = rx.recv().await.ok_or_else(|| {
+        let tx = self.end.waiting_for_op_rx.recv().await.ok_or_else(|| {
             tracing::error!("Executor channel closed - all senders have been dropped");
             tracing::error!("This typically happens when: 1) The executor task panicked/exited, 2) Network timeout cascaded to channel closure, 3) Resource constraints in CI");
             anyhow::anyhow!("channel closed")
@@ -375,11 +370,7 @@ impl Stream for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
     type Item = Transaction;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(rx) = self.end.waiting_for_op_rx.as_mut() {
-            Pin::new(rx).poll_recv(cx)
-        } else {
-            Poll::Ready(None)
-        }
+        Pin::new(&mut self.end.waiting_for_op_rx).poll_recv(cx)
     }
 }
 
@@ -399,7 +390,7 @@ pub(crate) struct Callback {
 pub(crate) struct NetworkEventListenerHalve {
     /// this is the receiver end of the Executor halve, which will be sent from the executor
     /// when a callback is expected for a given transaction
-    waiting_for_op_rx: Option<mpsc::Receiver<Transaction>>,
+    waiting_for_op_rx: mpsc::Receiver<Transaction>,
     /// this is the sender end of the Executor halve receiver, which will communicate
     /// back responses to the executor, it's cloned each tiome a new callback halve is created
     response_for_tx: mpsc::Sender<OpEnum>,

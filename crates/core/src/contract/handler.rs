@@ -231,7 +231,7 @@ impl From<Transaction> for WaitingTransaction {
 /// Communicates that a client is waiting for a transaction resolution
 /// to continue processing this event.
 pub(crate) struct WaitingResolution {
-    wait_for_res_rx: Option<mpsc::Receiver<(ClientId, WaitingTransaction)>>,
+    wait_for_res_rx: mpsc::Receiver<(ClientId, WaitingTransaction)>,
 }
 
 mod sealed {
@@ -265,9 +265,7 @@ pub(crate) fn contract_handler_channel() -> (
             session_adapter_tx: None,
         },
         ContractHandlerChannel {
-            end: WaitingResolution {
-                wait_for_res_rx: Some(wait_for_res_rx),
-            },
+            end: WaitingResolution { wait_for_res_rx },
             session_adapter_tx: None,
         },
     )
@@ -279,12 +277,9 @@ impl ContractHandlerChannel<WaitingResolution> {
     pub async fn relay_transaction_result_to_client(
         &mut self,
     ) -> anyhow::Result<(ClientId, WaitingTransaction)> {
-        let rx = self
-            .end
+        self.end
             .wait_for_res_rx
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("receiver already taken"))?;
-        rx.recv()
+            .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("channel dropped"))
     }
@@ -294,11 +289,7 @@ impl Stream for ContractHandlerChannel<WaitingResolution> {
     type Item = (ClientId, WaitingTransaction);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(rx) = self.end.wait_for_res_rx.as_mut() {
-            Pin::new(rx).poll_recv(cx)
-        } else {
-            Poll::Ready(None)
-        }
+        Pin::new(&mut self.end.wait_for_res_rx).poll_recv(cx)
     }
 }
 
