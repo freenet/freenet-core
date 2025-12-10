@@ -2,6 +2,7 @@ use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
     ExecutorToEventLoopChannel, InitCheckResult, RequestError, Response, StateStoreError,
+    SLOW_INIT_THRESHOLD,
 };
 
 impl ContractExecutor for Executor<Runtime> {
@@ -161,12 +162,23 @@ impl ContractExecutor for Executor<Runtime> {
                             if let Some(completion_info) =
                                 self.init_tracker.complete_initialization(&key)
                             {
-                                tracing::info!(
-                                    contract = %key,
-                                    queued_operations = completion_info.queued_ops.len(),
-                                    init_duration_ms = completion_info.init_duration.as_millis(),
-                                    "Contract initialization complete, will process queued operations"
-                                );
+                                let init_duration = completion_info.init_duration;
+                                if init_duration > SLOW_INIT_THRESHOLD {
+                                    tracing::warn!(
+                                        contract = %key,
+                                        queued_operations = completion_info.queued_ops.len(),
+                                        init_duration_ms = init_duration.as_millis(),
+                                        threshold_ms = SLOW_INIT_THRESHOLD.as_millis(),
+                                        "Contract initialization took longer than expected"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        contract = %key,
+                                        queued_operations = completion_info.queued_ops.len(),
+                                        init_duration_ms = init_duration.as_millis(),
+                                        "Contract initialization complete"
+                                    );
+                                }
 
                                 // Log details about queued operations
                                 for op in &completion_info.queued_ops {

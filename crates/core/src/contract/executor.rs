@@ -43,7 +43,11 @@ pub(super) mod init_tracker;
 pub(super) mod mock_runtime;
 pub(super) mod runtime;
 
-pub(crate) use init_tracker::{ContractInitTracker, InitCheckResult};
+pub(crate) use init_tracker::{ContractInitTracker, InitCheckResult, SLOW_INIT_THRESHOLD};
+
+// Re-export for periodic cleanup integration (to be called from event loop or similar)
+#[allow(unused_imports)]
+pub(crate) use init_tracker::{StaleInitInfo, STALE_INIT_THRESHOLD};
 
 #[derive(Debug)]
 pub struct ExecutorError {
