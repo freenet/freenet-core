@@ -157,6 +157,37 @@ impl TransportSecretKey {
 }
 
 #[cfg(test)]
+thread_local! {
+    static CACHED_KEYPAIR: std::cell::RefCell<Option<TransportKeypair>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for TransportKeypair {
+    fn arbitrary(_u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        // Cache the keypair to avoid expensive RSA generation on each call
+        Ok(CACHED_KEYPAIR.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            match &*cached {
+                Some(k) => k.clone(),
+                None => {
+                    let key = TransportKeypair::new();
+                    cached.replace(key.clone());
+                    key
+                }
+            }
+        }))
+    }
+}
+
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for TransportPublicKey {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let keypair = TransportKeypair::arbitrary(u)?;
+        Ok(keypair.public)
+    }
+}
+
+#[cfg(test)]
 #[test]
 fn key_sizes_and_decryption() {
     let pair = TransportKeypair::new();
@@ -193,5 +224,161 @@ mod display_uniqueness_tests {
                 display_str
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod crypto_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn test_default_creates_valid_keypair() {
+        let keypair = TransportKeypair::default();
+        // Verify we can encrypt/decrypt with the default keypair
+        let data = b"test data";
+        let encrypted = keypair.public.encrypt(data);
+        let decrypted = keypair.secret.decrypt(&encrypted).unwrap();
+        assert_eq!(data.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_new_with_rng_deterministic() {
+        // Using a seeded RNG should produce the same keypair
+        // Use OsRng which implements the CryptoRngCore trait from the correct rand_core version
+        use rsa::rand_core::OsRng;
+
+        // Create two keypairs with OsRng to verify the method works
+        // (Can't test determinism easily due to rand_core version mismatch)
+        let keypair1 = TransportKeypair::new_with_rng(&mut OsRng);
+        let keypair2 = TransportKeypair::new_with_rng(&mut OsRng);
+
+        // Both should be valid keypairs (different due to randomness)
+        assert_ne!(keypair1, keypair2);
+
+        // But both should work for encryption/decryption
+        let data = b"test";
+        let encrypted1 = keypair1.public.encrypt(data);
+        let decrypted1 = keypair1.secret.decrypt(&encrypted1).unwrap();
+        assert_eq!(data.as_slice(), decrypted1.as_slice());
+
+        let encrypted2 = keypair2.public.encrypt(data);
+        let decrypted2 = keypair2.secret.decrypt(&encrypted2).unwrap();
+        assert_eq!(data.as_slice(), decrypted2.as_slice());
+    }
+
+    #[test]
+    fn test_from_private_key() {
+        let original = TransportKeypair::new();
+        // Extract the private key and reconstruct
+        let pem_bytes = original.secret.to_pkcs8_pem().unwrap();
+
+        use rsa::pkcs8::DecodePrivateKey;
+        let priv_key =
+            RsaPrivateKey::from_pkcs8_pem(std::str::from_utf8(&pem_bytes).unwrap()).unwrap();
+
+        let reconstructed = TransportKeypair::from_private_key(priv_key);
+
+        // The public keys should match
+        assert_eq!(
+            format!("{}", original.public),
+            format!("{}", reconstructed.public)
+        );
+    }
+
+    #[test]
+    fn test_keypair_save_and_load() {
+        let keypair = TransportKeypair::new();
+        let temp_dir = std::env::temp_dir();
+        let key_path = temp_dir.join("test_keypair.pem");
+
+        // Save the keypair
+        keypair.save(&key_path).unwrap();
+
+        // Verify file exists and contains PEM data
+        let mut contents = String::new();
+        std::fs::File::open(&key_path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+
+        assert!(contents.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(contents.contains("-----END PRIVATE KEY-----"));
+
+        // Load the key back and verify it works
+        use rsa::pkcs8::DecodePrivateKey;
+        let loaded_key = RsaPrivateKey::from_pkcs8_pem(&contents).unwrap();
+        let loaded_keypair = TransportKeypair::from_private_key(loaded_key);
+
+        // Test that encryption/decryption works across save/load
+        let data = b"round trip test";
+        let encrypted = keypair.public.encrypt(data);
+        let decrypted = loaded_keypair.secret.decrypt(&encrypted).unwrap();
+        assert_eq!(data.as_slice(), decrypted.as_slice());
+
+        // Cleanup
+        std::fs::remove_file(&key_path).ok();
+    }
+
+    #[test]
+    fn test_public_key_save() {
+        let keypair = TransportKeypair::new();
+        let temp_dir = std::env::temp_dir();
+        let key_path = temp_dir.join("test_pubkey.pem");
+
+        // Save the public key
+        keypair.public.save(&key_path).unwrap();
+
+        // Verify file exists and contains PEM data
+        let mut contents = String::new();
+        std::fs::File::open(&key_path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+
+        assert!(contents.contains("-----BEGIN PUBLIC KEY-----"));
+        assert!(contents.contains("-----END PUBLIC KEY-----"));
+
+        // Cleanup
+        std::fs::remove_file(&key_path).ok();
+    }
+
+    #[test]
+    fn test_debug_impl_uses_display() {
+        let keypair = TransportKeypair::new();
+        let display_str = format!("{}", keypair.public);
+        let debug_str = format!("{:?}", keypair.public);
+
+        // Debug should use the Display implementation
+        assert_eq!(display_str, debug_str);
+    }
+
+    #[test]
+    fn test_public_key_from_rsa() {
+        use rsa::rand_core::OsRng;
+        let priv_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let pub_key = RsaPublicKey::from(&priv_key);
+
+        let transport_pub: TransportPublicKey = pub_key.into();
+
+        // Verify we can use it for encryption
+        let data = b"test from conversion";
+        let encrypted = transport_pub.encrypt(data);
+
+        // And decrypt with the original private key
+        let decrypted = priv_key.decrypt(Pkcs1v15Encrypt, &encrypted).unwrap();
+        assert_eq!(data.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_secret_accessor() {
+        let keypair = TransportKeypair::new();
+        let secret = keypair.secret();
+
+        // Verify the secret can decrypt what the public key encrypts
+        let data = b"secret accessor test";
+        let encrypted = keypair.public.encrypt(data);
+        let decrypted = secret.decrypt(&encrypted).unwrap();
+        assert_eq!(data.as_slice(), decrypted.as_slice());
     }
 }

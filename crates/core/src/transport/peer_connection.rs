@@ -71,6 +71,13 @@ impl std::fmt::Display for StreamId {
     }
 }
 
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for StreamId {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self(u.arbitrary()?))
+    }
+}
+
 type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
