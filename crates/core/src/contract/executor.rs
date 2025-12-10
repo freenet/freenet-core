@@ -6,8 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use futures::Stream;
 
 use either::Either;
 use freenet_stdlib::client_api::{
@@ -343,16 +347,11 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
 impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
     pub async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
         tracing::trace!("Waiting to receive transaction from executor channel");
-        let tx = self
-            .end
-            .waiting_for_op_rx
-            .recv()
-            .await
-            .ok_or_else(|| {
-                tracing::error!("Executor channel closed - all senders have been dropped");
-                tracing::error!("This typically happens when: 1) The executor task panicked/exited, 2) Network timeout cascaded to channel closure, 3) Resource constraints in CI");
-                anyhow::anyhow!("channel closed")
-            })?;
+        let tx = self.end.waiting_for_op_rx.recv().await.ok_or_else(|| {
+            tracing::error!("Executor channel closed - all senders have been dropped");
+            tracing::error!("This typically happens when: 1) The executor task panicked/exited, 2) Network timeout cascaded to channel closure, 3) Resource constraints in CI");
+            anyhow::anyhow!("channel closed")
+        })?;
         tracing::trace!("Successfully received transaction from executor channel");
         Ok(tx)
     }
@@ -364,6 +363,14 @@ impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
                 response_for_tx: self.end.response_for_tx.clone(),
             },
         }
+    }
+}
+
+impl Stream for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
+    type Item = Transaction;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.end.waiting_for_op_rx).poll_recv(cx)
     }
 }
 

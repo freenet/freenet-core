@@ -2075,6 +2075,11 @@ impl P2pConnManager {
             tokio::spawn(async move {
                 peer_connection_listener(rx, connection, peer_addr, conn_events).await;
             });
+            // Yield to allow the spawned peer_connection_listener task to start.
+            // This is important because on some runtimes (especially in tests with boxed_local
+            // futures), spawned tasks may not be scheduled immediately, causing messages
+            // sent to the channel to pile up without being processed.
+            tokio::task::yield_now().await;
             newly_inserted = true;
         } else {
             tracing::debug!(
@@ -2669,21 +2674,30 @@ async fn notify_transport_closed(
     }
 }
 
+/// Listens for messages on a peer connection using drain-then-select pattern.
+///
+/// On each iteration, drains all pending outbound messages via `try_recv()` before
+/// waiting for either new outbound or inbound messages. This approach:
+/// 1. Ensures queued outbound messages are sent promptly
+/// 2. Avoids starving inbound (which would happen with biased select)
+/// 3. No messages are lost due to poll ordering
 async fn peer_connection_listener(
     mut rx: PeerConnChannelRecv,
     mut conn: PeerConnection,
     peer_addr: SocketAddr,
     conn_events: Sender<ConnEvent>,
 ) {
-    const MAX_IMMEDIATE_SENDS: usize = 32;
     let remote_addr = conn.remote_addr();
     tracing::debug!(
         to = %remote_addr,
         %peer_addr,
         "[CONN_LIFECYCLE] Starting peer_connection_listener task"
     );
+
     loop {
-        let mut drained = 0;
+        // Drain all pending outbound messages first before checking inbound.
+        // This ensures queued outbound messages are sent promptly without starving
+        // the inbound channel (which would happen with biased select).
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
@@ -2691,20 +2705,16 @@ async fn peer_connection_listener(
                         tracing::debug!(
                             to = %remote_addr,
                             ?error,
-                            "[CONN_LIFECYCLE] Shutting down connection after send failure"
+                            "[CONN_LIFECYCLE] Connection closed after channel command"
                         );
                         notify_transport_closed(&conn_events, remote_addr, error).await;
                         return;
-                    }
-                    drained += 1;
-                    if drained >= MAX_IMMEDIATE_SENDS {
-                        break;
                     }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     tracing::warn!(
-                        to = %conn.remote_addr(),
+                        to = %remote_addr,
                         "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
                     );
                     notify_transport_closed(
@@ -2718,74 +2728,80 @@ async fn peer_connection_listener(
             }
         }
 
+        // Now wait for either new outbound or inbound messages fairly
         tokio::select! {
             msg = rx.recv() => {
-                let Some(msg) = msg else {
-                    tracing::warn!(
-                        to = %conn.remote_addr(),
-                        "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
-                    );
-                    notify_transport_closed(
-                        &conn_events,
-                        remote_addr,
-                        TransportError::ConnectionClosed(remote_addr),
-                    )
-                    .await;
-                    return;
-                };
-                if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
-                    tracing::debug!(
-                        to = %remote_addr,
-                        ?error,
-                        "[CONN_LIFECYCLE] Connection closed after channel command"
-                    );
-                    notify_transport_closed(&conn_events, remote_addr, error).await;
-                    return;
+                match msg {
+                    Some(msg) => {
+                        if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
+                            tracing::debug!(
+                                to = %remote_addr,
+                                ?error,
+                                "[CONN_LIFECYCLE] Connection closed after channel command"
+                            );
+                            notify_transport_closed(&conn_events, remote_addr, error).await;
+                            return;
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            to = %remote_addr,
+                            "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
+                        );
+                        notify_transport_closed(
+                            &conn_events,
+                            remote_addr,
+                            TransportError::ConnectionClosed(remote_addr),
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
+
             msg = conn.recv() => {
                 match msg {
-                    Ok(msg) => {
-                        match decode_msg(&msg) {
-                            Ok(net_message) => {
-                                let tx = *net_message.id();
-                                tracing::debug!(
-                                    from = %conn.remote_addr(),
-                                    %tx,
-                                    tx_type = ?tx.transaction_type(),
-                                    msg_type = %net_message,
-                                    "[CONN_LIFECYCLE] Received inbound NetMessage from peer"
-                                );
-                                if conn_events.send(ConnEvent::InboundMessage(IncomingMessage::with_remote(net_message, remote_addr))).await.is_err() {
-                                    tracing::debug!(
-                                        from = %remote_addr,
-                                        "[CONN_LIFECYCLE] conn_events receiver dropped; stopping listener"
-                                    );
-                                    return;
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    from = %conn.remote_addr(),
-                                    ?error,
-                                    "[CONN_LIFECYCLE] Failed to deserialize inbound message; closing connection"
-                                );
-                                let transport_error = TransportError::Other(anyhow!(
-                                    "Failed to deserialize inbound message from {remote_addr}: {error:?}"
-                                ));
-                                notify_transport_closed(
-                                    &conn_events,
+                    Ok(msg) => match decode_msg(&msg) {
+                        Ok(net_message) => {
+                            let tx = *net_message.id();
+                            tracing::debug!(
+                                from = %remote_addr,
+                                %tx,
+                                tx_type = ?tx.transaction_type(),
+                                msg_type = %net_message,
+                                "[CONN_LIFECYCLE] Received inbound NetMessage from peer"
+                            );
+                            if conn_events
+                                .send(ConnEvent::InboundMessage(IncomingMessage::with_remote(
+                                    net_message,
                                     remote_addr,
-                                    transport_error,
-                                )
-                                .await;
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    from = %remote_addr,
+                                    "[CONN_LIFECYCLE] conn_events receiver dropped; stopping listener"
+                                );
                                 return;
                             }
                         }
-                    }
+                        Err(error) => {
+                            tracing::error!(
+                                from = %remote_addr,
+                                ?error,
+                                "[CONN_LIFECYCLE] Failed to deserialize inbound message; closing connection"
+                            );
+                            let transport_error = TransportError::Other(anyhow!(
+                                "Failed to deserialize inbound message from {remote_addr}: {error:?}"
+                            ));
+                            notify_transport_closed(&conn_events, remote_addr, transport_error).await;
+                            return;
+                        }
+                    },
                     Err(error) => {
                         tracing::debug!(
-                            from = %conn.remote_addr(),
+                            from = %remote_addr,
                             ?error,
                             "[CONN_LIFECYCLE] peer_connection_listener terminating after recv error"
                         );

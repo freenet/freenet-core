@@ -138,6 +138,12 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
     }
 }
 
+/// Handles bidirectional communication between a client and the host.
+///
+/// Uses `tokio::select! { biased; ... }` to ensure host responses are always
+/// processed before client disconnect errors, preventing lost responses.
+/// The `biased` modifier ensures futures are polled in declaration order,
+/// and if multiple are ready, the first one wins.
 async fn client_fn(
     mut client: BoxedClient,
     mut rx: Receiver<(ClientId, HostResult)>,
@@ -145,25 +151,54 @@ async fn client_fn(
 ) {
     loop {
         tokio::select! {
-            host_msg = rx.recv() => {
-                if let Some((client_id, response)) = host_msg {
-                    if client.send(client_id, response).await.is_err() {
-                        break;
-                    }
-                } else {
-                    tracing::debug!("disconnected host");
-                    break;
-                }
-            }
-            client_msg = client.recv() => {
-                match client_msg {
-                    Ok(OpenRequest { client_id, request_id, request, notification_channel, token, attested_contract }) => {
-                        tracing::debug!("received msg @ combinator from external id {client_id}, msg: {request}");
-                        if tx_host.send(Ok(OpenRequest { client_id, request_id, request, notification_channel, token, attested_contract })).await.is_err() {
+            biased;
+
+            // Priority 1: Host responses (highest priority)
+            // Ensures responses are sent to client before handling disconnect
+            msg = rx.recv() => {
+                match msg {
+                    Some((client_id, response)) => {
+                        if client.send(client_id, response).await.is_err() {
                             break;
                         }
                     }
-                    Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) =>{
+                    None => {
+                        tracing::debug!("disconnected host");
+                        break;
+                    }
+                }
+            }
+
+            // Priority 2: Client requests
+            result = client.recv() => {
+                match result {
+                    Ok(OpenRequest {
+                        client_id,
+                        request_id,
+                        request,
+                        notification_channel,
+                        token,
+                        attested_contract,
+                    }) => {
+                        tracing::debug!(
+                            "received msg @ combinator from external id {client_id}, msg: {request}"
+                        );
+                        if tx_host
+                            .send(Ok(OpenRequest {
+                                client_id,
+                                request_id,
+                                request,
+                                notification_channel,
+                                token,
+                                attested_contract,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) => {
                         tracing::debug!("disconnected client");
                         let _ = tx_host.send(Err(err)).await;
                         break;
