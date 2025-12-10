@@ -3,6 +3,7 @@
 
 use either::Either;
 use futures::Stream;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
@@ -105,11 +106,8 @@ where
     // to avoid recreating futures on each poll (fixes waker registration issue)
     executor_transaction_stream: Option<tokio_stream::wrappers::ReceiverStream<Transaction>>,
 
-    // Keep the original types for callback() and other methods that need them
-    #[allow(dead_code)]
-    client_wait_for_transaction: C,
-    #[allow(dead_code)]
-    executor_listener: E,
+    // PhantomData to satisfy type parameter requirements (C and E are used in new() but not stored)
+    _phantom: PhantomData<(C, E)>,
 
     // Track which channels have been reported as closed (to avoid infinite loop of closure notifications)
     notification_closed: bool,
@@ -158,8 +156,7 @@ where
             handshake_handler,
             client_transaction_stream,
             executor_transaction_stream,
-            client_wait_for_transaction,
-            executor_listener,
+            _phantom: PhantomData,
             notification_closed: false,
             op_execution_closed: false,
             conn_bridge_closed: false,
