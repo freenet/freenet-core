@@ -20,43 +20,52 @@ fn create_mock_handshake_stream() -> MockHandshakeStream {
     MockHandshakeStream
 }
 
-/// Mock implementation that returns None (no receiver to take).
+/// Mock stream for client transactions that always returns Pending (no messages).
 /// Used when tests don't need these channels to receive anything.
-struct MockClientNoReceiver;
-impl ClientTransactionRelay for MockClientNoReceiver {
-    fn take_receiver(&mut self) -> Option<Receiver<(ClientId, WaitingTransaction)>> {
-        None
+struct MockClientStream;
+
+impl Stream for MockClientStream {
+    type Item = (ClientId, WaitingTransaction);
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
     }
 }
 
-struct MockExecutorNoReceiver;
-impl ExecutorTransactionReceiver for MockExecutorNoReceiver {
-    fn take_receiver(&mut self) -> Option<Receiver<Transaction>> {
-        None
+/// Mock stream for executor transactions that always returns Pending (no messages).
+struct MockExecutorStream;
+
+impl Stream for MockExecutorStream {
+    type Item = Transaction;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
     }
 }
 
-/// Mock implementation that provides a receiver for testing client transaction events
-#[allow(dead_code)]
-struct MockClientWithReceiver {
-    rx: Option<Receiver<(ClientId, WaitingTransaction)>>,
+/// Mock stream wrapping a receiver for client transactions
+struct MockClientReceiverStream {
+    rx: mpsc::Receiver<(ClientId, WaitingTransaction)>,
 }
 
-impl ClientTransactionRelay for MockClientWithReceiver {
-    fn take_receiver(&mut self) -> Option<Receiver<(ClientId, WaitingTransaction)>> {
-        self.rx.take()
+impl Stream for MockClientReceiverStream {
+    type Item = (ClientId, WaitingTransaction);
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_recv(cx)
     }
 }
 
-/// Mock implementation that provides a receiver for testing executor transaction events
-#[allow(dead_code)]
-struct MockExecutorWithReceiver {
-    rx: Option<Receiver<Transaction>>,
+/// Mock stream wrapping a receiver for executor transactions
+struct MockExecutorReceiverStream {
+    rx: mpsc::Receiver<Transaction>,
 }
 
-impl ExecutorTransactionReceiver for MockExecutorWithReceiver {
-    fn take_receiver(&mut self) -> Option<Receiver<Transaction>> {
-        self.rx.take()
+impl Stream for MockExecutorReceiverStream {
+    type Item = Transaction;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_recv(cx)
     }
 }
 
@@ -87,8 +96,8 @@ async fn test_priority_select_future_wakeup() {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientNoReceiver,
-        MockExecutorNoReceiver,
+        MockClientStream,
+        MockExecutorStream,
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -148,8 +157,8 @@ async fn test_priority_select_future_priority_ordering() {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientNoReceiver,
-        MockExecutorNoReceiver,
+        MockClientStream,
+        MockExecutorStream,
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -189,8 +198,8 @@ async fn test_priority_select_future_concurrent_messages() {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientNoReceiver,
-        MockExecutorNoReceiver,
+        MockClientStream,
+        MockExecutorStream,
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -227,8 +236,8 @@ async fn test_priority_select_future_buffered_messages() {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientNoReceiver,
-        MockExecutorNoReceiver,
+        MockClientStream,
+        MockExecutorStream,
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -273,8 +282,8 @@ async fn test_priority_select_future_rapid_cancellations() {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientNoReceiver,
-        MockExecutorNoReceiver,
+        MockClientStream,
+        MockExecutorStream,
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -367,8 +376,8 @@ async fn test_priority_select_event_loop_simulation() {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientNoReceiver,
-        MockExecutorNoReceiver,
+        MockClientStream,
+        MockExecutorStream,
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -680,30 +689,6 @@ async fn test_with_seed(seed: u64) {
     // Wait a bit for senders to start sending (shorter delay since we're using microseconds now)
     sleep(Duration::from_micros(100)).await;
 
-    // Mock implementations for the stream
-    struct MockClientStress {
-        rx: Option<
-            mpsc::Receiver<(
-                crate::client_events::ClientId,
-                crate::contract::WaitingTransaction,
-            )>,
-        >,
-    }
-    impl ClientTransactionRelay for MockClientStress {
-        fn take_receiver(&mut self) -> Option<Receiver<(ClientId, WaitingTransaction)>> {
-            self.rx.take()
-        }
-    }
-
-    struct MockExecutorStress {
-        rx: Option<mpsc::Receiver<Transaction>>,
-    }
-    impl ExecutorTransactionReceiver for MockExecutorStress {
-        fn take_receiver(&mut self) -> Option<Receiver<Transaction>> {
-            self.rx.take()
-        }
-    }
-
     // Create stream ONCE - it maintains waker registration and handles channel closures
     let stream = PrioritySelectStream::new(
         notif_rx,
@@ -711,12 +696,8 @@ async fn test_with_seed(seed: u64) {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientStress {
-            rx: Some(client_rx),
-        },
-        MockExecutorStress {
-            rx: Some(executor_rx),
-        },
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorReceiverStream { rx: executor_rx },
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -960,50 +941,14 @@ async fn test_with_seed(seed: u64) {
 async fn test_priority_select_all_pending_waker_registration() {
     use futures::StreamExt;
 
-    struct MockClientWaker {
-        #[allow(dead_code)]
-        rx: mpsc::Receiver<
-            Result<
-                (
-                    crate::client_events::ClientId,
-                    crate::contract::WaitingTransaction,
-                ),
-                anyhow::Error,
-            >,
-        >,
-    }
-    impl ClientTransactionRelay for MockClientWaker {
-        fn take_receiver(&mut self) -> Option<Receiver<(ClientId, WaitingTransaction)>> {
-            None // Test needs redesign for new API
-        }
-    }
-
-    struct MockExecutorWaker {
-        #[allow(dead_code)]
-        rx: mpsc::Receiver<Result<Transaction, anyhow::Error>>,
-    }
-    impl ExecutorTransactionReceiver for MockExecutorWaker {
-        fn take_receiver(&mut self) -> Option<Receiver<Transaction>> {
-            None // Test needs redesign for new API
-        }
-    }
-
     // Create all 8 channels
     let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
     let (op_tx, op_rx) = mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(10);
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(10);
     let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(10);
-    let (client_tx, client_rx) = mpsc::channel::<
-        Result<
-            (
-                crate::client_events::ClientId,
-                crate::contract::WaitingTransaction,
-            ),
-            anyhow::Error,
-        >,
-    >(10);
-    let (executor_tx, executor_rx) = mpsc::channel::<Result<Transaction, anyhow::Error>>(10);
+    let (client_tx, client_rx) = mpsc::channel::<(ClientId, WaitingTransaction)>(10);
+    let (executor_tx, executor_rx) = mpsc::channel::<Transaction>(10);
 
     // Start with NO messages buffered - this will cause all channels to return Pending on first poll
     tracing::info!("Creating PrioritySelectStream with all channels empty");
@@ -1017,7 +962,7 @@ async fn test_priority_select_all_pending_waker_registration() {
         // Send to multiple channels simultaneously (in reverse priority order)
         tracing::info!("Sending to executor channel (lowest priority)");
         executor_tx
-            .send(Ok(Transaction::new::<crate::operations::put::PutMsg>()))
+            .send(Transaction::new::<crate::operations::put::PutMsg>())
             .await
             .unwrap();
 
@@ -1026,7 +971,7 @@ async fn test_priority_select_all_pending_waker_registration() {
         let waiting_tx = crate::contract::WaitingTransaction::Transaction(Transaction::new::<
             crate::operations::put::PutMsg,
         >());
-        client_tx.send(Ok((client_id, waiting_tx))).await.unwrap();
+        client_tx.send((client_id, waiting_tx)).await.unwrap();
 
         tracing::info!("Sending to node controller channel");
         node_tx
@@ -1053,20 +998,14 @@ async fn test_priority_select_all_pending_waker_registration() {
 
     // Create the stream - it will poll all channels, find them all Pending,
     // and register wakers for all of them
-    // Note: client_rx and executor_rx are unused after test redesign for new API
-    let _ = (client_rx, executor_rx);
     let stream = PrioritySelectStream::new(
         notif_rx,
         op_rx,
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientWaker {
-            rx: mpsc::channel(1).1,
-        },
-        MockExecutorWaker {
-            rx: mpsc::channel(1).1,
-        },
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorReceiverStream { rx: executor_rx },
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -1155,8 +1094,8 @@ async fn test_sparse_messages_reproduce_race() {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientNoReceiver,
-        MockExecutorNoReceiver,
+        MockClientStream,
+        MockExecutorStream,
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -1784,8 +1723,8 @@ async fn test_waker_registration_after_pending_poll() {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientNoReceiver,
-        MockExecutorNoReceiver,
+        MockClientStream,
+        MockExecutorStream,
         conn_event_rx,
     );
     tokio::pin!(stream);
@@ -1851,8 +1790,8 @@ async fn test_waker_survives_multiple_pending_polls() {
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientNoReceiver,
-        MockExecutorNoReceiver,
+        MockClientStream,
+        MockExecutorStream,
         conn_event_rx,
     );
     tokio::pin!(stream);

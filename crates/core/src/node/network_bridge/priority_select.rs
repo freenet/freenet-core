@@ -3,7 +3,6 @@
 
 use either::Either;
 use futures::Stream;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
@@ -44,30 +43,6 @@ pub(super) enum SelectResult {
     ExecutorTransaction(Result<Transaction, anyhow::Error>),
 }
 
-/// Trait for types that can relay client transaction results via a receiver
-pub(super) trait ClientTransactionRelay: Send + Unpin {
-    /// Take the underlying receiver for streaming
-    fn take_receiver(&mut self) -> Option<Receiver<(ClientId, WaitingTransaction)>>;
-}
-
-/// Trait for types that can receive transactions from executor via a receiver
-pub(super) trait ExecutorTransactionReceiver: Send + Unpin {
-    /// Take the underlying receiver for streaming
-    fn take_receiver(&mut self) -> Option<Receiver<Transaction>>;
-}
-
-impl ClientTransactionRelay for ContractHandlerChannel<WaitingResolution> {
-    fn take_receiver(&mut self) -> Option<Receiver<(ClientId, WaitingTransaction)>> {
-        self.take_wait_for_res_receiver()
-    }
-}
-
-impl ExecutorTransactionReceiver for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
-    fn take_receiver(&mut self) -> Option<Receiver<Transaction>> {
-        self.take_waiting_for_op_receiver()
-    }
-}
-
 /// Type alias for the production PrioritySelectStream with concrete types
 pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
     super::handshake::HandshakeHandler,
@@ -82,8 +57,8 @@ pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
 pub(super) struct PrioritySelectStream<H, C, E>
 where
     H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
-    C: ClientTransactionRelay,
-    E: ExecutorTransactionReceiver,
+    C: Stream<Item = (ClientId, WaitingTransaction)> + Unpin,
+    E: Stream<Item = Transaction> + Unpin,
 {
     // Streams created from owned receivers
     notification: tokio_stream::wrappers::ReceiverStream<Either<NetMessage, NodeEvent>>,
@@ -97,17 +72,11 @@ where
     // Generic to allow testing with mocks
     handshake_handler: H,
 
-    // Client transaction stream - taken from the handler at construction time
-    // to avoid recreating futures on each poll (fixes waker registration issue)
-    client_transaction_stream:
-        Option<tokio_stream::wrappers::ReceiverStream<(ClientId, WaitingTransaction)>>,
+    // Client transaction handler - implements Stream directly
+    client_transaction_handler: C,
 
-    // Executor transaction stream - taken from the channel at construction time
-    // to avoid recreating futures on each poll (fixes waker registration issue)
-    executor_transaction_stream: Option<tokio_stream::wrappers::ReceiverStream<Transaction>>,
-
-    // PhantomData to satisfy type parameter requirements (C and E are used in new() but not stored)
-    _phantom: PhantomData<(C, E)>,
+    // Executor transaction handler - implements Stream directly
+    executor_transaction_handler: E,
 
     // Track which channels have been reported as closed (to avoid infinite loop of closure notifications)
     notification_closed: bool,
@@ -122,8 +91,8 @@ where
 impl<H, C, E> PrioritySelectStream<H, C, E>
 where
     H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
-    C: ClientTransactionRelay,
-    E: ExecutorTransactionReceiver,
+    C: Stream<Item = (ClientId, WaitingTransaction)> + Unpin,
+    E: Stream<Item = Transaction> + Unpin,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -132,20 +101,11 @@ where
         conn_bridge_rx: Receiver<P2pBridgeEvent>,
         handshake_handler: H,
         node_controller: Receiver<NodeEvent>,
-        mut client_wait_for_transaction: C,
-        mut executor_listener: E,
+        client_transaction_handler: C,
+        executor_transaction_handler: E,
         conn_events: Receiver<ConnEvent>,
     ) -> Self {
         use tokio_stream::wrappers::ReceiverStream;
-
-        // Take the receivers from the handlers and convert to streams.
-        // This fixes the waker registration issue - streams maintain their wakers
-        // properly across polls, unlike fresh futures created on each poll.
-        let client_transaction_stream = client_wait_for_transaction
-            .take_receiver()
-            .map(ReceiverStream::new);
-        let executor_transaction_stream =
-            executor_listener.take_receiver().map(ReceiverStream::new);
 
         Self {
             notification: ReceiverStream::new(notification_rx),
@@ -154,9 +114,8 @@ where
             node_controller: ReceiverStream::new(node_controller),
             conn_events: ReceiverStream::new(conn_events),
             handshake_handler,
-            client_transaction_stream,
-            executor_transaction_stream,
-            _phantom: PhantomData,
+            client_transaction_handler,
+            executor_transaction_handler,
             notification_closed: false,
             op_execution_closed: false,
             conn_bridge_closed: false,
@@ -171,8 +130,8 @@ where
 impl<H, C, E> Stream for PrioritySelectStream<H, C, E>
 where
     H: Stream<Item = crate::node::network_bridge::handshake::Event> + Unpin,
-    C: ClientTransactionRelay,
-    E: ExecutorTransactionReceiver,
+    C: Stream<Item = (ClientId, WaitingTransaction)> + Unpin,
+    E: Stream<Item = Transaction> + Unpin,
 {
     type Item = SelectResult;
 
@@ -249,8 +208,7 @@ where
             }
         }
 
-        // Priority 5: Handshake handler (now implements Stream)
-        // Poll the handshake handler stream - it maintains state across polls
+        // Priority 5: Handshake handler (implements Stream directly)
         match Pin::new(&mut this.handshake_handler).poll_next(cx) {
             Poll::Ready(Some(event)) => {
                 return Poll::Ready(Some(SelectResult::Handshake(Some(event))))
@@ -280,43 +238,39 @@ where
             }
         }
 
-        // Priority 7: Client transaction (now using stream instead of recreating futures)
+        // Priority 7: Client transaction handler (implements Stream directly)
         if !this.client_transaction_closed {
-            if let Some(ref mut stream) = this.client_transaction_stream {
-                match Pin::new(stream).poll_next(cx) {
-                    Poll::Ready(Some(result)) => {
-                        return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))))
-                    }
-                    Poll::Ready(None) => {
-                        this.client_transaction_closed = true;
-                        if first_closed_channel.is_none() {
-                            first_closed_channel = Some(SelectResult::ClientTransaction(Err(
-                                anyhow::anyhow!("channel closed"),
-                            )));
-                        }
-                    }
-                    Poll::Pending => {}
+            match Pin::new(&mut this.client_transaction_handler).poll_next(cx) {
+                Poll::Ready(Some(result)) => {
+                    return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))))
                 }
+                Poll::Ready(None) => {
+                    this.client_transaction_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::ClientTransaction(Err(
+                            anyhow::anyhow!("channel closed"),
+                        )));
+                    }
+                }
+                Poll::Pending => {}
             }
         }
 
-        // Priority 8: Executor transaction (now using stream instead of recreating futures)
+        // Priority 8: Executor transaction handler (implements Stream directly)
         if !this.executor_transaction_closed {
-            if let Some(ref mut stream) = this.executor_transaction_stream {
-                match Pin::new(stream).poll_next(cx) {
-                    Poll::Ready(Some(tx)) => {
-                        return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(tx))))
-                    }
-                    Poll::Ready(None) => {
-                        this.executor_transaction_closed = true;
-                        if first_closed_channel.is_none() {
-                            first_closed_channel = Some(SelectResult::ExecutorTransaction(Err(
-                                anyhow::anyhow!("channel closed"),
-                            )));
-                        }
-                    }
-                    Poll::Pending => {}
+            match Pin::new(&mut this.executor_transaction_handler).poll_next(cx) {
+                Poll::Ready(Some(tx)) => {
+                    return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(tx))))
                 }
+                Poll::Ready(None) => {
+                    this.executor_transaction_closed = true;
+                    if first_closed_channel.is_none() {
+                        first_closed_channel = Some(SelectResult::ExecutorTransaction(Err(
+                            anyhow::anyhow!("channel closed"),
+                        )));
+                    }
+                }
+                Poll::Pending => {}
             }
         }
 

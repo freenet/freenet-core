@@ -9,9 +9,13 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::hash::Hash;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+use futures::Stream;
 
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::*;
@@ -284,12 +288,17 @@ impl ContractHandlerChannel<WaitingResolution> {
             .await
             .ok_or_else(|| anyhow::anyhow!("channel dropped"))
     }
+}
 
-    /// Take the underlying receiver for streaming. Returns None if already taken.
-    pub fn take_wait_for_res_receiver(
-        &mut self,
-    ) -> Option<mpsc::Receiver<(ClientId, WaitingTransaction)>> {
-        self.end.wait_for_res_rx.take()
+impl Stream for ContractHandlerChannel<WaitingResolution> {
+    type Item = (ClientId, WaitingTransaction);
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(rx) = self.end.wait_for_res_rx.as_mut() {
+            Pin::new(rx).poll_recv(cx)
+        } else {
+            Poll::Ready(None)
+        }
     }
 }
 
