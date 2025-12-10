@@ -26,6 +26,7 @@ humantime = "2.2.0"
 
 [dev-dependencies]
 freenet = { path = "../../../crates/core" }
+serial_test = "3"
 test-log = "0.2"
 testresult = { workspace = true }
 
