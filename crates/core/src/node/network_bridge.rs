@@ -283,4 +283,156 @@ mod tests {
 
         assert!(result.is_err(), "Send should fail when receiver is dropped");
     }
+
+    // Note: Tests that require NetMessage creation are omitted because
+    // constructing valid NetMessage instances requires complex setup with
+    // cryptographic keys, proper state management, and specific operation states.
+    // The core channel functionality is already well-tested by the NodeEvent tests above.
+
+    /// Test channel capacity doesn't block under normal load
+    #[tokio::test]
+    async fn test_channel_capacity() {
+        let (notification_channel, notification_tx) = event_loop_notification_channel();
+        let mut rx = notification_channel.notifications_receiver;
+
+        // Send multiple messages without reading
+        for _ in 0..50 {
+            let test_event = crate::message::NodeEvent::Disconnect { cause: None };
+            notification_tx
+                .notifications_sender()
+                .send(Either::Right(test_event))
+                .await
+                .expect("Should not block with capacity of 100");
+        }
+
+        // Now read them all
+        let mut count = 0;
+        while count < 50 {
+            match timeout(Duration::from_millis(10), rx.recv()).await {
+                Ok(Some(_)) => count += 1,
+                _ => break,
+            }
+        }
+
+        assert_eq!(count, 50, "Should receive all 50 messages");
+    }
+
+    /// Test EventLoopNotificationsSender clone works correctly
+    #[tokio::test]
+    async fn test_sender_clone() {
+        let (notification_channel, notification_tx) = event_loop_notification_channel();
+        let mut rx = notification_channel.notifications_receiver;
+
+        // Clone the sender
+        let cloned_tx = notification_tx.clone();
+
+        // Send from original
+        let test_event1 = crate::message::NodeEvent::Disconnect { cause: None };
+        notification_tx
+            .notifications_sender()
+            .send(Either::Right(test_event1))
+            .await
+            .expect("Should send from original");
+
+        // Send from clone
+        let test_event2 = crate::message::NodeEvent::Disconnect {
+            cause: Some("cloned".into()),
+        };
+        cloned_tx
+            .notifications_sender()
+            .send(Either::Right(test_event2))
+            .await
+            .expect("Should send from clone");
+
+        // Both should be received
+        let mut received = 0;
+        for _ in 0..2 {
+            if timeout(Duration::from_millis(100), rx.recv()).await.is_ok() {
+                received += 1;
+            }
+        }
+        assert_eq!(received, 2, "Should receive both messages");
+    }
+}
+
+// ConnectionError tests
+#[cfg(test)]
+mod connection_error_tests {
+    use super::*;
+
+    #[test]
+    fn test_connection_error_clone() {
+        let errors = vec![
+            ConnectionError::LocationUnknown,
+            ConnectionError::SendNotCompleted("127.0.0.1:8080".parse().unwrap()),
+            ConnectionError::UnexpectedReq,
+            ConnectionError::Serialization(None),
+            ConnectionError::TransportError("test error".to_string()),
+            ConnectionError::FailedConnectOp,
+            ConnectionError::UnwantedConnection,
+            ConnectionError::AddressBlocked("127.0.0.1:8080".parse().unwrap()),
+            ConnectionError::IOError("io error".to_string()),
+            ConnectionError::Timeout,
+        ];
+
+        for error in errors {
+            let cloned = error.clone();
+            // Verify clone produces equivalent error
+            assert_eq!(format!("{}", error), format!("{}", cloned));
+        }
+    }
+
+    #[test]
+    fn test_connection_error_from_io_error() {
+        let io_error = std::io::Error::other("test io error");
+        let conn_error: ConnectionError = io_error.into();
+
+        match conn_error {
+            ConnectionError::IOError(msg) => {
+                assert!(msg.contains("test io error"));
+            }
+            _ => panic!("Expected IOError variant"),
+        }
+    }
+
+    #[test]
+    fn test_connection_error_display() {
+        let error = ConnectionError::LocationUnknown;
+        let display = format!("{}", error);
+        assert!(!display.is_empty());
+        assert!(display.contains("location unknown"));
+
+        let error = ConnectionError::SendNotCompleted("127.0.0.1:8080".parse().unwrap());
+        let display = format!("{}", error);
+        assert!(display.contains("127.0.0.1:8080"));
+
+        let error = ConnectionError::AddressBlocked("192.168.1.1:9000".parse().unwrap());
+        let display = format!("{}", error);
+        assert!(display.contains("192.168.1.1:9000"));
+
+        let error = ConnectionError::Timeout;
+        let display = format!("{}", error);
+        assert!(display.contains("timeout"));
+    }
+
+    #[test]
+    fn test_serialization_error_clone_loses_inner() {
+        // When cloning a Serialization error, the inner error is lost
+        let inner = Box::new(bincode::ErrorKind::SizeLimit);
+        let original = ConnectionError::Serialization(Some(inner));
+        let cloned = original.clone();
+
+        match cloned {
+            ConnectionError::Serialization(None) => {} // Expected - inner is lost
+            _ => panic!("Expected Serialization(None) after clone"),
+        }
+    }
+
+    #[test]
+    fn test_connection_error_debug() {
+        let error = ConnectionError::FailedConnectOp;
+        let debug = format!("{:?}", error);
+        assert!(!debug.is_empty());
+        assert!(debug.contains("FailedConnectOp"));
+    }
 }
