@@ -1733,3 +1733,168 @@ async fn test_nested_select_concurrent_arrivals() {
         "✅ Nested select with stream maintains waker registration under high concurrent load!"
     );
 }
+
+/// Regression test for issue #2253 - Waker registration lost when futures recreated in poll()
+///
+/// This test specifically targets the bug pattern that caused intermittent message loss:
+/// A custom Future that recreates internal futures on each poll() call breaks async waker
+/// registration. When a future is dropped, any waker registered with it becomes invalid,
+/// so if we recreate futures in poll(), we lose wakeup notifications.
+///
+/// WRONG pattern (causes lost wakeups):
+/// ```ignore
+/// impl Future for BadSelect {
+///     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+///         // BUG: Creates NEW future each poll - old waker registration is lost!
+///         let fut = self.rx.recv();
+///         tokio::pin!(fut);
+///         fut.poll(cx) // <-- Registers waker, but fut is dropped after this poll
+///     }
+/// }
+/// ```
+///
+/// CORRECT pattern (maintains waker registration):
+/// - Use `tokio::select! { biased; ... }` which maintains futures across polls
+/// - Or convert receivers to streams with `ReceiverStream::new()` and poll them as streams
+///
+/// This test verifies that messages sent AFTER the initial poll are received correctly,
+/// which would fail if wakers were being lost due to future recreation.
+#[tokio::test]
+#[test_log::test]
+async fn test_waker_registration_after_pending_poll() {
+    // This test catches the specific bug pattern from issue #2253:
+    // - First poll returns Pending (no messages yet)
+    // - Message is sent while awaiting
+    // - Second poll should receive the message via proper waker notification
+    //
+    // If futures are recreated in poll(), the waker from the first poll is lost,
+    // and the task is never woken when the message arrives.
+
+    let (tx, rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
+    // Keep senders alive to prevent channel closure
+    let (op_tx, op_rx) = mpsc::channel(10);
+    let (bridge_tx, bridge_rx) = mpsc::channel(10);
+    let (node_tx, node_rx) = mpsc::channel(10);
+
+    // Create stream
+    let stream = PrioritySelectStream::new(
+        rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientNoReceiver,
+        MockExecutorNoReceiver,
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    // Spawn a task that sends a message after a delay
+    // This delay ensures the stream has already been polled once and returned Pending
+    let tx_clone = tx.clone();
+    let sender = tokio::spawn(async move {
+        // Wait long enough for the stream to be polled and return Pending
+        sleep(Duration::from_millis(50)).await;
+        let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
+            crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
+        ));
+        tx_clone.send(Either::Left(test_msg)).await.unwrap();
+        tracing::info!("Message sent after delay");
+    });
+
+    // Poll the stream - should block until the message arrives
+    // If wakers are being lost (bug pattern), this would timeout
+    let result = timeout(Duration::from_millis(200), stream.next()).await;
+
+    assert!(
+        result.is_ok(),
+        "Stream should wake up when message arrives after initial Pending poll. \
+         If this times out, waker registration is being lost (futures recreated in poll)"
+    );
+
+    match result.unwrap() {
+        Some(SelectResult::Notification(Some(_))) => {
+            tracing::info!("✅ Waker registration maintained - message received correctly");
+        }
+        other => panic!(
+            "Expected Notification(Some(_)), got {:?}. \
+             Waker registration may be broken.",
+            other
+        ),
+    }
+
+    sender.await.unwrap();
+
+    // Keep senders alive until end of test
+    drop(tx);
+    drop(op_tx);
+    drop(bridge_tx);
+    drop(node_tx);
+}
+
+/// Test that multiple poll cycles with Pending results don't lose waker registrations
+/// This is a more aggressive version of test_waker_registration_after_pending_poll
+#[tokio::test]
+#[test_log::test]
+async fn test_waker_survives_multiple_pending_polls() {
+    let (tx, rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
+    let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
+    // Keep senders alive to prevent channel closure
+    let (op_tx, op_rx) = mpsc::channel(10);
+    let (bridge_tx, bridge_rx) = mpsc::channel(10);
+    let (node_tx, node_rx) = mpsc::channel(10);
+
+    let stream = PrioritySelectStream::new(
+        rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientNoReceiver,
+        MockExecutorNoReceiver,
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    // Do multiple short polls that will timeout (no messages yet)
+    // Note: These will return Err(Elapsed) from timeout, not Pending from poll
+    for i in 0..5 {
+        let poll_result = timeout(Duration::from_millis(5), stream.as_mut().next()).await;
+        assert!(
+            poll_result.is_err(),
+            "Poll {} should timeout (no messages yet)",
+            i
+        );
+    }
+
+    // Now send a message
+    let test_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
+        crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
+    ));
+    tx.send(Either::Left(test_msg)).await.unwrap();
+
+    // The next poll should receive it despite the previous timeout/pending results
+    let result = timeout(Duration::from_millis(100), stream.as_mut().next()).await;
+
+    assert!(
+        result.is_ok(),
+        "Stream should receive message even after multiple Pending polls. \
+         If this fails, waker registration is being lost across poll cycles."
+    );
+
+    match result.unwrap() {
+        Some(SelectResult::Notification(Some(_))) => {
+            tracing::info!(
+                "✅ Waker registration maintained across {} Pending polls",
+                5
+            );
+        }
+        other => panic!("Expected Notification(Some(_)), got {:?}", other),
+    }
+
+    // Keep senders alive until end of test
+    drop(op_tx);
+    drop(bridge_tx);
+    drop(node_tx);
+}
