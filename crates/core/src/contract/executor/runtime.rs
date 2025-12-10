@@ -2,7 +2,7 @@ use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
     ExecutorToEventLoopChannel, InitCheckResult, RequestError, Response, StateStoreError,
-    SLOW_INIT_THRESHOLD,
+    SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
 };
 
 impl ContractExecutor for Executor<Runtime> {
@@ -40,6 +40,19 @@ impl ContractExecutor for Executor<Runtime> {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
+        // Opportunistically clean up any stale initializations to prevent resource leaks
+        let stale = self
+            .init_tracker
+            .cleanup_stale_initializations(STALE_INIT_THRESHOLD);
+        for info in stale {
+            tracing::warn!(
+                contract = %info.key,
+                age_secs = info.age.as_secs(),
+                dropped_ops = info.dropped_ops,
+                "Cleaned up stale contract initialization (possible bug or timeout)"
+            );
+        }
+
         // Check if this contract is currently being initialized
         match self.init_tracker.check_and_maybe_queue(
             &key,

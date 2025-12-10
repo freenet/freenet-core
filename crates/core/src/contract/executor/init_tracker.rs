@@ -11,8 +11,6 @@ use std::time::{Duration, Instant};
 pub(crate) const SLOW_INIT_THRESHOLD: Duration = Duration::from_secs(1);
 
 /// Initializations older than this are considered stale and will be cleaned up.
-/// Used by periodic cleanup to prevent resource leaks.
-#[allow(dead_code)] // For future periodic cleanup integration
 pub(crate) const STALE_INIT_THRESHOLD: Duration = Duration::from_secs(30);
 
 use either::Either;
@@ -49,9 +47,7 @@ pub(crate) struct InitCompletionInfo {
 }
 
 /// Information about a stale initialization that was cleaned up.
-/// Used by periodic cleanup to log warnings about leaked initializations.
 #[derive(Debug)]
-#[allow(dead_code)] // For future periodic cleanup integration
 pub(crate) struct StaleInitInfo {
     /// The contract key that was stale
     pub key: ContractKey,
@@ -169,7 +165,6 @@ impl ContractInitTracker {
     /// Returns information about each stale initialization that was cleaned up.
     /// This should be called periodically to prevent resource leaks from
     /// initializations that never complete (e.g., due to bugs or crashes).
-    #[allow(dead_code)] // For future periodic cleanup integration
     pub fn cleanup_stale_initializations(&mut self, max_age: Duration) -> Vec<StaleInitInfo> {
         let now = Instant::now();
         let stale_keys: Vec<_> = self
