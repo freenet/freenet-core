@@ -560,16 +560,12 @@ async fn test_with_seed(seed: u64) {
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(100);
     let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(100);
     let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(100);
-    let (client_tx, client_rx) = mpsc::channel::<
-        Result<
-            (
-                crate::client_events::ClientId,
-                crate::contract::WaitingTransaction,
-            ),
-            anyhow::Error,
-        >,
-    >(100);
-    let (executor_tx, executor_rx) = mpsc::channel::<Result<Transaction, anyhow::Error>>(100);
+    // Create channels with the correct types expected by the trait
+    let (client_tx, client_rx) = mpsc::channel::<(
+        crate::client_events::ClientId,
+        crate::contract::WaitingTransaction,
+    )>(100);
+    let (executor_tx, executor_rx) = mpsc::channel::<Transaction>(100);
 
     tracing::info!(
         "Starting stress test with {} total messages from 6 concurrent tasks",
@@ -658,7 +654,7 @@ async fn test_with_seed(seed: u64) {
                 i,
                 delay_us
             );
-            client_tx.send(Ok((client_id, waiting_tx))).await.unwrap();
+            client_tx.send((client_id, waiting_tx)).await.unwrap();
         }
         tracing::info!("Client task sent all {} messages", CLIENT_COUNT);
         CLIENT_COUNT
@@ -673,7 +669,7 @@ async fn test_with_seed(seed: u64) {
                 delay_us
             );
             executor_tx
-                .send(Ok(Transaction::new::<crate::operations::put::PutMsg>()))
+                .send(Transaction::new::<crate::operations::put::PutMsg>())
                 .await
                 .unwrap();
         }
@@ -685,48 +681,42 @@ async fn test_with_seed(seed: u64) {
     sleep(Duration::from_micros(100)).await;
 
     // Mock implementations for the stream
-
     struct MockClientStress {
-        #[allow(dead_code)]
-        rx: mpsc::Receiver<
-            Result<
-                (
-                    crate::client_events::ClientId,
-                    crate::contract::WaitingTransaction,
-                ),
-                anyhow::Error,
-            >,
+        rx: Option<
+            mpsc::Receiver<(
+                crate::client_events::ClientId,
+                crate::contract::WaitingTransaction,
+            )>,
         >,
     }
     impl ClientTransactionRelay for MockClientStress {
         fn take_receiver(&mut self) -> Option<Receiver<(ClientId, WaitingTransaction)>> {
-            // Transform the Result receiver into direct value receiver
-            // For the stress test, we expect all sent values to be Ok
-            None // The stress test needs to be redesigned for the new API
+            self.rx.take()
         }
     }
 
     struct MockExecutorStress {
-        #[allow(dead_code)]
-        rx: mpsc::Receiver<Result<Transaction, anyhow::Error>>,
+        rx: Option<mpsc::Receiver<Transaction>>,
     }
     impl ExecutorTransactionReceiver for MockExecutorStress {
         fn take_receiver(&mut self) -> Option<Receiver<Transaction>> {
-            // For the stress test, we expect all sent values to be Ok
-            None // The stress test needs to be redesigned for the new API
+            self.rx.take()
         }
     }
 
     // Create stream ONCE - it maintains waker registration and handles channel closures
-    // Note: stress test now uses None receivers since the test design needs updating for new API
     let stream = PrioritySelectStream::new(
         notif_rx,
         op_rx,
         bridge_rx,
         create_mock_handshake_stream(),
         node_rx,
-        MockClientStress { rx: client_rx },
-        MockExecutorStress { rx: executor_rx },
+        MockClientStress {
+            rx: Some(client_rx),
+        },
+        MockExecutorStress {
+            rx: Some(executor_rx),
+        },
         conn_event_rx,
     );
     tokio::pin!(stream);
