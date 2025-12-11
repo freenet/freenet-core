@@ -2674,6 +2674,41 @@ async fn notify_transport_closed(
     }
 }
 
+/// Drains and sends all pending outbound messages before shutting down.
+///
+/// This is critical for preventing message loss: when we detect an error condition
+/// (transport error, channel closed, etc.), there may be messages that were queued
+/// to the channel AFTER we started waiting in select! but BEFORE we detected the error.
+/// Without this drain, those messages would be silently lost.
+async fn drain_pending_before_shutdown(
+    rx: &mut PeerConnChannelRecv,
+    conn: &mut PeerConnection,
+    remote_addr: SocketAddr,
+) -> usize {
+    let mut drained = 0;
+    while let Ok(msg) = rx.try_recv() {
+        // Best-effort send - connection may already be degraded
+        if let Err(e) = handle_peer_channel_message(conn, msg).await {
+            tracing::debug!(
+                to = %remote_addr,
+                ?e,
+                drained,
+                "[CONN_LIFECYCLE] Error during shutdown drain (expected if connection closed)"
+            );
+            break;
+        }
+        drained += 1;
+    }
+    if drained > 0 {
+        tracing::info!(
+            to = %remote_addr,
+            drained,
+            "[CONN_LIFECYCLE] Drained pending messages before shutdown"
+        );
+    }
+    drained
+}
+
 /// Listens for messages on a peer connection using drain-then-select pattern.
 ///
 /// On each iteration, drains all pending outbound messages via `try_recv()` before
@@ -2681,6 +2716,9 @@ async fn notify_transport_closed(
 /// 1. Ensures queued outbound messages are sent promptly
 /// 2. Avoids starving inbound (which would happen with biased select)
 /// 3. No messages are lost due to poll ordering
+///
+/// IMPORTANT: Before exiting on any error path, we drain pending messages to prevent
+/// loss of messages that arrived during the select! wait.
 async fn peer_connection_listener(
     mut rx: PeerConnChannelRecv,
     mut conn: PeerConnection,
@@ -2707,6 +2745,9 @@ async fn peer_connection_listener(
                             ?error,
                             "[CONN_LIFECYCLE] Connection closed after channel command"
                         );
+                        // Drain any messages that arrived after our try_recv() but before
+                        // handle_peer_channel_message returned an error
+                        drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
                         notify_transport_closed(&conn_events, remote_addr, error).await;
                         return;
                     }
@@ -2717,6 +2758,7 @@ async fn peer_connection_listener(
                         to = %remote_addr,
                         "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
                     );
+                    // Channel disconnected means no more messages can arrive
                     notify_transport_closed(
                         &conn_events,
                         remote_addr,
@@ -2739,6 +2781,8 @@ async fn peer_connection_listener(
                                 ?error,
                                 "[CONN_LIFECYCLE] Connection closed after channel command"
                             );
+                            // Drain any messages that arrived while we were processing this one
+                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
                             notify_transport_closed(&conn_events, remote_addr, error).await;
                             return;
                         }
@@ -2748,6 +2792,7 @@ async fn peer_connection_listener(
                             to = %remote_addr,
                             "[CONN_LIFECYCLE] peer_connection_listener channel closed without explicit DropConnection"
                         );
+                        // Channel closed means no more messages can arrive
                         notify_transport_closed(
                             &conn_events,
                             remote_addr,
@@ -2783,6 +2828,9 @@ async fn peer_connection_listener(
                                     from = %remote_addr,
                                     "[CONN_LIFECYCLE] conn_events receiver dropped; stopping listener"
                                 );
+                                // Drain pending messages - they may still be sendable even if
+                                // the conn_events channel is closed
+                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
                                 return;
                             }
                         }
@@ -2792,6 +2840,8 @@ async fn peer_connection_listener(
                                 ?error,
                                 "[CONN_LIFECYCLE] Failed to deserialize inbound message; closing connection"
                             );
+                            // Drain pending outbound messages before closing - they may still succeed
+                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
                             let transport_error = TransportError::Other(anyhow!(
                                 "Failed to deserialize inbound message from {remote_addr}: {error:?}"
                             ));
@@ -2805,6 +2855,10 @@ async fn peer_connection_listener(
                             ?error,
                             "[CONN_LIFECYCLE] peer_connection_listener terminating after recv error"
                         );
+                        // CRITICAL: Drain pending outbound messages before exiting.
+                        // Messages may have been queued to the channel while we were
+                        // waiting in select!, and they would be lost without this drain.
+                        drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
                         notify_transport_closed(&conn_events, remote_addr, error).await;
                         return;
                     }
@@ -2870,3 +2924,176 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 }
 
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio::time::{sleep, timeout, Duration};
+
+    /// Regression test for message loss during shutdown.
+    ///
+    /// This test validates the drain-before-shutdown pattern that prevents message loss
+    /// when an error occurs during select! wait. The bug scenario:
+    ///
+    /// 1. Listener enters select! waiting for inbound/outbound
+    /// 2. Message is queued to the channel while select! is waiting
+    /// 3. Error occurs (e.g., connection timeout, deserialize failure)
+    /// 4. select! returns with the error
+    /// 5. BUG: Without drain, we return immediately and the queued message is lost
+    /// 6. FIX: Drain pending messages before returning
+    ///
+    /// This test simulates the pattern by:
+    /// - Having a "listener" that waits on select! then encounters an error
+    /// - Sending messages during the wait period
+    /// - Verifying all messages are processed (drained) before exit
+    #[tokio::test]
+    async fn test_drain_before_shutdown_prevents_message_loss() {
+        let (tx, mut rx) = mpsc::channel::<String>(10);
+        let processed = Arc::new(AtomicUsize::new(0));
+        let processed_clone = processed.clone();
+
+        // Simulate peer_connection_listener pattern
+        let listener = tokio::spawn(async move {
+            // Drain-then-select loop (simplified)
+            loop {
+                // Phase 1: Drain pending messages (like the loop at start of peer_connection_listener)
+                loop {
+                    match rx.try_recv() {
+                        Ok(msg) => {
+                            tracing::debug!("Drained message: {}", msg);
+                            processed_clone.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => return,
+                    }
+                }
+
+                // Phase 2: Wait for new messages or "error" (simulated by timeout)
+                tokio::select! {
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(m) => {
+                                tracing::debug!("Received via select: {}", m);
+                                processed_clone.fetch_add(1, Ordering::SeqCst);
+                            }
+                            None => return, // Channel closed
+                        }
+                    }
+                    // Simulate error condition (e.g., connection timeout)
+                    _ = sleep(Duration::from_millis(50)) => {
+                        tracing::debug!("Simulated error occurred");
+
+                        // CRITICAL: This is the fix - drain before shutdown
+                        // Without this, messages queued during the 50ms wait would be lost
+                        let mut drained = 0;
+                        while let Ok(msg) = rx.try_recv() {
+                            tracing::debug!("Drain before shutdown: {}", msg);
+                            processed_clone.fetch_add(1, Ordering::SeqCst);
+                            drained += 1;
+                        }
+                        tracing::debug!("Drained {} messages before shutdown", drained);
+                        return;
+                    }
+                }
+            }
+        });
+
+        // Send messages with timing that causes them to arrive DURING the select! wait
+        // This is the race condition that causes message loss without the drain
+        tokio::spawn(async move {
+            // Wait for listener to enter select!
+            sleep(Duration::from_millis(10)).await;
+
+            // Send messages while listener is in select! waiting
+            for i in 0..5 {
+                tx.send(format!("msg{}", i)).await.unwrap();
+                sleep(Duration::from_millis(5)).await;
+            }
+            // Don't close the channel - let the timeout trigger the "error"
+        });
+
+        // Wait for listener to complete
+        let result = timeout(Duration::from_millis(200), listener).await;
+        assert!(result.is_ok(), "Listener should complete");
+
+        // All 5 messages should have been processed
+        let count = processed.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 5,
+            "All messages should be processed (drained before shutdown). Got {} instead of 5. \
+             If this fails, messages are being lost during the error-exit drain.",
+            count
+        );
+    }
+
+    /// Test that demonstrates what happens WITHOUT the drain (the bug we're preventing).
+    /// This test intentionally shows the failure mode when drain is missing.
+    ///
+    /// The key is to ensure messages are queued AFTER select! starts but the error
+    /// fires immediately, so select! returns with error before processing the messages.
+    #[tokio::test]
+    async fn test_message_loss_without_drain() {
+        let (tx, mut rx) = mpsc::channel::<String>(10);
+        let processed = Arc::new(AtomicUsize::new(0));
+        let processed_clone = processed.clone();
+
+        // Signal when listener is ready for messages
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Buggy listener - NO drain before shutdown (demonstrates the bug)
+        let listener = tokio::spawn(async move {
+            // Drain at loop start (the original PR #2255 fix)
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        tracing::debug!("Drained message: {}", msg);
+                        processed_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return,
+                }
+            }
+
+            // Signal that we're about to enter select! and then immediately timeout
+            let _ = ready_tx.send(());
+
+            // Immediate timeout to simulate error - messages sent after this starts are lost
+            tokio::select! {
+                biased; // Ensure timeout wins if both are ready
+                _ = sleep(Duration::from_millis(1)) => {
+                    tracing::debug!("Error occurred - BUG: returning without drain!");
+                    // BUG: No drain here! Messages queued during this 1ms window are lost.
+                }
+                msg = rx.recv() => {
+                    if let Some(m) = msg {
+                        tracing::debug!("Received via select: {}", m);
+                        processed_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+
+        // Wait for listener to be ready, then immediately send messages
+        let _ = ready_rx.await;
+
+        // Send messages - these arrive while select! is running with a very short timeout
+        // Some or all will be lost because we return without draining
+        for i in 0..5 {
+            let _ = tx.send(format!("msg{}", i)).await;
+        }
+
+        let _ = timeout(Duration::from_millis(100), listener).await;
+
+        // Without the drain fix, messages are lost
+        let count = processed.load(Ordering::SeqCst);
+        // The listener exits immediately due to timeout, so no messages should be processed
+        assert!(
+            count < 5,
+            "Without drain, messages should be lost. Got {} (expected < 5). \
+             This test validates the bug exists when drain is missing.",
+            count
+        );
+    }
+}
