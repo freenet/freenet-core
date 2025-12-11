@@ -196,7 +196,10 @@ impl PeerConnection {
                     "Sending keep-alive NoOp packet"
                 );
 
-                match outbound_packets.send_async((remote_addr, noop_packet)).await {
+                match outbound_packets
+                    .send_async((remote_addr, noop_packet))
+                    .await
+                {
                     Ok(_) => {
                         tracing::debug!(
                             target: "freenet_core::transport::keepalive_lifecycle",

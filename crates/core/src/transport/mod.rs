@@ -93,6 +93,7 @@ pub(crate) trait Socket: Sized + Send + Sync + 'static {
         &self,
         buf: &mut [u8],
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
+    #[allow(dead_code)] // Kept for completeness; blocking variant is used for rate-limiter
     fn send_to(
         &self,
         buf: &[u8],
@@ -118,9 +119,23 @@ impl Socket for UdpSocket {
     }
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        // try_send_to is synchronous and for UDP typically succeeds immediately
-        // since UDP doesn't have flow control - it just queues the packet
-        self.try_send_to(buf, target)
+        // try_send_to is synchronous and for UDP typically succeeds immediately.
+        // However, under high load the kernel buffer might be full, returning WouldBlock.
+        // In that case, we retry with exponential backoff since we're in a blocking context.
+        let mut backoff_us = 1u64; // Start at 1μs
+        const MAX_BACKOFF_US: u64 = 1000; // Cap at 1ms
+
+        loop {
+            match self.try_send_to(buf, target) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Kernel buffer full - exponential backoff
+                    std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+                    backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 

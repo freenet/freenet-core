@@ -37,7 +37,11 @@ impl<T: TimeSource> PacketRateLimiter<T> {
     ///
     /// This should be called via `tokio::task::spawn_blocking` for optimal performance.
     /// Uses blocking crossbeam channel recv() for ~3x better throughput than async.
-    pub(super) fn rate_limiter<S: Socket>(mut self, bandwidth_limit: Option<usize>, socket: Arc<S>) {
+    pub(super) fn rate_limiter<S: Socket>(
+        mut self,
+        bandwidth_limit: Option<usize>,
+        socket: Arc<S>,
+    ) {
         tracing::info!("Rate limiter task started (blocking mode)");
         while let Ok((socket_addr, packet)) = self.outbound_packets.recv() {
             tracing::debug!(

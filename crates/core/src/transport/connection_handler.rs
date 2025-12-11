@@ -776,10 +776,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
-    ) -> (
-        TraverseNatFuture,
-        FastSender<PacketData<UnknownEncryption>>,
-    ) {
+    ) -> (TraverseNatFuture, FastSender<PacketData<UnknownEncryption>>) {
         tracing::debug!(
             %remote_addr,
             "Starting NAT traversal"
@@ -940,7 +937,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 ))
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
-                                            let (inbound_sender, inbound_recv) = fast_channel::bounded(100);
+                                            let (inbound_sender, inbound_recv) =
+                                                fast_channel::bounded(100);
                                             tracing::debug!(%remote_addr, "connection established");
                                             tracing::info!(%remote_addr, attempts = attempts, "Outbound handshake completed (ack path)");
                                             return Ok((

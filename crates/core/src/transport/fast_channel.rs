@@ -1,4 +1,7 @@
-//! High-performance channel implementation for transport layer.
+// Allow dead_code since this module is exposed for benchmarking and future use
+#![allow(dead_code)]
+
+//! High-performance bounded channel implementation for transport layer.
 //!
 //! This module provides a hybrid channel that combines:
 //! - **crossbeam::channel** for fast, lock-free message passing (~4.4x faster than tokio::sync::mpsc)
@@ -12,12 +15,12 @@
 //! # Usage
 //!
 //! ```ignore
-//! let (tx, rx) = fast_channel::bounded::<Packet>(100);
+//! let (tx, rx) = fast_channel::bounded::<Packet>(1000);
 //!
-//! // Sync send (fastest, use when not in async context)
+//! // Sync send (fastest, blocks if full)
 //! tx.send(packet).unwrap();
 //!
-//! // Async send (for backpressure in async context)
+//! // Async send (yields if full)
 //! tx.send_async(packet).await.unwrap();
 //!
 //! // Async receive
@@ -52,14 +55,32 @@ impl std::fmt::Display for RecvError {
 
 impl std::error::Error for RecvError {}
 
-/// The sending half of a fast channel.
+/// Error returned by `try_send`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySendError<T> {
+    /// The channel is full.
+    Full(T),
+    /// The receiver has been dropped.
+    Disconnected(T),
+}
+
+impl<T> std::fmt::Display for TrySendError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrySendError::Full(_) => write!(f, "channel full"),
+            TrySendError::Disconnected(_) => write!(f, "channel disconnected"),
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for TrySendError<T> {}
+
+/// The sending half of a fast bounded channel.
 ///
 /// This can be cloned to create multiple senders.
 pub struct FastSender<T> {
     inner: crossbeam::channel::Sender<T>,
-    /// Notifies receivers that a message is available
-    recv_notify: Arc<Notify>,
-    /// Notifies senders that space is available (for bounded channels)
+    /// Notifies senders that space is available (for backpressure)
     send_notify: Arc<Notify>,
     /// Tracks if the receiver has been dropped
     closed: Arc<AtomicBool>,
@@ -69,50 +90,33 @@ impl<T> Clone for FastSender<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            recv_notify: self.recv_notify.clone(),
             send_notify: self.send_notify.clone(),
             closed: self.closed.clone(),
         }
     }
 }
 
-impl<T> Drop for FastSender<T> {
-    fn drop(&mut self) {
-        // When sender drops, wake any waiting receivers so they can detect disconnection
-        self.recv_notify.notify_waiters();
-    }
-}
-
 impl<T> FastSender<T> {
     /// Sends a message synchronously.
     ///
-    /// This is the fastest send method. Use when:
-    /// - You're not in an async context
-    /// - You don't need backpressure (willing to block)
-    ///
-    /// For bounded channels, this will block if the channel is full.
+    /// For bounded channels, this blocks if the channel is full.
     #[inline]
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
         match self.inner.send(msg) {
-            Ok(()) => {
-                // Use notify_waiters to ensure receiver wakes up even in high-throughput scenarios
-                self.recv_notify.notify_waiters();
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(crossbeam::channel::SendError(msg)) => Err(SendError(msg)),
         }
     }
 
     /// Sends a message asynchronously with backpressure.
     ///
-    /// For bounded channels, this will yield if the channel is full,
+    /// For bounded channels, this yields if the channel is full,
     /// allowing other tasks to run while waiting for space.
     pub async fn send_async(&self, msg: T) -> Result<(), SendError<T>> {
         let mut msg = msg;
         loop {
             match self.inner.try_send(msg) {
                 Ok(()) => {
-                    self.recv_notify.notify_waiters();
                     return Ok(());
                 }
                 Err(crossbeam::channel::TrySendError::Full(returned)) => {
@@ -134,10 +138,7 @@ impl<T> FastSender<T> {
     #[inline]
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
         match self.inner.try_send(msg) {
-            Ok(()) => {
-                self.recv_notify.notify_waiters();
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(crossbeam::channel::TrySendError::Full(msg)) => Err(TrySendError::Full(msg)),
             Err(crossbeam::channel::TrySendError::Disconnected(msg)) => {
                 Err(TrySendError::Disconnected(msg))
@@ -170,34 +171,10 @@ impl<T> FastSender<T> {
     }
 }
 
-/// Error returned by `try_send`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrySendError<T> {
-    /// The channel is full.
-    Full(T),
-    /// The receiver has been dropped.
-    Disconnected(T),
-}
-
-impl<T> std::fmt::Display for TrySendError<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TrySendError::Full(_) => write!(f, "channel full"),
-            TrySendError::Disconnected(_) => write!(f, "channel disconnected"),
-        }
-    }
-}
-
-impl<T: std::fmt::Debug> std::error::Error for TrySendError<T> {}
-
-/// The receiving half of a fast channel.
+/// The receiving half of a fast bounded channel.
 pub struct FastReceiver<T> {
     inner: crossbeam::channel::Receiver<T>,
-    /// Notifies receivers that a message is available.
-    /// Currently unused (using yield_now instead) but kept for potential future optimization.
-    #[allow(dead_code)]
-    recv_notify: Arc<Notify>,
-    /// Notifies senders that space is available (for bounded channels)
+    /// Notifies senders that space is available
     send_notify: Arc<Notify>,
     /// Tracks if the receiver has been dropped (shared with senders for is_closed())
     closed: Arc<AtomicBool>,
@@ -218,34 +195,20 @@ impl<T> FastReceiver<T> {
     /// This is the primary receive method for async contexts.
     pub async fn recv_async(&self) -> Result<T, RecvError> {
         loop {
-            // Try to receive
             match self.inner.try_recv() {
                 Ok(msg) => {
+                    // Notify senders that space is available
                     self.send_notify.notify_one();
                     return Ok(msg);
                 }
                 Err(crossbeam::channel::TryRecvError::Empty) => {
                     // Channel is empty - yield to let other tasks run, then check again
-                    // This is more efficient than pure spinning while still being responsive
                     tokio::task::yield_now().await;
                 }
                 Err(crossbeam::channel::TryRecvError::Disconnected) => {
                     return Err(RecvError);
                 }
             }
-        }
-    }
-
-    /// Attempts to receive a message without blocking.
-    #[inline]
-    pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        match self.inner.try_recv() {
-            Ok(msg) => {
-                self.send_notify.notify_one();
-                Ok(msg)
-            }
-            Err(crossbeam::channel::TryRecvError::Empty) => Err(TryRecvError::Empty),
-            Err(crossbeam::channel::TryRecvError::Disconnected) => Err(TryRecvError::Disconnected),
         }
     }
 
@@ -276,88 +239,31 @@ impl<T> FastReceiver<T> {
     }
 }
 
-/// Error returned by `try_recv`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TryRecvError {
-    /// The channel is empty.
-    Empty,
-    /// The sender has been dropped.
-    Disconnected,
-}
-
-impl std::fmt::Display for TryRecvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TryRecvError::Empty => write!(f, "channel empty"),
-            TryRecvError::Disconnected => write!(f, "channel disconnected"),
-        }
-    }
-}
-
-impl std::error::Error for TryRecvError {}
-
 /// Creates a bounded fast channel with the given capacity.
+///
+/// Bounded channels provide backpressure - senders will block/yield when the
+/// channel is full, preventing unbounded memory growth.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let (tx, rx) = fast_channel::bounded::<i32>(100);
+/// let (tx, rx) = fast_channel::bounded::<i32>(1000);
 /// tx.send(42).unwrap();
 /// assert_eq!(rx.recv_async().await.unwrap(), 42);
 /// ```
 pub fn bounded<T>(capacity: usize) -> (FastSender<T>, FastReceiver<T>) {
     let (tx, rx) = crossbeam::channel::bounded(capacity);
-    let recv_notify = Arc::new(Notify::new());
     let send_notify = Arc::new(Notify::new());
     let closed = Arc::new(AtomicBool::new(false));
 
     let sender = FastSender {
         inner: tx,
-        recv_notify: recv_notify.clone(),
         send_notify: send_notify.clone(),
         closed: closed.clone(),
     };
 
     let receiver = FastReceiver {
         inner: rx,
-        recv_notify,
-        send_notify,
-        closed,
-    };
-
-    (sender, receiver)
-}
-
-/// Creates an unbounded fast channel.
-///
-/// # Warning
-///
-/// Unbounded channels can grow without limit if the receiver is slower than
-/// the sender. Use bounded channels with backpressure for production workloads.
-///
-/// # Example
-///
-/// ```ignore
-/// let (tx, rx) = fast_channel::unbounded::<i32>();
-/// tx.send(42).unwrap();
-/// assert_eq!(rx.recv_async().await.unwrap(), 42);
-/// ```
-pub fn unbounded<T>() -> (FastSender<T>, FastReceiver<T>) {
-    let (tx, rx) = crossbeam::channel::unbounded();
-    let recv_notify = Arc::new(Notify::new());
-    let send_notify = Arc::new(Notify::new());
-    let closed = Arc::new(AtomicBool::new(false));
-
-    let sender = FastSender {
-        inner: tx,
-        recv_notify: recv_notify.clone(),
-        send_notify: send_notify.clone(),
-        closed: closed.clone(),
-    };
-
-    let receiver = FastReceiver {
-        inner: rx,
-        recv_notify,
         send_notify,
         closed,
     };
@@ -370,7 +276,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_bounded_send_recv() {
+    async fn test_send_recv() {
         let (tx, rx) = bounded::<i32>(10);
 
         tx.send(42).unwrap();
@@ -378,19 +284,6 @@ mod tests {
 
         assert_eq!(rx.recv_async().await.unwrap(), 42);
         assert_eq!(rx.recv_async().await.unwrap(), 43);
-    }
-
-    #[tokio::test]
-    async fn test_unbounded_send_recv() {
-        let (tx, rx) = unbounded::<i32>();
-
-        for i in 0..1000 {
-            tx.send(i).unwrap();
-        }
-
-        for i in 0..1000 {
-            assert_eq!(rx.recv_async().await.unwrap(), i);
-        }
     }
 
     #[tokio::test]
@@ -402,18 +295,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_send_full() {
+    async fn test_backpressure() {
         let (tx, rx) = bounded::<i32>(2);
 
-        assert!(tx.try_send(1).is_ok());
-        assert!(tx.try_send(2).is_ok());
-        assert!(matches!(tx.try_send(3), Err(TrySendError::Full(3))));
+        // Fill the channel
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        assert!(tx.is_full());
 
-        // Drain one
+        // Drain one to make space
         assert_eq!(rx.recv_async().await.unwrap(), 1);
+        assert!(!tx.is_full());
 
-        // Now we can send again
-        assert!(tx.try_send(3).is_ok());
+        // Can send again
+        tx.send(3).unwrap();
     }
 
     #[tokio::test]
@@ -443,14 +338,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_is_closed() {
+        let (tx, rx) = bounded::<i32>(10);
+
+        assert!(!tx.is_closed());
+        drop(rx);
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
     async fn test_concurrent_send_recv() {
-        // Use unbounded to avoid blocking sender
-        let (tx, rx) = unbounded::<i32>();
+        let (tx, rx) = bounded::<i32>(100);
         let count = 1000;
 
         let sender = tokio::spawn(async move {
             for i in 0..count {
-                tx.send(i).unwrap();
+                tx.send_async(i).await.unwrap();
             }
         });
 
