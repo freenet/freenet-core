@@ -827,6 +827,7 @@ impl P2pConnManager {
                             }
                             NodeEvent::QueryConnections { callback } => {
                                 // Reconstruct PeerKeyLocations from stored connections
+                                let total_connections = ctx.connections.len();
                                 let connections: Vec<PeerKeyLocation> = ctx
                                     .connections
                                     .iter()
@@ -837,6 +838,12 @@ impl P2pConnManager {
                                         })
                                     })
                                     .collect();
+                                let with_pub_key = connections.len();
+                                tracing::info!(
+                                    total_connections,
+                                    with_pub_key,
+                                    "QueryConnections: returning connections"
+                                );
                                 match timeout(
                                     Duration::from_secs(1),
                                     callback.send(QueryResult::Connections(connections)),
@@ -1569,13 +1576,26 @@ impl P2pConnManager {
                     entry.pub_key = Some(peer.pub_key().clone());
                     self.addr_by_pub_key
                         .insert(peer.pub_key().clone(), peer_addr);
-                    tracing::debug!(
+                    tracing::info!(
                         tx = %tx,
                         %peer_addr,
                         pub_key = %peer.pub_key(),
                         "connect_peer: updated transport entry with peer identity"
                     );
+                } else {
+                    tracing::info!(
+                        tx = %tx,
+                        %peer_addr,
+                        existing_pub_key = ?entry.pub_key,
+                        "connect_peer: transport entry already has pub_key"
+                    );
                 }
+            } else {
+                tracing::warn!(
+                    tx = %tx,
+                    %peer_addr,
+                    "connect_peer: no transport entry found for peer_addr"
+                );
             }
 
             // Return the remote peer's address we are connected to.
