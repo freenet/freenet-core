@@ -124,7 +124,9 @@ jobs:
           rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
 
       - name: Test
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb
+        # Limit test threads to reduce resource contention on high-core-count runners
+        # Without this, 64+ parallel tests cause timing-sensitive network tests to fail
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8
 
   six_peer_regression:
     name: six-peer-regression

@@ -3065,7 +3065,6 @@ mod tests {
                 _ = sleep(Duration::from_millis(1)) => {
                     tracing::debug!("Error occurred - BUG: returning without drain!");
                     // BUG: No drain here! Messages queued during this 1ms window are lost.
-                    return;
                 }
                 msg = rx.recv() => {
                     if let Some(m) = msg {
