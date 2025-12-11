@@ -1,0 +1,206 @@
+name: Performance Benchmarks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/src/transport/**'
+      - 'crates/core/benches/**'
+      - '.github/workflows/benchmarks.yml'
+  pull_request:
+    paths:
+      - 'crates/core/src/transport/**'
+      - 'crates/core/benches/**'
+      - '.github/workflows/benchmarks.yml'
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      benchmark_level:
+        description: 'Benchmark level to run (level0, level1, all)'
+        required: false
+        default: 'level0'
+
+# Cancel in-progress runs when a new commit is pushed
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: self-hosted
+    # Don't fail the whole workflow if benchmarks detect regressions
+    continue-on-error: true
+
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Reduce noise from logging during benchmarks
+      FREENET_LOG: error
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache benchmarks separately from test builds
+          prefix-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Download baseline from main branch for comparison
+      # PRs compare against main's baseline; main branch updates the baseline
+      # Note: Cache keys include SHA so each main commit creates a new baseline
+      # restore-keys finds the most recent baseline from main
+      - name: Download main branch baseline
+        id: baseline-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          # Try to find an exact match first (won't happen for PRs)
+          key: criterion-baseline-main-${{ runner.os }}-${{ github.sha }}
+          # Fall back to most recent main branch baseline
+          restore-keys: |
+            criterion-baseline-main-${{ runner.os }}-
+
+      - name: Report baseline status
+        run: |
+          if [ "${{ steps.baseline-cache.outputs.cache-hit }}" == "true" ]; then
+            echo "✅ Loaded exact baseline match" >> $GITHUB_STEP_SUMMARY
+          elif [ -d "target/criterion" ]; then
+            echo "✅ Loaded baseline from main branch (via restore-keys)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No baseline found - this run will establish the baseline" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Run Level 0 benchmarks (pure logic, deterministic)
+      - name: Run Level 0 Benchmarks (Pure Logic)
+        id: bench_level0
+        run: |
+          echo "## Level 0: Pure Logic Benchmarks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "These benchmarks measure pure computation without I/O:" >> $GITHUB_STEP_SUMMARY
+          echo "- AES-GCM encryption/decryption" >> $GITHUB_STEP_SUMMARY
+          echo "- Serialization" >> $GITHUB_STEP_SUMMARY
+          echo "- Nonce generation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Run benchmarks and capture output
+          cargo bench --bench transport_perf -- level0 2>&1 | tee bench_output.txt
+
+          # Parse for regressions (criterion outputs "regressed" for performance decreases)
+          if grep -q "regressed" bench_output.txt; then
+            echo "regression_detected=true" >> $GITHUB_OUTPUT
+            echo "### ⚠️ Performance Regressions Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -A2 "regressed" bench_output.txt >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "regression_detected=false" >> $GITHUB_OUTPUT
+            echo "### ✅ No Regressions Detected" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Also capture any improvements
+          if grep -q "improved" bench_output.txt; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🚀 Performance Improvements" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -A2 "improved" bench_output.txt >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Run Level 1 benchmarks (mock I/O) - only on main or manual trigger
+      - name: Run Level 1 Benchmarks (Mock I/O)
+        if: github.ref == 'refs/heads/main' || github.event.inputs.benchmark_level == 'level1' || github.event.inputs.benchmark_level == 'all'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Level 1: Mock I/O Benchmarks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "These benchmarks measure protocol logic with mock sockets:" >> $GITHUB_STEP_SUMMARY
+          echo "- Channel throughput" >> $GITHUB_STEP_SUMMARY
+          echo "- Packet routing" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          cargo bench --bench transport_perf -- level1 2>&1 | tee -a bench_output.txt
+
+          if grep -q "regressed" bench_output.txt; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -A2 "regressed" bench_output.txt | tail -20 >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Save baseline for future comparisons (only on main branch)
+      # Each main branch commit creates a new baseline with SHA in the key
+      # PRs use restore-keys to find the most recent one
+      - name: Save Baseline to Main
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          # Include SHA so each main commit has its own baseline
+          key: criterion-baseline-main-${{ runner.os }}-${{ github.sha }}
+
+      # Post comment on PR with regression summary
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && steps.bench_level0.outputs.regression_detected == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('bench_output.txt', 'utf8');
+
+            // Extract regression lines
+            const regressions = output.split('\n')
+              .filter(line => line.includes('regressed') || line.includes('change:'))
+              .slice(0, 20)  // Limit to 20 lines
+              .join('\n');
+
+            const body = `## ⚠️ Performance Benchmark Regressions Detected
+
+            The following benchmarks show performance regression compared to the baseline:
+
+            \`\`\`
+            ${regressions || 'See workflow summary for details'}
+            \`\`\`
+
+            > **Note:** This is informational only and does not block the PR. Please review if the regression is expected or needs investigation.
+
+            [View full benchmark results](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      # Upload benchmark results as artifact
+      - name: Upload Benchmark Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            bench_output.txt
+            target/criterion/**/report/index.html
+          retention-days: 30
+
+  # Summary job that always succeeds (so PR can merge)
+  benchmark-summary:
+    name: Benchmark Summary
+    runs-on: ubuntu-latest
+    needs: benchmark
+    # Always run, even if benchmark job "fails" (detected regression)
+    if: always()
+
+    steps:
+      - name: Check Benchmark Status
+        run: |
+          if [ "${{ needs.benchmark.result }}" == "failure" ]; then
+            echo "⚠️ Benchmarks detected performance regressions, but this is non-blocking."
+            echo "Please review the benchmark results in the workflow summary."
+          else
+            echo "✅ Benchmarks completed successfully."
+          fi
