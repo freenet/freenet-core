@@ -129,7 +129,8 @@ jobs:
       - name: Test
         # Limit test threads to reduce resource contention on high-core-count runners
         # Without this, 64+ parallel tests cause timing-sensitive network tests to fail
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8
+        # --nocapture shows logs in real-time instead of buffering until test completion
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8 --nocapture
 
   six_peer_regression:
     name: six-peer-regression

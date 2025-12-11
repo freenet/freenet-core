@@ -812,7 +812,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     } else {
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
-                        tracing::debug!("Transaction timed out: {tx}");
+                        tracing::info!(
+                            tx = %tx,
+                            tx_type = ?tx.transaction_type(),
+                            elapsed_ms = tx.elapsed().as_millis(),
+                            ttl_ms = crate::config::OPERATION_TTL.as_millis(),
+                            "Transaction timed out"
+                        );
 
                         // Check if this is a child operation and propagate timeout to parent
                         if let Some(parent_tx) = sub_op_tracker.get_parent(tx) {
@@ -857,7 +863,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         TransactionType::Update => ops.update.remove(&tx).is_some(),
                     };
                     if removed {
-                        tracing::debug!("Transaction timed out: {tx}");
+                        tracing::info!(
+                            tx = %tx,
+                            tx_type = ?tx.transaction_type(),
+                            elapsed_ms = tx.elapsed().as_millis(),
+                            ttl_ms = crate::config::OPERATION_TTL.as_millis(),
+                            "Transaction timed out"
+                        );
 
                         // Check if this is a child operation and propagate timeout to parent
                         if let Some(parent_tx) = sub_op_tracker.get_parent(tx) {

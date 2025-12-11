@@ -98,7 +98,8 @@ impl Transaction {
         self.id.0.to_le_bytes()
     }
 
-    fn elapsed(&self) -> Duration {
+    /// Returns the elapsed time since this transaction was created.
+    pub fn elapsed(&self) -> Duration {
         let current_unix_epoch_ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("now should be always be later than unix epoch")

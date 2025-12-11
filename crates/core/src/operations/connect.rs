@@ -678,6 +678,11 @@ impl ConnectOp {
                     self.recency.remove(&new_acceptor.peer);
                 }
                 if result.satisfied {
+                    tracing::info!(
+                        tx = %self.id,
+                        elapsed_ms = self.id.elapsed().as_millis(),
+                        "Connect operation completed"
+                    );
                     self.state = Some(ConnectState::Completed);
                 }
                 Some(result)
@@ -975,11 +980,13 @@ impl Operation for ConnectOp {
                                         tracing::info!(
                                             %peer_id,
                                             tx=%self.id,
+                                            elapsed_ms = self.id.elapsed().as_millis(),
                                             "connect joined peer"
                                         );
                                     } else {
                                         tracing::warn!(
                                             tx=%self.id,
+                                            elapsed_ms = self.id.elapsed().as_millis(),
                                             "connect ConnectPeer failed"
                                         );
                                     }

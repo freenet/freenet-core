@@ -341,6 +341,7 @@ impl Operation for PutOp {
                         tracing::info!(
                             tx = %id,
                             %key,
+                            elapsed_ms = id.elapsed().as_millis(),
                             "PUT operation completed successfully"
                         );
 
