@@ -99,6 +99,8 @@ jobs:
       # Enable debug logging for transport and PUT operations to diagnose test failures
       # Also allow info level for test_utils so logger capture tests work
       RUST_LOG: "error,freenet::transport::peer_connection=debug,freenet_core::transport::peer_connection=debug,freenet::test_utils=info,freenet_core::test_utils=info,freenet::operations::put=info,freenet_core::operations::put=info,freenet::node::network_bridge::p2p_protoc=info,freenet_core::node::network_bridge::p2p_protoc=info,connectivity=info"
+      # Use JSON log format for structured, parseable output in CI
+      FREENET_LOG_FORMAT: json
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
