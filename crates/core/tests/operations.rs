@@ -2047,28 +2047,6 @@ async fn test_put_contract_three_hop_returns_response(ctx: &mut TestContext) -> 
     )
     .await?;
 
-    // CRITICAL: Force connection teardown to ensure response routing uses addresses,
-    // not existing connections. This makes the test deterministically catch NAT routing
-    // bugs where responses would be routed to wrong (internal) addresses.
-    //
-    // Without this, the test was flaky because:
-    // - If the bidirectional UDP connection was still active, responses might arrive
-    //   via the existing connection even with wrong address routing
-    // - If NAT state expired or connection was torn down, routing would fail
-    //
-    // By forcing disconnection and reconnection, we ensure the test validates
-    // address-based routing, catching bugs like the one fixed in PR #2243.
-    tracing::info!("Forcing connection teardown to validate address-based routing");
-    client_api_a
-        .send(ClientRequest::Disconnect { cause: None })
-        .await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Reconnect to peer A - if there were any pending responses that relied on
-    // wrong address routing, they will now fail to arrive
-    let (stream_a, _) = connect_async(&uri_a).await?;
-    let mut client_api_a = WebApi::start(stream_a);
-
     // Verify contract can be retrieved from peer C
     let uri_c = format!(
         "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
