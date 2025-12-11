@@ -78,11 +78,12 @@ impl PutOp {
     }
 
     /// Get the next hop address if this operation is in a state that needs to send
-    /// an outbound message. PUT messages from originators are processed locally first
-    /// (to store the contract), then routing is determined in process_message.
-    /// Returns None since PUT doesn't store a pre-determined next hop.
+    /// an outbound message to a downstream peer.
     pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
-        None
+        match &self.state {
+            Some(PutState::AwaitingResponse { next_hop, .. }) => *next_hop,
+            _ => None,
+        }
     }
 }
 
@@ -178,7 +179,7 @@ impl Operation for PutOp {
             // Extract subscribe flag from state (only relevant for originator)
             let subscribe = match &self.state {
                 Some(PutState::PrepareRequest { subscribe, .. }) => *subscribe,
-                Some(PutState::AwaitingResponse { subscribe }) => *subscribe,
+                Some(PutState::AwaitingResponse { subscribe, .. }) => *subscribe,
                 _ => false,
             };
 
@@ -277,7 +278,11 @@ impl Operation for PutOp {
                         };
 
                         // Transition to AwaitingResponse, preserving subscribe flag for originator
-                        let new_state = Some(PutState::AwaitingResponse { subscribe });
+                        // Store next_hop so handle_notification_msg can route the message
+                        let new_state = Some(PutState::AwaitingResponse {
+                            subscribe,
+                            next_hop: Some(next_addr),
+                        });
 
                         Ok(OperationResult {
                             return_msg: Some(NetMessage::from(forward_msg)),
@@ -527,6 +532,8 @@ pub enum PutState {
     AwaitingResponse {
         /// If true, start a subscription after PUT completes (originator only)
         subscribe: bool,
+        /// Next hop address for routing the outbound message
+        next_hop: Option<std::net::SocketAddr>,
     },
     /// Operation completed successfully.
     Finished { key: ContractKey },
@@ -582,9 +589,13 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
 
     // Transition to AwaitingResponse and send the message
     // Note: upstream_addr is None because we're the originator
+    // next_hop is None initially - we process locally first then determine routing
     let new_op = PutOp {
         id,
-        state: Some(PutState::AwaitingResponse { subscribe }),
+        state: Some(PutState::AwaitingResponse {
+            subscribe,
+            next_hop: None,
+        }),
         upstream_addr: None,
     };
 
@@ -747,7 +758,10 @@ mod tests {
 
     #[test]
     fn put_op_not_finalized_when_awaiting_response() {
-        let op = make_put_op(Some(PutState::AwaitingResponse { subscribe: false }));
+        let op = make_put_op(Some(PutState::AwaitingResponse {
+            subscribe: false,
+            next_hop: None,
+        }));
         assert!(
             !op.finalized(),
             "PutOp should not be finalized in AwaitingResponse state"
@@ -777,7 +791,10 @@ mod tests {
 
     #[test]
     fn put_op_to_host_result_error_when_not_finished() {
-        let op = make_put_op(Some(PutState::AwaitingResponse { subscribe: false }));
+        let op = make_put_op(Some(PutState::AwaitingResponse {
+            subscribe: false,
+            next_hop: None,
+        }));
         let result = op.to_host_result();
         assert!(
             result.is_err(),
@@ -809,7 +826,10 @@ mod tests {
 
     #[test]
     fn put_op_is_not_completed_when_in_progress() {
-        let op = make_put_op(Some(PutState::AwaitingResponse { subscribe: false }));
+        let op = make_put_op(Some(PutState::AwaitingResponse {
+            subscribe: false,
+            next_hop: None,
+        }));
         assert!(
             !op.is_completed(),
             "is_completed should return false for AwaitingResponse state"
