@@ -1446,24 +1446,32 @@ impl P2pConnManager {
             .socket_addr()
             .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
 
-        if peer_addr.ip().is_unspecified() {
-            if let Some((existing_addr, _)) = self.connection_entry_by_pub_key(peer.pub_key()) {
-                peer_addr = existing_addr;
-                peer = PeerKeyLocation::new(peer.pub_key().clone(), existing_addr);
+        // IMPORTANT: Always try pub_key lookup first, not just for unspecified addresses.
+        // The peer's advertised address (from PeerKeyLocation) may differ from the actual
+        // TCP connection's remote address stored in self.connections. For example:
+        // - PeerKeyLocation may have the peer's listening port (e.g., 37791)
+        // - self.connections is keyed by the actual TCP source port (ephemeral port)
+        // By looking up via pub_key (populated when we receive the first message from this
+        // peer), we can find the correct connection entry regardless of address mismatch.
+        if let Some((existing_addr, _)) = self.connection_entry_by_pub_key(peer.pub_key()) {
+            if existing_addr != peer_addr {
                 tracing::info!(
                     tx = %tx,
                     remote = %peer,
-                    fallback_addr = %peer_addr,
+                    advertised_addr = %peer_addr,
+                    actual_addr = %existing_addr,
                     transient,
-                    "ConnectPeer provided unspecified address; using existing connection address"
-                );
-            } else {
-                tracing::debug!(
-                    tx = %tx,
-                    transient,
-                    "ConnectPeer received unspecified address without existing connection reference"
+                    "ConnectPeer: using existing connection address (differs from advertised)"
                 );
             }
+            peer_addr = existing_addr;
+            peer = PeerKeyLocation::new(peer.pub_key().clone(), existing_addr);
+        } else if peer_addr.ip().is_unspecified() {
+            tracing::debug!(
+                tx = %tx,
+                transient,
+                "ConnectPeer received unspecified address without existing connection reference"
+            );
         }
 
         tracing::info!(
