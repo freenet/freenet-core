@@ -98,6 +98,10 @@ pub(crate) trait Socket: Sized + Send + Sync + 'static {
         buf: &[u8],
         target: SocketAddr,
     ) -> impl Future<Output = io::Result<usize>> + Send;
+
+    /// Synchronous send for use in blocking contexts (e.g., spawn_blocking).
+    /// For UDP, this typically succeeds immediately since there's no flow control.
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize>;
 }
 
 impl Socket for UdpSocket {
@@ -111,6 +115,12 @@ impl Socket for UdpSocket {
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         self.send_to(buf, target).await
+    }
+
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        // try_send_to is synchronous and for UDP typically succeeds immediately
+        // since UDP doesn't have flow control - it just queues the packet
+        self.try_send_to(buf, target)
     }
 }
 

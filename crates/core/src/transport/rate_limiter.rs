@@ -1,10 +1,9 @@
-use tokio::sync::mpsc;
-
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::fast_channel::FastReceiver;
 use super::Socket;
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 
@@ -14,14 +13,14 @@ pub(super) struct PacketRateLimiter<T: TimeSource> {
     packets: VecDeque<(usize, Instant)>,
     window_size: Duration,
     current_bandwidth: usize,
-    outbound_packets: mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
+    outbound_packets: FastReceiver<(SocketAddr, Arc<[u8]>)>,
     time_source: T,
 }
 
 impl PacketRateLimiter<InstantTimeSrc> {
     pub(super) fn new(
         window_size: Duration,
-        outbound_packets: mpsc::Receiver<(SocketAddr, Arc<[u8]>)>,
+        outbound_packets: FastReceiver<(SocketAddr, Arc<[u8]>)>,
     ) -> Self {
         PacketRateLimiter {
             packets: VecDeque::new(),
@@ -34,23 +33,21 @@ impl PacketRateLimiter<InstantTimeSrc> {
 }
 
 impl<T: TimeSource> PacketRateLimiter<T> {
-    pub(super) async fn rate_limiter<S: Socket>(
-        mut self,
-        bandwidth_limit: Option<usize>,
-        socket: Arc<S>,
-    ) {
-        tracing::info!("Rate limiter task started");
-        while let Some((socket_addr, packet)) = self.outbound_packets.recv().await {
+    /// Run the rate limiter in a blocking context.
+    ///
+    /// This should be called via `tokio::task::spawn_blocking` for optimal performance.
+    /// Uses blocking crossbeam channel recv() for ~3x better throughput than async.
+    pub(super) fn rate_limiter<S: Socket>(mut self, bandwidth_limit: Option<usize>, socket: Arc<S>) {
+        tracing::info!("Rate limiter task started (blocking mode)");
+        while let Ok((socket_addr, packet)) = self.outbound_packets.recv() {
             tracing::debug!(
                 target: "freenet_core::transport::send_debug",
                 dest_addr = %socket_addr,
                 packet_len = packet.len(),
                 "Dequeued packet for sending"
             );
-            // tracing::trace!(%socket_addr, packet_len = %packet.len(), "Sending outbound packet");
             if let Some(bandwidth_limit) = bandwidth_limit {
-                self.rate_limiting(bandwidth_limit, &*socket, packet, socket_addr)
-                    .await;
+                self.rate_limiting(bandwidth_limit, &*socket, packet, socket_addr);
             } else {
                 tracing::debug!(
                     target: "freenet_core::transport::send_debug",
@@ -58,7 +55,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                     packet_len = packet.len(),
                     "Sending packet without bandwidth limit"
                 );
-                match socket.send_to(&packet, socket_addr).await {
+                match socket.send_to_blocking(&packet, socket_addr) {
                     Ok(bytes_sent) => {
                         tracing::debug!(
                             target: "freenet_core::transport::send_debug",
@@ -80,11 +77,11 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 }
             }
         }
-        tracing::debug!("Rate limiter task ended unexpectedly");
+        tracing::debug!("Rate limiter task ended");
     }
 
     #[inline(always)]
-    async fn rate_limiting<S: Socket>(
+    fn rate_limiting<S: Socket>(
         &mut self,
         bandwidth_limit: usize,
         socket: &S,
@@ -92,7 +89,8 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         socket_addr: SocketAddr,
     ) {
         if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
-            tokio::time::sleep(wait_time).await;
+            // Use blocking sleep instead of tokio::time::sleep
+            std::thread::sleep(wait_time);
             tracing::debug!(%socket_addr, "Sending outbound packet after waiting {:?}", wait_time);
 
             tracing::info!(
@@ -103,7 +101,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 "Attempting to send packet (after rate limit wait)"
             );
 
-            match socket.send_to(&packet, socket_addr).await {
+            match socket.send_to_blocking(&packet, socket_addr) {
                 Ok(bytes_sent) => {
                     tracing::info!(
                         target: "freenet_core::transport::send_debug",
@@ -130,7 +128,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 "Attempting to send packet (with rate limit)"
             );
 
-            match socket.send_to(&packet, socket_addr).await {
+            match socket.send_to_blocking(&packet, socket_addr) {
                 Ok(bytes_sent) => {
                     tracing::info!(
                         target: "freenet_core::transport::send_debug",
@@ -212,6 +210,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::fast_channel;
     use crate::util::time_source::MockTimeSource;
 
     fn mock_tracker(window_size: Duration) -> PacketRateLimiter<MockTimeSource> {
@@ -219,7 +218,7 @@ mod tests {
             packets: VecDeque::new(),
             window_size,
             current_bandwidth: 0,
-            outbound_packets: mpsc::channel(1).1,
+            outbound_packets: fast_channel::bounded(1).1,
             time_source: MockTimeSource::new(Instant::now()),
         }
     }
@@ -234,7 +233,8 @@ mod tests {
 
     #[test]
     fn test_adding_packets() {
-        let mut tracker = PacketRateLimiter::new(Duration::from_secs(1), mpsc::channel(1).1);
+        let mut tracker =
+            PacketRateLimiter::new(Duration::from_secs(1), fast_channel::bounded(1).1);
         verify_bandwidth_match(&tracker);
         tracker.add_packet(1500);
         verify_bandwidth_match(&tracker);
@@ -243,7 +243,8 @@ mod tests {
 
     #[test]
     fn test_bandwidth_calculation() {
-        let mut tracker = PacketRateLimiter::new(Duration::from_secs(1), mpsc::channel(1).1);
+        let mut tracker =
+            PacketRateLimiter::new(Duration::from_secs(1), fast_channel::bounded(1).1);
         tracker.add_packet(1500);
         tracker.add_packet(2500);
         verify_bandwidth_match(&tracker);
@@ -280,7 +281,8 @@ mod tests {
 
     #[test]
     fn test_immediate_send() {
-        let mut tracker = PacketRateLimiter::new(Duration::from_millis(10), mpsc::channel(1).1);
+        let mut tracker =
+            PacketRateLimiter::new(Duration::from_millis(10), fast_channel::bounded(1).1);
         tracker.add_packet(3000);
         assert_eq!(tracker.can_send_packet(10000, 2000), None);
     }

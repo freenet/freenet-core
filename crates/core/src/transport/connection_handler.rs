@@ -29,6 +29,7 @@ use version_cmp::PROTOC_VERSION;
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
+    fast_channel::{self, FastSender},
     packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
@@ -170,7 +171,8 @@ impl OutboundConnectionHandler {
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (outbound_sender, outbound_recv) = mpsc::channel(100);
+        // Using fast_channel for high-throughput packet routing
+        let (outbound_sender, outbound_recv) = fast_channel::bounded(100);
         let expected_non_gateway = Arc::new(DashSet::new());
 
         let transport = UdpPacketsListener {
@@ -202,7 +204,10 @@ impl OutboundConnectionHandler {
         // Bandwidth limiting is now only applied to large streaming transfers via send_stream()
         // in RemoteConnection. The bandwidth_limit parameter is still passed to RemoteConnection
         // for this purpose (default: 3 MB/s).
-        task::spawn(bw_tracker.rate_limiter(None, socket));
+        //
+        // The rate limiter runs in a blocking thread via spawn_blocking for ~3x better throughput
+        // than async (using crossbeam's blocking recv() instead of tokio's async recv).
+        task::spawn_blocking(move || bw_tracker.rate_limiter(None, socket));
         task::spawn(RANDOM_U64.scope(
             {
                 let mut rng = StdRng::seed_from_u64(rand::random());
@@ -273,7 +278,7 @@ struct UdpPacketsListener<S = UdpSocket> {
     this_peer_keypair: TransportKeypair,
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
-    outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    outbound_packets: FastSender<(SocketAddr, Arc<[u8]>)>,
     this_addr: SocketAddr,
     dropped_packets: HashMap<SocketAddr, u64>,
     last_drop_warning: Instant,
@@ -282,7 +287,7 @@ struct UdpPacketsListener<S = UdpSocket> {
 }
 
 type OngoingConnection = (
-    mpsc::Sender<PacketData<UnknownEncryption>>,
+    FastSender<PacketData<UnknownEncryption>>,
     oneshot::Sender<Result<RemoteConnection, TransportError>>,
 );
 
@@ -332,7 +337,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection> = BTreeMap::new();
         let mut ongoing_gw_connections: BTreeMap<
             SocketAddr,
-            mpsc::Sender<PacketData<UnknownEncryption>>,
+            FastSender<PacketData<UnknownEncryption>>,
         > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
@@ -367,7 +372,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         self.remote_connections.insert(remote_addr, remote_conn);
                                         continue;
                                     }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                    Err(fast_channel::TrySendError::Full(_)) => {
                                         // Channel full, reinsert connection
                                         self.remote_connections.insert(remote_addr, remote_conn);
 
@@ -396,7 +401,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         // from being sent to RSA decryption handlers
                                         continue;
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    Err(fast_channel::TrySendError::Disconnected(_)) => {
                                         // Channel closed, connection is dead
                                         tracing::warn!(
                                             %remote_addr,
@@ -411,7 +416,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some(inbound_packet_sender) = ongoing_gw_connections.get(&remote_addr) {
                                 match inbound_packet_sender.try_send(packet_data) {
                                     Ok(_) => continue,
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                    Err(fast_channel::TrySendError::Full(_)) => {
                                         // Channel full, drop packet to prevent misrouting
                                         tracing::debug!(
                                             %remote_addr,
@@ -419,7 +424,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         );
                                         continue;
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    Err(fast_channel::TrySendError::Disconnected(_)) => {
                                         // Channel closed, remove the connection
                                         ongoing_gw_connections.remove(&remote_addr);
                                         tracing::debug!(
@@ -432,7 +437,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
-                                if packets_sender.send(packet_data).await.inspect_err(|err| {
+                                if packets_sender.send_async(packet_data).await.inspect_err(|err| {
                                     tracing::warn!(
                                         %remote_addr,
                                         %err,
@@ -658,14 +663,14 @@ impl<S: Socket> UdpPacketsListener<S> {
         inbound_key_bytes: [u8; 16],
     ) -> (
         GatewayConnectionFuture,
-        mpsc::Sender<PacketData<UnknownEncryption>>,
+        FastSender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
         let outbound_packets = self.outbound_packets.clone();
         let bandwidth_limit = self.bandwidth_limit;
 
-        let (inbound_from_remote, mut next_inbound) =
-            mpsc::channel::<PacketData<UnknownEncryption>>(100);
+        let (inbound_from_remote, next_inbound) =
+            fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let f = async move {
             let decrypted_intro_packet =
                 secret.decrypt(remote_intro_packet.data()).map_err(|err| {
@@ -693,7 +698,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             if protoc != PROTOC_VERSION {
                 let packet = SymmetricMessage::ack_error(&outbound_key)?;
                 outbound_packets
-                    .send((remote_addr, packet.prepared_send()))
+                    .send_async((remote_addr, packet.prepared_send()))
                     .await
                     .map_err(|_| TransportError::ChannelClosed)?;
                 return Err(TransportError::ConnectionEstablishmentFailure {
@@ -712,14 +717,14 @@ impl<S: Socket> UdpPacketsListener<S> {
             tracing::debug!(%remote_addr, "Sending outbound ack packet: {:?}", outbound_ack_packet.data());
 
             outbound_packets
-                .send((remote_addr, outbound_ack_packet.clone().prepared_send()))
+                .send_async((remote_addr, outbound_ack_packet.clone().prepared_send()))
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
 
             // wait until the remote sends the ack packet
-            let timeout = tokio::time::timeout(Duration::from_secs(5), next_inbound.recv());
+            let timeout = tokio::time::timeout(Duration::from_secs(5), next_inbound.recv_async());
             match timeout.await {
-                Ok(Some(packet)) => {
+                Ok(Ok(packet)) => {
                     let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
                             tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key: {:?}", packet.data());
                             TransportError::ConnectionEstablishmentFailure {
@@ -727,7 +732,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                         })?;
                 }
-                Ok(None) => {
+                Ok(Err(_)) => {
                     return Err(TransportError::ConnectionEstablishmentFailure {
                         cause: "connection closed".into(),
                     });
@@ -741,7 +746,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
-            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(100);
+            let (inbound_packet_tx, inbound_packet_rx) = fast_channel::bounded(100);
             let remote_conn = RemoteConnection {
                 outbound_packets,
                 outbound_symmetric_key: outbound_key,
@@ -773,7 +778,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         remote_public_key: TransportPublicKey,
     ) -> (
         TraverseNatFuture,
-        mpsc::Sender<PacketData<UnknownEncryption>>,
+        FastSender<PacketData<UnknownEncryption>>,
     ) {
         tracing::debug!(
             %remote_addr,
@@ -822,8 +827,8 @@ impl<S: Socket> UdpPacketsListener<S> {
         let outbound_packets = self.outbound_packets.clone();
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
-        let (inbound_from_remote, mut next_inbound) =
-            mpsc::channel::<PacketData<UnknownEncryption>>(100);
+        let (inbound_from_remote, next_inbound) =
+            fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
         let f = async move {
             tracing::info!(%remote_addr, "Starting outbound handshake (NAT traversal)");
@@ -857,7 +862,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         ConnectionState::StartOutbound => {
                             tracing::debug!(%remote_addr, "sending protocol version and inbound key");
                             outbound_packets
-                                .send((remote_addr, outbound_intro_packet.data().into()))
+                                .send_async((remote_addr, outbound_intro_packet.data().into()))
                                 .await
                                 .map_err(|_| TransportError::ChannelClosed)?;
                             attempts += 1;
@@ -870,7 +875,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 remote_addr,
                             )?;
                             outbound_packets
-                                .send((remote_addr, our_inbound.data().into()))
+                                .send_async((remote_addr, our_inbound.data().into()))
                                 .await
                                 .map_err(|_| TransportError::ChannelClosed)?;
                             sent_tracker.report_sent_packet(
@@ -881,10 +886,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                 }
-                let next_inbound =
-                    tokio::time::timeout(Duration::from_millis(200), next_inbound.recv());
-                match next_inbound.await {
-                    Ok(Some(packet)) => {
+                let next_inbound_result =
+                    tokio::time::timeout(Duration::from_millis(200), next_inbound.recv_async());
+                match next_inbound_result.await {
+                    Ok(Ok(packet)) => {
                         tracing::debug!(%remote_addr, "received packet after sending it");
                         match state {
                             ConnectionState::StartOutbound => {
@@ -923,7 +928,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 })?;
                                             tracing::debug!(%remote_addr, "Sending back ack connection: {:?}", key);
                                             outbound_packets
-                                                .send((
+                                                .send_async((
                                                     remote_addr,
                                                     SymmetricMessage::ack_ok(
                                                         &outbound_sym_key,
@@ -935,7 +940,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 ))
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
-                                            let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                            let (inbound_sender, inbound_recv) = fast_channel::bounded(100);
                                             tracing::debug!(%remote_addr, "connection established");
                                             tracing::info!(%remote_addr, attempts = attempts, "Outbound handshake completed (ack path)");
                                             return Ok((
@@ -1001,7 +1006,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
-                                let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                let (inbound_sender, inbound_recv) = fast_channel::bounded(100);
                                 tracing::info!(%remote_addr, attempts = attempts, "Outbound handshake completed (inbound ack path)");
                                 return Ok((
                                     RemoteConnection {
@@ -1027,7 +1032,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                         }
                     }
-                    Ok(None) => {
+                    Ok(Err(_)) => {
                         tracing::debug!(%this_addr, %remote_addr, "debug: connection closed");
                         return Err(TransportError::ConnectionClosed(remote_addr));
                     }
@@ -1101,7 +1106,7 @@ pub(crate) enum ConnectionEvent {
 }
 
 struct InboundRemoteConnection {
-    inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
+    inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
 }
 
 mod version_cmp {
@@ -1327,6 +1332,10 @@ mod test {
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.send_to_blocking(buf, target)
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
             let packet_idx = self.num_packets_sent.fetch_add(1, Ordering::Release);
             match &self.packet_drop_policy {
                 PacketDropPolicy::ReceiveAll => {}

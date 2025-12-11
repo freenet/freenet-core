@@ -24,6 +24,7 @@
 //! let packet = rx.recv_async().await.unwrap();
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -60,6 +61,8 @@ pub struct FastSender<T> {
     recv_notify: Arc<Notify>,
     /// Notifies senders that space is available (for bounded channels)
     send_notify: Arc<Notify>,
+    /// Tracks if the receiver has been dropped
+    closed: Arc<AtomicBool>,
 }
 
 impl<T> Clone for FastSender<T> {
@@ -68,6 +71,7 @@ impl<T> Clone for FastSender<T> {
             inner: self.inner.clone(),
             recv_notify: self.recv_notify.clone(),
             send_notify: self.send_notify.clone(),
+            closed: self.closed.clone(),
         }
     }
 }
@@ -158,6 +162,12 @@ impl<T> FastSender<T> {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    /// Returns `true` if the receiver has been dropped.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
 }
 
 /// Error returned by `try_send`.
@@ -189,6 +199,17 @@ pub struct FastReceiver<T> {
     recv_notify: Arc<Notify>,
     /// Notifies senders that space is available (for bounded channels)
     send_notify: Arc<Notify>,
+    /// Tracks if the receiver has been dropped (shared with senders for is_closed())
+    closed: Arc<AtomicBool>,
+}
+
+impl<T> Drop for FastReceiver<T> {
+    fn drop(&mut self) {
+        // Mark channel as closed so senders can detect it via is_closed()
+        self.closed.store(true, Ordering::Release);
+        // Wake any senders waiting on backpressure so they can detect disconnection
+        self.send_notify.notify_waiters();
+    }
 }
 
 impl<T> FastReceiver<T> {
@@ -288,17 +309,20 @@ pub fn bounded<T>(capacity: usize) -> (FastSender<T>, FastReceiver<T>) {
     let (tx, rx) = crossbeam::channel::bounded(capacity);
     let recv_notify = Arc::new(Notify::new());
     let send_notify = Arc::new(Notify::new());
+    let closed = Arc::new(AtomicBool::new(false));
 
     let sender = FastSender {
         inner: tx,
         recv_notify: recv_notify.clone(),
         send_notify: send_notify.clone(),
+        closed: closed.clone(),
     };
 
     let receiver = FastReceiver {
         inner: rx,
         recv_notify,
         send_notify,
+        closed,
     };
 
     (sender, receiver)
@@ -322,17 +346,20 @@ pub fn unbounded<T>() -> (FastSender<T>, FastReceiver<T>) {
     let (tx, rx) = crossbeam::channel::unbounded();
     let recv_notify = Arc::new(Notify::new());
     let send_notify = Arc::new(Notify::new());
+    let closed = Arc::new(AtomicBool::new(false));
 
     let sender = FastSender {
         inner: tx,
         recv_notify: recv_notify.clone(),
         send_notify: send_notify.clone(),
+        closed: closed.clone(),
     };
 
     let receiver = FastReceiver {
         inner: rx,
         recv_notify,
         send_notify,
+        closed,
     };
 
     (sender, receiver)
