@@ -324,6 +324,13 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     let mut last_snapshot = (String::new(), String::new(), String::new());
 
     for attempt in 1..=MAX_RETRIES {
+        // Use println! for first 5 attempts to ensure visibility in CI stdout
+        if attempt <= 5 {
+            println!(
+                "Attempt {}/{}: Querying all nodes for connected peers...",
+                attempt, MAX_RETRIES
+            );
+        }
         tracing::info!(
             "Attempt {}/{}: Querying all nodes for connected peers...",
             attempt,
@@ -361,6 +368,15 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
             Err(e) => bail!("Error receiving peer2 response: {}", e),
         };
 
+        // Use println! for first 5 attempts to ensure visibility in CI stdout
+        if attempt <= 5 {
+            println!(
+                "  - Gateway has {} connections, Peer1 has {}, Peer2 has {}",
+                gw_peers.len(),
+                peer1_peers.len(),
+                peer2_peers.len()
+            );
+        }
         tracing::info!("  - Gateway has {} connections", gw_peers.len());
         tracing::info!("  - Peer1 has {} connections", peer1_peers.len());
         tracing::info!("  - Peer2 has {} connections", peer2_peers.len());
