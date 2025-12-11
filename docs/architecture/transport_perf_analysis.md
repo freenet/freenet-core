@@ -645,6 +645,11 @@ criterion_main!(benches);
 
 # Run full pipeline experiments
 ./scripts/run_benchmarks.sh experimental_combined
+
+# Or run directly with cargo (requires bench feature):
+cargo bench --bench transport_perf --features bench -- experimental_packet
+cargo bench --bench transport_perf --features bench -- experimental_tokio
+cargo bench --bench transport_perf --features bench -- experimental_combined
 ```
 
 ---
@@ -760,10 +765,13 @@ This means:
 # Run full size×batch matrix
 ./scripts/run_benchmarks.sh experimental_size_batch
 
-# Individual benchmark groups
-cargo bench --bench transport_perf -- experimental_size_batch_matrix
-cargo bench --bench transport_perf -- experimental_batch_improvement
-cargo bench --bench transport_perf -- experimental_throughput_ceiling
+# Individual benchmark groups (requires bench feature)
+cargo bench --bench transport_perf --features bench -- experimental_size_batch_matrix
+cargo bench --bench transport_perf --features bench -- experimental_batch_improvement
+cargo bench --bench transport_perf --features bench -- experimental_throughput_ceiling
+
+# NEW: Blackbox transport benchmarks (actual transport code with mock I/O)
+cargo bench --bench transport_perf --features bench -- blackbox
 ```
 
 ---

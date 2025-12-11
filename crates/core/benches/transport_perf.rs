@@ -2313,6 +2313,213 @@ mod experimental_size_batch_interaction {
 }
 
 // =============================================================================
+// Transport Layer Benchmarks (Blackbox)
+// =============================================================================
+//
+// These benchmarks test the actual Freenet transport code (PeerConnection,
+// connection_handler, fast_channel, encryption) with mock sockets instead
+// of real UDP. This tests the real code path without kernel syscall overhead.
+//
+// This is the primary CI benchmark group for detecting transport layer regressions.
+//
+// What's measured:
+// - Message throughput: Full pipeline (serialize → encrypt → channel → decrypt)
+// - fast_channel: Crossbeam-based channel vs tokio::sync::mpsc
+// - Connection establishment: Full handshake timing
+
+mod transport_blackbox {
+    use super::*;
+    use dashmap::DashMap;
+    use freenet::transport::mock_transport::{create_mock_peer, Channels, PacketDropPolicy};
+    use std::sync::Arc;
+
+    /// Benchmark connection establishment between two mock peers.
+    ///
+    /// This measures the full handshake: key exchange, encryption setup, etc.
+    pub fn bench_connection_establishment(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("transport/connection");
+
+        group.bench_function("establish", |b| {
+            b.to_async(&rt).iter_batched(
+                || {
+                    // Setup: create channel map for this iteration
+                    Arc::new(DashMap::new()) as Channels
+                },
+                |channels| async move {
+                    // Create two peers
+                    let (peer_a_pub, mut peer_a, peer_a_addr) =
+                        create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
+                            .await
+                            .unwrap();
+                    let (peer_b_pub, mut peer_b, peer_b_addr) =
+                        create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
+                            .await
+                            .unwrap();
+
+                    // Establish connection from both sides (NAT traversal style)
+                    // connect() is async fn returning Pin<Box<dyn Future<...>>>, so two levels of await
+                    let (conn_a_inner, conn_b_inner) = futures::join!(
+                        peer_a.connect(peer_b_pub, peer_b_addr),
+                        peer_b.connect(peer_a_pub, peer_a_addr),
+                    );
+                    let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+
+                    std_black_box((conn_a.unwrap(), conn_b.unwrap()));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.finish();
+    }
+
+    /// Benchmark message throughput between two connected mock peers.
+    ///
+    /// This measures the full pipeline: serialize → encrypt → channel → decrypt → deserialize
+    /// Note: Each iteration includes connection setup for proper benchmark isolation.
+    pub fn bench_message_throughput(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("transport/throughput");
+
+        // Test different message sizes
+        for &size in &[64, 256, 1024, 1364] {
+            group.throughput(Throughput::Bytes(size as u64));
+
+            group.bench_with_input(BenchmarkId::new("bytes", size), &size, |b, &sz| {
+                b.to_async(&rt).iter_batched(
+                    || {
+                        // Setup: Create fresh connected peers for each batch
+                        let message = vec![0xABu8; sz];
+                        (Arc::new(DashMap::new()) as Channels, message)
+                    },
+                    |(channels, message)| async move {
+                        // Create peers
+                        let (peer_a_pub, mut peer_a, peer_a_addr) =
+                            create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
+                                .await
+                                .unwrap();
+                        let (peer_b_pub, mut peer_b, peer_b_addr) =
+                            create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
+                                .await
+                                .unwrap();
+
+                        // Connect
+                        let (conn_a_inner, conn_b_inner) = futures::join!(
+                            peer_a.connect(peer_b_pub, peer_b_addr),
+                            peer_b.connect(peer_a_pub, peer_a_addr),
+                        );
+                        let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+                        let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+
+                        // Send and receive message (this is what we're measuring)
+                        conn_a.send(message).await.unwrap();
+                        let received: Vec<u8> = conn_b.recv().await.unwrap();
+                        std_black_box(received);
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+
+        group.finish();
+    }
+
+    /// Benchmark fast_channel throughput in isolation (our crossbeam-based channel).
+    ///
+    /// This directly benchmarks the channel implementation used in the transport layer.
+    pub fn bench_fast_channel(c: &mut Criterion) {
+        use freenet::transport::fast_channel;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("transport/fast_channel");
+        group.throughput(Throughput::Elements(1000));
+
+        let packet: Arc<[u8]> = vec![0u8; 1492].into();
+
+        // Benchmark our fast_channel implementation
+        group.bench_function("bounded_1000", |b| {
+            let packet = packet.clone();
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (tx, rx) = fast_channel::bounded::<Arc<[u8]>>(1000);
+                    (tx, rx, packet.clone())
+                },
+                |(tx, rx, packet)| async move {
+                    let receiver = tokio::spawn(async move {
+                        let mut count = 0;
+                        while rx.recv_async().await.is_ok() {
+                            count += 1;
+                            if count >= 1000 {
+                                break;
+                            }
+                        }
+                        count
+                    });
+
+                    for _ in 0..1000 {
+                        tx.send_async(packet.clone()).await.unwrap();
+                    }
+
+                    let count = receiver.await.unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // Compare with tokio::sync::mpsc for reference
+        group.bench_function("tokio_mpsc_1000", |b| {
+            use tokio::sync::mpsc;
+            let packet = packet.clone();
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (tx, rx) = mpsc::channel::<Arc<[u8]>>(1000);
+                    (tx, rx, packet.clone())
+                },
+                |(tx, mut rx, packet)| async move {
+                    let receiver = tokio::spawn(async move {
+                        let mut count = 0;
+                        while rx.recv().await.is_some() {
+                            count += 1;
+                            if count >= 1000 {
+                                break;
+                            }
+                        }
+                        count
+                    });
+
+                    for _ in 0..1000 {
+                        tx.send(packet.clone()).await.unwrap();
+                    }
+
+                    let count = receiver.await.unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.finish();
+    }
+}
+
+// =============================================================================
 // Criterion Groups - Organized by noise level
 // =============================================================================
 
@@ -2368,91 +2575,34 @@ criterion_group!(
         level3_stress::bench_max_send_rate,
 );
 
+// Transport layer benchmarks - uses actual transport code with mock I/O
+// This is the primary CI benchmark group for regression detection.
 criterion_group!(
-    name = experimental_packet;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(5))
-        .noise_threshold(0.10)
-        .significance_level(0.05);
-    targets =
-        experimental_packet_size::bench_packet_size_throughput,
-        experimental_packet_size::bench_syscall_overhead_vs_size,
-        experimental_packet_size::bench_roundtrip_by_size,
-);
-
-criterion_group!(
-    name = experimental_tokio;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(5))
-        .noise_threshold(0.10)
-        .significance_level(0.05);
-    targets =
-        experimental_tokio_overhead::bench_channel_comparison,
-        experimental_tokio_overhead::bench_socket_overhead,
-        experimental_tokio_overhead::bench_threading_model,
-);
-
-criterion_group!(
-    name = experimental_combined;
+    name = transport;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(10))
-        .sample_size(20)
-        .noise_threshold(0.15);
-    targets =
-        experimental_combined::bench_full_pipeline_by_size,
-);
-
-criterion_group!(
-    name = experimental_batching;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(5))
-        .noise_threshold(0.10)
+        .noise_threshold(0.10)  // 10% - some async variance expected
         .significance_level(0.05);
     targets =
-        experimental_syscall_batching::bench_sendmmsg_vs_single,
-        experimental_syscall_batching::bench_tokio_with_sendmmsg,
-        experimental_syscall_batching::bench_syscall_reduction,
+        transport_blackbox::bench_connection_establishment,
+        transport_blackbox::bench_message_throughput,
+        transport_blackbox::bench_fast_channel,
 );
 
-criterion_group!(
-    name = experimental_true_syscall;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(5))
-        .noise_threshold(0.10)
-        .significance_level(0.05);
-    targets =
-        experimental_true_sendmmsg::bench_true_sendmmsg,
-        experimental_true_sendmmsg::bench_sendmmsg_throughput,
-        experimental_true_sendmmsg::bench_tokio_sendmmsg_integration,
-);
+// Benchmark groups
+//
+// CI benchmarks (run on every PR):
+// - transport: Full transport pipeline with mock sockets - actual code path testing
+//
+// Additional benchmarks (run locally or on-demand):
+// - level0: Pure logic benchmarks (crypto, serialization) - deterministic, <2% noise
+// - level1: Mock I/O benchmarks (channel throughput, routing) - ~5% noise from async
+// - level2: Loopback socket benchmarks (UDP syscalls) - ~10% noise from kernel
+// - level3: Stress tests (max send rate) - ~15% noise, high variance expected
+criterion_main!(transport, level0, level1, level2, level3);
 
-criterion_group!(
-    name = experimental_size_batch;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(5))
-        .noise_threshold(0.10)
-        .significance_level(0.05);
-    targets =
-        experimental_size_batch_interaction::bench_size_batch_matrix,
-        experimental_size_batch_interaction::bench_batching_improvement_by_size,
-        experimental_size_batch_interaction::bench_throughput_ceiling,
-);
-
-criterion_main!(
-    level0,
-    level1,
-    level2,
-    level3,
-    experimental_packet,
-    experimental_tokio,
-    experimental_combined,
-    experimental_batching,
-    experimental_true_syscall,
-    experimental_size_batch
-);
+// Note: Experimental benchmarks (packet size, tokio overhead, syscall batching, sendmmsg)
+// have been moved to benches/transport_perf_experimental.rs
+// These are for local investigation and optimization research, NOT run in CI.
+// Run with: cargo bench --bench transport_perf_experimental

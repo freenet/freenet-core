@@ -1,27 +1,42 @@
-// Allow dead_code since this module is exposed for benchmarking and future use
-#![allow(dead_code)]
-
 //! High-performance bounded channel implementation for transport layer.
 //!
 //! This module provides a hybrid channel that combines:
-//! - **crossbeam::channel** for fast, lock-free message passing (~4.4x faster than tokio::sync::mpsc)
+//! - **crossbeam::channel** for fast, lock-free message passing (~2x faster than tokio::sync::mpsc)
 //! - **tokio::sync::Notify** for async/await integration
 //!
 //! # Performance
 //!
-//! Benchmarks show tokio::sync::mpsc achieves ~2.24 Melem/s while crossbeam achieves ~9.98 Melem/s.
-//! This hybrid approach captures most of crossbeam's performance while maintaining tokio compatibility.
+//! Benchmarks with 1M iterations of 1400-byte packets show:
+//!
+//! | Channel Type              | Throughput   |
+//! |---------------------------|--------------|
+//! | Crossbeam bounded(1000)   | ~2.88 Melem/s |
+//! | Crossbeam bounded(100)    | ~2.49 Melem/s |
+//! | Crossbeam unbounded       | ~2.84 Melem/s |
+//! | Tokio MPSC (1000)         | ~1.33 Melem/s |
+//!
+//! # Design Decisions
+//!
+//! **Why bounded channels?**
+//! - Unbounded channels risk OOM if sender outpaces receiver
+//! - Bounded channels provide backpressure with negligible performance penalty (~1% vs unbounded)
+//! - Ring buffer in bounded channels has slightly better cache locality
+//!
+//! **Why capacity 1000?**
+//! - Sweet spot between throughput (larger = less contention) and memory usage
+//! - ~15% better throughput than capacity 100
+//! - ~1.4MB memory footprint per channel (1000 × 1400 byte packets)
 //!
 //! # Usage
 //!
 //! ```ignore
 //! let (tx, rx) = fast_channel::bounded::<Packet>(1000);
 //!
-//! // Sync send (fastest, blocks if full)
-//! tx.send(packet).unwrap();
-//!
 //! // Async send (yields if full)
 //! tx.send_async(packet).await.unwrap();
+//!
+//! // Non-blocking try_send
+//! tx.try_send(packet)?;
 //!
 //! // Async receive
 //! let packet = rx.recv_async().await.unwrap();
@@ -97,9 +112,11 @@ impl<T> Clone for FastSender<T> {
 }
 
 impl<T> FastSender<T> {
-    /// Sends a message synchronously.
+    /// Sends a message synchronously (blocking).
     ///
     /// For bounded channels, this blocks if the channel is full.
+    /// Prefer `send_async` in async contexts.
+    #[cfg(test)]
     #[inline]
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
         match self.inner.send(msg) {
@@ -146,22 +163,11 @@ impl<T> FastSender<T> {
         }
     }
 
-    /// Returns `true` if the channel is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
     /// Returns `true` if the channel is full.
+    #[cfg(test)]
     #[inline]
     pub fn is_full(&self) -> bool {
         self.inner.is_full()
-    }
-
-    /// Returns the number of messages in the channel.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.inner.len()
     }
 
     /// Returns `true` if the receiver has been dropped.
@@ -225,18 +231,6 @@ impl<T> FastReceiver<T> {
             Err(crossbeam::channel::RecvError) => Err(RecvError),
         }
     }
-
-    /// Returns `true` if the channel is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Returns the number of messages in the channel.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
 }
 
 /// Creates a bounded fast channel with the given capacity.
@@ -248,7 +242,7 @@ impl<T> FastReceiver<T> {
 ///
 /// ```ignore
 /// let (tx, rx) = fast_channel::bounded::<i32>(1000);
-/// tx.send(42).unwrap();
+/// tx.send_async(42).await.unwrap();
 /// assert_eq!(rx.recv_async().await.unwrap(), 42);
 /// ```
 pub fn bounded<T>(capacity: usize) -> (FastSender<T>, FastReceiver<T>) {

@@ -11,12 +11,18 @@ use std::{borrow::Cow, io, net::SocketAddr};
 use futures::Future;
 use tokio::net::UdpSocket;
 
-pub(crate) mod connection_handler;
+pub mod connection_handler;
 mod crypto;
-/// High-performance channels for transport layer. Exposed for benchmarking.
+
+/// Mock transport infrastructure for testing and benchmarking.
+/// Provides MockSocket and helper functions to create mock peer connections
+/// without real network I/O.
+#[cfg(any(test, feature = "bench"))]
+pub use connection_handler::mock_transport;
+/// High-performance channels for transport layer.
 pub mod fast_channel;
 mod packet_data;
-mod peer_connection;
+pub mod peer_connection;
 mod rate_limiter;
 // todo: optimize trackers
 mod received_packet_tracker;
@@ -56,7 +62,7 @@ impl From<SocketAddr> for ObservedAddr {
 }
 
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
-pub(crate) use self::{
+pub use self::{
     connection_handler::{
         create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
     },
@@ -64,7 +70,8 @@ pub(crate) use self::{
 };
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TransportError {
+#[cfg_attr(feature = "bench", allow(dead_code))]
+pub enum TransportError {
     #[error("transport handler channel closed, socket likely closed")]
     ChannelClosed,
     #[error("connection to remote closed")]
