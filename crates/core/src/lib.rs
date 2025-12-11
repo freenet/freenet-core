@@ -43,6 +43,13 @@ pub mod tracing;
 
 /// Code for communicating with other peers over UDP, handles hole-punching, error handling, etc.
 mod transport;
+
+/// Re-export transport internals for benchmarks
+#[doc(hidden)]
+pub mod transport_bench {
+    pub use super::transport::fast_channel;
+}
+
 pub mod util;
 
 /// WASM code execution runtime, tailored for the contract and delegate APIs.

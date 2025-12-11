@@ -13,6 +13,8 @@ use tokio::net::UdpSocket;
 
 pub(crate) mod connection_handler;
 mod crypto;
+/// High-performance channels for transport layer. Exposed for benchmarking.
+pub mod fast_channel;
 mod packet_data;
 mod peer_connection;
 mod rate_limiter;

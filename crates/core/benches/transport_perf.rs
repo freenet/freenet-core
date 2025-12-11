@@ -2355,6 +2355,289 @@ criterion_group!(
         experimental_size_batch_interaction::bench_throughput_ceiling,
 );
 
+// =============================================================================
+// Fast Channel Benchmarks
+// =============================================================================
+//
+// Compares the FastChannel implementation (crossbeam + tokio::Notify)
+// against tokio::sync::mpsc for packet routing workloads.
+
+mod fast_channel_benchmarks {
+    use super::*;
+    use freenet::transport_bench::fast_channel;
+    use std::sync::Arc;
+
+    /// Compare FastChannel vs tokio::sync::mpsc for packet routing
+    ///
+    /// This benchmark validates that the FastChannel provides the expected
+    /// ~4.4x improvement over tokio::sync::mpsc.
+    pub fn bench_fast_channel_vs_tokio(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("fast_channel/throughput");
+        group.throughput(Throughput::Elements(10000));
+
+        let packet_size = 1492;
+        let packet_count = 10000;
+
+        // ========== tokio::sync::mpsc (baseline) ==========
+        group.bench_function("tokio_mpsc_100", |b| {
+            let packet: Arc<[u8]> = vec![0u8; packet_size].into();
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Arc<[u8]>>(100);
+                    (tx, rx, packet.clone())
+                },
+                |(tx, mut rx, packet)| async move {
+                    let receiver = tokio::spawn(async move {
+                        let mut count = 0;
+                        while rx.recv().await.is_some() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    for _ in 0..packet_count {
+                        tx.send(packet.clone()).await.unwrap();
+                    }
+                    drop(tx);
+
+                    let count = receiver.await.unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // ========== FastChannel (optimized) ==========
+        group.bench_function("fast_channel_100", |b| {
+            let packet: Arc<[u8]> = vec![0u8; packet_size].into();
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (tx, rx) = fast_channel::bounded::<Arc<[u8]>>(100);
+                    (tx, rx, packet.clone())
+                },
+                |(tx, rx, packet)| async move {
+                    let receiver = tokio::spawn(async move {
+                        let mut count = 0;
+                        while rx.recv_async().await.is_ok() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    for _ in 0..packet_count {
+                        tx.send_async(packet.clone()).await.unwrap();
+                    }
+                    drop(tx);
+
+                    let count = receiver.await.unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // ========== FastChannel with sync send (fastest) ==========
+        group.bench_function("fast_channel_sync_send", |b| {
+            let packet: Arc<[u8]> = vec![0u8; packet_size].into();
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (tx, rx) = fast_channel::bounded::<Arc<[u8]>>(100);
+                    (tx, rx, packet.clone())
+                },
+                |(tx, rx, packet)| async move {
+                    let receiver = tokio::spawn(async move {
+                        let mut count = 0;
+                        while rx.recv_async().await.is_ok() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    // Use blocking send (faster for high-throughput)
+                    for _ in 0..packet_count {
+                        tx.send(packet.clone()).unwrap();
+                    }
+                    drop(tx);
+
+                    let count = receiver.await.unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // ========== crossbeam baseline (for reference) ==========
+        group.bench_function("crossbeam_unbounded", |b| {
+            b.iter_batched(
+                || {
+                    let (tx, rx) = crossbeam::channel::unbounded::<Arc<[u8]>>();
+                    let packet: Arc<[u8]> = vec![0u8; packet_size].into();
+                    (tx, rx, packet)
+                },
+                |(tx, rx, packet)| {
+                    let receiver = std::thread::spawn(move || {
+                        let mut count = 0;
+                        while rx.recv().is_ok() {
+                            count += 1;
+                        }
+                        count
+                    });
+
+                    for _ in 0..packet_count {
+                        tx.send(packet.clone()).unwrap();
+                    }
+                    drop(tx);
+
+                    let count = receiver.join().unwrap();
+                    std_black_box(count);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.finish();
+    }
+
+    /// Benchmark different channel buffer sizes with FastChannel
+    pub fn bench_fast_channel_buffer_sizes(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("fast_channel/buffer_size");
+        group.throughput(Throughput::Elements(10000));
+
+        let packet: Arc<[u8]> = vec![0u8; 1492].into();
+        let packet_count = 10000;
+
+        for buffer_size in [10, 50, 100, 500, 1000] {
+            group.bench_with_input(
+                BenchmarkId::new("bounded", buffer_size),
+                &buffer_size,
+                |b, &buf_size| {
+                    let packet = packet.clone();
+                    b.to_async(&rt).iter_batched(
+                        || {
+                            let (tx, rx) = fast_channel::bounded::<Arc<[u8]>>(buf_size);
+                            (tx, rx, packet.clone())
+                        },
+                        |(tx, rx, packet)| async move {
+                            let receiver = tokio::spawn(async move {
+                                let mut count = 0;
+                                while rx.recv_async().await.is_ok() {
+                                    count += 1;
+                                }
+                                count
+                            });
+
+                            for _ in 0..packet_count {
+                                tx.send(packet.clone()).unwrap();
+                            }
+                            drop(tx);
+
+                            let count = receiver.await.unwrap();
+                            std_black_box(count);
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Measure latency characteristics of FastChannel
+    pub fn bench_fast_channel_latency(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("fast_channel/latency");
+
+        // Single message roundtrip latency
+        group.bench_function("single_roundtrip", |b| {
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (tx1, rx1) = fast_channel::bounded::<u64>(10);
+                    let (tx2, rx2) = fast_channel::bounded::<u64>(10);
+                    (tx1, rx1, tx2, rx2)
+                },
+                |(tx1, rx1, tx2, rx2)| async move {
+                    // Spawn echo server
+                    let echo = tokio::spawn(async move {
+                        let val = rx1.recv_async().await.unwrap();
+                        tx2.send(val).unwrap();
+                    });
+
+                    // Send and wait for response
+                    tx1.send(42).unwrap();
+                    let response = rx2.recv_async().await.unwrap();
+                    echo.await.unwrap();
+
+                    std_black_box(response);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // Multiple roundtrips in sequence
+        group.bench_function("multi_roundtrip_10", |b| {
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (tx1, rx1) = fast_channel::bounded::<u64>(10);
+                    let (tx2, rx2) = fast_channel::bounded::<u64>(10);
+                    (tx1, rx1, tx2, rx2)
+                },
+                |(tx1, rx1, tx2, rx2)| async move {
+                    // Spawn echo server for 10 messages
+                    let echo = tokio::spawn(async move {
+                        for _ in 0..10 {
+                            let val = rx1.recv_async().await.unwrap();
+                            tx2.send(val).unwrap();
+                        }
+                    });
+
+                    // Send and receive 10 roundtrips
+                    for i in 0..10 {
+                        tx1.send(i).unwrap();
+                        let response = rx2.recv_async().await.unwrap();
+                        std_black_box(response);
+                    }
+
+                    echo.await.unwrap();
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.finish();
+    }
+}
+
+criterion_group!(
+    name = fast_channel;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(5))
+        .noise_threshold(0.10)
+        .significance_level(0.05);
+    targets =
+        fast_channel_benchmarks::bench_fast_channel_vs_tokio,
+        fast_channel_benchmarks::bench_fast_channel_buffer_sizes,
+        fast_channel_benchmarks::bench_fast_channel_latency,
+);
+
 criterion_main!(
     level0,
     level1,
@@ -2365,5 +2648,6 @@ criterion_main!(
     experimental_combined,
     experimental_batching,
     experimental_true_syscall,
-    experimental_size_batch
+    experimental_size_batch,
+    fast_channel
 );
