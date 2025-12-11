@@ -128,7 +128,7 @@ jobs:
 
   six_peer_regression:
     name: six-peer-regression
-    needs: fmt_check  # Run in parallel with test_all (both need self-hosted runner)
+    needs: test_all  # Run after Test to avoid resource contention on self-hosted runner
     runs-on: self-hosted
     timeout-minutes: 30
 
