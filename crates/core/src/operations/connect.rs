@@ -671,12 +671,21 @@ impl ConnectOp {
                 tracing::info!(
                     acceptor_pub_key = %response.acceptor.pub_key(),
                     acceptor_loc = ?response.acceptor.location(),
+                    target_connections = state.target_connections,
+                    accepted_count = state.accepted.len(),
                     "connect: joiner received ConnectResponse"
                 );
                 let result = state.register_acceptance(response, now);
                 if let Some(new_acceptor) = &result.new_acceptor {
                     self.recency.remove(&new_acceptor.peer);
                 }
+                tracing::info!(
+                    tx = %self.id,
+                    satisfied = result.satisfied,
+                    accepted_count = state.accepted.len(),
+                    target_connections = state.target_connections,
+                    "connect: register_acceptance result"
+                );
                 if result.satisfied {
                     tracing::info!(
                         tx = %self.id,
