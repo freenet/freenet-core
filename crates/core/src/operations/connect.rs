@@ -1178,7 +1178,13 @@ pub(crate) async fn join_ring_request(
         op.backoff = Some(backoff);
     }
 
-    tracing::info!(gateway = %gateway.pub_key(), tx = %tx, "Attempting network join using connect");
+    tracing::info!(
+        gateway = %gateway.pub_key(),
+        tx = %tx,
+        target_connections,
+        ttl,
+        "Attempting network join using connect"
+    );
 
     op_manager
         .notify_op_change(
