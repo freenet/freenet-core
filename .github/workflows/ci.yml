@@ -130,7 +130,7 @@ jobs:
 
   six_peer_regression:
     name: six-peer-regression
-    needs: test_all
+    needs: test_all  # Run after Test to avoid resource contention on self-hosted runner
     runs-on: self-hosted
     timeout-minutes: 30
 
