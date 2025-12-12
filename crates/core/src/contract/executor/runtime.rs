@@ -1,8 +1,8 @@
 use super::*;
 use super::{
-    ContractExecutor, ContractInitState, ContractRequest, ContractResponse, ExecutorError,
-    ExecutorHalve, ExecutorToEventLoopChannel, QueuedOperation, RequestError, Response,
-    StateStoreError,
+    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
+    ExecutorToEventLoopChannel, InitCheckResult, RequestError, Response, StateStoreError,
+    SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
 };
 
 impl ContractExecutor for Executor<Runtime> {
@@ -40,42 +40,43 @@ impl ContractExecutor for Executor<Runtime> {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
+        // Opportunistically clean up any stale initializations to prevent resource leaks
+        let stale = self
+            .init_tracker
+            .cleanup_stale_initializations(STALE_INIT_THRESHOLD);
+        for info in stale {
+            tracing::warn!(
+                contract = %info.key,
+                age_secs = info.age.as_secs(),
+                dropped_ops = info.dropped_ops,
+                "Cleaned up stale contract initialization (possible bug or timeout)"
+            );
+        }
+
         // Check if this contract is currently being initialized
-        if let Some(ContractInitState::Initializing { .. }) = self.contract_init_state.get(&key) {
-            // If we're trying to PUT while already initializing, that's an error
-            if code.is_some() {
+        match self.init_tracker.check_and_maybe_queue(
+            &key,
+            code.is_some(),
+            update.clone(),
+            related_contracts.clone(),
+        ) {
+            InitCheckResult::NotInitializing => {
+                // Continue with normal processing below
+            }
+            InitCheckResult::PutDuringInit => {
                 return Err(ExecutorError::request(StdContractError::Put {
                     key,
                     cause: "contract is already being initialized".into(),
                 }));
             }
-
-            // This is an UPDATE arriving during initialization - queue it
-            tracing::info!(
-                contract = %key,
-                "Operation arrived during contract initialization - queueing for later processing"
-            );
-
-            if let Some(ContractInitState::Initializing {
-                ref mut queued_ops, ..
-            }) = self.contract_init_state.get_mut(&key)
-            {
-                queued_ops.push(QueuedOperation {
-                    update: update.clone(),
-                    related_contracts: related_contracts.clone(),
-                    queued_at: std::time::Instant::now(),
-                });
-
-                // Return a placeholder response indicating the operation is queued
-                // The caller should retry later once initialization is complete
-                tracing::debug!(
+            InitCheckResult::Queued { queue_size } => {
+                tracing::info!(
                     contract = %key,
-                    queued_count = queued_ops.len(),
-                    "Operation queued, initialization still in progress"
+                    queue_size,
+                    "Operation queued during contract initialization"
                 );
-
-                // For now, return NoChange to indicate the operation didn't fail but also didn't complete
-                // In the future, we might want a specific QueuedResult variant
+                // Return NoChange to indicate the operation didn't fail but also didn't complete
+                // The caller should retry later once initialization is complete
                 return Ok(UpsertResult::NoChange);
             }
         }
@@ -85,7 +86,8 @@ impl ContractExecutor for Executor<Runtime> {
                 contract = %key,
                 state_size = state.as_ref().len(),
                 state_hash = %hash,
-                "upserting contract state"
+                phase = "upsert_start",
+                "Upserting contract state"
             );
         }
         let params = if let Some(code) = &code {
@@ -119,7 +121,11 @@ impl ContractExecutor for Executor<Runtime> {
             .is_none()
         {
             if let Some(ref contract_code) = code {
-                tracing::debug!("Storing new contract - key={}", key);
+                tracing::debug!(
+                    contract = %key,
+                    phase = "store_contract",
+                    "Storing new contract"
+                );
 
                 self.runtime
                     .contract_store
@@ -143,14 +149,7 @@ impl ContractExecutor for Executor<Runtime> {
                 contract = %key,
                 "Starting contract initialization - queueing subsequent operations"
             );
-
-            self.contract_init_state.insert(
-                key,
-                ContractInitState::Initializing {
-                    queued_ops: Vec::new(),
-                    started_at: std::time::Instant::now(),
-                },
-            );
+            self.init_tracker.start_initialization(key);
         }
 
         let mut updates = match update {
@@ -166,11 +165,19 @@ impl ContractExecutor for Executor<Runtime> {
                     })?;
                 match result {
                     ValidateResult::Valid => {
-                        tracing::debug!("The incoming state is valid");
+                        tracing::debug!(
+                            contract = %key,
+                            phase = "validation_complete",
+                            "Incoming state is valid"
+                        );
 
                         // If the contract is new, we store the incoming state as the initial state avoiding the update
                         if is_new_contract {
-                            tracing::debug!("Contract is new, storing initial state");
+                            tracing::debug!(
+                                contract = %key,
+                                phase = "store_initial_state",
+                                "Contract is new, storing initial state"
+                            );
                             let state_to_store = incoming_state.clone();
                             self.state_store
                                 .store(key, state_to_store, params.clone())
@@ -178,26 +185,29 @@ impl ContractExecutor for Executor<Runtime> {
                                 .map_err(ExecutorError::other)?;
 
                             // Contract initialization complete - mark as ready and get queued ops
-                            let queued_ops = if let Some(ContractInitState::Initializing {
-                                queued_ops,
-                                started_at,
-                            }) = self.contract_init_state.remove(&key)
+                            if let Some(completion_info) =
+                                self.init_tracker.complete_initialization(&key)
                             {
-                                let init_duration = started_at.elapsed();
-                                tracing::info!(
-                                    contract = %key,
-                                    queued_operations = queued_ops.len(),
-                                    init_duration_ms = init_duration.as_millis(),
-                                    "Contract initialization complete, will process queued operations"
-                                );
-                                queued_ops
-                            } else {
-                                Vec::new()
-                            };
+                                let init_duration = completion_info.init_duration;
+                                if init_duration > SLOW_INIT_THRESHOLD {
+                                    tracing::warn!(
+                                        contract = %key,
+                                        queued_operations = completion_info.queued_ops.len(),
+                                        init_duration_ms = init_duration.as_millis(),
+                                        threshold_ms = SLOW_INIT_THRESHOLD.as_millis(),
+                                        "Contract initialization took longer than expected"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        contract = %key,
+                                        queued_operations = completion_info.queued_ops.len(),
+                                        init_duration_ms = init_duration.as_millis(),
+                                        "Contract initialization complete"
+                                    );
+                                }
 
-                            // Log details about queued operations
-                            if !queued_ops.is_empty() {
-                                for op in &queued_ops {
+                                // Log details about queued operations
+                                for op in &completion_info.queued_ops {
                                     let queue_time = op.queued_at.elapsed();
                                     tracing::info!(
                                         contract = %key,
@@ -216,12 +226,10 @@ impl ContractExecutor for Executor<Runtime> {
                     }
                     ValidateResult::Invalid => {
                         // Validation failed - clear any queued operations
-                        if let Some(ContractInitState::Initializing { queued_ops, .. }) =
-                            self.contract_init_state.remove(&key)
-                        {
+                        if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
                             tracing::warn!(
                                 contract = %key,
-                                dropped_operations = queued_ops.len(),
+                                dropped_operations = dropped_count,
                                 "Contract validation failed, dropping queued operations"
                             );
                         }
@@ -229,12 +237,10 @@ impl ContractExecutor for Executor<Runtime> {
                     }
                     ValidateResult::RequestRelated(mut related) => {
                         // Clear any queued operations since we're missing related contracts
-                        if let Some(ContractInitState::Initializing { queued_ops, .. }) =
-                            self.contract_init_state.remove(&key)
-                        {
+                        if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
                             tracing::warn!(
                                 contract = %key,
-                                dropped_operations = queued_ops.len(),
+                                dropped_operations = dropped_count,
                                 "Missing related contracts, dropping queued operations"
                             );
                         }
@@ -258,7 +264,11 @@ impl ContractExecutor for Executor<Runtime> {
         let current_state = match self.state_store.get(&key).await {
             Ok(s) => s,
             Err(StateStoreError::MissingContract(_)) => {
-                tracing::warn!("Missing contract {key} for upsert");
+                tracing::warn!(
+                    contract = %key,
+                    phase = "upsert_failed",
+                    "Missing contract for upsert"
+                );
                 return Err(ExecutorError::request(StdContractError::MissingContract {
                     key: key.into(),
                 }));
@@ -307,7 +317,10 @@ impl ContractExecutor for Executor<Runtime> {
                         .map_err(ExecutorError::other)?;
 
                     // todo: forward delta like we are doing with puts
-                    tracing::warn!("Delta updates are not yet supported");
+                    tracing::warn!(
+                        contract = %key,
+                        "Delta updates are not yet supported"
+                    );
                     Ok(UpsertResult::Updated(updated_state))
                 }
             }
@@ -350,7 +363,9 @@ impl ContractExecutor for Executor<Runtime> {
             .is_some()
         {
             tracing::warn!(
-                "contract {key} already was registered for peer {cli_id}; replaced summary"
+                contract = %key,
+                client = %cli_id,
+                "Contract already registered for client, replaced summary"
             );
         }
         Ok(())
@@ -388,7 +403,12 @@ impl ContractExecutor for Executor<Runtime> {
                         values: Vec::new(),
                     }),
                     Err(err) => {
-                        tracing::warn!("failed registering delegate `{key}`: {err}");
+                        tracing::warn!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "register_failed",
+                            "Failed to register delegate"
+                        );
                         Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
                     }
                 }
@@ -398,7 +418,12 @@ impl ContractExecutor for Executor<Runtime> {
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::warn!("failed unregistering delegate `{key}`: {err}");
+                        tracing::warn!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "unregister_failed",
+                            "Failed to unregister delegate"
+                        );
                         Ok(HostResponse::Ok)
                     }
                 }
@@ -450,7 +475,12 @@ impl ContractExecutor for Executor<Runtime> {
                 ) {
                     Ok(values) => Ok(DelegateResponse { key, values }),
                     Err(err) => {
-                        tracing::error!("failed executing delegate `{key}`: {err}");
+                        tracing::error!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "execution_failed",
+                            "Failed executing delegate"
+                        );
                         Err(ExecutorError::execution(
                             err,
                             Some(InnerOpError::Delegate(key)),
@@ -588,7 +618,8 @@ impl Executor<Runtime> {
                     state: state.ok_or_else(|| {
                         tracing::debug!(
                             contract = %key,
-                            "Contract state not found during get request."
+                            phase = "get_failed",
+                            "Contract state not found during get request"
                         );
                         ExecutorError::request(StdContractError::Get {
                             key,
@@ -635,7 +666,8 @@ impl Executor<Runtime> {
             tracing::error!(
                 client = %cli_id,
                 error = %e,
-                "contract request failed"
+                phase = "request_failed",
+                "Contract request failed"
             );
         }
 
@@ -674,7 +706,12 @@ impl Executor<Runtime> {
                         values: Vec::new(),
                     }),
                     Err(err) => {
-                        tracing::warn!("failed registering delegate `{key}`: {err}");
+                        tracing::warn!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "register_failed",
+                            "Failed to register delegate"
+                        );
                         Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
                     }
                 }
@@ -684,7 +721,12 @@ impl Executor<Runtime> {
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::warn!("failed unregistering delegate `{key}`: {err}");
+                        tracing::warn!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "unregister_failed",
+                            "Failed to unregister delegate"
+                        );
                         Ok(HostResponse::Ok)
                     }
                 }
@@ -736,7 +778,12 @@ impl Executor<Runtime> {
                 ) {
                     Ok(values) => Ok(DelegateResponse { key, values }),
                     Err(err) => {
-                        tracing::error!("failed executing delegate `{key}`: {err}");
+                        tracing::error!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "execution_failed",
+                            "Failed executing delegate"
+                        );
                         Err(ExecutorError::execution(
                             err,
                             Some(InnerOpError::Delegate(key)),
@@ -862,7 +909,11 @@ impl Executor<Runtime> {
         let new_state = WrappedState::new(new_state.into_bytes());
 
         if new_state.as_ref() == current_state.as_ref() {
-            tracing::debug!("No changes in state for contract {key}, avoiding update");
+            tracing::debug!(
+                contract = %key,
+                phase = "update_skipped",
+                "No changes in state, avoiding update"
+            );
             return Ok(Either::Left(current_state.clone()));
         }
 
@@ -872,8 +923,10 @@ impl Executor<Runtime> {
             .map_err(ExecutorError::other)?;
 
         tracing::info!(
-            "Contract state updated for {key}, new_size_bytes={}",
-            new_state.as_ref().len()
+            contract = %key,
+            new_size_bytes = new_state.as_ref().len(),
+            phase = "update_complete",
+            "Contract state updated"
         );
 
         if let Err(err) = self
@@ -881,9 +934,10 @@ impl Executor<Runtime> {
             .await
         {
             tracing::error!(
-                "Failed while sending notifications for contract {}: {}",
-                key,
-                err
+                contract = %key,
+                error = %err,
+                phase = "notification_failed",
+                "Failed to send update notification"
             );
         }
         Ok(Either::Left(new_state))
@@ -1240,9 +1294,20 @@ impl Executor<Runtime> {
                     ))
                 {
                     failures.push(*peer_key);
-                    tracing::error!(cli_id = %peer_key, "{err}");
+                    tracing::error!(
+                        client = %peer_key,
+                        contract = %key,
+                        error = %err,
+                        phase = "notification_send_failed",
+                        "Failed to send update notification to client"
+                    );
                 } else {
-                    tracing::debug!(cli_id = %peer_key, contract = %key, "notified of update");
+                    tracing::debug!(
+                        client = %peer_key,
+                        contract = %key,
+                        phase = "notification_sent",
+                        "Sent update notification to client"
+                    );
                 }
             }
             if !failures.is_empty() {

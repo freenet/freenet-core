@@ -3,7 +3,7 @@
 //! See `architecture.md`.
 
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Cow,
     fmt::Display,
     net::SocketAddr,
     time::{Duration, SystemTime},
@@ -98,7 +98,8 @@ impl Transaction {
         self.id.0.to_le_bytes()
     }
 
-    fn elapsed(&self) -> Duration {
+    /// Returns the elapsed time since this transaction was created.
+    pub fn elapsed(&self) -> Duration {
         let current_unix_epoch_ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("now should be always be later than unix epoch")
@@ -264,8 +265,6 @@ mod sealed_msg_type {
 pub(crate) trait MessageStats {
     fn id(&self) -> &Transaction;
 
-    fn target(&self) -> Option<PeerKeyLocation>;
-
     fn requested_location(&self) -> Option<Location>;
 }
 
@@ -396,8 +395,6 @@ impl From<NetMessage> for semver::Version {
 
 pub trait InnerMessage: Into<NetMessage> {
     fn id(&self) -> &Transaction;
-
-    fn target(&self) -> Option<impl Borrow<PeerKeyLocation>>;
 
     fn requested_location(&self) -> Option<Location>;
 }
@@ -551,12 +548,6 @@ impl MessageStats for NetMessage {
         }
     }
 
-    fn target(&self) -> Option<PeerKeyLocation> {
-        match self {
-            NetMessage::V1(msg) => msg.target(),
-        }
-    }
-
     fn requested_location(&self) -> Option<Location> {
         match self {
             NetMessage::V1(msg) => msg.requested_location(),
@@ -575,19 +566,6 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Aborted(tx) => tx,
             NetMessageV1::Unsubscribed { transaction, .. } => transaction,
             NetMessageV1::ProximityCache { .. } => Transaction::NULL,
-        }
-    }
-
-    fn target(&self) -> Option<PeerKeyLocation> {
-        match self {
-            NetMessageV1::Connect(op) => op.target().cloned(),
-            NetMessageV1::Put(op) => op.target().as_ref().map(|b| b.borrow().clone()),
-            NetMessageV1::Get(op) => op.target().as_ref().map(|b| b.borrow().clone()),
-            NetMessageV1::Subscribe(op) => op.target().as_ref().map(|b| b.borrow().clone()),
-            NetMessageV1::Update(op) => op.target().as_ref().map(|b| b.borrow().clone()),
-            NetMessageV1::Aborted(_) => None,
-            NetMessageV1::Unsubscribed { .. } => None,
-            NetMessageV1::ProximityCache { .. } => None,
         }
     }
 

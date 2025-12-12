@@ -1,5 +1,4 @@
-use tokio::sync::mpsc;
-
+use crate::transport::fast_channel::FastReceiver;
 use crate::transport::peer_connection::outbound_stream::SerializedStream;
 use std::collections::BTreeMap;
 
@@ -9,10 +8,10 @@ type FragmentIdx = u32;
 
 pub(super) async fn recv_stream(
     stream_id: StreamId,
-    mut receiver: mpsc::Receiver<(FragmentIdx, Vec<u8>)>,
+    receiver: FastReceiver<(FragmentIdx, Vec<u8>)>,
     mut stream: InboundStream,
 ) -> Result<(StreamId, Vec<u8>), StreamId> {
-    while let Some((fragment_number, payload)) = receiver.recv().await {
+    while let Ok((fragment_number, payload)) = receiver.recv_async().await {
         if let Some(msg) = stream.push_fragment(fragment_number, payload) {
             return Ok((stream_id, msg));
         }

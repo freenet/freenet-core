@@ -182,12 +182,15 @@ impl<'a> NetEventLog<'a> {
         let peer_id = PeerId::new(own_addr, own_loc.pub_key().clone());
         let kind = match msg {
             NetMessage::V1(NetMessageV1::Connect(connect::ConnectMsg::Response {
-                target, ..
+                payload,
+                ..
             })) => {
+                // With hop-by-hop routing, we (the joiner) are the target.
+                // The acceptor is in the payload.
                 let this_peer = ring.connection_manager.own_location();
                 EventKind::Connect(ConnectEvent::Connected {
                     this: this_peer,
-                    connected: target.clone(),
+                    connected: payload.acceptor.clone(),
                 })
             }
             _ => EventKind::Ignored,
@@ -204,134 +207,88 @@ impl<'a> NetEventLog<'a> {
         op_manager: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
         let kind = match msg {
-            NetMessageV1::Connect(connect::ConnectMsg::Response {
-                target, payload, ..
-            }) => {
+            NetMessageV1::Connect(connect::ConnectMsg::Response { payload, .. }) => {
                 let acceptor = payload.acceptor.clone();
-                // Skip event if addresses are unknown (e.g., gateway behind NAT without public address)
-                let (Some(acceptor_addr), Some(target_addr)) =
-                    (acceptor.socket_addr(), target.socket_addr())
+                // With hop-by-hop routing, the target (joiner) is determined from op_manager
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                // Skip event if addresses are unknown
+                let (Some(acceptor_addr), Some(this_addr)) =
+                    (acceptor.socket_addr(), this_peer.socket_addr())
                 else {
                     return Either::Right(vec![]);
                 };
-                let acceptor_peer = PeerId::new(acceptor_addr, acceptor.pub_key().clone());
-                let target_peer = PeerId::new(target_addr, target.pub_key().clone());
+                let acceptor_peer_id = PeerId::new(acceptor_addr, acceptor.pub_key().clone());
+                let this_peer_id = PeerId::new(this_addr, this_peer.pub_key().clone());
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
-                        peer_id: acceptor_peer.clone(),
+                        peer_id: acceptor_peer_id.clone(),
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: acceptor.clone(),
-                            connected: target.clone(),
+                            connected: this_peer.clone(),
                         }),
                     },
                     NetEventLog {
                         tx: msg.id(),
-                        peer_id: target_peer,
+                        peer_id: this_peer_id,
                         kind: EventKind::Connect(ConnectEvent::Connected {
-                            this: target.clone(),
+                            this: this_peer,
                             connected: acceptor,
                         }),
                     },
                 ];
                 return Either::Right(events);
             }
-            NetMessageV1::Put(PutMsg::RequestPut {
-                contract,
-                target,
-                id,
-                ..
-            }) => {
+            NetMessageV1::Put(PutMsg::Request { contract, id, .. }) => {
                 let this_peer = &op_manager.ring.connection_manager.own_location();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
                     requester: this_peer.clone(),
-                    target: target.clone(),
+                    target: this_peer.clone(), // No embedded target - use own location
                     key,
                     id: *id,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Put(PutMsg::SuccessfulPut {
-                id,
-                target,
-                key,
-                origin,
-            }) => EventKind::Put(PutEvent::PutSuccess {
-                id: *id,
-                requester: origin.clone(),
-                target: target.clone(),
-                key: *key,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
-            NetMessageV1::Put(PutMsg::Broadcasting {
-                new_value,
-                broadcast_to,
-                broadcasted_to, // broadcasted_to n peers
-                key,
-                id,
-                upstream,
-                origin,
-                ..
-            }) => EventKind::Put(PutEvent::BroadcastEmitted {
-                id: *id,
-                upstream: upstream.clone(),
-                broadcast_to: broadcast_to.clone(),
-                broadcasted_to: *broadcasted_to,
-                key: *key,
-                value: new_value.clone(),
-                sender: origin.clone(),
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
-            NetMessageV1::Put(PutMsg::BroadcastTo {
-                origin,
-                new_value,
-                key,
-                target,
-                id,
-                ..
-            }) => EventKind::Put(PutEvent::BroadcastReceived {
-                id: *id,
-                requester: origin.clone(),
-                key: *key,
-                value: new_value.clone(),
-                target: target.clone(),
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
-            NetMessageV1::Get(GetMsg::ReturnGet {
+            NetMessageV1::Put(PutMsg::Response { id, key }) => {
+                let this_peer = &op_manager.ring.connection_manager.own_location();
+                EventKind::Put(PutEvent::PutSuccess {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    target: this_peer.clone(),
+                    key: *key,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
+            NetMessageV1::Get(GetMsg::Response {
                 id,
                 key,
                 value: StoreResponse { state: Some(_), .. },
-                target,
-                ..
             }) => EventKind::Get {
                 id: *id,
                 key: *key,
                 timestamp: chrono::Utc::now().timestamp() as u64,
-                requester: target.clone(),
-                // Note: sender no longer embedded in message - use connection-based routing
-                target: target.clone(), // Placeholder - actual sender from source_addr
+                // Note: target no longer embedded in message - use connection-based routing
+                requester: op_manager.ring.connection_manager.own_location(),
+                target: op_manager.ring.connection_manager.own_location(),
             },
-            NetMessageV1::Subscribe(SubscribeMsg::ReturnSub {
+            NetMessageV1::Subscribe(SubscribeMsg::Response {
                 id,
                 subscribed: true,
                 key,
-                target,
             }) => EventKind::Subscribed {
                 id: *id,
                 key: *key,
-                // Note: sender no longer embedded in message - use connection-based routing
-                at: target.clone(), // Placeholder - actual sender from source_addr
+                // Note: target no longer embedded in message - use connection-based routing
+                at: op_manager.ring.connection_manager.own_location(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
-                requester: target.clone(),
+                requester: op_manager.ring.connection_manager.own_location(),
             },
-            NetMessageV1::Update(UpdateMsg::RequestUpdate {
-                key, target, id, ..
-            }) => {
-                let this_peer = &op_manager.ring.connection_manager.own_location();
+            NetMessageV1::Update(UpdateMsg::RequestUpdate { key, id, .. }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
                 EventKind::Update(UpdateEvent::Request {
                     requester: this_peer.clone(),
-                    target: target.clone(),
+                    target: this_peer, // With hop-by-hop routing, we are the target
                     key: *key,
                     id: *id,
                     timestamp: chrono::Utc::now().timestamp() as u64,
@@ -340,35 +297,33 @@ impl<'a> NetEventLog<'a> {
             NetMessageV1::Update(UpdateMsg::Broadcasting {
                 new_value,
                 broadcast_to,
-                broadcasted_to, // broadcasted_to n peers
+                broadcasted_to,
                 key,
                 id,
-                upstream,
-            }) => EventKind::Update(UpdateEvent::BroadcastEmitted {
-                id: *id,
-                upstream: upstream.clone(),
-                broadcast_to: broadcast_to.clone(),
-                broadcasted_to: *broadcasted_to,
-                key: *key,
-                value: new_value.clone(),
-                // Note: sender no longer embedded in message - use connection-based routing
-                sender: upstream.clone(), // Placeholder - actual sender from source_addr
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
-            NetMessageV1::Update(UpdateMsg::BroadcastTo {
-                new_value,
-                key,
-                target,
-                id,
-            }) => EventKind::Update(UpdateEvent::BroadcastReceived {
-                id: *id,
-                requester: target.clone(),
-                key: *key,
-                value: new_value.clone(),
-                // Note: sender no longer embedded in message - use connection-based routing
-                target: target.clone(), // Placeholder - actual sender from source_addr
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
+            }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Update(UpdateEvent::BroadcastEmitted {
+                    id: *id,
+                    upstream: this_peer.clone(), // We are the broadcaster
+                    broadcast_to: broadcast_to.clone(),
+                    broadcasted_to: *broadcasted_to,
+                    key: *key,
+                    value: new_value.clone(),
+                    sender: this_peer, // We are the sender
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
+            NetMessageV1::Update(UpdateMsg::BroadcastTo { new_value, key, id }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Update(UpdateEvent::BroadcastReceived {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    key: *key,
+                    value: new_value.clone(),
+                    target: this_peer, // We are the target
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
             _ => EventKind::Ignored,
         };
         let own_loc = op_manager.ring.connection_manager.own_location();

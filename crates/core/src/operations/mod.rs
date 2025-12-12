@@ -53,9 +53,10 @@ where
 pub(crate) struct OperationResult {
     /// Inhabited if there is a message to return to the other peer.
     pub return_msg: Option<NetMessage>,
-    /// Where to send the return message. Required if return_msg is Some.
-    /// This replaces the old pattern of embedding target in the message itself.
-    pub target_addr: Option<SocketAddr>,
+    /// The next hop to send the message to. Required if return_msg is Some.
+    /// For responses, this is upstream_addr (back toward originator).
+    /// For forwarded requests, this is the next peer toward the contract location.
+    pub next_hop: Option<SocketAddr>,
     /// None if the operation has been completed.
     pub state: Option<OpEnum>,
 }
@@ -117,13 +118,14 @@ where
         }
         Ok(OperationResult {
             return_msg: None,
-            target_addr: _,
+            next_hop: _,
             state: Some(final_state),
         }) if final_state.finalized() => {
             if op_manager.failed_parents().remove(&tx_id).is_some() {
                 tracing::warn!(
-                    "Operation {} reached finalized state after a sub-operation failure; dropping client response",
-                    tx_id
+                    tx = %tx_id,
+                    phase = "error",
+                    "Operation reached finalized state after a sub-operation failure; dropping client response"
                 );
                 op_manager.completed(tx_id);
                 return Ok(None);
@@ -144,21 +146,21 @@ where
                 op_manager
                     .root_ops_awaiting_sub_ops()
                     .insert(tx_id, final_state);
-                tracing::info!(%tx_id, "root operation registered as awaiting sub-ops");
+                tracing::info!(tx = %tx_id, phase = "wait_sub_ops", "root operation registered as awaiting sub-ops");
 
                 return Ok(None);
             }
         }
         Ok(OperationResult {
             return_msg: Some(msg),
-            target_addr,
+            next_hop,
             state: Some(updated_state),
         }) => {
             if updated_state.finalized() {
                 let id = *msg.id();
                 tracing::debug!(%id, "operation finalized with outgoing message");
                 op_manager.completed(id);
-                if let Some(target) = target_addr {
+                if let Some(target) = next_hop {
                     tracing::debug!(%id, ?target, "sending final message to target");
                     network_bridge.send(target, msg).await?;
                 }
@@ -166,10 +168,13 @@ where
             } else {
                 let id = *msg.id();
                 tracing::debug!(%id, "operation in progress");
-                if let Some(target) = target_addr {
+                if let Some(target) = next_hop {
                     tracing::debug!(%id, ?target, "sending updated op state");
-                    network_bridge.send(target, msg).await?;
+                    // IMPORTANT: Push state BEFORE sending message to avoid race condition.
+                    // If we send first, a fast response might arrive before the state is saved,
+                    // causing load_or_init to fail to find the operation.
                     op_manager.push(id, updated_state).await?;
+                    network_bridge.send(target, msg).await?;
                 } else {
                     tracing::debug!(%id, "queueing op state for local processing");
                     debug_assert!(
@@ -189,7 +194,7 @@ where
 
         Ok(OperationResult {
             return_msg: None,
-            target_addr: _,
+            next_hop: _,
             state: Some(updated_state),
         }) => {
             let id = *updated_state.id();
@@ -197,19 +202,19 @@ where
         }
         Ok(OperationResult {
             return_msg: Some(msg),
-            target_addr,
+            next_hop,
             state: None,
         }) => {
             op_manager.completed(tx_id);
 
-            if let Some(target) = target_addr {
+            if let Some(target) = next_hop {
                 tracing::debug!(%tx_id, ?target, "sending back message to target");
                 network_bridge.send(target, msg).await?;
             }
         }
         Ok(OperationResult {
             return_msg: None,
-            target_addr: _,
+            next_hop: _,
             state: None,
         }) => {
             op_manager.completed(tx_id);
@@ -384,8 +389,9 @@ pub(crate) async fn announce_contract_cached(op_manager: &OpManager, key: &Contr
             .await
         {
             tracing::warn!(
-                %key,
-                %err,
+                contract = %key,
+                error = %err,
+                phase = "error",
                 "PROXIMITY_CACHE: Failed to broadcast cache announcement"
             );
         }
@@ -434,14 +440,14 @@ fn start_subscription_request_internal(
                 tracing::debug!(%child_tx, %parent_tx, "child subscription completed");
             }
             Err(error) => {
-                tracing::error!(%parent_tx, %child_tx, %error, "child subscription failed");
+                tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = %error, phase = "error", "child subscription failed");
 
                 let error_msg = format!("{}", error);
                 if let Err(e) = op_manager_cloned
                     .sub_operation_failed(child_tx, &error_msg)
                     .await
                 {
-                    tracing::error!(%parent_tx, %child_tx, %e, "failed to propagate failure");
+                    tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = %e, phase = "error", "failed to propagate failure");
                 }
             }
         }

@@ -113,6 +113,10 @@ regex = "1"
 [[bench]]
 name = "transport_perf"
 harness = false
+required-features = ["bench"]
+
+[build-dependencies]
+chrono = "0.4"
 
 [features]
 default = ["redb", "trace", "websocket"]
@@ -123,3 +127,4 @@ websocket = ["axum/ws"]
 testing = ["freenet-stdlib/testing"]
 console-subscriber = ["dep:console-subscriber"]
 test-network = ["dep:freenet-test-network"]
+bench = []  # Exposes internal test infrastructure for benchmarking
