@@ -236,20 +236,20 @@ fn bench_serialize_pure(c: &mut Criterion) {
 
 Uses channels instead of sockets - measures protocol logic without syscalls.
 
-**Running the Blackbox Benchmarks:**
+**Running the Transport Benchmarks:**
 
 ```bash
-# Run just the blackbox transport benchmarks (uses actual transport code with mock I/O)
-cargo bench --bench transport_perf --features bench -- blackbox
+# Run just the transport benchmarks (uses actual transport code with mock I/O)
+cargo bench --bench transport_perf --features bench -- transport
 ```
 
-The `blackbox` benchmark group tests the **actual transport code** with mock sockets:
+The `transport` benchmark group tests the **actual transport code** with mock sockets:
 
 | Benchmark | What it measures |
 |-----------|-----------------|
-| `level1_blackbox/connection/establish` | Full handshake: key exchange, encryption setup |
-| `level1_blackbox/throughput/bytes/*` | End-to-end message throughput at different sizes |
-| `level1_blackbox/fast_channel/*` | Our crossbeam-based channel vs tokio::sync::mpsc |
+| `transport/connection/establish` | Full handshake: key exchange, encryption setup |
+| `transport/throughput/bytes/*` | End-to-end message throughput at different sizes |
+| `transport/fast_channel/*` | Our crossbeam-based channel vs tokio::sync::mpsc |
 
 **Using the Mock Transport Infrastructure:**
 
@@ -550,12 +550,12 @@ echo "=== Results in target/criterion/ ==="
 | Encryption throughput | `level0` | Any | None | Perfect |
 | Serialization | `level0` | Any | None | Perfect |
 | Protocol state machines | `level0` | Any | None | Perfect |
-| **Blackbox transport** | `blackbox` | Any | **Channels only** | **High** |
+| **Transport (mock I/O)** | `transport` | Any | **Channels only** | **High** |
 | Mock I/O throughput | `level1` | Linux bare metal | Channels only | High |
 | Syscall overhead | `level2` | Linux bare metal | recv/send | Medium |
 | Full stack | `level3` | Controlled hardware | Everything | Low |
 
-**Key insight**: The `blackbox` benchmark group tests the **actual Freenet transport code** (PeerConnection, fast_channel, encryption) with mock I/O. This catches real regressions in the transport pipeline without kernel noise.
+**Key insight**: The `transport` benchmark group tests the **actual Freenet transport code** (PeerConnection, fast_channel, encryption) with mock I/O. This catches real regressions in the transport pipeline without kernel noise.
 
 To run all benchmark groups:
 ```bash
@@ -565,7 +565,7 @@ cargo bench --bench transport_perf --features bench
 To run specific groups:
 ```bash
 cargo bench --bench transport_perf --features bench -- level0      # Pure logic
-cargo bench --bench transport_perf --features bench -- blackbox    # Actual transport with mock I/O
+cargo bench --bench transport_perf --features bench -- transport   # Actual transport with mock I/O
 cargo bench --bench transport_perf --features bench -- level2      # Loopback
 ```
 

@@ -636,20 +636,16 @@ criterion_main!(benches);
 
 ### 11.4 Running the Benchmarks
 
+> **Note**: The experimental benchmarks referenced in sections 11.1-11.3 were one-time experiments
+> to inform design decisions. They have been removed from the codebase. The results are preserved
+> here for reference. To run current benchmarks:
+
 ```bash
-# Run packet size experiments
-./scripts/run_benchmarks.sh experimental_packet
+# Run transport layer benchmarks (actual code with mock I/O - used in CI)
+cargo bench --bench transport_perf --features bench -- transport
 
-# Run Tokio overhead experiments
-./scripts/run_benchmarks.sh experimental_tokio
-
-# Run full pipeline experiments
-./scripts/run_benchmarks.sh experimental_combined
-
-# Or run directly with cargo (requires bench feature):
-cargo bench --bench transport_perf --features bench -- experimental_packet
-cargo bench --bench transport_perf --features bench -- experimental_tokio
-cargo bench --bench transport_perf --features bench -- experimental_combined
+# Run all benchmark levels
+cargo bench --bench transport_perf --features bench
 ```
 
 ---
@@ -761,22 +757,19 @@ This means:
 
 ### 12.7 Running These Benchmarks
 
+> **Note**: The size×batch experimental benchmarks referenced in section 12 were one-time
+> experiments to inform design decisions. They have been removed from the codebase.
+> The results are preserved here for reference.
+
 ```bash
-# Run full size×batch matrix
-./scripts/run_benchmarks.sh experimental_size_batch
+# Run transport layer benchmarks (actual transport code with mock I/O)
+cargo bench --bench transport_perf --features bench -- transport
 
-# Individual benchmark groups (requires bench feature)
-cargo bench --bench transport_perf --features bench -- experimental_size_batch_matrix
-cargo bench --bench transport_perf --features bench -- experimental_batch_improvement
-cargo bench --bench transport_perf --features bench -- experimental_throughput_ceiling
-
-# NEW: Blackbox transport benchmarks (actual transport code with mock I/O)
-cargo bench --bench transport_perf --features bench -- blackbox
+# Run all benchmark levels (level0, level1, level2, level3, transport)
+cargo bench --bench transport_perf --features bench
 ```
 
 ---
 
 *Analysis performed: December 2025*
-*Experimental benchmarks added: December 2025*
-*Size×batch interaction analysis: December 2025*
 *Codebase version: commit c50d888*
