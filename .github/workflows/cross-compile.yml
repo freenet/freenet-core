@@ -87,25 +87,25 @@ jobs:
 
     steps:
       - name: Download x86_64 freenet binary
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: binaries-x86_64-freenet
           path: artifacts/x86_64-freenet
 
       - name: Download x86_64 fdev binary
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: binaries-x86_64-fdev
           path: artifacts/x86_64-fdev
 
       - name: Download ARM64 freenet binary
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: binaries-arm64-freenet
           path: artifacts/arm64-freenet
 
       - name: Download ARM64 fdev binary
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: binaries-arm64-fdev
           path: artifacts/arm64-fdev
