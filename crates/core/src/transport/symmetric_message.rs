@@ -46,29 +46,33 @@ impl SymmetricMessage {
     };
 
     pub(crate) fn short_message_overhead() -> usize {
-        static OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
-            let blank = SymmetricMessage {
-                packet_id: u32::MAX,
-                confirm_receipt: vec![],
-                payload: SymmetricMessagePayload::ShortMessage { payload: vec![] },
+        thread_local! {
+            static OVERHEAD: usize = {
+                let blank = SymmetricMessage {
+                    packet_id: u32::MAX,
+                    confirm_receipt: vec![],
+                    payload: SymmetricMessagePayload::ShortMessage { payload: vec![] },
+                };
+                bincode::serialized_size(&blank).unwrap() as usize
             };
-            bincode::serialized_size(&blank).unwrap() as usize
-        });
+        }
 
-        *OVERHEAD
+        OVERHEAD.with(|o| *o)
     }
 
     pub(crate) fn noop_message_overhead() -> usize {
-        static OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
-            let blank = SymmetricMessage {
-                packet_id: u32::MAX,
-                confirm_receipt: vec![],
-                payload: SymmetricMessagePayload::NoOp,
+        thread_local! {
+            static OVERHEAD: usize = {
+                let blank = SymmetricMessage {
+                    packet_id: u32::MAX,
+                    confirm_receipt: vec![],
+                    payload: SymmetricMessagePayload::NoOp,
+                };
+                bincode::serialized_size(&blank).unwrap() as usize
             };
-            bincode::serialized_size(&blank).unwrap() as usize
-        });
+        }
 
-        *OVERHEAD
+        OVERHEAD.with(|o| *o)
     }
 
     #[allow(dead_code)]
