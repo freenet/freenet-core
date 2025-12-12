@@ -280,7 +280,7 @@ Each packet requires:
 |-------|----------|--------|----------------|--------|
 | No batch I/O (recvmmsg/sendmmsg) | Critical | 100x syscall overhead | Medium | ✅ Implemented (PR #2270) |
 | Channel buffer=1 for streams | High | Packet drops under load | Low | ✅ Implemented (PR #2263) |
-| Over-conservative metadata (100 vs ~21 bytes) | Medium | 5.4% capacity loss | Low | |
+| Over-conservative metadata (100 vs 40 bytes) | Medium | 4.4% capacity loss | Low | ✅ Implemented (PR #2271) |
 | No GSO/GRO support | High | CPU bottleneck at high pps | Medium | |
 | Naive rate limiting | Medium | Poor congestion response | High | |
 | No jumbo frame support | Low | Missed optimization in DC | Low | |
@@ -499,7 +499,15 @@ criterion_main!(benches);
    - Inbound streams use `bounded(64)` for stream fragments
    - Prevents packet drops under load
 
-2. **Measure actual metadata overhead**: Replace the 100-byte constant with actual measured value (~21 bytes)
+2. **~~Measure actual metadata overhead~~** ✅ **Implemented in PR #2271**
+   - Measured actual `SymmetricMessage::StreamFragment` overhead: 40 bytes (not 100!)
+   - Updated `MAX_DATA_SIZE` constant: `packet_data::MAX_DATA_SIZE - 40`
+   - **Impact**: +60 bytes per fragment (4.4% capacity increase)
+   - **Benchmark results** (local Criterion, 100 iterations):
+     - 256-byte messages: **+6.27% throughput** (biggest gain)
+     - 1364-byte messages: **+2.21% throughput**
+     - Network efficiency: fewer fragments needed for large messages
+   - See `symmetric_message::stream_fragment_overhead()` for measurement implementation
 
 3. **Use counter-based nonces**: Replace random nonce generation with atomic counter
 
