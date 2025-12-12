@@ -244,9 +244,312 @@ fn distribute_hash(x: u64) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::hash::Hash;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use super::*;
+
+    // ============ Location construction tests ============
+
+    #[test]
+    fn test_location_new_valid() {
+        let loc = Location::new(0.5);
+        assert_eq!(loc.as_f64(), 0.5);
+    }
+
+    #[test]
+    fn test_location_new_boundaries() {
+        // Test boundary values
+        let loc_zero = Location::new(0.0);
+        assert_eq!(loc_zero.as_f64(), 0.0);
+
+        let loc_one = Location::new(1.0);
+        assert_eq!(loc_one.as_f64(), 1.0);
+    }
+
+    #[test]
+    fn test_location_new_rounded_within_range() {
+        let loc = Location::new_rounded(0.75);
+        assert_eq!(loc.as_f64(), 0.75);
+    }
+
+    #[test]
+    fn test_location_new_rounded_wraps_above_one() {
+        // Values above 1.0 should wrap using rem_euclid
+        let loc = Location::new_rounded(1.25);
+        assert!((loc.as_f64() - 0.25).abs() < f64::EPSILON);
+
+        let loc2 = Location::new_rounded(2.5);
+        assert!((loc2.as_f64() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_location_new_rounded_wraps_negative() {
+        // Negative values should wrap correctly
+        let loc = Location::new_rounded(-0.25);
+        assert!((loc.as_f64() - 0.75).abs() < f64::EPSILON);
+
+        let loc2 = Location::new_rounded(-1.25);
+        assert!((loc2.as_f64() - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_location_try_from_valid() {
+        let loc: Result<Location, _> = 0.5f64.try_into();
+        assert!(loc.is_ok());
+        assert_eq!(loc.unwrap().as_f64(), 0.5);
+    }
+
+    #[test]
+    fn test_location_try_from_invalid_above() {
+        let loc: Result<Location, _> = 1.5f64.try_into();
+        assert!(loc.is_err());
+    }
+
+    #[test]
+    fn test_location_try_from_invalid_below() {
+        let loc: Result<Location, _> = (-0.1f64).try_into();
+        assert!(loc.is_err());
+    }
+
+    #[test]
+    fn test_location_random_in_range() {
+        // Generate multiple random locations and verify they're in range
+        for _ in 0..100 {
+            let loc = Location::random();
+            assert!(loc.as_f64() >= 0.0 && loc.as_f64() <= 1.0);
+        }
+    }
+
+    // ============ Location distance tests ============
+
+    #[test]
+    fn test_location_distance_same_location() {
+        let loc = Location::new(0.5);
+        let dist = loc.distance(loc);
+        assert_eq!(dist.as_f64(), 0.0);
+    }
+
+    #[test]
+    fn test_location_distance_adjacent() {
+        let l0 = Location::new(0.0);
+        let l1 = Location::new(0.25);
+        assert_eq!(l0.distance(l1), Distance::new(0.25));
+    }
+
+    #[test]
+    fn test_location_distance_wrap_around() {
+        // Distance should wrap around the ring
+        let l0 = Location::new(0.0);
+        let l1 = Location::new(0.9);
+        // Direct distance would be 0.9, but wrap-around is 0.1
+        assert_eq!(l0.distance(l1), Distance::new(0.1));
+    }
+
+    #[test]
+    fn test_location_distance_exactly_half() {
+        let l0 = Location::new(0.0);
+        let l1 = Location::new(0.5);
+        assert_eq!(l0.distance(l1), Distance::new(0.5));
+    }
+
+    #[test]
+    fn test_location_distance_symmetry() {
+        let l0 = Location::new(0.3);
+        let l1 = Location::new(0.7);
+        assert_eq!(l0.distance(l1), l1.distance(l0));
+    }
+
+    // ============ Location arithmetic tests ============
+
+    #[test]
+    fn test_location_add_distance() {
+        let loc = Location::new(0.5);
+        let dist = Distance::new(0.1);
+        let (neg, pos) = loc + dist;
+
+        assert!((neg.as_f64() - 0.4).abs() < f64::EPSILON);
+        assert!((pos.as_f64() - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_location_add_distance_at_boundary() {
+        let loc = Location::new(0.05);
+        let dist = Distance::new(0.1);
+        let (neg, pos) = loc + dist;
+
+        // neg location wraps to negative (won't be valid without normalization)
+        assert!((neg.as_f64() - (-0.05)).abs() < f64::EPSILON);
+        assert!((pos.as_f64() - 0.15).abs() < f64::EPSILON);
+    }
+
+    // ============ Location equality and ordering tests ============
+
+    #[test]
+    fn test_location_equality() {
+        let l1 = Location::new(0.5);
+        let l2 = Location::new(0.5);
+        assert_eq!(l1, l2);
+    }
+
+    #[test]
+    fn test_location_equality_with_epsilon() {
+        // Locations should be equal if difference is less than f64::EPSILON
+        let l1 = Location::new(0.5);
+        let l2 = Location(0.5 + f64::EPSILON / 2.0);
+        assert_eq!(l1, l2);
+    }
+
+    #[test]
+    fn test_location_ordering() {
+        let l1 = Location::new(0.3);
+        let l2 = Location::new(0.7);
+        assert!(l1 < l2);
+        assert!(l2 > l1);
+    }
+
+    #[test]
+    fn test_location_sorting() {
+        let mut locs = [
+            Location::new(0.7),
+            Location::new(0.2),
+            Location::new(0.9),
+            Location::new(0.1),
+        ];
+        locs.sort();
+
+        assert_eq!(locs[0].as_f64(), 0.1);
+        assert_eq!(locs[1].as_f64(), 0.2);
+        assert_eq!(locs[2].as_f64(), 0.7);
+        assert_eq!(locs[3].as_f64(), 0.9);
+    }
+
+    // ============ Location hashing tests ============
+
+    #[test]
+    fn test_location_hash_consistency() {
+        use std::collections::hash_map::DefaultHasher;
+
+        let loc1 = Location::new(0.5);
+        let loc2 = Location::new(0.5);
+
+        let mut hasher1 = DefaultHasher::new();
+        let mut hasher2 = DefaultHasher::new();
+
+        loc1.hash(&mut hasher1);
+        loc2.hash(&mut hasher2);
+
+        assert_eq!(hasher1.finish(), hasher2.finish());
+    }
+
+    #[test]
+    fn test_location_in_hashset() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert(Location::new(0.1));
+        set.insert(Location::new(0.2));
+        set.insert(Location::new(0.1)); // duplicate
+
+        assert_eq!(set.len(), 2);
+    }
+
+    // ============ Location display tests ============
+
+    #[test]
+    fn test_location_display() {
+        let loc = Location::new(0.5);
+        assert_eq!(format!("{}", loc), "0.5");
+    }
+
+    // ============ Distance tests ============
+
+    #[test]
+    fn test_distance_new_valid() {
+        let d = Distance::new(0.3);
+        assert_eq!(d.as_f64(), 0.3);
+    }
+
+    #[test]
+    fn test_distance_new_normalizes_above_half() {
+        // Distance values > 0.5 should be normalized (1.0 - value)
+        let d = Distance::new(0.7);
+        // Use approximate comparison due to floating point
+        assert!((d.as_f64() - 0.3).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_distance_new_exactly_half() {
+        let d = Distance::new(0.5);
+        assert_eq!(d.as_f64(), 0.5);
+    }
+
+    #[test]
+    fn test_distance_add() {
+        let d1 = Distance::new(0.1);
+        let d2 = Distance::new(0.2);
+        let sum = d1 + d2;
+        // Use approximate comparison due to floating point
+        assert!((sum.as_f64() - 0.3).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_distance_add_wraps_above_half() {
+        let d1 = Distance::new(0.3);
+        let d2 = Distance::new(0.4);
+        let sum = d1 + d2; // 0.7 > 0.5, so wraps to 0.3
+                           // Use approximate comparison due to floating point
+        assert!((sum.as_f64() - 0.3).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_distance_equality() {
+        let d1 = Distance::new(0.25);
+        let d2 = Distance::new(0.25);
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn test_distance_ordering() {
+        let d1 = Distance::new(0.1);
+        let d2 = Distance::new(0.3);
+        assert!(d1 < d2);
+    }
+
+    #[test]
+    fn test_distance_display() {
+        let d = Distance::new(0.25);
+        assert_eq!(format!("{}", d), "0.25");
+    }
+
+    // ============ Contract key location tests ============
+
+    #[test]
+    fn test_location_from_contract_key() {
+        // Test that contract key bytes produce valid locations
+        let bytes = [0x12, 0x34, 0x56, 0x78];
+        let loc = Location::from_contract_key(&bytes);
+        assert!(loc.as_f64() >= 0.0 && loc.as_f64() <= 1.0);
+    }
+
+    #[test]
+    fn test_location_from_contract_key_consistency() {
+        let bytes = [0xAB, 0xCD, 0xEF, 0x01];
+        let loc1 = Location::from_contract_key(&bytes);
+        let loc2 = Location::from_contract_key(&bytes);
+        assert_eq!(loc1, loc2);
+    }
+
+    #[test]
+    fn test_location_from_contract_key_different_bytes() {
+        let bytes1 = [0x00, 0x00, 0x00, 0x01];
+        let bytes2 = [0x00, 0x00, 0x00, 0x02];
+        let loc1 = Location::from_contract_key(&bytes1);
+        let loc2 = Location::from_contract_key(&bytes2);
+        assert_ne!(loc1, loc2);
+    }
+
+    // ============ IPv4 address tests ============
 
     #[test]
     fn test_ipv4_address_location_distribution() {
@@ -317,6 +620,33 @@ mod test {
     }
 
     #[test]
+    fn test_ipv4_last_byte_masked() {
+        // Two IPs that differ only in last byte should have same location
+        // (sybil mitigation)
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 255)), 12345);
+
+        let loc1 = Location::from_address(&addr1);
+        let loc2 = Location::from_address(&addr2);
+
+        assert_eq!(loc1, loc2);
+    }
+
+    #[test]
+    fn test_ipv4_different_subnets() {
+        // IPs in different /24 subnets should have different locations
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1)), 12345);
+
+        let loc1 = Location::from_address(&addr1);
+        let loc2 = Location::from_address(&addr2);
+
+        assert_ne!(loc1, loc2);
+    }
+
+    // ============ IPv6 address tests ============
+
+    #[test]
     fn test_ipv6_address_location() {
         let addresses = [
             SocketAddr::new(
@@ -356,6 +686,46 @@ mod test {
         ];
         assert_eq!(locations, expected_locations);
     }
+
+    #[test]
+    fn test_ipv6_uses_first_three_segments() {
+        // Two IPv6 addresses with same first 3 segments should have same location
+        let addr1 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x1234, 0x0001, 0, 0, 0, 1)),
+            12345,
+        );
+        let addr2 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0xdb8, 0x1234, 0x9999, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+            )),
+            12345,
+        );
+
+        let loc1 = Location::from_address(&addr1);
+        let loc2 = Location::from_address(&addr2);
+
+        assert_eq!(loc1, loc2);
+    }
+
+    #[test]
+    fn test_ipv6_different_prefix() {
+        // IPv6 addresses with different first 3 segments should have different locations
+        let addr1 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x1234, 0, 0, 0, 0, 1)),
+            12345,
+        );
+        let addr2 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x5678, 0, 0, 0, 0, 1)),
+            12345,
+        );
+
+        let loc1 = Location::from_address(&addr1);
+        let loc2 = Location::from_address(&addr2);
+
+        assert_ne!(loc1, loc2);
+    }
+
+    // ============ Original tests ============
 
     #[test]
     fn location_dist() {
