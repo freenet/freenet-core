@@ -79,6 +79,15 @@ pub enum TrySendError<T> {
     Disconnected(T),
 }
 
+/// Error returned by `try_recv`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// The channel is empty.
+    Empty,
+    /// All senders have been dropped.
+    Disconnected,
+}
+
 impl<T> std::fmt::Display for TrySendError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -229,6 +238,23 @@ impl<T> FastReceiver<T> {
                 Ok(msg)
             }
             Err(crossbeam::channel::RecvError) => Err(RecvError),
+        }
+    }
+
+    /// Attempts to receive a message without blocking.
+    ///
+    /// Returns immediately with `Ok(msg)` if a message is available,
+    /// or `Err(TryRecvError::Empty)` if the channel is empty,
+    /// or `Err(TryRecvError::Disconnected)` if all senders have been dropped.
+    #[inline]
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        match self.inner.try_recv() {
+            Ok(msg) => {
+                self.send_notify.notify_one();
+                Ok(msg)
+            }
+            Err(crossbeam::channel::TryRecvError::Empty) => Err(TryRecvError::Empty),
+            Err(crossbeam::channel::TryRecvError::Disconnected) => Err(TryRecvError::Disconnected),
         }
     }
 }
