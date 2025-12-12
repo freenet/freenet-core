@@ -29,7 +29,11 @@ impl Pool {
     pub async fn new(db_dir: Option<&Path>) -> Result<Self, SqlDbError> {
         let opts = if let Some(db_dir) = db_dir {
             let file = db_dir.join("freenet.db");
-            tracing::info!("loading contract store from {file:?}");
+            tracing::info!(
+                db_file = ?file,
+                phase = "store_init",
+                "Loading contract store"
+            );
             SqliteConnectOptions::new()
                 .create_if_missing(true)
                 .filename(file)

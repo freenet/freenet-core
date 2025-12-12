@@ -135,7 +135,8 @@ pub(crate) async fn request_get(
             // Contract found locally - complete the operation immediately
             tracing::info!(
                 tx = %id,
-                %key,
+                contract = %key,
+                phase = "complete",
                 "GET: contract found locally, returning immediately"
             );
 
@@ -165,7 +166,8 @@ pub(crate) async fn request_get(
             // No peers available and contract not found locally
             tracing::warn!(
                 tx = %id,
-                %key,
+                contract = %key,
+                phase = "error",
                 "GET: Contract not found locally and no peers available"
             );
             return Err(RingError::EmptyRing.into());
@@ -556,12 +558,13 @@ impl Operation for GetOp {
                         });
                     tracing::info!(
                         tx = %id,
-                        %key,
-                        sender = %sender_display,
+                        contract = %key,
+                        peer_addr = %sender_display,
                         fetch_contract,
                         htl,
                         skip = ?skip_list,
-                        "GET: received Request"
+                        phase = "request",
+                        "GET Request received"
                     );
 
                     // Use sender_from_addr (looked up from source_addr) instead of message field
@@ -588,8 +591,10 @@ impl Operation for GetOp {
                         // HTL exhausted - return empty response
                         tracing::warn!(
                             tx = %id,
-                            %key,
-                            sender = %sender_display,
+                            contract = %key,
+                            peer_addr = %sender_display,
+                            htl = 0,
+                            phase = "error",
                             "Dropping GET Request with zero HTL"
                         );
                         return build_op_result(
@@ -677,8 +682,9 @@ impl Operation for GetOp {
                             // Contract found locally!
                             tracing::info!(
                                 tx = %id,
-                                %key,
+                                contract = %key,
                                 fetch_contract,
+                                phase = "complete",
                                 "GET: contract found locally"
                             );
 
@@ -787,19 +793,20 @@ impl Operation for GetOp {
 
                     tracing::info!(
                         tx = %id,
-                        %key,
-                        from = %sender,
-                        "GET: Response received with empty value"
+                        contract = %key,
+                        peer_addr = %sender,
+                        phase = "response",
+                        "GET Response received with empty value"
                     );
                     // Handle case where neither contract nor state was found
                     let this_peer = op_manager.ring.connection_manager.own_location();
                     tracing::warn!(
                         tx = %id,
-                        %key,
-                        %this_peer,
-                        "Neither contract or contract value for contract found at peer {}, \
-                        retrying with other peers",
-                        sender
+                        contract = %key,
+                        peer_addr = %this_peer,
+                        from = %sender,
+                        phase = "retry",
+                        "Contract not found at peer, retrying with other peers"
                     );
 
                     match self.state {
@@ -830,13 +837,14 @@ impl Operation for GetOp {
 
                                 tracing::info!(
                                     tx = %id,
-                                    %key,
-                                    next_peer = %next_target,
+                                    contract = %key,
+                                    peer_addr = %next_target,
                                     fetch_contract,
                                     attempts_at_hop = attempts_at_hop + 1,
                                     max_attempts = DEFAULT_MAX_BREADTH,
                                     tried = ?tried_peers,
                                     remaining_alternatives = ?alternatives,
+                                    phase = "retry",
                                     "Trying alternative peer at same hop level"
                                 );
 
@@ -884,11 +892,12 @@ impl Operation for GetOp {
 
                                 tracing::info!(
                                 tx = %id,
-                                %key,
+                                contract = %key,
                                 new_candidates = ?new_candidates,
                                 skip = ?new_skip_list,
-                                hop = current_hop,
+                                htl = current_hop,
                                 retries = retries + 1,
+                                phase = "retry",
                                 "GET seeking new candidates after exhausted alternatives"
                                 );
 
@@ -926,11 +935,12 @@ impl Operation for GetOp {
                                     // No more peers to try, return failure to requester
                                     tracing::warn!(
                                         tx = %id,
-                                        %key,
-                                        %this_peer,
+                                        contract = %key,
+                                        peer_addr = %this_peer,
                                         target = %requester_peer,
                                         tried = ?tried_peers,
                                         skip = ?new_skip_list,
+                                        phase = "error",
                                         "No other peers found while trying to get the contract, returning response to requester"
                                     );
                                     return_msg = Some(GetMsg::Response {
@@ -945,11 +955,11 @@ impl Operation for GetOp {
                                     // Original requester, operation failed
                                     tracing::error!(
                                                             tx = %id,
-                                    %key,
+                                    contract = %key,
                                     tried = ?tried_peers,
                                     skip = ?skip_list,
-                                    "Failed getting a value for contract {}, reached max retries",
-                                    key
+                                    phase = "error",
+                                    "Failed getting a value for contract, reached max retries"
                                                         );
                                     return_msg = None;
                                     new_state = None;
@@ -963,19 +973,21 @@ impl Operation for GetOp {
                                 // Max retries reached
                                 tracing::error!(
                                     tx = %id,
-                                    "Failed getting a value for contract {}, reached max retries",
-                                    key
+                                    contract = %key,
+                                    phase = "error",
+                                    "Failed getting a value for contract, reached max retries"
                                 );
 
                                 if let Some(requester_peer) = requester.clone() {
                                     // Return failure to requester
                                     tracing::warn!(
                                         tx = %id,
-                                        %key,
-                                        %this_peer,
+                                        contract = %key,
+                                        peer_addr = %this_peer,
                                         target = %requester_peer,
                                         tried = ?tried_peers,
                                         skip = ?skip_list,
+                                        phase = "error",
                                         "No other peers found while trying to get the contract, returning response to requester"
                                     );
                                     return_msg = Some(GetMsg::Response {
@@ -991,8 +1003,9 @@ impl Operation for GetOp {
                                     // Original requester, operation failed
                                     tracing::error!(
                                         tx = %id,
-                                        "Failed getting a value for contract {}, reached max retries",
-                                        key
+                                        contract = %key,
+                                        phase = "error",
+                                        "Failed getting a value for contract, reached max retries"
                                     );
                                     return_msg = None;
                                     new_state = None;
@@ -1042,7 +1055,7 @@ impl Operation for GetOp {
                         return Err(OpError::invalid_transition(self.id));
                     };
 
-                    tracing::info!(tx = %id, %key, "GET: Response received with state: {:?}", self.state.as_ref().unwrap());
+                    tracing::info!(tx = %id, contract = %key, state = ?self.state, phase = "response", "GET Response received with state");
 
                     // Check if contract is required
                     let require_contract = matches!(
@@ -1220,7 +1233,7 @@ impl Operation for GetOp {
                             requester: None, ..
                         }) => {
                             // Original requester, operation completed successfully
-                            tracing::info!(tx = %id, %key, "Get response received for contract at original requester");
+                            tracing::info!(tx = %id, contract = %key, phase = "complete", "Get response received for contract at original requester");
                             new_state = Some(GetState::Finished { key });
                             return_msg = None;
                             result = Some(GetResult {
@@ -1234,7 +1247,7 @@ impl Operation for GetOp {
                             ..
                         }) => {
                             // Forward response to requester
-                            tracing::info!(tx = %id, %key, "Get response received for contract at hop peer");
+                            tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
                             new_state = None;
                             return_msg = Some(GetMsg::Response {
                                 id,
@@ -1253,7 +1266,7 @@ impl Operation for GetOp {
                         }
                         Some(GetState::ReceivedRequest { .. }) => {
                             // Return response to sender
-                            tracing::info!(tx = %id, "Returning contract {} to {}", key, sender);
+                            tracing::info!(tx = %id, contract = %key, peer_addr = %sender, phase = "response", "Returning contract to sender");
                             new_state = None;
                             return_msg = Some(GetMsg::Response {
                                 id,
@@ -1333,9 +1346,10 @@ async fn try_forward_or_return(
 ) -> Result<OperationResult, OpError> {
     tracing::warn!(
         tx = %id,
-        %key,
-        this_peer = %this_peer,
-        "Contract not found while processing a get request",
+        contract = %key,
+        peer_addr = %this_peer,
+        phase = "forward",
+        "Contract not found while processing a get request"
     );
 
     let mut new_skip_list = skip_list.clone();
@@ -1348,8 +1362,10 @@ async fn try_forward_or_return(
     let (new_target, alternatives) = if new_htl == 0 {
         tracing::warn!(
             tx = %id,
-            sender = %sender,
-            "The maximum hops have been exceeded, sending response back to the node",
+            peer_addr = %sender,
+            htl = 0,
+            phase = "error",
+            "The maximum hops have been exceeded, sending response back to the node"
         );
         (None, vec![])
     } else {
@@ -1362,9 +1378,10 @@ async fn try_forward_or_return(
         if candidates.is_empty() {
             tracing::warn!(
                 tx = %id,
-                %key,
-                this_peer = %this_peer,
-                "No other peers found while trying to get the contract",
+                contract = %key,
+                peer_addr = %this_peer,
+                phase = "error",
+                "No other peers found while trying to get the contract"
             );
             (None, vec![])
         } else {

@@ -141,7 +141,7 @@ impl ConfigArgs {
                     if filename.starts_with("config") {
                         match ext.as_str() {
                             "toml" => {
-                                tracing::info!("Found configuration file: {filename}");
+                                tracing::debug!(filename = %filename, "Found configuration file");
                                 return Some((filename, ext));
                             }
                             "json" => {
@@ -159,7 +159,7 @@ impl ConfigArgs {
         match config_args {
             Some((filename, ext)) => {
                 let path = dir.join(filename).with_extension(&ext);
-                tracing::info!("Reading configuration file: {path:?}",);
+                tracing::debug!(path = ?path, "Reading configuration file");
                 match ext.as_str() {
                     "toml" => {
                         let mut file = File::open(&path)?;
@@ -227,7 +227,7 @@ impl ConfigArgs {
                 self.config_paths.data_dir = Some(data);
             }
             Self::read_config(&config)?.inspect(|_| {
-                tracing::info!("Found configuration file in default directory");
+                tracing::debug!("Found configuration file in default directory");
             })
         };
 
@@ -303,7 +303,9 @@ impl ConfigArgs {
                 .await
                 .inspect_err(|error| {
                     tracing::error!(
-                        "Failed to load gateways from index (at {FREENET_GATEWAYS_INDEX}): {error}"
+                        error = %error,
+                        index = FREENET_GATEWAYS_INDEX,
+                        "Failed to load gateways from index"
                     );
                 })
                 .unwrap_or_default()
@@ -332,13 +334,17 @@ impl ConfigArgs {
             // This ensures users always use the current active gateways
             // TODO: This behavior will likely change once we release a stable version
             tracing::info!(
-                "Replacing local gateways with {} gateway(s) from remote index",
-                remotely_loaded_gateways.gateways.len()
+                gateway_count = remotely_loaded_gateways.gateways.len(),
+                "Replacing local gateways with gateways from remote index"
             );
 
             // Save the updated gateways to the local file for next time
             if let Err(e) = remotely_loaded_gateways.save_to_file(&gateways_file) {
-                tracing::warn!("Failed to save updated gateways to file: {}", e);
+                tracing::warn!(
+                    error = %e,
+                    file = ?gateways_file,
+                    "Failed to save updated gateways to file"
+                );
             }
 
             remotely_loaded_gateways
@@ -357,7 +363,11 @@ impl ConfigArgs {
                         && mode == OperationMode::Network
                         && remotely_loaded_gateways.gateways.is_empty()
                     {
-                        tracing::error!(file = ?gateways_file, "Failed to read gateways file: {err}");
+                        tracing::error!(
+                            file = ?gateways_file,
+                            error = %err,
+                            "Failed to read gateways file"
+                        );
 
                         return Err(anyhow::Error::new(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
@@ -365,7 +375,7 @@ impl ConfigArgs {
                         )));
                     }
                     if remotely_loaded_gateways.gateways.is_empty() {
-                        tracing::warn!("No gateways file found, initializing disjoint gateway, initializing a new network.");
+                        tracing::warn!("No gateways file found, initializing disjoint gateway");
                     }
                     Gateways { gateways: vec![] }
                 }
@@ -446,7 +456,7 @@ impl ConfigArgs {
 
         if should_persist {
             let path = this.config_dir().join("config.toml");
-            tracing::info!("Persisting configuration to {:?}", path);
+            tracing::info!(path = ?path, "Persisting configuration");
             let mut file = File::create(path)?;
             file.write_all(
                 toml::to_string(&this)
@@ -1234,8 +1244,8 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
             valid_gateways.push(gateway.clone());
         } else {
             tracing::warn!(
-                "Invalid public key found in remote gateway file: {:?}, ignoring",
-                gateway.public_key_path
+                public_key_path = ?gateway.public_key_path,
+                "Invalid public key found in remote gateway file, ignoring"
             );
         }
     }

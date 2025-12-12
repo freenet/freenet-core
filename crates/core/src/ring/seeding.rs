@@ -200,9 +200,9 @@ impl SeedingManager {
             {
                 subs.swap_remove(pos);
                 tracing::debug!(
-                    "Removed peer {} from subscriber list for contract {}",
-                    peer,
-                    contract
+                    contract = %contract,
+                    peer = %peer,
+                    "Removed peer from subscriber list"
                 );
             }
         }

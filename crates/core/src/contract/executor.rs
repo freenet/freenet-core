@@ -244,7 +244,7 @@ pub(crate) fn executor_channel(
     let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(1000);
     let (response_for_tx, response_for_rx) = mpsc::channel(1000);
 
-    tracing::debug!("Created executor channels with buffer size 1000");
+    tracing::debug!(buffer_size = 1000, "Created executor channels");
 
     let listener_halve = ExecutorToEventLoopChannel {
         op_manager: op_manager.clone(),
@@ -317,12 +317,19 @@ impl ExecutorToEventLoopChannel<ExecutorHalve> {
         }
 
         self.end.waiting_for_op_tx.send(tx).await.inspect_err(|_| {
-            tracing::debug!("failed to send request to executor, channel closed");
+            tracing::debug!(
+                tx = %tx,
+                "Failed to send request to executor - channel closed"
+            );
         })?;
         <T as ComposeNetworkMessage<Op>>::resume_op(op, &self.op_manager)
             .await
             .map_err(|e| {
-                tracing::debug!("failed to resume operation: {e}");
+                tracing::debug!(
+                    tx = %tx,
+                    error = %e,
+                    "Failed to resume operation"
+                );
                 e
             })?;
         Ok(tx)
@@ -353,11 +360,16 @@ impl ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
     pub async fn transaction_from_executor(&mut self) -> anyhow::Result<Transaction> {
         tracing::trace!("Waiting to receive transaction from executor channel");
         let tx = self.end.waiting_for_op_rx.recv().await.ok_or_else(|| {
-            tracing::error!("Executor channel closed - all senders have been dropped");
-            tracing::error!("This typically happens when: 1) The executor task panicked/exited, 2) Network timeout cascaded to channel closure, 3) Resource constraints in CI");
+            tracing::error!(
+                phase = "channel_closed",
+                "Executor channel closed - all senders dropped. Possible causes: 1) executor task panic, 2) network timeout cascade, 3) resource constraints"
+            );
             anyhow::anyhow!("channel closed")
         })?;
-        tracing::trace!("Successfully received transaction from executor channel");
+        tracing::trace!(
+            tx = %tx,
+            "Successfully received transaction from executor channel"
+        );
         Ok(tx)
     }
 
@@ -381,8 +393,12 @@ impl Stream for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
 
 impl ExecutorToEventLoopChannel<Callback> {
     pub async fn response(&mut self, result: OpEnum) {
+        let tx_id = *result.id();
         if self.end.response_for_tx.send(result).await.is_err() {
-            tracing::debug!("failed to send response to executor, channel closed");
+            tracing::debug!(
+                tx = %tx_id,
+                "Failed to send response to executor - channel closed"
+            );
         }
     }
 }
@@ -622,14 +638,22 @@ impl<R> Executor<R> {
                     continue;
                 }
                 Err(CallbackError::Conversion(err)) => {
-                    tracing::error!("expect message of one type but got an other: {err}");
+                    tracing::error!(
+                        tx = %transaction,
+                        error = %err,
+                        "Expected message of one type but got another"
+                    );
                     return Err(ExecutorError::other(err));
                 }
                 Err(CallbackError::Err(other)) => return Err(other),
             }
         };
         let result = <Op::Result>::try_from(result).map_err(|err| {
-            tracing::debug!("didn't get result back: {err}");
+            tracing::debug!(
+                tx = %transaction,
+                error = %err,
+                "Failed to convert operation result"
+            );
             ExecutorError::other(err)
         })?;
         Ok(result)

@@ -211,7 +211,12 @@ async fn register_subscription_listener(
     subscription_listener: UnboundedSender<HostResult>,
     operation_type: &str,
 ) -> Result<(), Error> {
-    tracing::debug!(%client_id, %key, "Registering subscription for {} with auto-subscribe", operation_type);
+    tracing::debug!(
+        client_id = %client_id,
+        contract = %key,
+        operation = operation_type,
+        "Registering subscription listener"
+    );
     let register_listener = op_manager
         .notify_contract_handler(ContractHandlerEvent::RegisterSubscriberListener {
             key,
@@ -222,22 +227,30 @@ async fn register_subscription_listener(
         .await
         .inspect_err(|err| {
             tracing::error!(
-                %client_id, %key,
-                "Register subscriber listener error for {}: {}", operation_type, err
+                client_id = %client_id,
+                contract = %key,
+                operation = operation_type,
+                error = %err,
+                "Register subscriber listener failed"
             );
         });
     match register_listener {
         Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
             tracing::debug!(
-                %client_id, %key,
-                "Subscriber listener registered successfully for {}", operation_type
+                client_id = %client_id,
+                contract = %key,
+                operation = operation_type,
+                "Subscriber listener registered successfully"
             );
             Ok(())
         }
         _ => {
             tracing::error!(
-                %client_id, %key,
-                "Subscriber listener registration failed for {}", operation_type
+                client_id = %client_id,
+                contract = %key,
+                operation = operation_type,
+                phase = "registration_failed",
+                "Subscriber listener registration failed"
             );
             Err(Error::Op(OpError::UnexpectedOpState))
         }
@@ -269,7 +282,12 @@ where
             client_request = client_events.recv() => {
                 let req = match client_request {
                     Ok(request) => {
-                        tracing::debug!(%request, "got client request event");
+                        tracing::debug!(
+                            client_id = %request.client_id,
+                            request_id = %request.request_id,
+                            request_type = ?request.request,
+                            "Received client request"
+                        );
                         request
                     }
                     Err(error) if matches!(error.kind(), ErrorKind::Shutdown) => {
@@ -280,7 +298,7 @@ where
                         return Err(anyhow::anyhow!(error));
                     }
                     Err(error) => {
-                        tracing::debug!(%error, "client error");
+                        tracing::debug!(error = %error, "Client error");
                         continue;
                     }
                 };
@@ -297,20 +315,36 @@ where
                         }
                         Ok(None) => (cli_id, Ok(None)),
                         Err(Error::Disconnected) => {
-                            tracing::debug!("client disconnected");
+                            tracing::debug!(client_id = %cli_id, "Client disconnected");
                             (cli_id, Err(ClientError::from(ErrorKind::Disconnect)))
                         }
-                        Err(err) => (cli_id, Err(ErrorKind::OperationError { cause: format!("{err}").into() }.into())),
+                        Err(err) => {
+                            tracing::error!(
+                                client_id = %cli_id,
+                                error = %err,
+                                "Operation error"
+                            );
+                            (cli_id, Err(ErrorKind::OperationError { cause: format!("{err}").into() }.into()))
+                        }
                     }
                 });
             }
             res = client_responses.recv() => {
-                if let Some((cli_id, _request_id, res)) = res {
+                if let Some((cli_id, request_id, res)) = res {
                     if let Ok(result) = &res {
-                        tracing::debug!(%result, "sending client response");
+                        tracing::debug!(
+                            client_id = %cli_id,
+                            request_id = %request_id,
+                            response = %result,
+                            "Sending client response"
+                        );
                     }
                     if let Err(err) = client_events.send(cli_id, res).await {
-                        tracing::debug!("channel closed: {err}");
+                        tracing::debug!(
+                            client_id = %cli_id,
+                            error = %err,
+                            "Client channel closed"
+                        );
                         anyhow::bail!(err);
                     }
                 }
@@ -362,17 +396,32 @@ where
                             }
                         };
                         if let Ok(result) = &res {
-                            tracing::debug!(%result, "sending client operation response");
+                            tracing::debug!(
+                                client_id = %cli_id,
+                                response = %result,
+                                "Sending client operation response"
+                            );
                         }
                         if let Err(err) = client_events.send(cli_id, res).await {
-                            tracing::debug!("channel closed: {err}");
+                            tracing::debug!(
+                                client_id = %cli_id,
+                                error = %err,
+                                "Client channel closed"
+                            );
                             anyhow::bail!(err);
                         }
                     }
                     (_, Ok(None)) => continue,
                     // TODO: we should change the API so client requests have a unique id so we can map specific responses
                     // to the specific client request
-                    (cli_id, Err(err)) => client_events.send(cli_id, Err(err)).await?,
+                    (cli_id, Err(err)) => {
+                        tracing::error!(
+                            client_id = %cli_id,
+                            error = %err,
+                            "Sending error response to client"
+                        );
+                        client_events.send(cli_id, Err(err)).await?
+                    }
                 }
             }
         }
@@ -437,21 +486,31 @@ async fn process_open_request(
                                 .load(std::sync::atomic::Ordering::SeqCst)
                         {
                             tracing::warn!(
-                                "Client attempted PUT operation before peer initialization complete. \
-                                Peer must complete initial network handshake before processing client operations."
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                phase = "peer_not_ready",
+                                "Client attempted PUT operation before peer initialization complete"
                             );
                             return Err(Error::Disconnected);
                         }
 
                         let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
                         else {
-                            tracing::error!("peer address not found at put op, it should be set");
+                            tracing::error!(
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                phase = "no_peer_address",
+                                "Peer address not found for PUT operation"
+                            );
                             return Err(Error::Disconnected);
                         };
 
                         tracing::debug!(
-                            this_peer = %peer_id,
-                            "Received put from user event",
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            peer = %peer_id,
+                            phase = "request",
+                            "Received PUT request from client"
                         );
 
                         let contract_key = contract.key();
@@ -469,9 +528,12 @@ async fn process_open_request(
                         if !has_remote_peers {
                             // Local-only PUT - bypass router to avoid race condition
                             tracing::debug!(
-                                peer_id = %peer_id,
-                                key = %contract_key,
-                                "PUT will complete locally (no remote peers), starting direct local PUT operation"
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                peer = %peer_id,
+                                contract = %contract_key,
+                                phase = "local_only",
+                                "PUT will complete locally (no remote peers)"
                             );
 
                             // Start a local PUT operation without going through the router
@@ -491,13 +553,27 @@ async fn process_open_request(
                                 .waiting_for_transaction_result(op_id, client_id, request_id)
                                 .await
                                 .inspect_err(|err| {
-                                    tracing::error!("Error waiting for transaction result: {}", err)
+                                    tracing::error!(
+                                        client_id = %client_id,
+                                        request_id = %request_id,
+                                        tx = %op_id,
+                                        error = %err,
+                                        "Error waiting for transaction result"
+                                    )
                                 })?;
 
                             // Execute the PUT operation
                             // Since there are no remote peers, this will complete locally
                             if let Err(err) = put::request_put(&op_manager, op).await {
-                                tracing::error!("Local PUT request error: {}", err);
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %op_id,
+                                    contract = %contract_key,
+                                    error = %err,
+                                    phase = "error",
+                                    "Local PUT request failed"
+                                );
 
                                 // Notify client of error via result router
                                 let error_response = Err(ErrorKind::OperationError {
@@ -511,8 +587,9 @@ async fn process_open_request(
                                     .await
                                 {
                                     tracing::error!(
-                                        "Failed to send PUT error to result router: {}. Transaction: {}",
-                                        e, op_id
+                                        tx = %op_id,
+                                        error = %e,
+                                        "Failed to send PUT error to result router"
                                     );
                                 }
                             }
@@ -523,9 +600,12 @@ async fn process_open_request(
                             // and deliver results through the normal transaction mechanism.
                         } else if let Some(router) = &request_router {
                             tracing::debug!(
-                                peer_id = %peer_id,
-                                key = %contract_key,
-                                "Routing PUT request through deduplication layer",
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                peer = %peer_id,
+                                contract = %contract_key,
+                                phase = "routing",
+                                "Routing PUT request through deduplication layer"
                             );
 
                             let request = crate::node::DeduplicatedRequest::Put {
@@ -562,9 +642,13 @@ async fn process_open_request(
                             // Only start new network operation if this is a new operation
                             if should_start_operation {
                                 tracing::debug!(
-                                    peer_id = %peer_id,
-                                    key = %contract_key,
-                                    "Starting new PUT network operation via RequestRouter",
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %transaction_id,
+                                    peer = %peer_id,
+                                    contract = %contract_key,
+                                    phase = "new_operation",
+                                    "Starting new PUT network operation"
                                 );
 
                                 let op = put::start_op_with_id(
@@ -577,7 +661,15 @@ async fn process_open_request(
                                 );
 
                                 if let Err(err) = put::request_put(&op_manager, op).await {
-                                    tracing::error!("Put request error: {}", err);
+                                    tracing::error!(
+                                        client_id = %client_id,
+                                        request_id = %request_id,
+                                        tx = %transaction_id,
+                                        contract = %contract_key,
+                                        error = %err,
+                                        phase = "error",
+                                        "PUT request failed"
+                                    );
 
                                     // Notify client of error via result router
                                     let error_response = Err(ErrorKind::OperationError {
@@ -591,23 +683,31 @@ async fn process_open_request(
                                         .await
                                     {
                                         tracing::error!(
-                                            "Failed to send PUT error to result router: {}. Transaction: {}",
-                                            e, transaction_id
+                                            tx = %transaction_id,
+                                            error = %e,
+                                            "Failed to send PUT error to result router"
                                         );
                                     }
                                 }
                             } else {
                                 tracing::debug!(
-                                    peer_id = %peer_id,
-                                    key = %contract_key,
-                                    "Reusing existing PUT operation via RequestRouter - client registered for result",
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %transaction_id,
+                                    peer = %peer_id,
+                                    contract = %contract_key,
+                                    phase = "reuse",
+                                    "Reusing existing PUT operation - client registered for result"
                                 );
                             }
                         } else {
                             tracing::debug!(
-                                peer_id = %peer_id,
-                                key = %contract_key,
-                                "Starting direct PUT operation (legacy mode)",
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                peer = %peer_id,
+                                contract = %contract_key,
+                                phase = "legacy",
+                                "Starting direct PUT operation (legacy mode)"
                             );
 
                             // Legacy mode: direct operation without deduplication
@@ -625,11 +725,25 @@ async fn process_open_request(
                                 .waiting_for_transaction_result(op_id, client_id, request_id)
                                 .await
                                 .inspect_err(|err| {
-                                    tracing::error!("Error waiting for transaction result: {}", err)
+                                    tracing::error!(
+                                        client_id = %client_id,
+                                        request_id = %request_id,
+                                        tx = %op_id,
+                                        error = %err,
+                                        "Error waiting for transaction result"
+                                    )
                                 })?;
 
                             if let Err(err) = put::request_put(&op_manager, op).await {
-                                tracing::error!("Put request error: {}", err);
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %op_id,
+                                    contract = %contract_key,
+                                    error = %err,
+                                    phase = "error",
+                                    "PUT request failed"
+                                );
 
                                 // Notify client of error via result router
                                 let error_response = Err(ErrorKind::OperationError {
@@ -643,8 +757,9 @@ async fn process_open_request(
                                     .await
                                 {
                                     tracing::error!(
-                                        "Failed to send PUT error to result router: {}. Transaction: {}",
-                                        e, op_id
+                                        tx = %op_id,
+                                        error = %e,
+                                        "Failed to send PUT error to result router"
                                     );
                                 }
                             }
@@ -662,7 +777,11 @@ async fn process_open_request(
                                 )
                                 .await?;
                             } else {
-                                tracing::warn!(%client_id, %contract_key, "PUT with subscribe=true but no subscription_listener");
+                                tracing::warn!(
+                                    client_id = %client_id,
+                                    contract = %contract_key,
+                                    "PUT with subscribe=true but no subscription_listener"
+                                );
                             }
                         }
                     }
@@ -670,22 +789,33 @@ async fn process_open_request(
                         let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
                         else {
                             tracing::error!(
-                                "Peer address not found at update op, it should be set"
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                phase = "no_peer_address",
+                                "Peer address not found for UPDATE operation"
                             );
                             return Err(Error::Disconnected);
                         };
 
                         tracing::debug!(
-                            this_peer = %peer_id,
-                            "Received update from user event",
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            peer = %peer_id,
+                            contract = %key,
+                            phase = "request",
+                            "Received UPDATE request from client"
                         );
 
                         let related_contracts = RelatedContracts::default();
 
                         tracing::debug!(
-                            this_peer = %peer_id,
-                            ?data,
-                            "Starting update op",
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            peer = %peer_id,
+                            contract = %key,
+                            data = ?data,
+                            phase = "starting",
+                            "Starting UPDATE operation"
                         );
                         let update_response = op_manager
                             .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
@@ -705,24 +835,46 @@ async fn process_open_request(
                             ContractHandlerEvent::UpdateNoChange { key } => {
                                 // This should not happen anymore since we now return UpdateResponse
                                 // from the contract handler even for NoChange cases
-                                tracing::warn!(%key, "Unexpected UpdateNoChange event - this should have been converted to UpdateResponse");
+                                tracing::warn!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    phase = "unexpected_no_change",
+                                    "Unexpected UpdateNoChange event"
+                                );
                                 return Err(OpError::UnexpectedOpState.into());
                             }
                             _ => return Err(OpError::UnexpectedOpState.into()),
                         }
-                        .inspect_err(|err| tracing::error!(%key, "update query failed: {}", err))?;
+                        .inspect_err(|err| {
+                            tracing::error!(
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                contract = %key,
+                                error = %err,
+                                phase = "error",
+                                "UPDATE query failed"
+                            )
+                        })?;
 
                         tracing::debug!(
-                            this_peer = %peer_id,
-                            ?new_state,
-                            "Sending update op",
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            peer = %peer_id,
+                            contract = %key,
+                            new_state = ?new_state,
+                            phase = "sending",
+                            "Sending UPDATE operation"
                         );
 
                         if let Some(router) = &request_router {
                             tracing::debug!(
-                                peer_id = %peer_id,
-                                key = %key,
-                                "Routing UPDATE request through deduplication layer",
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                peer = %peer_id,
+                                contract = %key,
+                                phase = "routing",
+                                "Routing UPDATE request through deduplication layer"
                             );
 
                             let request = crate::node::DeduplicatedRequest::Update {
@@ -757,9 +909,13 @@ async fn process_open_request(
                             // Only start new network operation if this is a new operation
                             if should_start_operation {
                                 tracing::debug!(
-                                    peer_id = %peer_id,
-                                    key = %key,
-                                    "Starting new UPDATE network operation via RequestRouter",
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %transaction_id,
+                                    peer = %peer_id,
+                                    contract = %key,
+                                    phase = "new_operation",
+                                    "Starting new UPDATE network operation"
                                 );
 
                                 let op = update::start_op_with_id(
@@ -779,7 +935,15 @@ async fn process_open_request(
                                 match update::request_update(&op_manager, op).await {
                                     Ok(()) | Err(OpError::StatePushed) => {}
                                     Err(err) => {
-                                        tracing::error!("request update error {}", err);
+                                        tracing::error!(
+                                            client_id = %client_id,
+                                            request_id = %request_id,
+                                            tx = %transaction_id,
+                                            contract = %key,
+                                            error = %err,
+                                            phase = "error",
+                                            "UPDATE request failed"
+                                        );
 
                                         // Notify client of error via result router
                                         let error_response = Err(ErrorKind::OperationError {
@@ -794,24 +958,32 @@ async fn process_open_request(
                                             .await
                                         {
                                             tracing::error!(
-                                                "Failed to send UPDATE error to result router: {}. Transaction: {}",
-                                                e, transaction_id
+                                                tx = %transaction_id,
+                                                error = %e,
+                                                "Failed to send UPDATE error to result router"
                                             );
                                         }
                                     }
                                 }
                             } else {
                                 tracing::debug!(
-                                    peer_id = %peer_id,
-                                    key = %key,
-                                    "Reusing existing UPDATE operation via RequestRouter - client registered for result",
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %transaction_id,
+                                    peer = %peer_id,
+                                    contract = %key,
+                                    phase = "reuse",
+                                    "Reusing existing UPDATE operation - client registered for result"
                                 );
                             }
                         } else {
                             tracing::debug!(
-                                peer_id = %peer_id,
-                                key = %key,
-                                "Starting direct UPDATE operation (legacy mode)",
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                peer = %peer_id,
+                                contract = %key,
+                                phase = "legacy",
+                                "Starting direct UPDATE operation (legacy mode)"
                             );
 
                             // Legacy mode: direct operation without deduplication
@@ -837,7 +1009,15 @@ async fn process_open_request(
                                 })?;
 
                             if let Err(err) = update::request_update(&op_manager, op).await {
-                                tracing::error!("request update error {}", err);
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %op_id,
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "error",
+                                    "UPDATE request failed"
+                                );
 
                                 // Notify client of error via result router
                                 let error_response = Err(ErrorKind::OperationError {
@@ -851,8 +1031,9 @@ async fn process_open_request(
                                     .await
                                 {
                                     tracing::error!(
-                                        "Failed to send UPDATE error to result router: {}. Transaction: {}",
-                                        e, op_id
+                                        tx = %op_id,
+                                        error = %e,
+                                        "Failed to send UPDATE error to result router"
                                     );
                                 }
                             }
@@ -865,7 +1046,12 @@ async fn process_open_request(
                     } => {
                         let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
                         else {
-                            tracing::error!("Peer address not found at get op, it should be set");
+                            tracing::error!(
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                phase = "no_peer_address",
+                                "Peer address not found for GET operation"
+                            );
                             return Err(Error::Disconnected);
                         };
 
@@ -883,15 +1069,35 @@ async fn process_open_request(
                             Ok(ContractHandlerEvent::GetResponse {
                                 response: Err(err), ..
                             }) => {
-                                tracing::error!("get query failed: {}", err);
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "error",
+                                    "GET query failed (executor error)"
+                                );
                                 return Err(Error::Executor(err));
                             }
                             Err(err) => {
-                                tracing::error!("get query failed: {}", err);
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "error",
+                                    "GET query failed (contract error)"
+                                );
                                 return Err(Error::Contract(err));
                             }
                             Ok(_) => {
-                                tracing::error!("get query failed: UnexpectedOpState");
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    phase = "error",
+                                    "GET query failed (unexpected state)"
+                                );
                                 return Err(Error::Op(OpError::UnexpectedOpState));
                             }
                         };
@@ -901,8 +1107,12 @@ async fn process_open_request(
                         {
                             if let Some(state) = state {
                                 tracing::debug!(
-                                    this_peer = %peer_id,
-                                    "Contract found, returning get result",
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    peer = %peer_id,
+                                    contract = %key,
+                                    phase = "local_found",
+                                    "Contract found locally, returning GET result"
                                 );
 
                                 // Handle subscription for locally found contracts
@@ -917,7 +1127,11 @@ async fn process_open_request(
                                         )
                                         .await?;
                                     } else {
-                                        tracing::warn!(%client_id, %key, "GET with subscribe=true but no subscription_listener");
+                                        tracing::warn!(
+                                            client_id = %client_id,
+                                            contract = %key,
+                                            "GET with subscribe=true but no subscription_listener"
+                                        );
                                     }
                                 }
 
@@ -929,8 +1143,12 @@ async fn process_open_request(
                             }
                         } else if let Some(router) = &request_router {
                             tracing::debug!(
-                                this_peer = %peer_id,
-                                "Contract not found, routing GET request through deduplication layer",
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                peer = %peer_id,
+                                contract = %key,
+                                phase = "not_found_routing",
+                                "Contract not found locally, routing GET request through deduplication layer"
                             );
 
                             let request = crate::node::DeduplicatedRequest::Get {
@@ -965,9 +1183,13 @@ async fn process_open_request(
                             // Only start new network operation if this is a new operation
                             if should_start_operation {
                                 tracing::debug!(
-                                    this_peer = %peer_id,
-                                    key = %key,
-                                    "Starting new GET network operation via RequestRouter",
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %transaction_id,
+                                    peer = %peer_id,
+                                    contract = %key,
+                                    phase = "new_operation",
+                                    "Starting new GET network operation"
                                 );
 
                                 let op = get::start_op_with_id(
@@ -980,7 +1202,15 @@ async fn process_open_request(
                                 if let Err(err) =
                                     get::request_get(&op_manager, op, HashSet::new()).await
                                 {
-                                    tracing::error!("get::request_get error: {}", err);
+                                    tracing::error!(
+                                        client_id = %client_id,
+                                        request_id = %request_id,
+                                        tx = %transaction_id,
+                                        contract = %key,
+                                        error = %err,
+                                        phase = "error",
+                                        "GET request failed"
+                                    );
 
                                     // Notify client of error via result router
                                     let error_response = Err(ErrorKind::OperationError {
@@ -994,16 +1224,21 @@ async fn process_open_request(
                                         .await
                                     {
                                         tracing::error!(
-                                            "Failed to send GET error to result router: {}. Transaction: {}",
-                                            e, transaction_id
+                                            tx = %transaction_id,
+                                            error = %e,
+                                            "Failed to send GET error to result router"
                                         );
                                     }
                                 }
                             } else {
                                 tracing::debug!(
-                                    this_peer = %peer_id,
-                                    key = %key,
-                                    "Reusing existing GET operation via RequestRouter - client registered for result",
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %transaction_id,
+                                    peer = %peer_id,
+                                    contract = %key,
+                                    phase = "reuse",
+                                    "Reusing existing GET operation - client registered for result"
                                 );
                             }
 
@@ -1019,13 +1254,21 @@ async fn process_open_request(
                                     )
                                     .await?;
                                 } else {
-                                    tracing::warn!(%client_id, %key, "GET with subscribe=true but no subscription_listener");
+                                    tracing::warn!(
+                                        client_id = %client_id,
+                                        contract = %key,
+                                        "GET with subscribe=true but no subscription_listener"
+                                    );
                                 }
                             }
                         } else {
                             tracing::debug!(
-                                this_peer = %peer_id,
-                                "Contract not found, starting direct GET operation (legacy mode)",
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                peer = %peer_id,
+                                contract = %key,
+                                phase = "legacy",
+                                "Contract not found locally, starting direct GET operation (legacy mode)"
                             );
 
                             // Legacy mode: direct operation without deduplication
@@ -1037,13 +1280,27 @@ async fn process_open_request(
                                 .waiting_for_transaction_result(op_id, client_id, request_id)
                                 .await
                                 .inspect_err(|err| {
-                                    tracing::error!("Error waiting for transaction result: {}", err)
+                                    tracing::error!(
+                                        client_id = %client_id,
+                                        request_id = %request_id,
+                                        tx = %op_id,
+                                        error = %err,
+                                        "Error waiting for transaction result"
+                                    )
                                 })?;
 
                             if let Err(err) =
                                 get::request_get(&op_manager, op, HashSet::new()).await
                             {
-                                tracing::error!("Get request error: {}", err);
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %op_id,
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "error",
+                                    "GET request failed"
+                                );
 
                                 // Notify client of error via result router
                                 let error_response = Err(ErrorKind::OperationError {
@@ -1057,8 +1314,9 @@ async fn process_open_request(
                                     .await
                                 {
                                     tracing::error!(
-                                        "Failed to send GET error to result router: {}. Transaction: {}",
-                                        e, op_id
+                                        tx = %op_id,
+                                        error = %e,
+                                        "Failed to send GET error to result router"
                                     );
                                 }
                             }
@@ -1075,7 +1333,11 @@ async fn process_open_request(
                                     )
                                     .await?;
                                 } else {
-                                    tracing::warn!(%client_id, %key, "GET with subscribe=true but no subscription_listener");
+                                    tracing::warn!(
+                                        client_id = %client_id,
+                                        contract = %key,
+                                        "GET with subscribe=true but no subscription_listener"
+                                    );
                                 }
                             }
                         }
@@ -1084,18 +1346,30 @@ async fn process_open_request(
                         let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
                         else {
                             tracing::error!(
-                                "Peer address not found at subscribe op, it should be set"
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                phase = "no_peer_address",
+                                "Peer address not found for SUBSCRIBE operation"
                             );
                             return Err(Error::Disconnected);
                         };
 
                         tracing::debug!(
-                            this_peer = %peer_id,
-                            "Received subscribe from user event",
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            peer = %peer_id,
+                            contract = %key,
+                            phase = "request",
+                            "Received SUBSCRIBE request from client"
                         );
 
                         let Some(subscriber_listener) = subscription_listener else {
-                            tracing::error!(%client_id, "No subscriber listener");
+                            tracing::error!(
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                contract = %key,
+                                "No subscriber listener for SUBSCRIBE request"
+                            );
                             return Ok(None);
                         };
 
@@ -1111,20 +1385,29 @@ async fn process_open_request(
                             .await
                             .inspect_err(|err| {
                                 tracing::error!(
-                                    %client_id, %key,
-                                    "Register subscriber listener error: {}", err
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    error = %err,
+                                    "Register subscriber listener error"
                                 );
                             });
                         match register_listener {
                             Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
                                 tracing::debug!(
-                                    %client_id, %key,
-                                    "Subscriber listener registered successfully (before subscribe op)"
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    phase = "listener_registered",
+                                    "Subscriber listener registered successfully"
                                 );
                             }
                             _ => {
                                 tracing::error!(
-                                    %client_id, %key,
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    phase = "registration_failed",
                                     "Subscriber listener registration failed"
                                 );
                                 return Err(Error::Op(OpError::UnexpectedOpState));
@@ -1139,9 +1422,12 @@ async fn process_open_request(
                         // Solution: Each client gets their own Subscribe operation (they're lightweight)
                         if let Some(_router) = &request_router {
                             tracing::debug!(
-                                peer_id = %peer_id,
-                                key = %key,
-                                "Processing SUBSCRIBE without deduplication",
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                peer = %peer_id,
+                                contract = %key,
+                                phase = "no_dedup",
+                                "Processing SUBSCRIBE without deduplication (instant-completion race avoidance)"
                             );
 
                             // Create operation with new transaction ID
@@ -1175,7 +1461,15 @@ async fn process_open_request(
                             )
                             .await
                             .inspect_err(|err| {
-                                tracing::error!("Subscribe error: {}", err);
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %tx,
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "error",
+                                    "SUBSCRIBE operation failed"
+                                );
                             })?;
 
                             tracing::debug!(
@@ -1210,7 +1504,15 @@ async fn process_open_request(
                             crate::node::subscribe_with_id(op_manager.clone(), key, None, Some(tx))
                                 .await
                                 .inspect_err(|err| {
-                                    tracing::error!("Subscribe error: {}", err);
+                                    tracing::error!(
+                                        client_id = %client_id,
+                                        request_id = %request_id,
+                                        tx = %tx,
+                                        contract = %key,
+                                        error = %err,
+                                        phase = "error",
+                                        "SUBSCRIBE operation failed"
+                                    );
                                 })?;
 
                             tracing::debug!(
@@ -1222,12 +1524,21 @@ async fn process_open_request(
                         }
                     }
                     _ => {
-                        tracing::error!("Op not supported");
+                        tracing::error!(
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            "Unsupported contract operation"
+                        );
                     }
                 }
             }
             ClientRequest::DelegateOp(req) => {
-                tracing::debug!("Received delegate operation from user event");
+                tracing::debug!(
+                    client_id = %client_id,
+                    request_id = %request_id,
+                    phase = "request",
+                    "Received delegate operation from client"
+                );
                 let delegate_key = req.key().clone();
                 let attested_contract = request.attested_contract;
 
@@ -1240,11 +1551,24 @@ async fn process_open_request(
                 {
                     Ok(ContractHandlerEvent::DelegateResponse(res)) => res,
                     Err(err) => {
-                        tracing::error!("delegate operation failed: {}", err);
+                        tracing::error!(
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            delegate = %delegate_key,
+                            error = %err,
+                            phase = "error",
+                            "Delegate operation failed (contract error)"
+                        );
                         return Err(Error::Contract(err));
                     }
                     Ok(_) => {
-                        tracing::error!("delegate operation failed: UnexpectedOpState");
+                        tracing::error!(
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            delegate = %delegate_key,
+                            phase = "error",
+                            "Delegate operation failed (unexpected state)"
+                        );
                         return Err(Error::Op(OpError::UnexpectedOpState));
                     }
                 };
@@ -1257,6 +1581,9 @@ async fn process_open_request(
                 if let Some(ch) = &subscription_listener {
                     if ch.send(host_response).is_err() {
                         tracing::error!(
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            delegate = %delegate_key,
                             "Failed to send delegate response through subscription channel"
                         );
                     }
@@ -1270,13 +1597,26 @@ async fn process_open_request(
                 })));
             }
             ClientRequest::Disconnect { .. } => {
-                tracing::debug!("Received disconnect from user event");
+                tracing::debug!(
+                    client_id = %client_id,
+                    request_id = %request_id,
+                    "Received disconnect request from client"
+                );
             }
             ClientRequest::NodeQueries(query) => {
-                tracing::debug!("Received node queries from user event: {:?}", query);
+                tracing::debug!(
+                    client_id = %client_id,
+                    request_id = %request_id,
+                    query = ?query,
+                    "Received node query from client"
+                );
 
                 let Some(tx) = callback_tx else {
-                    tracing::error!("callback_tx not available for NodeQueries");
+                    tracing::error!(
+                        client_id = %client_id,
+                        request_id = %request_id,
+                        "callback_tx not available for NodeQueries"
+                    );
                     unreachable!("callback_tx should always be Some for NodeQueries based on initialization logic");
                 };
 
@@ -1295,13 +1635,22 @@ async fn process_open_request(
                     }
                     freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo => {
                         // TODO: Implement proximity cache info query
-                        tracing::warn!("ProximityCacheInfo query not yet implemented");
+                        tracing::warn!(
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            "ProximityCacheInfo query not yet implemented"
+                        );
                         return Ok(None);
                     }
                 };
 
                 if let Err(err) = op_manager.notify_node_event(node_event).await {
-                    tracing::error!("notify_node_event error: {}", err);
+                    tracing::error!(
+                        client_id = %client_id,
+                        request_id = %request_id,
+                        error = %err,
+                        "notify_node_event error"
+                    );
                     return Err(Error::from(err));
                 }
 
@@ -1311,7 +1660,11 @@ async fn process_open_request(
                 return Err(Error::Disconnected);
             }
             _ => {
-                tracing::error!("Op not supported");
+                tracing::error!(
+                    client_id = %client_id,
+                    request_id = %request_id,
+                    "Unsupported operation"
+                );
             }
         }
         Ok(None)
@@ -1325,7 +1678,10 @@ async fn process_open_request(
         Ok(Ok(res)) => Ok(res),
         Ok(Err(err)) => Err(err),
         Err(err) => {
-            tracing::error!("Error processing client request: {}", err);
+            tracing::error!(
+                error = %err,
+                "Error processing client request (task panic)"
+            );
             Err(Error::from(err))
         }
     })

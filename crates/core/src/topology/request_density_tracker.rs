@@ -135,7 +135,7 @@ impl DensityMap {
         tracing::debug!("get_max_density called");
 
         if self.neighbor_request_counts.is_empty() {
-            tracing::warn!("No neighbors to get max density from");
+            tracing::debug!("No neighbors to get max density from");
             return Err(DensityMapError::EmptyNeighbors);
         }
 
@@ -162,13 +162,13 @@ impl DensityMap {
             );
             let _enter = span.enter();
             let combined_count = previous_neighbor_count + next_neighbor_count;
-            tracing::debug!("Combined count for neighbor pair: {}", combined_count);
+            tracing::debug!(combined_count, "Combined count for neighbor pair");
 
             if combined_count > max_density {
                 tracing::debug!(
-                    "New max density found: {} at location {:?}",
-                    combined_count,
-                    max_density_location
+                    max_density = combined_count,
+                    location = %max_density_location,
+                    "New max density found"
                 );
                 max_density = combined_count;
                 max_density_location = Location::new(
@@ -188,10 +188,7 @@ impl DensityMap {
         ) = (first_neighbor, last_neighbor)
         {
             let combined_count = first_neighbor_count + last_neighbor_count;
-            tracing::debug!(
-                "Combined count for first and last neighbor: {}",
-                combined_count
-            );
+            tracing::debug!(combined_count, "Combined count for first and last neighbor");
 
             if combined_count > max_density {
                 // max_density = combined_count; Not needed as this is the last check
@@ -202,13 +199,13 @@ impl DensityMap {
                 }
                 max_density_location = Location::new(mp);
                 tracing::debug!(
-                    "New max density found at the edge: location {:?}",
-                    max_density_location
+                    location = %max_density_location,
+                    "New max density found at the edge"
                 );
             }
         }
 
-        tracing::debug!("Returning max density location: {:?}", max_density_location);
+        tracing::debug!(location = %max_density_location, "Returning max density location");
         Ok(max_density_location)
     }
 }

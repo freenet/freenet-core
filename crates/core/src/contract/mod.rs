@@ -31,7 +31,10 @@ where
 {
     loop {
         let (id, event) = contract_handler.channel().recv_from_sender().await?;
-        tracing::debug!(%event, "Got contract handling event");
+        tracing::debug!(
+            event = %event,
+            "Received contract handling event"
+        );
         match event {
             ContractHandlerEvent::GetQuery {
                 key,
@@ -44,7 +47,14 @@ where
                     .await
                 {
                     Ok((state, contract)) => {
-                        tracing::debug!(with_contract_code = %return_contract_code, has_contract = %contract.is_some(), "Fetched contract {key}");
+                        tracing::debug!(
+                            contract = %key,
+                            with_contract_code = return_contract_code,
+                            has_contract = contract.is_some(),
+                            has_state = state.is_some(),
+                            phase = "get_complete",
+                            "Fetched contract"
+                        );
                         contract_handler
                             .channel()
                             .send_to_sender(
@@ -56,14 +66,27 @@ where
                             )
                             .await
                             .map_err(|error| {
-                                tracing::debug!(%error, "shutting down contract handler");
+                                tracing::debug!(
+                                    error = %error,
+                                    "Shutting down contract handler"
+                                );
                                 error
                             })?;
                     }
                     Err(err) => {
-                        tracing::warn!("Error while executing get contract query: {err}");
+                        tracing::warn!(
+                            contract = %key,
+                            error = %err,
+                            phase = "get_failed",
+                            "Error executing get contract query"
+                        );
                         if err.is_fatal() {
-                            tracing::error!(%key, %err, "Fatal executor error during get query");
+                            tracing::error!(
+                                contract = %key,
+                                error = %err,
+                                phase = "fatal_error",
+                                "Fatal executor error during get query"
+                            );
                             return Err(ContractError::FatalExecutorError { key, error: err });
                         }
                         contract_handler
@@ -77,7 +100,10 @@ where
                             )
                             .await
                             .map_err(|error| {
-                                tracing::debug!(%error, "shutting down contract handler");
+                                tracing::debug!(
+                                    error = %error,
+                                    "Shutting down contract handler"
+                                );
                                 error
                             })?;
                     }
@@ -92,17 +118,19 @@ where
                 // DEBUG: Log contract details in PutQuery handler
                 if let Some(ref contract_container) = contract {
                     tracing::debug!(
-                        "DEBUG PUT: In PutQuery handler - key={}, key.code_hash={:?}, contract.key={}, contract.key.code_hash={:?}, data_len={}",
-                        key,
-                        key.code_hash(),
-                        contract_container.key(),
-                        contract_container.key().code_hash(),
-                        contract_container.data().len()
+                        contract = %key,
+                        key_code_hash = ?key.code_hash(),
+                        container_key = %contract_container.key(),
+                        container_code_hash = ?contract_container.key().code_hash(),
+                        data_len = contract_container.data().len(),
+                        phase = "put_query_debug",
+                        "DEBUG PUT: In PutQuery handler with contract"
                     );
                 } else {
                     tracing::debug!(
-                        "DEBUG PUT: In PutQuery handler - contract is None for key={}",
-                        key
+                        contract = %key,
+                        phase = "put_query_debug",
+                        "DEBUG PUT: In PutQuery handler - contract is None"
                     );
                 }
 
@@ -126,7 +154,12 @@ where
                     },
                     Err(err) => {
                         if err.is_fatal() {
-                            tracing::error!(%key, %err, "Fatal executor error during put query");
+                            tracing::error!(
+                                contract = %key,
+                                error = %err,
+                                phase = "fatal_error",
+                                "Fatal executor error during put query"
+                            );
                             return Err(ContractError::FatalExecutorError { key, error: err });
                         }
                         ContractHandlerEvent::PutResponse {
@@ -140,7 +173,10 @@ where
                     .send_to_sender(id, event_result)
                     .await
                     .map_err(|error| {
-                        tracing::debug!(%error, "shutting down contract handler");
+                        tracing::debug!(
+                            error = %error,
+                            "Shutting down contract handler"
+                        );
                         error
                     })?;
             }
@@ -164,23 +200,40 @@ where
 
                 let event_result = match update_result {
                     Ok(UpsertResult::NoChange) => {
-                        tracing::info!(%key, "UPDATE resulted in NoChange, fetching current state to return UpdateResponse");
+                        tracing::info!(
+                            contract = %key,
+                            phase = "update_no_change",
+                            "UPDATE resulted in NoChange, fetching current state to return UpdateResponse"
+                        );
                         // When there's no change, we still need to return the current state
                         // so the client gets a proper response
                         match contract_handler.executor().fetch_contract(key, false).await {
                             Ok((Some(current_state), _)) => {
-                                tracing::info!(%key, "Successfully fetched current state for NoChange update");
+                                tracing::info!(
+                                    contract = %key,
+                                    phase = "fetch_complete",
+                                    "Successfully fetched current state for NoChange update"
+                                );
                                 ContractHandlerEvent::UpdateResponse {
                                     new_value: Ok(current_state),
                                 }
                             }
                             Ok((None, _)) => {
-                                tracing::warn!(%key, "No state found when fetching for NoChange update");
+                                tracing::warn!(
+                                    contract = %key,
+                                    phase = "fetch_failed",
+                                    "No state found when fetching for NoChange update"
+                                );
                                 // Fallback to the old behavior if we can't fetch the state
                                 ContractHandlerEvent::UpdateNoChange { key }
                             }
                             Err(err) => {
-                                tracing::error!(%key, %err, "Error fetching state for NoChange update");
+                                tracing::error!(
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "fetch_error",
+                                    "Error fetching state for NoChange update"
+                                );
                                 // Fallback to the old behavior if we can't fetch the state
                                 ContractHandlerEvent::UpdateNoChange { key }
                             }
@@ -191,7 +244,12 @@ where
                     },
                     Err(err) => {
                         if err.is_fatal() {
-                            tracing::error!(%key, %err, "Fatal executor error during update query");
+                            tracing::error!(
+                                contract = %key,
+                                error = %err,
+                                phase = "fatal_error",
+                                "Fatal executor error during update query"
+                            );
                             return Err(ContractError::FatalExecutorError { key, error: err });
                         }
                         ContractHandlerEvent::UpdateResponse {
@@ -205,7 +263,10 @@ where
                     .send_to_sender(id, event_result)
                     .await
                     .map_err(|error| {
-                        tracing::debug!(%error, "shutting down contract handler");
+                        tracing::debug!(
+                            error = %error,
+                            "Shutting down contract handler"
+                        );
                         error
                     })?;
             }
@@ -230,11 +291,20 @@ where
                     }) => values,
                     Ok(freenet_stdlib::client_api::HostResponse::Ok) => Vec::new(),
                     Ok(_other) => {
-                        tracing::error!("unexpected response type from delegate request");
+                        tracing::error!(
+                            delegate_key = %delegate_key,
+                            phase = "unexpected_response",
+                            "Unexpected response type from delegate request"
+                        );
                         return Err(ContractError::NoEvHandlerResponse);
                     }
                     Err(err) => {
-                        tracing::error!("failed executing delegate request: {}", err);
+                        tracing::error!(
+                            delegate_key = %delegate_key,
+                            error = %err,
+                            phase = "execution_failed",
+                            "Failed executing delegate request"
+                        );
                         return Err(ContractError::NoEvHandlerResponse);
                     }
                 };
@@ -244,7 +314,10 @@ where
                     .send_to_sender(id, ContractHandlerEvent::DelegateResponse(response))
                     .await
                     .map_err(|error| {
-                        tracing::debug!(%error, "shutting down contract handler");
+                        tracing::debug!(
+                            error = %error,
+                            "Shutting down contract handler"
+                        );
                         error
                     })?;
             }
@@ -258,7 +331,13 @@ where
                     .executor()
                     .register_contract_notifier(key, client_id, subscriber_listener, summary)
                     .inspect_err(|err| {
-                        tracing::warn!("Error while registering subscriber listener: {err}");
+                        tracing::warn!(
+                            contract = %key,
+                            client = %client_id,
+                            error = %err,
+                            phase = "registration_failed",
+                            "Error registering subscriber listener"
+                        );
                     });
 
                 // FIXME: if there is an error senc actually an error back

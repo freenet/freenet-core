@@ -14,26 +14,41 @@ pub struct ReDb(Database);
 impl ReDb {
     pub async fn new(data_dir: &Path) -> Result<Self, redb::Error> {
         let db_path = data_dir.join("db");
-        tracing::info!("loading contract store from {db_path:?}");
+        tracing::info!(
+            db_path = ?db_path,
+            phase = "store_init",
+            "Loading contract store"
+        );
 
         match Database::create(&db_path) {
             Ok(db) => Self::initialize_database(db),
             Err(e) if Self::is_version_mismatch(&e) => {
                 tracing::warn!(
-                    "Database format mismatch detected: {e}\n\
-                     Automatically migrating incompatible database at {db_path:?}"
+                    db_path = ?db_path,
+                    error = %e,
+                    phase = "version_mismatch",
+                    "Database format mismatch detected, automatically migrating"
                 );
 
                 // Attempt to back up the old database
                 Self::backup_and_remove_database(&db_path)?;
 
                 // Retry with fresh database
-                tracing::info!("Creating new database at {db_path:?}");
+                tracing::info!(
+                    db_path = ?db_path,
+                    phase = "create_new_db",
+                    "Creating new database"
+                );
                 let db = Database::create(&db_path)?;
                 Self::initialize_database(db)
             }
             Err(e) => {
-                tracing::error!("failed to load contract store: {e}");
+                tracing::error!(
+                    db_path = ?db_path,
+                    error = %e,
+                    phase = "store_init_failed",
+                    "Failed to load contract store"
+                );
                 Err(e.into())
             }
         }
@@ -44,12 +59,22 @@ impl ReDb {
         let txn = db.0.begin_write()?;
         {
             txn.open_table(STATE_TABLE).map_err(|e| {
-                tracing::error!(error = %e, "failed to open STATE_TABLE");
+                tracing::error!(
+                    error = %e,
+                    table = "STATE_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open STATE_TABLE"
+                );
                 e
             })?;
 
             txn.open_table(CONTRACT_PARAMS_TABLE).map_err(|e| {
-                tracing::error!(error = %e, "failed to open CONTRACT_PARAMS_TABLE");
+                tracing::error!(
+                    error = %e,
+                    table = "CONTRACT_PARAMS_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open CONTRACT_PARAMS_TABLE"
+                );
                 e
             })?;
         }
@@ -77,31 +102,44 @@ impl ReDb {
         match std::fs::rename(db_path, &backup_path) {
             Ok(_) => {
                 tracing::info!(
-                    "Old database backed up to {backup_path:?}\n\
-                     You can safely delete this backup after verifying the new database works correctly."
+                    backup_path = ?backup_path,
+                    phase = "backup_complete",
+                    "Old database backed up - you can safely delete this backup after verifying the new database works correctly"
                 );
                 Ok(())
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 // Database doesn't exist, nothing to backup
-                tracing::debug!("No existing database to backup");
+                tracing::debug!(
+                    db_path = ?db_path,
+                    "No existing database to backup"
+                );
                 Ok(())
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to backup old database: {e}\n\
-                     Attempting to remove it directly..."
+                    db_path = ?db_path,
+                    error = %e,
+                    phase = "backup_failed",
+                    "Failed to backup old database, attempting to remove it directly"
                 );
 
                 // If backup fails, try to remove directly
                 std::fs::remove_file(db_path).map_err(|remove_err| {
                     tracing::error!(
-                        "Failed to remove incompatible database at {db_path:?}: {remove_err}"
+                        db_path = ?db_path,
+                        error = %remove_err,
+                        phase = "remove_failed",
+                        "Failed to remove incompatible database"
                     );
                     redb::Error::Io(remove_err)
                 })?;
 
-                tracing::info!("Removed incompatible database (backup failed)");
+                tracing::info!(
+                    db_path = ?db_path,
+                    phase = "db_removed",
+                    "Removed incompatible database (backup failed)"
+                );
                 Ok(())
             }
         }

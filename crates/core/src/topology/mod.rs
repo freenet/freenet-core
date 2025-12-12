@@ -97,7 +97,12 @@ impl TopologyManager {
         target: Location,
         request_type: TransactionType,
     ) {
-        debug!(%request_type, %recipient, "Recording request sent to peer");
+        debug!(
+            request_type = %request_type,
+            recipient = %recipient,
+            target_location = %target,
+            "Recording request sent to peer"
+        );
 
         self.request_density_tracker.sample(target);
         self.outbound_request_counter.record_request(recipient);
@@ -112,8 +117,8 @@ impl TopologyManager {
         current_time: Instant,
     ) -> Result<bool, DensityMapError> {
         tracing::debug!(
-            "Evaluating new connection for candidate location: {:?}",
-            candidate_location
+            candidate_location = %candidate_location,
+            "Evaluating new connection"
         );
         let density_map = self
             .cached_density_map
@@ -152,11 +157,12 @@ impl TopologyManager {
 
         let best_location = match density_map.get_max_density() {
             Ok(location) => {
-                debug!("Max density found at location: {:?}", location);
+                debug!(location = %location, "Max density found");
                 location
             }
             Err(_) => {
                 debug!(
+                    fallback_location = %this_peer_location,
                     "An error occurred while getting max density, falling back to random location"
                 );
                 *this_peer_location
@@ -295,10 +301,9 @@ impl TopologyManager {
             {
                 LAST_LOG.with(|last_log| {
                     tracing::trace!(
-                        "Adjusting topology at {:?}. Current connections: {}, Filtered neighbors: {}",
-                        at_time,
                         current_connections,
-                        neighbor_locations.len()
+                        filtered_neighbors = neighbor_locations.len(),
+                        "Adjusting topology"
                     );
                     *last_log.borrow_mut() = Instant::now();
                 });
@@ -369,9 +374,14 @@ impl TopologyManager {
                 }
                 // If we have 5+ connections, use density-based selection
                 else {
-                    return self.select_connections_to_add(neighbor_locations)
+                    return self
+                        .select_connections_to_add(neighbor_locations)
                         .unwrap_or_else(|e| {
-                            debug!("Density-based selection failed: {:?}, falling back to random locations", e);
+                            debug!(
+                                error = ?e,
+                                fallback_count = below_threshold,
+                                "Density-based selection failed, falling back to random locations"
+                            );
                             let mut fallback_locations = Vec::new();
                             for _i in 0..below_threshold {
                                 fallback_locations.push(Location::random());
@@ -387,8 +397,8 @@ impl TopologyManager {
         // During startup or in small test networks, we need stability more than optimization
         if current_connections < 5 {
             debug!(
-                "Skipping resource-based topology adjustment for small network (connections: {})",
-                current_connections
+                current_connections,
+                "Skipping resource-based topology adjustment for small network"
             );
             return TopologyAdjustment::NoChange;
         }
@@ -401,13 +411,14 @@ impl TopologyManager {
         let (resource_type, usage_proportion) = self.calculate_usage_proportion(at_time);
 
         // Detailed resource usage information
-        debug!(?usage_proportion, "Resource usage information");
+        debug!(usage_proportion = ?usage_proportion, "Resource usage information");
 
         let adjustment: anyhow::Result<TopologyAdjustment> =
             if current_connections > self.limits.max_connections {
                 debug!(
-                    "Number of connections ({:?}) is above maximum ({:?}), removing connections",
-                    current_connections, self.limits.max_connections
+                    current_connections,
+                    max_connections = self.limits.max_connections,
+                    "Number of connections above maximum, removing connections"
                 );
 
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Slow);
@@ -415,37 +426,42 @@ impl TopologyManager {
                 Ok(self.select_connections_to_remove(&resource_type, at_time))
             } else if usage_proportion < increase_usage_if_below {
                 debug!(
-                    "{:?} resource usage ({:?}) is below threshold ({:?}), adding connections",
-                    resource_type, usage_proportion, increase_usage_if_below
+                    resource_type = ?resource_type,
+                    usage_proportion = ?usage_proportion,
+                    threshold = ?increase_usage_if_below,
+                    "Resource usage below threshold, adding connections"
                 );
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Fast);
                 self.select_connections_to_add(neighbor_locations)
             } else if usage_proportion > decrease_usage_if_above {
                 debug!(
-                    "{:?} resource usage ({:?}) is above threshold ({:?}), removing connections",
-                    resource_type, usage_proportion, decrease_usage_if_above
+                    resource_type = ?resource_type,
+                    usage_proportion = ?usage_proportion,
+                    threshold = ?decrease_usage_if_above,
+                    "Resource usage above threshold, removing connections"
                 );
                 Ok(self.select_connections_to_remove(&resource_type, at_time))
             } else {
                 debug!(
-                    "{:?} resource usage is within acceptable bounds: {:?}",
-                    resource_type, usage_proportion
+                    resource_type = ?resource_type,
+                    usage_proportion = ?usage_proportion,
+                    "Resource usage within acceptable bounds"
                 );
                 Ok(TopologyAdjustment::NoChange)
             };
 
         match &adjustment {
             Ok(TopologyAdjustment::AddConnections(connections)) => {
-                debug!("Added connections: {:?}", connections);
+                debug!(connections = ?connections, "Added connections");
             }
             Ok(TopologyAdjustment::RemoveConnections(connections)) => {
-                debug!("Removed connections: {:?}", connections);
+                debug!(connections = ?connections, "Removed connections");
             }
             Ok(TopologyAdjustment::NoChange) => {
-                debug!("No topology change required.");
+                debug!("No topology change required");
             }
             Err(e) => {
-                error!("Couldn't adjust topology due to error: {:?}", e);
+                error!(error = ?e, "Couldn't adjust topology");
             }
         }
 
@@ -455,7 +471,7 @@ impl TopologyManager {
                 if let Some(peer) = select_fallback_peer_to_drop(neighbor_locations, my_location) {
                     info!(
                         current_connections,
-                        max_allowed = self.limits.max_connections,
+                        max_connections = self.limits.max_connections,
                         peer = %peer,
                         "Enforcing max-connections cap via fallback removal"
                     );
@@ -463,7 +479,7 @@ impl TopologyManager {
                 } else {
                     warn!(
                         current_connections,
-                        max_allowed = self.limits.max_connections,
+                        max_connections = self.limits.max_connections,
                         "Over capacity but no removable peer found; leaving topology unchanged"
                     );
                 }
@@ -503,7 +519,7 @@ impl TopologyManager {
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> anyhow::Result<TopologyAdjustment> {
         if neighbor_locations.is_empty() {
-            tracing::warn!("select_connections_to_add: neighbor map empty; skipping adjustment");
+            tracing::warn!("select_connections_to_add: neighbor map empty, skipping adjustment");
             return Ok(TopologyAdjustment::NoChange);
         }
 
@@ -519,16 +535,16 @@ impl TopologyManager {
         debug!("Attempting to get max density location");
         let max_density_location = match density_map.get_max_density() {
             Ok(location) => {
-                debug!(location = ?location, "Max density location found");
+                debug!(location = %location, "Max density location found");
                 location
             }
             Err(e) => {
-                error!("Failed to get max density location: {:?}", e);
+                error!(error = ?e, "Failed to get max density location");
                 return Err(anyhow!(e));
             }
         };
 
-        info!("Adding new connection to {:?}", max_density_location);
+        info!(location = %max_density_location, "Adding new connection");
         Ok(TopologyAdjustment::AddConnections(vec![
             max_density_location,
         ]))

@@ -42,9 +42,9 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         bandwidth_limit: Option<usize>,
         socket: Arc<S>,
     ) {
-        tracing::info!("Rate limiter task started (blocking mode)");
+        tracing::debug!("Rate limiter task started (blocking mode)");
         while let Ok((socket_addr, packet)) = self.outbound_packets.recv() {
-            tracing::debug!(
+            tracing::trace!(
                 target: "freenet_core::transport::send_debug",
                 dest_addr = %socket_addr,
                 packet_len = packet.len(),
@@ -53,7 +53,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
             if let Some(bandwidth_limit) = bandwidth_limit {
                 self.rate_limiting(bandwidth_limit, &*socket, packet, socket_addr);
             } else {
-                tracing::debug!(
+                tracing::trace!(
                     target: "freenet_core::transport::send_debug",
                     dest_addr = %socket_addr,
                     packet_len = packet.len(),
@@ -61,7 +61,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 );
                 match socket.send_to_blocking(&packet, socket_addr) {
                     Ok(bytes_sent) => {
-                        tracing::debug!(
+                        tracing::trace!(
                             target: "freenet_core::transport::send_debug",
                             dest_addr = %socket_addr,
                             bytes_sent,
@@ -95,9 +95,8 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         if let Some(wait_time) = self.can_send_packet(bandwidth_limit, packet.len()) {
             // Use blocking sleep instead of tokio::time::sleep
             std::thread::sleep(wait_time);
-            tracing::debug!(%socket_addr, "Sending outbound packet after waiting {:?}", wait_time);
 
-            tracing::info!(
+            tracing::trace!(
                 target: "freenet_core::transport::send_debug",
                 dest_addr = %socket_addr,
                 packet_len = packet.len(),
@@ -107,7 +106,7 @@ impl<T: TimeSource> PacketRateLimiter<T> {
 
             match socket.send_to_blocking(&packet, socket_addr) {
                 Ok(bytes_sent) => {
-                    tracing::info!(
+                    tracing::trace!(
                         target: "freenet_core::transport::send_debug",
                         dest_addr = %socket_addr,
                         bytes_sent,
@@ -124,17 +123,16 @@ impl<T: TimeSource> PacketRateLimiter<T> {
                 }
             }
         } else {
-            tracing::info!(
+            tracing::trace!(
                 target: "freenet_core::transport::send_debug",
                 dest_addr = %socket_addr,
                 packet_len = packet.len(),
-                first_bytes = ?&packet[..std::cmp::min(32, packet.len())],
                 "Attempting to send packet (with rate limit)"
             );
 
             match socket.send_to_blocking(&packet, socket_addr) {
                 Ok(bytes_sent) => {
-                    tracing::info!(
+                    tracing::trace!(
                         target: "freenet_core::transport::send_debug",
                         dest_addr = %socket_addr,
                         bytes_sent,

@@ -58,9 +58,10 @@ impl UpdateOp {
             ))
         } else {
             tracing::error!(
-                "UPDATE operation {} failed to finish successfully, current state: {:?}",
-                self.id,
-                self.state
+                tx = %self.id,
+                state = ?self.state,
+                phase = "error",
+                "UPDATE operation failed to finish successfully"
             );
             Err(ErrorKind::OperationError {
                 cause: "update didn't finish successfully".into(),
@@ -359,11 +360,12 @@ impl Operation for UpdateOp {
                                     op_manager.ring.connection_manager.num_connections();
                                 tracing::error!(
                                     tx = %id,
-                                    %key,
+                                    contract = %key,
                                     subscribers = ?subscribers,
                                     candidates = ?candidates,
                                     connection_count,
-                                    request_sender = ?sender_addr,
+                                    peer_addr = ?sender_addr,
+                                    phase = "error",
                                     "Cannot handle UPDATE: contract not found locally and no peers to forward to"
                                 );
                                 return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
@@ -476,9 +478,10 @@ impl Operation for UpdateOp {
                             .socket_addr()
                             .expect("broadcast target must have socket address");
                         tracing::warn!(
-                            "failed broadcasting update change to {} with error {}; dropping connection",
-                            peer_addr,
-                            err
+                            peer_addr = %peer_addr,
+                            error = %err,
+                            phase = "error",
+                            "failed broadcasting update change; dropping connection"
                         );
                         // TODO: review this, maybe we should just dropping this subscription
                         conn_manager.drop_connection(peer_addr).await?;
@@ -646,18 +649,19 @@ impl OpManager {
         // Trace update propagation for debugging
         if !targets.is_empty() {
             tracing::info!(
-                "UPDATE_PROPAGATION: contract={:.8} from={} targets={} count={} (subscribers={}, proximity={})",
-                key,
-                sender,
-                targets
+                contract = %format!("{:.8}", key),
+                peer_addr = %sender,
+                targets = %targets
                     .iter()
                     .filter_map(|s| s.socket_addr())
                     .map(|addr| format!("{:.8}", addr))
                     .collect::<Vec<_>>()
                     .join(","),
-                targets.len(),
-                subscriber_count,
-                proximity_count
+                count = targets.len(),
+                subscribers = subscriber_count,
+                proximity = proximity_count,
+                phase = "broadcast",
+                "UPDATE_PROPAGATION"
             );
         } else {
             let own_addr = self.ring.connection_manager.get_own_addr();
@@ -671,11 +675,12 @@ impl OpManager {
                 .collect::<Vec<_>>();
 
             tracing::warn!(
-                "UPDATE_PROPAGATION: contract={:.8} from={} NO_TARGETS - update will not propagate (self={:?}, fallback_candidates={:?})",
-                key,
-                sender,
-                own_addr.map(|a| format!("{:.8}", a)),
-                fallback_candidates
+                contract = %format!("{:.8}", key),
+                peer_addr = %sender,
+                self_addr = ?own_addr.map(|a| format!("{:.8}", a)),
+                fallback_candidates = ?fallback_candidates,
+                phase = "error",
+                "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate"
             );
         }
 
@@ -773,7 +778,7 @@ async fn update_contract(
         Ok(ContractHandlerEvent::UpdateResponse {
             new_value: Err(err),
         }) => {
-            tracing::error!(%key, %err, "Failed to update contract value");
+            tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
             Err(OpError::UnexpectedOpState)
         }
         Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
@@ -825,7 +830,7 @@ async fn update_contract(
         }
         Err(err) => Err(err.into()),
         Ok(other) => {
-            tracing::error!(?other, %key, "Unexpected event from contract handler during update");
+            tracing::error!(event = ?other, contract = %key, phase = "error", "Unexpected event from contract handler during update");
             Err(OpError::UnexpectedOpState)
         }
     }
@@ -952,8 +957,9 @@ pub(crate) async fn request_update(
 
             if !should_handle_update {
                 tracing::error!(
-                    "UPDATE: Cannot update contract {} on isolated node - contract not seeded and no subscribers",
-                    key
+                    contract = %key,
+                    phase = "error",
+                    "UPDATE: Cannot update contract on isolated node - contract not seeded and no subscribers"
                 );
                 return Err(OpError::RingError(RingError::NoCachingPeers(key)));
             }
@@ -1030,7 +1036,8 @@ pub(crate) async fn request_update(
                         .map_err(|error| {
                             tracing::error!(
                                 tx = %id,
-                                %error,
+                                error = %error,
+                                phase = "error",
                                 "Failed to enqueue UPDATE broadcast message"
                             );
                             OpError::NotificationError
@@ -1067,8 +1074,9 @@ pub(crate) async fn request_update(
         .map_err(|e| {
             tracing::error!(
                 tx = %id,
-                %key,
+                contract = %key,
                 error = %e,
+                phase = "error",
                 "Failed to apply update locally before forwarding UPDATE"
             );
             e
@@ -1129,7 +1137,7 @@ pub(crate) async fn request_update(
         .send((id, host_result))
         .await
         .map_err(|error| {
-            tracing::error!(tx = %id, %error, "Failed to send UPDATE result to result router");
+            tracing::error!(tx = %id, error = %error, phase = "error", "Failed to send UPDATE result to result router");
             OpError::NotificationError
         })?;
 
@@ -1164,7 +1172,8 @@ async fn deliver_update_result(
         .map_err(|error| {
             tracing::error!(
                 tx = %id,
-                %error,
+                error = %error,
+                phase = "error",
                 "Failed to send UPDATE result to result router"
             );
             OpError::NotificationError
@@ -1178,7 +1187,8 @@ async fn deliver_update_result(
     {
         tracing::warn!(
             tx = %id,
-            %error,
+            error = %error,
+            phase = "error",
             "Failed to notify transaction completion for UPDATE"
         );
     }

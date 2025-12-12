@@ -154,17 +154,20 @@ impl ConnectionManager {
         // Don't accept connections from ourselves
         if let Some(own_addr) = self.get_own_addr() {
             if own_addr == addr {
-                tracing::warn!(%addr, "should_accept: rejecting self-connection attempt");
+                tracing::warn!(
+                    addr = %addr,
+                    peer_location = %location,
+                    "should_accept: rejecting self-connection attempt"
+                );
                 return false;
             }
         }
-
-        tracing::info!("Checking if should accept connection");
         let open = self.connection_count();
         let reserved_before = self.pending_reservations.read().len();
 
-        tracing::info!(
-            %addr,
+        tracing::debug!(
+            addr = %addr,
+            peer_location = %location,
             open,
             reserved_before,
             is_gateway = self.is_gateway,
@@ -175,8 +178,9 @@ impl ConnectionManager {
         );
 
         if self.is_gateway && (open > 0 || reserved_before > 0) {
-            tracing::info!(
-                %addr,
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
                 open,
                 reserved_before,
                 "Gateway evaluating additional direct connection (post-bootstrap)"
@@ -185,7 +189,11 @@ impl ConnectionManager {
 
         if self.location_for_peer.read().get(&addr).is_some() {
             // We've already accepted this peer (pending or active); treat as a no-op acceptance.
-            tracing::debug!(%addr, "Peer already pending/connected; acknowledging acceptance");
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                "Peer already pending/connected; acknowledging acceptance"
+            );
             return true;
         }
 
@@ -201,7 +209,8 @@ impl ConnectionManager {
             Some(val) => val,
             None => {
                 tracing::error!(
-                    %addr,
+                    addr = %addr,
+                    peer_location = %location,
                     reserved_before,
                     open,
                     "connection counters would overflow; rejecting connection"
@@ -212,15 +221,29 @@ impl ConnectionManager {
         };
 
         if open == 0 {
-            tracing::debug!(%addr, "should_accept: first connection -> accepting");
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                "should_accept: first connection -> accepting"
+            );
             return true;
         }
 
         let accepted = if total_conn < self.min_connections {
-            tracing::info!(%addr, total_conn, "should_accept: accepted (below min connections)");
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                total_conn,
+                "should_accept: accepted (below min connections)"
+            );
             true
         } else if total_conn >= self.max_connections {
-            tracing::info!(%addr, total_conn, "should_accept: rejected (max connections reached)");
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                total_conn,
+                "should_accept: rejected (max connections reached)"
+            );
             false
         } else {
             let accepted = self
@@ -229,8 +252,9 @@ impl ConnectionManager {
                 .evaluate_new_connection(location, Instant::now())
                 .unwrap_or(true);
 
-            tracing::info!(
-                %addr,
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
                 total_conn,
                 accepted,
                 "should_accept: topology manager decision"
@@ -238,7 +262,8 @@ impl ConnectionManager {
             accepted
         };
         tracing::info!(
-            %addr,
+            addr = %addr,
+            peer_location = %location,
             accepted,
             total_conn,
             open_connections = open,
@@ -250,7 +275,12 @@ impl ConnectionManager {
         if !accepted {
             self.pending_reservations.write().remove(&addr);
         } else {
-            tracing::info!(%addr, total_conn, "should_accept: accepted (reserving spot)");
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                total_conn,
+                "should_accept: accepted (reserving spot)"
+            );
             self.record_pending_location(addr, location);
         }
         accepted
@@ -266,16 +296,16 @@ impl ConnectionManager {
         let entry = locations.entry(addr);
         match entry {
             Entry::Occupied(_) => {
-                tracing::info!(
-                    %addr,
-                    %location,
+                tracing::debug!(
+                    addr = %addr,
+                    peer_location = %location,
                     "record_pending_location: location already known"
                 );
             }
             Entry::Vacant(v) => {
-                tracing::info!(
-                    %addr,
-                    %location,
+                tracing::debug!(
+                    addr = %addr,
+                    peer_location = %location,
                     "record_pending_location: registering advertised location for peer"
                 );
                 v.insert(location);
@@ -454,7 +484,12 @@ impl ConnectionManager {
         pub_key: TransportPublicKey,
         was_reserved: bool,
     ) {
-        tracing::info!(%addr, %loc, %was_reserved, "Adding connection to topology");
+        tracing::debug!(
+            addr = %addr,
+            peer_location = %loc,
+            was_reserved = %was_reserved,
+            "Adding connection to topology"
+        );
         debug_assert!(self.get_own_addr().expect("should be set") != addr);
         if was_reserved {
             self.pending_reservations.write().remove(&addr);
@@ -466,8 +501,8 @@ impl ConnectionManager {
         // Enforce the global cap when adding a new peer (relocations reuse the existing slot).
         if previous_location.is_none() && self.connection_count() >= self.max_connections {
             tracing::warn!(
-                %addr,
-                %loc,
+                addr = %addr,
+                peer_location = %loc,
                 max = self.max_connections,
                 "add_connection: rejecting new connection to enforce cap"
             );
@@ -480,10 +515,10 @@ impl ConnectionManager {
         }
 
         if let Some(prev_loc) = previous_location {
-            tracing::info!(
-                %addr,
-                %prev_loc,
-                %loc,
+            tracing::debug!(
+                addr = %addr,
+                prev_location = %prev_loc,
+                new_location = %loc,
                 "add_connection: replacing existing connection for peer"
             );
             let mut cbl = self.connections_by_location.write();
@@ -515,21 +550,29 @@ impl ConnectionManager {
         new_pub_key: TransportPublicKey,
     ) -> bool {
         if old_addr == new_addr {
-            tracing::debug!(%old_addr, "update_peer_identity: same address; skipping");
+            tracing::debug!(
+                addr = %old_addr,
+                "update_peer_identity: same address; skipping"
+            );
             return false;
         }
 
         let mut loc_for_peer = self.location_for_peer.write();
         let Some(loc) = loc_for_peer.remove(&old_addr) else {
             tracing::debug!(
-                %old_addr,
-                %new_addr,
+                old_addr = %old_addr,
+                new_addr = %new_addr,
                 "update_peer_identity: old peer entry not found"
             );
             return false;
         };
 
-        tracing::info!(%old_addr, %new_addr, %loc, "Updating peer identity for active connection");
+        tracing::debug!(
+            old_addr = %old_addr,
+            new_addr = %new_addr,
+            peer_location = %loc,
+            "Updating peer identity for active connection"
+        );
         loc_for_peer.insert(new_addr, loc);
         drop(loc_for_peer);
 
@@ -544,7 +587,8 @@ impl ConnectionManager {
             conn.location.set_addr(new_addr);
         } else {
             tracing::warn!(
-                %old_addr,
+                old_addr = %old_addr,
+                peer_location = %loc,
                 "update_peer_identity: connection entry missing; creating placeholder"
             );
             entry.push(Connection {
@@ -557,7 +601,11 @@ impl ConnectionManager {
 
     fn prune_connection(&self, addr: SocketAddr, is_alive: bool) -> Option<Location> {
         let connection_type = if is_alive { "active" } else { "in transit" };
-        tracing::debug!(%addr, "Pruning {} connection", connection_type);
+        tracing::debug!(
+            addr = %addr,
+            connection_type,
+            "Pruning connection"
+        );
 
         let mut locations_for_peer = self.location_for_peer.write();
 
@@ -569,7 +617,7 @@ impl ConnectionManager {
                 let removed = self.pending_reservations.write().remove(&addr).is_some();
                 if !removed {
                     tracing::warn!(
-                        %addr,
+                        addr = %addr,
                         "prune_connection: no pending reservation to release for in-transit peer"
                     );
                 }
@@ -667,7 +715,7 @@ impl ConnectionManager {
         tracing::debug!(
             total_locations = connections.len(),
             candidates = candidates.len(),
-            target = %target,
+            target_location = %target,
             self_addr = self
                 .get_own_addr()
                 .as_ref()
