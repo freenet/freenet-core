@@ -48,9 +48,9 @@ impl<T: TimeSource> PacketRateLimiter<T> {
         let batch_size = socket.optimal_batch_size();
         tracing::debug!(batch_size, "Rate limiter task started (blocking mode)");
 
-        if bandwidth_limit.is_some() {
+        if let Some(limit) = bandwidth_limit {
             // Rate-limited path: send packets one at a time with rate limiting
-            self.rate_limiter_with_limit(bandwidth_limit.unwrap(), socket);
+            self.rate_limiter_with_limit(limit, socket);
         } else {
             // Non-rate-limited path: use syscall batching for better throughput
             self.rate_limiter_batched(batch_size, socket);

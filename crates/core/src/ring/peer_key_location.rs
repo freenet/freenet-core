@@ -379,13 +379,11 @@ mod tests {
         let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
         let addr3 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5000);
 
-        let mut peers = vec![
-            PeerKeyLocation::with_unknown_addr(pub_key.clone()),
+        let mut peers = [PeerKeyLocation::with_unknown_addr(pub_key.clone()),
             PeerKeyLocation::new(pub_key.clone(), addr1),
             PeerKeyLocation::new(pub_key.clone(), addr2),
             PeerKeyLocation::with_unknown_addr(pub_key.clone()),
-            PeerKeyLocation::new(pub_key.clone(), addr3),
-        ];
+            PeerKeyLocation::new(pub_key.clone(), addr3)];
 
         peers.sort();
 
