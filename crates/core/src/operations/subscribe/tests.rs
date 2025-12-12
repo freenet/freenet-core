@@ -448,38 +448,18 @@ async fn test_subscription_validates_k_closest_usage() {
         );
     }
 
-    // Test 3: Validate subscription state transitions maintain skip list correctly
+    // Test 3: Validate simplified AwaitingResponse state
     {
-        // Create AwaitingResponse state with skip list (of socket addresses)
-        use std::net::{IpAddr, Ipv4Addr};
-        let failed_addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001);
-        let failed_addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002);
-        let mut skip_list: HashSet<SocketAddr> = HashSet::new();
-        skip_list.insert(failed_addr1);
-        skip_list.insert(failed_addr2);
-
         let op = SubscribeOp {
             id: transaction_id,
-            state: Some(SubscribeState::AwaitingResponse {
-                skip_list: skip_list.clone(),
-                retries: 2,
-                upstream_subscriber: None,
-                current_hop: 5,
-            }),
+            state: Some(SubscribeState::AwaitingResponse { next_hop: None }),
             upstream_addr: None,
         };
 
-        // Verify skip list is maintained in state
-        if let Some(SubscribeState::AwaitingResponse {
-            skip_list: list,
-            retries,
-            ..
-        }) = &op.state
-        {
-            assert_eq!(list.len(), 2, "Skip list maintains failed peers");
-            assert!(list.contains(&failed_addr1));
-            assert!(list.contains(&failed_addr2));
-            assert_eq!(*retries, 2, "Retry count is tracked");
-        }
+        // State is simplified - skip list is now in the Request message, not state
+        assert!(matches!(
+            op.state,
+            Some(SubscribeState::AwaitingResponse { .. })
+        ));
     }
 }

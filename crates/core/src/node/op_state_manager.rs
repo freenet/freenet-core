@@ -477,6 +477,49 @@ impl OpManager {
         Ok(())
     }
 
+    /// Peek at the next hop address for an operation without removing it.
+    /// Used by hop-by-hop routing to determine where to send initial outbound messages.
+    /// Returns None if the operation doesn't exist or doesn't have a next hop address.
+    pub fn peek_next_hop_addr(&self, id: &Transaction) -> Option<std::net::SocketAddr> {
+        if self.ops.completed.contains(id) || self.ops.under_progress.contains(id) {
+            return None;
+        }
+        match id.transaction_type() {
+            TransactionType::Connect => self
+                .ops
+                .connect
+                .get(id)
+                .and_then(|op| op.get_next_hop_addr()),
+            TransactionType::Put => self.ops.put.get(id).and_then(|op| op.get_next_hop_addr()),
+            TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_next_hop_addr()),
+            TransactionType::Subscribe => self
+                .ops
+                .subscribe
+                .get(id)
+                .and_then(|op| op.get_next_hop_addr()),
+            TransactionType::Update => self
+                .ops
+                .update
+                .get(id)
+                .and_then(|op| op.get_next_hop_addr()),
+        }
+    }
+
+    /// Peek at the full target peer (including public key) without removing the operation.
+    /// Used when establishing new connections where we need the public key for handshake.
+    pub fn peek_target_peer(&self, id: &Transaction) -> Option<PeerKeyLocation> {
+        if self.ops.completed.contains(id) || self.ops.under_progress.contains(id) {
+            return None;
+        }
+        match id.transaction_type() {
+            TransactionType::Connect => {
+                self.ops.connect.get(id).and_then(|op| op.get_target_peer())
+            }
+            // Other operations only store addresses, not full peer info
+            _ => None,
+        }
+    }
+
     pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
         if self.ops.completed.contains(id) {
             return Err(OpNotAvailable::Completed);
@@ -653,9 +696,11 @@ impl OpManager {
     /// Notify the operation manager that a transaction is being transacted over the network.
     pub fn sending_transaction(&self, peer: &PeerKeyLocation, msg: &NetMessage) {
         let transaction = msg.id();
-        if let (Some(recipient), Some(target)) = (msg.target(), msg.requested_location()) {
+        // With hop-by-hop routing, record the request using the peer we're sending to
+        // and the message's requested location (contract location)
+        if let Some(target_loc) = msg.requested_location() {
             self.ring
-                .record_request(recipient.clone(), target, transaction.transaction_type());
+                .record_request(peer.clone(), target_loc, transaction.transaction_type());
         }
         if let Some(peer_addr) = peer.socket_addr() {
             self.ring
@@ -767,7 +812,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     } else {
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
-                        tracing::debug!("Transaction timed out: {tx}");
+                        tracing::info!(
+                            tx = %tx,
+                            tx_type = ?tx.transaction_type(),
+                            elapsed_ms = tx.elapsed().as_millis(),
+                            ttl_ms = crate::config::OPERATION_TTL.as_millis(),
+                            "Transaction timed out"
+                        );
 
                         // Check if this is a child operation and propagate timeout to parent
                         if let Some(parent_tx) = sub_op_tracker.get_parent(tx) {
@@ -812,7 +863,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         TransactionType::Update => ops.update.remove(&tx).is_some(),
                     };
                     if removed {
-                        tracing::debug!("Transaction timed out: {tx}");
+                        tracing::info!(
+                            tx = %tx,
+                            tx_type = ?tx.transaction_type(),
+                            elapsed_ms = tx.elapsed().as_millis(),
+                            ttl_ms = crate::config::OPERATION_TTL.as_millis(),
+                            "Transaction timed out"
+                        );
 
                         // Check if this is a child operation and propagate timeout to parent
                         if let Some(parent_tx) = sub_op_tracker.get_parent(tx) {
