@@ -71,6 +71,7 @@ impl SymmetricMessage {
         *OVERHEAD
     }
 
+    #[allow(dead_code)]
     pub(crate) fn stream_fragment_overhead() -> usize {
         static OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
             let blank = SymmetricMessage {
