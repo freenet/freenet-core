@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::vec;
 
 use aes_gcm::Aes128Gcm;
-use tokio::sync::mpsc;
 
 use crate::{
     transport::{
+        fast_channel::FastSender,
         packet_data,
         sent_packet_tracker::SentPacketTracker,
         symmetric_message::{self},
@@ -32,7 +32,7 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
 pub(super) async fn send_stream(
     stream_id: StreamId,
     last_packet_id: Arc<AtomicU32>,
-    sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    sender: FastSender<(SocketAddr, Arc<[u8]>)>,
     destination_addr: SocketAddr,
     mut stream_to_send: SerializedStream,
     outbound_symmetric_key: Aes128Gcm,
@@ -140,11 +140,12 @@ mod tests {
         symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
         *,
     };
+    use crate::transport::fast_channel;
     use crate::transport::packet_data::PacketData;
 
     #[tokio::test]
     async fn test_send_stream_success() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let (outbound_sender, outbound_receiver) = fast_channel::bounded(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let message: Vec<_> = std::iter::repeat(())
             .take(100_000)
@@ -168,7 +169,7 @@ mod tests {
         ));
 
         let mut inbound_bytes = Vec::new();
-        while let Some((_, packet)) = outbound_receiver.recv().await {
+        while let Ok((_, packet)) = outbound_receiver.recv_async().await {
             let decrypted_packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
                 .try_decrypt_sym(&cipher)
                 .map_err(|e| e.to_string())?;
@@ -190,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_with_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
+        let (outbound_sender, outbound_receiver) = fast_channel::bounded(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
@@ -210,14 +211,14 @@ mod tests {
         let start_time = Instant::now();
 
         // Clone sender for receiver task termination
-        let sender_clone: mpsc::Sender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
+        let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
         let key_clone = key.clone();
 
         // Spawn receiver task to collect packets
         let receiver_task = tokio::spawn(async move {
             let mut packet_count = 0;
             let mut total_bytes = 0;
-            while let Some((addr, packet)) = outbound_receiver.recv().await {
+            while let Ok((addr, packet)) = outbound_receiver.recv_async().await {
                 assert_eq!(addr, destination_addr);
                 packet_count += 1;
                 total_bytes += packet.len();
@@ -280,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
+        let (outbound_sender, outbound_receiver) = fast_channel::bounded(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
@@ -296,12 +297,12 @@ mod tests {
         let start_time = Instant::now();
 
         // Clone sender for receiver task termination
-        let sender_clone: mpsc::Sender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
+        let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
 
         // Spawn receiver task to collect packets
         let receiver_task = tokio::spawn(async move {
             let mut packet_count = 0;
-            while let Some((addr, _packet)) = outbound_receiver.recv().await {
+            while let Ok((addr, _packet)) = outbound_receiver.recv_async().await {
                 assert_eq!(addr, destination_addr);
                 packet_count += 1;
             }

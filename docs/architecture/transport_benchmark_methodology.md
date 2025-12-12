@@ -234,44 +234,55 @@ fn bench_serialize_pure(c: &mut Criterion) {
 
 ### 4.2 Level 1: Mock I/O Benchmarks (In-Process)
 
-Uses channels instead of sockets - measures protocol logic without syscalls:
+Uses channels instead of sockets - measures protocol logic without syscalls.
+
+**Running the Blackbox Benchmarks:**
+
+```bash
+# Run just the blackbox transport benchmarks (uses actual transport code with mock I/O)
+cargo bench --bench transport_perf --features bench -- blackbox
+```
+
+The `blackbox` benchmark group tests the **actual transport code** with mock sockets:
+
+| Benchmark | What it measures |
+|-----------|-----------------|
+| `level1_blackbox/connection/establish` | Full handshake: key exchange, encryption setup |
+| `level1_blackbox/throughput/bytes/*` | End-to-end message throughput at different sizes |
+| `level1_blackbox/fast_channel/*` | Our crossbeam-based channel vs tokio::sync::mpsc |
+
+**Using the Mock Transport Infrastructure:**
+
+The `mock_transport` module (enabled with `bench` or `test` feature) provides:
 
 ```rust
-// bench_mock_io.rs - Protocol logic with mock transport
+use freenet::transport::mock_transport::{create_mock_peer, Channels, PacketDropPolicy};
 
-async fn setup_mock_peers() -> (PeerConnection, PeerConnection) {
-    let channels = Arc::new(DashMap::new());
+// Create a shared channel map for mock socket communication
+let channels: Channels = Arc::new(DashMap::new());
 
-    let (pk_a, mut handler_a, addr_a) =
-        set_peer_connection_mock(channels.clone()).await;
-    let (pk_b, mut handler_b, addr_b) =
-        set_peer_connection_mock(channels.clone()).await;
+// Create two mock peers
+let (peer_a_pub, mut peer_a, peer_a_addr) =
+    create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone()).await?;
+let (peer_b_pub, mut peer_b, peer_b_addr) =
+    create_mock_peer(PacketDropPolicy::ReceiveAll, channels).await?;
 
-    // Connect through mock transport
-    let (conn_a, conn_b) = tokio::join!(
-        handler_a.connect(pk_b, addr_b),
-        handler_b.connect(pk_a, addr_a),
-    );
+// Connect through mock transport (full encryption, handshake, etc.)
+let conn_a_fut = peer_a.connect(peer_b_pub, peer_b_addr);
+let conn_b_fut = peer_b.connect(peer_a_pub, peer_a_addr);
+let (conn_a, conn_b) = futures::join!(conn_a_fut, conn_b_fut);
 
-    (conn_a.unwrap(), conn_b.unwrap())
-}
+let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
 
-fn bench_protocol_throughput(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-
-    c.bench_function("mock_io_roundtrip_1kb", |b| {
-        b.to_async(&rt).iter(|| async {
-            let (mut sender, mut receiver) = setup_mock_peers().await;
-            let data = vec![0u8; 1024];
-
-            sender.send(&data).await.unwrap();
-            let received = receiver.recv().await.unwrap();
-
-            black_box(received)
-        })
-    });
-}
+// Send/receive through the actual transport pipeline
+conn_a.send(message).await?;
+let received: Vec<u8> = conn_b.recv().await?;
 ```
+
+**PacketDropPolicy options:**
+- `ReceiveAll` - No packet loss (default)
+- `Factor(f64)` - Drop packets randomly (0.0-1.0)
+- `Ranges(Vec<Range<usize>>)` - Drop specific packet index ranges
 
 ### 4.3 Level 2: Loopback Benchmarks (Kernel Involved)
 
@@ -534,15 +545,28 @@ echo "=== Results in target/criterion/ ==="
 
 ## 9. Summary: What to Measure Where
 
-| Benchmark Type | Environment | OS Interaction | Reproducibility |
-|----------------|-------------|----------------|-----------------|
-| Encryption throughput | Any | None | Perfect |
-| Serialization | Any | None | Perfect |
-| Protocol state machines | Any | None | Perfect |
-| Mock I/O throughput | Linux bare metal | Channels only | High |
-| Syscall overhead | Linux bare metal | recv/send | Medium |
-| Full stack | Controlled hardware | Everything | Low |
+| Benchmark Type | Group | Environment | OS Interaction | Reproducibility |
+|----------------|-------|-------------|----------------|-----------------|
+| Encryption throughput | `level0` | Any | None | Perfect |
+| Serialization | `level0` | Any | None | Perfect |
+| Protocol state machines | `level0` | Any | None | Perfect |
+| **Blackbox transport** | `blackbox` | Any | **Channels only** | **High** |
+| Mock I/O throughput | `level1` | Linux bare metal | Channels only | High |
+| Syscall overhead | `level2` | Linux bare metal | recv/send | Medium |
+| Full stack | `level3` | Controlled hardware | Everything | Low |
 
-**Key insight**: To truly isolate transport logic from OS noise, use the existing `MockSocket` infrastructure. This gives you **protocol overhead** without **kernel overhead**.
+**Key insight**: The `blackbox` benchmark group tests the **actual Freenet transport code** (PeerConnection, fast_channel, encryption) with mock I/O. This catches real regressions in the transport pipeline without kernel noise.
+
+To run all benchmark groups:
+```bash
+cargo bench --bench transport_perf --features bench
+```
+
+To run specific groups:
+```bash
+cargo bench --bench transport_perf --features bench -- level0      # Pure logic
+cargo bench --bench transport_perf --features bench -- blackbox    # Actual transport with mock I/O
+cargo bench --bench transport_perf --features bench -- level2      # Loopback
+```
 
 For syscall optimization work specifically, you need Level 2+ benchmarks on controlled hardware, but the improvement targets can be validated with mock I/O first.

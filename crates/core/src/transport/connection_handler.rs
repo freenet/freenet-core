@@ -29,6 +29,7 @@ use version_cmp::PROTOC_VERSION;
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
+    fast_channel::{self, FastSender},
     packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
@@ -140,7 +141,7 @@ async fn bind_socket_with_retry<S: Socket>(
 }
 
 /// Receives  new inbound connections from the network.
-pub(crate) struct InboundConnectionHandler {
+pub struct InboundConnectionHandler {
     new_connection_notifier: mpsc::Receiver<PeerConnection>,
 }
 
@@ -152,7 +153,7 @@ impl InboundConnectionHandler {
 
 /// Requests a new outbound connection to a remote peer.
 #[derive(Clone)]
-pub(crate) struct OutboundConnectionHandler {
+pub struct OutboundConnectionHandler {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
 }
@@ -170,7 +171,8 @@ impl OutboundConnectionHandler {
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
 
         // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        let (outbound_sender, outbound_recv) = mpsc::channel(100);
+        // Using fast_channel for high-throughput packet routing
+        let (outbound_sender, outbound_recv) = fast_channel::bounded(1000);
         let expected_non_gateway = Arc::new(DashSet::new());
 
         let transport = UdpPacketsListener {
@@ -202,7 +204,10 @@ impl OutboundConnectionHandler {
         // Bandwidth limiting is now only applied to large streaming transfers via send_stream()
         // in RemoteConnection. The bandwidth_limit parameter is still passed to RemoteConnection
         // for this purpose (default: 3 MB/s).
-        task::spawn(bw_tracker.rate_limiter(None, socket));
+        //
+        // The rate limiter runs in a blocking thread via spawn_blocking for ~3x better throughput
+        // than async (using crossbeam's blocking recv() instead of tokio's async recv).
+        task::spawn_blocking(move || bw_tracker.rate_limiter(None, socket));
         task::spawn(RANDOM_U64.scope(
             {
                 let mut rng = StdRng::seed_from_u64(rand::random());
@@ -214,8 +219,8 @@ impl OutboundConnectionHandler {
         Ok((connection_handler, new_connection_notifier))
     }
 
-    #[cfg(test)]
-    fn new_test(
+    #[cfg(any(test, feature = "bench"))]
+    pub(crate) fn new_test(
         socket_addr: SocketAddr,
         socket: Arc<impl Socket>,
         keypair: TransportKeypair,
@@ -273,7 +278,7 @@ struct UdpPacketsListener<S = UdpSocket> {
     this_peer_keypair: TransportKeypair,
     is_gateway: bool,
     new_connection_notifier: mpsc::Sender<PeerConnection>,
-    outbound_packets: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    outbound_packets: FastSender<(SocketAddr, Arc<[u8]>)>,
     this_addr: SocketAddr,
     dropped_packets: HashMap<SocketAddr, u64>,
     last_drop_warning: Instant,
@@ -282,7 +287,7 @@ struct UdpPacketsListener<S = UdpSocket> {
 }
 
 type OngoingConnection = (
-    mpsc::Sender<PacketData<UnknownEncryption>>,
+    FastSender<PacketData<UnknownEncryption>>,
     oneshot::Sender<Result<RemoteConnection, TransportError>>,
 );
 
@@ -307,7 +312,7 @@ type GwOngoingConnectionResult = Option<
     >,
 >;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bench"))]
 impl<T> Drop for UdpPacketsListener<T> {
     fn drop(&mut self) {
         tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
@@ -319,9 +324,9 @@ task_local! {
 
 /// The amount of times to retry NAT traversal before giving up. It should be sufficient
 /// so we give peers enough time for the other party to start the connection on its end.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "bench")))]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 40;
-#[cfg(test)]
+#[cfg(any(test, feature = "bench"))]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
 impl<S: Socket> UdpPacketsListener<S> {
@@ -332,7 +337,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection> = BTreeMap::new();
         let mut ongoing_gw_connections: BTreeMap<
             SocketAddr,
-            mpsc::Sender<PacketData<UnknownEncryption>>,
+            FastSender<PacketData<UnknownEncryption>>,
         > = BTreeMap::new();
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
@@ -367,7 +372,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         self.remote_connections.insert(remote_addr, remote_conn);
                                         continue;
                                     }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                    Err(fast_channel::TrySendError::Full(_)) => {
                                         // Channel full, reinsert connection
                                         self.remote_connections.insert(remote_addr, remote_conn);
 
@@ -396,7 +401,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         // from being sent to RSA decryption handlers
                                         continue;
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    Err(fast_channel::TrySendError::Disconnected(_)) => {
                                         // Channel closed, connection is dead
                                         tracing::warn!(
                                             %remote_addr,
@@ -411,7 +416,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some(inbound_packet_sender) = ongoing_gw_connections.get(&remote_addr) {
                                 match inbound_packet_sender.try_send(packet_data) {
                                     Ok(_) => continue,
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                    Err(fast_channel::TrySendError::Full(_)) => {
                                         // Channel full, drop packet to prevent misrouting
                                         tracing::debug!(
                                             %remote_addr,
@@ -419,7 +424,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         );
                                         continue;
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    Err(fast_channel::TrySendError::Disconnected(_)) => {
                                         // Channel closed, remove the connection
                                         ongoing_gw_connections.remove(&remote_addr);
                                         tracing::debug!(
@@ -432,7 +437,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
-                                if packets_sender.send(packet_data).await.inspect_err(|err| {
+                                if packets_sender.send_async(packet_data).await.inspect_err(|err| {
                                     tracing::warn!(
                                         %remote_addr,
                                         %err,
@@ -658,14 +663,14 @@ impl<S: Socket> UdpPacketsListener<S> {
         inbound_key_bytes: [u8; 16],
     ) -> (
         GatewayConnectionFuture,
-        mpsc::Sender<PacketData<UnknownEncryption>>,
+        FastSender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
         let outbound_packets = self.outbound_packets.clone();
         let bandwidth_limit = self.bandwidth_limit;
 
-        let (inbound_from_remote, mut next_inbound) =
-            mpsc::channel::<PacketData<UnknownEncryption>>(100);
+        let (inbound_from_remote, next_inbound) =
+            fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let f = async move {
             let decrypted_intro_packet =
                 secret.decrypt(remote_intro_packet.data()).map_err(|err| {
@@ -693,7 +698,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             if protoc != PROTOC_VERSION {
                 let packet = SymmetricMessage::ack_error(&outbound_key)?;
                 outbound_packets
-                    .send((remote_addr, packet.prepared_send()))
+                    .send_async((remote_addr, packet.prepared_send()))
                     .await
                     .map_err(|_| TransportError::ChannelClosed)?;
                 return Err(TransportError::ConnectionEstablishmentFailure {
@@ -712,14 +717,14 @@ impl<S: Socket> UdpPacketsListener<S> {
             tracing::debug!(%remote_addr, "Sending outbound ack packet: {:?}", outbound_ack_packet.data());
 
             outbound_packets
-                .send((remote_addr, outbound_ack_packet.clone().prepared_send()))
+                .send_async((remote_addr, outbound_ack_packet.clone().prepared_send()))
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
 
             // wait until the remote sends the ack packet
-            let timeout = tokio::time::timeout(Duration::from_secs(5), next_inbound.recv());
+            let timeout = tokio::time::timeout(Duration::from_secs(5), next_inbound.recv_async());
             match timeout.await {
-                Ok(Some(packet)) => {
+                Ok(Ok(packet)) => {
                     let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
                             tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key: {:?}", packet.data());
                             TransportError::ConnectionEstablishmentFailure {
@@ -727,7 +732,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                         })?;
                 }
-                Ok(None) => {
+                Ok(Err(_)) => {
                     return Err(TransportError::ConnectionEstablishmentFailure {
                         cause: "connection closed".into(),
                     });
@@ -741,7 +746,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
-            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(100);
+            let (inbound_packet_tx, inbound_packet_rx) = fast_channel::bounded(1000);
             let remote_conn = RemoteConnection {
                 outbound_packets,
                 outbound_symmetric_key: outbound_key,
@@ -771,10 +776,7 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
-    ) -> (
-        TraverseNatFuture,
-        mpsc::Sender<PacketData<UnknownEncryption>>,
-    ) {
+    ) -> (TraverseNatFuture, FastSender<PacketData<UnknownEncryption>>) {
         tracing::debug!(
             %remote_addr,
             "Starting NAT traversal"
@@ -822,8 +824,8 @@ impl<S: Socket> UdpPacketsListener<S> {
         let outbound_packets = self.outbound_packets.clone();
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
-        let (inbound_from_remote, mut next_inbound) =
-            mpsc::channel::<PacketData<UnknownEncryption>>(100);
+        let (inbound_from_remote, next_inbound) =
+            fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
         let f = async move {
             tracing::info!(%remote_addr, "Starting outbound handshake (NAT traversal)");
@@ -857,7 +859,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                         ConnectionState::StartOutbound => {
                             tracing::debug!(%remote_addr, "sending protocol version and inbound key");
                             outbound_packets
-                                .send((remote_addr, outbound_intro_packet.data().into()))
+                                .send_async((remote_addr, outbound_intro_packet.data().into()))
                                 .await
                                 .map_err(|_| TransportError::ChannelClosed)?;
                             attempts += 1;
@@ -870,7 +872,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 remote_addr,
                             )?;
                             outbound_packets
-                                .send((remote_addr, our_inbound.data().into()))
+                                .send_async((remote_addr, our_inbound.data().into()))
                                 .await
                                 .map_err(|_| TransportError::ChannelClosed)?;
                             sent_tracker.report_sent_packet(
@@ -881,10 +883,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                 }
-                let next_inbound =
-                    tokio::time::timeout(Duration::from_millis(200), next_inbound.recv());
-                match next_inbound.await {
-                    Ok(Some(packet)) => {
+                let next_inbound_result =
+                    tokio::time::timeout(Duration::from_millis(200), next_inbound.recv_async());
+                match next_inbound_result.await {
+                    Ok(Ok(packet)) => {
                         tracing::debug!(%remote_addr, "received packet after sending it");
                         match state {
                             ConnectionState::StartOutbound => {
@@ -923,7 +925,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 })?;
                                             tracing::debug!(%remote_addr, "Sending back ack connection: {:?}", key);
                                             outbound_packets
-                                                .send((
+                                                .send_async((
                                                     remote_addr,
                                                     SymmetricMessage::ack_ok(
                                                         &outbound_sym_key,
@@ -935,7 +937,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 ))
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
-                                            let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                            let (inbound_sender, inbound_recv) =
+                                                fast_channel::bounded(1000);
                                             tracing::debug!(%remote_addr, "connection established");
                                             tracing::info!(%remote_addr, attempts = attempts, "Outbound handshake completed (ack path)");
                                             return Ok((
@@ -1001,7 +1004,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
-                                let (inbound_sender, inbound_recv) = mpsc::channel(100);
+                                let (inbound_sender, inbound_recv) = fast_channel::bounded(1000);
                                 tracing::info!(%remote_addr, attempts = attempts, "Outbound handshake completed (inbound ack path)");
                                 return Ok((
                                     RemoteConnection {
@@ -1027,7 +1030,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
                         }
                     }
-                    Ok(None) => {
+                    Ok(Err(_)) => {
                         tracing::debug!(%this_addr, %remote_addr, "debug: connection closed");
                         return Err(TransportError::ConnectionClosed(remote_addr));
                     }
@@ -1101,7 +1104,7 @@ pub(crate) enum ConnectionEvent {
 }
 
 struct InboundRemoteConnection {
-    inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
+    inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
 }
 
 mod version_cmp {
@@ -1224,8 +1227,8 @@ mod version_cmp {
     }
 }
 
-#[cfg(test)]
-mod test {
+#[cfg(any(test, feature = "bench"))]
+pub mod mock_transport {
     #![allow(clippy::single_range_in_vec_init)]
 
     use std::{
@@ -1243,6 +1246,7 @@ mod test {
     use tracing::info;
 
     use super::*;
+    #[allow(unused_imports)] // Used in some test configurations
     use crate::transport::packet_data::MAX_DATA_SIZE;
 
     #[test]
@@ -1266,20 +1270,23 @@ mod test {
         }
     }
 
-    type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>;
+    /// Channel mapping for mock socket communication between peers.
+    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>;
 
+    /// Policy for simulating packet loss in mock transport.
     #[derive(Default, Clone)]
-    enum PacketDropPolicy {
+    pub enum PacketDropPolicy {
         /// Receive all packets without dropping
         #[default]
         ReceiveAll,
-        /// Drop the packets randomly based on the factor
+        /// Drop the packets randomly based on the factor (0.0 to 1.0)
         Factor(f64),
-        /// Drop packets with the given ranges
+        /// Drop packets with the given packet index ranges
         Ranges(Vec<Range<usize>>),
     }
 
-    struct MockSocket {
+    /// Mock socket implementation for testing transport without real network I/O.
+    pub struct MockSocket {
         inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
         this: SocketAddr,
         packet_drop_policy: PacketDropPolicy,
@@ -1289,7 +1296,8 @@ mod test {
     }
 
     impl MockSocket {
-        async fn test_config(
+        /// Create a new MockSocket with the given configuration.
+        pub async fn new(
             packet_drop_policy: PacketDropPolicy,
             addr: SocketAddr,
             channels: Channels,
@@ -1327,6 +1335,10 @@ mod test {
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.send_to_blocking(buf, target)
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
             let packet_idx = self.num_packets_sent.fetch_add(1, Ordering::Release);
             match &self.packet_drop_policy {
                 PacketDropPolicy::ReceiveAll => {}
@@ -1363,16 +1375,22 @@ mod test {
         }
     }
 
-    async fn set_peer_connection(
+    /// Create a mock peer connection for testing/benchmarking.
+    ///
+    /// Returns the peer's public key, outbound connection handler, and socket address.
+    pub async fn create_mock_peer(
         packet_drop_policy: PacketDropPolicy,
         channels: Channels,
     ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
-        set_peer_connection_in(packet_drop_policy, false, channels)
+        create_mock_peer_internal(packet_drop_policy, false, channels)
             .await
             .map(|(pk, (o, _), s)| (pk, o, s))
     }
 
-    async fn set_gateway_connection(
+    /// Create a mock gateway connection for testing/benchmarking.
+    ///
+    /// Returns the gateway's public key, outbound handler, inbound connection receiver, and socket address.
+    pub async fn create_mock_gateway(
         packet_drop_policy: PacketDropPolicy,
         channels: Channels,
     ) -> Result<
@@ -1383,10 +1401,10 @@ mod test {
         ),
         anyhow::Error,
     > {
-        set_peer_connection_in(packet_drop_policy, true, channels).await
+        create_mock_peer_internal(packet_drop_policy, true, channels).await
     }
 
-    async fn set_peer_connection_in(
+    async fn create_mock_peer_internal(
         packet_drop_policy: PacketDropPolicy,
         gateway: bool,
         channels: Channels,
@@ -1404,7 +1422,7 @@ mod test {
         let peer_pub = peer_keypair.public.clone();
         let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let socket = Arc::new(
-            MockSocket::test_config(
+            MockSocket::new(
                 packet_drop_policy,
                 (Ipv4Addr::LOCALHOST, port).into(),
                 channels,
@@ -1425,6 +1443,8 @@ mod test {
         ))
     }
 
+    // Test infrastructure for multi-peer communication tests (reserved for future use)
+    #[allow(dead_code)]
     trait TestFixture: Clone + Send + Sync + 'static {
         type Message: DeserializeOwned + Serialize + Send + Debug + 'static;
         fn expected_iterations(&self) -> usize;
@@ -1432,6 +1452,7 @@ mod test {
         fn assert_message_ok(&self, peer_idx: usize, msg: Self::Message) -> bool;
     }
 
+    #[allow(dead_code)]
     struct TestConfig {
         packet_drop_policy: PacketDropPolicy,
         peers: usize,
@@ -1448,6 +1469,7 @@ mod test {
         }
     }
 
+    #[allow(dead_code)]
     async fn run_test<G: TestFixture>(
         config: TestConfig,
         generators: Vec<G>,
@@ -1458,7 +1480,7 @@ mod test {
         let channels = Arc::new(DashMap::new());
         for _ in 0..config.peers {
             let (peer_pub, peer, peer_addr) =
-                set_peer_connection(config.packet_drop_policy.clone(), channels.clone()).await?;
+                create_mock_peer(config.packet_drop_policy.clone(), channels.clone()).await?;
             peer_keys_and_addr.push((peer_pub, peer_addr));
             peer_conns.push(peer);
         }
@@ -1562,9 +1584,9 @@ mod test {
     async fn simulate_nat_traversal() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(Default::default(), channels).await?;
+            create_mock_peer(Default::default(), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1589,9 +1611,9 @@ mod test {
     async fn simulate_nat_traversal_drop_first_packets_for_all() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
+            create_mock_peer(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
+            create_mock_peer(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1615,9 +1637,9 @@ mod test {
     async fn simulate_nat_traversal_drop_first_packets_of_peerb() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
+            create_mock_peer(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1643,8 +1665,8 @@ mod test {
     async fn simulate_nat_traversal_drop_packet_ranges_of_peerb_killed() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
-        let (peer_b_pub, mut peer_b, peer_b_addr) = set_peer_connection(
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer(
             PacketDropPolicy::Ranges(vec![0..1, 3..usize::MAX]),
             channels,
         )
@@ -1685,9 +1707,9 @@ mod test {
     async fn simulate_nat_traversal_drop_packet_ranges_of_peerb() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1, 3..9]), channels).await?;
+            create_mock_peer(PacketDropPolicy::Ranges(vec![0..1, 3..9]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1743,9 +1765,9 @@ mod test {
     async fn simulate_gateway_connection() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(Default::default(), channels).await?;
+            create_mock_gateway(Default::default(), channels).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1772,9 +1794,9 @@ mod test {
     async fn simulate_gateway_connection_drop_first_packets_of_gateway() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
+            create_mock_gateway(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1801,9 +1823,9 @@ mod test {
     async fn simulate_gateway_connection_drop_first_packets_for_all() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
+            create_mock_peer(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
+            create_mock_gateway(PacketDropPolicy::Ranges(vec![0..1]), channels).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1829,9 +1851,9 @@ mod test {
     async fn simulate_gateway_connection_drop_first_packets_of_peer() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (_peer_a_pub, mut peer_a, _peer_a_addr) =
-            set_peer_connection(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
+            create_mock_peer(PacketDropPolicy::Ranges(vec![0..1]), channels.clone()).await?;
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            set_gateway_connection(Default::default(), channels).await?;
+            create_mock_gateway(Default::default(), channels).await?;
 
         let gw = tokio::spawn(async move {
             let gw_conn = gw_conn.recv();
@@ -1891,9 +1913,9 @@ mod test {
     async fn simulate_send_max_short_message() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(Default::default(), channels).await?;
+            create_mock_peer(Default::default(), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
@@ -1924,9 +1946,9 @@ mod test {
     async fn simulate_send_max_short_message_plus_1() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(Default::default(), channels).await?;
+            create_mock_peer(Default::default(), channels).await?;
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
@@ -2084,11 +2106,11 @@ mod test {
 
         // Create the gateway
         let (gw_pub, (gw_outbound, mut gw_conn), gw_addr) =
-            set_gateway_connection(Default::default(), channels.clone()).await?;
+            create_mock_gateway(Default::default(), channels.clone()).await?;
 
         // Create peer A at port X
         let (_peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
 
         tracing::info!(
             "Step 1: Peer A at {} connecting to gateway at {}",
@@ -2127,7 +2149,7 @@ mod test {
         // This peer uses the same shared channels so packets can still route
         tracing::info!("Step 3: Creating peer B at different port");
         let (_peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
 
         // Verify this is testing the same-IP-different-port scenario
         assert_eq!(
@@ -2203,15 +2225,15 @@ mod test {
 
         // Create the gateway
         let (gw_pub, (_gw_outbound, mut gw_conn), gw_addr) =
-            set_gateway_connection(Default::default(), channels.clone()).await?;
+            create_mock_gateway(Default::default(), channels.clone()).await?;
 
         // Create peer A (first device behind NAT)
         let (_peer_a_pub, mut peer_a, peer_a_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
 
         // Create peer B (second device behind NAT, same IP different port)
         let (_peer_b_pub, mut peer_b, peer_b_addr) =
-            set_peer_connection(Default::default(), channels.clone()).await?;
+            create_mock_peer(Default::default(), channels.clone()).await?;
 
         // Verify both peers have same IP but different ports (simulating NAT)
         assert_eq!(

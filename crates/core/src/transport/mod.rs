@@ -11,10 +11,18 @@ use std::{borrow::Cow, io, net::SocketAddr};
 use futures::Future;
 use tokio::net::UdpSocket;
 
-pub(crate) mod connection_handler;
+pub mod connection_handler;
 mod crypto;
+
+/// Mock transport infrastructure for testing and benchmarking.
+/// Provides MockSocket and helper functions to create mock peer connections
+/// without real network I/O.
+#[cfg(any(test, feature = "bench"))]
+pub use connection_handler::mock_transport;
+/// High-performance channels for transport layer.
+pub mod fast_channel;
 mod packet_data;
-mod peer_connection;
+pub mod peer_connection;
 mod rate_limiter;
 // todo: optimize trackers
 mod received_packet_tracker;
@@ -53,16 +61,16 @@ impl From<SocketAddr> for ObservedAddr {
     }
 }
 
+pub(crate) use self::connection_handler::create_connection_handler;
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
-pub(crate) use self::{
-    connection_handler::{
-        create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
-    },
+pub use self::{
+    connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
     peer_connection::PeerConnection,
 };
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TransportError {
+#[cfg_attr(feature = "bench", allow(dead_code))]
+pub enum TransportError {
     #[error("transport handler channel closed, socket likely closed")]
     ChannelClosed,
     #[error("connection to remote closed")]
@@ -91,11 +99,16 @@ pub(crate) trait Socket: Sized + Send + Sync + 'static {
         &self,
         buf: &mut [u8],
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
+    #[allow(dead_code)] // Kept for completeness; blocking variant is used for rate-limiter
     fn send_to(
         &self,
         buf: &[u8],
         target: SocketAddr,
     ) -> impl Future<Output = io::Result<usize>> + Send;
+
+    /// Synchronous send for use in blocking contexts (e.g., spawn_blocking).
+    /// For UDP, this typically succeeds immediately since there's no flow control.
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize>;
 }
 
 impl Socket for UdpSocket {
@@ -109,6 +122,26 @@ impl Socket for UdpSocket {
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         self.send_to(buf, target).await
+    }
+
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        // try_send_to is synchronous and for UDP typically succeeds immediately.
+        // However, under high load the kernel buffer might be full, returning WouldBlock.
+        // In that case, we retry with exponential backoff since we're in a blocking context.
+        let mut backoff_us = 1u64; // Start at 1μs
+        const MAX_BACKOFF_US: u64 = 1000; // Cap at 1ms
+
+        loop {
+            match self.try_send_to(buf, target) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Kernel buffer full - exponential backoff
+                    std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+                    backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
