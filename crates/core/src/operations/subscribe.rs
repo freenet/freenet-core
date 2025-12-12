@@ -256,8 +256,7 @@ pub(crate) async fn request_subscribe(
                         .ring
                         .subscribers_of(key)
                         .map(|subs| {
-                            subs.value()
-                                .iter()
+                            subs.iter()
                                 .filter_map(|loc| loc.socket_addr())
                                 .map(|addr| format!("{:.8}", addr))
                                 .collect::<Vec<_>>()
@@ -512,10 +511,10 @@ impl Operation for SubscribeOp {
                             "subscribe: handling RequestSub locally (contract available)"
                         );
 
-                        // Local registration - no upstream NAT address
+                        // Register as downstream subscriber (they want updates FROM us)
                         if op_manager
                             .ring
-                            .add_subscriber(key, subscriber.clone(), None)
+                            .add_downstream(key, subscriber.clone(), None)
                             .is_err()
                         {
                             tracing::warn!(
@@ -544,7 +543,7 @@ impl Operation for SubscribeOp {
                             %key,
                             subscriber = %subscriber_addr,
                             subscribers_after = ?after_direct,
-                            "subscribe: registered direct subscriber (RequestSub)"
+                            "subscribe: registered downstream subscriber (RequestSub)"
                         );
 
                         let own_addr = own_loc
@@ -610,10 +609,10 @@ impl Operation for SubscribeOp {
                             "subscribe: contract arrived, handling locally"
                         );
 
-                        // Contract exists, register subscription
+                        // Contract exists, register as downstream subscriber
                         if op_manager
                             .ring
-                            .add_subscriber(key, subscriber.clone(), None)
+                            .add_downstream(key, subscriber.clone(), None)
                             .is_err()
                         {
                             let return_msg = SubscribeMsg::ReturnSub {
@@ -889,12 +888,12 @@ impl Operation for SubscribeOp {
                         %key,
                         subscriber = %subscriber_addr,
                         subscribers_before = ?before_direct,
-                        "subscribe: attempting to register direct subscriber"
+                        "subscribe: attempting to register downstream subscriber"
                     );
-                    // Local registration - no upstream NAT address
+                    // Register as downstream subscriber (they want updates FROM us)
                     if op_manager
                         .ring
-                        .add_subscriber(key, subscriber.clone(), None)
+                        .add_downstream(key, subscriber.clone(), None)
                         .is_err()
                     {
                         tracing::warn!(
@@ -902,7 +901,7 @@ impl Operation for SubscribeOp {
                             %key,
                             subscriber = %subscriber_addr,
                             subscribers_before = ?before_direct,
-                            "subscribe: direct registration failed (max subscribers reached)"
+                            "subscribe: downstream registration failed (max subscribers reached)"
                         );
                         // max number of subscribers for this contract reached
                         return Ok(return_not_subbed());
@@ -913,7 +912,7 @@ impl Operation for SubscribeOp {
                         %key,
                         subscriber = %subscriber_addr,
                         subscribers_after = ?after_direct,
-                        "subscribe: registered direct subscriber"
+                        "subscribe: registered downstream subscriber"
                     );
 
                     match self.state {
@@ -1057,72 +1056,58 @@ impl Operation for SubscribeOp {
                                 .unwrap_or_else(|| "<none>".into()),
                             "Handling ReturnSub (subscribed=true)"
                         );
+                        // Register the peer who forwarded the subscription to us as downstream
+                        // (they want updates FROM us - we forward updates to them)
                         if let Some(upstream_subscriber) = upstream_subscriber.as_ref() {
-                            let before_upstream = subscribers_snapshot(op_manager, key);
-                            let upstream_addr = upstream_subscriber
+                            let before_downstream = subscribers_snapshot(op_manager, key);
+                            let downstream_addr = upstream_subscriber
                                 .socket_addr()
-                                .expect("upstream subscriber must have socket address");
+                                .expect("downstream subscriber must have socket address");
                             tracing::info!(
                                 tx = %id,
                                 %key,
-                                upstream = %upstream_addr,
-                                subscribers_before = ?before_upstream,
-                                "subscribe: attempting to register upstream link"
+                                downstream = %downstream_addr,
+                                subscribers_before = ?before_downstream,
+                                "subscribe: attempting to register downstream subscriber (forwarding peer)"
                             );
-                            // Local registration - no upstream NAT address
                             if op_manager
                                 .ring
-                                .add_subscriber(key, upstream_subscriber.clone(), None)
+                                .add_downstream(key, upstream_subscriber.clone(), None)
                                 .is_err()
                             {
                                 tracing::warn!(
                                     tx = %id,
                                     %key,
-                                    upstream = %upstream_addr,
-                                    subscribers_before = ?before_upstream,
-                                    "subscribe: upstream registration failed (max subscribers reached)"
+                                    downstream = %downstream_addr,
+                                    subscribers_before = ?before_downstream,
+                                    "subscribe: downstream registration failed (max subscribers reached)"
                                 );
                             } else {
-                                let after_upstream = subscribers_snapshot(op_manager, key);
+                                let after_downstream = subscribers_snapshot(op_manager, key);
                                 tracing::info!(
                                     tx = %id,
                                     %key,
-                                    upstream = %upstream_addr,
-                                    subscribers_after = ?after_upstream,
-                                    "subscribe: registered upstream link"
+                                    downstream = %downstream_addr,
+                                    subscribers_after = ?after_downstream,
+                                    "subscribe: registered downstream subscriber (forwarding peer)"
                                 );
                             }
                         }
 
-                        let before_provider = subscribers_snapshot(op_manager, key);
+                        // Register the sender (provider) as our upstream
+                        // (we receive updates FROM them)
                         tracing::info!(
                             tx = %id,
                             %key,
-                            provider = %sender_addr,
-                            subscribers_before = ?before_provider,
-                            "subscribe: registering provider/subscription source"
+                            upstream = %sender_addr,
+                            "subscribe: registering upstream source (provider)"
                         );
-                        // Local registration - no upstream NAT address
-                        if op_manager
-                            .ring
-                            .add_subscriber(key, sender.clone(), None)
-                            .is_err()
-                        {
-                            // concurrently it reached max number of subscribers for this contract
-                            tracing::debug!(
-                                tx = %id,
-                                %key,
-                                "Max number of subscribers reached for contract"
-                            );
-                            return Err(OpError::UnexpectedOpState);
-                        }
-                        let after_provider = subscribers_snapshot(op_manager, key);
+                        op_manager.ring.set_upstream(key, sender.clone());
                         tracing::info!(
                             tx = %id,
                             %key,
-                            provider = %sender_addr,
-                            subscribers_after = ?after_provider,
-                            "subscribe: registered provider/subscription source"
+                            upstream = %sender_addr,
+                            "subscribe: registered upstream source (provider)"
                         );
 
                         new_state = Some(SubscribeState::Completed { key: *key });

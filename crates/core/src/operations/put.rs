@@ -950,18 +950,15 @@ impl OpManager {
         key: &ContractKey,
         sender: &PeerKeyLocation,
     ) -> Vec<PeerKeyLocation> {
-        let subscribers = self
-            .ring
+        self.ring
             .subscribers_of(key)
             .map(|subs| {
-                subs.value()
-                    .iter()
+                subs.iter()
                     .filter(|pk| pk.pub_key() != sender.pub_key())
                     .cloned()
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
-        subscribers
+            .unwrap_or_default()
     }
 }
 

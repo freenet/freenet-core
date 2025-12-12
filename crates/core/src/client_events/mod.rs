@@ -232,6 +232,8 @@ async fn register_subscription_listener(
                 %client_id, %key,
                 "Subscriber listener registered successfully for {}", operation_type
             );
+            // Register client subscription to prevent upstream unsubscription while this client is active
+            op_manager.ring.add_client_subscription(&key, client_id);
             Ok(())
         }
         _ => {

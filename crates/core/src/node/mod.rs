@@ -848,7 +848,9 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Unsubscribed {
-                ref key, ref from, ..
+                ref key,
+                ref from,
+                ref transaction,
             } => {
                 tracing::debug!(
                     "Received Unsubscribed message for contract {} from peer {}",
@@ -862,7 +864,37 @@ async fn process_message_v1<CB>(
                         .expect("from peer should have socket address"),
                     pub_key: from.pub_key().clone(),
                 };
-                op_manager.ring.remove_subscriber(key, &peer_id);
+
+                // Remove subscriber and check if we need to propagate unsubscribe upstream
+                let result = op_manager.ring.remove_subscriber(key, &peer_id);
+
+                if let Some(upstream) = result.notify_upstream {
+                    // No more downstream subscribers and no local interest - propagate unsubscribe
+                    let upstream_addr = upstream
+                        .socket_addr()
+                        .expect("upstream must have socket address");
+                    tracing::info!(
+                        %key,
+                        %upstream_addr,
+                        "Propagating Unsubscribed to upstream (no remaining interest) [legacy]"
+                    );
+
+                    let own_location = op_manager.ring.connection_manager.own_location();
+                    let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
+                        transaction: *transaction,
+                        key: *key,
+                        from: own_location,
+                    });
+
+                    if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await {
+                        tracing::warn!(
+                            %key,
+                            %upstream_addr,
+                            error = %e,
+                            "Failed to propagate Unsubscribed to upstream [legacy]"
+                        );
+                    }
+                }
                 break;
             }
             NetMessageV1::ProximityCache { .. } => {
@@ -1096,7 +1128,9 @@ where
                 .await;
             }
             NetMessageV1::Unsubscribed {
-                ref key, ref from, ..
+                ref key,
+                ref from,
+                ref transaction,
             } => {
                 tracing::debug!(
                     "Received Unsubscribed message for contract {} from peer {}",
@@ -1110,7 +1144,37 @@ where
                         .expect("from peer should have socket address"),
                     pub_key: from.pub_key().clone(),
                 };
-                op_manager.ring.remove_subscriber(key, &peer_id);
+
+                // Remove subscriber and check if we need to propagate unsubscribe upstream
+                let result = op_manager.ring.remove_subscriber(key, &peer_id);
+
+                if let Some(upstream) = result.notify_upstream {
+                    // No more downstream subscribers and no local interest - propagate unsubscribe
+                    let upstream_addr = upstream
+                        .socket_addr()
+                        .expect("upstream must have socket address");
+                    tracing::info!(
+                        %key,
+                        %upstream_addr,
+                        "Propagating Unsubscribed to upstream (no remaining interest)"
+                    );
+
+                    let own_location = op_manager.ring.connection_manager.own_location();
+                    let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
+                        transaction: *transaction,
+                        key: *key,
+                        from: own_location,
+                    });
+
+                    if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await {
+                        tracing::warn!(
+                            %key,
+                            %upstream_addr,
+                            error = %e,
+                            "Failed to propagate Unsubscribed to upstream"
+                        );
+                    }
+                }
                 break;
             }
             NetMessageV1::ProximityCache { ref message } => {

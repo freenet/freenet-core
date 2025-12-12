@@ -348,8 +348,7 @@ impl Operation for UpdateOp {
                                     .ring
                                     .subscribers_of(key)
                                     .map(|subs| {
-                                        subs.value()
-                                            .iter()
+                                        subs.iter()
                                             .filter_map(|loc| loc.socket_addr())
                                             .map(|addr| format!("{:.8}", addr))
                                             .collect::<Vec<_>>()
@@ -519,8 +518,7 @@ impl Operation for UpdateOp {
                                 .ring
                                 .subscribers_of(key)
                                 .map(|subs| {
-                                    subs.value()
-                                        .iter()
+                                    subs.iter()
                                         .filter_map(|loc| loc.socket_addr())
                                         .map(|addr| format!("{:.8}", addr))
                                         .collect::<Vec<_>>()
@@ -760,19 +758,14 @@ impl OpManager {
         let self_addr = self.ring.connection_manager.get_own_addr();
         let allow_self = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
 
-        // Collect explicit subscribers (downstream interest)
+        // Collect downstream subscribers (peers that want updates FROM us)
         let subscribers: HashSet<PeerKeyLocation> = self
             .ring
-            .subscribers_of(key)
-            .map(|subs| {
-                subs.value()
-                    .iter()
-                    // Filter out the sender to avoid sending the update back to where it came from
-                    .filter(|pk| pk.socket_addr().as_ref() != Some(sender))
-                    .cloned()
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+            .get_downstream(key)
+            .into_iter()
+            // Filter out the sender to avoid sending the update back to where it came from
+            .filter(|pk| pk.socket_addr().as_ref() != Some(sender))
+            .collect();
 
         // Collect proximity neighbors (nearby seeders who may not be explicitly subscribed)
         let proximity_addrs = self.proximity_cache.neighbors_with_contract(key);
@@ -1092,10 +1085,10 @@ pub(crate) async fn request_update(
             .closest_potentially_caching(&key, [sender_addr].as_slice());
 
         if let Some(target) = remote_target {
-            // Subscribe on behalf of the requesting peer (no upstream_addr - direct registration)
+            // Register sender as downstream subscriber (they want updates FROM us)
             op_manager
                 .ring
-                .add_subscriber(&key, sender.clone(), None)
+                .add_downstream(&key, sender.clone(), None)
                 .map_err(|_| RingError::NoCachingPeers(key))?;
 
             target
