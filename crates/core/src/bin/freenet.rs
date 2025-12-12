@@ -8,7 +8,23 @@ use freenet::{
 };
 use std::sync::Arc;
 
+/// Build metadata embedded at compile time
+mod build_info {
+    pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+    pub const GIT_COMMIT: &str = env!("GIT_COMMIT_HASH");
+    pub const GIT_DIRTY: &str = env!("GIT_DIRTY");
+    pub const BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP");
+}
+
 async fn run(config: Config) -> anyhow::Result<()> {
+    // Log build info on startup - critical for correlating logs with code version
+    tracing::info!(
+        version = build_info::VERSION,
+        git_commit = %format!("{}{}", build_info::GIT_COMMIT, build_info::GIT_DIRTY),
+        build_timestamp = build_info::BUILD_TIMESTAMP,
+        "Freenet node starting"
+    );
+
     match config.mode {
         OperationMode::Local => run_local(config).await,
         OperationMode::Network => run_network(config).await,

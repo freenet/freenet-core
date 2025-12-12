@@ -152,12 +152,12 @@ pub(crate) async fn request_subscribe(
 
     // If we have the contract locally but no remote peers, complete locally only
     if has_contract_locally && candidates.is_empty() {
-        tracing::info!(tx = %id, %key, "Contract available locally, no remote peers, completing subscription locally");
+        tracing::info!(tx = %id, contract = %key, phase = "complete", "Contract available locally, no remote peers, completing subscription locally");
         return complete_local_subscription(op_manager, *id, *key).await;
     }
 
     let Some(target) = candidates.first() else {
-        tracing::warn!(tx = %id, %key, "No remote peers available for subscription");
+        tracing::warn!(tx = %id, contract = %key, phase = "error", "No remote peers available for subscription");
         return Err(RingError::NoCachingPeers(*key).into());
     };
 
@@ -362,7 +362,7 @@ impl Operation for SubscribeOp {
                                 );
                             }
 
-                            tracing::info!(tx = %id, %key, "Subscription fulfilled, sending Response");
+                            tracing::info!(tx = %id, contract = %key, phase = "response", "Subscription fulfilled, sending Response");
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
@@ -422,7 +422,7 @@ impl Operation for SubscribeOp {
 
                     // Contract still not found - try to forward
                     if *htl == 0 {
-                        tracing::warn!(tx = %id, %key, "Subscribe request exhausted HTL");
+                        tracing::warn!(tx = %id, contract = %key, htl = 0, phase = "error", "Subscribe request exhausted HTL");
                         if let Some(upstream_addr) = self.upstream_addr {
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
@@ -531,7 +531,7 @@ impl Operation for SubscribeOp {
                         })
                     } else {
                         // We're the originator - complete the operation
-                        tracing::info!(tx = %msg_id, %key, subscribed, "Subscribe completed (originator)");
+                        tracing::info!(tx = %msg_id, contract = %key, subscribed, phase = "complete", "Subscribe completed (originator)");
                         Ok(OperationResult {
                             return_msg: None,
                             next_hop: None,

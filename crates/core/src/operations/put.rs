@@ -108,7 +108,8 @@ impl Operation for PutOp {
         tracing::debug!(
             tx = %tx,
             msg_type = %msg,
-            "PutOp::load_or_init: Attempting to load or initialize operation"
+            phase = "load_or_init",
+            "Attempting to load or initialize PUT operation"
         );
 
         match op_manager.pop(msg.id()) {
@@ -117,7 +118,8 @@ impl Operation for PutOp {
                 tracing::debug!(
                     tx = %tx,
                     state = %put_op.state.as_ref().map(|s| format!("{:?}", s)).unwrap_or_else(|| "None".to_string()),
-                    "PutOp::load_or_init: Found existing PUT operation"
+                    phase = "load_or_init",
+                    "Found existing PUT operation"
                 );
                 Ok(OpInitialization {
                     op: put_op,
@@ -127,7 +129,8 @@ impl Operation for PutOp {
             Ok(Some(op)) => {
                 tracing::warn!(
                     tx = %tx,
-                    "PutOp::load_or_init: Found operation with wrong type, pushing back"
+                    phase = "load_or_init",
+                    "Found operation with wrong type, pushing back"
                 );
                 let _ = op_manager.push(tx, op).await;
                 Err(OpError::OpNotPresent(tx))
@@ -138,7 +141,8 @@ impl Operation for PutOp {
                 tracing::debug!(
                     tx = %tx,
                     source = ?source_addr,
-                    "PutOp::load_or_init: New incoming request"
+                    phase = "load_or_init",
+                    "New incoming request"
                 );
                 Ok(OpInitialization {
                     op: Self {
@@ -153,7 +157,8 @@ impl Operation for PutOp {
                 tracing::error!(
                     tx = %tx,
                     error = %err,
-                    "PutOp::load_or_init: Error popping operation"
+                    phase = "load_or_init",
+                    "Error popping operation"
                 );
                 Err(err.into())
             }
@@ -197,10 +202,11 @@ impl Operation for PutOp {
 
                     tracing::info!(
                         tx = %id,
-                        %key,
+                        contract = %key,
                         htl,
                         is_originator,
                         subscribe,
+                        phase = "request",
                         "Processing PUT Request"
                     );
 
@@ -229,7 +235,8 @@ impl Operation for PutOp {
                     if was_seeding && state_changed {
                         tracing::debug!(
                             tx = %id,
-                            %key,
+                            contract = %key,
+                            phase = "update_trigger",
                             "PUT on subscribed contract resulted in state change, triggering Update"
                         );
                         start_update_after_put(op_manager, id, key, merged_value.clone()).await;
@@ -262,9 +269,10 @@ impl Operation for PutOp {
 
                         tracing::debug!(
                             tx = %id,
-                            %key,
-                            next = %next_addr,
+                            contract = %key,
+                            peer_addr = %next_addr,
                             htl = htl - 1,
+                            phase = "forward",
                             "Forwarding PUT to next hop"
                         );
 
@@ -297,7 +305,8 @@ impl Operation for PutOp {
                         // No next hop - we're the final destination (or htl exhausted)
                         tracing::info!(
                             tx = %id,
-                            %key,
+                            contract = %key,
+                            phase = "complete",
                             "PUT complete at this node, sending response"
                         );
 
@@ -335,18 +344,20 @@ impl Operation for PutOp {
                 PutMsg::Response { id: _msg_id, key } => {
                     tracing::info!(
                         tx = %id,
-                        %key,
+                        contract = %key,
                         is_originator,
                         subscribe,
-                        "Processing PUT Response"
+                        phase = "response",
+                        "PUT Response received"
                     );
 
                     if is_originator {
                         // We're the originator - operation complete!
                         tracing::info!(
                             tx = %id,
-                            %key,
+                            contract = %key,
                             elapsed_ms = id.elapsed().as_millis(),
+                            phase = "complete",
                             "PUT operation completed successfully"
                         );
 
@@ -370,8 +381,9 @@ impl Operation for PutOp {
 
                         tracing::debug!(
                             tx = %id,
-                            %key,
-                            upstream = %upstream,
+                            contract = %key,
+                            peer_addr = %upstream,
+                            phase = "response",
                             "Forwarding PUT Response to upstream"
                         );
 
@@ -402,14 +414,16 @@ async fn start_subscription_after_put(
         let child_tx = super::start_subscription_request(op_manager, parent_tx, key);
         tracing::debug!(
             tx = %parent_tx,
-            %child_tx,
-            %key,
+            child_tx = %child_tx,
+            contract = %key,
+            phase = "subscribe",
             "Started subscription as child operation after PUT"
         );
     } else {
         tracing::warn!(
             tx = %parent_tx,
-            %key,
+            contract = %key,
+            phase = "subscribe",
             "Not starting subscription for failed parent PUT operation"
         );
     }
@@ -430,8 +444,9 @@ async fn start_update_after_put(
 
     tracing::debug!(
         tx = %parent_tx,
-        %child_tx,
-        %key,
+        child_tx = %child_tx,
+        contract = %key,
+        phase = "update",
         "Starting Update as child operation after PUT changed subscribed contract state"
     );
 
@@ -445,10 +460,10 @@ async fn start_update_after_put(
 
         match update::request_update(&op_manager_cloned, update_op).await {
             Ok(_) => {
-                tracing::debug!(%child_tx, %parent_tx, %key, "child Update completed");
+                tracing::debug!(tx = %child_tx, parent_tx = %parent_tx, contract = %key, phase = "complete", "child Update completed");
             }
             Err(error) => {
-                tracing::error!(%parent_tx, %child_tx, %key, %error, "child Update failed");
+                tracing::error!(tx = %parent_tx, child_tx = %child_tx, contract = %key, error = %error, phase = "error", "child Update failed");
                 // Note: We don't propagate this failure to the parent PUT since the PUT itself
                 // succeeded - the Update is best-effort propagation to subscribers
             }
@@ -465,7 +480,7 @@ pub(crate) fn start_op(
 ) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
-    tracing::debug!(%contract_location, %key, "Requesting put");
+    tracing::debug!(contract_location = %contract_location, contract = %key, phase = "request", "Requesting put");
 
     let id = Transaction::new::<PutMsg>();
     let state = Some(PutState::PrepareRequest {
@@ -494,7 +509,7 @@ pub(crate) fn start_op_with_id(
 ) -> PutOp {
     let key = contract.key();
     let contract_location = Location::from(&key);
-    tracing::debug!(%contract_location, %key, tx = %id, "Requesting put with existing transaction ID");
+    tracing::debug!(contract_location = %contract_location, contract = %key, tx = %id, phase = "request", "Requesting put with existing transaction ID");
 
     let state = Some(PutState::PrepareRequest {
         contract,
@@ -561,6 +576,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
             tracing::error!(
                 tx = %put_op.id,
                 state = ?put_op.state,
+                phase = "error",
                 "request_put called with unexpected state"
             );
             return Err(OpError::UnexpectedOpState);
@@ -569,7 +585,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
 
     let key = contract.key();
 
-    tracing::info!(tx = %id, %key, htl, subscribe, "Starting PUT operation");
+    tracing::info!(tx = %id, contract = %key, htl, subscribe, phase = "request", "Starting PUT operation");
 
     // Build initial skip list with our own address
     let mut skip_list = HashSet::new();
@@ -634,7 +650,7 @@ async fn put_contract(
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Err(err),
         }) => {
-            tracing::error!(%key, "Failed to update contract value: {}", err);
+            tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
             Err(OpError::from(err))
             // TODO: not a valid value update, notify back to requester
         }

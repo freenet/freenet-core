@@ -86,7 +86,8 @@ impl ContractExecutor for Executor<Runtime> {
                 contract = %key,
                 state_size = state.as_ref().len(),
                 state_hash = %hash,
-                "upserting contract state"
+                phase = "upsert_start",
+                "Upserting contract state"
             );
         }
         let params = if let Some(code) = &code {
@@ -120,7 +121,11 @@ impl ContractExecutor for Executor<Runtime> {
             .is_none()
         {
             if let Some(ref contract_code) = code {
-                tracing::debug!("Storing new contract - key={}", key);
+                tracing::debug!(
+                    contract = %key,
+                    phase = "store_contract",
+                    "Storing new contract"
+                );
 
                 self.runtime
                     .contract_store
@@ -160,11 +165,19 @@ impl ContractExecutor for Executor<Runtime> {
                     })?;
                 match result {
                     ValidateResult::Valid => {
-                        tracing::debug!("The incoming state is valid");
+                        tracing::debug!(
+                            contract = %key,
+                            phase = "validation_complete",
+                            "Incoming state is valid"
+                        );
 
                         // If the contract is new, we store the incoming state as the initial state avoiding the update
                         if is_new_contract {
-                            tracing::debug!("Contract is new, storing initial state");
+                            tracing::debug!(
+                                contract = %key,
+                                phase = "store_initial_state",
+                                "Contract is new, storing initial state"
+                            );
                             let state_to_store = incoming_state.clone();
                             self.state_store
                                 .store(key, state_to_store, params.clone())
@@ -251,7 +264,11 @@ impl ContractExecutor for Executor<Runtime> {
         let current_state = match self.state_store.get(&key).await {
             Ok(s) => s,
             Err(StateStoreError::MissingContract(_)) => {
-                tracing::warn!("Missing contract {key} for upsert");
+                tracing::warn!(
+                    contract = %key,
+                    phase = "upsert_failed",
+                    "Missing contract for upsert"
+                );
                 return Err(ExecutorError::request(StdContractError::MissingContract {
                     key: key.into(),
                 }));
@@ -300,7 +317,10 @@ impl ContractExecutor for Executor<Runtime> {
                         .map_err(ExecutorError::other)?;
 
                     // todo: forward delta like we are doing with puts
-                    tracing::warn!("Delta updates are not yet supported");
+                    tracing::warn!(
+                        contract = %key,
+                        "Delta updates are not yet supported"
+                    );
                     Ok(UpsertResult::Updated(updated_state))
                 }
             }
@@ -343,7 +363,9 @@ impl ContractExecutor for Executor<Runtime> {
             .is_some()
         {
             tracing::warn!(
-                "contract {key} already was registered for peer {cli_id}; replaced summary"
+                contract = %key,
+                client = %cli_id,
+                "Contract already registered for client, replaced summary"
             );
         }
         Ok(())
@@ -381,7 +403,12 @@ impl ContractExecutor for Executor<Runtime> {
                         values: Vec::new(),
                     }),
                     Err(err) => {
-                        tracing::warn!("failed registering delegate `{key}`: {err}");
+                        tracing::warn!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "register_failed",
+                            "Failed to register delegate"
+                        );
                         Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
                     }
                 }
@@ -391,7 +418,12 @@ impl ContractExecutor for Executor<Runtime> {
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::warn!("failed unregistering delegate `{key}`: {err}");
+                        tracing::warn!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "unregister_failed",
+                            "Failed to unregister delegate"
+                        );
                         Ok(HostResponse::Ok)
                     }
                 }
@@ -443,7 +475,12 @@ impl ContractExecutor for Executor<Runtime> {
                 ) {
                     Ok(values) => Ok(DelegateResponse { key, values }),
                     Err(err) => {
-                        tracing::error!("failed executing delegate `{key}`: {err}");
+                        tracing::error!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "execution_failed",
+                            "Failed executing delegate"
+                        );
                         Err(ExecutorError::execution(
                             err,
                             Some(InnerOpError::Delegate(key)),
@@ -581,7 +618,8 @@ impl Executor<Runtime> {
                     state: state.ok_or_else(|| {
                         tracing::debug!(
                             contract = %key,
-                            "Contract state not found during get request."
+                            phase = "get_failed",
+                            "Contract state not found during get request"
                         );
                         ExecutorError::request(StdContractError::Get {
                             key,
@@ -628,7 +666,8 @@ impl Executor<Runtime> {
             tracing::error!(
                 client = %cli_id,
                 error = %e,
-                "contract request failed"
+                phase = "request_failed",
+                "Contract request failed"
             );
         }
 
@@ -667,7 +706,12 @@ impl Executor<Runtime> {
                         values: Vec::new(),
                     }),
                     Err(err) => {
-                        tracing::warn!("failed registering delegate `{key}`: {err}");
+                        tracing::warn!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "register_failed",
+                            "Failed to register delegate"
+                        );
                         Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
                     }
                 }
@@ -677,7 +721,12 @@ impl Executor<Runtime> {
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::warn!("failed unregistering delegate `{key}`: {err}");
+                        tracing::warn!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "unregister_failed",
+                            "Failed to unregister delegate"
+                        );
                         Ok(HostResponse::Ok)
                     }
                 }
@@ -729,7 +778,12 @@ impl Executor<Runtime> {
                 ) {
                     Ok(values) => Ok(DelegateResponse { key, values }),
                     Err(err) => {
-                        tracing::error!("failed executing delegate `{key}`: {err}");
+                        tracing::error!(
+                            delegate_key = %key,
+                            error = %err,
+                            phase = "execution_failed",
+                            "Failed executing delegate"
+                        );
                         Err(ExecutorError::execution(
                             err,
                             Some(InnerOpError::Delegate(key)),
@@ -855,7 +909,11 @@ impl Executor<Runtime> {
         let new_state = WrappedState::new(new_state.into_bytes());
 
         if new_state.as_ref() == current_state.as_ref() {
-            tracing::debug!("No changes in state for contract {key}, avoiding update");
+            tracing::debug!(
+                contract = %key,
+                phase = "update_skipped",
+                "No changes in state, avoiding update"
+            );
             return Ok(Either::Left(current_state.clone()));
         }
 
@@ -865,8 +923,10 @@ impl Executor<Runtime> {
             .map_err(ExecutorError::other)?;
 
         tracing::info!(
-            "Contract state updated for {key}, new_size_bytes={}",
-            new_state.as_ref().len()
+            contract = %key,
+            new_size_bytes = new_state.as_ref().len(),
+            phase = "update_complete",
+            "Contract state updated"
         );
 
         if let Err(err) = self
@@ -874,9 +934,10 @@ impl Executor<Runtime> {
             .await
         {
             tracing::error!(
-                "Failed while sending notifications for contract {}: {}",
-                key,
-                err
+                contract = %key,
+                error = %err,
+                phase = "notification_failed",
+                "Failed to send update notification"
             );
         }
         Ok(Either::Left(new_state))
@@ -1233,9 +1294,20 @@ impl Executor<Runtime> {
                     ))
                 {
                     failures.push(*peer_key);
-                    tracing::error!(cli_id = %peer_key, "{err}");
+                    tracing::error!(
+                        client = %peer_key,
+                        contract = %key,
+                        error = %err,
+                        phase = "notification_send_failed",
+                        "Failed to send update notification to client"
+                    );
                 } else {
-                    tracing::debug!(cli_id = %peer_key, contract = %key, "notified of update");
+                    tracing::debug!(
+                        client = %peer_key,
+                        contract = %key,
+                        phase = "notification_sent",
+                        "Sent update notification to client"
+                    );
                 }
             }
             if !failures.is_empty() {

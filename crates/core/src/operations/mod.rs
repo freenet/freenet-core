@@ -123,8 +123,9 @@ where
         }) if final_state.finalized() => {
             if op_manager.failed_parents().remove(&tx_id).is_some() {
                 tracing::warn!(
-                    "Operation {} reached finalized state after a sub-operation failure; dropping client response",
-                    tx_id
+                    tx = %tx_id,
+                    phase = "error",
+                    "Operation reached finalized state after a sub-operation failure; dropping client response"
                 );
                 op_manager.completed(tx_id);
                 return Ok(None);
@@ -145,7 +146,7 @@ where
                 op_manager
                     .root_ops_awaiting_sub_ops()
                     .insert(tx_id, final_state);
-                tracing::info!(%tx_id, "root operation registered as awaiting sub-ops");
+                tracing::info!(tx = %tx_id, phase = "wait_sub_ops", "root operation registered as awaiting sub-ops");
 
                 return Ok(None);
             }
@@ -388,8 +389,9 @@ pub(crate) async fn announce_contract_cached(op_manager: &OpManager, key: &Contr
             .await
         {
             tracing::warn!(
-                %key,
-                %err,
+                contract = %key,
+                error = %err,
+                phase = "error",
                 "PROXIMITY_CACHE: Failed to broadcast cache announcement"
             );
         }
@@ -438,14 +440,14 @@ fn start_subscription_request_internal(
                 tracing::debug!(%child_tx, %parent_tx, "child subscription completed");
             }
             Err(error) => {
-                tracing::error!(%parent_tx, %child_tx, %error, "child subscription failed");
+                tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = %error, phase = "error", "child subscription failed");
 
                 let error_msg = format!("{}", error);
                 if let Err(e) = op_manager_cloned
                     .sub_operation_failed(child_tx, &error_msg)
                     .await
                 {
-                    tracing::error!(%parent_tx, %child_tx, %e, "failed to propagate failure");
+                    tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = %e, phase = "error", "failed to propagate failure");
                 }
             }
         }

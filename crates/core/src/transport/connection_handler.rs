@@ -74,9 +74,9 @@ pub(crate) async fn create_connection_handler<S: Socket>(
 ) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
-    tracing::info!(
+    tracing::debug!(
         target: "freenet_core::transport::send_debug",
-        %bind_addr,
+        bind_addr = %bind_addr,
         is_gateway,
         "Binding UDP socket"
     );
@@ -85,7 +85,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
 
     tracing::info!(
         target: "freenet_core::transport::send_debug",
-        %bind_addr,
+        bind_addr = %bind_addr,
         is_gateway,
         "UDP socket bound successfully"
     );
@@ -120,7 +120,7 @@ async fn bind_socket_with_retry<S: Socket>(
             Ok(socket) => return Ok(socket),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt + 1 < max_retries => {
                 tracing::debug!(
-                    %addr,
+                    bind_addr = %addr,
                     attempt = attempt + 1,
                     max_retries,
                     "Socket bind failed with AddrInUse, retrying after delay"
@@ -235,7 +235,11 @@ impl OutboundConnectionHandler {
         remote_addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<PeerConnection, TransportError>> + Send>> {
         if self.expected_non_gateway.insert(remote_addr.ip()) {
-            tracing::debug!(%remote_addr, "awaiting outbound handshake response from remote IP");
+            tracing::debug!(
+                peer_addr = %remote_addr,
+                direction = "outbound",
+                "Awaiting outbound handshake response from remote IP"
+            );
         }
         let (open_connection, recv_connection) = oneshot::channel();
         if self
@@ -265,7 +269,11 @@ impl OutboundConnectionHandler {
 
     pub fn expect_incoming(&self, remote_addr: SocketAddr) {
         if self.expected_non_gateway.insert(remote_addr.ip()) {
-            tracing::debug!(%remote_addr, "registered expected inbound handshake from remote IP");
+            tracing::debug!(
+                peer_addr = %remote_addr,
+                direction = "inbound",
+                "Registered expected inbound handshake from remote IP"
+            );
         }
     }
 }
@@ -332,7 +340,10 @@ pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 impl<S: Socket> UdpPacketsListener<S> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
     async fn listen(mut self) -> Result<(), TransportError> {
-        tracing::debug!(%self.this_addr, "listening for packets");
+        tracing::debug!(
+            bind_addr = %self.this_addr,
+            "Listening for packets"
+        );
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection> = BTreeMap::new();
         let mut ongoing_gw_connections: BTreeMap<
@@ -358,12 +369,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                             let packet_data = PacketData::from_buf(&buf[..size]);
 
                             tracing::trace!(
-                                %remote_addr,
-                                %size,
-                                has_remote_conn = %self.remote_connections.contains_key(&remote_addr),
-                                has_ongoing_gw = %ongoing_gw_connections.contains_key(&remote_addr),
-                                has_ongoing_conn = %ongoing_connections.contains_key(&remote_addr),
-                                "received packet from remote"
+                                peer_addr = %remote_addr,
+                                packet_size = size,
+                                has_remote_conn = self.remote_connections.contains_key(&remote_addr),
+                                has_ongoing_gw = ongoing_gw_connections.contains_key(&remote_addr),
+                                has_ongoing_conn = ongoing_connections.contains_key(&remote_addr),
+                                "Received packet from remote"
                             );
 
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
@@ -385,12 +396,17 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         if now.duration_since(self.last_drop_warning) > Duration::from_secs(10) {
                                             let total_dropped: u64 = self.dropped_packets.values().sum();
                                             tracing::warn!(
-                                                "Channel overflow: dropped {} packets in last 10s (bandwidth limit may be too high or receiver too slow)",
-                                                total_dropped
+                                                total_dropped,
+                                                elapsed_secs = 10,
+                                                "Channel overflow: dropped packets (bandwidth limit may be too high or receiver too slow)"
                                             );
                                             for (addr, count) in &self.dropped_packets {
                                                 if *count > 100 {
-                                                    tracing::warn!("  {} dropped from {}", count, addr);
+                                                    tracing::warn!(
+                                                        peer_addr = %addr,
+                                                        dropped_count = count,
+                                                        "High packet drop rate for peer"
+                                                    );
                                                 }
                                             }
                                             self.dropped_packets.clear();
@@ -404,8 +420,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     Err(fast_channel::TrySendError::Disconnected(_)) => {
                                         // Channel closed, connection is dead
                                         tracing::warn!(
-                                            %remote_addr,
-                                            "connection closed, removing from active connections"
+                                            peer_addr = %remote_addr,
+                                            "Connection closed, removing from active connections"
                                         );
                                         // Don't reinsert - connection is truly dead
                                         continue;
@@ -419,8 +435,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     Err(fast_channel::TrySendError::Full(_)) => {
                                         // Channel full, drop packet to prevent misrouting
                                         tracing::debug!(
-                                            %remote_addr,
-                                            "ongoing gateway connection channel full, dropping packet"
+                                            peer_addr = %remote_addr,
+                                            direction = "inbound",
+                                            "Ongoing gateway connection channel full, dropping packet"
                                         );
                                         continue;
                                     }
@@ -428,8 +445,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         // Channel closed, remove the connection
                                         ongoing_gw_connections.remove(&remote_addr);
                                         tracing::debug!(
-                                            %remote_addr,
-                                            "ongoing gateway connection channel closed, removing"
+                                            peer_addr = %remote_addr,
+                                            direction = "inbound",
+                                            "Ongoing gateway connection channel closed, removing"
                                         );
                                         continue;
                                     }
@@ -439,9 +457,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                             if let Some((packets_sender, open_connection)) = ongoing_connections.remove(&remote_addr) {
                                 if packets_sender.send_async(packet_data).await.inspect_err(|err| {
                                     tracing::warn!(
-                                        %remote_addr,
-                                        %err,
-                                        "failed to send packet to remote"
+                                        peer_addr = %remote_addr,
+                                        error = %err,
+                                        "Failed to send packet to remote"
                                     );
                                 }).is_ok() {
                                     ongoing_connections.insert(remote_addr, (packets_sender, open_connection));
@@ -458,7 +476,11 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                                 // Check if we already have a gateway connection in progress
                                 if ongoing_gw_connections.contains_key(&remote_addr) {
-                                    tracing::debug!(%remote_addr, "gateway connection already in progress, ignoring duplicate packet");
+                                    tracing::debug!(
+                                        peer_addr = %remote_addr,
+                                        direction = "inbound",
+                                        "Gateway connection already in progress, ignoring duplicate packet"
+                                    );
                                     continue;
                                 }
 
@@ -483,9 +505,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 for stale_addr in stale_addrs {
                                     self.remote_connections.remove(&stale_addr);
                                     tracing::debug!(
-                                        %stale_addr,
-                                        %remote_addr,
-                                        "removed stale closed connection from same IP"
+                                        stale_peer_addr = %stale_addr,
+                                        new_peer_addr = %remote_addr,
+                                        "Removed stale closed connection from same IP"
                                     );
                                 }
 
@@ -494,7 +516,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 let task = tokio::spawn(gw_ongoing_connection
                                     .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                     .map_err(move |error| {
-                                        tracing::warn!(%remote_addr, %error, "gateway connection error");
+                                        tracing::warn!(
+                                            peer_addr = %remote_addr,
+                                            error = %error,
+                                            direction = "inbound",
+                                            "Gateway connection error"
+                                        );
                                         (error, remote_addr)
                                     }));
                                 ongoing_gw_connections.insert(remote_addr, packets_sender);
@@ -503,15 +530,18 @@ impl<S: Socket> UdpPacketsListener<S> {
                             } else {
                                 // Non-gateway peers: mark as expected and wait for the normal peer handshake flow.
                                 self.expected_non_gateway.insert(remote_addr.ip());
-                                tracing::debug!(
-                                    %remote_addr,
-                                    "unexpected peer intro; marking expected_non_gateway"
+                                tracing::trace!(
+                                    peer_addr = %remote_addr,
+                                    "Ignoring unknown packet (not an intro, no active connection)"
                                 );
                                 continue;
                             }
                         }
                         Err(e) => {
-                            tracing::error!("Failed to receive UDP packet: {:?}", e);
+                            tracing::error!(
+                                error = ?e,
+                                "Failed to receive UDP packet"
+                            );
                             return Err(e.into());
                         }
                     }
@@ -532,7 +562,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 .send(PeerConnection::new(outbound_remote_conn))
                                 .await
                                 .is_err() {
-                                tracing::error!(%remote_addr, "gateway connection established but failed to notify new connection");
+                                tracing::error!(
+                                    peer_addr = %remote_addr,
+                                    direction = "inbound",
+                                    "Gateway connection established but failed to notify new connection"
+                                );
                                 break 'outer Err(TransportError::ConnectionClosed(self.this_addr));
                             }
 
@@ -542,7 +576,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                             );
                         }
                         Err((error, remote_addr)) => {
-                            tracing::error!(%error, ?remote_addr, "Failed to establish gateway connection");
+                            tracing::error!(
+                                error = %error,
+                                peer_addr = %remote_addr,
+                                direction = "inbound",
+                                "Failed to establish gateway connection"
+                            );
                             if let TransportError::ConnectionEstablishmentFailure { cause } = error {
                                 cause.starts_with("remote is using a different protocol version");
                                 outdated_peer.insert(remote_addr, Instant::now());
@@ -565,17 +604,28 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     .is_some()
                                 {
                                     tracing::debug!(
-                                        remote_addr = %outbound_remote_conn.remote_addr,
-                                        "cleared expected handshake flag after successful connection"
+                                        peer_addr = %outbound_remote_conn.remote_addr,
+                                        direction = "outbound",
+                                        "Cleared expected handshake flag after successful connection"
                                     );
                                 }
-                                tracing::debug!(remote_addr = %outbound_remote_conn.remote_addr, "connection established");
+                                tracing::info!(
+                                    peer_addr = %outbound_remote_conn.remote_addr,
+                                    direction = "outbound",
+                                    "Connection established"
+                                );
                                 self.remote_connections.insert(outbound_remote_conn.remote_addr, inbound_remote_connection);
                                 let _ = result_sender.send(Ok(outbound_remote_conn)).map_err(|_| {
-                                    tracing::error!("failed sending back peer connection");
+                                    tracing::error!(
+                                        "Failed sending back peer connection"
+                                    );
                                 });
                             } else {
-                                tracing::error!(remote_addr = %outbound_remote_conn.remote_addr, "connection established but no ongoing connection found");
+                                tracing::error!(
+                                    peer_addr = %outbound_remote_conn.remote_addr,
+                                    direction = "outbound",
+                                    "Connection established but no ongoing connection found"
+                                );
                             }
                         }
                         Err((error, remote_addr)) => {
@@ -583,10 +633,20 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // Version mismatches have their own user-friendly error message
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
-                                    tracing::info!(?remote_addr, "Connection failed due to version mismatch");
+                                    tracing::warn!(
+                                        peer_addr = %remote_addr,
+                                        error = %error,
+                                        direction = "outbound",
+                                        "Connection failed due to version mismatch"
+                                    );
                                 }
                                 _ => {
-                                    tracing::error!(%error, ?remote_addr, "Failed to establish connection");
+                                    tracing::error!(
+                                        error = %error,
+                                        peer_addr = %remote_addr,
+                                        direction = "outbound",
+                                        "Failed to establish connection"
+                                    );
                                 }
                             }
                             if let Some((_, result_sender)) = ongoing_connections.remove(&remote_addr) {
@@ -595,7 +655,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     .remove(&remote_addr.ip())
                                     .is_some()
                                 {
-                                    tracing::debug!(%remote_addr, "cleared expected handshake flag after failed connection");
+                                    tracing::debug!(
+                                        peer_addr = %remote_addr,
+                                        direction = "outbound",
+                                        "Cleared expected handshake flag after failed connection"
+                                    );
                                 }
                                 let _ = result_sender.send(Err(error));
                             }
@@ -605,10 +669,16 @@ impl<S: Socket> UdpPacketsListener<S> {
                 // Handling of connection events
                 connection_event = self.connection_handler.recv() => {
                     let Some((remote_addr, event)) = connection_event else {
-                        tracing::debug!(%self.this_addr, "connection handler closed");
+                        tracing::debug!(
+                            bind_addr = %self.this_addr,
+                            "Connection handler closed"
+                        );
                         return Ok(());
                     };
-                    tracing::debug!(%remote_addr, "received connection event");
+                    tracing::debug!(
+                        peer_addr = %remote_addr,
+                        "Received connection event"
+                    );
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
 
                     // Check if we already have an active connection
@@ -617,10 +687,18 @@ impl<S: Socket> UdpPacketsListener<S> {
                         if existing_conn.inbound_packet_sender.is_closed() {
                             // Connection is dead, remove it
                             self.remote_connections.remove(&remote_addr);
-                            tracing::warn!(%remote_addr, "removing closed connection");
+                            tracing::warn!(
+                                peer_addr = %remote_addr,
+                                direction = "outbound",
+                                "Removing closed connection"
+                            );
                         } else {
                             // Connection is still alive, reject new connection attempt
-                            tracing::debug!(%remote_addr, "connection already established and healthy, rejecting new attempt");
+                            tracing::debug!(
+                                peer_addr = %remote_addr,
+                                direction = "outbound",
+                                "Connection already established and healthy, rejecting new attempt"
+                            );
                             let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
                                 cause: "connection already exists".into(),
                             }));
@@ -632,13 +710,21 @@ impl<S: Socket> UdpPacketsListener<S> {
                     if ongoing_connections.contains_key(&remote_addr) {
                         // Duplicate connection attempt - just reject this one
                         // The first attempt is still in progress and will complete
-                        tracing::info!(%remote_addr, "connection attempt already in progress, rejecting duplicate");
+                        tracing::debug!(
+                            peer_addr = %remote_addr,
+                            direction = "outbound",
+                            "Connection attempt already in progress, rejecting duplicate"
+                        );
                         let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
                             cause: "connection attempt already in progress".into(),
                         }));
                         continue;
                     }
-                    tracing::info!(%remote_addr, "attempting to establish connection");
+                    tracing::info!(
+                        peer_addr = %remote_addr,
+                        direction = "outbound",
+                        "Attempting to establish connection"
+                    );
                     let (ongoing_connection, packets_sender) = self.traverse_nat(
                         remote_addr,
                         remote_public_key.clone(),
@@ -674,7 +760,12 @@ impl<S: Socket> UdpPacketsListener<S> {
         let f = async move {
             let decrypted_intro_packet =
                 secret.decrypt(remote_intro_packet.data()).map_err(|err| {
-                    tracing::debug!(%remote_addr, %err, "Failed to decrypt intro packet");
+                    tracing::debug!(
+                        peer_addr = %remote_addr,
+                        error = %err,
+                        direction = "inbound",
+                        "Failed to decrypt intro packet"
+                    );
                     err
                 })?;
 
@@ -714,7 +805,12 @@ impl<S: Socket> UdpPacketsListener<S> {
             let outbound_ack_packet =
                 SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
 
-            tracing::debug!(%remote_addr, "Sending outbound ack packet: {:?}", outbound_ack_packet.data());
+            tracing::trace!(
+                peer_addr = %remote_addr,
+                direction = "inbound",
+                packet_len = outbound_ack_packet.data().len(),
+                "Sending outbound ack packet"
+            );
 
             outbound_packets
                 .send_async((remote_addr, outbound_ack_packet.clone().prepared_send()))
@@ -726,11 +822,16 @@ impl<S: Socket> UdpPacketsListener<S> {
             match timeout.await {
                 Ok(Ok(packet)) => {
                     let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
-                            tracing::debug!(%remote_addr, "Failed to decrypt packet with inbound key: {:?}", packet.data());
-                            TransportError::ConnectionEstablishmentFailure {
-                                cause: "invalid symmetric key".into(),
-                            }
-                        })?;
+                        tracing::debug!(
+                            peer_addr = %remote_addr,
+                            direction = "inbound",
+                            packet_len = packet.data().len(),
+                            "Failed to decrypt packet with inbound key"
+                        );
+                        TransportError::ConnectionEstablishmentFailure {
+                            cause: "invalid symmetric key".into(),
+                        }
+                    })?;
                 }
                 Ok(Err(_)) => {
                     return Err(TransportError::ConnectionEstablishmentFailure {
@@ -765,7 +866,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                 inbound_packet_sender: inbound_packet_tx,
             };
 
-            tracing::debug!("returning connection at gw");
+            tracing::debug!(
+                peer_addr = %remote_addr,
+                direction = "inbound",
+                "Returning connection at gateway"
+            );
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
         };
         (f.boxed(), inbound_from_remote)
@@ -778,7 +883,8 @@ impl<S: Socket> UdpPacketsListener<S> {
         remote_public_key: TransportPublicKey,
     ) -> (TraverseNatFuture, FastSender<PacketData<UnknownEncryption>>) {
         tracing::debug!(
-            %remote_addr,
+            peer_addr = %remote_addr,
+            direction = "outbound",
             "Starting NAT traversal"
         );
         #[allow(clippy::large_enum_variant)]
@@ -801,10 +907,20 @@ impl<S: Socket> UdpPacketsListener<S> {
         ) -> Result<(), ()> {
             // probably the first packet to punch through the NAT
             if let Ok(decrypted_intro_packet) = packet.try_decrypt_asym(transport_secret_key) {
-                tracing::debug!(%remote_addr, "received intro packet");
+                tracing::debug!(
+                    peer_addr = %remote_addr,
+                    direction = "outbound",
+                    "Received intro packet"
+                );
                 let protoc = &decrypted_intro_packet.data()[..PROTOC_VERSION.len()];
                 if protoc != PROTOC_VERSION {
-                    tracing::debug!(%remote_addr, ?protoc, this_protoc = ?PROTOC_VERSION, "remote is using a different protocol version");
+                    tracing::debug!(
+                        peer_addr = %remote_addr,
+                        remote_protoc = ?protoc,
+                        this_protoc = ?PROTOC_VERSION,
+                        direction = "outbound",
+                        "Remote is using a different protocol version"
+                    );
                     return Err(());
                 }
                 let outbound_key_bytes =
@@ -817,7 +933,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                 };
                 return Ok(());
             }
-            tracing::debug!(%remote_addr, "failed to decrypt packet");
+            tracing::trace!(
+                peer_addr = %remote_addr,
+                direction = "outbound",
+                "Failed to decrypt packet"
+            );
             Err(())
         }
 
@@ -828,7 +948,11 @@ impl<S: Socket> UdpPacketsListener<S> {
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
         let f = async move {
-            tracing::info!(%remote_addr, "Starting outbound handshake (NAT traversal)");
+            tracing::info!(
+                peer_addr = %remote_addr,
+                direction = "outbound",
+                "Starting outbound handshake (NAT traversal)"
+            );
             let mut state = ConnectionState::StartOutbound {};
             let mut attempts = 0usize;
             let start_time = Instant::now();
@@ -857,7 +981,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                 if attempts < NAT_TRAVERSAL_MAX_ATTEMPTS {
                     match state {
                         ConnectionState::StartOutbound => {
-                            tracing::debug!(%remote_addr, "sending protocol version and inbound key");
+                            tracing::trace!(
+                                peer_addr = %remote_addr,
+                                direction = "outbound",
+                                "Sending protocol version and inbound key"
+                            );
                             outbound_packets
                                 .send_async((remote_addr, outbound_intro_packet.data().into()))
                                 .await
@@ -865,7 +993,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                             attempts += 1;
                         }
                         ConnectionState::RemoteInbound { .. } => {
-                            tracing::debug!(%remote_addr, "sending back protocol version and inbound key to remote");
+                            tracing::trace!(
+                                peer_addr = %remote_addr,
+                                direction = "outbound",
+                                "Sending back protocol version and inbound key to remote"
+                            );
                             let our_inbound = SymmetricMessage::ack_ok(
                                 outbound_sym_key.as_ref().expect("should be set"),
                                 inbound_sym_key_bytes,
@@ -887,12 +1019,21 @@ impl<S: Socket> UdpPacketsListener<S> {
                     tokio::time::timeout(Duration::from_millis(200), next_inbound.recv_async());
                 match next_inbound_result.await {
                     Ok(Ok(packet)) => {
-                        tracing::debug!(%remote_addr, "received packet after sending it");
+                        tracing::trace!(
+                            peer_addr = %remote_addr,
+                            direction = "outbound",
+                            "Received packet after sending it"
+                        );
                         match state {
                             ConnectionState::StartOutbound => {
                                 // at this point it's either the remote sending us an intro packet or a symmetric packet
                                 // cause is the first packet that passes through the NAT
-                                tracing::debug!(%remote_addr, "received packet from remote: {:?}", packet.data());
+                                tracing::trace!(
+                                    peer_addr = %remote_addr,
+                                    direction = "outbound",
+                                    packet_len = packet.data().len(),
+                                    "Received packet from remote"
+                                );
                                 if let Ok(decrypted_packet) =
                                     packet.try_decrypt_sym(&inbound_sym_key)
                                 {
@@ -902,11 +1043,20 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                                     #[cfg(test)]
                                     {
-                                        tracing::debug!(%remote_addr, ?symmetric_message.payload, "received symmetric packet");
+                                        tracing::trace!(
+                                            peer_addr = %remote_addr,
+                                            direction = "outbound",
+                                            payload = ?symmetric_message.payload,
+                                            "Received symmetric packet"
+                                        );
                                     }
                                     #[cfg(not(test))]
                                     {
-                                        tracing::trace!(%remote_addr, "received symmetric packet");
+                                        tracing::trace!(
+                                            peer_addr = %remote_addr,
+                                            direction = "outbound",
+                                            "Received symmetric packet"
+                                        );
                                     }
 
                                     match symmetric_message.payload {
@@ -923,7 +1073,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                         cause: "invalid symmetric key".into(),
                                                     }
                                                 })?;
-                                            tracing::debug!(%remote_addr, "Sending back ack connection: {:?}", key);
+                                            tracing::trace!(
+                                                peer_addr = %remote_addr,
+                                                direction = "outbound",
+                                                "Sending back ack connection"
+                                            );
                                             outbound_packets
                                                 .send_async((
                                                     remote_addr,
@@ -939,8 +1093,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) =
                                                 fast_channel::bounded(1000);
-                                            tracing::debug!(%remote_addr, "connection established");
-                                            tracing::info!(%remote_addr, attempts = attempts, "Outbound handshake completed (ack path)");
+                                            tracing::info!(
+                                                peer_addr = %remote_addr,
+                                                attempts,
+                                                direction = "outbound",
+                                                "Outbound handshake completed (ack path)"
+                                            );
                                             return Ok((
                                                 RemoteConnection {
                                                     outbound_packets: outbound_packets.clone(),
@@ -970,7 +1128,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             return Err(handle_ack_connection_error(err));
                                         }
                                         _ => {
-                                            tracing::debug!(%remote_addr, "unexpected packet from remote");
+                                            tracing::trace!(
+                                                peer_addr = %remote_addr,
+                                                direction = "outbound",
+                                                "Unexpected packet from remote"
+                                            );
                                             continue;
                                         }
                                     }
@@ -989,7 +1151,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     continue;
                                 }
 
-                                tracing::debug!("Failed to decrypt packet");
+                                tracing::trace!(
+                                    peer_addr = %remote_addr,
+                                    direction = "outbound",
+                                    "Failed to decrypt packet"
+                                );
                                 continue;
                             }
                             ConnectionState::RemoteInbound {
@@ -1000,12 +1166,21 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // next packet should be an acknowledgement packet, but might also be a repeated
                                 // intro packet so we need to handle that
                                 if packet.is_intro_packet(intro_packet) {
-                                    tracing::debug!(%remote_addr, "received intro packet");
+                                    tracing::trace!(
+                                        peer_addr = %remote_addr,
+                                        direction = "outbound",
+                                        "Received intro packet"
+                                    );
                                     continue;
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
                                 let (inbound_sender, inbound_recv) = fast_channel::bounded(1000);
-                                tracing::info!(%remote_addr, attempts = attempts, "Outbound handshake completed (inbound ack path)");
+                                tracing::info!(
+                                    peer_addr = %remote_addr,
+                                    attempts,
+                                    direction = "outbound",
+                                    "Outbound handshake completed (inbound ack path)"
+                                );
                                 return Ok((
                                     RemoteConnection {
                                         outbound_packets: outbound_packets.clone(),
@@ -1031,11 +1206,21 @@ impl<S: Socket> UdpPacketsListener<S> {
                         }
                     }
                     Ok(Err(_)) => {
-                        tracing::debug!(%this_addr, %remote_addr, "debug: connection closed");
+                        tracing::debug!(
+                            bind_addr = %this_addr,
+                            peer_addr = %remote_addr,
+                            direction = "outbound",
+                            "Connection closed"
+                        );
                         return Err(TransportError::ConnectionClosed(remote_addr));
                     }
                     Err(_) => {
-                        tracing::debug!(%this_addr, %remote_addr, "failed to receive UDP response in time, retrying");
+                        tracing::trace!(
+                            bind_addr = %this_addr,
+                            peer_addr = %remote_addr,
+                            direction = "outbound",
+                            "Failed to receive UDP response in time, retrying"
+                        );
                     }
                 }
 
@@ -1043,9 +1228,10 @@ impl<S: Socket> UdpPacketsListener<S> {
             }
 
             tracing::warn!(
-                %remote_addr,
+                peer_addr = %remote_addr,
                 attempts,
                 elapsed_ms = start_time.elapsed().as_millis(),
+                direction = "outbound",
                 "Outbound handshake failed: max connection attempts reached"
             );
             Err(TransportError::ConnectionEstablishmentFailure {

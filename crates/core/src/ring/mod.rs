@@ -169,7 +169,7 @@ impl Ring {
                 .get_router_events(10_000)
                 .await
                 .map_err(|error| {
-                    tracing::error!(%error, "shutting down refresh router task");
+                    tracing::error!(error = %error, "Shutting down refresh router task");
                     error
                 })
                 .expect("todo: propagate this to main thread");
@@ -234,7 +234,13 @@ impl Ring {
     }
 
     pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) {
-        tracing::info!(%peer, this = ?self.connection_manager.get_own_addr(), %was_reserved, "Adding connection to peer");
+        tracing::info!(
+            peer = %peer,
+            peer_location = %loc,
+            this = ?self.connection_manager.get_own_addr(),
+            was_reserved = %was_reserved,
+            "Adding connection to peer"
+        );
         let addr = peer.addr;
         let pub_key = peer.pub_key.clone();
         self.connection_manager
@@ -375,7 +381,7 @@ impl Ring {
     }
 
     pub async fn prune_connection(&self, peer: PeerId) {
-        tracing::debug!(%peer, "Removing connection");
+        tracing::debug!(peer = %peer, "Removing connection");
         self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
         // This case would be when a connection is being open, so peer location hasn't been recorded yet and we can ignore everything below
         let Some(loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
@@ -394,7 +400,6 @@ impl Ring {
         notifier: EventLoopNotificationsSender,
         live_tx_tracker: LiveTransactionTracker,
     ) -> anyhow::Result<()> {
-        tracing::info!("Initializing connection maintenance task");
         let is_gateway = self.is_gateway;
         tracing::info!(is_gateway, "Connection maintenance task starting");
         #[cfg(not(test))]
@@ -417,7 +422,6 @@ impl Ring {
         // if the peer is just starting wait a bit before
         // we even attempt acquiring more connections
         tokio::time::sleep(Duration::from_secs(2)).await;
-        tracing::info!("Connection maintenance task: initial sleep completed");
 
         let mut pending_conn_adds = BTreeSet::new();
         let mut this_peer = None;
@@ -446,11 +450,11 @@ impl Ring {
             let active_count = live_tx_tracker.active_connect_transaction_count();
             if let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if active_count < MAX_CONCURRENT_CONNECTIONS {
-                    tracing::info!(
+                    tracing::debug!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
-                        "Attempting to acquire new connection for location: {:?}",
-                        ideal_location
+                        target_location = %ideal_location,
+                        "Attempting to acquire new connection"
                     );
                     let tx = self
                         .acquire_new(
@@ -463,7 +467,7 @@ impl Ring {
                         .await
                         .map_err(|error| {
                             tracing::error!(
-                                ?error,
+                                error = ?error,
                                 "FATAL: Connection maintenance task failed - shutting down"
                             );
                             error
@@ -471,11 +475,12 @@ impl Ring {
                     if tx.is_none() {
                         let conns = self.connection_manager.connection_count();
                         tracing::warn!(
-                            "acquire_new returned None - likely no peers to query through (connections: {})",
-                            conns
+                            connections = conns,
+                            target_location = %ideal_location,
+                            "acquire_new returned None - likely no peers to query through"
                         );
                     } else {
-                        tracing::info!(
+                        tracing::debug!(
                             active_connections = active_count + 1,
                             "Successfully initiated connection acquisition"
                         );
@@ -484,8 +489,8 @@ impl Ring {
                     tracing::debug!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
-                        "At max concurrent connections, re-queuing location {}",
-                        ideal_location
+                        target_location = %ideal_location,
+                        "At max concurrent connections, re-queuing location"
                     );
                     pending_conn_adds.insert(ideal_location);
                 }
@@ -535,10 +540,10 @@ impl Ring {
             }
 
             tracing::debug!(
-                "Maintenance task: current connections = {}, candidates = {}, live_tx_peers = {}",
                 current_connections,
-                peers.len(),
-                live_tx_tracker.len()
+                candidates = peers.len(),
+                live_tx_peers = live_tx_tracker.len(),
+                "Evaluating topology maintenance"
             );
 
             let adjustment = self
@@ -552,8 +557,8 @@ impl Ring {
                     current_connections,
                 );
 
-            tracing::info!(
-                ?adjustment,
+            tracing::debug!(
+                adjustment = ?adjustment,
                 current_connections,
                 is_gateway,
                 pending_adds = pending_connection_targets,
@@ -581,7 +586,7 @@ impl Ring {
                         );
                     } else {
                         let total_pending_after = pending_connection_targets + allowed;
-                        tracing::info!(
+                        tracing::debug!(
                             requested = target_locs.len(),
                             allowed,
                             total_pending_after,
@@ -601,7 +606,7 @@ impl Ring {
                                 .await
                                 .map_err(|error| {
                                     tracing::debug!(
-                                        ?error,
+                                        error = ?error,
                                         "Shutting down connection maintenance task"
                                     );
                                     error
@@ -633,9 +638,10 @@ impl Ring {
         let current_connections = self.connection_manager.connection_count();
         let is_gateway = self.is_gateway;
 
-        tracing::info!(
+        tracing::debug!(
             current_connections,
             is_gateway,
+            target_location = %ideal_location,
             "acquire_new: attempting to find peer to query"
         );
 
@@ -643,7 +649,7 @@ impl Ring {
             let router = self.router.read();
             let num_connections = self.connection_manager.num_connections();
             tracing::debug!(
-                %ideal_location,
+                target_location = %ideal_location,
                 num_connections,
                 skip_list_size = skip_list.len(),
                 self_addr = ?self.connection_manager.get_own_addr(),
@@ -653,27 +659,28 @@ impl Ring {
                 self.connection_manager
                     .routing(ideal_location, None, skip_list, &router)
             {
-                tracing::info!(
+                tracing::debug!(
                     query_target = %target,
-                    %ideal_location,
+                    target_location = %ideal_location,
                     "connection_maintenance selected routing target"
                 );
                 target
             } else {
                 tracing::warn!(
-                    "acquire_new: routing() returned None - cannot find peer to query (connections: {}, is_gateway: {})",
                     current_connections,
-                    is_gateway
+                    is_gateway,
+                    target_location = %ideal_location,
+                    "acquire_new: routing() returned None - cannot find peer to query"
                 );
                 return Ok(None);
             }
         };
 
         let joiner = self.connection_manager.own_location();
-        tracing::info!(
+        tracing::debug!(
             this_peer = %joiner,
             query_target_peer = %query_target,
-            %ideal_location,
+            target_location = %ideal_location,
             "Sending connect request via connection_maintenance"
         );
         let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
@@ -699,7 +706,7 @@ impl Ring {
             .notifications_sender
             .send(Either::Left(NetMessage::V1(NetMessageV1::Connect(msg))))
             .await?;
-        tracing::info!(tx = %tx, "Connect request sent");
+        tracing::debug!(tx = %tx, "Connect request sent");
         Ok(Some(tx))
     }
 }

@@ -39,7 +39,12 @@ pub(super) async fn send_stream(
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
     bandwidth_limit: Option<usize>,
 ) -> Result<(), TransportError> {
-    tracing::debug!(stream_id = %stream_id.0, length = stream_to_send.len(), ?bandwidth_limit, "sending stream");
+    tracing::debug!(
+        stream_id = %stream_id.0,
+        length_bytes = stream_to_send.len(),
+        bandwidth_limit_bytes_per_sec = bandwidth_limit,
+        "Sending stream"
+    );
     let total_length_bytes = stream_to_send.len() as u32;
     let total_packets = stream_to_send.len().div_ceil(MAX_DATA_SIZE);
     let mut sent_so_far = 0;
@@ -84,7 +89,12 @@ pub(super) async fn send_stream(
                 let elapsed = batch_start.elapsed();
                 if elapsed < tokio::time::Duration::from_millis(10) {
                     let sleep_time = tokio::time::Duration::from_millis(10) - elapsed;
-                    tracing::trace!(stream_id = %stream_id.0, ?sleep_time, packets_sent = packets_in_current_batch, "rate limiting, sleeping");
+                    tracing::trace!(
+                        stream_id = %stream_id.0,
+                        sleep_time_ms = sleep_time.as_millis(),
+                        packets_sent = packets_in_current_batch,
+                        "Rate limiting stream transmission"
+                    );
                     tokio::time::sleep(sleep_time).await;
                 }
                 // Reset for next batch

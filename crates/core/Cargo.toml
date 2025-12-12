@@ -115,6 +115,9 @@ name = "transport_perf"
 harness = false
 required-features = ["bench"]
 
+[build-dependencies]
+chrono = "0.4"
+
 [features]
 default = ["redb", "trace", "websocket"]
 sqlite = ["sqlx"]

@@ -775,7 +775,7 @@ impl Operation for ConnectOp {
                         )
                     }
                     (ConnectMsg::Request { .. }, None) => {
-                        tracing::warn!(%tx, "connect request received without source address");
+                        tracing::warn!(tx = %tx, phase = "error", "connect request received without source address");
                         return Err(OpError::OpNotPresent(tx));
                     }
                     _ => {
@@ -1131,12 +1131,15 @@ pub(crate) async fn join_ring_request(
 ) -> Result<(), OpError> {
     use crate::node::ConnectionError;
     let location = gateway.location().ok_or_else(|| {
-        tracing::error!("Gateway location not found, this should not be possible, report an error");
+        tracing::error!(
+            phase = "error",
+            "Gateway location not found, this should not be possible, report an error"
+        );
         OpError::ConnError(ConnectionError::LocationUnknown)
     })?;
 
     let gateway_addr = gateway.socket_addr().ok_or_else(|| {
-        tracing::error!("Gateway address not found");
+        tracing::error!(phase = "error", "Gateway address not found");
         OpError::ConnError(ConnectionError::LocationUnknown)
     })?;
 
@@ -1155,7 +1158,7 @@ pub(crate) async fn join_ring_request(
             backoff_state.retries() + 1
         );
         if backoff_state.sleep().await.is_none() {
-            tracing::error!("Max number of retries reached");
+            tracing::error!(phase = "error", "Max number of retries reached");
             if op_manager.ring.open_connections() == 0 {
                 let tx = Transaction::new::<ConnectMsg>();
                 return Err(OpError::MaxRetriesExceeded(tx, tx.transaction_type()));
@@ -1218,7 +1221,10 @@ pub(crate) async fn initial_join_procedure(
     let gateways = gateways.to_vec();
     let handle = task::spawn(async move {
         if gateways.is_empty() {
-            tracing::warn!("No gateways available, aborting join procedure");
+            tracing::warn!(
+                phase = "error",
+                "No gateways available, aborting join procedure"
+            );
             return;
         }
 
