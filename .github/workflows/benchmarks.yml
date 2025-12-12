@@ -24,6 +24,7 @@ jobs:
   benchmark:
     name: Performance Benchmarks
     runs-on: self-hosted
+    timeout-minutes: 20
     # Don't fail the whole workflow if benchmarks detect regressions
     continue-on-error: true
 
@@ -193,6 +194,7 @@ jobs:
   benchmark-summary:
     name: Benchmark Summary
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: benchmark
     # Always run, even if benchmark job "fails" (detected regression)
     if: always()

@@ -11,6 +11,7 @@ permissions:
 jobs:
   auto-label:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Rate limit: only 1 run at a time, cancel if new issue comes in
     concurrency:
       group: auto-label
