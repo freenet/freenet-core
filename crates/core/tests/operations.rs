@@ -1526,6 +1526,14 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     let mut client_api2 = WebApi::start(stream2);
 
     // First client puts contract with initial state and auto-subscribes
+    let put_start = std::time::Instant::now();
+    tracing::info!(
+        contract = %contract_key,
+        client = 1,
+        subscribe = true,
+        phase = "put_request",
+        "Sending PUT request"
+    );
     make_put(
         &mut client_api1,
         wrapped_state.clone(),
@@ -1542,6 +1550,13 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+                tracing::info!(
+                    contract = %contract_key,
+                    client = 1,
+                    elapsed_ms = put_start.elapsed().as_millis(),
+                    phase = "put_response",
+                    "PUT response received"
+                );
                 put_response_received = true;
             }
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
@@ -1555,29 +1570,54 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
             }
             Ok(Ok(other)) => {
                 tracing::debug!(
-                    "Client 1: Received non-PUT response while waiting for PUT: {:?}",
-                    other
+                    contract = %contract_key,
+                    client = 1,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    response = ?other,
+                    "Received unexpected response while waiting for PUT"
                 );
-                // Continue waiting - might receive other messages before PUT response
             }
             Ok(Err(e)) => {
-                tracing::error!("Client 1: Error receiving put response: {}", e);
+                tracing::error!(
+                    contract = %contract_key,
+                    client = 1,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    error = %e,
+                    phase = "put_error",
+                    "WebSocket error receiving PUT response"
+                );
                 bail!("WebSocket error while waiting for PUT response: {}", e);
             }
             Err(_) => {
-                // Timeout on recv - continue looping with outer timeout check
                 tracing::debug!(
-                    "Client 1: No message received in 5s, continuing to wait for PUT response"
+                    contract = %contract_key,
+                    client = 1,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Waiting for PUT response (no message in 5s)"
                 );
             }
         }
     }
 
     if !put_response_received {
+        tracing::error!(
+            contract = %contract_key,
+            client = 1,
+            elapsed_ms = start.elapsed().as_millis(),
+            phase = "put_timeout",
+            "PUT response timeout after 30 seconds"
+        );
         bail!("Client 1: Did not receive PUT response within 30 seconds");
     }
 
     // Second client gets the contract (without subscribing)
+    let get_start = std::time::Instant::now();
+    tracing::info!(
+        contract = %contract_key,
+        client = 2,
+        phase = "get_request",
+        "Sending GET request"
+    );
     make_get(&mut client_api2, contract_key, true, false).await?;
 
     // Wait for get response on second client
@@ -1592,29 +1632,54 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
                 state: _,
             }))) => {
                 assert_eq!(key, contract_key, "Contract key mismatch in GET response");
+                tracing::info!(
+                    contract = %contract_key,
+                    client = 2,
+                    elapsed_ms = get_start.elapsed().as_millis(),
+                    phase = "get_response",
+                    "GET response received"
+                );
                 get_response_received = true;
             }
             Ok(Ok(other)) => {
                 tracing::debug!(
-                    "Client 2: Received non-GET response while waiting for GET: {:?}",
-                    other
+                    contract = %contract_key,
+                    client = 2,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    response = ?other,
+                    "Received unexpected response while waiting for GET"
                 );
-                // Continue waiting - might receive other messages before GET response
             }
             Ok(Err(e)) => {
-                tracing::error!("Client 2: Error receiving get response: {}", e);
+                tracing::error!(
+                    contract = %contract_key,
+                    client = 2,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    error = %e,
+                    phase = "get_error",
+                    "WebSocket error receiving GET response"
+                );
                 bail!("WebSocket error while waiting for GET response: {}", e);
             }
             Err(_) => {
-                // Timeout on recv - continue looping with outer timeout check
                 tracing::debug!(
-                    "Client 2: No message received in 5s, continuing to wait for GET response"
+                    contract = %contract_key,
+                    client = 2,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Waiting for GET response (no message in 5s)"
                 );
             }
         }
     }
 
     if !get_response_received {
+        tracing::error!(
+            contract = %contract_key,
+            client = 2,
+            elapsed_ms = start.elapsed().as_millis(),
+            phase = "get_timeout",
+            "GET response timeout after 30 seconds"
+        );
         bail!("Client 2: Did not receive GET response within 30 seconds");
     }
 
@@ -1639,7 +1704,13 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     let updated_state = WrappedState::from(updated_bytes);
 
     // Second client updates the contract
-    tracing::info!("Client 2: Updating contract to trigger notification");
+    let update_start = std::time::Instant::now();
+    tracing::info!(
+        contract = %contract_key,
+        client = 2,
+        phase = "update_request",
+        "Sending UPDATE request to trigger notification"
+    );
     make_update(&mut client_api2, contract_key, updated_state.clone()).await?;
 
     // Wait for update response
@@ -1656,29 +1727,54 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
                     key, contract_key,
                     "Contract key mismatch in UPDATE response"
                 );
+                tracing::info!(
+                    contract = %contract_key,
+                    client = 2,
+                    elapsed_ms = update_start.elapsed().as_millis(),
+                    phase = "update_response",
+                    "UPDATE response received"
+                );
                 update_response_received = true;
             }
             Ok(Ok(other)) => {
                 tracing::debug!(
-                    "Client 2: Received non-UPDATE response while waiting for UPDATE: {:?}",
-                    other
+                    contract = %contract_key,
+                    client = 2,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    response = ?other,
+                    "Received unexpected response while waiting for UPDATE"
                 );
-                // Continue waiting - might receive other messages before UPDATE response
             }
             Ok(Err(e)) => {
-                tracing::error!("Client 2: Error receiving update response: {}", e);
+                tracing::error!(
+                    contract = %contract_key,
+                    client = 2,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    error = %e,
+                    phase = "update_error",
+                    "WebSocket error receiving UPDATE response"
+                );
                 bail!("WebSocket error while waiting for UPDATE response: {}", e);
             }
             Err(_) => {
-                // Timeout on recv - continue looping with outer timeout check
                 tracing::debug!(
-                    "Client 2: No message received in 5s, continuing to wait for UPDATE response"
+                    contract = %contract_key,
+                    client = 2,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Waiting for UPDATE response (no message in 5s)"
                 );
             }
         }
     }
 
     if !update_response_received {
+        tracing::error!(
+            contract = %contract_key,
+            client = 2,
+            elapsed_ms = start.elapsed().as_millis(),
+            phase = "update_timeout",
+            "UPDATE response timeout after 30 seconds"
+        );
         bail!("Client 2: Did not receive UPDATE response within 30 seconds");
     }
 
@@ -1693,10 +1789,16 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
     // Wait for update notification on client 1 (should be auto-subscribed from PUT)
     let mut client1_received_notification = false;
+    let notification_start = std::time::Instant::now();
+    tracing::info!(
+        contract = %contract_key,
+        client = 1,
+        phase = "notification_wait",
+        "Waiting for UPDATE notification (auto-subscribed via PUT)"
+    );
 
     // Try for up to 30 seconds to receive the notification
-    let start_time = std::time::Instant::now();
-    while start_time.elapsed() < Duration::from_secs(30) && !client1_received_notification {
+    while notification_start.elapsed() < Duration::from_secs(30) && !client1_received_notification {
         let resp = tokio::time::timeout(Duration::from_secs(1), client_api1.recv()).await;
         match resp {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
@@ -1737,21 +1839,44 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
                             "Task priority should match"
                         );
 
-                        tracing::info!("Client 1: Successfully verified update content");
+                        tracing::info!(
+                            contract = %contract_key,
+                            client = 1,
+                            elapsed_ms = notification_start.elapsed().as_millis(),
+                            phase = "notification_received",
+                            "UPDATE notification received and verified"
+                        );
                     }
                     _ => {
-                        tracing::warn!("Client 1: Received unexpected update type: {:?}", update);
+                        tracing::warn!(
+                            contract = %contract_key,
+                            client = 1,
+                            update_type = ?update,
+                            "Received unexpected update type in notification"
+                        );
                     }
                 }
                 client1_received_notification = true;
                 break;
             }
             Ok(Ok(other)) => {
-                tracing::debug!("Client 1: Received non-notification response while waiting for update notification: {:?}", other);
-                // Continue waiting - might receive other messages before notification
+                tracing::debug!(
+                    contract = %contract_key,
+                    client = 1,
+                    elapsed_ms = notification_start.elapsed().as_millis(),
+                    response = ?other,
+                    "Received unexpected response while waiting for notification"
+                );
             }
             Ok(Err(e)) => {
-                tracing::error!("Client 1: Error receiving update notification: {}", e);
+                tracing::error!(
+                    contract = %contract_key,
+                    client = 1,
+                    elapsed_ms = notification_start.elapsed().as_millis(),
+                    error = %e,
+                    phase = "notification_error",
+                    "WebSocket error receiving notification"
+                );
                 bail!(
                     "WebSocket error while waiting for update notification: {}",
                     e
@@ -1759,7 +1884,6 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
             }
             Err(_) => {
                 // Timeout on recv - this is expected, just continue looping
-                tracing::debug!("Client 1: No message received in 1s, continuing to wait for update notification");
             }
         }
 
@@ -1768,11 +1892,25 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     }
 
     // Assert that client 1 received the notification (proving auto-subscribe worked)
+    if !client1_received_notification {
+        tracing::error!(
+            contract = %contract_key,
+            client = 1,
+            elapsed_ms = notification_start.elapsed().as_millis(),
+            phase = "notification_timeout",
+            "UPDATE notification not received within 30 seconds - auto-subscribe via PUT may have failed"
+        );
+    }
     assert!(
         client1_received_notification,
         "Client 1 did not receive update notification within timeout period (auto-subscribe via PUT failed)"
     );
 
+    tracing::info!(
+        contract = %contract_key,
+        phase = "test_complete",
+        "test_put_with_subscribe_flag completed successfully"
+    );
     Ok(())
 }
 
