@@ -63,11 +63,10 @@ impl From<SocketAddr> for ObservedAddr {
 
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 pub use self::{
-    connection_handler::{
-        create_connection_handler, InboundConnectionHandler, OutboundConnectionHandler,
-    },
+    connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
     peer_connection::PeerConnection,
 };
+pub(crate) use self::connection_handler::create_connection_handler;
 
 #[derive(Debug, thiserror::Error)]
 #[cfg_attr(feature = "bench", allow(dead_code))]

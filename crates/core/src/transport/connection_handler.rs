@@ -65,7 +65,7 @@ type TraverseNatFuture =
 const SOCKET_BIND_MAX_RETRIES: usize = 5;
 const SOCKET_BIND_RETRY_DELAY_MS: u64 = 50;
 
-pub async fn create_connection_handler<S: Socket>(
+pub(crate) async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
     listen_host: IpAddr,
     listen_port: u16,
@@ -1246,6 +1246,7 @@ pub mod mock_transport {
     use tracing::info;
 
     use super::*;
+    #[allow(unused_imports)] // Used in some test configurations
     use crate::transport::packet_data::MAX_DATA_SIZE;
 
     #[test]
@@ -1442,6 +1443,8 @@ pub mod mock_transport {
         ))
     }
 
+    // Test infrastructure for multi-peer communication tests (reserved for future use)
+    #[allow(dead_code)]
     trait TestFixture: Clone + Send + Sync + 'static {
         type Message: DeserializeOwned + Serialize + Send + Debug + 'static;
         fn expected_iterations(&self) -> usize;
@@ -1449,6 +1452,7 @@ pub mod mock_transport {
         fn assert_message_ok(&self, peer_idx: usize, msg: Self::Message) -> bool;
     }
 
+    #[allow(dead_code)]
     struct TestConfig {
         packet_drop_policy: PacketDropPolicy,
         peers: usize,
@@ -1465,6 +1469,7 @@ pub mod mock_transport {
         }
     }
 
+    #[allow(dead_code)]
     async fn run_test<G: TestFixture>(
         config: TestConfig,
         generators: Vec<G>,
