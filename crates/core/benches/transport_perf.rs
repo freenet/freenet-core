@@ -809,89 +809,6 @@ mod transport_blackbox {
 
         group.finish();
     }
-
-    /// Benchmark fast_channel throughput in isolation (our crossbeam-based channel).
-    ///
-    /// This directly benchmarks the channel implementation used in the transport layer.
-    pub fn bench_fast_channel(c: &mut Criterion) {
-        use freenet::transport::fast_channel;
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let mut group = c.benchmark_group("transport/fast_channel");
-        group.throughput(Throughput::Elements(1000));
-
-        let packet: Arc<[u8]> = vec![0u8; 1492].into();
-
-        // Benchmark our fast_channel implementation
-        group.bench_function("bounded_1000", |b| {
-            let packet = packet.clone();
-            b.to_async(&rt).iter_batched(
-                || {
-                    let (tx, rx) = fast_channel::bounded::<Arc<[u8]>>(1000);
-                    (tx, rx, packet.clone())
-                },
-                |(tx, rx, packet)| async move {
-                    let receiver = tokio::spawn(async move {
-                        let mut count = 0;
-                        while rx.recv_async().await.is_ok() {
-                            count += 1;
-                            if count >= 1000 {
-                                break;
-                            }
-                        }
-                        count
-                    });
-
-                    for _ in 0..1000 {
-                        tx.send_async(packet.clone()).await.unwrap();
-                    }
-
-                    let count = receiver.await.unwrap();
-                    std_black_box(count);
-                },
-                BatchSize::SmallInput,
-            );
-        });
-
-        // Compare with tokio::sync::mpsc for reference
-        group.bench_function("tokio_mpsc_1000", |b| {
-            use tokio::sync::mpsc;
-            let packet = packet.clone();
-            b.to_async(&rt).iter_batched(
-                || {
-                    let (tx, rx) = mpsc::channel::<Arc<[u8]>>(1000);
-                    (tx, rx, packet.clone())
-                },
-                |(tx, mut rx, packet)| async move {
-                    let receiver = tokio::spawn(async move {
-                        let mut count = 0;
-                        while rx.recv().await.is_some() {
-                            count += 1;
-                            if count >= 1000 {
-                                break;
-                            }
-                        }
-                        count
-                    });
-
-                    for _ in 0..1000 {
-                        tx.send(packet.clone()).await.unwrap();
-                    }
-
-                    let count = receiver.await.unwrap();
-                    std_black_box(count);
-                },
-                BatchSize::SmallInput,
-            );
-        });
-
-        group.finish();
-    }
 }
 
 // =============================================================================
@@ -962,7 +879,6 @@ criterion_group!(
     targets =
         transport_blackbox::bench_connection_establishment,
         transport_blackbox::bench_message_throughput,
-        transport_blackbox::bench_fast_channel,
 );
 
 // Benchmark groups
