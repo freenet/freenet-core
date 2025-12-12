@@ -207,7 +207,7 @@ jobs:
 
       # Upload benchmark results as artifact
       - name: Upload Benchmark Results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: benchmark-results
           path: |
