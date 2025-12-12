@@ -71,6 +71,24 @@ impl SymmetricMessage {
         *OVERHEAD
     }
 
+    pub(crate) fn stream_fragment_overhead() -> usize {
+        static OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
+            let blank = SymmetricMessage {
+                packet_id: u32::MAX,
+                confirm_receipt: vec![],
+                payload: SymmetricMessagePayload::StreamFragment {
+                    stream_id: StreamId::next(),
+                    total_length_bytes: u64::MAX,
+                    fragment_number: u32::MAX,
+                    payload: vec![],
+                },
+            };
+            bincode::serialized_size(&blank).unwrap() as usize
+        });
+
+        *OVERHEAD
+    }
+
     pub(crate) fn max_num_of_confirm_receipts_of_noop_message() -> usize {
         static MAX_NUM_CONFIRM_RECEIPTS: LazyLock<usize> = LazyLock::new(|| {
             let overhead = SymmetricMessage::noop_message_overhead() as u64;
@@ -403,5 +421,30 @@ mod test {
         };
         let size = bincode::serialized_size(&msg).unwrap();
         assert_eq!(size, MAX_DATA_SIZE as u64);
+    }
+
+    #[test]
+    fn measure_stream_fragment_overhead() {
+        let overhead = SymmetricMessage::stream_fragment_overhead();
+
+        // The perf docs assumed 100 bytes overhead, but let's measure actual
+        println!("StreamFragment overhead: {} bytes", overhead);
+
+        // Verify it fits in MAX_DATA_SIZE
+        let msg = SymmetricMessage {
+            packet_id: u32::MAX,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::StreamFragment {
+                stream_id: StreamId::next(),
+                total_length_bytes: u64::MAX,
+                fragment_number: u32::MAX,
+                payload: vec![0; MAX_DATA_SIZE - overhead],
+            },
+        };
+        let size = bincode::serialized_size(&msg).unwrap();
+        assert_eq!(size, MAX_DATA_SIZE as u64);
+
+        // Verify our assumption: overhead should be much less than 100
+        assert!(overhead < 100, "Overhead is {} bytes, expected < 100", overhead);
     }
 }

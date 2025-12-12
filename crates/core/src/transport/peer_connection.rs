@@ -32,10 +32,10 @@ use crate::util::time_source::InstantTimeSrc;
 
 type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 
-// TODO: measure the space overhead of SymmetricMessage::ShortMessage since is likely less than 100
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
-/// since we need to account for the space overhead of SymmetricMessage::LongMessage metadata
-const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
+/// since we need to account for the space overhead of SymmetricMessage::StreamFragment metadata.
+/// Measured overhead: 40 bytes (see symmetric_message::stream_fragment_overhead())
+const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 
 #[must_use]
 pub(crate) struct RemoteConnection {

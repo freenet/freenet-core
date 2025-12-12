@@ -20,10 +20,10 @@ use super::StreamId;
 
 pub(crate) type SerializedStream = Vec<u8>;
 
-// TODO: measure the space overhead of SymmetricMessage::LongMessage since is likely less than 100
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
-/// since we need to account for the space overhead of SymmetricMessage::LongMessage metadata
-const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 100;
+/// since we need to account for the space overhead of SymmetricMessage::StreamFragment metadata.
+/// Measured overhead: 40 bytes (see symmetric_message::stream_fragment_overhead())
+const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 
 // TODO: unit test
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
