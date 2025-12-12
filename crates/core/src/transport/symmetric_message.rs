@@ -445,6 +445,10 @@ mod test {
         assert_eq!(size, MAX_DATA_SIZE as u64);
 
         // Verify our assumption: overhead should be much less than 100
-        assert!(overhead < 100, "Overhead is {} bytes, expected < 100", overhead);
+        assert!(
+            overhead < 100,
+            "Overhead is {} bytes, expected < 100",
+            overhead
+        );
     }
 }
