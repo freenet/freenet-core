@@ -14,11 +14,6 @@ on:
       - '.github/workflows/benchmarks.yml'
   # Allow manual trigger
   workflow_dispatch:
-    inputs:
-      benchmark_level:
-        description: 'Benchmark level to run (level0, level1, all)'
-        required: false
-        default: 'level0'
 
 # Cancel in-progress runs when a new commit is pushed
 concurrency:
@@ -83,7 +78,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "These benchmarks test the actual transport code with mock sockets:" >> $GITHUB_STEP_SUMMARY
           echo "- **Message throughput**: Full pipeline (serialize → encrypt → channel → decrypt)" >> $GITHUB_STEP_SUMMARY
-          echo "- **fast_channel**: Crossbeam-based channel performance vs tokio::sync::mpsc" >> $GITHUB_STEP_SUMMARY
           echo "- **Connection establishment**: Full handshake timing" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
@@ -107,26 +101,6 @@ jobs:
             echo "### 🚀 Performance Improvements" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             grep -A2 "improved" bench_output.txt >> $GITHUB_STEP_SUMMARY || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          fi
-
-      # Run Level 1 benchmarks (mock I/O) - only on main or manual trigger
-      - name: Run Level 1 Benchmarks (Mock I/O)
-        if: github.ref == 'refs/heads/main' || github.event.inputs.benchmark_level == 'level1' || github.event.inputs.benchmark_level == 'all'
-        run: |
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Level 1: Mock I/O Benchmarks" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "These benchmarks measure protocol logic with mock sockets:" >> $GITHUB_STEP_SUMMARY
-          echo "- Channel throughput" >> $GITHUB_STEP_SUMMARY
-          echo "- Packet routing" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          cargo bench --bench transport_perf -- level1 2>&1 | tee -a bench_output.txt
-
-          if grep -q "regressed" bench_output.txt; then
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -A2 "regressed" bench_output.txt | tail -20 >> $GITHUB_STEP_SUMMARY || true
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
 

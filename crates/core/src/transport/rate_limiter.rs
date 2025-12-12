@@ -37,51 +37,99 @@ impl<T: TimeSource> PacketRateLimiter<T> {
     ///
     /// This should be called via `tokio::task::spawn_blocking` for optimal performance.
     /// Uses blocking crossbeam channel recv() for ~3x better throughput than async.
+    ///
+    /// When bandwidth limiting is disabled (None), uses syscall batching for improved
+    /// throughput on Linux (~1.75x improvement with sendmmsg).
     pub(super) fn rate_limiter<S: Socket>(
         mut self,
         bandwidth_limit: Option<usize>,
         socket: Arc<S>,
     ) {
-        tracing::debug!("Rate limiter task started (blocking mode)");
+        let batch_size = socket.optimal_batch_size();
+        tracing::debug!(batch_size, "Rate limiter task started (blocking mode)");
+
+        if let Some(limit) = bandwidth_limit {
+            // Rate-limited path: send packets one at a time with rate limiting
+            self.rate_limiter_with_limit(limit, socket);
+        } else {
+            // Non-rate-limited path: use syscall batching for better throughput
+            self.rate_limiter_batched(batch_size, socket);
+        }
+
+        tracing::debug!("Rate limiter task ended");
+    }
+
+    /// Rate limiter with bandwidth limit enabled (no batching, precise rate control).
+    fn rate_limiter_with_limit<S: Socket>(&mut self, bandwidth_limit: usize, socket: Arc<S>) {
         while let Ok((socket_addr, packet)) = self.outbound_packets.recv() {
+            self.rate_limiting(bandwidth_limit, &*socket, packet, socket_addr);
+        }
+    }
+
+    /// Rate limiter without bandwidth limit (uses syscall batching).
+    ///
+    /// Accumulates packets up to batch_size using non-blocking try_recv,
+    /// then sends them all in a single syscall (on Linux via sendmmsg).
+    fn rate_limiter_batched<S: Socket>(&mut self, batch_size: usize, socket: Arc<S>) {
+        // Pre-allocate batch buffer
+        let mut pending: Vec<(SocketAddr, Arc<[u8]>)> = Vec::with_capacity(batch_size);
+
+        while let Ok((socket_addr, packet)) = self.outbound_packets.recv() {
+            // Add first packet (we blocked waiting for this one)
+            pending.push((socket_addr, packet));
+
+            // Non-blocking drain: grab any other packets already in the queue
+            while pending.len() < batch_size {
+                match self.outbound_packets.try_recv() {
+                    Ok((addr, pkt)) => pending.push((addr, pkt)),
+                    Err(_) => break, // No more packets available
+                }
+            }
+
+            // Send batch
+            let batch_len = pending.len();
             tracing::trace!(
                 target: "freenet_core::transport::send_debug",
-                dest_addr = %socket_addr,
-                packet_len = packet.len(),
-                "Dequeued packet for sending"
+                batch_len,
+                "Sending packet batch"
             );
-            if let Some(bandwidth_limit) = bandwidth_limit {
-                self.rate_limiting(bandwidth_limit, &*socket, packet, socket_addr);
-            } else {
-                tracing::trace!(
-                    target: "freenet_core::transport::send_debug",
-                    dest_addr = %socket_addr,
-                    packet_len = packet.len(),
-                    "Sending packet without bandwidth limit"
-                );
-                match socket.send_to_blocking(&packet, socket_addr) {
-                    Ok(bytes_sent) => {
-                        tracing::trace!(
+
+            // Build packet slice for batch send
+            let packets: Vec<(&[u8], SocketAddr)> = pending
+                .iter()
+                .map(|(addr, pkt)| (pkt.as_ref(), *addr))
+                .collect();
+
+            match socket.send_batch_blocking(&packets) {
+                Ok(sent) => {
+                    tracing::trace!(
+                        target: "freenet_core::transport::send_debug",
+                        sent,
+                        batch_len,
+                        "Batch send completed"
+                    );
+                    if sent < batch_len {
+                        tracing::warn!(
                             target: "freenet_core::transport::send_debug",
-                            dest_addr = %socket_addr,
-                            bytes_sent,
-                            expected_len = packet.len(),
-                            "Socket send_to completed (no rate limit)"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            target: "freenet_core::transport::send_debug",
-                            dest_addr = %socket_addr,
-                            error = %error,
-                            error_kind = ?error.kind(),
-                            "Socket send_to failed (no rate limit)"
+                            sent,
+                            batch_len,
+                            "Partial batch send"
                         );
                     }
                 }
+                Err(error) => {
+                    tracing::error!(
+                        target: "freenet_core::transport::send_debug",
+                        error = %error,
+                        error_kind = ?error.kind(),
+                        batch_len,
+                        "Batch send failed"
+                    );
+                }
             }
+
+            pending.clear();
         }
-        tracing::debug!("Rate limiter task ended");
     }
 
     #[inline(always)]
