@@ -14,11 +14,6 @@ on:
       - '.github/workflows/benchmarks.yml'
   # Allow manual trigger
   workflow_dispatch:
-    inputs:
-      benchmark_level:
-        description: 'Benchmark level to run (level0, all)'
-        required: false
-        default: 'level0'
 
 # Cancel in-progress runs when a new commit is pushed
 concurrency:
