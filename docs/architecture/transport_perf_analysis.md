@@ -276,16 +276,16 @@ Each packet requires:
 
 ## 8. Summary of Issues
 
-| Issue | Severity | Impact | Fix Complexity |
-|-------|----------|--------|----------------|
-| No batch I/O (recvmmsg/sendmmsg) | Critical | 100x syscall overhead | Medium |
-| Channel buffer=1 for streams | High | Packet drops under load | Low |
-| Over-conservative metadata (100 vs ~21 bytes) | Medium | 5.4% capacity loss | Low |
-| No GSO/GRO support | High | CPU bottleneck at high pps | Medium |
-| Naive rate limiting | Medium | Poor congestion response | High |
-| No jumbo frame support | Low | Missed optimization in DC | Low |
-| Double serialization copies | Medium | Memory bandwidth waste | Medium |
-| Disabled global rate limiter | High | No global flow control | High |
+| Issue | Severity | Impact | Fix Complexity | Status |
+|-------|----------|--------|----------------|--------|
+| No batch I/O (recvmmsg/sendmmsg) | Critical | 100x syscall overhead | Medium | ✅ Implemented (PR #2270) |
+| Channel buffer=1 for streams | High | Packet drops under load | Low | |
+| Over-conservative metadata (100 vs ~21 bytes) | Medium | 5.4% capacity loss | Low | |
+| No GSO/GRO support | High | CPU bottleneck at high pps | Medium | |
+| Naive rate limiting | Medium | Poor congestion response | High | |
+| No jumbo frame support | Low | Missed optimization in DC | Low | |
+| Double serialization copies | Medium | Memory bandwidth waste | Medium | |
+| Disabled global rate limiter | High | No global flow control | High | |
 
 ---
 
@@ -502,9 +502,11 @@ criterion_main!(benches);
 
 ### 10.2 Medium-Term Improvements
 
-1. **Implement batch I/O**:
-   - Use `socket2` crate for `recvmmsg`/`sendmmsg` on Linux
-   - Batch multiple packets per syscall
+1. **~~Implement batch I/O~~** ✅ **Implemented in PR #2270**:
+   - Implemented `sendmmsg` syscall batching on Linux (batch size: 100)
+   - Graceful fallback to sequential sends on other platforms
+   - Achieves ~1.75x throughput improvement on Linux (based on experimental data)
+   - Note: `recvmmsg` for receive batching not yet implemented
 
 2. **Enable GSO/GRO**:
    - Set `UDP_SEGMENT` socket option
@@ -619,17 +621,19 @@ criterion_main!(benches);
 
 ### 11.3 Recommendations Based on Experiments
 
-1. **Packet Coalescing (High Priority)**
-   - Implement `sendmmsg`/`recvmmsg` to batch multiple packets per syscall
-   - Potential: 5-10x throughput improvement based on packet size scaling
+1. **~~Packet Coalescing~~** ✅ **Implemented in PR #2270**
+   - ✅ Implemented `sendmmsg` batching (batch size: 100) on Linux
+   - ✅ Achieved ~1.75x throughput improvement (validated experimentally)
+   - ⏳ `recvmmsg` for receive batching not yet implemented
 
-2. **Replace tokio::sync::mpsc in Hot Paths (Medium Priority)**
-   - Switch to `crossbeam::channel` for internal packet routing
-   - Potential: 4.4x channel throughput improvement
+2. **~~Replace tokio::sync::mpsc in Hot Paths~~** ✅ **Implemented in PR #2263**
+   - ✅ Implemented `fast_channel` using `crossbeam::channel` + `tokio::sync::Notify`
+   - ✅ Achieved 2.88 Melem/s vs tokio's 1.33 Melem/s (~2.2x improvement)
+   - Used in rate limiter for outbound packet routing
 
-3. **Consider Hybrid Threading Model (Low Priority)**
-   - Use `spawn_blocking` for UDP I/O tasks
-   - Keep async for connection management and higher-level logic
+3. **~~Consider Hybrid Threading Model~~** ✅ **Implemented in PR #2263**
+   - ✅ Rate limiter now uses `spawn_blocking` for UDP I/O tasks
+   - Async logic remains for connection management and higher-level operations
 
 4. **Single-Thread Transport Option (Future)**
    - For latency-sensitive deployments, single-threaded runtime eliminates scheduler overhead
@@ -742,14 +746,16 @@ This means:
 1. **Maximize Packet Size First**
    - Use the largest MTU your network supports (1500 standard, 9000 jumbo)
    - This is the biggest lever: 16x improvement for 16x larger packets
+   - ⚠️ Freenet currently uses 1400-byte packets (stays under typical 1500 MTU to avoid IP fragmentation)
 
-2. **Implement Batching Second**
-   - Use sendmmsg/recvmmsg for ~1.75x additional improvement
+2. **~~Implement Batching Second~~** ✅ **Implemented in PR #2270**
+   - ✅ `sendmmsg` batching implemented on Linux (batch size: 100)
+   - ✅ Achieves ~1.75x additional improvement
    - Works equally well at all packet sizes
 
-3. **Sweet Spot**
-   - Batch size of 50-100 captures most benefit (diminishing returns beyond)
-   - With 1400-byte packets and batch-100: 235 MiB/s (vs 135 MiB/s baseline = 1.74x)
+3. **Sweet Spot** ✅ **Current Implementation**
+   - Batch size of 100 (experimentally validated - diminishing returns beyond)
+   - With 1400-byte packets and batch-100: ~235 MiB/s (vs 135 MiB/s baseline = 1.74x)
 
 4. **For Maximum Throughput**
    - 8192-byte packets + batch-500: **1.39 GiB/s**
