@@ -19,6 +19,7 @@ jobs:
   conventional_commits:
     name: Conventional Commits
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: github.event_name == 'pull_request'
 
     steps:
@@ -53,6 +54,7 @@ jobs:
   fmt_check:
     name: Fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # Run in parallel with conventional_commits (both are fast GitHub-hosted checks)
 
     steps:
@@ -70,6 +72,7 @@ jobs:
   clippy_check:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: fmt_check
 
     env:
@@ -92,6 +95,7 @@ jobs:
   test_all:
     name: Test
     runs-on: self-hosted
+    timeout-minutes: 30
     needs: fmt_check
 
     env:
@@ -191,6 +195,7 @@ jobs:
     # TODO: Re-enable when ubertest is stable - currently failing
     if: false
     runs-on: self-hosted
+    timeout-minutes: 30
 
     env:
       FREENET_LOG: error
@@ -223,6 +228,7 @@ jobs:
   claude-ci-analysis:
     name: Claude CI Analysis
     runs-on: self-hosted
+    timeout-minutes: 30
     needs: [test_all, clippy_check, fmt_check]
     if: failure() && contains(github.event.pull_request.labels.*.name, 'claude-debug')
 

@@ -26,6 +26,7 @@ jobs:
   validate:
     name: Validate release inputs
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.validate.outputs.version }}
       fdev_version: ${{ steps.validate.outputs.fdev_version }}
@@ -67,6 +68,7 @@ jobs:
   update_versions:
     name: Update versions and create PR
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: validate
     outputs:
       pr_number: ${{ steps.create_pr.outputs.pr_number }}
@@ -150,6 +152,7 @@ jobs:
   wait_for_pr:
     name: Wait for PR to merge
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: [validate, update_versions]
 
     steps:
@@ -189,6 +192,7 @@ jobs:
   publish_crates:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [validate, wait_for_pr]
     if: always() && (needs.wait_for_pr.result == 'success' || inputs.dry_run)
 
@@ -241,6 +245,7 @@ jobs:
   create_release:
     name: Create GitHub release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: [validate, publish_crates]
     if: always() && (needs.publish_crates.result == 'success' || inputs.dry_run)
 
@@ -311,6 +316,7 @@ jobs:
   summary:
     name: Release summary
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: [validate, create_release]
     if: always()
 

@@ -7,6 +7,7 @@ on:
 jobs:
   notify_matrix:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: github.event.pull_request.merged == true
     steps:
       - name: Send message to Matrix
