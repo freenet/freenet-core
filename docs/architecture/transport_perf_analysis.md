@@ -279,7 +279,7 @@ Each packet requires:
 | Issue | Severity | Impact | Fix Complexity | Status |
 |-------|----------|--------|----------------|--------|
 | No batch I/O (recvmmsg/sendmmsg) | Critical | 100x syscall overhead | Medium | ✅ Implemented (PR #2270) |
-| Channel buffer=1 for streams | High | Packet drops under load | Low | |
+| Channel buffer=1 for streams | High | Packet drops under load | Low | ✅ Implemented (PR #2263) |
 | Over-conservative metadata (100 vs ~21 bytes) | Medium | 5.4% capacity loss | Low | |
 | No GSO/GRO support | High | CPU bottleneck at high pps | Medium | |
 | Naive rate limiting | Medium | Poor congestion response | High | |
@@ -494,7 +494,10 @@ criterion_main!(benches);
 
 ### 10.1 Quick Wins (Low Effort, High Impact)
 
-1. **Increase stream channel buffer**: Change `mpsc::channel(1)` to `mpsc::channel(100)` in `peer_connection.rs:592`
+1. **~~Increase stream channel buffer~~** ✅ **Implemented in PR #2263**
+   - Migrated from `tokio::sync::mpsc::channel(1)` to `fast_channel::bounded(1000)` for packet routing
+   - Inbound streams use `bounded(64)` for stream fragments
+   - Prevents packet drops under load
 
 2. **Measure actual metadata overhead**: Replace the 100-byte constant with actual measured value (~21 bytes)
 
