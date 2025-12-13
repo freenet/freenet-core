@@ -31,8 +31,8 @@ async fn test_websocket_client_waits_for_put_response() {
     let response: HostResponse<WrappedState> =
         HostResponse::ContractResponse(ContractResponse::PutResponse { key: mock_key });
 
-    // Channel to signal when server received request
-    let (request_tx, request_rx) = oneshot::channel::<bool>();
+    // Channel to signal when server is ready to accept connections
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
 
     // Start the mock server
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
@@ -41,6 +41,9 @@ async fn test_websocket_client_waits_for_put_response() {
 
     let server_response = response.clone();
     let server_handle = tokio::spawn(async move {
+        // Signal that we're ready to accept connections
+        let _ = ready_tx.send(());
+
         let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
             .expect("accept timeout")
@@ -59,14 +62,11 @@ async fn test_websocket_client_waits_for_put_response() {
             .expect("stream not empty")
             .expect("receive");
 
-        // Just verify we received a binary message (which is what contract requests are)
+        // Verify we received a binary message (contract requests are binary)
         match msg {
             Message::Binary(_) => {} // Request received successfully
             _ => panic!("expected binary message"),
         };
-
-        // Signal that we received the request
-        let _ = request_tx.send(true);
 
         // Send back the response
         let response_bytes = bincode::serialize(&Ok::<_, freenet_stdlib::client_api::ClientError>(
@@ -77,13 +77,10 @@ async fn test_websocket_client_waits_for_put_response() {
             .send(Message::Binary(response_bytes.into()))
             .await
             .expect("send response");
-
-        // Give the client time to receive the response
-        tokio::time::sleep(Duration::from_millis(100)).await;
     });
 
-    // Give server time to start listening
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for server to be ready before connecting
+    ready_rx.await.expect("server ready signal");
 
     // Connect client
     let url = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
@@ -108,8 +105,8 @@ async fn test_websocket_client_waits_for_put_response() {
 
     client.send(request).await.expect("send request");
 
-    // This is the key fix: we must receive the response before dropping the client
-    // Before the fix, fdev would exit here without waiting, causing connection reset
+    // This is the key behavior: we must receive the response before dropping the client.
+    // Before the fix, fdev would exit here without waiting, causing connection reset.
     let response = tokio::time::timeout(Duration::from_secs(5), client.recv())
         .await
         .expect("response timeout")
@@ -122,10 +119,6 @@ async fn test_websocket_client_waits_for_put_response() {
         }
         other => panic!("unexpected response: {:?}", other),
     }
-
-    // Verify the server received the request
-    let received = request_rx.await.expect("server signaled");
-    assert!(received, "server should have received the request");
 
     // Wait for server to complete
     server_handle.await.expect("server task");
