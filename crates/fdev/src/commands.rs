@@ -5,7 +5,9 @@ use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
 };
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, DelegateRequest, WebApi},
+    client_api::{
+        ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse, WebApi,
+    },
     prelude::*,
 };
 use xz2::read::XzDecoder;
@@ -170,9 +172,26 @@ async fn put_contract(
     tracing::debug!("Starting WebSocket client connection");
     let mut client = start_api_client(other).await?;
     tracing::debug!("WebSocket client connected successfully");
-    let result = execute_command(request, &mut client).await;
-    tracing::debug!(success = ?result.is_ok(), "WebSocket client operation complete");
-    result
+    execute_command(request, &mut client).await?;
+
+    // Wait for server response before closing connection
+    let response = client
+        .recv()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
+
+    match response {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key: response_key }) => {
+            tracing::info!(%response_key, "Contract published successfully");
+            Ok(())
+        }
+        HostResponse::ContractResponse(other) => {
+            anyhow::bail!("Unexpected contract response: {:?}", other)
+        }
+        other => {
+            anyhow::bail!("Unexpected response type: {:?}", other)
+        }
+    }
 }
 
 async fn put_delegate(
@@ -204,7 +223,8 @@ For additional hardening is recommended to use a different cipher and nonce to e
         (cipher, nonce)
     };
 
-    println!("Putting delegate {} ", delegate.key().encode());
+    let delegate_key = delegate.key().clone();
+    println!("Putting delegate {} ", delegate_key.encode());
     let request = DelegateRequest::RegisterDelegate {
         delegate,
         cipher,
@@ -212,7 +232,23 @@ For additional hardening is recommended to use a different cipher and nonce to e
     }
     .into();
     let mut client = start_api_client(other).await?;
-    execute_command(request, &mut client).await
+    execute_command(request, &mut client).await?;
+
+    // Wait for server response before closing connection
+    let response = client
+        .recv()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
+
+    match response {
+        HostResponse::DelegateResponse { key, values } => {
+            tracing::info!(%key, response_count = values.len(), "Delegate registered successfully");
+            Ok(())
+        }
+        other => {
+            anyhow::bail!("Unexpected response type: {:?}", other)
+        }
+    }
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -253,7 +289,7 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     if config.release {
         anyhow::bail!("Cannot publish contracts in the network yet");
     }
-    let key = ContractInstanceId::try_from(config.key)?.into();
+    let key: ContractKey = ContractInstanceId::try_from(config.key)?.into();
     println!("Updating contract {key}");
     let data = {
         let mut buf = vec![];
@@ -262,7 +298,29 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     };
     let request = ContractRequest::Update { key, data }.into();
     let mut client = start_api_client(other).await?;
-    execute_command(request, &mut client).await
+    execute_command(request, &mut client).await?;
+
+    // Wait for server response before closing connection
+    let response = client
+        .recv()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
+
+    match response {
+        HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key: response_key,
+            summary,
+        }) => {
+            tracing::info!(%response_key, ?summary, "Contract updated successfully");
+            Ok(())
+        }
+        HostResponse::ContractResponse(other) => {
+            anyhow::bail!("Unexpected contract response: {:?}", other)
+        }
+        other => {
+            anyhow::bail!("Unexpected response type: {:?}", other)
+        }
+    }
 }
 
 pub(crate) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {
