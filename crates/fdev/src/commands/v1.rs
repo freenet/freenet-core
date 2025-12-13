@@ -1,3 +1,5 @@
+use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+
 use super::*;
 
 pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {
@@ -32,5 +34,43 @@ pub(super) async fn execute_command(
     api_client: &mut WebApi,
 ) -> anyhow::Result<()> {
     api_client.send(request).await?;
-    Ok(())
+
+    // Wait for the server's response before closing the connection
+    let response = api_client
+        .recv()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
+
+    match response {
+        HostResponse::ContractResponse(contract_response) => match contract_response {
+            ContractResponse::PutResponse { key } => {
+                tracing::info!(%key, "Contract published successfully");
+                Ok(())
+            }
+            ContractResponse::UpdateResponse { key, summary } => {
+                tracing::info!(%key, ?summary, "Contract updated successfully");
+                Ok(())
+            }
+            other => {
+                tracing::warn!(?other, "Unexpected contract response");
+                Ok(())
+            }
+        },
+        HostResponse::DelegateResponse { key, values } => {
+            tracing::info!(%key, response_count = values.len(), "Delegate registered successfully");
+            Ok(())
+        }
+        HostResponse::Ok => {
+            tracing::info!("Operation completed successfully");
+            Ok(())
+        }
+        HostResponse::QueryResponse(query_response) => {
+            tracing::info!(?query_response, "Query response received");
+            Ok(())
+        }
+        _ => {
+            tracing::warn!(?response, "Unexpected response type");
+            Ok(())
+        }
+    }
 }
