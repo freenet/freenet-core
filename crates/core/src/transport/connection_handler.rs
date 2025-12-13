@@ -441,6 +441,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         "Detected new peer identity from existing address (issue #2277). \
                                          Peer likely restarted with new identity. Resetting session."
                                     );
+                                    // Clean up rate-limit tracking for the old peer
+                                    self.last_rsa_attempt.remove(&remote_addr);
                                     // Don't reinsert - let the packet fall through to gateway_connection
                                     // which will establish a fresh session with the new peer
                                 } else {
@@ -490,6 +492,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 peer_addr = %remote_addr,
                                                 "Connection closed, removing from active connections"
                                             );
+                                            // Clean up rate-limit tracking
+                                            self.last_rsa_attempt.remove(&remote_addr);
                                             // Don't reinsert - connection is truly dead
                                             continue;
                                         }
@@ -572,6 +576,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     .collect();
                                 for stale_addr in stale_addrs {
                                     self.remote_connections.remove(&stale_addr);
+                                    // Clean up rate-limit tracking for the stale connection
+                                    self.last_rsa_attempt.remove(&stale_addr);
                                     tracing::debug!(
                                         stale_peer_addr = %stale_addr,
                                         new_peer_addr = %remote_addr,
@@ -755,6 +761,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                         if existing_conn.inbound_packet_sender.is_closed() {
                             // Connection is dead, remove it
                             self.remote_connections.remove(&remote_addr);
+                            // Clean up rate-limit tracking
+                            self.last_rsa_attempt.remove(&remote_addr);
                             tracing::warn!(
                                 peer_addr = %remote_addr,
                                 direction = "outbound",
