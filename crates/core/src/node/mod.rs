@@ -869,7 +869,7 @@ async fn process_message_v1<CB>(
                 let result = op_manager.ring.remove_subscriber(key, &peer_id);
 
                 if let Some(upstream) = result.notify_upstream {
-                    // No more downstream subscribers and no local interest - propagate unsubscribe
+                    // No more downstream subscribers and no client subscriptions - propagate unsubscribe
                     let upstream_addr = upstream
                         .socket_addr()
                         .expect("upstream must have socket address");
@@ -1149,7 +1149,7 @@ where
                 let result = op_manager.ring.remove_subscriber(key, &peer_id);
 
                 if let Some(upstream) = result.notify_upstream {
-                    // No more downstream subscribers and no local interest - propagate unsubscribe
+                    // No more downstream subscribers and no client subscriptions - propagate unsubscribe
                     let upstream_addr = upstream
                         .socket_addr()
                         .expect("upstream must have socket address");
