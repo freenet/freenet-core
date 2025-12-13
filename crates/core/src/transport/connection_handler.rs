@@ -42,6 +42,15 @@ const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
 
 const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
 
+/// Size of RSA-2048 encrypted intro packets (PKCS#1 v1.5 padding).
+/// RSA-2048 produces 256-byte ciphertext for any input up to 245 bytes.
+/// Used to detect new peer identities from existing addresses (issue #2277).
+const RSA_INTRO_PACKET_SIZE: usize = 256;
+
+/// Minimum interval between RSA decryption attempts for the same address.
+/// Prevents CPU exhaustion from attackers sending 256-byte packets.
+const RSA_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
+
 pub type SerializedMessage = Vec<u8>;
 
 type GatewayConnectionFuture = BoxFuture<
@@ -188,6 +197,7 @@ impl OutboundConnectionHandler {
             last_drop_warning: Instant::now(),
             bandwidth_limit,
             expected_non_gateway: expected_non_gateway.clone(),
+            last_rsa_attempt: HashMap::new(),
         };
         let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
             DEFAULT_BW_TRACKER_WINDOW_SIZE,
@@ -292,6 +302,8 @@ struct UdpPacketsListener<S = UdpSocket> {
     last_drop_warning: Instant,
     bandwidth_limit: Option<usize>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
+    /// Rate limiting for RSA decryption attempts to prevent DoS (issue #2277).
+    last_rsa_attempt: HashMap<SocketAddr, Instant>,
 }
 
 type OngoingConnection = (
@@ -382,9 +394,46 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // restarted with a new identity. RSA intro packets are exactly 256 bytes.
                                 // If we can decrypt it as an intro, a new peer is connecting from the
                                 // same IP:port (e.g., NAT assigned the same mapping after restart).
-                                let is_new_identity = self.is_gateway
-                                    && size == 256
-                                    && packet_data.try_decrypt_asym(&self.this_peer_keypair.secret).is_ok();
+                                let is_new_identity = if self.is_gateway
+                                    && size == RSA_INTRO_PACKET_SIZE
+                                {
+                                    // Rate limit RSA decryption attempts to prevent DoS
+                                    let now = Instant::now();
+                                    let rate_limited = self
+                                        .last_rsa_attempt
+                                        .get(&remote_addr)
+                                        .is_some_and(|last| now.duration_since(*last) < RSA_DECRYPTION_RATE_LIMIT);
+
+                                    if rate_limited {
+                                        false
+                                    } else {
+                                        self.last_rsa_attempt.insert(remote_addr, now);
+                                        // Try RSA decryption and validate intro packet structure
+                                        match packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
+                                            Ok(decrypted) => {
+                                                // Validate intro packet structure:
+                                                // 1. Protocol version (PROTOC_VERSION.len() bytes)
+                                                // 2. Outbound symmetric key (16 bytes)
+                                                let decrypted_data = decrypted.data();
+                                                let proto_len = PROTOC_VERSION.len();
+                                                if decrypted_data.len() >= proto_len + 16
+                                                    && decrypted_data[..proto_len] == PROTOC_VERSION
+                                                {
+                                                    true
+                                                } else {
+                                                    tracing::debug!(
+                                                        peer_addr = %remote_addr,
+                                                        "256-byte packet decrypted but not valid intro structure"
+                                                    );
+                                                    false
+                                                }
+                                            }
+                                            Err(_) => false, // Not an RSA intro packet for us
+                                        }
+                                    }
+                                } else {
+                                    false
+                                };
 
                                 if is_new_identity {
                                     tracing::info!(
