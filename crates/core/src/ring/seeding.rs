@@ -31,7 +31,7 @@ const DEFAULT_SEEDING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
 pub enum SubscriptionRole {
     /// This peer subscribed through us - they expect updates FROM us.
     /// We are responsible for forwarding updates to them.
-    /// When all downstream peers disconnect and there's no local interest,
+    /// When all downstream peers disconnect and there are no client subscriptions,
     /// we should unsubscribe from our upstream.
     Downstream,
 
@@ -78,7 +78,7 @@ pub struct RemoveSubscriberResult {
     /// This is Some when:
     /// - The removed peer was downstream
     /// - No more downstream subscribers remain
-    /// - No local interest in this contract
+    /// - No client subscriptions for this contract
     pub notify_upstream: Option<PeerKeyLocation>,
 }
 
@@ -307,7 +307,7 @@ impl SeedingManager {
     /// Remove a subscriber by peer ID from a specific contract.
     ///
     /// Returns information about whether upstream notification is needed:
-    /// - If the removed peer was downstream AND no more downstream remain AND no local interest,
+    /// - If the removed peer was downstream AND no more downstream remain AND no client subscriptions,
     ///   returns the upstream peer to notify with Unsubscribed.
     pub fn remove_subscriber(
         &self,
@@ -332,9 +332,9 @@ impl SeedingManager {
                 if removed.role == SubscriptionRole::Downstream {
                     let has_downstream =
                         subs.iter().any(|e| e.role == SubscriptionRole::Downstream);
-                    let has_local = self.has_client_subscriptions(contract);
+                    let has_client = self.has_client_subscriptions(contract);
 
-                    if !has_downstream && !has_local {
+                    if !has_downstream && !has_client {
                         // Find upstream to notify
                         notify_upstream = subs
                             .iter()
@@ -344,7 +344,7 @@ impl SeedingManager {
                         if notify_upstream.is_some() {
                             info!(
                                 %contract,
-                                "remove_subscriber: no downstream or local interest, will notify upstream"
+                                "remove_subscriber: no downstream or client subscriptions, will notify upstream"
                             );
                         }
 
@@ -390,9 +390,9 @@ impl SeedingManager {
                     if removed.role == SubscriptionRole::Downstream {
                         let has_downstream =
                             subs.iter().any(|e| e.role == SubscriptionRole::Downstream);
-                        let has_local = self.has_client_subscriptions(&contract);
+                        let has_client = self.has_client_subscriptions(&contract);
 
-                        if !has_downstream && !has_local {
+                        if !has_downstream && !has_client {
                             if let Some(upstream) = subs
                                 .iter()
                                 .find(|e| e.role == SubscriptionRole::Upstream)
@@ -526,9 +526,9 @@ impl SeedingManager {
             .filter_map(|e| e.peer.socket_addr())
             .collect();
 
-        let has_local = self.has_client_subscriptions(contract);
+        let has_client = self.has_client_subscriptions(contract);
 
-        Some((upstream, downstream, has_local))
+        Some((upstream, downstream, has_client))
     }
 }
 
@@ -800,7 +800,7 @@ mod tests {
 
         let result = manager.remove_subscriber(&contract, &downstream);
 
-        // Should notify upstream because no downstream and no local interest
+        // Should notify upstream because no downstream and no client subscriptions
         assert!(result.notify_upstream.is_some());
         assert_eq!(
             result.notify_upstream.unwrap().socket_addr(),
@@ -1001,7 +1001,7 @@ mod tests {
 
         assert_eq!(details.0, upstream.socket_addr()); // upstream
         assert_eq!(details.1.len(), 1); // downstream
-        assert!(details.2); // has_local
+        assert!(details.2); // has_client
     }
 
     #[test]
