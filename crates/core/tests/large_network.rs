@@ -9,18 +9,25 @@
 //! ```text
 //! cargo test -p freenet --test large_network -- --ignored --nocapture
 //! ```
-//! Environment overrides:
-//! - `SOAK_PEER_COUNT` – number of non-gateway peers (default: 38).
+//!
+//! ## Environment Overrides
+//! - `SOAK_PEER_COUNT` – number of non-gateway peers (default: 100).
 //! - `SOAK_SNAPSHOT_INTERVAL_SECS` – seconds between diagnostics snapshots (default: 60).
 //! - `SOAK_SNAPSHOT_ITERATIONS` – number of snapshots to capture (default: 5).
 //! - `SOAK_CONNECTIVITY_TARGET` – minimum ratio of peers that must report >=1 connection (default: 0.75).
+//! - `SOAK_SNAPSHOT_WARMUP_SECS` – warmup time before first snapshot (default: 60).
+//! - `SOAK_MIN_CONNECTIONS` – minimum connections per peer (default: 5).
+//! - `SOAK_MAX_CONNECTIONS` – maximum connections per peer (default: 7).
 //!
-//! Requirements:
+//! ## Requirements
 //! - `riverctl` must be installed and in PATH (`cargo install riverctl`).
-//! - Enough CPU/RAM to host ~40 peers locally.
+//! - Enough CPU/RAM to host ~100 peers locally (recommend 32GB+ RAM).
 //!
-//! The snapshots are stored under the network's `run_root()/large-soak/` directory for later
-//! inspection or visualization.
+//! ## Outputs
+//! The snapshots are stored under the network's `run_root()/large-soak/` directory:
+//! - `snapshot-NN.json` – full diagnostics snapshot
+//! - `ring-NN.json` – ring topology snapshot
+//! - `subscription-tree.html` – interactive visualization of the subscription tree for the room contract
 
 use anyhow::{anyhow, bail, ensure, Context};
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
@@ -35,7 +42,7 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 use which::which;
 
-const DEFAULT_PEER_COUNT: usize = 38;
+const DEFAULT_PEER_COUNT: usize = 100;
 const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_SNAPSHOT_ITERATIONS: usize = 5;
 const DEFAULT_SNAPSHOT_WARMUP: Duration = Duration::from_secs(60);
@@ -175,6 +182,21 @@ async fn large_network_soak() -> anyhow::Result<()> {
         }
     }
 
+    // Generate subscription tree visualization for the room contract
+    println!(
+        "Generating subscription tree visualization for room contract: {}",
+        session.room_contract_id()
+    );
+    let viz_path = snapshots_dir.join("subscription-tree.html");
+    network
+        .write_ring_visualization_for_contract(&viz_path, session.room_contract_id())
+        .await
+        .context("failed to generate subscription tree visualization")?;
+    println!(
+        "Subscription tree visualization written to: {}",
+        viz_path.display()
+    );
+
     println!(
         "Large network soak complete; inspect {} for diagnostics snapshots",
         snapshots_dir.display()
@@ -280,6 +302,11 @@ impl RiverSession {
         self.run_riverctl(user, &["message", "list", self.room_key.as_str()])
             .await
             .map(|_| ())
+    }
+
+    /// Returns the room's contract key as a string (for subscription tree analysis)
+    fn room_contract_id(&self) -> &str {
+        &self.room_key
     }
 
     async fn run_riverctl(&self, user: RiverUser, args: &[&str]) -> anyhow::Result<String> {
