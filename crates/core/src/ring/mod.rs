@@ -15,7 +15,7 @@ use either::Either;
 use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
 
-pub use seeding::{PrunePeerResult, RemoveSubscriberResult, SubscriptionError};
+pub use seeding::{PruneSubscriptionsResult, RemoveSubscriberResult, SubscriptionError};
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -462,18 +462,18 @@ impl Ring {
     /// Prune a peer connection and return notifications needed for subscription tree pruning.
     ///
     /// Returns a list of (contract, upstream) pairs where Unsubscribed messages should be sent.
-    pub async fn prune_connection(&self, peer: PeerId) -> PrunePeerResult {
+    pub async fn prune_connection(&self, peer: PeerId) -> PruneSubscriptionsResult {
         tracing::debug!(%peer, "Removing connection");
         self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
 
         // This case would be when a connection is being open, so peer location hasn't been recorded yet
         let Some(loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
-            return PrunePeerResult {
+            return PruneSubscriptionsResult {
                 notifications: Vec::new(),
             };
         };
 
-        let prune_result = self.seeding_manager.prune_peer(loc);
+        let prune_result = self.seeding_manager.prune_subscriptions_for_peer(loc);
 
         self.event_register
             .register_events(Either::Left(NetEventLog::disconnected(self, &peer)))

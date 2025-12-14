@@ -82,9 +82,9 @@ pub struct RemoveSubscriberResult {
     pub notify_upstream: Option<PeerKeyLocation>,
 }
 
-/// Result of pruning a peer from all contracts.
+/// Result of pruning subscriptions for a disconnected peer.
 #[derive(Debug)]
-pub struct PrunePeerResult {
+pub struct PruneSubscriptionsResult {
     /// List of (contract, upstream) pairs where upstream notification is needed.
     pub notifications: Vec<(ContractKey, PeerKeyLocation)>,
 }
@@ -427,7 +427,7 @@ impl SeedingManager {
     /// Prune all subscriptions for a peer that disconnected (by location).
     ///
     /// Returns a list of (contract, upstream) pairs where upstream notification is needed.
-    pub fn prune_peer(&self, loc: Location) -> PrunePeerResult {
+    pub fn prune_subscriptions_for_peer(&self, loc: Location) -> PruneSubscriptionsResult {
         let mut notifications = Vec::new();
 
         // Collect contracts that need modification to avoid holding locks
@@ -448,7 +448,7 @@ impl SeedingManager {
                         %contract,
                         removed_location = ?loc,
                         role = ?removed.role,
-                        "prune_peer: removed peer by location"
+                        "prune_subscriptions_for_peer: removed peer by location"
                     );
 
                     // Check for pruning if we removed a downstream
@@ -478,11 +478,11 @@ impl SeedingManager {
         if !notifications.is_empty() {
             info!(
                 contracts_to_notify = notifications.len(),
-                "prune_peer: will notify upstream for contracts with no remaining interest"
+                "prune_subscriptions_for_peer: will notify upstream for contracts with no remaining interest"
             );
         }
 
-        PrunePeerResult { notifications }
+        PruneSubscriptionsResult { notifications }
     }
 
     // ==================== Seeding Cache Integration ====================
@@ -895,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_peer_by_location() {
+    fn test_prune_subscriptions_for_peer_by_location() {
         let manager = SeedingManager::new();
         let contract1 = make_contract_key(1);
         let contract2 = make_contract_key(2);
@@ -915,7 +915,7 @@ mod tests {
 
         // Prune the downstream peer
         let loc = downstream.location().unwrap();
-        let result = manager.prune_peer(loc);
+        let result = manager.prune_subscriptions_for_peer(loc);
 
         // Should have notifications for both contracts
         assert_eq!(result.notifications.len(), 2);
@@ -926,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_peer_partial_with_client_subscription() {
+    fn test_prune_subscriptions_for_peer_partial_with_client_subscription() {
         let manager = SeedingManager::new();
         let contract1 = make_contract_key(1);
         let contract2 = make_contract_key(2);
@@ -949,7 +949,7 @@ mod tests {
         manager.add_client_subscription(&contract1, client_id);
 
         let loc = downstream.location().unwrap();
-        let result = manager.prune_peer(loc);
+        let result = manager.prune_subscriptions_for_peer(loc);
 
         // Should only notify for contract2 (contract1 has client subscription)
         assert_eq!(result.notifications.len(), 1);
