@@ -55,7 +55,8 @@ where
                             phase = "get_complete",
                             "Fetched contract"
                         );
-                        contract_handler
+                        // Send response back to caller. If the caller disconnected, just log and continue.
+                        if let Err(error) = contract_handler
                             .channel()
                             .send_to_sender(
                                 id,
@@ -65,13 +66,13 @@ where
                                 },
                             )
                             .await
-                            .map_err(|error| {
-                                tracing::debug!(
-                                    error = %error,
-                                    "Shutting down contract handler"
-                                );
-                                error
-                            })?;
+                        {
+                            tracing::debug!(
+                                error = %error,
+                                contract = %key,
+                                "Failed to send GET response (client may have disconnected)"
+                            );
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -89,7 +90,8 @@ where
                             );
                             return Err(ContractError::FatalExecutorError { key, error: err });
                         }
-                        contract_handler
+                        // Send error response back to caller. If the caller disconnected, just log and continue.
+                        if let Err(error) = contract_handler
                             .channel()
                             .send_to_sender(
                                 id,
@@ -99,13 +101,13 @@ where
                                 },
                             )
                             .await
-                            .map_err(|error| {
-                                tracing::debug!(
-                                    error = %error,
-                                    "Shutting down contract handler"
-                                );
-                                error
-                            })?;
+                        {
+                            tracing::debug!(
+                                error = %error,
+                                contract = %key,
+                                "Failed to send GET error response (client may have disconnected)"
+                            );
+                        }
                     }
                 }
             }
@@ -168,17 +170,20 @@ where
                     }
                 };
 
-                contract_handler
+                // Send response back to caller. If the caller disconnected (e.g., WebSocket closed),
+                // the response channel may be dropped. This is not fatal - the contract has already
+                // been stored, so we just log and continue processing other events.
+                if let Err(error) = contract_handler
                     .channel()
                     .send_to_sender(id, event_result)
                     .await
-                    .map_err(|error| {
-                        tracing::debug!(
-                            error = %error,
-                            "Shutting down contract handler"
-                        );
-                        error
-                    })?;
+                {
+                    tracing::debug!(
+                        error = %error,
+                        contract = %key,
+                        "Failed to send PUT response (client may have disconnected)"
+                    );
+                }
             }
             ContractHandlerEvent::UpdateQuery {
                 key,
@@ -258,17 +263,19 @@ where
                     }
                 };
 
-                contract_handler
+                // Send response back to caller. If the caller disconnected, the response channel
+                // may be dropped. This is not fatal - the update has already been applied.
+                if let Err(error) = contract_handler
                     .channel()
                     .send_to_sender(id, event_result)
                     .await
-                    .map_err(|error| {
-                        tracing::debug!(
-                            error = %error,
-                            "Shutting down contract handler"
-                        );
-                        error
-                    })?;
+                {
+                    tracing::debug!(
+                        error = %error,
+                        contract = %key,
+                        "Failed to send UPDATE response (client may have disconnected)"
+                    );
+                }
             }
             ContractHandlerEvent::DelegateRequest {
                 req,
@@ -309,17 +316,19 @@ where
                     }
                 };
 
-                contract_handler
+                // Send response back to caller. If the caller disconnected, the response channel
+                // may be dropped. This is not fatal - the delegate has already been processed.
+                if let Err(error) = contract_handler
                     .channel()
                     .send_to_sender(id, ContractHandlerEvent::DelegateResponse(response))
                     .await
-                    .map_err(|error| {
-                        tracing::debug!(
-                            error = %error,
-                            "Shutting down contract handler"
-                        );
-                        error
-                    })?;
+                {
+                    tracing::debug!(
+                        error = %error,
+                        delegate_key = %delegate_key,
+                        "Failed to send DELEGATE response (client may have disconnected)"
+                    );
+                }
             }
             ContractHandlerEvent::RegisterSubscriberListener {
                 key,
@@ -340,14 +349,19 @@ where
                         );
                     });
 
-                // FIXME: if there is an error senc actually an error back
-                contract_handler
+                // FIXME: if there is an error send actually an error back
+                // If the caller disconnected, just log and continue.
+                if let Err(error) = contract_handler
                     .channel()
                     .send_to_sender(id, ContractHandlerEvent::RegisterSubscriberListenerResponse)
                     .await
-                    .inspect_err(|error| {
-                        tracing::debug!(%error, "shutting down contract handler");
-                    })?;
+                {
+                    tracing::debug!(
+                        error = %error,
+                        contract = %key,
+                        "Failed to send RegisterSubscriberListener response (client may have disconnected)"
+                    );
+                }
             }
             ContractHandlerEvent::QuerySubscriptions { callback } => {
                 // Get subscription information from the executor and send it through the callback
@@ -362,13 +376,17 @@ where
                     .send(crate::message::QueryResult::NetworkDebug(network_debug))
                     .await;
 
-                contract_handler
+                // If the caller disconnected, just log and continue.
+                if let Err(error) = contract_handler
                     .channel()
                     .send_to_sender(id, ContractHandlerEvent::QuerySubscriptionsResponse)
                     .await
-                    .inspect_err(|error| {
-                        tracing::debug!(%error, "shutting down contract handler");
-                    })?;
+                {
+                    tracing::debug!(
+                        error = %error,
+                        "Failed to send QuerySubscriptions response (client may have disconnected)"
+                    );
+                }
             }
             _ => unreachable!("ContractHandlerEvent enum should be exhaustive here"),
         }

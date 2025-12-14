@@ -664,6 +664,85 @@ pub mod test {
 
         Ok(())
     }
+
+    /// Regression test for issue #2278: Verifies that send_to_sender returns
+    /// an error when the response receiver is dropped, but does NOT crash or
+    /// break the channel.
+    ///
+    /// This tests that the channel infrastructure supports the fix in
+    /// contract/mod.rs where we changed `send_to_sender()?` to non-propagating
+    /// error handling, so the handler loop can continue even when a response
+    /// can't be delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_to_sender_fails_gracefully_when_receiver_dropped() -> anyhow::Result<()> {
+        let (send_halve, mut rcv_halve, _) = contract_handler_channel();
+
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![0, 1, 2, 3])),
+            Parameters::from(vec![4, 5]),
+        )));
+        let key = contract.key();
+
+        // Send a request
+        let h = GlobalExecutor::spawn({
+            async move {
+                send_halve
+                    .send_to_handler(ContractHandlerEvent::PutQuery {
+                        key,
+                        state: vec![6, 7, 8].into(),
+                        related_contracts: RelatedContracts::default(),
+                        contract: None,
+                    })
+                    .await
+            }
+        });
+
+        // Receive the event from the handler side
+        let (id, ev) =
+            tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_sender())
+                .await??;
+
+        // Verify it's a PutQuery
+        let ContractHandlerEvent::PutQuery { state, .. } = ev else {
+            anyhow::bail!("expected PutQuery event");
+        };
+        assert_eq!(state.as_ref(), &[6, 7, 8]);
+
+        // Abort the request handler task - this drops the oneshot receiver
+        // simulating a client disconnect
+        h.abort();
+        // Wait a bit for the abort to take effect
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Try to send the response - this should fail because the receiver was dropped
+        // when we aborted the task. In the actual contract_handling loop (after the fix),
+        // this would just log and continue rather than propagating the error.
+        let send_result = rcv_halve
+            .send_to_sender(
+                id,
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(vec![0, 7].into()),
+                },
+            )
+            .await;
+
+        // send_to_sender should fail because receiver was dropped
+        assert!(
+            send_result.is_err(),
+            "send_to_sender should fail when receiver is dropped, got {:?}",
+            send_result
+        );
+
+        // Verify the error is the expected NoEvHandlerResponse
+        // Use super:: to disambiguate from freenet_stdlib::prelude::ContractError
+        assert!(
+            matches!(send_result, Err(super::ContractError::NoEvHandlerResponse)),
+            "Expected NoEvHandlerResponse error, got {:?}",
+            send_result
+        );
+
+        Ok(())
+    }
 }
 
 pub(super) mod in_memory {
