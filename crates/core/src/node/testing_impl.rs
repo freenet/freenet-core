@@ -974,6 +974,13 @@ where
                     tracing::debug!(?message, "BroadcastProximityCache ignored in testing impl");
                     continue;
                 }
+                NodeEvent::ClientDisconnected { client_id } => {
+                    tracing::debug!(%client_id, "Client disconnected");
+                    op_manager
+                        .ring
+                        .remove_client_from_all_subscriptions(client_id);
+                    continue;
+                }
             },
             Err(err) => {
                 super::report_result(

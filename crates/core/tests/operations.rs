@@ -5,13 +5,15 @@ use freenet::{
     local_node::NodeConfig,
     server::serve_gateway,
     test_utils::{
-        self, load_delegate, make_get, make_put, make_subscribe, make_update,
-        verify_contract_exists, TestContext,
+        self, load_delegate, make_get, make_node_diagnostics, make_put, make_subscribe,
+        make_update, verify_contract_exists, TestContext,
     },
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractResponse, HostResponse, QueryResponse, WebApi},
+    client_api::{
+        ClientRequest, ContractResponse, HostResponse, NodeDiagnosticsConfig, QueryResponse, WebApi,
+    },
     prelude::*,
 };
 use futures::FutureExt;
@@ -3325,14 +3327,12 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
     tokio_worker_threads = 4
 )]
 async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
-    // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
     let initial_state = test_utils::create_empty_todo_list();
     let wrapped_state = WrappedState::from(initial_state);
 
-    // Get node information
     let gateway = ctx.node("gateway")?;
     let peer_a = ctx.node("peer-a")?;
 
@@ -3342,10 +3342,8 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
         peer_a.ws_port
     );
 
-    // Wait for network to stabilize
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Connect WebSocket clients
     let uri_gw = format!(
         "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
         gateway.ws_port
@@ -3360,7 +3358,6 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
     let (stream_a, _) = connect_async(&uri_a).await?;
     let mut client_a = WebApi::start(stream_a);
 
-    // Step 1: Put contract on gateway
     tracing::info!("Step 1: Putting contract on gateway");
     make_put(
         &mut client_gw,
@@ -3384,7 +3381,6 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
         }
     }
 
-    // Step 2: Subscribe peer-a to the contract
     tracing::info!("Step 2: Subscribing peer-a to contract");
     make_subscribe(&mut client_a, contract_key).await?;
 
@@ -3406,11 +3402,82 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
         }
     }
 
-    // Wait for subscription to propagate
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Step 3: Update contract from gateway - peer-a should receive it
-    tracing::info!("Step 3: Updating contract (peer-a should receive notification)");
+    tracing::info!("Step 2.5: Verifying peer-a is in gateway's subscribers");
+    let peer_a_diag_config = NodeDiagnosticsConfig {
+        include_node_info: true,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: false,
+    };
+    make_node_diagnostics(&mut client_a, peer_a_diag_config).await?;
+
+    let peer_a_peer_id = loop {
+        let resp = timeout(Duration::from_secs(10), client_a.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let node_info = diag
+                    .node_info
+                    .ok_or_else(|| anyhow!("Missing node_info in peer-a diagnostics"))?;
+                tracing::info!("Peer-a peer_id: {}", node_info.peer_id);
+                break node_info.peer_id;
+            }
+            other => {
+                tracing::warn!(
+                    "Peer-a: unexpected response while getting peer_id: {:?}",
+                    other
+                );
+            }
+        }
+    };
+
+    let gw_diag_config = NodeDiagnosticsConfig {
+        include_node_info: false,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![contract_key],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: true,
+    };
+    make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
+
+    let gateway_subscribers_before = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let contract_state = diag.contract_states.get(&contract_key);
+                let subscribers = contract_state
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
+                tracing::info!(
+                    "Gateway subscribers for contract (before disconnect): {:?}",
+                    subscribers
+                );
+                break subscribers;
+            }
+            other => {
+                tracing::warn!(
+                    "Gateway: unexpected response while getting subscribers: {:?}",
+                    other
+                );
+            }
+        }
+    };
+
+    assert!(
+        gateway_subscribers_before.contains(&peer_a_peer_id),
+        "Peer-a should be in gateway's subscriber list. peer_id {} not in {:?}",
+        peer_a_peer_id,
+        gateway_subscribers_before
+    );
+    tracing::info!("Verified: peer-a is in gateway's subscription tree");
+
+    tracing::info!("Step 3: Updating contract");
     let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())?;
     todo_list.tasks.push(test_utils::Task {
         id: 1,
@@ -3423,7 +3490,6 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
 
     make_update(&mut client_gw, contract_key, update_state).await?;
 
-    // Wait for update response on gateway
     loop {
         let resp = timeout(Duration::from_secs(30), client_gw.recv()).await??;
         match resp {
@@ -3438,7 +3504,6 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
         }
     }
 
-    // Wait for peer-a to receive the update notification
     let mut peer_a_received_update = false;
     for _ in 0..10 {
         match timeout(Duration::from_secs(3), client_a.recv()).await {
@@ -3467,42 +3532,46 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
         tracing::warn!("Peer-a did not receive update notification (may be network topology)");
     }
 
-    // Step 4: Disconnect peer-a
     tracing::info!("Step 4: Disconnecting peer-a (triggers pruning)");
     drop(client_a);
 
-    // Wait for disconnect detection and pruning
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tracing::info!("Waiting for disconnect processing...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Step 5: Update contract again - should complete without errors
-    tracing::info!("Step 5: Updating contract after peer-a disconnect (pruning test)");
-    todo_list.tasks.push(test_utils::Task {
-        id: 2,
-        title: "Second update".to_string(),
-        description: "After disconnect".to_string(),
-        completed: false,
-        priority: 2,
-    });
-    let update_state2 = WrappedState::from(serde_json::to_vec(&todo_list)?);
+    tracing::info!("Step 4.5: Verifying peer-a removed from gateway's subscribers");
 
-    make_update(&mut client_gw, contract_key, update_state2).await?;
+    make_node_diagnostics(&mut client_gw, gw_diag_config).await?;
 
-    // Wait for update response - should succeed without errors
-    loop {
-        let resp = timeout(Duration::from_secs(30), client_gw.recv()).await??;
+    let gateway_subscribers_after = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
         match resp {
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
-                assert_eq!(key, contract_key);
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let contract_state = diag.contract_states.get(&contract_key);
+                let subscribers = contract_state
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
                 tracing::info!(
-                    "Gateway: Update after disconnect completed successfully - pruning worked!"
+                    "Gateway subscribers for contract (after disconnect): {:?}",
+                    subscribers
                 );
-                break;
+                break subscribers;
             }
             other => {
-                tracing::warn!("Gateway: unexpected response: {:?}", other);
+                tracing::warn!(
+                    "Gateway: unexpected response while getting subscribers after disconnect: {:?}",
+                    other
+                );
             }
         }
-    }
+    };
+
+    assert!(
+        !gateway_subscribers_after.contains(&peer_a_peer_id),
+        "Peer-a should NOT be in gateway's subscriber list after disconnect. \
+         peer_id {} found in {:?}",
+        peer_a_peer_id,
+        gateway_subscribers_after
+    );
 
     tracing::info!("Subscription tree pruning test passed");
     Ok(())

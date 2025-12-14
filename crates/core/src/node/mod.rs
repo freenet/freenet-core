@@ -852,12 +852,7 @@ async fn process_message_v1<CB>(
                 ref from,
                 ref transaction,
             } => {
-                tracing::debug!(
-                    "Received Unsubscribed message for contract {} from peer {}",
-                    key,
-                    from
-                );
-                // Convert PeerKeyLocation to PeerId for remove_subscriber
+                tracing::debug!(%key, %from, "Received Unsubscribed");
                 let peer_id = PeerId {
                     addr: from
                         .socket_addr()
@@ -865,19 +860,13 @@ async fn process_message_v1<CB>(
                     pub_key: from.pub_key().clone(),
                 };
 
-                // Remove subscriber and check if we need to propagate unsubscribe upstream
                 let result = op_manager.ring.remove_subscriber(key, &peer_id);
 
                 if let Some(upstream) = result.notify_upstream {
-                    // No more downstream subscribers and no client subscriptions - propagate unsubscribe
                     let upstream_addr = upstream
                         .socket_addr()
                         .expect("upstream must have socket address");
-                    tracing::info!(
-                        %key,
-                        %upstream_addr,
-                        "Propagating Unsubscribed to upstream (no remaining interest) [legacy]"
-                    );
+                    tracing::debug!(%key, %upstream_addr, "Propagating Unsubscribed");
 
                     let own_location = op_manager.ring.connection_manager.own_location();
                     let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
@@ -887,12 +876,7 @@ async fn process_message_v1<CB>(
                     });
 
                     if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await {
-                        tracing::warn!(
-                            %key,
-                            %upstream_addr,
-                            error = %e,
-                            "Failed to propagate Unsubscribed to upstream [legacy]"
-                        );
+                        tracing::warn!(%key, %upstream_addr, error = %e, "Failed to propagate Unsubscribed");
                     }
                 }
                 break;
@@ -1132,12 +1116,7 @@ where
                 ref from,
                 ref transaction,
             } => {
-                tracing::debug!(
-                    "Received Unsubscribed message for contract {} from peer {}",
-                    key,
-                    from
-                );
-                // Convert PeerKeyLocation to PeerId for remove_subscriber
+                tracing::debug!(%key, %from, "Received Unsubscribed");
                 let peer_id = PeerId {
                     addr: from
                         .socket_addr()
@@ -1145,19 +1124,13 @@ where
                     pub_key: from.pub_key().clone(),
                 };
 
-                // Remove subscriber and check if we need to propagate unsubscribe upstream
                 let result = op_manager.ring.remove_subscriber(key, &peer_id);
 
                 if let Some(upstream) = result.notify_upstream {
-                    // No more downstream subscribers and no client subscriptions - propagate unsubscribe
                     let upstream_addr = upstream
                         .socket_addr()
                         .expect("upstream must have socket address");
-                    tracing::info!(
-                        %key,
-                        %upstream_addr,
-                        "Propagating Unsubscribed to upstream (no remaining interest)"
-                    );
+                    tracing::debug!(%key, %upstream_addr, "Propagating Unsubscribed");
 
                     let own_location = op_manager.ring.connection_manager.own_location();
                     let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
@@ -1167,12 +1140,7 @@ where
                     });
 
                     if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await {
-                        tracing::warn!(
-                            %key,
-                            %upstream_addr,
-                            error = %e,
-                            "Failed to propagate Unsubscribed to upstream"
-                        );
+                        tracing::warn!(%key, %upstream_addr, error = %e, "Failed to propagate Unsubscribed");
                     }
                 }
                 break;

@@ -455,6 +455,10 @@ pub(crate) enum NodeEvent {
     BroadcastProximityCache {
         message: ProximityCacheMessage,
     },
+    /// A WebSocket client disconnected - clean up its subscriptions and trigger tree pruning.
+    ClientDisconnected {
+        client_id: ClientId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -536,6 +540,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::BroadcastProximityCache { message } => {
                 write!(f, "BroadcastProximityCache ({message:?})")
+            }
+            NodeEvent::ClientDisconnected { client_id } => {
+                write!(f, "ClientDisconnected (client: {client_id})")
             }
         }
     }

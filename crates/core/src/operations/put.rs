@@ -19,7 +19,7 @@ use crate::{
     contract::ContractHandlerEvent,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
-    ring::Location,
+    ring::{Location, PeerKeyLocation},
 };
 
 pub(crate) struct PutOp {

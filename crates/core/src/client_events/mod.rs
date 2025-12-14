@@ -1399,6 +1399,8 @@ async fn process_open_request(
                                     phase = "listener_registered",
                                     "Subscriber listener registered successfully"
                                 );
+                                // Register client subscription to enable subscription tree pruning on disconnect
+                                op_manager.ring.add_client_subscription(&key, client_id);
                             }
                             _ => {
                                 tracing::error!(
@@ -1598,8 +1600,16 @@ async fn process_open_request(
                 tracing::debug!(
                     client_id = %client_id,
                     request_id = %request_id,
-                    "Received disconnect request from client"
+                    "Received disconnect request from client, triggering subscription cleanup"
                 );
+
+                // Notify the node to clean up this client's subscriptions and trigger tree pruning
+                if let Err(err) = op_manager
+                    .notify_node_event(NodeEvent::ClientDisconnected { client_id })
+                    .await
+                {
+                    tracing::error!(%client_id, "Failed to notify node of client disconnect: {}", err);
+                }
             }
             ClientRequest::NodeQueries(query) => {
                 tracing::debug!(

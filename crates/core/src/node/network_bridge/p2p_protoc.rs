@@ -1356,6 +1356,46 @@ impl P2pConnManager {
                                 );
                                 break;
                             }
+                            NodeEvent::ClientDisconnected { client_id } => {
+                                tracing::debug!(%client_id, "Client disconnected");
+
+                                let notifications = op_manager
+                                    .ring
+                                    .remove_client_from_all_subscriptions(client_id);
+
+                                for (contract_key, upstream) in notifications {
+                                    let Some(upstream_addr) = upstream.socket_addr() else {
+                                        tracing::warn!(%contract_key, "No upstream socket address");
+                                        continue;
+                                    };
+
+                                    tracing::debug!(%contract_key, %upstream_addr, "Sending Unsubscribed");
+
+                                    let own_location =
+                                        op_manager.ring.connection_manager.own_location();
+                                    let unsubscribe_msg = crate::message::NetMessage::V1(
+                                        crate::message::NetMessageV1::Unsubscribed {
+                                            transaction: crate::message::Transaction::new::<
+                                                crate::operations::subscribe::SubscribeMsg,
+                                            >(
+                                            ),
+                                            key: contract_key,
+                                            from: own_location,
+                                        },
+                                    );
+
+                                    if let Err(e) =
+                                        ctx.bridge.send(upstream_addr, unsubscribe_msg).await
+                                    {
+                                        tracing::warn!(
+                                            %contract_key,
+                                            %upstream_addr,
+                                            error = %e,
+                                            "Failed to propagate Unsubscribed to upstream"
+                                        );
+                                    }
+                                }
+                            }
                         },
                     }
                 }

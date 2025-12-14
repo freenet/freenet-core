@@ -10,7 +10,7 @@ use std::{
 use clap::ValueEnum;
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, WebApi},
+    client_api::{ClientRequest, ContractRequest, NodeDiagnosticsConfig, NodeQuery, WebApi},
     prelude::*,
 };
 use once_cell::sync::Lazy;
@@ -361,6 +361,22 @@ pub async fn make_get(
             key,
             return_contract_code,
             subscribe,
+        }))
+        .await?;
+    Ok(())
+}
+
+/// Query node diagnostics including subscription tree information.
+///
+/// Use `config` to control what information is returned. For subscription tree testing,
+/// use `NodeDiagnosticsConfig::for_update_propagation_debugging(contract_key)`.
+pub async fn make_node_diagnostics(
+    client: &mut WebApi,
+    config: NodeDiagnosticsConfig,
+) -> anyhow::Result<()> {
+    client
+        .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+            config,
         }))
         .await?;
     Ok(())

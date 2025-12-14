@@ -53,9 +53,9 @@ impl SubscriptionEntry {
         Self { peer, role }
     }
 
-    /// Check if this entry matches a given peer (by public key and address).
+    /// Check if this entry matches a given peer.
     pub fn matches_peer(&self, peer_id: &PeerId) -> bool {
-        self.peer.pub_key == peer_id.pub_key && self.peer.socket_addr() == Some(peer_id.addr)
+        self.peer.pub_key == peer_id.pub_key
     }
 
     /// Check if this entry matches a given location.
@@ -300,6 +300,71 @@ impl SeedingManager {
             .get(contract)
             .map(|clients| !clients.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Remove a client from ALL its subscriptions (used when client disconnects).
+    ///
+    /// This method:
+    /// 1. Finds all contracts where this client was subscribed
+    /// 2. Removes the client from each
+    /// 3. For contracts where this was the last client AND no downstream remain,
+    ///    returns the upstream to notify for pruning
+    ///
+    /// Returns a list of (contract, upstream) pairs that need Unsubscribed notification.
+    pub fn remove_client_from_all_subscriptions(
+        &self,
+        client_id: crate::client_events::ClientId,
+    ) -> Vec<(ContractKey, PeerKeyLocation)> {
+        let mut notifications = Vec::new();
+
+        // Find all contracts where this client is subscribed
+        let contracts_with_client: Vec<ContractKey> = self
+            .client_subscriptions
+            .iter()
+            .filter(|entry| entry.value().contains(&client_id))
+            .map(|entry| *entry.key())
+            .collect();
+
+        for contract in contracts_with_client {
+            // Remove client from this contract's subscriptions
+            let was_last_client = self.remove_client_subscription(&contract, client_id);
+
+            if was_last_client {
+                // Check if we need to prune upstream
+                if let Some(subs) = self.subscriptions.get(&contract) {
+                    let has_downstream =
+                        subs.iter().any(|e| e.role == SubscriptionRole::Downstream);
+
+                    if !has_downstream {
+                        // No downstream and no clients - need to notify upstream
+                        if let Some(upstream) = subs
+                            .iter()
+                            .find(|e| e.role == SubscriptionRole::Upstream)
+                            .map(|e| e.peer.clone())
+                        {
+                            info!(
+                                %contract,
+                                %client_id,
+                                "remove_client_from_all_subscriptions: client disconnect triggers pruning"
+                            );
+                            notifications.push((contract, upstream));
+                        }
+
+                        // Clean up the subscription entry
+                        drop(subs);
+                        self.subscriptions.remove(&contract);
+                    }
+                }
+            }
+        }
+
+        debug!(
+            %client_id,
+            contracts_cleaned = notifications.len(),
+            "remove_client_from_all_subscriptions: completed cleanup"
+        );
+
+        notifications
     }
 
     // ==================== Subscriber Removal & Pruning ====================
@@ -1014,5 +1079,233 @@ mod tests {
         manager.record_contract_access(key, 1000, AccessType::Get);
 
         assert!(manager.is_seeding_contract(&key));
+    }
+
+    // ==================== Client Disconnect Cleanup Tests ====================
+
+    #[test]
+    fn test_remove_client_from_all_subscriptions_basic() {
+        let manager = SeedingManager::new();
+        let contract1 = make_contract_key(1);
+        let contract2 = make_contract_key(2);
+        let client_id = crate::client_events::ClientId::next();
+        let upstream1 = test_peer_loc(1);
+        let upstream2 = test_peer_loc(2);
+
+        // Setup: client subscribed to 2 contracts
+        manager.set_upstream(&contract1, upstream1.clone());
+        manager.set_upstream(&contract2, upstream2.clone());
+        manager.add_client_subscription(&contract1, client_id);
+        manager.add_client_subscription(&contract2, client_id);
+
+        assert!(manager.has_client_subscriptions(&contract1));
+        assert!(manager.has_client_subscriptions(&contract2));
+
+        // Remove client from all subscriptions
+        let notifications = manager.remove_client_from_all_subscriptions(client_id);
+
+        // Should return 2 notifications (one for each contract's upstream)
+        assert_eq!(notifications.len(), 2);
+
+        // Client subscriptions should be gone
+        assert!(!manager.has_client_subscriptions(&contract1));
+        assert!(!manager.has_client_subscriptions(&contract2));
+    }
+
+    #[test]
+    fn test_remove_client_from_all_subscriptions_no_pruning_with_downstream() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let client_id = crate::client_events::ClientId::next();
+        let upstream = test_peer_loc(1);
+        let downstream = test_peer_loc(2);
+
+        // Setup: upstream, downstream, and client subscription
+        manager.set_upstream(&contract, upstream.clone());
+        assert!(manager
+            .add_downstream(&contract, downstream.clone(), None)
+            .is_ok());
+        manager.add_client_subscription(&contract, client_id);
+
+        // Remove client
+        let notifications = manager.remove_client_from_all_subscriptions(client_id);
+
+        // Should NOT notify upstream because downstream still exists
+        assert!(notifications.is_empty());
+
+        // Client subscription should be gone
+        assert!(!manager.has_client_subscriptions(&contract));
+
+        // Downstream should still exist
+        assert!(!manager.get_downstream(&contract).is_empty());
+    }
+
+    #[test]
+    fn test_remove_client_from_all_subscriptions_with_other_clients() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let client1 = crate::client_events::ClientId::next();
+        let client2 = crate::client_events::ClientId::next();
+        let upstream = test_peer_loc(1);
+
+        // Setup: two clients subscribed
+        manager.set_upstream(&contract, upstream.clone());
+        manager.add_client_subscription(&contract, client1);
+        manager.add_client_subscription(&contract, client2);
+
+        // Remove only client1
+        let notifications = manager.remove_client_from_all_subscriptions(client1);
+
+        // Should NOT notify upstream because client2 still exists
+        assert!(notifications.is_empty());
+
+        // client2 subscription should still exist
+        assert!(manager.has_client_subscriptions(&contract));
+    }
+
+    #[test]
+    fn test_remove_client_from_all_subscriptions_no_subscriptions() {
+        let manager = SeedingManager::new();
+        let client_id = crate::client_events::ClientId::next();
+
+        // Client has no subscriptions
+        let notifications = manager.remove_client_from_all_subscriptions(client_id);
+
+        // Should return empty list
+        assert!(notifications.is_empty());
+    }
+
+    #[test]
+    fn test_remove_client_from_all_subscriptions_mixed_scenarios() {
+        let manager = SeedingManager::new();
+        let contract1 = make_contract_key(1); // Will prune (only this client, no downstream)
+        let contract2 = make_contract_key(2); // Won't prune (has downstream)
+        let contract3 = make_contract_key(3); // Won't prune (has other client)
+        let client_id = crate::client_events::ClientId::next();
+        let other_client = crate::client_events::ClientId::next();
+        let upstream1 = test_peer_loc(1);
+        let upstream2 = test_peer_loc(2);
+        let upstream3 = test_peer_loc(3);
+        let downstream2 = test_peer_loc(4);
+
+        // Setup contract1: only client subscription
+        manager.set_upstream(&contract1, upstream1.clone());
+        manager.add_client_subscription(&contract1, client_id);
+
+        // Setup contract2: client + downstream
+        manager.set_upstream(&contract2, upstream2.clone());
+        assert!(manager
+            .add_downstream(&contract2, downstream2.clone(), None)
+            .is_ok());
+        manager.add_client_subscription(&contract2, client_id);
+
+        // Setup contract3: client + other client
+        manager.set_upstream(&contract3, upstream3.clone());
+        manager.add_client_subscription(&contract3, client_id);
+        manager.add_client_subscription(&contract3, other_client);
+
+        // Remove client from all
+        let notifications = manager.remove_client_from_all_subscriptions(client_id);
+
+        // Should only notify upstream1 (contract1 pruned)
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0, contract1);
+        assert_eq!(notifications[0].1.socket_addr(), upstream1.socket_addr());
+
+        // contract2 should still have downstream
+        assert!(!manager.get_downstream(&contract2).is_empty());
+
+        // contract3 should still have other_client
+        assert!(manager.has_client_subscriptions(&contract3));
+    }
+
+    /// Test chain propagation: Source → Intermediate → Leaf
+    ///
+    /// When Leaf disconnects, Intermediate should propagate Unsubscribed to Source.
+    #[test]
+    fn test_chain_propagation() {
+        // Simulate: Source → Intermediate → Leaf
+        //
+        // Intermediate's view:
+        //   - upstream = Source
+        //   - downstream = [Leaf]
+        //
+        // When Leaf sends Unsubscribed to Intermediate:
+        //   1. Intermediate removes Leaf from downstream
+        //   2. No more downstream → Intermediate should notify Source
+
+        let intermediate = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let source = test_peer_loc(1);
+        let leaf = test_peer_id(2);
+
+        // Setup Intermediate's subscriptions
+        intermediate.set_upstream(&contract, source.clone());
+        intermediate
+            .add_downstream(
+                &contract,
+                PeerKeyLocation::new(leaf.pub_key.clone(), leaf.addr),
+                None,
+            )
+            .unwrap();
+
+        // Leaf sends Unsubscribed → Intermediate removes Leaf
+        let result = intermediate.remove_subscriber(&contract, &leaf);
+
+        // Intermediate should notify Source (no more downstream)
+        assert!(
+            result.notify_upstream.is_some(),
+            "Intermediate should propagate Unsubscribed to Source"
+        );
+        assert_eq!(
+            result.notify_upstream.unwrap().socket_addr(),
+            source.socket_addr()
+        );
+    }
+
+    /// Test chain does NOT propagate when other subscribers remain.
+    #[test]
+    fn test_chain_no_propagation_with_siblings() {
+        // Simulate: Source → Intermediate → [Leaf1, Leaf2]
+        //
+        // When Leaf1 disconnects, Intermediate should NOT notify Source
+        // because Leaf2 is still subscribed.
+
+        let intermediate = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let source = test_peer_loc(1);
+        let leaf1 = test_peer_id(2);
+        let leaf2 = test_peer_loc(3);
+
+        intermediate.set_upstream(&contract, source.clone());
+        intermediate
+            .add_downstream(
+                &contract,
+                PeerKeyLocation::new(leaf1.pub_key.clone(), leaf1.addr),
+                None,
+            )
+            .unwrap();
+        intermediate
+            .add_downstream(&contract, leaf2.clone(), None)
+            .unwrap();
+
+        // Leaf1 disconnects
+        let result = intermediate.remove_subscriber(&contract, &leaf1);
+
+        // Should NOT propagate (Leaf2 still subscribed)
+        assert!(
+            result.notify_upstream.is_none(),
+            "Should not propagate when other subscribers remain"
+        );
+
+        // Leaf2 disconnects
+        let leaf2_id = PeerId::new(leaf2.socket_addr().unwrap(), leaf2.pub_key().clone());
+        let result = intermediate.remove_subscriber(&contract, &leaf2_id);
+
+        // NOW should propagate (no subscribers left)
+        assert!(
+            result.notify_upstream.is_some(),
+            "Should propagate when last subscriber disconnects"
+        );
     }
 }
