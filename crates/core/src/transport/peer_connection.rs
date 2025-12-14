@@ -487,7 +487,8 @@ impl PeerConnection {
                         false
                     };
 
-                    self.remote_conn
+                    // TODO(Week 3): Use RTT samples for AIMD congestion controller
+                    let _rtt_data = self.remote_conn
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);

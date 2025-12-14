@@ -207,7 +207,7 @@ mod tests {
         // Get receipts and simulate acknowledging them
         let receipts = received_tracker.get_receipts();
         assert_eq!(receipts, vec![1u32, 3, 5]);
-        sent_tracker.report_received_receipts(&receipts);
+        let _ = sent_tracker.report_received_receipts(&receipts);
 
         // Check resend action for lost packets
         sent_tracker
