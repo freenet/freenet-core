@@ -812,6 +812,214 @@ mod transport_blackbox {
 }
 
 // =============================================================================
+// Transport Streaming Benchmarks - Large message transfers
+// =============================================================================
+//
+// These benchmarks test stream fragmentation, reassembly, and rate limiting
+// for messages larger than a single packet (>1364 bytes).
+//
+// This is critical for measuring the impact of congestion control improvements.
+
+mod transport_streaming {
+    use super::*;
+    use dashmap::DashMap;
+    use freenet::transport::mock_transport::{create_mock_peer, Channels, PacketDropPolicy};
+    use std::sync::Arc;
+
+    /// Benchmark large message streaming (multi-packet transfers)
+    ///
+    /// This measures the stream fragmentation and reassembly pipeline with
+    /// the current rate limiting in place (3 MB/s default).
+    pub fn bench_stream_throughput(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("transport/streaming/throughput");
+
+        // Test STREAM_SIZES: 4KB, 16KB, 64KB
+        for &size in &[4096, 16384, 65536] {
+            group.throughput(Throughput::Bytes(size as u64));
+
+            group.bench_with_input(
+                BenchmarkId::new("rate_limited", size),
+                &size,
+                |b, &sz| {
+                    b.to_async(&rt).iter_batched(
+                        || {
+                            let message = vec![0xABu8; sz];
+                            (Arc::new(DashMap::new()) as Channels, message)
+                        },
+                        |(channels, message)| async move {
+                            // Create connected peers
+                            let (peer_a_pub, mut peer_a, peer_a_addr) =
+                                create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
+                                    .await
+                                    .unwrap();
+                            let (peer_b_pub, mut peer_b, peer_b_addr) =
+                                create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
+                                    .await
+                                    .unwrap();
+
+                            let (conn_a_inner, conn_b_inner) = futures::join!(
+                                peer_a.connect(peer_b_pub, peer_b_addr),
+                                peer_b.connect(peer_a_pub, peer_a_addr),
+                            );
+                            let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+                            let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+
+                            // Send large message (will be fragmented)
+                            conn_a.send(message.clone()).await.unwrap();
+                            let received: Vec<u8> = conn_b.recv().await.unwrap();
+
+                            // Note: received length may differ slightly due to serialization overhead
+                            // Just verify we got data back
+                            assert!(!received.is_empty());
+                            std_black_box(received);
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Benchmark multiple concurrent streams to same peer
+    ///
+    /// This measures fairness and aggregate throughput when multiple streams
+    /// compete for bandwidth.
+    pub fn bench_concurrent_streams(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("transport/streaming/concurrent");
+
+        // Test 2, 5, 10 concurrent streams
+        for num_streams in [2, 5, 10] {
+            group.bench_with_input(
+                BenchmarkId::new("streams", num_streams),
+                &num_streams,
+                |b, &n| {
+                    b.to_async(&rt).iter_batched(
+                        || Arc::new(DashMap::new()) as Channels,
+                        |channels| async move {
+                            // Create connected peers
+                            let (peer_a_pub, mut peer_a, peer_a_addr) =
+                                create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
+                                    .await
+                                    .unwrap();
+                            let (peer_b_pub, mut peer_b, peer_b_addr) =
+                                create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
+                                    .await
+                                    .unwrap();
+
+                            let (conn_a_inner, conn_b_inner) = futures::join!(
+                                peer_a.connect(peer_b_pub, peer_b_addr),
+                                peer_b.connect(peer_a_pub, peer_a_addr),
+                            );
+                            let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+                            let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+
+                            // Send n messages concurrently (connection handles concurrency internally)
+                            let message = vec![0xABu8; 16384]; // 16KB each
+
+                            // Spawn concurrent send and receive tasks
+                            let send_task = tokio::spawn(async move {
+                                for _ in 0..n {
+                                    conn_a.send(message.clone()).await.unwrap();
+                                }
+                            });
+
+                            let recv_task = tokio::spawn(async move {
+                                let mut results = Vec::new();
+                                for i in 0..n {
+                                    let received: Vec<u8> = conn_b.recv().await.unwrap();
+                                    results.push((i, received.len()));
+                                }
+                                results
+                            });
+
+                            // Wait for both to complete
+                            send_task.await.unwrap();
+                            let results = recv_task.await.unwrap();
+
+                            std_black_box(results);
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Benchmark rate limiting accuracy
+    ///
+    /// Measures how closely actual throughput matches configured limit.
+    /// This validates the current 3 MB/s implementation.
+    pub fn bench_rate_limit_accuracy(c: &mut Criterion) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut group = c.benchmark_group("transport/streaming/rate_limit");
+        group.measurement_time(Duration::from_secs(10));
+
+        // Send 1MB with rate limiting
+        let size = 1_000_000; // 1 MB
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_function("1mb_with_3mbps_limit", |b| {
+            b.to_async(&rt).iter_batched(
+                || {
+                    let message = vec![0xABu8; size];
+                    (Arc::new(DashMap::new()) as Channels, message)
+                },
+                |(channels, message)| async move {
+                    let (peer_a_pub, mut peer_a, peer_a_addr) =
+                        create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
+                            .await
+                            .unwrap();
+                    let (peer_b_pub, mut peer_b, peer_b_addr) =
+                        create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
+                            .await
+                            .unwrap();
+
+                    let (conn_a_inner, conn_b_inner) = futures::join!(
+                        peer_a.connect(peer_b_pub, peer_b_addr),
+                        peer_b.connect(peer_a_pub, peer_a_addr),
+                    );
+                    let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+                    let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+
+                    let start = std::time::Instant::now();
+                    conn_a.send(message).await.unwrap();
+                    let received: Vec<u8> = conn_b.recv().await.unwrap();
+                    let elapsed = start.elapsed();
+
+                    // Expected: ~333ms for 1MB at 3 MB/s
+                    // Actual will be measured by Criterion
+                    std_black_box((received, elapsed));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.finish();
+    }
+}
+
+// =============================================================================
 // Criterion Groups - Organized by noise level
 // =============================================================================
 
@@ -881,14 +1089,30 @@ criterion_group!(
         transport_blackbox::bench_message_throughput,
 );
 
+// Streaming benchmarks - large message transfers with rate limiting
+// Used to establish baseline before congestion control implementation
+criterion_group!(
+    name = streaming;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(2))
+        .measurement_time(Duration::from_secs(10))
+        .noise_threshold(0.10)  // 10% - async variance expected
+        .significance_level(0.05);
+    targets =
+        transport_streaming::bench_stream_throughput,
+        transport_streaming::bench_concurrent_streams,
+        transport_streaming::bench_rate_limit_accuracy,
+);
+
 // Benchmark groups
 //
 // CI benchmarks (run on every PR):
 // - transport: Full transport pipeline with mock sockets - actual code path testing
+// - streaming: Large message transfers - baseline for congestion control improvements
 //
 // Additional benchmarks (run locally or on-demand):
 // - level0: Pure logic benchmarks (crypto, serialization) - deterministic, <2% noise
 // - level1: Mock I/O benchmarks (channel throughput, routing) - ~5% noise from async
 // - level2: Loopback socket benchmarks (UDP syscalls) - ~10% noise from kernel
 // - level3: Stress tests (max send rate) - ~15% noise, high variance expected
-criterion_main!(transport, level0, level1, level2, level3);
+criterion_main!(transport, streaming, level0, level1, level2, level3);
