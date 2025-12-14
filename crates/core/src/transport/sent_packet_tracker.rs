@@ -8,6 +8,9 @@ const NETWORK_DELAY_ALLOWANCE: Duration = Duration::from_millis(500);
 
 /// We can wait up to 100ms to confirm a message was received, this allows us to batch
 /// receipts together and send them in a single message.
+#[cfg(test)]
+pub(crate) const MAX_CONFIRMATION_DELAY: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
 const MAX_CONFIRMATION_DELAY: Duration = Duration::from_millis(100);
 
 /// If we don't get a receipt for a message within 500ms, we assume the message was lost and
