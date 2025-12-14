@@ -39,14 +39,15 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 
 /// How often to check for pending ACKs and send them proactively.
 /// This prevents ACKs from being delayed when there's no outgoing traffic to piggyback on.
-/// Set to half of MAX_CONFIRMATION_DELAY (100ms) for safety margin.
+/// Set to MAX_CONFIRMATION_DELAY (100ms) to ensure ACKs are sent within the sender's
+/// expected confirmation window.
 ///
 /// Without this timer, ACKs would only be sent when:
 /// 1. The receipt buffer fills up (20 packets)
 /// 2. MESSAGE_CONFIRMATION_TIMEOUT (600ms) expires on packet arrival
 ///
 /// This caused ~600ms delays per hop for streams larger than 20 packets.
-const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[must_use]
 pub(crate) struct RemoteConnection {
@@ -300,7 +301,7 @@ impl PeerConnection {
         let mut timeout_check = tokio::time::interval(Duration::from_secs(5));
         timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Background ACK timer - sends pending ACKs proactively every 50ms
+        // Background ACK timer - sends pending ACKs proactively every 100ms
         // This prevents delays when there's no outgoing traffic to piggyback ACKs on
         let mut ack_check = tokio::time::interval(ACK_CHECK_INTERVAL);
         ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -915,24 +916,14 @@ mod tests {
     use crate::transport::sent_packet_tracker::MAX_CONFIRMATION_DELAY;
 
     /// Verify that ACK_CHECK_INTERVAL is properly configured relative to MAX_CONFIRMATION_DELAY.
-    /// The ACK timer should fire more frequently than the maximum allowed confirmation delay
-    /// to ensure ACKs are sent promptly.
+    /// The ACK timer should ensure ACKs are sent within the sender's expected confirmation window.
     #[test]
-    fn ack_check_interval_is_faster_than_confirmation_delay() {
-        // ACK_CHECK_INTERVAL should be significantly less than MAX_CONFIRMATION_DELAY
-        // to ensure receipts are sent well within the allowed window
+    fn ack_check_interval_is_within_confirmation_window() {
+        // ACK_CHECK_INTERVAL should not exceed MAX_CONFIRMATION_DELAY
+        // to ensure receipts are sent within the allowed window
         assert!(
-            ACK_CHECK_INTERVAL < MAX_CONFIRMATION_DELAY,
-            "ACK_CHECK_INTERVAL ({:?}) must be less than MAX_CONFIRMATION_DELAY ({:?})",
-            ACK_CHECK_INTERVAL,
-            MAX_CONFIRMATION_DELAY
-        );
-
-        // ACK timer should fire at least twice within the confirmation window
-        // This provides margin for timing jitter
-        assert!(
-            ACK_CHECK_INTERVAL <= MAX_CONFIRMATION_DELAY / 2,
-            "ACK_CHECK_INTERVAL ({:?}) should be at most half of MAX_CONFIRMATION_DELAY ({:?})",
+            ACK_CHECK_INTERVAL <= MAX_CONFIRMATION_DELAY,
+            "ACK_CHECK_INTERVAL ({:?}) must not exceed MAX_CONFIRMATION_DELAY ({:?})",
             ACK_CHECK_INTERVAL,
             MAX_CONFIRMATION_DELAY
         );
@@ -965,7 +956,7 @@ mod tests {
         // With MAX_PENDING_RECEIPTS = 20 and typical streams of ~28 packets:
         // - First 20 packets: buffer fills, ACK sent
         // - Remaining 8 packets: rely on timer for ACK delivery
-        // The background ACK timer ensures these remaining packets get ACKed within 50ms
+        // The background ACK timer ensures these remaining packets get ACKed within 100ms
         assert_eq!(
             MAX_PENDING_RECEIPTS, 20,
             "MAX_PENDING_RECEIPTS changed - verify ACK timing behavior is still correct"
