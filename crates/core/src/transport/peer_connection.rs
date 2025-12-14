@@ -303,7 +303,12 @@ impl PeerConnection {
 
         // Background ACK timer - sends pending ACKs proactively every 100ms
         // This prevents delays when there's no outgoing traffic to piggyback ACKs on
-        let mut ack_check = tokio::time::interval(ACK_CHECK_INTERVAL);
+        // Use interval_at to delay the first tick - unlike the keep-alive task which can
+        // block to skip its first tick, we're inside a select! loop so we delay instead
+        let mut ack_check = tokio::time::interval_at(
+            tokio::time::Instant::now() + ACK_CHECK_INTERVAL,
+            ACK_CHECK_INTERVAL,
+        );
         ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
