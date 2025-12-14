@@ -37,6 +37,17 @@ type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 /// Measured overhead: 40 bytes (see symmetric_message::stream_fragment_overhead())
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 
+/// How often to check for pending ACKs and send them proactively.
+/// This prevents ACKs from being delayed when there's no outgoing traffic to piggyback on.
+/// Set to half of MAX_CONFIRMATION_DELAY (100ms) for safety margin.
+///
+/// Without this timer, ACKs would only be sent when:
+/// 1. The receipt buffer fills up (20 packets)
+/// 2. MESSAGE_CONFIRMATION_TIMEOUT (600ms) expires on packet arrival
+///
+/// This caused ~600ms delays per hop for streams larger than 20 packets.
+const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
 #[must_use]
 pub(crate) struct RemoteConnection {
     pub(super) outbound_packets: FastSender<(SocketAddr, Arc<[u8]>)>,
@@ -288,6 +299,11 @@ impl PeerConnection {
         // Check for timeout periodically
         let mut timeout_check = tokio::time::interval(Duration::from_secs(5));
         timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Background ACK timer - sends pending ACKs proactively every 50ms
+        // This prevents delays when there's no outgoing traffic to piggyback ACKs on
+        let mut ack_check = tokio::time::interval(ACK_CHECK_INTERVAL);
+        ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         loop {
@@ -598,6 +614,19 @@ impl PeerConnection {
                         }
                     }
                 }
+                // Background ACK timer - proactively send pending ACKs
+                // This prevents ACK delays when there's no outgoing traffic to piggyback on
+                _ = ack_check.tick() => {
+                    let receipts = self.received_tracker.get_receipts();
+                    if !receipts.is_empty() {
+                        tracing::trace!(
+                            peer_addr = %self.remote_conn.remote_addr,
+                            receipt_count = receipts.len(),
+                            "Background ACK timer: sending pending receipts"
+                        );
+                        self.noop(receipts).await?;
+                    }
+                }
             }
         }
     }
@@ -882,6 +911,66 @@ mod tests {
         *,
     };
     use crate::transport::packet_data::MAX_PACKET_SIZE;
+    use crate::transport::received_packet_tracker::MAX_PENDING_RECEIPTS;
+    use crate::transport::sent_packet_tracker::MAX_CONFIRMATION_DELAY;
+
+    /// Verify that ACK_CHECK_INTERVAL is properly configured relative to MAX_CONFIRMATION_DELAY.
+    /// The ACK timer should fire more frequently than the maximum allowed confirmation delay
+    /// to ensure ACKs are sent promptly.
+    #[test]
+    fn ack_check_interval_is_faster_than_confirmation_delay() {
+        // ACK_CHECK_INTERVAL should be significantly less than MAX_CONFIRMATION_DELAY
+        // to ensure receipts are sent well within the allowed window
+        assert!(
+            ACK_CHECK_INTERVAL < MAX_CONFIRMATION_DELAY,
+            "ACK_CHECK_INTERVAL ({:?}) must be less than MAX_CONFIRMATION_DELAY ({:?})",
+            ACK_CHECK_INTERVAL,
+            MAX_CONFIRMATION_DELAY
+        );
+
+        // ACK timer should fire at least twice within the confirmation window
+        // This provides margin for timing jitter
+        assert!(
+            ACK_CHECK_INTERVAL <= MAX_CONFIRMATION_DELAY / 2,
+            "ACK_CHECK_INTERVAL ({:?}) should be at most half of MAX_CONFIRMATION_DELAY ({:?})",
+            ACK_CHECK_INTERVAL,
+            MAX_CONFIRMATION_DELAY
+        );
+    }
+
+    /// Verify that the ACK timer interval is reasonable (not too fast or too slow).
+    #[test]
+    fn ack_check_interval_is_reasonable() {
+        // Should not be too fast (would cause excessive CPU usage)
+        assert!(
+            ACK_CHECK_INTERVAL >= Duration::from_millis(10),
+            "ACK_CHECK_INTERVAL ({:?}) should be at least 10ms to avoid excessive CPU usage",
+            ACK_CHECK_INTERVAL
+        );
+
+        // Should not be too slow (would cause unnecessary delays)
+        assert!(
+            ACK_CHECK_INTERVAL <= Duration::from_millis(100),
+            "ACK_CHECK_INTERVAL ({:?}) should be at most 100ms to ensure timely ACK delivery",
+            ACK_CHECK_INTERVAL
+        );
+    }
+
+    /// Test that MAX_PENDING_RECEIPTS is appropriate for typical stream sizes.
+    /// A 40KB stream splits into ~28 packets, so buffer should be able to handle
+    /// at least one batch before triggering an ACK send.
+    #[test]
+    fn pending_receipts_buffer_size_documented() {
+        // Document the current buffer size - this affects when buffer-full ACKs are sent
+        // With MAX_PENDING_RECEIPTS = 20 and typical streams of ~28 packets:
+        // - First 20 packets: buffer fills, ACK sent
+        // - Remaining 8 packets: rely on timer for ACK delivery
+        // The background ACK timer ensures these remaining packets get ACKed within 50ms
+        assert_eq!(
+            MAX_PENDING_RECEIPTS, 20,
+            "MAX_PENDING_RECEIPTS changed - verify ACK timing behavior is still correct"
+        );
+    }
 
     #[tokio::test]
     async fn test_inbound_outbound_interaction() -> Result<(), Box<dyn std::error::Error>> {

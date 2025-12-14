@@ -6,6 +6,13 @@ use std::time::{Duration, Instant};
 
 /// How long to retain packets in case they need to be retransmitted
 const RETAIN_TIME: Duration = Duration::from_secs(60);
+
+/// Maximum number of pending receipts before forcing an ACK send.
+/// When this many packets have been received without sending ACKs,
+/// the receiver will send a NOOP with all pending receipts.
+#[cfg(test)]
+pub(crate) const MAX_PENDING_RECEIPTS: usize = 20;
+#[cfg(not(test))]
 const MAX_PENDING_RECEIPTS: usize = 20;
 
 /// This struct is responsible for tracking received packets and deciding when to send receipts
