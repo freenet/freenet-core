@@ -2,7 +2,7 @@ use freenet_stdlib::client_api::{HostResponse, NodeQuery, QueryResponse};
 use prettytable::{Cell, Row, Table};
 
 use crate::{
-    commands::{execute_command, start_api_client},
+    commands::{close_api_client, execute_command, start_api_client},
     config::BaseConfig,
 };
 
@@ -71,6 +71,9 @@ pub async fn query(base_cfg: BaseConfig) -> anyhow::Result<()> {
     } else {
         println!("No application subscriptions");
     }
+
+    // Gracefully close the WebSocket connection
+    close_api_client(&mut client).await;
 
     Ok(())
 }

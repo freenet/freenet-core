@@ -180,18 +180,21 @@ async fn put_contract(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
 
-    match response {
+    let result = match response {
         HostResponse::ContractResponse(ContractResponse::PutResponse { key: response_key }) => {
             tracing::info!(%response_key, "Contract published successfully");
             Ok(())
         }
         HostResponse::ContractResponse(other) => {
-            anyhow::bail!("Unexpected contract response: {:?}", other)
+            Err(anyhow::anyhow!("Unexpected contract response: {:?}", other))
         }
-        other => {
-            anyhow::bail!("Unexpected response type: {:?}", other)
-        }
-    }
+        other => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+    };
+
+    // Gracefully close the WebSocket connection
+    close_api_client(&mut client).await;
+
+    result
 }
 
 async fn put_delegate(
@@ -240,15 +243,18 @@ For additional hardening is recommended to use a different cipher and nonce to e
         .await
         .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
 
-    match response {
+    let result = match response {
         HostResponse::DelegateResponse { key, values } => {
             tracing::info!(%key, response_count = values.len(), "Delegate registered successfully");
             Ok(())
         }
-        other => {
-            anyhow::bail!("Unexpected response type: {:?}", other)
-        }
-    }
+        other => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+    };
+
+    // Gracefully close the WebSocket connection
+    close_api_client(&mut client).await;
+
+    result
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -306,7 +312,7 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
 
-    match response {
+    let result = match response {
         HostResponse::ContractResponse(ContractResponse::UpdateResponse {
             key: response_key,
             summary,
@@ -315,16 +321,29 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
             Ok(())
         }
         HostResponse::ContractResponse(other) => {
-            anyhow::bail!("Unexpected contract response: {:?}", other)
+            Err(anyhow::anyhow!("Unexpected contract response: {:?}", other))
         }
-        other => {
-            anyhow::bail!("Unexpected response type: {:?}", other)
-        }
-    }
+        other => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+    };
+
+    // Gracefully close the WebSocket connection
+    close_api_client(&mut client).await;
+
+    result
 }
 
 pub(crate) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {
     v1::start_api_client(cfg).await
+}
+
+/// Gracefully close the WebSocket connection.
+/// This sends a Disconnect message and waits briefly for the close handshake to complete,
+/// preventing "Connection reset without closing handshake" errors on the server.
+pub(crate) async fn close_api_client(client: &mut WebApi) {
+    // Send disconnect message - ignore errors since we're closing anyway
+    let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
+    // Brief delay to allow the close handshake to complete
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
 pub(crate) async fn execute_command(
