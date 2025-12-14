@@ -39,8 +39,14 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 
 /// How often to check for pending ACKs and send them proactively.
 /// This prevents ACKs from being delayed when there's no outgoing traffic to piggyback on.
-/// Set to MAX_CONFIRMATION_DELAY (100ms) to ensure ACKs are sent within the sender's
-/// expected confirmation window.
+///
+/// Set to MAX_CONFIRMATION_DELAY (100ms), which is the documented expectation from
+/// `ReceivedPacketTracker`. The sender's actual timeout is MESSAGE_CONFIRMATION_TIMEOUT
+/// (600ms = 100ms + 500ms network allowance), so 100ms provides ample margin.
+///
+/// Note: 50ms was tried initially but caused issues in Docker NAT test environments
+/// due to increased timer overhead. 100ms provides the right balance between
+/// responsiveness and system load.
 ///
 /// Without this timer, ACKs would only be sent when:
 /// 1. The receipt buffer fills up (20 packets)

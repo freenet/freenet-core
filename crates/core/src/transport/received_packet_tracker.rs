@@ -80,7 +80,7 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
 
     /// Returns a list of packets that have been received since the last call to this function.
     /// This should be called every time a packet is sent to ensure that receipts are sent
-    /// promptly. Every `MAX_CONFIRMATION_DELAY` (50ms) this should be called and if the returned
+    /// promptly. Every `MAX_CONFIRMATION_DELAY` (100ms) this should be called and if the returned
     /// list is not empty, the list should be sent as receipts immediately in a noop packet.
     pub(super) fn get_receipts(&mut self) -> Vec<PacketId> {
         self.cleanup();
