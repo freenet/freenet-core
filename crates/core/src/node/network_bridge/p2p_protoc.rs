@@ -465,16 +465,32 @@ impl P2pConnManager {
                                     // Uses peek method to avoid pop/push overhead
                                     let target_peer = ctx.bridge.op_manager.peek_target_peer(&tx);
 
+                                    // If peek_target_peer returns None (e.g., for Put/Get operations which
+                                    // only store addresses, not full peer info), try looking up the peer
+                                    // in the connection_manager by address. This enables response routing
+                                    // when the connection still exists but operation state lacks full peer info.
+                                    let target_peer = target_peer.or_else(|| {
+                                        ctx.bridge
+                                            .op_manager
+                                            .ring
+                                            .connection_manager
+                                            .get_peer_location_by_addr(target_addr)
+                                    });
+
                                     let Some(target_peer) = target_peer else {
-                                        // Can't establish connection without peer info
-                                        // This shouldn't happen for hop-by-hop routing since
-                                        // we should have the connection from a previous request
-                                        tracing::error!(
+                                        // Can't establish connection without peer info.
+                                        // This happens when the connection was dropped before we could
+                                        // route the response. Since the peer is no longer in
+                                        // connection_manager, we can't re-establish the connection.
+                                        // Log at warn level since this can legitimately happen with
+                                        // transient connections that time out before response routing.
+                                        tracing::warn!(
                                             tx = %tx,
                                             peer_addr = %target_addr,
                                             active_connections = ctx.connections.len(),
-                                            phase = "error",
-                                            "Cannot establish connection - no peer info available in operation state"
+                                            phase = "connect",
+                                            "Cannot establish connection - peer not found in connection_manager. \
+                                             Connection likely dropped before response could be routed."
                                         );
                                         ctx.bridge.op_manager.completed(tx);
                                         continue;

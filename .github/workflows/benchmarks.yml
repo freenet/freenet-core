@@ -52,7 +52,7 @@ jobs:
       # restore-keys finds the most recent baseline from main
       - name: Download main branch baseline
         id: baseline-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: target/criterion
           # Try to find an exact match first (won't happen for PRs)
@@ -110,7 +110,7 @@ jobs:
       # PRs use restore-keys to find the most recent one
       - name: Save Baseline to Main
         if: github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: target/criterion
           # Include SHA so each main commit has its own baseline
@@ -182,7 +182,7 @@ jobs:
 
       # Upload benchmark results as artifact
       - name: Upload Benchmark Results
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results
           path: |
