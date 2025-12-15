@@ -1613,11 +1613,30 @@ pub mod mock_transport {
         Ranges(Vec<Range<usize>>),
     }
 
+    /// Policy for simulating network delay in mock transport.
+    #[derive(Clone)]
+    pub enum PacketDelayPolicy {
+        /// No artificial delay (instant delivery)
+        NoDelay,
+        /// Fixed delay for all packets
+        Fixed(Duration),
+        /// Uniform random delay between min and max
+        Uniform { min: Duration, max: Duration },
+    }
+
+    impl Default for PacketDelayPolicy {
+        fn default() -> Self {
+            PacketDelayPolicy::NoDelay
+        }
+    }
+
     /// Mock socket implementation for testing transport without real network I/O.
     pub struct MockSocket {
         inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
         this: SocketAddr,
         packet_drop_policy: PacketDropPolicy,
+        #[allow(dead_code)] // Used in send_to method
+        packet_delay_policy: PacketDelayPolicy,
         num_packets_sent: AtomicUsize,
         rng: std::sync::Mutex<rand::rngs::SmallRng>,
         channels: Channels,
@@ -1627,6 +1646,7 @@ pub mod mock_transport {
         /// Create a new MockSocket with the given configuration.
         pub async fn new(
             packet_drop_policy: PacketDropPolicy,
+            packet_delay_policy: PacketDelayPolicy,
             addr: SocketAddr,
             channels: Channels,
         ) -> Self {
@@ -1637,6 +1657,7 @@ pub mod mock_transport {
                 inbound: Mutex::new(inbound),
                 this: addr,
                 packet_drop_policy,
+                packet_delay_policy,
                 num_packets_sent: AtomicUsize::new(0),
                 rng: std::sync::Mutex::new(rand::rngs::SmallRng::seed_from_u64(
                     SEED.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
@@ -1663,6 +1684,26 @@ pub mod mock_transport {
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            // Inject artificial delay to simulate network latency
+            match &self.packet_delay_policy {
+                PacketDelayPolicy::NoDelay => {}
+                PacketDelayPolicy::Fixed(delay) => {
+                    tokio::time::sleep(*delay).await;
+                }
+                PacketDelayPolicy::Uniform { min, max } => {
+                    let range = max.as_nanos().saturating_sub(min.as_nanos());
+                    let delay = if range == 0 {
+                        *min // If min == max, use min (avoids division by zero)
+                    } else {
+                        let random_nanos = {
+                            let mut rng = self.rng.try_lock().unwrap();
+                            rng.random::<u128>() % range
+                        };
+                        *min + Duration::from_nanos((random_nanos) as u64)
+                    };
+                    tokio::time::sleep(delay).await;
+                }
+            }
             self.send_to_blocking(buf, target)
         }
 
@@ -1710,7 +1751,20 @@ pub mod mock_transport {
         packet_drop_policy: PacketDropPolicy,
         channels: Channels,
     ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
-        create_mock_peer_internal(packet_drop_policy, false, channels)
+        create_mock_peer_internal(packet_drop_policy, PacketDelayPolicy::NoDelay, false, channels)
+            .await
+            .map(|(pk, (o, _), s)| (pk, o, s))
+    }
+
+    /// Create a mock peer connection with custom delay policy for testing/benchmarking.
+    ///
+    /// Returns the peer's public key, outbound connection handler, and socket address.
+    pub async fn create_mock_peer_with_delay(
+        packet_drop_policy: PacketDropPolicy,
+        packet_delay_policy: PacketDelayPolicy,
+        channels: Channels,
+    ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
+        create_mock_peer_internal(packet_drop_policy, packet_delay_policy, false, channels)
             .await
             .map(|(pk, (o, _), s)| (pk, o, s))
     }
@@ -1729,11 +1783,12 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
-        create_mock_peer_internal(packet_drop_policy, true, channels).await
+        create_mock_peer_internal(packet_drop_policy, PacketDelayPolicy::NoDelay, true, channels).await
     }
 
     async fn create_mock_peer_internal(
         packet_drop_policy: PacketDropPolicy,
+        packet_delay_policy: PacketDelayPolicy,
         gateway: bool,
         channels: Channels,
     ) -> Result<
@@ -1752,6 +1807,7 @@ pub mod mock_transport {
         let socket = Arc::new(
             MockSocket::new(
                 packet_drop_policy,
+                packet_delay_policy,
                 (Ipv4Addr::LOCALHOST, port).into(),
                 channels,
             )
@@ -2667,7 +2723,7 @@ pub mod mock_transport {
     ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
-        let socket = Arc::new(MockSocket::new(packet_drop_policy, addr, channels).await);
+        let socket = Arc::new(MockSocket::new(packet_drop_policy, PacketDelayPolicy::NoDelay, addr, channels).await);
         let (peer_conn, _inbound_conn) =
             OutboundConnectionHandler::new_test(addr, socket, peer_keypair, false)
                 .expect("failed to create peer");
