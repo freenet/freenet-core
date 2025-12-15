@@ -138,10 +138,10 @@ jobs:
 
   six_peer_regression:
     name: six-peer-regression
-    needs: test_all  # Run after Test to avoid resource contention on self-hosted runner
+    needs: fmt_check  # Changed from test_all to avoid dependency skip cascade
     runs-on: self-hosted
     timeout-minutes: 30
-    # Skip on merge_group - same rationale as test_all
+    # Skip on merge_group - PR already passed full tests
     if: github.event_name != 'merge_group'
 
     env:
@@ -196,10 +196,10 @@ jobs:
 
   ubertest:
     name: Ubertest
-    needs: test_all
+    needs: fmt_check  # Changed from test_all to avoid dependency skip cascade
     # TODO: Re-enable when ubertest is stable - currently failing
-    # Also skip on merge_group
-    if: false && github.event_name != 'merge_group'
+    # When re-enabling, add: && github.event_name != 'merge_group'
+    if: false
     runs-on: self-hosted
     timeout-minutes: 30
 
@@ -235,7 +235,7 @@ jobs:
     name: Claude CI Analysis
     runs-on: self-hosted
     timeout-minutes: 30
-    needs: [test_all, clippy_check, fmt_check]
+    needs: [clippy_check, fmt_check]  # Removed test_all to avoid dependency skip cascade
     # Only run on PRs with claude-debug label when there's a failure
     if: |
       github.event_name == 'pull_request' &&
