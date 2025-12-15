@@ -502,6 +502,21 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if let Some(inbound_packet_sender) = ongoing_gw_connections.get(&remote_addr) {
+                                // Issue #2292: Filter out duplicate RSA intro packets during gateway handshake.
+                                // The peer sends multiple RSA intro packets for NAT traversal reliability.
+                                // After we detect a new identity and create a gateway_connection, subsequent
+                                // intro packets (256 bytes) should be ignored - we're waiting for a symmetric
+                                // ACK response which is not 256 bytes.
+                                if size == RSA_INTRO_PACKET_SIZE {
+                                    tracing::debug!(
+                                        peer_addr = %remote_addr,
+                                        direction = "inbound",
+                                        packet_len = size,
+                                        "Ignoring duplicate RSA intro packet during gateway handshake"
+                                    );
+                                    continue;
+                                }
+
                                 match inbound_packet_sender.try_send(packet_data) {
                                     Ok(_) => continue,
                                     Err(fast_channel::TrySendError::Full(_)) => {
@@ -546,7 +561,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // caused NAT peers to misroute gateway ACKs to this handler instead
                                 // of the traverse_nat handler, breaking peer->gateway connections.
 
-                                // Check if we already have a gateway connection in progress
+                                // Check if we already have a gateway connection in progress.
+                                // Note: This guard prevents CREATING duplicate connections. Packets for
+                                // EXISTING ongoing connections are routed above at line 504, where we
+                                // filter duplicate RSA intro packets (issue #2292).
                                 if ongoing_gw_connections.contains_key(&remote_addr) {
                                     tracing::debug!(
                                         peer_addr = %remote_addr,
@@ -656,9 +674,15 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 direction = "inbound",
                                 "Failed to establish gateway connection"
                             );
+                            // Only block peers with incompatible protocol versions, not other errors.
+                            // Issue #2292: Previously, ALL ConnectionEstablishmentFailure errors
+                            // caused the peer to be blocked for 10 minutes. This line was buggy:
+                            //   cause.starts_with("remote is using a different protocol version");
+                            // It evaluated to a boolean but was discarded - the insert always ran.
                             if let TransportError::ConnectionEstablishmentFailure { cause } = error {
-                                cause.starts_with("remote is using a different protocol version");
-                                outdated_peer.insert(remote_addr, Instant::now());
+                                if cause.starts_with("remote is using a different protocol version") {
+                                    outdated_peer.insert(remote_addr, Instant::now());
+                                }
                             }
                             ongoing_gw_connections.remove(&remote_addr);
                             ongoing_connections.remove(&remote_addr);
