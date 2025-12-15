@@ -97,6 +97,9 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 30
     needs: fmt_check
+    # Skip tests for release PRs - they only change version numbers in Cargo.toml
+    # The actual code has already passed CI when it merged to main
+    if: ${{ !startsWith(github.head_ref || '', 'release/v') }}
 
     env:
       FREENET_LOG: error
@@ -138,6 +141,8 @@ jobs:
     needs: test_all  # Run after Test to avoid resource contention on self-hosted runner
     runs-on: self-hosted
     timeout-minutes: 30
+    # Skip for release PRs - same reason as test_all
+    if: ${{ !startsWith(github.head_ref || '', 'release/v') }}
 
     env:
       FREENET_LOG: error
@@ -230,7 +235,11 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 30
     needs: [test_all, clippy_check, fmt_check]
-    if: failure() && contains(github.event.pull_request.labels.*.name, 'claude-debug')
+    # Run if any job failed (not skipped) and has claude-debug label
+    if: |
+      failure() &&
+      contains(github.event.pull_request.labels.*.name, 'claude-debug') &&
+      !startsWith(github.head_ref || '', 'release/v')
 
     permissions:
       contents: write
