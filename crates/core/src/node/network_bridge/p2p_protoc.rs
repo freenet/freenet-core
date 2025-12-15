@@ -74,6 +74,40 @@ impl P2pBridge {
             log_register: Arc::new(event_register),
         }
     }
+
+    /// Send Unsubscribed messages to upstream peers after subscription tree pruning.
+    ///
+    /// This is called after `prune_connection()` or `remove_client_from_all_subscriptions()`
+    /// to notify upstream peers that we're no longer subscribed to certain contracts.
+    pub(crate) async fn send_prune_notifications(
+        &self,
+        notifications: Vec<(freenet_stdlib::prelude::ContractKey, PeerKeyLocation)>,
+    ) {
+        if notifications.is_empty() {
+            return;
+        }
+
+        let own_location = self.op_manager.ring.connection_manager.own_location();
+
+        for (contract_key, upstream) in notifications {
+            if let Some(upstream_addr) = upstream.socket_addr() {
+                let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
+                    transaction: Transaction::new::<crate::operations::subscribe::SubscribeMsg>(),
+                    key: contract_key,
+                    from: own_location.clone(),
+                });
+
+                if let Err(e) = self.send(upstream_addr, unsubscribe_msg).await {
+                    tracing::warn!(
+                        %contract_key,
+                        %upstream_addr,
+                        error = %e,
+                        "Failed to send Unsubscribed to upstream after pruning"
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl NetworkBridge for P2pBridge {
@@ -682,38 +716,9 @@ impl P2pConnManager {
                                             ))
                                             .await;
 
-                                        // Send Unsubscribed to upstream peers for contracts that should be pruned
-                                        let own_location = ctx
-                                            .bridge
-                                            .op_manager
-                                            .ring
-                                            .connection_manager
-                                            .own_location();
-                                        for (contract_key, upstream) in prune_result.notifications {
-                                            if let Some(upstream_addr) = upstream.socket_addr() {
-                                                let unsubscribe_msg = crate::message::NetMessage::V1(
-                                                    crate::message::NetMessageV1::Unsubscribed {
-                                                        transaction: crate::message::Transaction::new::<
-                                                            crate::operations::subscribe::SubscribeMsg,
-                                                        >(),
-                                                        key: contract_key,
-                                                        from: own_location.clone(),
-                                                    },
-                                                );
-                                                if let Err(e) = ctx
-                                                    .bridge
-                                                    .send(upstream_addr, unsubscribe_msg)
-                                                    .await
-                                                {
-                                                    tracing::warn!(
-                                                        %contract_key,
-                                                        %upstream_addr,
-                                                        error = %e,
-                                                        "Failed to send Unsubscribed to upstream after peer disconnect"
-                                                    );
-                                                }
-                                            }
-                                        }
+                                        ctx.bridge
+                                            .send_prune_notifications(prune_result.notifications)
+                                            .await;
 
                                         // Remove from connection map
                                         tracing::trace!(
@@ -825,39 +830,9 @@ impl P2pConnManager {
                                         ))
                                         .await;
 
-                                    // Send Unsubscribed to upstream peers for contracts that should be pruned
-                                    let own_location = ctx
-                                        .bridge
-                                        .op_manager
-                                        .ring
-                                        .connection_manager
-                                        .own_location();
-                                    for (contract_key, upstream) in prune_result.notifications {
-                                        if let Some(upstream_addr) = upstream.socket_addr() {
-                                            let unsubscribe_msg = crate::message::NetMessage::V1(
-                                                crate::message::NetMessageV1::Unsubscribed {
-                                                    transaction: crate::message::Transaction::new::<
-                                                        crate::operations::subscribe::SubscribeMsg,
-                                                    >(
-                                                    ),
-                                                    key: contract_key,
-                                                    from: own_location.clone(),
-                                                },
-                                            );
-                                            if let Err(e) = ctx
-                                                .bridge
-                                                .send(upstream_addr, unsubscribe_msg)
-                                                .await
-                                            {
-                                                tracing::warn!(
-                                                    %contract_key,
-                                                    %upstream_addr,
-                                                    error = %e,
-                                                    "Failed to send Unsubscribed to upstream after peer disconnect"
-                                                );
-                                            }
-                                        }
-                                    }
+                                    ctx.bridge
+                                        .send_prune_notifications(prune_result.notifications)
+                                        .await;
 
                                     // Clean up proximity cache for disconnected peer
                                     ctx.bridge
@@ -1432,38 +1407,7 @@ impl P2pConnManager {
                                     .ring
                                     .remove_client_from_all_subscriptions(client_id);
 
-                                for (contract_key, upstream) in notifications {
-                                    let Some(upstream_addr) = upstream.socket_addr() else {
-                                        tracing::warn!(%contract_key, "No upstream socket address");
-                                        continue;
-                                    };
-
-                                    tracing::debug!(%contract_key, %upstream_addr, "Sending Unsubscribed");
-
-                                    let own_location =
-                                        op_manager.ring.connection_manager.own_location();
-                                    let unsubscribe_msg = crate::message::NetMessage::V1(
-                                        crate::message::NetMessageV1::Unsubscribed {
-                                            transaction: crate::message::Transaction::new::<
-                                                crate::operations::subscribe::SubscribeMsg,
-                                            >(
-                                            ),
-                                            key: contract_key,
-                                            from: own_location,
-                                        },
-                                    );
-
-                                    if let Err(e) =
-                                        ctx.bridge.send(upstream_addr, unsubscribe_msg).await
-                                    {
-                                        tracing::warn!(
-                                            %contract_key,
-                                            %upstream_addr,
-                                            error = %e,
-                                            "Failed to propagate Unsubscribed to upstream"
-                                        );
-                                    }
-                                }
+                                ctx.bridge.send_prune_notifications(notifications).await;
                             }
                         },
                     }
@@ -2486,34 +2430,9 @@ impl P2pConnManager {
                         .prune_connection(PeerId::new(remote_addr, peer.pub_key().clone()))
                         .await;
 
-                    // Send Unsubscribed to upstream peers for contracts that should be pruned
-                    let own_location = self
-                        .bridge
-                        .op_manager
-                        .ring
-                        .connection_manager
-                        .own_location();
-                    for (contract_key, upstream) in prune_result.notifications {
-                        if let Some(upstream_addr) = upstream.socket_addr() {
-                            let unsubscribe_msg = crate::message::NetMessage::V1(
-                                crate::message::NetMessageV1::Unsubscribed {
-                                    transaction: crate::message::Transaction::new::<
-                                        crate::operations::subscribe::SubscribeMsg,
-                                    >(),
-                                    key: contract_key,
-                                    from: own_location.clone(),
-                                },
-                            );
-                            if let Err(e) = self.bridge.send(upstream_addr, unsubscribe_msg).await {
-                                tracing::warn!(
-                                    %contract_key,
-                                    %upstream_addr,
-                                    error = %e,
-                                    "Failed to send Unsubscribed to upstream after transport closed"
-                                );
-                            }
-                        }
-                    }
+                    self.bridge
+                        .send_prune_notifications(prune_result.notifications)
+                        .await;
 
                     if let Err(error) = handshake_commands
                         .send(HandshakeCommand::DropConnection { peer: peer.clone() })
