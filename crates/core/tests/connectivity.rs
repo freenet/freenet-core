@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context};
-use freenet::test_utils::{self, make_get, make_put, make_update, TestContext, TestResult};
+use freenet::test_utils::{
+    self, make_get, make_put, make_subscribe, make_update, TestContext, TestResult,
+};
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
@@ -474,8 +476,8 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     )
     .await?;
 
-    // GET with subscribe=true so peer2 receives update notifications
-    make_get(&mut client2, contract_key, true, false).await?;
+    // GET so peer2 caches the contract
+    make_get(&mut client2, contract_key, false, false).await?;
     let get_response = tokio::time::timeout(Duration::from_secs(60), client2.recv()).await;
     match get_response {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -499,6 +501,29 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     // - Both peers should have each other in proximity_cache.neighbors_with_contract()
     // - UPDATE from peer1 should route to peer2 via proximity cache, not ring routing
     tracing::info!("Testing UPDATE propagation via proximity cache");
+
+    // Explicitly subscribe peer2 to receive update notifications
+    make_subscribe(&mut client2, contract_key).await?;
+    loop {
+        let resp = tokio::time::timeout(Duration::from_secs(30), client2.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            }))) => {
+                assert_eq!(key, contract_key, "Subscribe response key mismatch");
+                assert!(subscribed, "Subscribe should succeed");
+                tracing::info!("✅ Peer2 subscribed to contract updates");
+                break;
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!("Ignoring non-subscribe response: {:?}", other);
+                continue;
+            }
+            Ok(Err(e)) => bail!("Error receiving subscribe response: {}", e),
+            Err(_) => bail!("Timeout waiting for subscribe response"),
+        }
+    }
 
     // Allow time for CacheAnnounce messages to propagate
     tokio::time::sleep(Duration::from_secs(2)).await;
