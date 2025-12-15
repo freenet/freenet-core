@@ -19,13 +19,17 @@
 //! | Competing flows | Slow to yield | Fast to yield |
 //! | User perception | Noticeable | Imperceptible |
 
+#![allow(dead_code)] // Infrastructure not yet integrated
+
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// Maximum segment size (MAX_DATA_SIZE from packet_data)
-const MSS: usize = 1424;
+use super::packet_data::MAX_DATA_SIZE;
+
+/// Maximum segment size (actual packet data capacity)
+const MSS: usize = MAX_DATA_SIZE;
 
 /// Target queuing delay (RFC 6817 default)
 const TARGET: Duration = Duration::from_millis(100);
@@ -39,6 +43,24 @@ const BASE_HISTORY_SIZE: usize = 10;
 /// Delay filter sample count (RFC 6817 recommendation)
 const DELAY_FILTER_SIZE: usize = 4;
 
+/// Consolidated state for LEDBAT to reduce lock contention.
+///
+/// Previously these were 4 separate Mutex fields causing 6 lock acquisitions
+/// per ACK. Now consolidated to a single lock acquisition.
+struct LedbatState {
+    /// Base delay history (10-minute buckets)
+    base_delay_history: BaseDelayHistory,
+
+    /// Delay filter (MIN over recent samples)
+    delay_filter: DelayFilter,
+
+    /// Current queuing delay estimate
+    queuing_delay: Duration,
+
+    /// Last update time (for rate-limiting updates)
+    last_update: Instant,
+}
+
 /// LEDBAT congestion controller (RFC 6817).
 ///
 /// Maintains target queuing delay to yield bandwidth to competing flows.
@@ -50,20 +72,11 @@ pub struct LedbatController {
     /// Bytes currently in flight (sent but not ACKed)
     flightsize: AtomicUsize,
 
-    /// Base delay history (10-minute buckets)
-    base_delay_history: Mutex<BaseDelayHistory>,
-
-    /// Delay filter (MIN over recent samples)
-    delay_filter: Mutex<DelayFilter>,
-
-    /// Current queuing delay estimate
-    queuing_delay: Mutex<Duration>,
+    /// Consolidated state (single lock for all delay tracking)
+    state: Mutex<LedbatState>,
 
     /// Bytes acknowledged since last update
     bytes_acked_since_update: AtomicUsize,
-
-    /// Last update time (for rate-limiting updates)
-    last_update: Mutex<Instant>,
 
     /// Configuration
     target_delay: Duration,
@@ -100,11 +113,13 @@ impl LedbatController {
         Self {
             cwnd: AtomicUsize::new(initial_cwnd),
             flightsize: AtomicUsize::new(0),
-            base_delay_history: Mutex::new(BaseDelayHistory::new()),
-            delay_filter: Mutex::new(DelayFilter::new()),
-            queuing_delay: Mutex::new(Duration::ZERO),
+            state: Mutex::new(LedbatState {
+                base_delay_history: BaseDelayHistory::new(),
+                delay_filter: DelayFilter::new(),
+                queuing_delay: Duration::ZERO,
+                last_update: Instant::now(),
+            }),
             bytes_acked_since_update: AtomicUsize::new(0),
-            last_update: Mutex::new(Instant::now()),
             target_delay: TARGET,
             gain: GAIN,
             allowed_increase_packets: 2, // RFC 6817 default
@@ -132,42 +147,52 @@ impl LedbatController {
     /// * `rtt_sample` - Round-trip time measurement
     /// * `bytes_acked_now` - Bytes acknowledged by this ACK
     pub fn on_ack(&self, rtt_sample: Duration, bytes_acked_now: usize) {
-        // Decrease flightsize
-        self.flightsize.fetch_sub(bytes_acked_now, Ordering::Relaxed);
+        // Decrease flightsize with saturating subtraction to prevent underflow
+        self.flightsize
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes_acked_now))
+            })
+            .ok();
 
         // Accumulate acknowledged bytes
         self.bytes_acked_since_update
             .fetch_add(bytes_acked_now, Ordering::Relaxed);
 
-        // Update base delay history
-        self.base_delay_history.lock().update(rtt_sample);
+        // Single lock acquisition for all delay tracking (was 6 locks before)
+        let (queuing_delay, base_delay) = {
+            let mut state = self.state.lock();
 
-        // Add to delay filter
-        self.delay_filter.lock().add_sample(rtt_sample);
+            // Update base delay history
+            state.base_delay_history.update(rtt_sample);
 
-        // Get filtered delay (minimum of recent samples)
-        let filtered_rtt = {
-            let filter = self.delay_filter.lock();
-            if !filter.is_ready() {
+            // Add to delay filter
+            state.delay_filter.add_sample(rtt_sample);
+
+            // Get filtered delay (minimum of recent samples)
+            if !state.delay_filter.is_ready() {
                 return; // Need more samples
             }
-            filter.filtered_delay().unwrap_or(rtt_sample)
+            let filtered_rtt = state
+                .delay_filter
+                .filtered_delay()
+                .unwrap_or(rtt_sample);
+
+            // Calculate base and queuing delays
+            let base_delay = state.base_delay_history.base_delay();
+            let queuing_delay = filtered_rtt.saturating_sub(base_delay);
+            state.queuing_delay = queuing_delay;
+
+            // Rate-limit updates to approximately once per RTT
+            let elapsed_since_update = state.last_update.elapsed();
+
+            // Use base delay as RTT estimate for rate-limiting
+            if elapsed_since_update < base_delay {
+                return;
+            }
+            state.last_update = Instant::now();
+
+            (queuing_delay, base_delay)
         };
-
-        // Calculate base and queuing delays
-        let base_delay = self.base_delay_history.lock().base_delay();
-        let queuing_delay = filtered_rtt.saturating_sub(base_delay);
-        *self.queuing_delay.lock() = queuing_delay;
-
-        // Rate-limit updates to approximately once per RTT
-        let mut last_update = self.last_update.lock();
-        let elapsed_since_update = last_update.elapsed();
-
-        // Use base delay as RTT estimate for rate-limiting
-        if elapsed_since_update < base_delay {
-            return;
-        }
-        *last_update = Instant::now();
 
         // Calculate off-target amount
         let target = self.target_delay;
@@ -280,22 +305,24 @@ impl LedbatController {
     /// Convert cwnd (bytes in flight) to rate (bytes/sec).
     ///
     /// rate = cwnd / RTT
+    ///
+    /// Enforces minimum RTT of 1ms to prevent division by near-zero
+    /// (sub-millisecond RTTs would cause unrealistically high rates).
     pub fn current_rate(&self, rtt: Duration) -> usize {
         let cwnd = self.current_cwnd();
-        if rtt.is_zero() {
-            return self.min_cwnd;
-        }
-        ((cwnd as f64) / rtt.as_secs_f64()) as usize
+        // Enforce minimum RTT of 1ms to prevent division by near-zero
+        let safe_rtt = rtt.max(Duration::from_millis(1));
+        ((cwnd as f64) / safe_rtt.as_secs_f64()) as usize
     }
 
     /// Get current queuing delay.
     pub fn queuing_delay(&self) -> Duration {
-        *self.queuing_delay.lock()
+        self.state.lock().queuing_delay
     }
 
     /// Get base delay.
     pub fn base_delay(&self) -> Duration {
-        self.base_delay_history.lock().base_delay()
+        self.state.lock().base_delay_history.base_delay()
     }
 
     /// Get current flightsize.
@@ -457,6 +484,9 @@ mod tests {
     async fn test_ledbat_increases_when_below_target() {
         let controller = LedbatController::new(10_000, 2848, 10_000_000);
 
+        // Track flightsize to avoid application-limited cap interference
+        controller.on_send(20_000); // Send enough to keep flightsize high
+
         // Set base delay with multiple samples (need 2+ for filter)
         controller.on_ack(Duration::from_millis(10), 1000);
         controller.on_ack(Duration::from_millis(10), 1000);
@@ -598,7 +628,7 @@ mod tests {
         let controller = LedbatController::new(10_000, 2848, 10_000_000);
 
         // Track flightsize for application-limited cap
-        controller.on_send(5000);
+        controller.on_send(20_000); // Send enough to cover all acks
 
         // Set base delay with filter (need 2+ samples)
         for _ in 0..4 {
@@ -613,7 +643,7 @@ mod tests {
         // RTT below target: 30ms (10ms base + 20ms queuing) < 100ms target
         // off_target = 70ms, target = 100ms
         // Δcwnd = GAIN * (70/100) * bytes_acked * MSS / cwnd
-        //       = 1.0 * 0.7 * 5000 * 1424 / initial_cwnd
+        //       = 1.0 * 0.7 * 5000 * 1464 (MAX_DATA_SIZE) / initial_cwnd
         // BUT: limited by application-limited cap (flightsize + ALLOWED_INCREASE)
         controller.on_ack(Duration::from_millis(30), 5000);
 

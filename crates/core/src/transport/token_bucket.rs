@@ -4,6 +4,8 @@
 //! algorithm (LEDBAT, AIMD, etc.). The token bucket ensures smooth packet pacing
 //! without bursts, and supports dynamic rate updates from the congestion controller.
 
+#![allow(dead_code)] // Infrastructure not yet integrated
+
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
@@ -24,6 +26,8 @@ struct BucketState {
     capacity: usize,
     /// Current available tokens (bytes)
     tokens: usize,
+    /// Fractional tokens (prevents precision loss at high rates)
+    fractional_tokens: f64,
     /// Refill rate (bytes/second)
     rate: usize,
     /// Last refill timestamp
@@ -50,6 +54,7 @@ impl TokenBucket {
             state: Mutex::new(BucketState {
                 capacity,
                 tokens: capacity,  // Start full
+                fractional_tokens: 0.0,
                 rate,
                 last_refill: Instant::now(),
             }),
@@ -136,6 +141,8 @@ impl TokenBucket {
 
 impl BucketState {
     /// Refill tokens based on elapsed time.
+    ///
+    /// Uses fractional token tracking to prevent precision loss at high rates.
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill);
@@ -145,10 +152,21 @@ impl BucketState {
             return;
         }
 
-        let new_tokens = (self.rate as f64 * elapsed.as_secs_f64()) as usize;
-        if new_tokens > 0 {
+        // Calculate new tokens with fractional precision
+        let new_tokens_f64 = self.rate as f64 * elapsed.as_secs_f64();
+
+        // Add to fractional accumulator
+        self.fractional_tokens += new_tokens_f64;
+
+        // Convert whole tokens
+        let new_tokens_whole = self.fractional_tokens.floor() as usize;
+        if new_tokens_whole > 0 {
             // Add tokens, capped at capacity
-            self.tokens = (self.tokens + new_tokens).min(self.capacity);
+            self.tokens = (self.tokens + new_tokens_whole).min(self.capacity);
+
+            // Keep fractional part for next refill
+            self.fractional_tokens -= new_tokens_whole as f64;
+
             self.last_refill = now;
         }
     }
