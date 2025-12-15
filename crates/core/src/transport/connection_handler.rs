@@ -675,14 +675,10 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 "Failed to establish gateway connection"
                             );
                             // Only block peers with incompatible protocol versions, not other errors.
-                            // Issue #2292: Previously, ALL ConnectionEstablishmentFailure errors
-                            // caused the peer to be blocked for 10 minutes. This line was buggy:
-                            //   cause.starts_with("remote is using a different protocol version");
-                            // It evaluated to a boolean but was discarded - the insert always ran.
-                            if let TransportError::ConnectionEstablishmentFailure { cause } = error {
-                                if cause.starts_with("remote is using a different protocol version") {
-                                    outdated_peer.insert(remote_addr, Instant::now());
-                                }
+                            // Issue #2292: Previously used fragile string matching on error messages.
+                            // Now we use proper typed error matching.
+                            if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
+                                outdated_peer.insert(remote_addr, Instant::now());
                             }
                             ongoing_gw_connections.remove(&remote_addr);
                             ongoing_connections.remove(&remote_addr);
@@ -892,12 +888,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                     .send_async((remote_addr, packet.prepared_send()))
                     .await
                     .map_err(|_| TransportError::ChannelClosed)?;
-                return Err(TransportError::ConnectionEstablishmentFailure {
-                    cause: format!(
-                        "remote is using a different protocol version: {:?}",
-                        String::from_utf8_lossy(protoc)
-                    )
-                    .into(),
+                return Err(TransportError::ProtocolVersionMismatch {
+                    expected: PCK_VERSION.to_string(),
+                    actual: PCK_VERSION, // We expected our version, they sent something else
                 });
             }
 
