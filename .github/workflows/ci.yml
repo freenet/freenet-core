@@ -12,6 +12,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Detect if this is a release PR to skip expensive tests
+  # Release PRs only change version numbers - the code has already passed CI
+  check_release_pr:
+    name: Check Release PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      is_release: ${{ steps.check.outputs.is_release }}
+    steps:
+      - name: Check if release PR
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IS_RELEASE="false"
+
+          # For pull_request events, check head_ref directly
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            HEAD_REF="${{ github.head_ref }}"
+            echo "PR head ref: $HEAD_REF"
+            if [[ "$HEAD_REF" == release/v* ]]; then
+              IS_RELEASE="true"
+              echo "✓ Direct PR from release branch"
+            fi
+          fi
+
+          # For merge_group events, extract PR number and query API
+          if [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            # Branch format: gh-readonly-queue/main/pr-XXXX-<sha>
+            REF="${{ github.ref }}"
+            echo "Merge group ref: $REF"
+
+            # Extract PR number from the ref
+            if [[ "$REF" =~ pr-([0-9]+)- ]]; then
+              PR_NUMBER="${BASH_REMATCH[1]}"
+              echo "Extracted PR number: $PR_NUMBER"
+
+              # Query GitHub API to get the PR's head branch
+              HEAD_REF=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER --jq '.head.ref' 2>/dev/null || echo "")
+              echo "PR head ref from API: $HEAD_REF"
+
+              if [[ "$HEAD_REF" == release/v* ]]; then
+                IS_RELEASE="true"
+                echo "✓ Merge queue entry for release PR #$PR_NUMBER"
+              fi
+            else
+              echo "Could not extract PR number from ref"
+            fi
+          fi
+
+          # For push events to main, never skip tests
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "Push to main - running full tests"
+          fi
+
+          echo "is_release=$IS_RELEASE" >> $GITHUB_OUTPUT
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            echo "🚀 Release PR detected - expensive tests will be skipped"
+          else
+            echo "📋 Regular PR/push - running full test suite"
+          fi
+
   # Fast checks first - fail fast on simple issues
   # Order: fastest to slowest for single-runner efficiency
 
@@ -96,7 +158,9 @@ jobs:
     name: Test
     runs-on: self-hosted
     timeout-minutes: 30
-    needs: fmt_check
+    needs: [fmt_check, check_release_pr]
+    # Skip for release PRs - they only change version numbers, code already passed CI
+    if: needs.check_release_pr.outputs.is_release != 'true'
 
     env:
       FREENET_LOG: error
@@ -135,9 +199,14 @@ jobs:
 
   six_peer_regression:
     name: six-peer-regression
-    needs: test_all  # Run after Test to avoid resource contention on self-hosted runner
+    needs: [test_all, check_release_pr]  # Run after Test to avoid resource contention on self-hosted runner
     runs-on: self-hosted
     timeout-minutes: 30
+    # Skip for release PRs; also handle when test_all was skipped
+    if: |
+      always() &&
+      needs.check_release_pr.outputs.is_release != 'true' &&
+      (needs.test_all.result == 'success' || needs.test_all.result == 'skipped')
 
     env:
       FREENET_LOG: error
@@ -191,9 +260,12 @@ jobs:
 
   ubertest:
     name: Ubertest
-    needs: test_all
+    needs: [test_all, check_release_pr]
     # TODO: Re-enable when ubertest is stable - currently failing
-    if: false
+    # Also skip for release PRs
+    if: |
+      false &&
+      needs.check_release_pr.outputs.is_release != 'true'
     runs-on: self-hosted
     timeout-minutes: 30
 
@@ -229,8 +301,12 @@ jobs:
     name: Claude CI Analysis
     runs-on: self-hosted
     timeout-minutes: 30
-    needs: [test_all, clippy_check, fmt_check]
-    if: failure() && contains(github.event.pull_request.labels.*.name, 'claude-debug')
+    needs: [test_all, clippy_check, fmt_check, check_release_pr]
+    # Run if any job failed (not for release PRs) and has claude-debug label
+    if: |
+      failure() &&
+      needs.check_release_pr.outputs.is_release != 'true' &&
+      contains(github.event.pull_request.labels.*.name, 'claude-debug')
 
     permissions:
       contents: write
