@@ -925,10 +925,30 @@ pub(crate) async fn request_update(
         None
     };
 
+    // Check proximity cache for neighbors that have announced caching this contract.
+    // This is critical for peer-to-peer updates when peers are directly connected
+    // but not explicitly subscribed (e.g., River chat rooms where both peers cache
+    // the contract but haven't established a subscription tree).
+    let target_from_proximity = op_manager
+        .proximity_cache
+        .neighbors_with_contract(&key)
+        .into_iter()
+        .filter(|addr| addr != &sender_addr)
+        .find_map(|addr| op_manager.ring.connection_manager.get_peer_by_addr(addr));
+
     let target = if let Some(remote_subscriber) = target_from_subscribers {
         remote_subscriber
+    } else if let Some(proximity_neighbor) = target_from_proximity {
+        // Use peer from proximity cache that announced having this contract.
+        // This aligns with get_broadcast_targets_update() which also uses proximity cache.
+        tracing::debug!(
+            %key,
+            target = ?proximity_neighbor.socket_addr(),
+            "UPDATE: Using proximity cache neighbor as target"
+        );
+        proximity_neighbor
     } else {
-        // Find the best peer to send the update to
+        // Find the best peer to send the update to based on ring location
         let remote_target = op_manager
             .ring
             .closest_potentially_caching(&key, [sender_addr].as_slice());
