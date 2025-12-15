@@ -214,31 +214,10 @@ impl Ring {
             .record_contract_access(key, size_bytes, AccessType::Get)
     }
 
-    /// Record a subscribe access for a contract (for future use when subscribe
-    /// operations directly record access rather than delegating to GET).
-    #[allow(dead_code)]
-    pub fn record_subscribe_access(
-        &self,
-        key: ContractKey,
-        size_bytes: u64,
-    ) -> Vec<(ContractKey, Option<PeerKeyLocation>)> {
-        use seeding_cache::AccessType;
-        self.seeding_manager
-            .record_contract_access(key, size_bytes, AccessType::Subscribe)
-    }
-
     /// Whether this node already is seeding to this contract or not.
     #[inline]
     pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
         self.seeding_manager.is_seeding_contract(key)
-    }
-
-    /// Remove a contract from the seeding cache (for future use in cleanup paths).
-    ///
-    /// Returns the upstream peer to notify with Unsubscribed if any.
-    #[allow(dead_code)]
-    pub fn remove_seeded_contract(&self, key: &ContractKey) -> Option<PeerKeyLocation> {
-        self.seeding_manager.remove_seeded_contract(key)
     }
 
     pub fn record_request(
@@ -388,18 +367,6 @@ impl Ring {
         self.seeding_manager.set_upstream(contract, upstream)
     }
 
-    /// Get the upstream peer for a contract (if any).
-    #[allow(dead_code)] // Part of subscription tree API, will be used for diagnostics
-    pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
-        self.seeding_manager.get_upstream(contract)
-    }
-
-    /// Get all downstream subscribers for a contract (for broadcast targeting).
-    #[allow(dead_code)] // Part of subscription tree API, will be used for diagnostics
-    pub fn get_downstream(&self, contract: &ContractKey) -> Vec<PeerKeyLocation> {
-        self.seeding_manager.get_downstream(contract)
-    }
-
     /// Remove a subscriber and check if upstream notification is needed.
     pub fn remove_subscriber(
         &self,
@@ -430,24 +397,6 @@ impl Ring {
     ) {
         self.seeding_manager
             .add_client_subscription(contract, client_id)
-    }
-
-    /// Remove a client subscription.
-    /// Returns true if this was the last client subscription for this contract.
-    #[allow(dead_code)] // Part of client subscription API, to be integrated with client disconnect handling
-    pub fn remove_client_subscription(
-        &self,
-        contract: &ContractKey,
-        client_id: crate::client_events::ClientId,
-    ) -> bool {
-        self.seeding_manager
-            .remove_client_subscription(contract, client_id)
-    }
-
-    /// Check if there are any client subscriptions for a contract.
-    #[allow(dead_code)] // Part of client subscription API, to be integrated with client disconnect handling
-    pub fn has_client_subscriptions(&self, contract: &ContractKey) -> bool {
-        self.seeding_manager.has_client_subscriptions(contract)
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).
