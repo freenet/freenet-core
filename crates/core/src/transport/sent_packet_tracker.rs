@@ -94,7 +94,7 @@ impl SentPacketTracker<InstantTimeSrc> {
             // RFC 6298: Initial RTO = 1 second
             srtt: None,
             rttvar: Duration::from_secs(0),
-            min_rtt: Duration::from_secs(3600), // Start with a high value
+            min_rtt: Duration::from_millis(100), // Reasonable default until real RTT samples arrive
             rto: Duration::from_secs(1),
             retransmitted_packets: HashSet::new(),
             total_packets_sent: 0,
@@ -277,7 +277,7 @@ pub(in crate::transport) mod tests {
             time_source,
             srtt: None,
             rttvar: Duration::from_secs(0),
-            min_rtt: Duration::from_secs(3600),
+            min_rtt: Duration::from_millis(100),
             rto: Duration::from_secs(1),
             retransmitted_packets: HashSet::new(),
             total_packets_sent: 0,

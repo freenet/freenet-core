@@ -636,6 +636,9 @@ impl PeerConnection {
                                 break;
                             }
                             ResendAction::Resend(idx, packet) => {
+                                // Notify LEDBAT of packet loss (timeout-based retransmission)
+                                self.remote_conn.ledbat.on_timeout();
+
                                 self.remote_conn
                                     .outbound_packets
                                     .send_async((self.remote_conn.remote_addr, packet.clone()))
@@ -661,10 +664,14 @@ impl PeerConnection {
                 }
                 // Rate update timer - update TokenBucket rate based on LEDBAT cwnd
                 _ = rate_update_check.tick() => {
-                    // Get current RTT estimate (smoothed RTT if available, otherwise min RTT)
-                    let tracker = self.remote_conn.sent_tracker.lock();
-                    let rtt = tracker.smoothed_rtt().unwrap_or_else(|| tracker.min_rtt());
-                    drop(tracker); // Release lock before calling current_rate
+                    // Use LEDBAT's base delay for rate calculation (consistent with its internal state)
+                    // Fallback to min_rtt only if base_delay is not yet established
+                    let base_delay = self.remote_conn.ledbat.base_delay();
+                    let rtt = if base_delay.is_zero() {
+                        self.remote_conn.sent_tracker.lock().min_rtt()
+                    } else {
+                        base_delay
+                    };
 
                     let new_rate = self.remote_conn.ledbat.current_rate(rtt);
                     self.remote_conn.token_bucket.set_rate(new_rate);
@@ -672,6 +679,7 @@ impl PeerConnection {
                         peer_addr = %self.remote_conn.remote_addr,
                         new_rate_bytes_per_sec = new_rate,
                         cwnd = self.remote_conn.ledbat.current_cwnd(),
+                        base_delay_ms = base_delay.as_millis(),
                         rtt_ms = rtt.as_millis(),
                         "Updated token bucket rate from LEDBAT"
                     );
