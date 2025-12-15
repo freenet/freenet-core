@@ -2908,3 +2908,253 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
 
     Ok(())
 }
+
+/// Regression test for issue #2301: UPDATE broadcast NoChange false positive
+///
+/// This test verifies that when a node updates a contract, the update is properly
+/// broadcast to other nodes that have cached the contract. Prior to the fix,
+/// the change detection logic ran AFTER the local state was committed, causing
+/// the comparison to always return NoChange and preventing any broadcast.
+///
+/// The test validates the fix by:
+/// 1. Having peer-a PUT a contract
+/// 2. Having gateway GET the contract (so it's cached on gateway)
+/// 3. Having peer-a UPDATE the contract with new state
+/// 4. Verifying that gateway's cached state is updated via broadcast
+///
+/// If the NoChange bug is present, gateway would still have the old state
+/// because the UPDATE broadcast would be skipped.
+#[freenet_test(
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 180,
+    startup_wait_secs = 15,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> TestResult {
+    // Load test contract
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    // Create initial state with empty todo list
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_initial_state = WrappedState::from(initial_state);
+
+    let peer_a = ctx.node("peer-a")?;
+    let gateway = ctx.node("gateway")?;
+    let ws_api_port_peer_a = peer_a.ws_port;
+    let ws_api_port_gateway = gateway.ws_port;
+
+    tracing::info!("Peer A data dir: {:?}", peer_a.temp_dir_path);
+    tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
+
+    // Give extra time for peer to connect to gateway
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Connect to peer-a's websocket API
+    let uri_peer_a =
+        format!("ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native");
+    let (stream_a, _) = connect_async(&uri_peer_a).await?;
+    let mut client_peer_a = WebApi::start(stream_a);
+
+    // Connect to gateway's websocket API
+    let uri_gateway =
+        format!("ws://127.0.0.1:{ws_api_port_gateway}/v1/contract/command?encodingProtocol=native");
+    let (stream_gw, _) = connect_async(&uri_gateway).await?;
+    let mut client_gateway = WebApi::start(stream_gw);
+
+    // Step 1: Peer-a puts the contract with initial state
+    tracing::info!("Step 1: Peer-a putting contract with initial state");
+    make_put(
+        &mut client_peer_a,
+        wrapped_initial_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    // Wait for put response from peer-a
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_peer_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+            tracing::info!("Peer-a: PUT successful for contract {}", key);
+        }
+        Ok(Ok(other)) => {
+            bail!(
+                "Peer-a: unexpected response while waiting for put: {:?}",
+                other
+            );
+        }
+        Ok(Err(e)) => {
+            bail!("Peer-a: Error receiving put response: {}", e);
+        }
+        Err(_) => {
+            bail!("Peer-a: Timeout waiting for put response");
+        }
+    }
+
+    // Step 2: Gateway gets the contract (this caches it on gateway)
+    tracing::info!("Step 2: Gateway getting contract to cache it");
+    make_get(&mut client_gateway, contract_key, true, false).await?;
+
+    // Wait for get response on gateway
+    let resp = tokio::time::timeout(Duration::from_secs(60), client_gateway.recv()).await;
+    let initial_state_on_gateway: WrappedState = match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key,
+            state,
+            ..
+        }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in GET response");
+            tracing::info!("Gateway: GET successful, contract cached");
+            state
+        }
+        Ok(Ok(other)) => {
+            bail!(
+                "Gateway: unexpected response while waiting for get: {:?}",
+                other
+            );
+        }
+        Ok(Err(e)) => {
+            bail!("Gateway: Error receiving get response: {}", e);
+        }
+        Err(_) => {
+            bail!("Gateway: Timeout waiting for get response");
+        }
+    };
+
+    // Step 3: Peer-a updates the contract with new state
+    tracing::info!("Step 3: Peer-a updating contract with new state");
+
+    // Create updated state (add a todo item)
+    let mut todo_list: test_utils::TodoList =
+        serde_json::from_slice(wrapped_initial_state.as_ref()).unwrap_or_else(|_| {
+            test_utils::TodoList {
+                tasks: Vec::new(),
+                version: 0,
+            }
+        });
+    todo_list.tasks.push(test_utils::Task {
+        id: 1,
+        title: "Issue 2301 regression test".to_string(),
+        description: "This task should propagate to gateway via UPDATE broadcast".to_string(),
+        completed: false,
+        priority: 1,
+    });
+    let updated_bytes = serde_json::to_vec(&todo_list).unwrap();
+    let wrapped_updated_state = WrappedState::from(updated_bytes);
+
+    make_update(
+        &mut client_peer_a,
+        contract_key,
+        wrapped_updated_state.clone(),
+    )
+    .await?;
+
+    // Wait for update response on peer-a
+    let resp = tokio::time::timeout(Duration::from_secs(30), client_peer_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key, ..
+        }))) => {
+            assert_eq!(
+                key, contract_key,
+                "Contract key mismatch in UPDATE response"
+            );
+            tracing::info!("Peer-a: UPDATE successful");
+        }
+        Ok(Ok(other)) => {
+            bail!(
+                "Peer-a: unexpected response while waiting for update: {:?}",
+                other
+            );
+        }
+        Ok(Err(e)) => {
+            bail!("Peer-a: Error receiving update response: {}", e);
+        }
+        Err(_) => {
+            bail!("Peer-a: Timeout waiting for update response");
+        }
+    }
+
+    // Step 4: Verify gateway received the update by polling GET
+    // The update should have been broadcast to gateway. We poll GET
+    // because subscription notifications across nodes are known to be flaky.
+    tracing::info!("Step 4: Verifying gateway received the update via polling GET");
+
+    // Poll gateway for up to 30 seconds to see if the state was updated
+    let poll_start = std::time::Instant::now();
+    let poll_timeout = Duration::from_secs(30);
+    let mut gateway_received_update = false;
+
+    while poll_start.elapsed() < poll_timeout {
+        // Small delay between polls
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        make_get(&mut client_gateway, contract_key, false, false).await?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), client_gateway.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key,
+                state,
+                ..
+            }))) => {
+                assert_eq!(key, contract_key);
+
+                // Check if the state has been updated
+                if state.as_ref() != initial_state_on_gateway.as_ref() {
+                    // State changed - verify it matches the expected updated state
+                    let state_on_gateway: test_utils::TodoList =
+                        serde_json::from_slice(state.as_ref())
+                            .expect("Failed to deserialize gateway state");
+
+                    if !state_on_gateway.tasks.is_empty()
+                        && state_on_gateway.tasks[0].title == "Issue 2301 regression test"
+                    {
+                        tracing::info!(
+                            "SUCCESS: Gateway received the UPDATE broadcast! State updated with {} task(s)",
+                            state_on_gateway.tasks.len()
+                        );
+                        gateway_received_update = true;
+                        break;
+                    }
+                }
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!("Gateway poll: unexpected response: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Gateway poll: error: {}", e);
+            }
+            Err(_) => {
+                tracing::warn!("Gateway poll: timeout");
+            }
+        }
+
+        tracing::debug!(
+            "Gateway state not yet updated, polling... (elapsed: {:?})",
+            poll_start.elapsed()
+        );
+    }
+
+    // REGRESSION TEST: If the bug in issue #2301 is present, the UPDATE would not be
+    // broadcast because change detection would return NoChange (false positive).
+    // The fix ensures that in network mode, the state is not committed before the
+    // network operation, allowing proper change detection and broadcasting.
+    ensure!(
+        gateway_received_update,
+        "REGRESSION FAILURE (Issue #2301): Gateway did not receive UPDATE broadcast. \
+         This indicates the NoChange false positive bug is present - the UPDATE was \
+         not broadcast to other nodes because change detection incorrectly returned \
+         NoChange after the local state was already committed."
+    );
+
+    tracing::info!(
+        "Issue #2301 regression test passed: UPDATE broadcast propagation works correctly"
+    );
+
+    Ok(())
+}

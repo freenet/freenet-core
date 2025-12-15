@@ -4,6 +4,20 @@ use super::{
     ExecutorToEventLoopChannel, InitCheckResult, RequestError, Response, StateStoreError,
     SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
 };
+use freenet_stdlib::prelude::RelatedContract;
+
+/// Result of computing a state update without committing.
+/// Used in network mode to separate state computation from commit,
+/// allowing the network operation to handle the commit and properly
+/// detect changes for broadcasting.
+enum ComputedStateUpdate {
+    /// State changed - contains the new state to commit
+    Changed(WrappedState),
+    /// No change detected - contains the current state
+    NoChange(WrappedState),
+    /// Missing related contracts - contains the list of required contracts
+    MissingRelated(Vec<RelatedContract>),
+}
 
 impl ContractExecutor for Executor<Runtime> {
     async fn fetch_contract(
@@ -851,26 +865,132 @@ impl Executor<Runtime> {
             .clone();
 
         let updates = vec![update];
-        let new_state = self
-            .get_updated_state(&parameters, current_state, key, updates)
-            .await?;
 
-        // in the network impl this would be sent over the network
-        let summary = self
-            .runtime
-            .summarize_state(&key, &parameters, &new_state)
-            .map_err(|e| ExecutorError::execution(e, None))?;
-        self.send_update_notification(&key, &parameters, &new_state)
-            .await?;
-
+        // In local mode, we handle the full update locally (compute, commit, notify)
         if self.mode == OperationMode::Local {
+            let new_state = self
+                .get_updated_state(&parameters, current_state, key, updates)
+                .await?;
+            let summary = self
+                .runtime
+                .summarize_state(&key, &parameters, &new_state)
+                .map_err(|e| ExecutorError::execution(e, None))?;
+            // Note: notification is sent by attempt_state_update, no need to send again
             return Ok(ContractResponse::UpdateResponse { key, summary }.into());
         }
-        // notify peers with deltas from summary in network
-        let request = UpdateContract { key, new_state };
-        let _op: operations::update::UpdateResult = self.op_request(request).await?;
 
-        Ok(ContractResponse::UpdateResponse { key, summary }.into())
+        // In network mode, compute the state WITHOUT committing.
+        // The network operation will handle the commit and broadcast.
+        // This fixes issue #2301: previously we committed here, causing the network
+        // operation to see no change and skip broadcasting.
+        let computed = self
+            .compute_state_update(&parameters, &current_state, &key, &updates)
+            .await?;
+
+        match computed {
+            ComputedStateUpdate::NoChange(state) => {
+                // No change detected, return early without starting network operation
+                tracing::debug!(
+                    contract = %key,
+                    phase = "update_no_change",
+                    "Update resulted in no change, skipping network operation"
+                );
+                let summary = self
+                    .runtime
+                    .summarize_state(&key, &parameters, &state)
+                    .map_err(|e| ExecutorError::execution(e, None))?;
+                Ok(ContractResponse::UpdateResponse { key, summary }.into())
+            }
+            ComputedStateUpdate::MissingRelated(_missing) => {
+                // Missing related contracts - fall back to the existing path that handles this.
+                // This path commits locally, which means the network operation won't broadcast,
+                // but for related contract resolution this is acceptable as the complexity
+                // of handling this without committing is not worth the benefit.
+                tracing::debug!(
+                    contract = %key,
+                    phase = "update_missing_related",
+                    "Update requires related contracts, using fallback path"
+                );
+                let new_state = self
+                    .get_updated_state(&parameters, current_state, key, updates)
+                    .await?;
+                let summary = self
+                    .runtime
+                    .summarize_state(&key, &parameters, &new_state)
+                    .map_err(|e| ExecutorError::execution(e, None))?;
+                // Note: notification is sent by attempt_state_update
+                let request = UpdateContract { key, new_state };
+                let _op: operations::update::UpdateResult = self.op_request(request).await?;
+                Ok(ContractResponse::UpdateResponse { key, summary }.into())
+            }
+            ComputedStateUpdate::Changed(new_state) => {
+                // State changed - start network operation which will commit and broadcast.
+                // We pass the computed new_state so the network operation can detect the change.
+                tracing::debug!(
+                    contract = %key,
+                    new_size_bytes = new_state.as_ref().len(),
+                    phase = "update_starting_network_op",
+                    "State changed, starting network operation for commit and broadcast"
+                );
+                let summary = self
+                    .runtime
+                    .summarize_state(&key, &parameters, &new_state)
+                    .map_err(|e| ExecutorError::execution(e, None))?;
+                let request = UpdateContract { key, new_state };
+                let _op: operations::update::UpdateResult = self.op_request(request).await?;
+                Ok(ContractResponse::UpdateResponse { key, summary }.into())
+            }
+        }
+    }
+
+    /// Computes the updated state WITHOUT committing it to storage.
+    ///
+    /// This is used in network mode to prepare the state for the network operation
+    /// which will handle the commit. This separation fixes issue #2301 where
+    /// committing before the network operation caused change detection to fail.
+    async fn compute_state_update(
+        &mut self,
+        parameters: &Parameters<'_>,
+        current_state: &WrappedState,
+        key: &ContractKey,
+        updates: &[UpdateData<'_>],
+    ) -> Result<ComputedStateUpdate, ExecutorError> {
+        let update_modification =
+            match self
+                .runtime
+                .update_state(key, parameters, current_state, updates)
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    return Err(ExecutorError::execution(
+                        err,
+                        Some(InnerOpError::Upsert(*key)),
+                    ))
+                }
+            };
+
+        let UpdateModification {
+            new_state, related, ..
+        } = update_modification;
+
+        let Some(new_state) = new_state else {
+            if related.is_empty() {
+                // No updates were made, return current state
+                return Ok(ComputedStateUpdate::NoChange(current_state.clone()));
+            } else {
+                // Missing related contracts
+                return Ok(ComputedStateUpdate::MissingRelated(related));
+            }
+        };
+
+        let new_state = WrappedState::new(new_state.into_bytes());
+        let changed = new_state.as_ref() != current_state.as_ref();
+
+        if changed {
+            Ok(ComputedStateUpdate::Changed(new_state))
+        } else {
+            Ok(ComputedStateUpdate::NoChange(current_state.clone()))
+        }
     }
 
     /// Attempts to update the state with the provided updates.
@@ -963,10 +1083,8 @@ impl Executor<Runtime> {
                     .await?;
                 let missing = match state_update_res {
                     Either::Left(new_state) => {
-                        self.state_store
-                            .update(&key, new_state.clone())
-                            .await
-                            .map_err(ExecutorError::other)?;
+                        // Note: attempt_state_update already commits the state to storage,
+                        // so we don't need to call state_store.update again here.
                         break new_state;
                     }
                     Either::Right(missing) => missing,
