@@ -523,11 +523,16 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     // Wait for UPDATE response on peer1
     let update_response = tokio::time::timeout(Duration::from_secs(30), client1.recv()).await;
     match update_response {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }))) => {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key, ..
+        }))) => {
             assert_eq!(key, contract_key);
             tracing::info!("✅ Peer1 received UpdateResponse");
         }
-        Ok(Ok(other)) => bail!("Unexpected response waiting for UpdateResponse: {:?}", other),
+        Ok(Ok(other)) => bail!(
+            "Unexpected response waiting for UpdateResponse: {:?}",
+            other
+        ),
         Ok(Err(e)) => bail!("Error receiving UpdateResponse: {}", e),
         Err(_) => bail!("Timeout waiting for UpdateResponse"),
     }
@@ -556,7 +561,10 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
                 other => bail!("Unexpected update data type: {:?}", other),
             }
         }
-        Ok(Ok(other)) => bail!("Unexpected response waiting for UpdateNotification: {:?}", other),
+        Ok(Ok(other)) => bail!(
+            "Unexpected response waiting for UpdateNotification: {:?}",
+            other
+        ),
         Ok(Err(e)) => bail!("Error receiving UpdateNotification: {}", e),
         Err(_) => bail!(
             "Timeout waiting for UpdateNotification on peer2 - \
