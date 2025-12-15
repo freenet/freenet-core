@@ -2924,6 +2924,10 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
 ///
 /// If the NoChange bug is present, gateway would still have the old state
 /// because the UPDATE broadcast would be skipped.
+// Test configuration values:
+// - timeout_secs: 180s to account for slow CI environments and network propagation delays
+// - startup_wait_secs: 15s to allow nodes to fully start and establish connections
+// - tokio_worker_threads: 4 to provide adequate concurrency for multi-node test
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
     timeout_secs = 180,
@@ -2949,7 +2953,8 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
     tracing::info!("Peer A data dir: {:?}", peer_a.temp_dir_path);
     tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
 
-    // Give extra time for peer to connect to gateway
+    // Additional wait for peer-to-gateway connection to stabilize after startup_wait_secs.
+    // This helps avoid race conditions in CI where connection establishment may take longer.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Connect to peer-a's websocket API
@@ -3029,13 +3034,11 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
     tracing::info!("Step 3: Peer-a updating contract with new state");
 
     // Create updated state (add a todo item)
+    // Using expect() to fail fast if state is corrupted - this is a regression test,
+    // so we want clear failure on any unexpected condition.
     let mut todo_list: test_utils::TodoList =
-        serde_json::from_slice(wrapped_initial_state.as_ref()).unwrap_or_else(|_| {
-            test_utils::TodoList {
-                tasks: Vec::new(),
-                version: 0,
-            }
-        });
+        serde_json::from_slice(wrapped_initial_state.as_ref())
+            .expect("Failed to deserialize wrapped_initial_state as TodoList");
     todo_list.tasks.push(test_utils::Task {
         id: 1,
         title: "Issue 2301 regression test".to_string(),
@@ -3080,18 +3083,27 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
     }
 
     // Step 4: Verify gateway received the update by polling GET
-    // The update should have been broadcast to gateway. We poll GET
-    // because subscription notifications across nodes are known to be flaky.
+    //
+    // Note: We poll GET instead of using subscription notifications because cross-node
+    // subscription notifications have known reliability issues (see test_multiple_clients_subscription).
+    // While polling doesn't prove the broadcast mechanism specifically, it verifies the end behavior
+    // that this regression test cares about: gateway has the updated state.
+    //
+    // The key insight is that without the fix, the gateway would NEVER receive the update because
+    // the broadcast would be skipped entirely due to the NoChange false positive.
     tracing::info!("Step 4: Verifying gateway received the update via polling GET");
 
-    // Poll gateway for up to 30 seconds to see if the state was updated
+    // Polling configuration
+    const POLL_INTERVAL_SECS: u64 = 2; // Interval between GET requests
+    const POLL_TIMEOUT_SECS: u64 = 30; // Maximum time to wait for update propagation
+
     let poll_start = std::time::Instant::now();
-    let poll_timeout = Duration::from_secs(30);
+    let poll_timeout = Duration::from_secs(POLL_TIMEOUT_SECS);
     let mut gateway_received_update = false;
 
     while poll_start.elapsed() < poll_timeout {
-        // Small delay between polls
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Small delay between polls to avoid overwhelming the gateway
+        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
 
         make_get(&mut client_gateway, contract_key, false, false).await?;
 
@@ -3120,6 +3132,14 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
                         );
                         gateway_received_update = true;
                         break;
+                    } else {
+                        // State changed but doesn't match expected - log for debugging
+                        tracing::warn!(
+                            "Gateway state changed but did not match expected task. \
+                             Tasks: {:?}, version: {}",
+                            state_on_gateway.tasks,
+                            state_on_gateway.version
+                        );
                     }
                 }
             }

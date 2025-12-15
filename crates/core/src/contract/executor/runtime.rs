@@ -903,13 +903,20 @@ impl Executor<Runtime> {
             }
             ComputedStateUpdate::MissingRelated(_missing) => {
                 // Missing related contracts - fall back to the existing path that handles this.
-                // This path commits locally, which means the network operation won't broadcast,
-                // but for related contract resolution this is acceptable as the complexity
-                // of handling this without committing is not worth the benefit.
+                //
+                // KNOWN LIMITATION: This path commits state locally via get_updated_state before
+                // starting the network operation. This means:
+                // 1. Local notifications ARE sent (via attempt_state_update)
+                // 2. Network broadcast will see NoChange (same bug as #2301 for this edge case)
+                //
+                // Fixing this properly would require refactoring how related contracts are fetched
+                // to work without committing the partial state. For now, this edge case is accepted
+                // since contracts with related dependencies are less common.
+                // TODO: Consider tracking this as a follow-up issue if it causes problems.
                 tracing::debug!(
                     contract = %key,
                     phase = "update_missing_related",
-                    "Update requires related contracts, using fallback path"
+                    "Update requires related contracts, using fallback path (broadcast may be skipped)"
                 );
                 let new_state = self
                     .get_updated_state(&parameters, current_state, key, updates)
@@ -918,7 +925,7 @@ impl Executor<Runtime> {
                     .runtime
                     .summarize_state(&key, &parameters, &new_state)
                     .map_err(|e| ExecutorError::execution(e, None))?;
-                // Note: notification is sent by attempt_state_update
+                // Note: notification is sent by attempt_state_update in this fallback path
                 let request = UpdateContract { key, new_state };
                 let _op: operations::update::UpdateResult = self.op_request(request).await?;
                 Ok(ContractResponse::UpdateResponse { key, summary }.into())
@@ -926,6 +933,11 @@ impl Executor<Runtime> {
             ComputedStateUpdate::Changed(new_state) => {
                 // State changed - start network operation which will commit and broadcast.
                 // We pass the computed new_state so the network operation can detect the change.
+                //
+                // Notification flow in this path:
+                // 1. compute_state_update does NOT send notifications (by design)
+                // 2. Network operation calls update_contract -> UpdateQuery -> upsert_contract_state
+                // 3. upsert_contract_state -> attempt_state_update sends the notification
                 tracing::debug!(
                     contract = %key,
                     new_size_bytes = new_state.as_ref().len(),
@@ -984,6 +996,12 @@ impl Executor<Runtime> {
         };
 
         let new_state = WrappedState::new(new_state.into_bytes());
+
+        // Compare bytes to determine if state actually changed.
+        // Note: Even though runtime.update_state returned Some(new_state), we still check bytes
+        // because the contract may have "processed" the update but produced identical output
+        // (e.g., idempotent merge operations in CRDTs). In such cases, we should NOT broadcast
+        // since nothing actually changed from the subscribers' perspective.
         let changed = new_state.as_ref() != current_state.as_ref();
 
         if changed {
