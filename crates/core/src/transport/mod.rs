@@ -32,6 +32,7 @@ mod received_packet_tracker;
 mod batching;
 mod sent_packet_tracker;
 mod symmetric_message;
+pub(crate) mod token_bucket;
 
 type MessagePayload = Vec<u8>;
 
