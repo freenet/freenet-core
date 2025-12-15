@@ -134,6 +134,9 @@ pub struct PeerConnection {
     first_failure_time: Option<std::time::Instant>,
     last_packet_report_time: Instant,
     keep_alive_handle: Option<JoinHandle<()>>,
+    /// Last time we updated the TokenBucket rate from LEDBAT
+    /// Used to implement RTT-adaptive rate updates (update approximately once per RTT)
+    last_rate_update: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for PeerConnection {
@@ -272,6 +275,7 @@ impl PeerConnection {
             first_failure_time: None,
             last_packet_report_time: Instant::now(),
             keep_alive_handle: Some(keep_alive_handle),
+            last_rate_update: None,
         }
     }
 
@@ -663,7 +667,10 @@ impl PeerConnection {
                     }
                 }
                 // Rate update timer - update TokenBucket rate based on LEDBAT cwnd
+                // RTT-adaptive: only update if at least one RTT has elapsed since last update
                 _ = rate_update_check.tick() => {
+                    let now = std::time::Instant::now();
+
                     // Use LEDBAT's base delay for rate calculation (consistent with its internal state)
                     // Fallback to min_rtt only if base_delay is not yet established
                     let base_delay = self.remote_conn.ledbat.base_delay();
@@ -673,16 +680,32 @@ impl PeerConnection {
                         base_delay
                     };
 
-                    let new_rate = self.remote_conn.ledbat.current_rate(rtt);
-                    self.remote_conn.token_bucket.set_rate(new_rate);
-                    tracing::trace!(
-                        peer_addr = %self.remote_conn.remote_addr,
-                        new_rate_bytes_per_sec = new_rate,
-                        cwnd = self.remote_conn.ledbat.current_cwnd(),
-                        base_delay_ms = base_delay.as_millis(),
-                        rtt_ms = rtt.as_millis(),
-                        "Updated token bucket rate from LEDBAT"
-                    );
+                    // RTT-adaptive update: only update if at least one RTT has elapsed since last update
+                    // This prevents updating too frequently at high RTT or too slowly at low RTT
+                    let should_update = match self.last_rate_update {
+                        None => true, // First update
+                        Some(last_update) => {
+                            let elapsed = now.duration_since(last_update);
+                            // Update if at least one RTT has passed, with bounds (50ms min, 500ms max)
+                            let min_interval = rtt.max(Duration::from_millis(50)).min(Duration::from_millis(500));
+                            elapsed >= min_interval
+                        }
+                    };
+
+                    if should_update {
+                        let new_rate = self.remote_conn.ledbat.current_rate(rtt);
+                        self.remote_conn.token_bucket.set_rate(new_rate);
+                        self.last_rate_update = Some(now);
+
+                        tracing::trace!(
+                            peer_addr = %self.remote_conn.remote_addr,
+                            new_rate_bytes_per_sec = new_rate,
+                            cwnd = self.remote_conn.ledbat.current_cwnd(),
+                            base_delay_ms = base_delay.as_millis(),
+                            rtt_ms = rtt.as_millis(),
+                            "Updated token bucket rate from LEDBAT (RTT-adaptive)"
+                        );
+                    }
                 }
             }
         }
