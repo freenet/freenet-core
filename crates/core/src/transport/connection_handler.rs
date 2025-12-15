@@ -30,10 +30,12 @@ use version_cmp::PROTOC_VERSION;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
+    ledbat::LedbatController,
     packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
+    token_bucket::TokenBucket,
     Socket, TransportError,
 };
 
@@ -940,6 +942,20 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
+            // Initialize LEDBAT congestion controller (RFC 6817)
+            let ledbat = Arc::new(LedbatController::new(
+                2928,           // initial_cwnd = 2 * MSS (1464 * 2)
+                2928,           // min_cwnd = 2 * MSS
+                1_000_000_000,  // max_cwnd = 1 GB
+            ));
+
+            // Initialize token bucket for smooth packet pacing
+            let initial_rate = bandwidth_limit.unwrap_or(10_000_000); // 10 MB/s default
+            let token_bucket = Arc::new(TokenBucket::new(
+                10_000,        // capacity = 10 KB burst
+                initial_rate,
+            ));
+
             let (inbound_packet_tx, inbound_packet_rx) = fast_channel::bounded(1000);
             let remote_conn = RemoteConnection {
                 outbound_packets,
@@ -953,6 +969,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                 my_address: None,
                 transport_secret_key: secret,
                 bandwidth_limit,
+                ledbat,
+                token_bucket,
             };
 
             let inbound_conn = InboundRemoteConnection {
@@ -1186,6 +1204,21 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) =
                                                 fast_channel::bounded(1000);
+
+                                            // Initialize LEDBAT congestion controller (RFC 6817)
+                                            let ledbat = Arc::new(LedbatController::new(
+                                                2928,           // initial_cwnd = 2 * MSS
+                                                2928,           // min_cwnd = 2 * MSS
+                                                1_000_000_000,  // max_cwnd = 1 GB
+                                            ));
+
+                                            // Initialize token bucket
+                                            let initial_rate = bandwidth_limit.unwrap_or(10_000_000);
+                                            let token_bucket = Arc::new(TokenBucket::new(
+                                                10_000,        // capacity = 10 KB burst
+                                                initial_rate,
+                                            ));
+
                                             tracing::info!(
                                                 peer_addr = %remote_addr,
                                                 attempts,
@@ -1209,6 +1242,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     transport_secret_key: transport_secret_key
                                                         .clone(),
                                                     bandwidth_limit,
+                                                    ledbat,
+                                                    token_bucket,
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
@@ -1268,6 +1303,21 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
                                 let (inbound_sender, inbound_recv) = fast_channel::bounded(1000);
+
+                                // Initialize LEDBAT congestion controller (RFC 6817)
+                                let ledbat = Arc::new(LedbatController::new(
+                                    2928,           // initial_cwnd = 2 * MSS
+                                    2928,           // min_cwnd = 2 * MSS
+                                    1_000_000_000,  // max_cwnd = 1 GB
+                                ));
+
+                                // Initialize token bucket
+                                let initial_rate = bandwidth_limit.unwrap_or(10_000_000);
+                                let token_bucket = Arc::new(TokenBucket::new(
+                                    10_000,        // capacity = 10 KB burst
+                                    initial_rate,
+                                ));
+
                                 tracing::info!(
                                     peer_addr = %remote_addr,
                                     attempts,
@@ -1290,6 +1340,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         my_address: None,
                                         transport_secret_key: transport_secret_key.clone(),
                                         bandwidth_limit,
+                                        ledbat,
+                                        token_bucket,
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,

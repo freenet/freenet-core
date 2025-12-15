@@ -21,11 +21,13 @@ mod outbound_stream;
 
 use super::{
     connection_handler::SerializedMessage,
+    ledbat::LedbatController,
     packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
     received_packet_tracker::ReportResult,
     sent_packet_tracker::{ResendAction, SentPacketTracker},
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
+    token_bucket::TokenBucket,
     TransportError,
 };
 use crate::util::time_source::InstantTimeSrc;
@@ -68,7 +70,13 @@ pub(crate) struct RemoteConnection {
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
     pub(super) transport_secret_key: TransportSecretKey,
+    /// DEPRECATED: Replaced by ledbat + token_bucket for adaptive congestion control
+    #[allow(dead_code)]
     pub(super) bandwidth_limit: Option<usize>,
+    /// LEDBAT congestion controller (RFC 6817) - adapts to network conditions
+    pub(super) ledbat: Arc<LedbatController>,
+    /// Token bucket rate limiter - smooths packet pacing based on LEDBAT rate
+    pub(super) token_bucket: Arc<TokenBucket>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
