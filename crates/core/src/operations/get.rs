@@ -1178,51 +1178,70 @@ impl Operation for GetOp {
                                 tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
                             }
                         } else {
-                            tracing::debug!(tx = %id, %key, %is_original_requester, %subscribe_requested, "Putting contract at executor - state differs from local cache");
-                            let res = op_manager
-                                .notify_contract_handler(ContractHandlerEvent::PutQuery {
-                                    key,
-                                    state: value.clone(),
-                                    related_contracts: RelatedContracts::default(), // fixme: i think we need to get the related contracts so the final put is ok
-                                    contract: contract.clone(),
-                                })
-                                .await?;
+                            // Only attempt to cache if we have the contract code.
+                            // Without the code, we can't store the contract locally (issue #2306).
+                            if let Some(ref _contract_code) = contract {
+                                tracing::debug!(tx = %id, %key, %is_original_requester, %subscribe_requested, "Putting contract at executor - state differs from local cache");
+                                let res = op_manager
+                                    .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                                        key,
+                                        state: value.clone(),
+                                        related_contracts: RelatedContracts::default(), // fixme: i think we need to get the related contracts so the final put is ok
+                                        contract: contract.clone(),
+                                    })
+                                    .await?;
 
-                            match res {
-                                ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {
-                                    tracing::debug!(tx = %id, %key, "Contract put at executor");
-                                    let is_subscribed_contract =
-                                        op_manager.ring.is_seeding_contract(&key);
+                                match res {
+                                    ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {
+                                        tracing::debug!(tx = %id, %key, "Contract put at executor");
+                                        let is_subscribed_contract =
+                                            op_manager.ring.is_seeding_contract(&key);
 
-                                    // Start subscription if not already seeding
-                                    if !is_subscribed_contract {
-                                        tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Contract not cached @ peer, caching");
-                                        op_manager.ring.record_get_access(key, value.size() as u64);
-                                        super::announce_contract_cached(op_manager, &key).await;
+                                        // Start subscription if not already seeding
+                                        if !is_subscribed_contract {
+                                            tracing::debug!(tx = %id, %key, peer = ?op_manager.ring.connection_manager.get_own_addr(), "Contract not cached @ peer, caching");
+                                            op_manager.ring.record_get_access(key, value.size() as u64);
+                                            super::announce_contract_cached(op_manager, &key).await;
 
-                                        let child_tx =
-                                            super::start_subscription_request(op_manager, id, key);
-                                        tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
+                                            let child_tx =
+                                                super::start_subscription_request(op_manager, id, key);
+                                            tracing::debug!(tx = %id, %child_tx, "started subscription as child operation");
+                                        }
                                     }
+                                    ContractHandlerEvent::PutResponse {
+                                        new_value: Err(err),
+                                    } => {
+                                        // Local caching failed, but GET operation succeeded
+                                        // Log warning and continue - caching is an optimization, not required
+                                        tracing::warn!(
+                                            tx = %id,
+                                            %key,
+                                            error = %err,
+                                            %is_original_requester,
+                                            "Failed to cache contract locally during GET - continuing with operation"
+                                        );
+                                        // Don't return error - the GET succeeded, caching is optional
+                                        // Continue to process the GET result below
+                                    }
+                                    _ => unreachable!(
+                                        "PutQuery from Get operation should always return PutResponse"
+                                    ),
                                 }
-                                ContractHandlerEvent::PutResponse {
-                                    new_value: Err(err),
-                                } => {
-                                    // Local caching failed, but GET operation succeeded
-                                    // Log warning and continue - caching is an optimization, not required
-                                    tracing::warn!(
-                                        tx = %id,
-                                        %key,
-                                        error = %err,
-                                        %is_original_requester,
-                                        "Failed to cache contract locally during GET - continuing with operation"
-                                    );
-                                    // Don't return error - the GET succeeded, caching is optional
-                                    // Continue to process the GET result below
+                            } else {
+                                // No contract code in GET response - can't cache locally
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    "Cannot cache contract locally - no contract code in GET response"
+                                );
+                                // Still record the GET access and start subscription
+                                if !op_manager.ring.is_seeding_contract(&key) {
+                                    op_manager.ring.record_get_access(key, value.size() as u64);
+                                    super::announce_contract_cached(op_manager, &key).await;
+                                    let child_tx =
+                                        super::start_subscription_request(op_manager, id, key);
+                                    tracing::debug!(tx = %id, %child_tx, "started subscription as child operation (no contract code)");
                                 }
-                                _ => unreachable!(
-                                    "PutQuery from Get operation should always return PutResponse"
-                                ),
                             }
                         }
                     }

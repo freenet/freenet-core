@@ -238,7 +238,17 @@ impl Runtime {
             let contract = self
                 .contract_store
                 .fetch_contract(key, parameters)
-                .ok_or_else(|| RuntimeInnerError::ContractNotFound(*key))?;
+                .ok_or_else(|| {
+                    // Bug #2306: Log diagnostic info when contract lookup fails
+                    tracing::error!(
+                        contract = %key,
+                        key_code_hash = ?key.code_hash(),
+                        phase = "prepare_contract_call_failed",
+                        "Contract not found in store during WASM execution - \
+                         this should not happen if contract was just stored"
+                    );
+                    RuntimeInnerError::ContractNotFound(*key)
+                })?;
             let module = match contract {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                     Module::new(self.wasm_store.as_ref().unwrap(), contract_v1.code().data())?

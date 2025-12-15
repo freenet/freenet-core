@@ -306,10 +306,12 @@ impl RiverSession {
             }
 
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            // Only retry on transient infrastructure errors, not application-level bugs.
+            // "missing contract" errors indicate contract propagation bugs and should fail
+            // immediately rather than being masked by retries (see issue #2306).
             let retriable = stderr.contains("Timeout waiting for")
                 || stderr.contains("connection refused")
-                || stderr.contains("HTTP request failed")
-                || stderr.contains("missing contract");
+                || stderr.contains("HTTP request failed");
             if attempt == MAX_RETRIES || !retriable {
                 bail!("riverctl failed (user {:?}): {}", user, stderr);
             }
