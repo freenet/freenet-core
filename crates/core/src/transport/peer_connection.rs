@@ -326,6 +326,14 @@ impl PeerConnection {
         );
         ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Rate update timer - updates TokenBucket rate based on LEDBAT cwnd every 100ms
+        // This allows the token bucket to adapt to network conditions dynamically
+        let mut rate_update_check = tokio::time::interval_at(
+            tokio::time::Instant::now() + ACK_CHECK_INTERVAL,
+            ACK_CHECK_INTERVAL,
+        );
+        rate_update_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         loop {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
@@ -495,11 +503,16 @@ impl PeerConnection {
                         false
                     };
 
-                    // TODO(Week 3): Use RTT samples for AIMD congestion controller
-                    let _rtt_data = self.remote_conn
+                    // Process ACKs and update LEDBAT congestion controller
+                    let (rtt_samples, _loss_rate) = self.remote_conn
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
+
+                    // Feed RTT samples to LEDBAT for congestion window adjustment
+                    for (rtt_sample, packet_size) in rtt_samples {
+                        self.remote_conn.ledbat.on_ack(rtt_sample, packet_size);
+                    }
 
                     let report_result = self.received_tracker.report_received_packet(packet_id);
                     match (report_result, should_send_receipts) {
@@ -649,6 +662,23 @@ impl PeerConnection {
                         self.noop(receipts).await?;
                     }
                 }
+                // Rate update timer - update TokenBucket rate based on LEDBAT cwnd
+                _ = rate_update_check.tick() => {
+                    // Get current RTT estimate (smoothed RTT if available, otherwise min RTT)
+                    let tracker = self.remote_conn.sent_tracker.lock();
+                    let rtt = tracker.smoothed_rtt().unwrap_or_else(|| tracker.min_rtt());
+                    drop(tracker); // Release lock before calling current_rate
+
+                    let new_rate = self.remote_conn.ledbat.current_rate(rtt);
+                    self.remote_conn.token_bucket.set_rate(new_rate);
+                    tracing::trace!(
+                        peer_addr = %self.remote_conn.remote_addr,
+                        new_rate_bytes_per_sec = new_rate,
+                        cwnd = self.remote_conn.ledbat.current_cwnd(),
+                        rtt_ms = rtt.as_millis(),
+                        "Updated token bucket rate from LEDBAT"
+                    );
+                }
             }
         }
     }
@@ -781,7 +811,8 @@ impl PeerConnection {
                 data,
                 self.remote_conn.outbound_symmetric_key.clone(),
                 self.remote_conn.sent_tracker.clone(),
-                self.remote_conn.bandwidth_limit,
+                self.remote_conn.token_bucket.clone(),
+                self.remote_conn.ledbat.clone(),
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
@@ -997,6 +1028,10 @@ mod tests {
         let cipher = Aes128Gcm::new(&key.into());
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
+        // Initialize LEDBAT and TokenBucket for test
+        let ledbat = Arc::new(LedbatController::new(2928, 2928, 1_000_000_000));
+        let token_bucket = Arc::new(TokenBucket::new(10_000, 10_000_000));
+
         let stream_id = StreamId::next();
         // Send a long message using the outbound stream
         let outbound = tokio::task::spawn(send_stream(
@@ -1007,7 +1042,8 @@ mod tests {
             message.clone(),
             cipher.clone(),
             sent_tracker,
-            None, // No bandwidth limit for test
+            token_bucket,
+            ledbat,
         ))
         .map_err(|e| e.into());
 

@@ -114,8 +114,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
     }
 
     /// Reports that receipts have been received for the given packet IDs.
-    /// Returns: (RTT samples, loss rate)
-    pub(super) fn report_received_receipts(&mut self, packet_ids: &[PacketId]) -> (Vec<Duration>, Option<f64>) {
+    /// Returns: ((RTT sample, packet size) pairs, loss rate)
+    pub(super) fn report_received_receipts(&mut self, packet_ids: &[PacketId]) -> (Vec<(Duration, usize)>, Option<f64>) {
         let now = self.time_source.now();
         let mut rtt_samples = Vec::new();
 
@@ -127,9 +127,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
 
             // Calculate RTT if this packet wasn't retransmitted (Karn's algorithm)
             if !self.retransmitted_packets.contains(packet_id) {
-                if let Some((_, sent_time)) = self.pending_receipts.get(packet_id) {
+                if let Some((payload, sent_time)) = self.pending_receipts.get(packet_id) {
                     let rtt_sample = now.duration_since(*sent_time);
-                    rtt_samples.push(rtt_sample);
+                    let packet_size = payload.len();
+                    rtt_samples.push((rtt_sample, packet_size));
                     self.update_rtt(rtt_sample);
                 }
             }
@@ -210,6 +211,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
     }
 
     /// Get the current retransmission timeout
+    #[allow(dead_code)]
     pub(super) fn rto(&self) -> Duration {
         self.rto
     }
@@ -395,7 +397,7 @@ pub(in crate::transport) mod tests {
 
         // Verify first sample (RFC 6298 Section 2.2)
         assert_eq!(rtt_samples.len(), 1);
-        assert_eq!(rtt_samples[0], Duration::from_millis(50));
+        assert_eq!(rtt_samples[0].0, Duration::from_millis(50)); // .0 = RTT, .1 = packet size
         assert_eq!(tracker.smoothed_rtt(), Some(Duration::from_millis(50)));
         assert_eq!(tracker.rttvar, Duration::from_millis(25)); // R/2
         assert_eq!(tracker.min_rtt(), Duration::from_millis(50));
@@ -417,7 +419,7 @@ pub(in crate::transport) mod tests {
 
         // Verify exponential smoothing (ALPHA = 1/8)
         // SRTT = (7/8 * 100) + (1/8 * 200) = 87.5 + 25 = 112.5ms
-        assert_eq!(rtt_samples[0], Duration::from_millis(200));
+        assert_eq!(rtt_samples[0].0, Duration::from_millis(200)); // .0 = RTT, .1 = packet size
         let srtt = tracker.smoothed_rtt().unwrap();
         assert!((srtt.as_millis() as i64 - 112).abs() <= 1); // Allow 1ms tolerance
     }

@@ -244,7 +244,7 @@ impl LedbatController {
         self.cwnd.store(new_cwnd_usize, Ordering::Release);
 
         // Log significant changes
-        let change_abs = (new_cwnd_usize as i64 - current_cwnd as i64).abs() as usize;
+        let change_abs = (new_cwnd_usize as i64 - current_cwnd as i64).unsigned_abs() as usize;
         if change_abs > 10_000 {
             tracing::debug!(
                 old_cwnd_kb = current_cwnd / 1024,
