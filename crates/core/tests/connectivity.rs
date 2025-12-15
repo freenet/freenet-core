@@ -476,8 +476,8 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     )
     .await?;
 
-    // GET so peer2 caches the contract
-    make_get(&mut client2, contract_key, false, false).await?;
+    // GET so peer2 caches the contract (return_contract_code=true, subscribe=false)
+    make_get(&mut client2, contract_key, true, false).await?;
     let get_response = tokio::time::timeout(Duration::from_secs(60), client2.recv()).await;
     match get_response {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
