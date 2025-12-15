@@ -19,7 +19,7 @@ use crate::{
     contract::ContractHandlerEvent,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
-    ring::{Location, PeerKeyLocation},
+    ring::Location,
 };
 
 pub(crate) struct PutOp {
@@ -426,24 +426,6 @@ async fn start_subscription_after_put(
             phase = "subscribe",
             "Not starting subscription for failed parent PUT operation"
         );
-    }
-}
-
-impl OpManager {
-    fn get_broadcast_targets(
-        &self,
-        key: &ContractKey,
-        sender: &PeerKeyLocation,
-    ) -> Vec<PeerKeyLocation> {
-        self.ring
-            .subscribers_of(key)
-            .map(|subs| {
-                subs.iter()
-                    .filter(|pk| pk.pub_key() != sender.pub_key())
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
     }
 }
 

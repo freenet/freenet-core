@@ -389,11 +389,13 @@ impl Ring {
     }
 
     /// Get the upstream peer for a contract (if any).
+    #[allow(dead_code)] // Part of subscription tree API, will be used for diagnostics
     pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
         self.seeding_manager.get_upstream(contract)
     }
 
     /// Get all downstream subscribers for a contract (for broadcast targeting).
+    #[allow(dead_code)] // Part of subscription tree API, will be used for diagnostics
     pub fn get_downstream(&self, contract: &ContractKey) -> Vec<PeerKeyLocation> {
         self.seeding_manager.get_downstream(contract)
     }
@@ -432,6 +434,7 @@ impl Ring {
 
     /// Remove a client subscription.
     /// Returns true if this was the last client subscription for this contract.
+    #[allow(dead_code)] // Part of client subscription API, to be integrated with client disconnect handling
     pub fn remove_client_subscription(
         &self,
         contract: &ContractKey,
@@ -442,6 +445,7 @@ impl Ring {
     }
 
     /// Check if there are any client subscriptions for a contract.
+    #[allow(dead_code)] // Part of client subscription API, to be integrated with client disconnect handling
     pub fn has_client_subscriptions(&self, contract: &ContractKey) -> bool {
         self.seeding_manager.has_client_subscriptions(contract)
     }

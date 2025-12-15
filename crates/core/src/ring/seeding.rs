@@ -7,7 +7,6 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
 /// Default seeding cache budget: 100MB
@@ -28,7 +27,7 @@ const DEFAULT_SEEDING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
 ///             [PeerA]           [PeerB]  <-- Downstream from Intermediate's perspective
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubscriptionRole {
+pub enum SubscriberType {
     /// This peer subscribed through us - they expect updates FROM us.
     /// We are responsible for forwarding updates to them.
     /// When all downstream peers disconnect and there are no client subscriptions,
@@ -45,11 +44,11 @@ pub enum SubscriptionRole {
 #[derive(Clone, Debug)]
 pub struct SubscriptionEntry {
     pub peer: PeerKeyLocation,
-    pub role: SubscriptionRole,
+    pub role: SubscriberType,
 }
 
 impl SubscriptionEntry {
-    pub fn new(peer: PeerKeyLocation, role: SubscriptionRole) -> Self {
+    pub fn new(peer: PeerKeyLocation, role: SubscriberType) -> Self {
         Self { peer, role }
     }
 
@@ -143,7 +142,7 @@ impl SeedingManager {
         // Count current downstream subscribers
         let downstream_count = subs
             .iter()
-            .filter(|e| e.role == SubscriptionRole::Downstream)
+            .filter(|e| e.role == SubscriberType::Downstream)
             .count();
 
         if downstream_count >= Self::MAX_DOWNSTREAM {
@@ -157,7 +156,7 @@ impl SeedingManager {
 
         // Check for duplicate
         let already_exists = subs.iter().any(|e| {
-            e.role == SubscriptionRole::Downstream
+            e.role == SubscriberType::Downstream
                 && e.peer.pub_key == subscriber.pub_key
                 && e.peer.socket_addr() == subscriber.socket_addr()
         });
@@ -178,7 +177,7 @@ impl SeedingManager {
 
         subs.push(SubscriptionEntry::new(
             subscriber,
-            SubscriptionRole::Downstream,
+            SubscriberType::Downstream,
         ));
 
         info!(
@@ -199,14 +198,14 @@ impl SeedingManager {
         let mut subs = self.subscriptions.entry(*contract).or_default();
 
         // Remove any existing upstream
-        subs.retain(|e| e.role != SubscriptionRole::Upstream);
+        subs.retain(|e| e.role != SubscriberType::Upstream);
 
         let upstream_addr = upstream
             .socket_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".into());
 
-        subs.push(SubscriptionEntry::new(upstream, SubscriptionRole::Upstream));
+        subs.push(SubscriptionEntry::new(upstream, SubscriberType::Upstream));
 
         info!(
             %contract,
@@ -219,7 +218,7 @@ impl SeedingManager {
     pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
         self.subscriptions.get(contract).and_then(|subs| {
             subs.iter()
-                .find(|e| e.role == SubscriptionRole::Upstream)
+                .find(|e| e.role == SubscriberType::Upstream)
                 .map(|e| e.peer.clone())
         })
     }
@@ -230,7 +229,7 @@ impl SeedingManager {
             .get(contract)
             .map(|subs| {
                 subs.iter()
-                    .filter(|e| e.role == SubscriptionRole::Downstream)
+                    .filter(|e| e.role == SubscriberType::Downstream)
                     .map(|e| e.peer.clone())
                     .collect()
             })
@@ -238,6 +237,7 @@ impl SeedingManager {
     }
 
     /// Check if we have any subscription entries for a contract.
+    #[cfg(test)]
     pub fn has_subscriptions(&self, contract: &ContractKey) -> bool {
         self.subscriptions
             .get(contract)
@@ -332,14 +332,13 @@ impl SeedingManager {
             if was_last_client {
                 // Check if we need to prune upstream
                 if let Some(subs) = self.subscriptions.get(&contract) {
-                    let has_downstream =
-                        subs.iter().any(|e| e.role == SubscriptionRole::Downstream);
+                    let has_downstream = subs.iter().any(|e| e.role == SubscriberType::Downstream);
 
                     if !has_downstream {
                         // No downstream and no clients - need to notify upstream
                         if let Some(upstream) = subs
                             .iter()
-                            .find(|e| e.role == SubscriptionRole::Upstream)
+                            .find(|e| e.role == SubscriberType::Upstream)
                             .map(|e| e.peer.clone())
                         {
                             info!(
@@ -394,16 +393,15 @@ impl SeedingManager {
                 );
 
                 // Only check for pruning if we removed a downstream subscriber
-                if removed.role == SubscriptionRole::Downstream {
-                    let has_downstream =
-                        subs.iter().any(|e| e.role == SubscriptionRole::Downstream);
+                if removed.role == SubscriberType::Downstream {
+                    let has_downstream = subs.iter().any(|e| e.role == SubscriberType::Downstream);
                     let has_client = self.has_client_subscriptions(contract);
 
                     if !has_downstream && !has_client {
                         // Find upstream to notify
                         notify_upstream = subs
                             .iter()
-                            .find(|e| e.role == SubscriptionRole::Upstream)
+                            .find(|e| e.role == SubscriberType::Upstream)
                             .map(|e| e.peer.clone());
 
                         if notify_upstream.is_some() {
@@ -452,15 +450,15 @@ impl SeedingManager {
                     );
 
                     // Check for pruning if we removed a downstream
-                    if removed.role == SubscriptionRole::Downstream {
+                    if removed.role == SubscriberType::Downstream {
                         let has_downstream =
-                            subs.iter().any(|e| e.role == SubscriptionRole::Downstream);
+                            subs.iter().any(|e| e.role == SubscriberType::Downstream);
                         let has_client = self.has_client_subscriptions(&contract);
 
                         if !has_downstream && !has_client {
                             if let Some(upstream) = subs
                                 .iter()
-                                .find(|e| e.role == SubscriptionRole::Upstream)
+                                .find(|e| e.role == SubscriberType::Upstream)
                                 .map(|e| e.peer.clone())
                             {
                                 notifications.push((contract, upstream));
@@ -564,7 +562,7 @@ impl SeedingManager {
                 let downstream: Vec<PeerKeyLocation> = entry
                     .value()
                     .iter()
-                    .filter(|e| e.role == SubscriptionRole::Downstream)
+                    .filter(|e| e.role == SubscriberType::Downstream)
                     .map(|e| e.peer.clone())
                     .collect();
                 (*entry.key(), downstream)
@@ -574,20 +572,25 @@ impl SeedingManager {
     }
 
     /// Get detailed subscription info for debugging.
+    #[cfg(test)]
     pub fn subscription_details(
         &self,
         contract: &ContractKey,
-    ) -> Option<(Option<SocketAddr>, Vec<SocketAddr>, bool)> {
+    ) -> Option<(
+        Option<std::net::SocketAddr>,
+        Vec<std::net::SocketAddr>,
+        bool,
+    )> {
         let subs = self.subscriptions.get(contract)?;
 
         let upstream = subs
             .iter()
-            .find(|e| e.role == SubscriptionRole::Upstream)
+            .find(|e| e.role == SubscriberType::Upstream)
             .and_then(|e| e.peer.socket_addr());
 
-        let downstream: Vec<SocketAddr> = subs
+        let downstream: Vec<std::net::SocketAddr> = subs
             .iter()
-            .filter(|e| e.role == SubscriptionRole::Downstream)
+            .filter(|e| e.role == SubscriberType::Downstream)
             .filter_map(|e| e.peer.socket_addr())
             .collect();
 
@@ -602,7 +605,7 @@ mod tests {
     use super::*;
     use crate::transport::TransportKeypair;
     use freenet_stdlib::prelude::ContractInstanceId;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn test_peer_id(id: u8) -> PeerId {
         // Use different IP prefixes to get different locations
