@@ -883,76 +883,138 @@ impl Executor<Runtime> {
         // The network operation will handle the commit and broadcast.
         // This fixes issue #2301: previously we committed here, causing the network
         // operation to see no change and skip broadcasting.
-        let computed = self
-            .compute_state_update(&parameters, &current_state, &key, &updates)
-            .await?;
+        //
+        // If related contracts are needed, we fetch them and retry compute_state_update
+        // in a loop (similar to get_updated_state, but without committing).
+        let mut updates = updates;
+        let start = Instant::now();
+        let new_state = loop {
+            let computed = self
+                .compute_state_update(&parameters, &current_state, &key, &updates)
+                .await?;
 
-        match computed {
-            ComputedStateUpdate::NoChange(state) => {
-                // No change detected, return early without starting network operation
-                tracing::debug!(
-                    contract = %key,
-                    phase = "update_no_change",
-                    "Update resulted in no change, skipping network operation"
-                );
-                let summary = self
-                    .runtime
-                    .summarize_state(&key, &parameters, &state)
-                    .map_err(|e| ExecutorError::execution(e, None))?;
-                Ok(ContractResponse::UpdateResponse { key, summary }.into())
+            match computed {
+                ComputedStateUpdate::NoChange(state) => {
+                    // No change detected, return early without starting network operation
+                    tracing::debug!(
+                        contract = %key,
+                        phase = "update_no_change",
+                        "Update resulted in no change, skipping network operation"
+                    );
+                    let summary = self
+                        .runtime
+                        .summarize_state(&key, &parameters, &state)
+                        .map_err(|e| ExecutorError::execution(e, None))?;
+                    return Ok(ContractResponse::UpdateResponse { key, summary }.into());
+                }
+                ComputedStateUpdate::MissingRelated(missing) => {
+                    // Fetch missing related contracts WITHOUT committing.
+                    // This mirrors the logic in get_updated_state but avoids the commit
+                    // that would cause the network operation to see NoChange.
+                    tracing::debug!(
+                        contract = %key,
+                        missing_count = missing.len(),
+                        phase = "update_fetching_related",
+                        "Fetching missing related contracts"
+                    );
+
+                    let required_contracts = missing.len() + 1;
+                    for RelatedContract {
+                        contract_instance_id: id,
+                        mode,
+                    } in missing
+                    {
+                        match self.state_store.get(&id.into()).await {
+                            Ok(state) => {
+                                // Already have this contract locally
+                                updates.push(UpdateData::RelatedState {
+                                    related_to: id,
+                                    state: state.into(),
+                                });
+                            }
+                            Err(StateStoreError::MissingContract(_)) => {
+                                // Fetch from network
+                                let state =
+                                    match self.local_state_or_from_network(&id, false).await? {
+                                        Either::Left(state) => state,
+                                        Either::Right(GetResult {
+                                            state, contract, ..
+                                        }) => {
+                                            let Some(contract) = contract else {
+                                                return Err(ExecutorError::request(
+                                                    RequestError::ContractError(
+                                                        StdContractError::Get {
+                                                            key,
+                                                            cause: "Missing contract".into(),
+                                                        },
+                                                    ),
+                                                ));
+                                            };
+                                            // Store the related contract (this is necessary for future lookups)
+                                            // but does NOT commit the main contract's state update
+                                            self.verify_and_store_contract(
+                                                state.clone(),
+                                                contract,
+                                                RelatedContracts::default(),
+                                            )
+                                            .await?;
+                                            state
+                                        }
+                                    };
+                                updates.push(UpdateData::State(state.into()));
+                                match mode {
+                                    RelatedMode::StateOnce => {}
+                                    RelatedMode::StateThenSubscribe => {
+                                        self.subscribe(id.into()).await?;
+                                    }
+                                }
+                            }
+                            Err(other_err) => {
+                                return Err(ExecutorError::other(other_err));
+                            }
+                        }
+                    }
+
+                    // Check if we have enough related contracts to retry
+                    if updates.len() + 1 >= required_contracts {
+                        // Retry with related contracts
+                        continue;
+                    } else if start.elapsed() > Duration::from_secs(10) {
+                        tracing::error!(
+                            contract = %key,
+                            elapsed_secs = start.elapsed().as_secs(),
+                            phase = "update_timeout",
+                            "Timeout fetching related contracts for update"
+                        );
+                        return Err(ExecutorError::request(RequestError::Timeout));
+                    }
+                }
+                ComputedStateUpdate::Changed(new_state) => {
+                    break new_state;
+                }
             }
-            ComputedStateUpdate::MissingRelated(_missing) => {
-                // Missing related contracts - fall back to the existing path that handles this.
-                //
-                // KNOWN LIMITATION: This path commits state locally via get_updated_state before
-                // starting the network operation. This means:
-                // 1. Local notifications ARE sent (via attempt_state_update)
-                // 2. Network broadcast will see NoChange (same bug as #2301 for this edge case)
-                //
-                // Fixing this properly would require refactoring how related contracts are fetched
-                // to work without committing the partial state. For now, this edge case is accepted
-                // since contracts with related dependencies are less common.
-                // TODO: Consider tracking this as a follow-up issue if it causes problems.
-                tracing::debug!(
-                    contract = %key,
-                    phase = "update_missing_related",
-                    "Update requires related contracts, using fallback path (broadcast may be skipped)"
-                );
-                let new_state = self
-                    .get_updated_state(&parameters, current_state, key, updates)
-                    .await?;
-                let summary = self
-                    .runtime
-                    .summarize_state(&key, &parameters, &new_state)
-                    .map_err(|e| ExecutorError::execution(e, None))?;
-                // Note: notification is sent by attempt_state_update in this fallback path
-                let request = UpdateContract { key, new_state };
-                let _op: operations::update::UpdateResult = self.op_request(request).await?;
-                Ok(ContractResponse::UpdateResponse { key, summary }.into())
-            }
-            ComputedStateUpdate::Changed(new_state) => {
-                // State changed - start network operation which will commit and broadcast.
-                // We pass the computed new_state so the network operation can detect the change.
-                //
-                // Notification flow in this path:
-                // 1. compute_state_update does NOT send notifications (by design)
-                // 2. Network operation calls update_contract -> UpdateQuery -> upsert_contract_state
-                // 3. upsert_contract_state -> attempt_state_update sends the notification
-                tracing::debug!(
-                    contract = %key,
-                    new_size_bytes = new_state.as_ref().len(),
-                    phase = "update_starting_network_op",
-                    "State changed, starting network operation for commit and broadcast"
-                );
-                let summary = self
-                    .runtime
-                    .summarize_state(&key, &parameters, &new_state)
-                    .map_err(|e| ExecutorError::execution(e, None))?;
-                let request = UpdateContract { key, new_state };
-                let _op: operations::update::UpdateResult = self.op_request(request).await?;
-                Ok(ContractResponse::UpdateResponse { key, summary }.into())
-            }
-        }
+        };
+
+        // State changed - start network operation which will commit and broadcast.
+        // We pass the computed new_state so the network operation can detect the change.
+        //
+        // Notification flow in this path:
+        // 1. compute_state_update does NOT send notifications (by design)
+        // 2. Network operation calls update_contract -> UpdateQuery -> upsert_contract_state
+        // 3. upsert_contract_state -> attempt_state_update sends the notification
+        tracing::debug!(
+            contract = %key,
+            new_size_bytes = new_state.as_ref().len(),
+            phase = "update_starting_network_op",
+            "State changed, starting network operation for commit and broadcast"
+        );
+        let summary = self
+            .runtime
+            .summarize_state(&key, &parameters, &new_state)
+            .map_err(|e| ExecutorError::execution(e, None))?;
+        let request = UpdateContract { key, new_state };
+        let _op: operations::update::UpdateResult = self.op_request(request).await?;
+        Ok(ContractResponse::UpdateResponse { key, summary }.into())
     }
 
     /// Computes the updated state WITHOUT committing it to storage.
