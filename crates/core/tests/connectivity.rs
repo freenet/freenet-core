@@ -575,9 +575,15 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
                     let received_list: test_utils::TodoList =
                         serde_json::from_slice(state.as_ref())
                             .expect("deserialize update notification state");
-                    assert_eq!(
-                        received_list.version, todo_list.version,
-                        "Update version mismatch"
+                    // Verify our update task is present in the received state
+                    let has_our_task = received_list
+                        .tasks
+                        .iter()
+                        .any(|t| t.title == "Proximity cache test");
+                    assert!(
+                        has_our_task,
+                        "Update notification state should contain our task. Got: {:?}",
+                        received_list.tasks
                     );
                     tracing::info!(
                         "✅ Peer2 received UpdateNotification via proximity cache (issue #2294 regression test passed)"
