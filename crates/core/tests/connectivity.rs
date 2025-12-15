@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context};
-use freenet::test_utils::{self, make_get, make_put, TestContext, TestResult};
+use freenet::test_utils::{
+    self, make_get, make_put, make_subscribe, make_update, TestContext, TestResult,
+};
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
@@ -218,6 +220,7 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
 /// This test verifies that a network of 3 nodes (1 gateway + 2 peers) can:
 /// 1. Establish connections to form a full mesh
 /// 2. Successfully perform PUT/GET operations across the network
+/// 3. Propagate UPDATE via proximity cache (issue #2294 regression test)
 ///
 /// # Port Configuration for P2P Mesh
 ///
@@ -316,25 +319,37 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     let (stream2, _) = connect_async(&uri2).await?;
     let mut client2 = WebApi::start(stream2);
 
-    // Retry loop to wait for full mesh connectivity
-    // CI can be slower; give more attempts and longer waits before declaring failure.
-    const MAX_RETRIES: usize = 90;
+    // Retry loop to wait for full mesh connectivity.
+    // Use a deadline-based approach to ensure we leave time for PUT/GET operations.
+    //
+    // Timeout budget (test_timeout=180s, startup_wait=30s → 150s available):
+    //   - Mesh formation: up to 90s (deadline-based, not retry count)
+    //   - PUT with retries: ~30s
+    //   - GET: ~30s
+    //   - Safety margin: ~30s for CI variability
+    const MESH_FORMATION_TIMEOUT: Duration = Duration::from_secs(90);
     const RETRY_DELAY: Duration = Duration::from_secs(2);
+    let mesh_deadline = tokio::time::Instant::now() + MESH_FORMATION_TIMEOUT;
     let mut mesh_established = false;
     let mut last_snapshot = (String::new(), String::new(), String::new());
+    let mut attempt = 0;
 
-    for attempt in 1..=MAX_RETRIES {
+    while tokio::time::Instant::now() < mesh_deadline {
+        attempt += 1;
+        let remaining_secs = mesh_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_secs();
         // Use println! for first 5 attempts to ensure visibility in CI stdout
         if attempt <= 5 {
             println!(
-                "Attempt {}/{}: Querying all nodes for connected peers...",
-                attempt, MAX_RETRIES
+                "Attempt {} ({}s remaining): Querying all nodes for connected peers...",
+                attempt, remaining_secs
             );
         }
         tracing::info!(
-            "Attempt {}/{}: Querying all nodes for connected peers...",
+            "Attempt {} ({}s remaining): Querying all nodes for connected peers...",
             attempt,
-            MAX_RETRIES
+            remaining_secs
         );
 
         // Query each node for connections
@@ -436,8 +451,9 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
         }
 
         bail!(
-            "Failed to establish minimum connectivity after {} attempts. Gateway peers: {}; peer1 peers: {}; peer2 peers: {}",
-            MAX_RETRIES,
+            "Failed to establish minimum connectivity after {} attempts ({}s timeout). Gateway peers: {}; peer1 peers: {}; peer2 peers: {}",
+            attempt,
+            MESH_FORMATION_TIMEOUT.as_secs(),
             last_snapshot.0,
             last_snapshot.1,
             last_snapshot.2
@@ -460,6 +476,7 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     )
     .await?;
 
+    // GET so peer2 caches the contract (return_contract_code=true, subscribe=false)
     make_get(&mut client2, contract_key, true, false).await?;
     let get_response = tokio::time::timeout(Duration::from_secs(60), client2.recv()).await;
     match get_response {
@@ -475,6 +492,115 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
         Ok(Ok(other)) => bail!("Unexpected GET response: {:?}", other),
         Ok(Err(e)) => bail!("Error receiving GET response: {}", e),
         Err(_) => bail!("Timeout waiting for GET response"),
+    }
+
+    // Test UPDATE propagation via proximity cache (issue #2294 regression test).
+    // At this point:
+    // - Peer1 cached the contract via PUT, sent CacheAnnounce to neighbors
+    // - Peer2 cached the contract via GET, sent CacheAnnounce to neighbors
+    // - Both peers should have each other in proximity_cache.neighbors_with_contract()
+    // - UPDATE from peer1 should route to peer2 via proximity cache, not ring routing
+    tracing::info!("Testing UPDATE propagation via proximity cache");
+
+    // Explicitly subscribe peer2 to receive update notifications
+    make_subscribe(&mut client2, contract_key).await?;
+    loop {
+        let resp = tokio::time::timeout(Duration::from_secs(30), client2.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            }))) => {
+                assert_eq!(key, contract_key, "Subscribe response key mismatch");
+                assert!(subscribed, "Subscribe should succeed");
+                tracing::info!("✅ Peer2 subscribed to contract updates");
+                break;
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!("Ignoring non-subscribe response: {:?}", other);
+                continue;
+            }
+            Ok(Err(e)) => bail!("Error receiving subscribe response: {}", e),
+            Err(_) => bail!("Timeout waiting for subscribe response"),
+        }
+    }
+
+    // Allow time for CacheAnnounce messages to propagate
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Create updated state
+    let mut todo_list: test_utils::TodoList =
+        serde_json::from_slice(wrapped_state.as_ref()).expect("deserialize state");
+    todo_list.tasks.push(test_utils::Task {
+        id: todo_list.tasks.len() as u64 + 1,
+        title: "Proximity cache test".to_string(),
+        description: "Update via proximity cache test".to_string(),
+        completed: false,
+        priority: 1,
+    });
+    todo_list.version += 1;
+    let updated_bytes = serde_json::to_vec(&todo_list).expect("serialize updated state");
+    let updated_state = WrappedState::from(updated_bytes);
+
+    // Peer1 sends UPDATE
+    make_update(&mut client1, contract_key, updated_state.clone()).await?;
+
+    // Wait for UPDATE response on peer1
+    let update_response = tokio::time::timeout(Duration::from_secs(30), client1.recv()).await;
+    match update_response {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key, ..
+        }))) => {
+            assert_eq!(key, contract_key);
+            tracing::info!("✅ Peer1 received UpdateResponse");
+        }
+        Ok(Ok(other)) => bail!(
+            "Unexpected response waiting for UpdateResponse: {:?}",
+            other
+        ),
+        Ok(Err(e)) => bail!("Error receiving UpdateResponse: {}", e),
+        Err(_) => bail!("Timeout waiting for UpdateResponse"),
+    }
+
+    // Wait for UPDATE notification on peer2 (subscribed via GET)
+    let notification = tokio::time::timeout(Duration::from_secs(30), client2.recv()).await;
+    match notification {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+            key,
+            update,
+        }))) => {
+            assert_eq!(key, contract_key);
+            match update {
+                UpdateData::State(state) => {
+                    let received_list: test_utils::TodoList =
+                        serde_json::from_slice(state.as_ref())
+                            .expect("deserialize update notification state");
+                    // Verify our update task is present in the received state
+                    let has_our_task = received_list
+                        .tasks
+                        .iter()
+                        .any(|t| t.title == "Proximity cache test");
+                    assert!(
+                        has_our_task,
+                        "Update notification state should contain our task. Got: {:?}",
+                        received_list.tasks
+                    );
+                    tracing::info!(
+                        "✅ Peer2 received UpdateNotification via proximity cache (issue #2294 regression test passed)"
+                    );
+                }
+                other => bail!("Unexpected update data type: {:?}", other),
+            }
+        }
+        Ok(Ok(other)) => bail!(
+            "Unexpected response waiting for UpdateNotification: {:?}",
+            other
+        ),
+        Ok(Err(e)) => bail!("Error receiving UpdateNotification: {}", e),
+        Err(_) => bail!(
+            "Timeout waiting for UpdateNotification on peer2 - \
+             UPDATE may not have propagated via proximity cache (issue #2294)"
+        ),
     }
 
     // Clean disconnect

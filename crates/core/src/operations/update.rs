@@ -925,10 +925,57 @@ pub(crate) async fn request_update(
         None
     };
 
+    // Check proximity cache for neighbors that have announced caching this contract.
+    // This is critical for peer-to-peer updates when peers are directly connected
+    // but not explicitly subscribed (e.g., River chat rooms where both peers cache
+    // the contract but haven't established a subscription tree).
+    //
+    // Note: The proximity cache is populated asynchronously via CacheAnnounce messages,
+    // so there may be a brief race window after a peer caches a contract before its
+    // neighbors receive the announcement. This is acceptable - the ring-based fallback
+    // handles this case, and the proximity cache improves the common case where
+    // announcements have propagated.
+    let proximity_neighbors: Vec<_> = op_manager
+        .proximity_cache
+        .neighbors_with_contract(&key)
+        .into_iter()
+        .filter(|addr| addr != &sender_addr)
+        .collect();
+
+    let mut target_from_proximity = None;
+    for addr in &proximity_neighbors {
+        match op_manager.ring.connection_manager.get_peer_by_addr(*addr) {
+            Some(peer) => {
+                target_from_proximity = Some(peer);
+                break;
+            }
+            None => {
+                // Neighbor is in proximity cache but no longer connected.
+                // This is normal during connection churn - the proximity cache
+                // will be cleaned up when the disconnect is processed.
+                tracing::debug!(
+                    %key,
+                    peer = %addr,
+                    "UPDATE: Proximity cache neighbor not connected, trying next"
+                );
+            }
+        }
+    }
+
     let target = if let Some(remote_subscriber) = target_from_subscribers {
         remote_subscriber
+    } else if let Some(proximity_neighbor) = target_from_proximity {
+        // Use peer from proximity cache that announced having this contract.
+        // This aligns with get_broadcast_targets_update() which also uses proximity cache.
+        tracing::debug!(
+            %key,
+            target = ?proximity_neighbor.socket_addr(),
+            proximity_neighbors_found = proximity_neighbors.len(),
+            "UPDATE: Using proximity cache neighbor as target"
+        );
+        proximity_neighbor
     } else {
-        // Find the best peer to send the update to
+        // Find the best peer to send the update to based on ring location
         let remote_target = op_manager
             .ring
             .closest_potentially_caching(&key, [sender_addr].as_slice());
