@@ -316,25 +316,37 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     let (stream2, _) = connect_async(&uri2).await?;
     let mut client2 = WebApi::start(stream2);
 
-    // Retry loop to wait for full mesh connectivity
-    // CI can be slower; give more attempts and longer waits before declaring failure.
-    const MAX_RETRIES: usize = 90;
+    // Retry loop to wait for full mesh connectivity.
+    // Use a deadline-based approach to ensure we leave time for PUT/GET operations.
+    //
+    // Timeout budget (test_timeout=180s, startup_wait=30s → 150s available):
+    //   - Mesh formation: up to 90s (deadline-based, not retry count)
+    //   - PUT with retries: ~30s
+    //   - GET: ~30s
+    //   - Safety margin: ~30s for CI variability
+    const MESH_FORMATION_TIMEOUT: Duration = Duration::from_secs(90);
     const RETRY_DELAY: Duration = Duration::from_secs(2);
+    let mesh_deadline = tokio::time::Instant::now() + MESH_FORMATION_TIMEOUT;
     let mut mesh_established = false;
     let mut last_snapshot = (String::new(), String::new(), String::new());
+    let mut attempt = 0;
 
-    for attempt in 1..=MAX_RETRIES {
+    while tokio::time::Instant::now() < mesh_deadline {
+        attempt += 1;
+        let remaining_secs = mesh_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_secs();
         // Use println! for first 5 attempts to ensure visibility in CI stdout
         if attempt <= 5 {
             println!(
-                "Attempt {}/{}: Querying all nodes for connected peers...",
-                attempt, MAX_RETRIES
+                "Attempt {} ({}s remaining): Querying all nodes for connected peers...",
+                attempt, remaining_secs
             );
         }
         tracing::info!(
-            "Attempt {}/{}: Querying all nodes for connected peers...",
+            "Attempt {} ({}s remaining): Querying all nodes for connected peers...",
             attempt,
-            MAX_RETRIES
+            remaining_secs
         );
 
         // Query each node for connections
@@ -436,8 +448,9 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
         }
 
         bail!(
-            "Failed to establish minimum connectivity after {} attempts. Gateway peers: {}; peer1 peers: {}; peer2 peers: {}",
-            MAX_RETRIES,
+            "Failed to establish minimum connectivity after {} attempts ({}s timeout). Gateway peers: {}; peer1 peers: {}; peer2 peers: {}",
+            attempt,
+            MESH_FORMATION_TIMEOUT.as_secs(),
             last_snapshot.0,
             last_snapshot.1,
             last_snapshot.2
