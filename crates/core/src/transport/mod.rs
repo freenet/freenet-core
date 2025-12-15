@@ -33,6 +33,7 @@ mod batching;
 mod sent_packet_tracker;
 mod symmetric_message;
 pub(crate) mod token_bucket;
+pub(crate) mod ledbat;
 
 type MessagePayload = Vec<u8>;
 
