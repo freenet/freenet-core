@@ -929,12 +929,38 @@ pub(crate) async fn request_update(
     // This is critical for peer-to-peer updates when peers are directly connected
     // but not explicitly subscribed (e.g., River chat rooms where both peers cache
     // the contract but haven't established a subscription tree).
-    let target_from_proximity = op_manager
+    //
+    // Note: The proximity cache is populated asynchronously via CacheAnnounce messages,
+    // so there may be a brief race window after a peer caches a contract before its
+    // neighbors receive the announcement. This is acceptable - the ring-based fallback
+    // handles this case, and the proximity cache improves the common case where
+    // announcements have propagated.
+    let proximity_neighbors: Vec<_> = op_manager
         .proximity_cache
         .neighbors_with_contract(&key)
         .into_iter()
         .filter(|addr| addr != &sender_addr)
-        .find_map(|addr| op_manager.ring.connection_manager.get_peer_by_addr(addr));
+        .collect();
+
+    let mut target_from_proximity = None;
+    for addr in &proximity_neighbors {
+        match op_manager.ring.connection_manager.get_peer_by_addr(*addr) {
+            Some(peer) => {
+                target_from_proximity = Some(peer);
+                break;
+            }
+            None => {
+                // Neighbor is in proximity cache but no longer connected.
+                // This is normal during connection churn - the proximity cache
+                // will be cleaned up when the disconnect is processed.
+                tracing::debug!(
+                    %key,
+                    peer = %addr,
+                    "UPDATE: Proximity cache neighbor not connected, trying next"
+                );
+            }
+        }
+    }
 
     let target = if let Some(remote_subscriber) = target_from_subscribers {
         remote_subscriber
@@ -944,6 +970,7 @@ pub(crate) async fn request_update(
         tracing::debug!(
             %key,
             target = ?proximity_neighbor.socket_addr(),
+            proximity_neighbors_found = proximity_neighbors.len(),
             "UPDATE: Using proximity cache neighbor as target"
         );
         proximity_neighbor
