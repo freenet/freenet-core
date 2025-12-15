@@ -211,7 +211,6 @@ impl<T: TimeSource> SentPacketTracker<T> {
     }
 
     /// Get the current retransmission timeout
-    #[allow(dead_code)]
     pub(super) fn rto(&self) -> Duration {
         self.rto
     }

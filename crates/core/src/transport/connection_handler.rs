@@ -968,7 +968,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                 inbound_symmetric_key_bytes: inbound_key_bytes,
                 my_address: None,
                 transport_secret_key: secret,
-                bandwidth_limit,
                 ledbat,
                 token_bucket,
             };
@@ -1241,7 +1240,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     my_address: Some(my_address),
                                                     transport_secret_key: transport_secret_key
                                                         .clone(),
-                                                    bandwidth_limit,
                                                     ledbat,
                                                     token_bucket,
                                                 },
@@ -1339,7 +1337,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         inbound_symmetric_key_bytes: inbound_sym_key_bytes,
                                         my_address: None,
                                         transport_secret_key: transport_secret_key.clone(),
-                                        bandwidth_limit,
                                         ledbat,
                                         token_bucket,
                                     },

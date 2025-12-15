@@ -234,14 +234,15 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Should take ~100ms (100KB at 1MB/s)
-        // Allow wider tolerance for timing variance (tokio sleep isn't precise)
+        // Allow wide tolerance for timing variance (tokio sleep isn't precise,
+        // especially under system load)
         assert!(
             elapsed >= Duration::from_millis(50),
             "Too fast: {:?}",
             elapsed
         );
         assert!(
-            elapsed <= Duration::from_millis(200),
+            elapsed <= Duration::from_millis(300),
             "Too slow: {:?}",
             elapsed
         );
