@@ -384,12 +384,11 @@ impl Ring {
         tracing::debug!(peer = %peer, "Removing connection");
         self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
         // This case would be when a connection is being open, so peer location hasn't been recorded yet and we can ignore everything below
-        let Some(loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
+        let Some(_loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
             return;
         };
-        {
-            self.seeding_manager.prune_subscriber(loc);
-        }
+        // Use address-based pruning for O(1) lookup via reverse index
+        self.seeding_manager.prune_subscriber_by_addr(peer.addr);
         self.event_register
             .register_events(Either::Left(NetEventLog::disconnected(self, &peer)))
             .await;

@@ -7,26 +7,27 @@ use std::sync::Arc;
 ///
 /// Uses `SocketAddr` as the key since transactions are tied to network connections,
 /// not cryptographic identities.
+///
+/// Maintains a reverse index (tx -> peer) for O(1) transaction removal instead of
+/// O(n) full-map iteration. This significantly reduces lock contention under load.
 #[derive(Clone)]
 pub struct LiveTransactionTracker {
     tx_per_peer: Arc<DashMap<SocketAddr, Vec<Transaction>>>,
+    /// Reverse index: Transaction -> SocketAddr for O(1) lookup during removal.
+    /// Without this, remove_finished_transaction would need to iterate all peers.
+    peer_for_tx: Arc<DashMap<Transaction, SocketAddr>>,
 }
 
 impl LiveTransactionTracker {
     pub fn add_transaction(&self, peer_addr: SocketAddr, tx: Transaction) {
         self.tx_per_peer.entry(peer_addr).or_default().push(tx);
+        self.peer_for_tx.insert(tx, peer_addr);
     }
 
     pub fn remove_finished_transaction(&self, tx: Transaction) {
-        let keys_to_remove: Vec<SocketAddr> = self
-            .tx_per_peer
-            .iter()
-            .filter(|entry| entry.value().iter().any(|otx| otx == &tx))
-            .map(|entry| *entry.key())
-            .collect();
-
-        for k in keys_to_remove {
-            self.tx_per_peer.remove_if_mut(&k, |_, v| {
+        // O(1) lookup using reverse index instead of O(n) full-map iteration
+        if let Some((_, peer_addr)) = self.peer_for_tx.remove(&tx) {
+            self.tx_per_peer.remove_if_mut(&peer_addr, |_, v| {
                 v.retain(|otx| otx != &tx);
                 v.is_empty()
             });
@@ -36,11 +37,17 @@ impl LiveTransactionTracker {
     pub(crate) fn new() -> Self {
         Self {
             tx_per_peer: Arc::new(DashMap::default()),
+            peer_for_tx: Arc::new(DashMap::default()),
         }
     }
 
     pub(crate) fn prune_transactions_from_peer(&self, peer_addr: SocketAddr) {
-        self.tx_per_peer.remove(&peer_addr);
+        // Remove all transactions for this peer from the reverse index
+        if let Some((_, txs)) = self.tx_per_peer.remove(&peer_addr) {
+            for tx in txs {
+                self.peer_for_tx.remove(&tx);
+            }
+        }
     }
 
     pub(crate) fn has_live_connection(&self, peer_addr: SocketAddr) -> bool {
