@@ -1165,8 +1165,10 @@ impl GlobalExecutor {
     /// running on the background.
     pub(crate) fn initialize_async_rt() -> Option<Runtime> {
         if tokio::runtime::Handle::try_current().is_ok() {
+            tracing::debug!(target: "freenet::diagnostics::thread_explosion", "GlobalExecutor: runtime exists");
             None
         } else {
+            tracing::warn!(target: "freenet::diagnostics::thread_explosion", "GlobalExecutor: Creating fallback runtime");
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             builder.enable_all().thread_name("freenet-node");
             if cfg!(debug_assertions) {
@@ -1183,6 +1185,7 @@ impl GlobalExecutor {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(f)
         } else if let Some(rt) = &*ASYNC_RT {
+            tracing::warn!(target: "freenet::diagnostics::thread_explosion", "GlobalExecutor::spawn using fallback");
             rt.spawn(f)
         } else {
             unreachable!("ASYNC_RT should be initialized if Handle::try_current fails")
