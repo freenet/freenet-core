@@ -133,26 +133,21 @@ impl ContractStore {
             return Ok(());
         }
 
-        // insert in the memory cache
-        let size = code.data().len() as i64;
-        let data = code.data().to_vec();
-        self.contract_cache
-            .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
-        // Wait for the cache insert to be visible. Stretto uses background threads
-        // for inserts, and without wait() the value may not be immediately visible
-        // to subsequent get() calls (eventual consistency). This is critical because
-        // validate_state() needs to fetch the contract immediately after storing.
-        let _ = self.contract_cache.wait();
+        // CRITICAL ORDER: Write disk first, then index, then cache.
+        // This ensures fetch_contract() can always fall back to disk lookup
+        // even if the cache insert is rejected by TinyLFU admission policy.
+        // See issue #2306 - stretto's cache.wait() doesn't guarantee visibility.
 
-        // save on disc
+        // Step 1: Save to disk first (ensures data is persisted)
         let version = APIVersion::from(contract);
         let output: Vec<u8> = code
             .to_bytes_versioned(version)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let mut file = File::create(key_path)?;
+        let mut file = File::create(&key_path)?;
         file.write_all(output.as_slice())?;
+        file.sync_all()?; // Ensure durability before updating index
 
-        // Update index
+        // Step 2: Update index (enables disk fallback lookup in fetch_contract)
         let keys = self.key_to_code_part.entry(*key.id());
         match keys {
             dashmap::mapref::entry::Entry::Occupied(mut v) => {
@@ -169,6 +164,15 @@ impl ContractStore {
                 v.insert((offset, *code_hash));
             }
         }
+
+        // Step 3: Insert into memory cache (best-effort, may be rejected by TinyLFU)
+        let size = code.data().len() as i64;
+        let data = code.data().to_vec();
+        self.contract_cache
+            .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
+        // Wait for cache to process the insert. Even if TinyLFU rejects it,
+        // the disk fallback above ensures the contract can still be fetched.
+        let _ = self.contract_cache.wait();
 
         Ok(())
     }
@@ -226,6 +230,49 @@ mod test {
         store.store_contract(container)?;
         let f = store.fetch_contract(contract.key(), &[0, 1].as_ref().into());
         assert!(f.is_some());
+        Ok(())
+    }
+
+    /// Test that simulates the actual contract store flow to see if
+    /// contracts can be "lost" between store and fetch
+    #[test]
+    fn test_contract_store_fetch_reliability() -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+
+        // Use realistic-ish cache size
+        let mut store = ContractStore::new(contract_dir.path().into(), 100_000)?;
+
+        // Store multiple contracts with varying sizes, track their keys
+        let mut keys = Vec::new();
+        for i in 0..10u8 {
+            // Create contracts of different sizes
+            let size = ((i as usize) + 1) * 1000;
+            let code = vec![i; size];
+            let params = Parameters::from(vec![i, i + 1]);
+            let contract = WrappedContract::new(Arc::new(ContractCode::from(code)), params.clone());
+            let key = *contract.key();
+            keys.push((key, params));
+            let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract));
+            store.store_contract(container)?;
+        }
+
+        // Immediately try to fetch all contracts - this is the critical path
+        // where issue #2306 manifests
+        let mut fetch_failures = 0;
+        for (key, params) in &keys {
+            let fetched = store.fetch_contract(key, params);
+            if fetched.is_none() {
+                eprintln!("FETCH FAILED for contract {key} immediately after store!");
+                fetch_failures += 1;
+            }
+        }
+
+        assert_eq!(
+            fetch_failures, 0,
+            "Contracts should be fetchable immediately after store"
+        );
+
         Ok(())
     }
 }

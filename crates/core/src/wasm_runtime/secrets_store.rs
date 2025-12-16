@@ -165,7 +165,20 @@ impl SecretsStore {
                 }
             })?;
 
-        // Update index
+        // CRITICAL ORDER: Write file first, then update index.
+        // This ensures get_secret() can find the file even if we crash between
+        // operations. If we update index first and crash before file write,
+        // the index would point to a non-existent file.
+        // See issue #2306 for similar ordering fixes in contract_store/delegate_store.
+
+        // Step 1: Write secret to disk first
+        fs::create_dir_all(&delegate_path)?;
+        tracing::debug!("storing secret `{key}` at {secret_file_path:?}");
+        let mut file = File::create(&secret_file_path)?;
+        file.write_all(&ciphertext)?;
+        file.sync_all()?; // Ensure durability before updating index
+
+        // Step 2: Update index (now safe because file exists on disk)
         let hashes = self.key_to_secret_part.entry(delegate.clone());
         match hashes {
             dashmap::mapref::entry::Entry::Occupied(mut v) => {
@@ -195,10 +208,6 @@ impl SecretsStore {
             }
         }
 
-        fs::create_dir_all(&delegate_path)?;
-        tracing::debug!("storing secret `{key}` at {secret_file_path:?}");
-        let mut file = File::create(secret_file_path)?;
-        file.write_all(&ciphertext)?;
         Ok(())
     }
 

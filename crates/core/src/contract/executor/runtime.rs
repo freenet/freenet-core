@@ -147,6 +147,17 @@ impl ContractExecutor for Executor<Runtime> {
                     .map_err(ExecutorError::other)?;
                 (true, true)
             } else {
+                // Bug #2306: This should never happen for PUT operations because they
+                // always provide the contract code. If we hit this path during a PUT,
+                // it indicates the contract code was lost somewhere in the flow.
+                tracing::error!(
+                    contract = %key,
+                    key_code_hash = ?key.code_hash(),
+                    code_provided = code.is_some(),
+                    is_delta = matches!(update, Either::Right(_)),
+                    phase = "missing_contract_error",
+                    "Contract not in store and no code provided - this is a bug if this is a PUT operation"
+                );
                 return Err(ExecutorError::request(StdContractError::MissingContract {
                     key: key.into(),
                 }));
