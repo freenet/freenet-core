@@ -20,8 +20,12 @@ pub struct LiveTransactionTracker {
 
 impl LiveTransactionTracker {
     pub fn add_transaction(&self, peer_addr: SocketAddr, tx: Transaction) {
-        self.tx_per_peer.entry(peer_addr).or_default().push(tx);
+        // Insert to reverse index first to prevent race condition:
+        // If remove_finished_transaction runs concurrently, it will find the tx
+        // in peer_for_tx and clean up properly. If we did tx_per_peer first,
+        // a concurrent remove could miss the tx in peer_for_tx and leave orphans.
         self.peer_for_tx.insert(tx, peer_addr);
+        self.tx_per_peer.entry(peer_addr).or_default().push(tx);
     }
 
     pub fn remove_finished_transaction(&self, tx: Transaction) {
@@ -174,5 +178,38 @@ mod tests {
 
         assert_eq!(tracker.active_transaction_count(), 2);
         assert_eq!(tracker.active_connect_transaction_count(), 0);
+    }
+
+    #[test]
+    fn prune_transactions_from_peer_cleans_both_indices() {
+        let tracker = LiveTransactionTracker::new();
+        let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        let tx1 = Transaction::new::<ConnectMsg>();
+        let tx2 = Transaction::new::<GetMsg>();
+        let tx3 = Transaction::new::<PutMsg>();
+
+        // Add transactions for two peers
+        tracker.add_transaction(addr1, tx1);
+        tracker.add_transaction(addr1, tx2);
+        tracker.add_transaction(addr2, tx3);
+
+        assert_eq!(tracker.active_transaction_count(), 3);
+        assert_eq!(tracker.peer_for_tx.len(), 3);
+
+        // Prune peer1
+        tracker.prune_transactions_from_peer(addr1);
+
+        // peer1's transactions should be gone from both indices
+        assert_eq!(tracker.active_transaction_count(), 1);
+        assert_eq!(tracker.peer_for_tx.len(), 1);
+        assert!(!tracker.peer_for_tx.contains_key(&tx1));
+        assert!(!tracker.peer_for_tx.contains_key(&tx2));
+        assert!(tracker.peer_for_tx.contains_key(&tx3));
+
+        // peer2's transaction should still exist
+        assert!(tracker.has_live_connection(addr2));
+        assert!(!tracker.has_live_connection(addr1));
     }
 }
