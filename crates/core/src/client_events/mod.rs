@@ -815,56 +815,52 @@ async fn process_open_request(
                             contract = %key,
                             data = ?data,
                             phase = "starting",
-                            "Starting UPDATE operation"
+                            "Starting UPDATE operation - passing delta to network layer"
                         );
-                        let update_response = op_manager
-                            .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
-                                key,
-                                data,
-                                related_contracts: related_contracts.clone(),
-                            })
-                            .await?;
 
-                        let new_state = match update_response {
-                            ContractHandlerEvent::UpdateResponse {
-                                new_value: Ok(new_val),
-                            } => Ok(new_val),
-                            ContractHandlerEvent::UpdateResponse {
-                                new_value: Err(err),
-                            } => Err(OpError::from(err)),
-                            ContractHandlerEvent::UpdateNoChange { key } => {
-                                // This should not happen anymore since we now return UpdateResponse
-                                // from the contract handler even for NoChange cases
-                                tracing::warn!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    contract = %key,
-                                    phase = "unexpected_no_change",
-                                    "Unexpected UpdateNoChange event"
-                                );
-                                return Err(OpError::UnexpectedOpState.into());
+                        // Convert UpdateData to 'static lifetime for storage in operation state.
+                        // This is safe because we're cloning the underlying bytes.
+                        let update_data: UpdateData<'static> = match data {
+                            UpdateData::State(s) => UpdateData::State(State::from(s.into_bytes())),
+                            UpdateData::Delta(d) => {
+                                UpdateData::Delta(StateDelta::from(d.into_bytes()))
                             }
-                            _ => return Err(OpError::UnexpectedOpState.into()),
-                        }
-                        .inspect_err(|err| {
-                            tracing::error!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                contract = %key,
-                                error = %err,
-                                phase = "error",
-                                "UPDATE query failed"
-                            )
-                        })?;
+                            UpdateData::StateAndDelta { state, delta } => {
+                                UpdateData::StateAndDelta {
+                                    state: State::from(state.into_bytes()),
+                                    delta: StateDelta::from(delta.into_bytes()),
+                                }
+                            }
+                            UpdateData::RelatedState { related_to, state } => {
+                                UpdateData::RelatedState {
+                                    related_to,
+                                    state: State::from(state.into_bytes()),
+                                }
+                            }
+                            UpdateData::RelatedDelta { related_to, delta } => {
+                                UpdateData::RelatedDelta {
+                                    related_to,
+                                    delta: StateDelta::from(delta.into_bytes()),
+                                }
+                            }
+                            UpdateData::RelatedStateAndDelta {
+                                related_to,
+                                state,
+                                delta,
+                            } => UpdateData::RelatedStateAndDelta {
+                                related_to,
+                                state: State::from(state.into_bytes()),
+                                delta: StateDelta::from(delta.into_bytes()),
+                            },
+                        };
 
                         tracing::debug!(
                             client_id = %client_id,
                             request_id = %request_id,
                             peer = %peer_id,
                             contract = %key,
-                            new_state = ?new_state,
                             phase = "sending",
-                            "Sending UPDATE operation"
+                            "Sending UPDATE operation to network layer"
                         );
 
                         if let Some(router) = &request_router {
@@ -879,7 +875,7 @@ async fn process_open_request(
 
                             let request = crate::node::DeduplicatedRequest::Update {
                                 key,
-                                new_state: new_state.clone(),
+                                update_data: update_data.clone(),
                                 related_contracts: related_contracts.clone(),
                                 client_id,
                                 request_id,
@@ -920,7 +916,7 @@ async fn process_open_request(
 
                                 let op = update::start_op_with_id(
                                     key,
-                                    new_state,
+                                    update_data.clone(),
                                     related_contracts,
                                     transaction_id,
                                 );
@@ -987,7 +983,7 @@ async fn process_open_request(
                             );
 
                             // Legacy mode: direct operation without deduplication
-                            let op = update::start_op(key, new_state, related_contracts);
+                            let op = update::start_op(key, update_data, related_contracts);
                             let op_id = op.id;
 
                             tracing::debug!(

@@ -37,7 +37,7 @@ pub enum RequestResource {
     /// UPDATE requests with their parameters that affect the operation
     Update {
         key: ContractKey,
-        new_state: freenet_stdlib::prelude::WrappedState,
+        update_data: freenet_stdlib::prelude::UpdateData<'static>,
         related_contracts: freenet_stdlib::prelude::RelatedContracts<'static>,
     },
 }
@@ -86,20 +86,55 @@ impl Hash for RequestResource {
             }
             RequestResource::Update {
                 key,
-                new_state,
+                update_data,
                 related_contracts,
             } => {
                 // Hash discriminant for UPDATE variant
                 3u8.hash(state);
                 key.hash(state);
                 // For complex types, we'll serialize to bytes and hash that
-                // This ensures different states/related_contracts produce different hashes
+                // This ensures different update data/related_contracts produce different hashes
                 let mut hasher = DefaultHasher::new();
                 key.hash(&mut hasher);
                 for (key, _) in related_contracts.states() {
                     key.hash(&mut hasher);
                 }
-                new_state.hash(&mut hasher);
+                // Hash the update data - works for all variants
+                match update_data {
+                    freenet_stdlib::prelude::UpdateData::State(s) => {
+                        0u8.hash(&mut hasher);
+                        s.hash(&mut hasher);
+                    }
+                    freenet_stdlib::prelude::UpdateData::Delta(d) => {
+                        1u8.hash(&mut hasher);
+                        d.hash(&mut hasher);
+                    }
+                    freenet_stdlib::prelude::UpdateData::StateAndDelta { state, delta } => {
+                        2u8.hash(&mut hasher);
+                        state.hash(&mut hasher);
+                        delta.hash(&mut hasher);
+                    }
+                    freenet_stdlib::prelude::UpdateData::RelatedState { related_to, state } => {
+                        3u8.hash(&mut hasher);
+                        related_to.hash(&mut hasher);
+                        state.hash(&mut hasher);
+                    }
+                    freenet_stdlib::prelude::UpdateData::RelatedDelta { related_to, delta } => {
+                        4u8.hash(&mut hasher);
+                        related_to.hash(&mut hasher);
+                        delta.hash(&mut hasher);
+                    }
+                    freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta {
+                        related_to,
+                        state,
+                        delta,
+                    } => {
+                        5u8.hash(&mut hasher);
+                        related_to.hash(&mut hasher);
+                        state.hash(&mut hasher);
+                        delta.hash(&mut hasher);
+                    }
+                }
                 hasher.finish().hash(state);
             }
         }
@@ -135,7 +170,7 @@ pub enum DeduplicatedRequest {
     },
     Update {
         key: ContractKey,
-        new_state: freenet_stdlib::prelude::WrappedState,
+        update_data: freenet_stdlib::prelude::UpdateData<'static>,
         related_contracts: freenet_stdlib::prelude::RelatedContracts<'static>,
         client_id: ClientId,
         request_id: RequestId,
@@ -172,12 +207,12 @@ impl DeduplicatedRequest {
             DeduplicatedRequest::Subscribe { key, .. } => RequestResource::Subscribe { key: *key },
             DeduplicatedRequest::Update {
                 key,
-                new_state,
+                update_data,
                 related_contracts,
                 ..
             } => RequestResource::Update {
                 key: *key,
-                new_state: new_state.clone(),
+                update_data: update_data.clone(),
                 related_contracts: related_contracts.clone(),
             },
         }
@@ -639,6 +674,9 @@ mod tests {
         let key = create_test_contract_key();
         let related_contracts = create_test_related_contracts();
         let new_state = create_test_wrapped_state();
+        let update_data = freenet_stdlib::prelude::UpdateData::State(
+            freenet_stdlib::prelude::State::from(new_state),
+        );
         let client_id_1 = ClientId::next();
         let client_id_2 = ClientId::next();
         let request_id_1 = RequestId::new();
@@ -647,7 +685,7 @@ mod tests {
         // First UPDATE request
         let request_1 = DeduplicatedRequest::Update {
             key,
-            new_state: new_state.clone(),
+            update_data: update_data.clone(),
             related_contracts: related_contracts.clone(),
             client_id: client_id_1,
             request_id: request_id_1,
@@ -656,7 +694,7 @@ mod tests {
         // Identical UPDATE request from different client (should be deduplicated)
         let request_2 = DeduplicatedRequest::Update {
             key,
-            new_state: new_state.clone(),
+            update_data: update_data.clone(),
             related_contracts: related_contracts.clone(),
             client_id: client_id_2,
             request_id: request_id_2,
@@ -679,6 +717,12 @@ mod tests {
         let related_contracts = create_test_related_contracts();
         let state1 = create_test_wrapped_state();
         let state2 = WrappedState::new(vec![15, 16, 17, 18]); // Different state
+        let update_data1 = freenet_stdlib::prelude::UpdateData::State(
+            freenet_stdlib::prelude::State::from(state1),
+        );
+        let update_data2 = freenet_stdlib::prelude::UpdateData::State(
+            freenet_stdlib::prelude::State::from(state2),
+        );
         let client_id = create_test_client_id();
         let request_id_1 = RequestId::new();
         let request_id_2 = RequestId::new();
@@ -686,7 +730,7 @@ mod tests {
         // UPDATE request with first state
         let request_1 = DeduplicatedRequest::Update {
             key,
-            new_state: state1,
+            update_data: update_data1,
             related_contracts: related_contracts.clone(),
             client_id,
             request_id: request_id_1,
@@ -695,7 +739,7 @@ mod tests {
         // UPDATE request with different state (should not be deduplicated)
         let request_2 = DeduplicatedRequest::Update {
             key,
-            new_state: state2,
+            update_data: update_data2,
             related_contracts: related_contracts.clone(),
             client_id,
             request_id: request_id_2,
@@ -716,6 +760,9 @@ mod tests {
         let key2 = ContractInstanceId::new([3u8; 32]).into(); // Different contract
         let related_contracts = create_test_related_contracts();
         let new_state = create_test_wrapped_state();
+        let update_data = freenet_stdlib::prelude::UpdateData::State(
+            freenet_stdlib::prelude::State::from(new_state),
+        );
         let client_id = create_test_client_id();
         let request_id_1 = RequestId::new();
         let request_id_2 = RequestId::new();
@@ -723,7 +770,7 @@ mod tests {
         // UPDATE request for first contract
         let request_1 = DeduplicatedRequest::Update {
             key: key1,
-            new_state: new_state.clone(),
+            update_data: update_data.clone(),
             related_contracts: related_contracts.clone(),
             client_id,
             request_id: request_id_1,
@@ -732,7 +779,7 @@ mod tests {
         // UPDATE request for different contract (should not be deduplicated)
         let request_2 = DeduplicatedRequest::Update {
             key: key2,
-            new_state: new_state.clone(),
+            update_data: update_data.clone(),
             related_contracts: related_contracts.clone(),
             client_id,
             request_id: request_id_2,
@@ -769,14 +816,17 @@ mod tests {
         let subscribe_2 = RequestResource::Subscribe { key };
         assert_eq!(subscribe_1, subscribe_2);
 
+        let update_data = freenet_stdlib::prelude::UpdateData::State(
+            freenet_stdlib::prelude::State::from(state.clone()),
+        );
         let update_1 = RequestResource::Update {
             key,
-            new_state: state.clone(),
+            update_data: update_data.clone(),
             related_contracts: related_contracts.clone(),
         };
         let update_2 = RequestResource::Update {
             key,
-            new_state: state.clone(),
+            update_data: update_data.clone(),
             related_contracts: related_contracts.clone(),
         };
         assert_eq!(update_1, update_2);
@@ -792,9 +842,12 @@ mod tests {
         };
         assert_ne!(subscribe_1, subscribe_different);
 
+        let update_data_different = freenet_stdlib::prelude::UpdateData::State(
+            freenet_stdlib::prelude::State::from(WrappedState::new(vec![99, 100])),
+        );
         let update_different = RequestResource::Update {
             key,
-            new_state: WrappedState::new(vec![99, 100]),
+            update_data: update_data_different,
             related_contracts: related_contracts.clone(),
         };
         assert_ne!(update_1, update_different);

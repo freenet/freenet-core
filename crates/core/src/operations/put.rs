@@ -455,8 +455,12 @@ async fn start_update_after_put(
     tokio::spawn(async move {
         tokio::task::yield_now().await;
 
+        // Wrap the state as UpdateData::State for the update operation
+        let update_data = freenet_stdlib::prelude::UpdateData::State(
+            freenet_stdlib::prelude::State::from(new_state),
+        );
         let update_op =
-            update::start_op_with_id(key, new_state, RelatedContracts::default(), child_tx);
+            update::start_op_with_id(key, update_data, RelatedContracts::default(), child_tx);
 
         match update::request_update(&op_manager_cloned, update_op).await {
             Ok(_) => {

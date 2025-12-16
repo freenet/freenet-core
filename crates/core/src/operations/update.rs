@@ -232,7 +232,7 @@ impl Operation for UpdateOp {
                             } = update_contract(
                                 op_manager,
                                 *key,
-                                value.clone(),
+                                UpdateData::State(State::from(value.clone())),
                                 related_contracts.clone(),
                             )
                             .await?;
@@ -387,7 +387,7 @@ impl Operation for UpdateOp {
                     } = update_contract(
                         op_manager,
                         *key,
-                        new_value.clone(),
+                        UpdateData::State(State::from(new_value.clone())),
                         RelatedContracts::default(),
                     )
                     .await?;
@@ -716,10 +716,20 @@ fn build_op_result(
     })
 }
 
+/// Apply an update to a contract.
+///
+/// This function:
+/// 1. Fetches the current state (for change detection)
+/// 2. Calls UpdateQuery to merge the update and persist
+/// 3. Returns the merged state, summary, and whether the state changed
+///
+/// The `update_data` parameter can be:
+/// - `UpdateData::Delta(delta)` - A delta from the client, merged with current state
+/// - `UpdateData::State(state)` - A full state from PUT or executor
 async fn update_contract(
     op_manager: &OpManager,
     key: ContractKey,
-    state: WrappedState,
+    update_data: UpdateData<'static>,
     related_contracts: RelatedContracts<'static>,
 ) -> Result<UpdateExecution, OpError> {
     let previous_state = match op_manager
@@ -743,11 +753,10 @@ async fn update_contract(
         }
     };
 
-    let update_data = UpdateData::State(State::from(state.clone()));
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
             key,
-            data: update_data,
+            data: update_data.clone(),
             related_contracts,
         })
         .await
@@ -804,17 +813,43 @@ async fn update_contract(
                             tracing::debug!(
                                 ?other,
                                 %key,
-                                "Fallback fetch for UpdateNoChange returned no state; using requested state"
+                                "Fallback fetch for UpdateNoChange returned no state; trying to extract from update_data"
                             );
-                            state.clone()
+                            // Try to extract state from update_data if it's a State variant
+                            match &update_data {
+                                UpdateData::State(s) => WrappedState::from(s.clone().into_bytes()),
+                                UpdateData::StateAndDelta { state, .. } => {
+                                    WrappedState::from(state.clone().into_bytes())
+                                }
+                                _ => {
+                                    tracing::error!(
+                                        %key,
+                                        "Cannot extract state from delta-only UpdateData in NoChange fallback"
+                                    );
+                                    return Err(OpError::UnexpectedOpState);
+                                }
+                            }
                         }
                         Err(err) => {
                             tracing::debug!(
                                 %key,
                                 %err,
-                                "Fallback fetch for UpdateNoChange failed; using requested state"
+                                "Fallback fetch for UpdateNoChange failed; trying to extract from update_data"
                             );
-                            state.clone()
+                            // Try to extract state from update_data if it's a State variant
+                            match &update_data {
+                                UpdateData::State(s) => WrappedState::from(s.clone().into_bytes()),
+                                UpdateData::StateAndDelta { state, .. } => {
+                                    WrappedState::from(state.clone().into_bytes())
+                                }
+                                _ => {
+                                    tracing::error!(
+                                        %key,
+                                        "Cannot extract state from delta-only UpdateData in NoChange fallback"
+                                    );
+                                    return Err(OpError::UnexpectedOpState);
+                                }
+                            }
                         }
                     }
                 }
@@ -840,18 +875,17 @@ async fn update_contract(
 // todo: new_state should be a delta when possible!
 pub(crate) fn start_op(
     key: ContractKey,
-    new_state: WrappedState,
+    update_data: UpdateData<'static>,
     related_contracts: RelatedContracts<'static>,
 ) -> UpdateOp {
     let contract_location = Location::from(&key);
     tracing::debug!(%contract_location, %key, "Requesting update");
     let id = Transaction::new::<UpdateMsg>();
-    // let payload_size = contract.data().len();
 
     let state = Some(UpdateState::PrepareRequest {
         key,
         related_contracts,
-        value: new_state,
+        update_data,
     });
 
     UpdateOp {
@@ -865,18 +899,17 @@ pub(crate) fn start_op(
 /// This will be called from the node when processing an open request with a specific transaction ID
 pub(crate) fn start_op_with_id(
     key: ContractKey,
-    new_state: WrappedState,
+    update_data: UpdateData<'static>,
     related_contracts: RelatedContracts<'static>,
     id: Transaction,
 ) -> UpdateOp {
     let contract_location = Location::from(&key);
     tracing::debug!(%contract_location, %key, "Requesting update with transaction ID {}", id);
-    // let payload_size = contract.data().len();
 
     let state = Some(UpdateState::PrepareRequest {
         key,
         related_contracts,
-        value: new_state,
+        update_data,
     });
 
     UpdateOp {
@@ -893,13 +926,13 @@ pub(crate) async fn request_update(
     mut update_op: UpdateOp,
 ) -> Result<(), OpError> {
     // Extract the key and check if we need to handle this locally
-    let (key, value, related_contracts) = if let Some(UpdateState::PrepareRequest {
+    let (key, update_data, related_contracts) = if let Some(UpdateState::PrepareRequest {
         key,
-        value,
+        update_data,
         related_contracts,
     }) = update_op.state.take()
     {
-        (key, value, related_contracts)
+        (key, update_data, related_contracts)
     } else {
         return Err(OpError::UnexpectedOpState);
     };
@@ -1020,7 +1053,7 @@ pub(crate) async fn request_update(
                 value: updated_value,
                 summary,
                 changed,
-            } = update_contract(op_manager, key, value, related_contracts).await?;
+            } = update_contract(op_manager, key, update_data, related_contracts).await?;
 
             tracing::debug!(
                 tx = %id,
@@ -1116,18 +1149,23 @@ pub(crate) async fn request_update(
         value: updated_value,
         summary,
         changed: _changed,
-    } = update_contract(op_manager, key, value.clone(), related_contracts.clone())
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                tx = %id,
-                contract = %key,
-                error = %e,
-                phase = "error",
-                "Failed to apply update locally before forwarding UPDATE"
-            );
-            e
-        })?;
+    } = update_contract(
+        op_manager,
+        key,
+        update_data.clone(),
+        related_contracts.clone(),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            tx = %id,
+            contract = %key,
+            error = %e,
+            phase = "error",
+            "Failed to apply update locally before forwarding UPDATE"
+        );
+        e
+    })?;
 
     tracing::debug!(
         tx = %id,
@@ -1331,7 +1369,9 @@ pub enum UpdateState {
     PrepareRequest {
         key: ContractKey,
         related_contracts: RelatedContracts<'static>,
-        value: WrappedState,
+        /// The update data - can be a delta (from client) or full state (from PUT/executor).
+        /// This is passed to update_contract which calls UpdateQuery to merge and persist.
+        update_data: UpdateData<'static>,
     },
     BroadcastOngoing,
 }
