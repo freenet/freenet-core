@@ -498,7 +498,13 @@ impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::update::UpdateOp {
         let UpdateContract { key, new_state } = self;
         let related_contracts = RelatedContracts::default();
-        operations::update::start_op(key, new_state, related_contracts)
+        // Wrap the computed state as UpdateData::State for the update operation.
+        // The executor computes state without committing, expecting update_contract
+        // to handle persistence and change detection.
+        let update_data = freenet_stdlib::prelude::UpdateData::State(
+            freenet_stdlib::prelude::State::from(new_state),
+        );
+        operations::update::start_op(key, update_data, related_contracts)
     }
 
     async fn resume_op(
