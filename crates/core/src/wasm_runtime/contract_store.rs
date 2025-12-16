@@ -133,26 +133,20 @@ impl ContractStore {
             return Ok(());
         }
 
-        // insert in the memory cache
-        let size = code.data().len() as i64;
-        let data = code.data().to_vec();
-        self.contract_cache
-            .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
-        // Wait for the cache insert to be visible. Stretto uses background threads
-        // for inserts, and without wait() the value may not be immediately visible
-        // to subsequent get() calls (eventual consistency). This is critical because
-        // validate_state() needs to fetch the contract immediately after storing.
-        let _ = self.contract_cache.wait();
+        // CRITICAL ORDER: Write disk first, then index, then cache.
+        // This ensures fetch_contract() can always fall back to disk lookup
+        // even if the cache insert is rejected by TinyLFU admission policy.
+        // See issue #2306 - stretto's cache.wait() doesn't guarantee visibility.
 
-        // save on disc
+        // Step 1: Save to disk first (ensures data is persisted)
         let version = APIVersion::from(contract);
         let output: Vec<u8> = code
             .to_bytes_versioned(version)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let mut file = File::create(key_path)?;
+        let mut file = File::create(&key_path)?;
         file.write_all(output.as_slice())?;
 
-        // Update index
+        // Step 2: Update index (enables disk fallback lookup in fetch_contract)
         let keys = self.key_to_code_part.entry(*key.id());
         match keys {
             dashmap::mapref::entry::Entry::Occupied(mut v) => {
@@ -169,6 +163,15 @@ impl ContractStore {
                 v.insert((offset, *code_hash));
             }
         }
+
+        // Step 3: Insert into memory cache (best-effort, may be rejected by TinyLFU)
+        let size = code.data().len() as i64;
+        let data = code.data().to_vec();
+        self.contract_cache
+            .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
+        // Wait for cache to process the insert. Even if TinyLFU rejects it,
+        // the disk fallback above ensures the contract can still be fetched.
+        let _ = self.contract_cache.wait();
 
         Ok(())
     }
