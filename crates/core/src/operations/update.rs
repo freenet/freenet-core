@@ -791,6 +791,21 @@ async fn update_contract(
             Err(OpError::UnexpectedOpState)
         }
         Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+            // Helper to extract state from UpdateData variants that contain state
+            fn extract_state_from_update_data(
+                update_data: &UpdateData<'static>,
+            ) -> Option<WrappedState> {
+                match update_data {
+                    UpdateData::State(s) => Some(WrappedState::from(s.clone().into_bytes())),
+                    UpdateData::StateAndDelta { state, .. }
+                    | UpdateData::RelatedState { state, .. }
+                    | UpdateData::RelatedStateAndDelta { state, .. } => {
+                        Some(WrappedState::from(state.clone().into_bytes()))
+                    }
+                    UpdateData::Delta(_) | UpdateData::RelatedDelta { .. } => None,
+                }
+            }
+
             let resolved_state = match previous_state {
                 Some(prev_state) => prev_state,
                 None => {
@@ -815,13 +830,9 @@ async fn update_contract(
                                 %key,
                                 "Fallback fetch for UpdateNoChange returned no state; trying to extract from update_data"
                             );
-                            // Try to extract state from update_data if it's a State variant
-                            match &update_data {
-                                UpdateData::State(s) => WrappedState::from(s.clone().into_bytes()),
-                                UpdateData::StateAndDelta { state, .. } => {
-                                    WrappedState::from(state.clone().into_bytes())
-                                }
-                                _ => {
+                            match extract_state_from_update_data(&update_data) {
+                                Some(state) => state,
+                                None => {
                                     tracing::error!(
                                         %key,
                                         "Cannot extract state from delta-only UpdateData in NoChange fallback"
@@ -836,13 +847,9 @@ async fn update_contract(
                                 %err,
                                 "Fallback fetch for UpdateNoChange failed; trying to extract from update_data"
                             );
-                            // Try to extract state from update_data if it's a State variant
-                            match &update_data {
-                                UpdateData::State(s) => WrappedState::from(s.clone().into_bytes()),
-                                UpdateData::StateAndDelta { state, .. } => {
-                                    WrappedState::from(state.clone().into_bytes())
-                                }
-                                _ => {
+                            match extract_state_from_update_data(&update_data) {
+                                Some(state) => state,
+                                None => {
                                     tracing::error!(
                                         %key,
                                         "Cannot extract state from delta-only UpdateData in NoChange fallback"
