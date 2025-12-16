@@ -1228,20 +1228,19 @@ impl Operation for GetOp {
                                     ),
                                 }
                             } else {
-                                // No contract code in GET response - can't cache locally
-                                tracing::debug!(
+                                // No contract code in GET response - can't cache or subscribe locally.
+                                // Without the contract code, we can't:
+                                // 1. Validate incoming state updates
+                                // 2. Process delta updates from subscriptions
+                                // Announcing as cached or subscribing would cause #2306 errors when
+                                // updates arrive for a contract we can't process.
+                                tracing::warn!(
                                     tx = %id,
                                     %key,
-                                    "Cannot cache contract locally - no contract code in GET response"
+                                    "Cannot cache or subscribe to contract - no contract code in GET response"
                                 );
-                                // Still record the GET access and start subscription
-                                if !op_manager.ring.is_seeding_contract(&key) {
-                                    op_manager.ring.record_get_access(key, value.size() as u64);
-                                    super::announce_contract_cached(op_manager, &key).await;
-                                    let child_tx =
-                                        super::start_subscription_request(op_manager, id, key);
-                                    tracing::debug!(tx = %id, %child_tx, "started subscription as child operation (no contract code)");
-                                }
+                                // Don't announce cached or start subscription without contract code.
+                                // The GET still succeeded - the client gets their state response.
                             }
                         }
                     }

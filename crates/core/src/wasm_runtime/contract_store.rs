@@ -228,4 +228,91 @@ mod test {
         assert!(f.is_some());
         Ok(())
     }
+
+    /// Test that directly verifies stretto cache behavior to understand if
+    /// TinyLFU admission policy can reject inserts (issue #2306 investigation)
+    #[test]
+    fn test_stretto_insert_behavior() {
+        // Create a cache with small capacity to test admission policy
+        let cache: Cache<u64, Vec<u8>> = Cache::new(10, 1000).expect("create cache");
+
+        // Test 1: Basic insert should work
+        let accepted = cache.insert(1, vec![0u8; 100], 100);
+        let _ = cache.wait();
+        println!("Insert #1 accepted: {accepted}");
+
+        let found = cache.get(&1);
+        println!("Insert #1 found after wait: {}", found.is_some());
+
+        // Test 2: Insert many items to see if TinyLFU rejects any
+        let mut rejected_count = 0;
+        let mut not_found_count = 0;
+
+        for i in 2..=20u64 {
+            let accepted = cache.insert(i, vec![i as u8; 50], 50);
+            if !accepted {
+                rejected_count += 1;
+                println!("Insert #{i} was REJECTED by TinyLFU");
+            }
+        }
+        let _ = cache.wait();
+
+        // Now check how many are actually retrievable
+        for i in 1..=20u64 {
+            if cache.get(&i).is_none() {
+                not_found_count += 1;
+                println!("Key {i} NOT FOUND after wait");
+            }
+        }
+
+        println!("\nSummary:");
+        println!("  Rejected by insert(): {rejected_count}");
+        println!("  Not found after wait: {not_found_count}");
+
+        // The key insight: if items are rejected or evicted, we need to handle it!
+        // This test is informational - it shows us what stretto actually does.
+    }
+
+    /// Test that simulates the actual contract store flow to see if
+    /// contracts can be "lost" between store and fetch
+    #[test]
+    fn test_contract_store_fetch_reliability() -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+
+        // Use realistic-ish cache size
+        let mut store = ContractStore::new(contract_dir.path().into(), 100_000)?;
+
+        // Store multiple contracts with varying sizes, track their keys
+        let mut keys = Vec::new();
+        for i in 0..10u8 {
+            // Create contracts of different sizes
+            let size = ((i as usize) + 1) * 1000;
+            let code = vec![i; size];
+            let params = Parameters::from(vec![i, i + 1]);
+            let contract = WrappedContract::new(Arc::new(ContractCode::from(code)), params.clone());
+            let key = *contract.key();
+            keys.push((key, params));
+            let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract));
+            store.store_contract(container)?;
+        }
+
+        // Immediately try to fetch all contracts - this is the critical path
+        // where issue #2306 manifests
+        let mut fetch_failures = 0;
+        for (key, params) in &keys {
+            let fetched = store.fetch_contract(key, params);
+            if fetched.is_none() {
+                eprintln!("FETCH FAILED for contract {key} immediately after store!");
+                fetch_failures += 1;
+            }
+        }
+
+        assert_eq!(
+            fetch_failures, 0,
+            "Contracts should be fetchable immediately after store"
+        );
+
+        Ok(())
+    }
 }
