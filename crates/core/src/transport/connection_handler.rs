@@ -1972,6 +1972,9 @@ pub mod mock_transport {
             // conn should be broken as the remote peer cannot receive message and ping
             // Use timeout to avoid hanging if connection detection is slow
             let res = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
+            if res.is_err() {
+                tracing::error!("Test timeout: connection detection took longer than 10s - investigate if this causes test failures");
+            }
             assert!(res.is_err() || res.unwrap().is_err());
             Ok::<_, anyhow::Error>(())
         });

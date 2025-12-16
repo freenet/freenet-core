@@ -1180,7 +1180,7 @@ impl Operation for GetOp {
                         } else {
                             // Only attempt to cache if we have the contract code.
                             // Without the code, we can't store the contract locally (issue #2306).
-                            if let Some(ref _contract_code) = contract {
+                            if contract.is_some() {
                                 tracing::debug!(tx = %id, %key, %is_original_requester, %subscribe_requested, "Putting contract at executor - state differs from local cache");
                                 let res = op_manager
                                     .notify_contract_handler(ContractHandlerEvent::PutQuery {
