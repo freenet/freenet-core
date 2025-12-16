@@ -112,26 +112,22 @@ impl DelegateStore {
             return Ok(());
         }
 
-        // insert in the memory cache
-        let data = delegate.code().as_ref();
-        let code_size = data.len() as i64;
-        self.delegate_cache
-            .insert(*code_hash, delegate.code().clone().into_owned(), code_size);
-        // Wait for the cache insert to be visible. Stretto uses background threads
-        // for inserts, and without wait() the value may not be immediately visible
-        // to subsequent get() calls (eventual consistency).
-        let _ = self.delegate_cache.wait();
+        // CRITICAL ORDER: Write disk first, then index, then cache.
+        // This ensures fetch_delegate() can always fall back to disk lookup
+        // even if the cache insert is rejected by TinyLFU admission policy.
+        // See issue #2306 - stretto's cache.wait() doesn't guarantee visibility.
 
-        // save on disc
+        // Step 1: Save to disk first (ensures data is persisted)
         let version = APIVersion::from(delegate.clone());
         let output: Vec<u8> = delegate
             .code()
             .to_bytes_versioned(version)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let mut file = File::create(delegate_path)?;
+        let mut file = File::create(&delegate_path)?;
         file.write_all(output.as_slice())?;
+        file.sync_all()?; // Ensure durability before updating index
 
-        // Update index
+        // Step 2: Update index (enables disk fallback lookup in fetch_delegate)
         let keys = self.key_to_code_part.entry(key.clone());
         match keys {
             dashmap::mapref::entry::Entry::Occupied(mut v) => {
@@ -148,6 +144,15 @@ impl DelegateStore {
                 v.insert((offset, *code_hash));
             }
         }
+
+        // Step 3: Insert into memory cache (best-effort, may be rejected by TinyLFU)
+        let data = delegate.code().as_ref();
+        let code_size = data.len() as i64;
+        self.delegate_cache
+            .insert(*code_hash, delegate.code().clone().into_owned(), code_size);
+        // Wait for cache to process the insert. Even if TinyLFU rejects it,
+        // the disk fallback above ensures the delegate can still be fetched.
+        let _ = self.delegate_cache.wait();
 
         Ok(())
     }

@@ -145,6 +145,7 @@ impl ContractStore {
             .map_err(|e| anyhow::anyhow!(e))?;
         let mut file = File::create(&key_path)?;
         file.write_all(output.as_slice())?;
+        file.sync_all()?; // Ensure durability before updating index
 
         // Step 2: Update index (enables disk fallback lookup in fetch_contract)
         let keys = self.key_to_code_part.entry(*key.id());
