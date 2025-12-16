@@ -45,6 +45,9 @@ aider.conf.yaml
 CI_STATUS.md
 claude_notes/
 .claude/**
+.claude-plugin/
+external_plugins/
+plugins/
 
 # Temporary test outputs and logs
 *.log
