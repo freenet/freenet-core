@@ -1481,23 +1481,28 @@ pub(crate) mod tracer {
                 fmt_layer.boxed()
             }
         };
-        // Apply filter and set subscriber - use LevelFilter (fast) or EnvFilter (flexible)
-        if use_env_filter {
-            // User set RUST_LOG, use EnvFilter for dynamic/per-target filtering
-            let filter_layer = tracing_subscriber::EnvFilter::builder()
+        // Build filter and set subscriber.
+        // When RUST_LOG is set, parse it for dynamic per-target filtering.
+        // When not set, skip env parsing but still apply stretto/sqlx directives.
+        // The main optimization is compile-time filtering (release_max_level_info)
+        // which eliminates TRACE/DEBUG spans entirely in release builds.
+        let filter_layer = if use_env_filter {
+            tracing_subscriber::EnvFilter::builder()
                 .with_default_directive(default_filter.into())
                 .from_env_lossy()
                 .add_directive("stretto=off".parse().expect("infallible"))
-                .add_directive("sqlx=error".parse().expect("infallible"));
-            let filtered = layers.with_filter(filter_layer);
-            let subscriber = Registry::default().with(filtered);
-            tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
+                .add_directive("sqlx=error".parse().expect("infallible"))
         } else {
-            // No RUST_LOG set, use fast LevelFilter to avoid EnvFilter overhead
-            let filtered = layers.with_filter(default_filter);
-            let subscriber = Registry::default().with(filtered);
-            tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
-        }
+            // No RUST_LOG set - use static directives only (avoids env parsing)
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(default_filter.into())
+                .parse("")
+                .expect("empty filter is valid")
+                .add_directive("stretto=off".parse().expect("infallible"))
+                .add_directive("sqlx=error".parse().expect("infallible"))
+        };
+        let subscriber = Registry::default().with(layers.with_filter(filter_layer));
+        tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
         Ok(())
     }
 }

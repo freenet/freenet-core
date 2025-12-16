@@ -75,8 +75,9 @@ sha2 = "0.10"
 # Tracing deps
 opentelemetry = "0.31"
 opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], optional = true, version = "0.22" }
-# In release builds, TRACE/DEBUG spans are compiled out entirely to avoid
-# EnvFilter overhead (~7% CPU). Use RUST_LOG for dynamic filtering in debug builds.
+# In release builds, TRACE/DEBUG spans are compiled out entirely via
+# release_max_level_info, reducing the number of spans EnvFilter must evaluate.
+# Debug builds retain all levels. RUST_LOG can filter among compiled-in levels.
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-opentelemetry = { optional = true, version = "0.32.0" }
 tracing-subscriber = { optional = true, version = "0.3", features = ["json"] }
