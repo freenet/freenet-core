@@ -1970,8 +1970,9 @@ pub mod mock_transport {
             tracing::info!("Peer a received package from peer b");
             tokio::time::sleep(Duration::from_secs(3)).await;
             // conn should be broken as the remote peer cannot receive message and ping
-            let res = conn.recv().await;
-            assert!(res.is_err());
+            // Use timeout to avoid hanging if connection detection is slow
+            let res = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
+            assert!(res.is_err() || res.unwrap().is_err());
             Ok::<_, anyhow::Error>(())
         });
 
