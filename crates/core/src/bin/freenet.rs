@@ -8,6 +8,21 @@ use freenet::{
 };
 use std::sync::Arc;
 
+/// Count threads with "tokio-runtime" in their name by reading /proc/self/task
+fn count_tokio_threads() -> usize {
+    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|entry| {
+            let comm_path = entry.path().join("comm");
+            std::fs::read_to_string(comm_path).ok()
+        })
+        .filter(|name| name.contains("tokio-runtime"))
+        .count()
+}
+
 /// Build metadata embedded at compile time
 mod build_info {
     pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,6 +61,29 @@ async fn run_local(config: Config) -> anyhow::Result<()> {
 
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
+
+    // Thread monitor for diagnosing thread explosion issue
+    tokio::spawn(async {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BASELINE: AtomicUsize = AtomicUsize::new(0);
+        let expected = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        let initial = count_tokio_threads();
+        BASELINE.store(initial, Ordering::SeqCst);
+        tracing::info!(target: "freenet::diagnostics::thread_explosion", initial, expected, "Thread monitor started");
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let current = count_tokio_threads();
+            let baseline = BASELINE.load(Ordering::SeqCst);
+            if current > baseline + 10 {
+                tracing::error!(target: "freenet::diagnostics::thread_explosion", current, baseline, "THREAD EXPLOSION");
+            } else if current > baseline {
+                tracing::warn!(target: "freenet::diagnostics::thread_explosion", current, baseline, "Thread count increased");
+            }
+        }
+    });
 
     let clients = serve_gateway(config.ws_api)
         .await
