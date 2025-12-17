@@ -116,11 +116,6 @@ ureq = { version = "3.1", features = ["json"] }
 which = "8.0"
 regex = "1"
 
-[[bench]]
-name = "transport_perf"
-harness = false
-required-features = ["bench"]
-
 # CI-optimized benchmark suite (~8 min, deterministic)
 [[bench]]
 name = "transport_ci"
