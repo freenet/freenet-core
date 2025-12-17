@@ -4,6 +4,10 @@ use freenet_stdlib::client_api::ErrorKind;
 use freenet_stdlib::prelude::ContractKey;
 use std::fmt::{Display, Formatter};
 
+/// Marker string used to identify EmptyRing errors without needing to modify freenet-stdlib.
+/// If this string changes in ring/mod.rs, update it here too.
+const EMPTY_RING_ERROR: &str = "No ring connections found";
+
 #[derive(Debug)]
 pub(super) enum WebSocketApiError {
     /// Something went wrong when calling the user repo.
@@ -58,6 +62,14 @@ impl From<WebSocketApiError> for Response {
 
 impl IntoResponse for WebSocketApiError {
     fn into_response(self) -> Response {
+        // Check for EmptyRing error (peer still connecting to network)
+        if let WebSocketApiError::AxumError { ref error } = self {
+            let error_str = format!("{error}");
+            if error_str.contains(EMPTY_RING_ERROR) {
+                return (StatusCode::SERVICE_UNAVAILABLE, Html(connecting_page())).into_response();
+            }
+        }
+
         let (status, error_message) = match self {
             WebSocketApiError::InvalidParam { error_cause } => {
                 (StatusCode::BAD_REQUEST, error_cause)
@@ -82,4 +94,66 @@ impl IntoResponse for WebSocketApiError {
 
         (status, body).into_response()
     }
+}
+
+/// Returns a user-friendly HTML page shown while the peer is connecting to the network.
+fn connecting_page() -> String {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="3">
+    <title>Connecting to Freenet</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: #f5f5f5;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+        }
+        .logo {
+            width: 80px;
+            height: 80px;
+            margin-bottom: 1.5rem;
+        }
+        h1 {
+            color: #333;
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+        p {
+            color: #666;
+            margin-bottom: 1rem;
+        }
+        .spinner {
+            width: 24px;
+            height: 24px;
+            border: 3px solid #e0e0e0;
+            border-top-color: #2196F3;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo">
+        <h1>Connecting to Freenet...</h1>
+        <p>This peer is establishing network connections.<br>This page will refresh automatically.</p>
+        <div class="spinner"></div>
+    </div>
+</body>
+</html>"#.to_string()
 }
