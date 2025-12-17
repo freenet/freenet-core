@@ -23,7 +23,7 @@
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::packet_data::MAX_DATA_SIZE;
@@ -43,6 +43,47 @@ const BASE_HISTORY_SIZE: usize = 10;
 /// Delay filter sample count (RFC 6817 recommendation)
 const DELAY_FILTER_SIZE: usize = 4;
 
+/// Default slow start threshold (100 KB)
+const DEFAULT_SSTHRESH: usize = 102_400;
+
+/// Configuration for LEDBAT with slow start
+#[derive(Debug, Clone)]
+pub struct LedbatConfig {
+    /// Initial congestion window (bytes)
+    pub initial_cwnd: usize,
+    /// Minimum congestion window (bytes)
+    pub min_cwnd: usize,
+    /// Maximum congestion window (bytes)
+    pub max_cwnd: usize,
+    /// Slow start threshold (bytes)
+    pub ssthresh: usize,
+    /// Enable slow start phase
+    pub enable_slow_start: bool,
+    /// Delay threshold to exit slow start (fraction of TARGET)
+    /// Default: 0.5 (exit when queuing_delay > TARGET/2 = 50ms)
+    pub delay_exit_threshold: f64,
+    /// Randomize ssthresh to prevent synchronization (±20% jitter)
+    /// Default: true
+    pub randomize_ssthresh: bool,
+}
+
+impl Default for LedbatConfig {
+    fn default() -> Self {
+        Self {
+            // IW26: 26 * MSS = 38,000 bytes
+            // Reaches 300KB cwnd in 3 RTTs (38KB → 76KB → 152KB → 304KB)
+            // This enables >3 MB/s throughput at 100ms RTT
+            initial_cwnd: 38_000,        // 26 * MSS (IW26)
+            min_cwnd: 2_848,             // 2 * MSS
+            max_cwnd: 1_000_000_000,     // 1 GB
+            ssthresh: DEFAULT_SSTHRESH,  // 100 KB
+            enable_slow_start: true,     // Enable by default
+            delay_exit_threshold: 0.5,   // Exit at TARGET/2
+            randomize_ssthresh: true,    // Enable jitter by default
+        }
+    }
+}
+
 /// Consolidated state for LEDBAT to reduce lock contention.
 ///
 /// Previously these were 4 separate Mutex fields causing 6 lock acquisitions
@@ -61,10 +102,17 @@ struct LedbatState {
     last_update: Instant,
 }
 
-/// LEDBAT congestion controller (RFC 6817).
+/// LEDBAT congestion controller (RFC 6817) with slow start.
 ///
 /// Maintains target queuing delay to yield bandwidth to competing flows.
 /// Uses delay-based congestion control instead of loss-based (AIMD).
+///
+/// ## Slow Start Phase
+///
+/// Before LEDBAT's congestion avoidance, uses TCP-style exponential growth
+/// for fast ramp-up. Exits when:
+/// - cwnd >= ssthresh (reached threshold), OR
+/// - queuing_delay > TARGET * delay_exit_threshold (congestion detected)
 pub struct LedbatController {
     /// Congestion window (bytes in flight)
     cwnd: AtomicUsize,
@@ -78,22 +126,31 @@ pub struct LedbatController {
     /// Bytes acknowledged since last update
     bytes_acked_since_update: AtomicUsize,
 
+    /// Slow start threshold (bytes)
+    ssthresh: AtomicUsize,
+
+    /// Are we in slow start phase?
+    in_slow_start: AtomicBool,
+
     /// Configuration
     target_delay: Duration,
     gain: f64,
     allowed_increase_packets: usize,
     min_cwnd: usize,
     max_cwnd: usize,
+    enable_slow_start: bool,
+    delay_exit_threshold: f64,
 
     /// Statistics
     total_increases: AtomicUsize,
     total_decreases: AtomicUsize,
     total_losses: AtomicUsize,
     min_cwnd_events: AtomicUsize,
+    slow_start_exits: AtomicUsize,
 }
 
 impl LedbatController {
-    /// Create new LEDBAT controller.
+    /// Create new LEDBAT controller with default config (backward compatible).
     ///
     /// # Arguments
     /// * `initial_cwnd` - Initial congestion window (bytes)
@@ -110,8 +167,45 @@ impl LedbatController {
     /// );
     /// ```
     pub fn new(initial_cwnd: usize, min_cwnd: usize, max_cwnd: usize) -> Self {
+        let config = LedbatConfig {
+            initial_cwnd,
+            min_cwnd,
+            max_cwnd,
+            ..LedbatConfig::default()
+        };
+        Self::new_with_config(config)
+    }
+
+    /// Create new LEDBAT controller with custom configuration.
+    ///
+    /// This constructor allows full control over slow start parameters
+    /// and other LEDBAT settings.
+    ///
+    /// # Example
+    /// ```
+    /// # use freenet::transport::ledbat::{LedbatController, LedbatConfig};
+    /// let config = LedbatConfig {
+    ///     initial_cwnd: 14_600,  // IW10
+    ///     ssthresh: 102_400,     // 100 KB
+    ///     enable_slow_start: true,
+    ///     ..LedbatConfig::default()
+    /// };
+    /// let controller = LedbatController::new_with_config(config);
+    /// ```
+    pub fn new_with_config(config: LedbatConfig) -> Self {
+        // Apply ±20% jitter to ssthresh to prevent synchronization
+        let ssthresh = if config.randomize_ssthresh {
+            // Use deterministic jitter based on Instant::now() nanos
+            // to avoid needing a full RNG
+            let nanos = Instant::now().elapsed().as_nanos() as u64;
+            let jitter_pct = 0.8 + (nanos % 40) as f64 / 100.0; // 0.8 to 1.2 (±20%)
+            ((config.ssthresh as f64) * jitter_pct) as usize
+        } else {
+            config.ssthresh
+        };
+
         Self {
-            cwnd: AtomicUsize::new(initial_cwnd),
+            cwnd: AtomicUsize::new(config.initial_cwnd),
             flightsize: AtomicUsize::new(0),
             state: Mutex::new(LedbatState {
                 base_delay_history: BaseDelayHistory::new(),
@@ -120,15 +214,20 @@ impl LedbatController {
                 last_update: Instant::now(),
             }),
             bytes_acked_since_update: AtomicUsize::new(0),
+            ssthresh: AtomicUsize::new(ssthresh),
+            in_slow_start: AtomicBool::new(config.enable_slow_start),
             target_delay: TARGET,
             gain: GAIN,
             allowed_increase_packets: 2, // RFC 6817 default
-            min_cwnd,
-            max_cwnd,
+            min_cwnd: config.min_cwnd,
+            max_cwnd: config.max_cwnd,
+            enable_slow_start: config.enable_slow_start,
+            delay_exit_threshold: config.delay_exit_threshold,
             total_increases: AtomicUsize::new(0),
             total_decreases: AtomicUsize::new(0),
             total_losses: AtomicUsize::new(0),
             min_cwnd_events: AtomicUsize::new(0),
+            slow_start_exits: AtomicUsize::new(0),
         }
     }
 
@@ -209,7 +308,13 @@ impl LedbatController {
             return; // No progress
         }
 
-        // Calculate cwnd change (RFC 6817 Section 2.4.2)
+        // Check if in slow start phase
+        if self.enable_slow_start && self.in_slow_start.load(Ordering::Acquire) {
+            self.handle_slow_start(bytes_acked_total, queuing_delay);
+            return;
+        }
+
+        // LEDBAT congestion avoidance (RFC 6817 Section 2.4.2)
         // Δcwnd = GAIN * (off_target / TARGET) * bytes_acked * MSS / cwnd
         let current_cwnd = self.cwnd.load(Ordering::Acquire);
         let cwnd_change = self.gain
@@ -260,11 +365,79 @@ impl LedbatController {
         }
     }
 
+    /// Handle slow start phase (exponential growth).
+    ///
+    /// Exits slow start when:
+    /// - cwnd >= ssthresh (reached threshold), OR
+    /// - queuing_delay > TARGET * delay_exit_threshold (congestion detected)
+    fn handle_slow_start(&self, bytes_acked: usize, queuing_delay: Duration) {
+        // Early exit if no longer in slow start (race: loss/timeout occurred)
+        if !self.in_slow_start.load(Ordering::Acquire) {
+            return;
+        }
+
+        let current_cwnd = self.cwnd.load(Ordering::Acquire);
+        let ssthresh = self.ssthresh.load(Ordering::Acquire);
+
+        // Check exit conditions
+        let delay_threshold = Duration::from_secs_f64(
+            self.target_delay.as_secs_f64() * self.delay_exit_threshold
+        );
+        let should_exit = current_cwnd >= ssthresh || queuing_delay > delay_threshold;
+
+        if should_exit {
+            // Exit slow start
+            self.in_slow_start.store(false, Ordering::Release);
+            self.slow_start_exits.fetch_add(1, Ordering::Relaxed);
+
+            // Conservative reduction on exit (optional, can be tuned)
+            let new_cwnd = ((current_cwnd as f64) * 0.9) as usize;
+            let new_cwnd = new_cwnd.max(self.min_cwnd).min(self.max_cwnd);
+            self.cwnd.store(new_cwnd, Ordering::Release);
+
+            let exit_reason = if current_cwnd >= ssthresh {
+                "ssthresh"
+            } else {
+                "delay"
+            };
+
+            tracing::debug!(
+                old_cwnd_kb = current_cwnd / 1024,
+                new_cwnd_kb = new_cwnd / 1024,
+                ssthresh_kb = ssthresh / 1024,
+                queuing_delay_ms = queuing_delay.as_millis(),
+                delay_threshold_ms = delay_threshold.as_millis(),
+                reason = exit_reason,
+                total_exits = self.slow_start_exits.load(Ordering::Relaxed),
+                "Exiting slow start"
+            );
+        } else {
+            // Exponential growth: cwnd += bytes_acked (doubles per RTT)
+            let new_cwnd = (current_cwnd + bytes_acked).min(self.max_cwnd);
+            self.cwnd.store(new_cwnd, Ordering::Release);
+
+            tracing::trace!(
+                old_cwnd_kb = current_cwnd / 1024,
+                new_cwnd_kb = new_cwnd / 1024,
+                bytes_acked_kb = bytes_acked / 1024,
+                queuing_delay_ms = queuing_delay.as_millis(),
+                "Slow start growth"
+            );
+        }
+    }
+
     /// Called when packet loss detected (not timeout).
     ///
     /// RFC 6817 Section 2.4.1: halve cwnd on loss.
+    ///
+    /// Also exits slow start if currently in that phase.
     pub fn on_loss(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
+
+        // Exit slow start on loss
+        if self.in_slow_start.swap(false, Ordering::AcqRel) {
+            self.slow_start_exits.fetch_add(1, Ordering::Relaxed);
+        }
 
         let current_cwnd = self.cwnd.load(Ordering::Acquire);
         let new_cwnd = (current_cwnd / 2).max(self.min_cwnd);
@@ -282,8 +455,14 @@ impl LedbatController {
     /// Called on retransmission timeout (severe congestion).
     ///
     /// RFC 6817: Reset to 1 * MSS on timeout.
+    /// Also exits slow start and resets to min_cwnd.
     pub fn on_timeout(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
+
+        // Exit slow start on timeout
+        if self.in_slow_start.swap(false, Ordering::AcqRel) {
+            self.slow_start_exits.fetch_add(1, Ordering::Relaxed);
+        }
 
         let new_cwnd = MSS.max(self.min_cwnd);
 
@@ -341,6 +520,7 @@ impl LedbatController {
             total_decreases: self.total_decreases.load(Ordering::Relaxed),
             total_losses: self.total_losses.load(Ordering::Relaxed),
             min_cwnd_events: self.min_cwnd_events.load(Ordering::Relaxed),
+            slow_start_exits: self.slow_start_exits.load(Ordering::Relaxed),
         }
     }
 }
@@ -356,6 +536,7 @@ pub struct LedbatStats {
     pub total_decreases: usize,
     pub total_losses: usize,
     pub min_cwnd_events: usize,
+    pub slow_start_exits: usize,
 }
 
 /// Delay filter: MIN over recent samples (RFC 6817 Section 4.2).

@@ -57,8 +57,54 @@ pub(super) async fn send_stream(
             break;
         }
 
-        // Token bucket rate limiting - reserve tokens and wait if needed
         let packet_size = stream_to_send.len().min(MAX_DATA_SIZE);
+
+        // LEDBAT congestion control - wait until cwnd has space for this packet
+        // This enforces the congestion window calculated by LEDBAT's slow start
+        // and congestion avoidance algorithms
+        let mut cwnd_wait_iterations = 0;
+        loop {
+            let flightsize = ledbat.flightsize();
+            let cwnd = ledbat.current_cwnd();
+
+            // Check if we have space in the congestion window
+            if flightsize + packet_size <= cwnd {
+                break; // Space available, proceed to send
+            }
+
+            cwnd_wait_iterations += 1;
+            if cwnd_wait_iterations == 1 {
+                tracing::trace!(
+                    stream_id = %stream_id.0,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    packet_size,
+                    "Waiting for cwnd space"
+                );
+            }
+
+            // Exponential backoff to balance responsiveness and CPU usage
+            // First 10 attempts: immediate yield (context switch only)
+            // Next 90 attempts: 100μs sleep
+            // Beyond 100: 1ms sleep (graceful degradation)
+            if cwnd_wait_iterations <= 10 {
+                tokio::task::yield_now().await;
+            } else if cwnd_wait_iterations <= 100 {
+                tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        if cwnd_wait_iterations > 0 {
+            tracing::trace!(
+                stream_id = %stream_id.0,
+                wait_iterations = cwnd_wait_iterations,
+                "Acquired cwnd space"
+            );
+        }
+
+        // Token bucket rate limiting - reserve tokens and wait if needed
         let wait_time = token_bucket.reserve(packet_size);
         if !wait_time.is_zero() {
             tracing::trace!(

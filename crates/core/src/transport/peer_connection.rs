@@ -694,16 +694,34 @@ impl PeerConnection {
 
                     if should_update {
                         let new_rate = self.remote_conn.ledbat.current_rate(rtt);
+                        let cwnd = self.remote_conn.ledbat.current_cwnd();
+                        let queuing_delay = self.remote_conn.ledbat.queuing_delay();
+
+                        // Calculate time since last update for debugging RTT-adaptive timing
+                        let since_last_update_ms = self.last_rate_update
+                            .map(|last| now.duration_since(last).as_millis())
+                            .unwrap_or(0);
+
                         self.remote_conn.token_bucket.set_rate(new_rate);
                         self.last_rate_update = Some(now);
 
-                        tracing::trace!(
+                        tracing::debug!(
                             peer_addr = %self.remote_conn.remote_addr,
+                            // Rate control
                             new_rate_bytes_per_sec = new_rate,
-                            cwnd = self.remote_conn.ledbat.current_cwnd(),
+                            new_rate_mbps = (new_rate as f64) / 1_000_000.0,
+                            // LEDBAT state
+                            cwnd_bytes = cwnd,
+                            cwnd_packets = cwnd / MAX_DATA_SIZE,
+                            // Delay measurements
                             base_delay_ms = base_delay.as_millis(),
                             rtt_ms = rtt.as_millis(),
-                            "Updated token bucket rate from LEDBAT (RTT-adaptive)"
+                            queuing_delay_ms = queuing_delay.as_millis(),
+                            target_delay_ms = 100, // TARGET constant
+                            // Derived metrics
+                            off_target_ms = (queuing_delay.as_millis() as i64) - 100,
+                            since_last_update_ms = since_last_update_ms,
+                            "LEDBAT metrics (RTT-adaptive rate update)"
                         );
                     }
                 }
