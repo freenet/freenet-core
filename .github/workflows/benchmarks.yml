@@ -36,11 +36,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Install system dependencies required for linking
-      - name: Install system dependencies
+      # Check/install system dependencies required for linking
+      # On self-hosted runners, liblzma-dev should be pre-installed
+      - name: Check system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y liblzma-dev
+          if pkg-config --exists liblzma 2>/dev/null; then
+            echo "✅ liblzma found"
+          elif command -v apt-get >/dev/null && sudo -n true 2>/dev/null; then
+            echo "Installing liblzma-dev..."
+            sudo apt-get update && sudo apt-get install -y liblzma-dev
+          else
+            echo "⚠️ liblzma not found and cannot install automatically"
+            echo "Please install liblzma-dev on the self-hosted runner"
+            # Continue anyway - linking will fail if library is truly missing
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
