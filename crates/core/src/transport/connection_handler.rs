@@ -956,13 +956,13 @@ impl<S: Socket> UdpPacketsListener<S> {
             // Initialize LEDBAT congestion controller with slow start (RFC 6817)
             // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
             let ledbat = Arc::new(LedbatController::new_with_config(
-                crate::transport::ledbat::LedbatConfig::default()
+                crate::transport::ledbat::LedbatConfig::default(),
             ));
 
             // Initialize token bucket for smooth packet pacing
             let initial_rate = bandwidth_limit.unwrap_or(10_000_000); // 10 MB/s default
             let token_bucket = Arc::new(TokenBucket::new(
-                10_000,        // capacity = 10 KB burst
+                10_000, // capacity = 10 KB burst
                 initial_rate,
             ));
 
@@ -1216,14 +1216,17 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                                             // Initialize LEDBAT congestion controller with slow start (RFC 6817)
                                             // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
-                                            let ledbat = Arc::new(LedbatController::new_with_config(
-                                                crate::transport::ledbat::LedbatConfig::default()
-                                            ));
+                                            let ledbat =
+                                                Arc::new(LedbatController::new_with_config(
+                                                    crate::transport::ledbat::LedbatConfig::default(
+                                                    ),
+                                                ));
 
                                             // Initialize token bucket
-                                            let initial_rate = bandwidth_limit.unwrap_or(10_000_000);
+                                            let initial_rate =
+                                                bandwidth_limit.unwrap_or(10_000_000);
                                             let token_bucket = Arc::new(TokenBucket::new(
-                                                10_000,        // capacity = 10 KB burst
+                                                10_000, // capacity = 10 KB burst
                                                 initial_rate,
                                             ));
 
@@ -1314,13 +1317,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // Initialize LEDBAT congestion controller with slow start (RFC 6817)
                                 // Uses IW26 (26 * MSS = 38,000 bytes) for fast ramp-up
                                 let ledbat = Arc::new(LedbatController::new_with_config(
-                                    crate::transport::ledbat::LedbatConfig::default()
+                                    crate::transport::ledbat::LedbatConfig::default(),
                                 ));
 
                                 // Initialize token bucket
                                 let initial_rate = bandwidth_limit.unwrap_or(10_000_000);
                                 let token_bucket = Arc::new(TokenBucket::new(
-                                    10_000,        // capacity = 10 KB burst
+                                    10_000, // capacity = 10 KB burst
                                     initial_rate,
                                 ));
 
@@ -1759,9 +1762,15 @@ pub mod mock_transport {
         packet_drop_policy: PacketDropPolicy,
         channels: Channels,
     ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
-        create_mock_peer_internal(packet_drop_policy, PacketDelayPolicy::NoDelay, false, channels, None)
-            .await
-            .map(|(pk, (o, _), s)| (pk, o, s))
+        create_mock_peer_internal(
+            packet_drop_policy,
+            PacketDelayPolicy::NoDelay,
+            false,
+            channels,
+            None,
+        )
+        .await
+        .map(|(pk, (o, _), s)| (pk, o, s))
     }
 
     /// Create a mock peer connection with custom delay policy for testing/benchmarking.
@@ -1772,9 +1781,15 @@ pub mod mock_transport {
         packet_delay_policy: PacketDelayPolicy,
         channels: Channels,
     ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
-        create_mock_peer_internal(packet_drop_policy, packet_delay_policy, false, channels, None)
-            .await
-            .map(|(pk, (o, _), s)| (pk, o, s))
+        create_mock_peer_internal(
+            packet_drop_policy,
+            packet_delay_policy,
+            false,
+            channels,
+            None,
+        )
+        .await
+        .map(|(pk, (o, _), s)| (pk, o, s))
     }
 
     /// Create a mock peer connection with custom delay and bandwidth limit for testing/benchmarking.
@@ -1786,9 +1801,15 @@ pub mod mock_transport {
         channels: Channels,
         bandwidth_limit: Option<usize>,
     ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
-        create_mock_peer_internal(packet_drop_policy, packet_delay_policy, false, channels, bandwidth_limit)
-            .await
-            .map(|(pk, (o, _), s)| (pk, o, s))
+        create_mock_peer_internal(
+            packet_drop_policy,
+            packet_delay_policy,
+            false,
+            channels,
+            bandwidth_limit,
+        )
+        .await
+        .map(|(pk, (o, _), s)| (pk, o, s))
     }
 
     /// Create a mock gateway connection for testing/benchmarking.
@@ -1805,7 +1826,14 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
-        create_mock_peer_internal(packet_drop_policy, PacketDelayPolicy::NoDelay, true, channels, None).await
+        create_mock_peer_internal(
+            packet_drop_policy,
+            PacketDelayPolicy::NoDelay,
+            true,
+            channels,
+            None,
+        )
+        .await
     }
 
     async fn create_mock_peer_internal(
@@ -2747,7 +2775,15 @@ pub mod mock_transport {
     ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
-        let socket = Arc::new(MockSocket::new(packet_drop_policy, PacketDelayPolicy::NoDelay, addr, channels).await);
+        let socket = Arc::new(
+            MockSocket::new(
+                packet_drop_policy,
+                PacketDelayPolicy::NoDelay,
+                addr,
+                channels,
+            )
+            .await,
+        );
         let (peer_conn, _inbound_conn) =
             OutboundConnectionHandler::new_test(addr, socket, peer_keypair, false)
                 .expect("failed to create peer");

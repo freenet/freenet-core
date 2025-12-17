@@ -186,15 +186,8 @@ mod tests {
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
         // Initialize LEDBAT and TokenBucket for test
-        let ledbat = Arc::new(LedbatController::new(
-            2928,
-            2928,
-            1_000_000_000,
-        ));
-        let token_bucket = Arc::new(TokenBucket::new(
-            10_000,
-            10_000_000,
-        ));
+        let ledbat = Arc::new(LedbatController::new(2928, 2928, 1_000_000_000));
+        let token_bucket = Arc::new(TokenBucket::new(10_000, 10_000_000));
 
         let background_task = tokio::spawn(send_stream(
             StreamId::next(),
@@ -246,13 +239,9 @@ mod tests {
 
         // Initialize LEDBAT and TokenBucket for test
         // Use small burst capacity (1KB) to ensure rate limiting is observable
-        let ledbat = Arc::new(LedbatController::new(
-            2928,
-            2928,
-            1_000_000_000,
-        ));
+        let ledbat = Arc::new(LedbatController::new(2928, 2928, 1_000_000_000));
         let token_bucket = Arc::new(TokenBucket::new(
-            1_000,  // 1KB burst - ensures rate limiting kicks in
+            1_000, // 1KB burst - ensures rate limiting kicks in
             bandwidth_limit,
         ));
 
@@ -345,13 +334,9 @@ mod tests {
         let message = vec![0u8; 10_000];
 
         // Initialize LEDBAT and TokenBucket with very high rate (effectively unlimited)
-        let ledbat = Arc::new(LedbatController::new(
-            2928,
-            2928,
-            1_000_000_000,
-        ));
+        let ledbat = Arc::new(LedbatController::new(2928, 2928, 1_000_000_000));
         let token_bucket = Arc::new(TokenBucket::new(
-            100_000,      // 100 KB burst capacity
+            100_000,       // 100 KB burst capacity
             1_000_000_000, // 1 GB/s rate (effectively unlimited)
         ));
 

@@ -73,13 +73,13 @@ impl Default for LedbatConfig {
             // IW26: 26 * MSS = 38,000 bytes
             // Reaches 300KB cwnd in 3 RTTs (38KB → 76KB → 152KB → 304KB)
             // This enables >3 MB/s throughput at 100ms RTT
-            initial_cwnd: 38_000,        // 26 * MSS (IW26)
-            min_cwnd: 2_848,             // 2 * MSS
-            max_cwnd: 1_000_000_000,     // 1 GB
-            ssthresh: DEFAULT_SSTHRESH,  // 100 KB
-            enable_slow_start: true,     // Enable by default
-            delay_exit_threshold: 0.5,   // Exit at TARGET/2
-            randomize_ssthresh: true,    // Enable jitter by default
+            initial_cwnd: 38_000,       // 26 * MSS (IW26)
+            min_cwnd: 2_848,            // 2 * MSS
+            max_cwnd: 1_000_000_000,    // 1 GB
+            ssthresh: DEFAULT_SSTHRESH, // 100 KB
+            enable_slow_start: true,    // Enable by default
+            delay_exit_threshold: 0.5,  // Exit at TARGET/2
+            randomize_ssthresh: true,   // Enable jitter by default
         }
     }
 }
@@ -271,10 +271,7 @@ impl LedbatController {
             if !state.delay_filter.is_ready() {
                 return; // Need more samples
             }
-            let filtered_rtt = state
-                .delay_filter
-                .filtered_delay()
-                .unwrap_or(rtt_sample);
+            let filtered_rtt = state.delay_filter.filtered_delay().unwrap_or(rtt_sample);
 
             // Calculate base and queuing delays
             let base_delay = state.base_delay_history.base_delay();
@@ -317,11 +314,9 @@ impl LedbatController {
         // LEDBAT congestion avoidance (RFC 6817 Section 2.4.2)
         // Δcwnd = GAIN * (off_target / TARGET) * bytes_acked * MSS / cwnd
         let current_cwnd = self.cwnd.load(Ordering::Acquire);
-        let cwnd_change = self.gain
-            * (off_target_ms / target_ms)
-            * (bytes_acked_total as f64)
-            * (MSS as f64)
-            / (current_cwnd as f64);
+        let cwnd_change =
+            self.gain * (off_target_ms / target_ms) * (bytes_acked_total as f64) * (MSS as f64)
+                / (current_cwnd as f64);
 
         let mut new_cwnd = current_cwnd as f64 + cwnd_change;
 
@@ -380,9 +375,8 @@ impl LedbatController {
         let ssthresh = self.ssthresh.load(Ordering::Acquire);
 
         // Check exit conditions
-        let delay_threshold = Duration::from_secs_f64(
-            self.target_delay.as_secs_f64() * self.delay_exit_threshold
-        );
+        let delay_threshold =
+            Duration::from_secs_f64(self.target_delay.as_secs_f64() * self.delay_exit_threshold);
         let should_exit = current_cwnd >= ssthresh || queuing_delay > delay_threshold;
 
         if should_exit {

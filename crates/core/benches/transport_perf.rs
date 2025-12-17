@@ -843,46 +843,42 @@ mod transport_streaming {
         for &size in &[4096, 16384, 65536] {
             group.throughput(Throughput::Bytes(size as u64));
 
-            group.bench_with_input(
-                BenchmarkId::new("rate_limited", size),
-                &size,
-                |b, &sz| {
-                    b.to_async(&rt).iter_batched(
-                        || {
-                            let message = vec![0xABu8; sz];
-                            (Arc::new(DashMap::new()) as Channels, message)
-                        },
-                        |(channels, message)| async move {
-                            // Create connected peers
-                            let (peer_a_pub, mut peer_a, peer_a_addr) =
-                                create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
-                                    .await
-                                    .unwrap();
-                            let (peer_b_pub, mut peer_b, peer_b_addr) =
-                                create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
-                                    .await
-                                    .unwrap();
+            group.bench_with_input(BenchmarkId::new("rate_limited", size), &size, |b, &sz| {
+                b.to_async(&rt).iter_batched(
+                    || {
+                        let message = vec![0xABu8; sz];
+                        (Arc::new(DashMap::new()) as Channels, message)
+                    },
+                    |(channels, message)| async move {
+                        // Create connected peers
+                        let (peer_a_pub, mut peer_a, peer_a_addr) =
+                            create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
+                                .await
+                                .unwrap();
+                        let (peer_b_pub, mut peer_b, peer_b_addr) =
+                            create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
+                                .await
+                                .unwrap();
 
-                            let (conn_a_inner, conn_b_inner) = futures::join!(
-                                peer_a.connect(peer_b_pub, peer_b_addr),
-                                peer_b.connect(peer_a_pub, peer_a_addr),
-                            );
-                            let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-                            let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+                        let (conn_a_inner, conn_b_inner) = futures::join!(
+                            peer_a.connect(peer_b_pub, peer_b_addr),
+                            peer_b.connect(peer_a_pub, peer_a_addr),
+                        );
+                        let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+                        let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
 
-                            // Send large message (will be fragmented)
-                            conn_a.send(message.clone()).await.unwrap();
-                            let received: Vec<u8> = conn_b.recv().await.unwrap();
+                        // Send large message (will be fragmented)
+                        conn_a.send(message.clone()).await.unwrap();
+                        let received: Vec<u8> = conn_b.recv().await.unwrap();
 
-                            // Note: received length may differ slightly due to serialization overhead
-                            // Just verify we got data back
-                            assert!(!received.is_empty());
-                            std_black_box(received);
-                        },
-                        BatchSize::SmallInput,
-                    );
-                },
-            );
+                        // Note: received length may differ slightly due to serialization overhead
+                        // Just verify we got data back
+                        assert!(!received.is_empty());
+                        std_black_box(received);
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
         }
 
         group.finish();
@@ -1137,22 +1133,20 @@ mod transport_with_delay {
                         max: Duration::from_millis(70),
                     };
 
-                    let (peer_a_pub, mut peer_a, peer_a_addr) =
-                        create_mock_peer_with_delay(
-                            PacketDropPolicy::ReceiveAll,
-                            delay_policy.clone(),
-                            channels.clone(),
-                        )
-                        .await
-                        .unwrap();
-                    let (peer_b_pub, mut peer_b, peer_b_addr) =
-                        create_mock_peer_with_delay(
-                            PacketDropPolicy::ReceiveAll,
-                            delay_policy,
-                            channels,
-                        )
-                        .await
-                        .unwrap();
+                    let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
+                        PacketDropPolicy::ReceiveAll,
+                        delay_policy.clone(),
+                        channels.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_delay(
+                        PacketDropPolicy::ReceiveAll,
+                        delay_policy,
+                        channels,
+                    )
+                    .await
+                    .unwrap();
 
                     let (conn_a_inner, conn_b_inner) = futures::join!(
                         peer_a.connect(peer_b_pub, peer_b_addr),
@@ -1202,7 +1196,8 @@ mod transport_with_delay {
                         },
                         |(channels, message)| async move {
                             let drop_policy = PacketDropPolicy::Factor(loss_pct / 100.0);
-                            let delay_policy = PacketDelayPolicy::Fixed(Duration::from_millis(delay_ms));
+                            let delay_policy =
+                                PacketDelayPolicy::Fixed(Duration::from_millis(delay_ms));
 
                             let (peer_a_pub, mut peer_a, peer_a_addr) =
                                 create_mock_peer_with_delay(
@@ -1213,13 +1208,9 @@ mod transport_with_delay {
                                 .await
                                 .unwrap();
                             let (peer_b_pub, mut peer_b, peer_b_addr) =
-                                create_mock_peer_with_delay(
-                                    drop_policy,
-                                    delay_policy,
-                                    channels,
-                                )
-                                .await
-                                .unwrap();
+                                create_mock_peer_with_delay(drop_policy, delay_policy, channels)
+                                    .await
+                                    .unwrap();
 
                             let (conn_a_inner, conn_b_inner) = futures::join!(
                                 peer_a.connect(peer_b_pub, peer_b_addr),
@@ -1264,22 +1255,20 @@ mod transport_with_delay {
                 |channels| async move {
                     let delay_policy = PacketDelayPolicy::Fixed(Duration::from_millis(50));
 
-                    let (peer_a_pub, mut peer_a, peer_a_addr) =
-                        create_mock_peer_with_delay(
-                            PacketDropPolicy::ReceiveAll,
-                            delay_policy.clone(),
-                            channels.clone(),
-                        )
-                        .await
-                        .unwrap();
-                    let (peer_b_pub, mut peer_b, peer_b_addr) =
-                        create_mock_peer_with_delay(
-                            PacketDropPolicy::ReceiveAll,
-                            delay_policy,
-                            channels,
-                        )
-                        .await
-                        .unwrap();
+                    let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
+                        PacketDropPolicy::ReceiveAll,
+                        delay_policy.clone(),
+                        channels.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_delay(
+                        PacketDropPolicy::ReceiveAll,
+                        delay_policy,
+                        channels,
+                    )
+                    .await
+                    .unwrap();
 
                     let (conn_a_inner, conn_b_inner) = futures::join!(
                         peer_a.connect(peer_b_pub, peer_b_addr),
@@ -1508,7 +1497,8 @@ mod ledbat_validation {
                         },
                         |(channels, message)| async move {
                             let drop_policy = PacketDropPolicy::Factor(loss_pct / 100.0);
-                            let delay_policy = PacketDelayPolicy::Fixed(Duration::from_millis(delay_ms));
+                            let delay_policy =
+                                PacketDelayPolicy::Fixed(Duration::from_millis(delay_ms));
 
                             let (peer_a_pub, mut peer_a, peer_a_addr) =
                                 create_mock_peer_with_delay(
@@ -1519,13 +1509,9 @@ mod ledbat_validation {
                                 .await
                                 .unwrap();
                             let (peer_b_pub, mut peer_b, peer_b_addr) =
-                                create_mock_peer_with_delay(
-                                    drop_policy,
-                                    delay_policy,
-                                    channels,
-                                )
-                                .await
-                                .unwrap();
+                                create_mock_peer_with_delay(drop_policy, delay_policy, channels)
+                                    .await
+                                    .unwrap();
 
                             let (conn_a_inner, conn_b_inner) = futures::join!(
                                 peer_a.connect(peer_b_pub, peer_b_addr),
@@ -1560,12 +1546,12 @@ mod ledbat_validation {
 
 mod slow_start_validation {
     use super::*;
-    use std::sync::Arc;
-    use std::time::Instant;
     use dashmap::DashMap;
     use freenet::transport::mock_transport::{
         create_mock_peer_with_delay, PacketDelayPolicy, PacketDropPolicy,
     };
+    use std::sync::Arc;
+    use std::time::Instant;
 
     /// Benchmark fresh connection cold-start throughput
     /// This measures the actual slow start benefit (or lack thereof)
@@ -1771,10 +1757,7 @@ mod slow_start_validation {
 
                 // Log timing (visible with --nocapture)
                 let throughput_mbps = (1.0 / elapsed.as_secs_f64()) * 8.0;
-                println!(
-                    "1MB transfer: {:?} ({:.2} Mbps)",
-                    elapsed, throughput_mbps
-                );
+                println!("1MB transfer: {:?} ({:.2} Mbps)", elapsed, throughput_mbps);
 
                 std_black_box(received);
             });

@@ -105,7 +105,8 @@ impl SentPacketTracker<InstantTimeSrc> {
 impl<T: TimeSource> SentPacketTracker<T> {
     pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Arc<[u8]>) {
         let sent_time = self.time_source.now();
-        self.pending_receipts.insert(packet_id, (payload, sent_time));
+        self.pending_receipts
+            .insert(packet_id, (payload, sent_time));
         self.resend_queue.push_back(ResendQueueEntry {
             timeout_at: sent_time + MESSAGE_CONFIRMATION_TIMEOUT,
             packet_id,
@@ -115,7 +116,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
 
     /// Reports that receipts have been received for the given packet IDs.
     /// Returns: ((RTT sample, packet size) pairs, loss rate)
-    pub(super) fn report_received_receipts(&mut self, packet_ids: &[PacketId]) -> (Vec<(Duration, usize)>, Option<f64>) {
+    pub(super) fn report_received_receipts(
+        &mut self,
+        packet_ids: &[PacketId],
+    ) -> (Vec<(Duration, usize)>, Option<f64>) {
         let now = self.time_source.now();
         let mut rtt_samples = Vec::new();
 
@@ -152,9 +156,9 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// Updates RTT estimation based on a new sample using RFC 6298 algorithm
     fn update_rtt(&mut self, sample: Duration) {
         // RFC 6298 constants
-        const ALPHA: f64 = 1.0 / 8.0;  // Smoothing factor for SRTT
-        const BETA: f64 = 1.0 / 4.0;   // Smoothing factor for RTTVAR
-        const K: u32 = 4;               // RTO variance multiplier
+        const ALPHA: f64 = 1.0 / 8.0; // Smoothing factor for SRTT
+        const BETA: f64 = 1.0 / 4.0; // Smoothing factor for RTTVAR
+        const K: u32 = 4; // RTO variance multiplier
         const G: Duration = Duration::from_millis(10); // Clock granularity
 
         match self.srtt {
@@ -229,7 +233,9 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 let wait_until = entry.timeout_at;
                 self.resend_queue.push_front(entry);
                 return ResendAction::WaitUntil(wait_until);
-            } else if let Some((packet, _sent_time)) = self.pending_receipts.remove(&entry.packet_id) {
+            } else if let Some((packet, _sent_time)) =
+                self.pending_receipts.remove(&entry.packet_id)
+            {
                 // Update packet loss proportion for a lost packet
                 // Resend logic
                 self.packet_loss_proportion = self.packet_loss_proportion
@@ -488,7 +494,9 @@ pub(in crate::transport) mod tests {
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
 
         // Wait for timeout
-        tracker.time_source.advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
+        tracker
+            .time_source
+            .advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
 
         // Get resend action
         match tracker.get_resend() {
@@ -501,4 +509,3 @@ pub(in crate::transport) mod tests {
         }
     }
 }
-

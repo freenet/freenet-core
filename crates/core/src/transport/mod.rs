@@ -30,10 +30,10 @@ mod received_packet_tracker;
 /// Syscall batching for improved UDP throughput.
 /// Uses sendmmsg on Linux, falls back to sequential sends on other platforms.
 mod batching;
+pub(crate) mod ledbat;
 mod sent_packet_tracker;
 mod symmetric_message;
 pub(crate) mod token_bucket;
-pub(crate) mod ledbat;
 
 type MessagePayload = Vec<u8>;
 

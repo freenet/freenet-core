@@ -53,7 +53,7 @@ impl TokenBucket {
         Self {
             state: Mutex::new(BucketState {
                 capacity,
-                tokens: capacity,  // Start full
+                tokens: capacity, // Start full
                 fractional_tokens: 0.0,
                 rate,
                 last_refill: Instant::now(),
