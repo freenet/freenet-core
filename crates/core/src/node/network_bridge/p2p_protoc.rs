@@ -79,6 +79,7 @@ impl P2pBridge {
     ///
     /// This is called after `prune_connection()` or `remove_client_from_all_subscriptions()`
     /// to notify upstream peers that we're no longer subscribed to certain contracts.
+    /// Notifications are sent concurrently for better performance.
     pub(crate) async fn send_prune_notifications(
         &self,
         notifications: Vec<(freenet_stdlib::prelude::ContractKey, PeerKeyLocation)>,
@@ -89,24 +90,30 @@ impl P2pBridge {
 
         let own_location = self.op_manager.ring.connection_manager.own_location();
 
-        for (contract_key, upstream) in notifications {
-            if let Some(upstream_addr) = upstream.socket_addr() {
+        let futures: Vec<_> = notifications
+            .into_iter()
+            .filter_map(|(contract_key, upstream)| {
+                let upstream_addr = upstream.socket_addr()?;
                 let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
                     transaction: Transaction::new::<crate::operations::subscribe::SubscribeMsg>(),
                     key: contract_key,
                     from: own_location.clone(),
                 });
 
-                if let Err(e) = self.send(upstream_addr, unsubscribe_msg).await {
-                    tracing::warn!(
-                        %contract_key,
-                        %upstream_addr,
-                        error = %e,
-                        "Failed to send Unsubscribed to upstream after pruning"
-                    );
-                }
-            }
-        }
+                Some(async move {
+                    if let Err(e) = self.send(upstream_addr, unsubscribe_msg).await {
+                        tracing::warn!(
+                            %contract_key,
+                            %upstream_addr,
+                            error = %e,
+                            "Failed to send Unsubscribed to upstream after pruning"
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        futures::future::join_all(futures).await;
     }
 }
 

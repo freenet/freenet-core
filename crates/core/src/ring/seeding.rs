@@ -88,6 +88,16 @@ pub struct PruneSubscriptionsResult {
     pub notifications: Vec<(ContractKey, PeerKeyLocation)>,
 }
 
+/// Information about a contract that was removed from the seeding cache.
+/// Contains the contract key and optionally the upstream peer to notify.
+#[derive(Debug, Clone)]
+pub struct UnseededContractInfo {
+    /// The contract that was removed from the seeding cache.
+    pub contract: ContractKey,
+    /// The upstream peer to notify with an Unsubscribed message, if any.
+    pub upstream_to_notify: Option<PeerKeyLocation>,
+}
+
 pub(crate) struct SeedingManager {
     /// Subscriptions per contract with explicit upstream/downstream roles.
     /// This replaces the flat Vec<PeerKeyLocation> to enable proper tree pruning.
@@ -487,14 +497,14 @@ impl SeedingManager {
 
     /// Record an access to a contract (GET, PUT, or SUBSCRIBE).
     ///
-    /// Returns a list of (evicted_contract, upstream_to_notify) pairs.
-    /// The upstream should be sent an Unsubscribed message for each evicted contract.
+    /// Returns a list of contracts that were removed from the seeding cache.
+    /// Each entry contains the contract and optionally the upstream peer to notify.
     pub fn record_contract_access(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
-    ) -> Vec<(ContractKey, Option<PeerKeyLocation>)> {
+    ) -> Vec<UnseededContractInfo> {
         let evicted = self
             .seeding_cache
             .write()
@@ -515,7 +525,10 @@ impl SeedingManager {
                     );
                 }
 
-                (evicted_key, upstream)
+                UnseededContractInfo {
+                    contract: evicted_key,
+                    upstream_to_notify: upstream,
+                }
             })
             .collect()
     }
@@ -977,10 +990,14 @@ mod tests {
 
         // Should have eviction with upstream
         assert_eq!(evictions.len(), 1);
-        assert_eq!(evictions[0].0, key);
-        assert!(evictions[0].1.is_some());
+        assert_eq!(evictions[0].contract, key);
+        assert!(evictions[0].upstream_to_notify.is_some());
         assert_eq!(
-            evictions[0].1.as_ref().unwrap().socket_addr(),
+            evictions[0]
+                .upstream_to_notify
+                .as_ref()
+                .unwrap()
+                .socket_addr(),
             upstream.socket_addr()
         );
     }

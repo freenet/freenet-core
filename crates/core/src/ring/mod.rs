@@ -184,18 +184,15 @@ impl Ring {
     /// Record an access to a contract (GET, PUT, or SUBSCRIBE).
     ///
     /// This adds the contract to the seeding cache if not present, or refreshes
-    /// its LRU position if already cached. Returns the list of evicted contracts
-    /// that need cleanup (unsubscription, state removal, etc.).
+    /// its LRU position if already cached. Returns the list of contracts that
+    /// were removed from the cache due to capacity limits.
     ///
     /// The `size_bytes` should be the size of the contract state.
-    ///
-    /// Returns a list of (evicted_contract, upstream_to_notify) pairs.
-    /// The upstream should be sent an Unsubscribed message for each evicted contract.
     pub fn seed_contract(
         &self,
         key: ContractKey,
         size_bytes: u64,
-    ) -> Vec<(ContractKey, Option<PeerKeyLocation>)> {
+    ) -> Vec<seeding::UnseededContractInfo> {
         use seeding_cache::AccessType;
         self.seeding_manager
             .record_contract_access(key, size_bytes, AccessType::Put)
@@ -203,12 +200,12 @@ impl Ring {
 
     /// Record a GET access to a contract.
     ///
-    /// Returns a list of (evicted_contract, upstream_to_notify) pairs.
+    /// Returns a list of contracts that were removed from the cache.
     pub fn record_get_access(
         &self,
         key: ContractKey,
         size_bytes: u64,
-    ) -> Vec<(ContractKey, Option<PeerKeyLocation>)> {
+    ) -> Vec<seeding::UnseededContractInfo> {
         use seeding_cache::AccessType;
         self.seeding_manager
             .record_contract_access(key, size_bytes, AccessType::Get)
@@ -515,8 +512,9 @@ impl Ring {
                     if tx.is_none() {
                         let conns = self.connection_manager.connection_count();
                         tracing::warn!(
-                            "acquire_new returned None - likely no peers to query through (connections: {})",
-                            conns
+                            connections = conns,
+                            target_location = %ideal_location,
+                            "acquire_new returned None - likely no peers to query through"
                         );
                     } else {
                         tracing::info!(
@@ -528,8 +526,8 @@ impl Ring {
                     tracing::debug!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
-                        "At max concurrent connections, re-queuing location {}",
-                        ideal_location
+                        target_location = %ideal_location,
+                        "At max concurrent connections, re-queuing location"
                     );
                     pending_conn_adds.insert(ideal_location);
                 }
