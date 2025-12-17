@@ -4,7 +4,6 @@
 //! algorithm (LEDBAT, AIMD, etc.). The token bucket ensures smooth packet pacing
 //! without bursts, and supports dynamic rate updates from the congestion controller.
 
-
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
