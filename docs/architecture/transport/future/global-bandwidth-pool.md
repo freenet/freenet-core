@@ -1,5 +1,7 @@
 # Global Bandwidth Pool - Future Enhancement
 
+> **⚠️ NOT IMPLEMENTED** - This is a future design document for Phase 2. The feature described here does not exist yet.
+
 **Status**: Design documented, implementation deferred to separate PR
 **Priority**: Medium (Phase 2 - after current LEDBAT work stabilizes)
 **Estimated effort**: 2-4 weeks
