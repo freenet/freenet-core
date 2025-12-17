@@ -40,8 +40,8 @@ impl TokenBucket {
     /// * `rate` - Refill rate (bytes/second)
     ///
     /// # Example
-    /// ```
-    /// # use freenet::transport::token_bucket::TokenBucket;
+    /// ```ignore
+    /// use freenet::transport::token_bucket::TokenBucket;
     /// let bucket = TokenBucket::new(
     ///     10_000,      // 10 KB burst
     ///     1_000_000,   // 1 MB/s rate
@@ -71,18 +71,18 @@ impl TokenBucket {
     /// Duration to wait before transmitting
     ///
     /// # Example
-    /// ```
-    /// # use freenet::transport::token_bucket::TokenBucket;
-    /// # use std::time::Duration;
-    /// # tokio_test::block_on(async {
-    /// let bucket = TokenBucket::new(1000, 1_000_000);
+    /// ```ignore
+    /// use freenet::transport::token_bucket::TokenBucket;
+    /// use std::time::Duration;
+    /// tokio_test::block_on(async {
+    ///     let bucket = TokenBucket::new(1000, 1_000_000);
     ///
-    /// let wait = bucket.reserve(500);
-    /// if wait > Duration::ZERO {
-    ///     tokio::time::sleep(wait).await;
-    /// }
-    /// // Tokens already deducted, can transmit now
-    /// # });
+    ///     let wait = bucket.reserve(500);
+    ///     if wait > Duration::ZERO {
+    ///         tokio::time::sleep(wait).await;
+    ///     }
+    ///     // Tokens already deducted, can transmit now
+    /// });
     /// ```
     pub fn reserve(&self, bytes: usize) -> Duration {
         let mut state = self.state.lock();

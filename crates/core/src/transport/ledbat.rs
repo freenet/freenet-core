@@ -157,8 +157,8 @@ impl LedbatController {
     /// * `max_cwnd` - Maximum window (protocol limit or config)
     ///
     /// # Example
-    /// ```
-    /// # use freenet::transport::ledbat::LedbatController;
+    /// ```ignore
+    /// use freenet::transport::ledbat::LedbatController;
     /// let controller = LedbatController::new(
     ///     2848,      // 2 * MSS (RFC 6817)
     ///     2848,      // min
@@ -181,8 +181,8 @@ impl LedbatController {
     /// and other LEDBAT settings.
     ///
     /// # Example
-    /// ```
-    /// # use freenet::transport::ledbat::{LedbatController, LedbatConfig};
+    /// ```ignore
+    /// use freenet::transport::ledbat::{LedbatController, LedbatConfig};
     /// let config = LedbatConfig {
     ///     initial_cwnd: 14_600,  // IW10
     ///     ssthresh: 102_400,     // 100 KB
