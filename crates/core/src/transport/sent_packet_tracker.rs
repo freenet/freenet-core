@@ -205,6 +205,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
     }
 
     /// Get the smoothed RTT estimate
+    #[allow(dead_code)] // Used in tests, may be useful for debugging
     pub(super) fn smoothed_rtt(&self) -> Option<Duration> {
         self.srtt
     }
@@ -215,6 +216,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
     }
 
     /// Get the current retransmission timeout
+    #[allow(dead_code)] // Used in tests, may be useful for debugging
     pub(super) fn rto(&self) -> Duration {
         self.rto
     }
