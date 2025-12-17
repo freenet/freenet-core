@@ -61,22 +61,20 @@ pub fn bench_large_transfer_validation(c: &mut Criterion) {
                     |(channels, message, delay)| async move {
                         let delay_policy = PacketDelayPolicy::Fixed(delay);
 
-                        let (peer_a_pub, mut peer_a, peer_a_addr) =
-                            create_mock_peer_with_delay(
-                                PacketDropPolicy::ReceiveAll,
-                                delay_policy.clone(),
-                                channels.clone(),
-                            )
-                            .await
-                            .unwrap();
-                        let (peer_b_pub, mut peer_b, peer_b_addr) =
-                            create_mock_peer_with_delay(
-                                PacketDropPolicy::ReceiveAll,
-                                delay_policy,
-                                channels,
-                            )
-                            .await
-                            .unwrap();
+                        let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
+                            PacketDropPolicy::ReceiveAll,
+                            delay_policy.clone(),
+                            channels.clone(),
+                        )
+                        .await
+                        .unwrap();
+                        let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_delay(
+                            PacketDropPolicy::ReceiveAll,
+                            delay_policy,
+                            channels,
+                        )
+                        .await
+                        .unwrap();
 
                         let (conn_a_inner, conn_b_inner) = futures::join!(
                             peer_a.connect(peer_b_pub, peer_b_addr),
@@ -132,22 +130,20 @@ pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
                     |(channels, message, delay)| async move {
                         let delay_policy = PacketDelayPolicy::Fixed(delay);
 
-                        let (peer_a_pub, mut peer_a, peer_a_addr) =
-                            create_mock_peer_with_delay(
-                                PacketDropPolicy::ReceiveAll,
-                                delay_policy.clone(),
-                                channels.clone(),
-                            )
-                            .await
-                            .unwrap();
-                        let (peer_b_pub, mut peer_b, peer_b_addr) =
-                            create_mock_peer_with_delay(
-                                PacketDropPolicy::ReceiveAll,
-                                delay_policy,
-                                channels,
-                            )
-                            .await
-                            .unwrap();
+                        let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
+                            PacketDropPolicy::ReceiveAll,
+                            delay_policy.clone(),
+                            channels.clone(),
+                        )
+                        .await
+                        .unwrap();
+                        let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_delay(
+                            PacketDropPolicy::ReceiveAll,
+                            delay_policy,
+                            channels,
+                        )
+                        .await
+                        .unwrap();
 
                         let (conn_a_inner, conn_b_inner) = futures::join!(
                             peer_a.connect(peer_b_pub, peer_b_addr),
@@ -204,14 +200,13 @@ pub fn bench_congestion_256kb(c: &mut Criterion) {
                         let delay_policy =
                             PacketDelayPolicy::Fixed(Duration::from_millis(delay_ms));
 
-                        let (peer_a_pub, mut peer_a, peer_a_addr) =
-                            create_mock_peer_with_delay(
-                                drop_policy.clone(),
-                                delay_policy.clone(),
-                                channels.clone(),
-                            )
-                            .await
-                            .unwrap();
+                        let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
+                            drop_policy.clone(),
+                            delay_policy.clone(),
+                            channels.clone(),
+                        )
+                        .await
+                        .unwrap();
                         let (peer_b_pub, mut peer_b, peer_b_addr) =
                             create_mock_peer_with_delay(drop_policy, delay_policy, channels)
                                 .await

@@ -3,7 +3,7 @@
 use criterion::{BatchSize, Criterion, Throughput};
 use dashmap::DashMap;
 use freenet::transport::mock_transport::{
-    create_mock_peer_with_delay, create_mock_peer_with_bandwidth, PacketDelayPolicy,
+    create_mock_peer_with_bandwidth, create_mock_peer_with_delay, PacketDelayPolicy,
     PacketDropPolicy,
 };
 use std::hint::black_box as std_black_box;
@@ -108,23 +108,21 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                     let (conn_a, conn_b) = rt.block_on(async {
                         let channels = Arc::new(DashMap::new());
 
-                        let (peer_a_pub, mut peer_a, peer_a_addr) =
-                            create_mock_peer_with_delay(
-                                PacketDropPolicy::ReceiveAll,
-                                PacketDelayPolicy::Fixed(delay),
-                                channels.clone(),
-                            )
-                            .await
-                            .unwrap();
+                        let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
+                            PacketDropPolicy::ReceiveAll,
+                            PacketDelayPolicy::Fixed(delay),
+                            channels.clone(),
+                        )
+                        .await
+                        .unwrap();
 
-                        let (peer_b_pub, mut peer_b, peer_b_addr) =
-                            create_mock_peer_with_delay(
-                                PacketDropPolicy::ReceiveAll,
-                                PacketDelayPolicy::Fixed(delay),
-                                channels,
-                            )
-                            .await
-                            .unwrap();
+                        let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_delay(
+                            PacketDropPolicy::ReceiveAll,
+                            PacketDelayPolicy::Fixed(delay),
+                            channels,
+                        )
+                        .await
+                        .unwrap();
 
                         let (conn_a_inner, conn_b_inner) = futures::join!(
                             peer_a.connect(peer_b_pub, peer_b_addr),
@@ -245,54 +243,57 @@ pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
     // Test with 100 MB/s bandwidth limit (10x the default)
     let bandwidth_limit_mb = 100;
 
-    group.bench_function(&format!("1mb_transfer_{}mb_limit", bandwidth_limit_mb), |b| {
-        b.to_async(&rt).iter(|| async {
-            let delay = Duration::from_millis(10); // 10ms RTT
-            let channels = Arc::new(DashMap::new());
-            let bandwidth_limit = Some(bandwidth_limit_mb * 1_000_000); // Convert to bytes/sec
+    group.bench_function(
+        &format!("1mb_transfer_{}mb_limit", bandwidth_limit_mb),
+        |b| {
+            b.to_async(&rt).iter(|| async {
+                let delay = Duration::from_millis(10); // 10ms RTT
+                let channels = Arc::new(DashMap::new());
+                let bandwidth_limit = Some(bandwidth_limit_mb * 1_000_000); // Convert to bytes/sec
 
-            // Create connection with high bandwidth limit
-            let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_bandwidth(
-                PacketDropPolicy::ReceiveAll,
-                PacketDelayPolicy::Fixed(delay),
-                channels.clone(),
-                bandwidth_limit,
-            )
-            .await
-            .unwrap();
+                // Create connection with high bandwidth limit
+                let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_bandwidth(
+                    PacketDropPolicy::ReceiveAll,
+                    PacketDelayPolicy::Fixed(delay),
+                    channels.clone(),
+                    bandwidth_limit,
+                )
+                .await
+                .unwrap();
 
-            let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_bandwidth(
-                PacketDropPolicy::ReceiveAll,
-                PacketDelayPolicy::Fixed(delay),
-                channels,
-                bandwidth_limit,
-            )
-            .await
-            .unwrap();
+                let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_bandwidth(
+                    PacketDropPolicy::ReceiveAll,
+                    PacketDelayPolicy::Fixed(delay),
+                    channels,
+                    bandwidth_limit,
+                )
+                .await
+                .unwrap();
 
-            let (conn_a_inner, conn_b_inner) = futures::join!(
-                peer_a.connect(peer_b_pub, peer_b_addr),
-                peer_b.connect(peer_a_pub, peer_a_addr),
-            );
-            let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-            let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+                let (conn_a_inner, conn_b_inner) = futures::join!(
+                    peer_a.connect(peer_b_pub, peer_b_addr),
+                    peer_b.connect(peer_a_pub, peer_a_addr),
+                );
+                let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+                let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
 
-            let message = vec![0xABu8; 1024 * 1024]; // 1MB
-            let start = Instant::now();
-            conn_a.send(message).await.unwrap();
-            let received: Vec<u8> = conn_b.recv().await.unwrap();
-            let elapsed = start.elapsed();
+                let message = vec![0xABu8; 1024 * 1024]; // 1MB
+                let start = Instant::now();
+                conn_a.send(message).await.unwrap();
+                let received: Vec<u8> = conn_b.recv().await.unwrap();
+                let elapsed = start.elapsed();
 
-            // Log throughput
-            let throughput_mbps = (1.0 / elapsed.as_secs_f64()) * 8.0;
-            println!(
-                "1MB @ {}MB/s limit, 10ms RTT: {:?} ({:.2} Mbps)",
-                bandwidth_limit_mb, elapsed, throughput_mbps
-            );
+                // Log throughput
+                let throughput_mbps = (1.0 / elapsed.as_secs_f64()) * 8.0;
+                println!(
+                    "1MB @ {}MB/s limit, 10ms RTT: {:?} ({:.2} Mbps)",
+                    bandwidth_limit_mb, elapsed, throughput_mbps
+                );
 
-            std_black_box(received);
-        });
-    });
+                std_black_box(received);
+            });
+        },
+    );
 
     group.finish();
 }

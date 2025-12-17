@@ -22,9 +22,9 @@ use std::time::Duration;
 mod transport;
 
 // Import benchmark functions
+use transport::blackbox::*;
 use transport::level0::*;
 use transport::level1::*;
-use transport::blackbox::*;
 
 // =============================================================================
 // CI Benchmark Groups
