@@ -273,11 +273,12 @@ impl PeerConnection {
     #[instrument(name = "peer_connection", skip_all)]
     pub async fn send<T>(&mut self, data: T) -> Result
     where
-        T: Serialize + Send + std::fmt::Debug + 'static,
+        T: Serialize + Send + std::fmt::Debug,
     {
-        let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
-            .await
-            .unwrap();
+        // Serialize directly on async runtime - bincode is fast enough (<1ms for typical messages)
+        // that spawn_blocking overhead isn't worth it. Using spawn_blocking here caused chronic
+        // blocking pool thread churn under load (see issue #2310).
+        let data = bincode::serialize(&data).expect("serialization failed");
         if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
@@ -1034,5 +1035,37 @@ mod tests {
         out_res?;
         assert_eq!(message, inbound_msg);
         Ok(())
+    }
+
+    /// Verify that bincode serialization is fast enough to run on async runtime.
+    ///
+    /// This test documents the assumption behind removing spawn_blocking from send().
+    /// Bincode serialization of typical messages should complete in < 1ms, making
+    /// spawn_blocking overhead unnecessary and actually harmful (causes thread churn).
+    ///
+    /// See issue #2310 for details on the thread explosion this caused.
+    #[test]
+    fn bincode_serialization_is_fast_enough_for_async() {
+        use std::time::Instant;
+
+        // Test with various payload sizes up to MAX_DATA_SIZE
+        let test_sizes = [100, 1000, MAX_DATA_SIZE / 2, MAX_DATA_SIZE];
+
+        for size in test_sizes {
+            let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
+            let start = Instant::now();
+            let _serialized = bincode::serialize(&payload).expect("serialization failed");
+            let elapsed = start.elapsed();
+
+            // Serialization should complete in well under 10ms (typically < 1ms)
+            // We use 10ms as a generous upper bound to avoid flaky tests
+            assert!(
+                elapsed.as_millis() < 10,
+                "bincode serialization of {} bytes took {:?}, expected < 10ms. \
+                 If this fails consistently, reconsider whether spawn_blocking is needed.",
+                size,
+                elapsed
+            );
+        }
     }
 }
