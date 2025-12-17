@@ -441,6 +441,11 @@ impl LedbatController {
     /// RFC 6817 Section 2.4.1: halve cwnd on loss.
     ///
     /// Also exits slow start if currently in that phase.
+    ///
+    /// **Note:** Currently not called in production - the transport layer uses
+    /// [`on_timeout`] for retransmissions. This method is for future fast-retransmit
+    /// support (3 duplicate ACKs). LEDBAT primarily uses delay-based signals anyway,
+    /// so loss detection is less critical than in traditional TCP congestion control.
     pub fn on_loss(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
 
