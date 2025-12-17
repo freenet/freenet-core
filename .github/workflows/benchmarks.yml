@@ -83,7 +83,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Run transport benchmarks (requires bench feature)
-          cargo bench --bench transport_perf --features bench -- transport 2>&1 | tee bench_output.txt
+          # Uses transport_ci benchmark suite - fast, deterministic subset for CI
+          cargo bench --bench transport_ci --features bench 2>&1 | tee bench_output.txt
 
           if grep -q "regressed" bench_output.txt; then
             echo "regression_detected=true" >> $GITHUB_OUTPUT
