@@ -3178,3 +3178,126 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
 
     Ok(())
 }
+
+/// Regression test for issue #2326: Subscribe should complete locally when contract is cached,
+/// even if remote peers exist that don't have the contract yet.
+///
+/// Before the fix, Subscribe would forward to a remote peer even when the contract was
+/// cached locally. If that peer didn't have the contract, it would return subscribed=false,
+/// causing the client to think subscription failed.
+///
+/// This test validates the real user scenario:
+/// 1. Client does PUT (contract is cached locally)
+/// 2. Client immediately does Subscribe (before propagation to other peers)
+/// 3. Subscribe should succeed locally without network round-trip
+#[freenet_test(
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 60,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
+    ctx: &mut TestContext,
+) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    let peer_a = ctx.node("peer-a")?;
+    let ws_api_port = peer_a.ws_port;
+
+    tracing::info!(
+        "Regression test #2326: Testing PUT then immediate Subscribe on peer-a (ws_port: {})",
+        ws_api_port
+    );
+
+    // Give time for peer to connect to gateway (so remote peers exist)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Connect to peer-a's websocket API
+    let uri = format!("ws://127.0.0.1:{ws_api_port}/v1/contract/command?encodingProtocol=native");
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client_api = WebApi::start(stream);
+
+    // Step 1: PUT with subscribe=false (like River room creation)
+    tracing::info!("Step 1: PUT contract with subscribe=false");
+    make_put(
+        &mut client_api,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    // Wait for PUT response
+    let put_resp = tokio::time::timeout(Duration::from_secs(30), client_api.recv()).await;
+    match put_resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            tracing::info!("PUT successful for contract: {}", key);
+            assert_eq!(key, contract_key);
+        }
+        Ok(Ok(other)) => {
+            bail!("Unexpected response while waiting for PUT: {:?}", other);
+        }
+        Ok(Err(e)) => {
+            bail!("Error receiving PUT response: {}", e);
+        }
+        Err(_) => {
+            bail!("Timeout waiting for PUT response");
+        }
+    }
+
+    // Step 2: IMMEDIATELY Subscribe (don't wait for propagation to gateway)
+    // This is the critical part - the contract is local but gateway may not have it yet
+    tracing::info!("Step 2: Immediately Subscribe (before propagation to gateway)");
+    make_subscribe(&mut client_api, contract_key).await?;
+
+    // Wait for Subscribe response
+    let sub_resp = tokio::time::timeout(Duration::from_secs(10), client_api.recv()).await;
+    match sub_resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key,
+            subscribed,
+            ..
+        }))) => {
+            // REGRESSION CHECK: Before fix #2326, this would return subscribed=false
+            // because Subscribe forwarded to gateway (which didn't have the contract yet)
+            ensure!(
+                subscribed,
+                "REGRESSION FAILURE (Issue #2326): Subscribe returned subscribed=false. \
+                 This indicates the bug is present - Subscribe forwarded to a remote peer \
+                 instead of completing locally for a cached contract."
+            );
+            tracing::info!(
+                "Subscribe successful for contract: {} (completed locally as expected)",
+                key
+            );
+            assert_eq!(key, contract_key);
+        }
+        Ok(Ok(other)) => {
+            bail!(
+                "Unexpected response while waiting for Subscribe: {:?}",
+                other
+            );
+        }
+        Ok(Err(e)) => {
+            bail!("Error receiving Subscribe response: {}", e);
+        }
+        Err(_) => {
+            bail!("Timeout waiting for Subscribe response");
+        }
+    }
+
+    // Cleanup
+    client_api
+        .send(ClientRequest::Disconnect { cause: None })
+        .await?;
+
+    tracing::info!("Issue #2326 regression test passed: PUT then immediate Subscribe works");
+
+    Ok(())
+}
