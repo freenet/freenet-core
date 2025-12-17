@@ -29,7 +29,7 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
 
         for delay_ms in [10, 50, 100] {
             group.bench_function(
-                &format!("{}kb_{}ms_no_warmup", transfer_size_kb, delay_ms),
+                format!("{}kb_{}ms_no_warmup", transfer_size_kb, delay_ms),
                 |b| {
                     b.to_async(&rt).iter_batched(
                         || {
@@ -102,7 +102,7 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
             let delay = Duration::from_millis(delay_ms);
 
             group.bench_function(
-                &format!("{}kb_{}ms_warm", transfer_size_kb, delay_ms),
+                format!("{}kb_{}ms_warm", transfer_size_kb, delay_ms),
                 |b| {
                     // Setup connection and warmup OUTSIDE measurement
                     let (conn_a, conn_b) = rt.block_on(async {
@@ -244,7 +244,7 @@ pub fn bench_high_bandwidth_throughput(c: &mut Criterion) {
     let bandwidth_limit_mb = 100;
 
     group.bench_function(
-        &format!("1mb_transfer_{}mb_limit", bandwidth_limit_mb),
+        format!("1mb_transfer_{}mb_limit", bandwidth_limit_mb),
         |b| {
             b.to_async(&rt).iter(|| async {
                 let delay = Duration::from_millis(10); // 10ms RTT

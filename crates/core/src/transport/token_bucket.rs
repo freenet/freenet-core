@@ -108,13 +108,6 @@ impl TokenBucket {
         wait_time
     }
 
-    /// Deprecated: Tokens are now deducted immediately in reserve().
-    /// This is kept for API compatibility but is a no-op.
-    #[deprecated(note = "No longer needed - tokens deducted in reserve()")]
-    pub fn consume_reserved(&self, _bytes: usize) {
-        // No-op: tokens already deducted in reserve()
-    }
-
     /// Update the refill rate dynamically.
     ///
     /// Called by the congestion controller when the rate changes.

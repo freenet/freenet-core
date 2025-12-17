@@ -1625,20 +1625,15 @@ pub mod mock_transport {
     }
 
     /// Policy for simulating network delay in mock transport.
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     pub enum PacketDelayPolicy {
         /// No artificial delay (instant delivery)
+        #[default]
         NoDelay,
         /// Fixed delay for all packets
         Fixed(Duration),
         /// Uniform random delay between min and max
         Uniform { min: Duration, max: Duration },
-    }
-
-    impl Default for PacketDelayPolicy {
-        fn default() -> Self {
-            PacketDelayPolicy::NoDelay
-        }
     }
 
     /// Mock socket implementation for testing transport without real network I/O.

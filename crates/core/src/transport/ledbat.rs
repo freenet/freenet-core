@@ -960,6 +960,6 @@ mod tests {
 
         // With proper randomization, we should see some variation
         // (initial_cwnd is fixed, so this just verifies no crashes with RNG)
-        assert!(ssthresh_values.len() >= 1);
+        assert!(!ssthresh_values.is_empty());
     }
 }
