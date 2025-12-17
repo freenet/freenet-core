@@ -278,7 +278,7 @@ impl PeerConnection {
         // Serialize directly on async runtime - bincode is fast enough (<1ms for typical messages)
         // that spawn_blocking overhead isn't worth it. Using spawn_blocking here caused chronic
         // blocking pool thread churn under load (see issue #2310).
-        let data = bincode::serialize(&data).expect("serialization failed");
+        let data = bincode::serialize(&data)?;
         if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
@@ -1046,26 +1046,54 @@ mod tests {
     /// See issue #2310 for details on the thread explosion this caused.
     #[test]
     fn bincode_serialization_is_fast_enough_for_async() {
+        use crate::message::{NetMessage, NetMessageV1, ProximityCacheMessage};
+        use freenet_stdlib::prelude::ContractInstanceId;
         use std::time::Instant;
 
-        // Test with various payload sizes up to MAX_DATA_SIZE
-        let test_sizes = [100, 1000, MAX_DATA_SIZE / 2, MAX_DATA_SIZE];
-
-        for size in test_sizes {
-            let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
+        // Helper to time serialization and assert it's fast enough
+        fn assert_fast_serialize<T: serde::Serialize>(name: &str, value: &T) {
             let start = Instant::now();
-            let _serialized = bincode::serialize(&payload).expect("serialization failed");
+            let serialized = bincode::serialize(value).expect("serialization failed");
             let elapsed = start.elapsed();
 
             // Serialization should complete in well under 10ms (typically < 1ms)
-            // We use 10ms as a generous upper bound to avoid flaky tests
+            // We use 10ms as a generous upper bound to avoid flaky tests on slow CI
             assert!(
                 elapsed.as_millis() < 10,
-                "bincode serialization of {} bytes took {:?}, expected < 10ms. \
+                "{} serialization ({} bytes) took {:?}, expected < 10ms. \
                  If this fails consistently, reconsider whether spawn_blocking is needed.",
-                size,
+                name,
+                serialized.len(),
                 elapsed
             );
         }
+
+        // Test 1: Simple byte payloads at various sizes (baseline)
+        for size in [100, 1000, MAX_DATA_SIZE / 2, MAX_DATA_SIZE] {
+            let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
+            assert_fast_serialize(&format!("Vec<u8>[{}]", size), &payload);
+        }
+
+        // Test 2: Actual network message types used in production
+        // These are the types that go through peer_connection.send()
+
+        // ProximityCache messages (common during connection setup)
+        let cache_msg = NetMessage::V1(NetMessageV1::ProximityCache {
+            message: ProximityCacheMessage::CacheAnnounce {
+                added: vec![ContractInstanceId::new([1u8; 32])],
+                removed: vec![],
+            },
+        });
+        assert_fast_serialize("ProximityCacheMessage", &cache_msg);
+
+        // Large cache state response (worst case for ProximityCache)
+        let large_cache = NetMessage::V1(NetMessageV1::ProximityCache {
+            message: ProximityCacheMessage::CacheStateResponse {
+                contracts: (0..100)
+                    .map(|i| ContractInstanceId::new([i as u8; 32]))
+                    .collect(),
+            },
+        });
+        assert_fast_serialize("Large CacheStateResponse", &large_cache);
     }
 }
