@@ -706,23 +706,44 @@ mod tests {
 
     #[tokio::test]
     async fn test_ledbat_decreases_when_above_target() {
-        let controller = LedbatController::new(100_000, 2848, 10_000_000);
+        // Disable slow start to test pure LEDBAT congestion avoidance
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            enable_slow_start: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
 
         // Track flightsize to avoid application-limited cap interference
-        controller.on_send(50_000); // High flightsize
+        controller.on_send(200_000); // High flightsize
 
-        // Set base delay
+        // Set base delay with low RTT samples
         controller.on_ack(Duration::from_millis(10), 1000);
         controller.on_ack(Duration::from_millis(10), 1000);
+
+        // Wait for update interval
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Fill the delay filter with high RTT samples (filter uses MIN over 4 samples)
+        // We need enough high-RTT samples to push out the low ones
+        for _ in 0..4 {
+            controller.on_send(10_000);
+            controller.on_ack(Duration::from_millis(160), 2000);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
 
         let initial_cwnd = controller.current_cwnd();
 
         // Wait for update interval
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        // RTT above target (10ms + 150ms = 160ms > 100ms target)
-        // off_target = -60ms (negative = decrease)
-        // Should decrease
+        // RTT above target (10ms base + 150ms queuing = 160ms > 100ms target)
+        // Now filter has [160, 160, 160, 160], filtered_delay = 160ms
+        // queuing_delay = 160ms - 10ms = 150ms > 100ms target
+        // off_target = -50ms (negative = decrease)
+        controller.on_send(10_000);
         controller.on_ack(Duration::from_millis(160), 5000);
 
         let new_cwnd = controller.current_cwnd();
@@ -821,14 +842,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_ledbat_cwnd_formula_correctness() {
-        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+        // Disable slow start to test pure LEDBAT congestion avoidance formula
+        let config = LedbatConfig {
+            initial_cwnd: 10_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            enable_slow_start: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
 
         // Track flightsize for application-limited cap
-        controller.on_send(20_000); // Send enough to cover all acks
+        controller.on_send(50_000); // Send enough to cover all acks
 
         // Set base delay with filter (need 2+ samples)
         for _ in 0..4 {
             controller.on_ack(Duration::from_millis(10), 1000);
+        }
+
+        // Wait for update interval
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Fill the delay filter with 30ms RTT samples (below target)
+        // This establishes a consistent filtered delay
+        for _ in 0..4 {
+            controller.on_send(5000);
+            controller.on_ack(Duration::from_millis(30), 1000);
+            tokio::time::sleep(Duration::from_millis(15)).await;
         }
 
         let initial_cwnd = controller.current_cwnd();
@@ -837,10 +877,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // RTT below target: 30ms (10ms base + 20ms queuing) < 100ms target
-        // off_target = 70ms, target = 100ms
-        // Δcwnd = GAIN * (70/100) * bytes_acked * MSS / cwnd
-        //       = 1.0 * 0.7 * 5000 * 1464 (MAX_DATA_SIZE) / initial_cwnd
-        // BUT: limited by application-limited cap (flightsize + ALLOWED_INCREASE)
+        // Now filter has [30, 30, 30, 30], filtered_delay = 30ms
+        // queuing_delay = 30ms - 10ms = 20ms < 100ms target
+        // off_target = +80ms (positive = increase)
+        // Δcwnd = GAIN * (80/100) * bytes_acked * MSS / cwnd
+        controller.on_send(10_000);
         controller.on_ack(Duration::from_millis(30), 5000);
 
         let new_cwnd = controller.current_cwnd();
