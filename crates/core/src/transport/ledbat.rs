@@ -18,7 +18,6 @@
 //! | Optimization goal | Maximize throughput | Minimize interference |
 //! | Competing flows | Slow to yield | Fast to yield |
 //! | User perception | Noticeable | Imperceptible |
-
 #![allow(dead_code)] // Infrastructure not yet integrated
 
 use parking_lot::Mutex;
