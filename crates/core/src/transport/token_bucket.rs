@@ -22,8 +22,10 @@ pub struct TokenBucket {
 struct BucketState {
     /// Maximum tokens (burst capacity in bytes)
     capacity: usize,
-    /// Current available tokens (bytes)
-    tokens: usize,
+    /// Current available tokens (bytes). Can be negative to track "debt" from
+    /// concurrent reservations - this ensures proper rate limiting when multiple
+    /// tasks reserve tokens simultaneously.
+    tokens: isize,
     /// Fractional tokens (prevents precision loss at high rates)
     fractional_tokens: f64,
     /// Refill rate (bytes/second)
@@ -51,7 +53,7 @@ impl TokenBucket {
         Self {
             state: Mutex::new(BucketState {
                 capacity,
-                tokens: capacity, // Start full
+                tokens: capacity as isize, // Start full
                 fractional_tokens: 0.0,
                 rate,
                 last_refill: Instant::now(),
@@ -88,22 +90,26 @@ impl TokenBucket {
         let mut state = self.state.lock();
         state.refill();
 
+        let bytes_isize = bytes as isize;
+
         // Calculate wait time BEFORE deducting
-        let wait_time = if state.tokens >= bytes {
+        let wait_time = if state.tokens >= bytes_isize {
             // Sufficient tokens available
             Duration::ZERO
         } else if state.rate == 0 {
             // Rate is 0 (not yet initialized or set to 0) - no rate limiting
             Duration::ZERO
         } else {
-            // Need to wait for more tokens
-            let deficit = bytes - state.tokens;
+            // Need to wait for more tokens. Deficit accounts for any existing
+            // debt (negative tokens) from previous concurrent reservations.
+            let deficit = bytes_isize - state.tokens;
             let wait_secs = deficit as f64 / state.rate as f64;
             Duration::from_secs_f64(wait_secs)
         };
 
-        // Deduct tokens (may go to 0 if we had a deficit)
-        state.tokens = state.tokens.saturating_sub(bytes);
+        // Deduct tokens - may go negative to track "debt" from concurrent reservations.
+        // This ensures subsequent reservations see the accumulated deficit and wait longer.
+        state.tokens -= bytes_isize;
 
         wait_time
     }
@@ -130,7 +136,8 @@ impl TokenBucket {
     pub fn available_tokens(&self) -> usize {
         let mut state = self.state.lock();
         state.refill();
-        state.tokens
+        // Return 0 if we're in debt (negative tokens)
+        state.tokens.max(0) as usize
     }
 }
 
@@ -154,10 +161,12 @@ impl BucketState {
         self.fractional_tokens += new_tokens_f64;
 
         // Convert whole tokens
-        let new_tokens_whole = self.fractional_tokens.floor() as usize;
+        let new_tokens_whole = self.fractional_tokens.floor() as isize;
         if new_tokens_whole > 0 {
-            // Add tokens, capped at capacity
-            self.tokens = (self.tokens + new_tokens_whole).min(self.capacity);
+            // Add tokens, capped at capacity. Note: tokens may be negative (debt),
+            // so we add to it and cap at capacity.
+            let capacity_isize = self.capacity as isize;
+            self.tokens = (self.tokens + new_tokens_whole).min(capacity_isize);
 
             // Keep fractional part for next refill
             self.fractional_tokens -= new_tokens_whole as f64;
@@ -313,11 +322,11 @@ mod tests {
 
         let elapsed = start.elapsed();
 
-        // Total: 100KB at 1MB/s should take ~100ms
-        // Allow very wide tolerance for concurrent scheduling variance
-        // Lowered from 40ms to 35ms to account for timing precision on fast systems
+        // Total: 100KB at 1MB/s should take ~100ms, minus 10KB burst = ~90ms minimum
+        // With proper debt tracking, concurrent reservations now correctly queue up
+        // their wait times instead of all seeing the same deficit.
         assert!(
-            elapsed >= Duration::from_millis(35),
+            elapsed >= Duration::from_millis(70),
             "Too fast: {:?}",
             elapsed
         );
