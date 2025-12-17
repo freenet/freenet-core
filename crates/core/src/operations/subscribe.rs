@@ -150,9 +150,10 @@ pub(crate) async fn request_subscribe(
         .ring
         .k_closest_potentially_caching(key, &skip_list, 3);
 
-    // If we have the contract locally but no remote peers, complete locally only
-    if has_contract_locally && candidates.is_empty() {
-        tracing::info!(tx = %id, contract = %key, phase = "complete", "Contract available locally, no remote peers, completing subscription locally");
+    // If we have the contract locally, complete locally - no need to forward to network
+    // The contract is already being seeded, so updates will flow to this client
+    if has_contract_locally {
+        tracing::info!(tx = %id, contract = %key, phase = "complete", "Contract available locally, completing subscription locally");
         return complete_local_subscription(op_manager, *id, *key).await;
     }
 
