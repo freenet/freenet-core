@@ -1,10 +1,11 @@
 use super::seeding_cache::{AccessType, SeedingCache};
-use super::{Location, PeerKeyLocation};
+use super::PeerKeyLocation;
 use crate::transport::ObservedAddr;
 use crate::util::time_source::InstantTimeSrc;
-use dashmap::{mapref::one::Ref as DmRef, DashMap};
+use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
 use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
+use std::net::SocketAddr;
 use tracing::{info, warn};
 
 /// Default seeding cache budget: 100MB
@@ -20,6 +21,9 @@ pub(crate) struct SeedingManager {
     subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
     /// LRU cache of contracts this peer is seeding, with byte-budget awareness.
     seeding_cache: RwLock<SeedingCache<InstantTimeSrc>>,
+    /// Reverse index: SocketAddr -> Set of contracts they're subscribed to.
+    /// This allows O(1) lookup for prune_subscriber instead of O(n) alter_all.
+    contracts_per_subscriber: DashMap<SocketAddr, DashSet<ContractKey>>,
 }
 
 impl SeedingManager {
@@ -36,6 +40,7 @@ impl SeedingManager {
                 DEFAULT_SEEDING_BUDGET_BYTES,
                 InstantTimeSrc::new(),
             )),
+            contracts_per_subscriber: DashMap::new(),
         }
     }
 
@@ -65,7 +70,18 @@ impl SeedingManager {
 
         // Clean up subscribers for evicted contracts
         for evicted_key in &evicted {
-            self.subscribers.remove(evicted_key);
+            if let Some((_, subs)) = self.subscribers.remove(evicted_key) {
+                for sub in subs {
+                    if let Some(addr) = sub.socket_addr() {
+                        // Remove contract from reverse index and clean up empty entries
+                        self.contracts_per_subscriber
+                            .remove_if_mut(&addr, |_, contracts| {
+                                contracts.remove(evicted_key);
+                                contracts.is_empty()
+                            });
+                    }
+                }
+            }
         }
 
         evicted
@@ -84,7 +100,19 @@ impl SeedingManager {
     pub fn remove_seeded_contract(&self, key: &ContractKey) -> bool {
         let removed = self.seeding_cache.write().remove(key).is_some();
         if removed {
-            self.subscribers.remove(key);
+            // Clean up subscribers and reverse index
+            if let Some((_, subs)) = self.subscribers.remove(key) {
+                for sub in subs {
+                    if let Some(addr) = sub.socket_addr() {
+                        // Remove contract from reverse index and clean up empty entries
+                        self.contracts_per_subscriber
+                            .remove_if_mut(&addr, |_, contracts| {
+                                contracts.remove(key);
+                                contracts.is_empty()
+                            });
+                    }
+                }
+            }
         }
         removed
     }
@@ -107,6 +135,7 @@ impl SeedingManager {
         } else {
             subscriber
         };
+        let subscriber_addr = subscriber.socket_addr();
         let mut subs = self
             .subscribers
             .entry(*contract)
@@ -152,6 +181,15 @@ impl SeedingManager {
                     );
                     Err(())
                 } else {
+                    // Update reverse index first to prevent race condition:
+                    // If prune_subscriber_by_addr runs concurrently, it will find
+                    // the contract in the reverse index and clean up properly.
+                    if let Some(addr) = subscriber_addr {
+                        self.contracts_per_subscriber
+                            .entry(addr)
+                            .or_default()
+                            .insert(*contract);
+                    }
                     subs_vec.insert(next_idx, subscriber);
                     let after = subs_vec
                         .iter()
@@ -175,20 +213,29 @@ impl SeedingManager {
         self.subscribers.get(contract)
     }
 
-    pub fn prune_subscriber(&self, loc: Location) {
-        self.subscribers.alter_all(|contract_key, mut subs| {
-            if let Some(pos) = subs.iter().position(|l| l.location() == Some(loc)) {
-                let removed = subs[pos].clone();
-                tracing::debug!(
-                    %contract_key,
-                    removed_peer = %removed.pub_key,
-                    removed_location = ?removed.location(),
-                    "seeding_manager: pruning subscriber due to location match"
-                );
-                subs.swap_remove(pos);
+    /// Prune a subscriber by their socket address.
+    /// Uses reverse index for O(1) lookup instead of O(n) full-map iteration.
+    pub fn prune_subscriber_by_addr(&self, addr: SocketAddr) {
+        // Use reverse index to find contracts this peer is subscribed to
+        if let Some((_, contracts)) = self.contracts_per_subscriber.remove(&addr) {
+            for contract_key_ref in contracts.iter() {
+                let contract_key = *contract_key_ref;
+                // Remove subscriber and clean up empty entries
+                self.subscribers.remove_if_mut(&contract_key, |_, subs| {
+                    if let Some(pos) = subs.iter().position(|l| l.socket_addr() == Some(addr)) {
+                        let removed = subs[pos].clone();
+                        tracing::debug!(
+                            %contract_key,
+                            removed_peer = %removed.pub_key,
+                            removed_addr = %addr,
+                            "seeding_manager: pruning subscriber by address"
+                        );
+                        subs.swap_remove(pos);
+                    }
+                    subs.is_empty()
+                });
             }
-            subs
-        });
+        }
     }
 
     /// Remove a subscriber by peer ID from a specific contract
@@ -199,6 +246,12 @@ impl SeedingManager {
                 .position(|l| l.pub_key == peer.pub_key && l.socket_addr() == Some(peer.addr))
             {
                 subs.swap_remove(pos);
+                // Update reverse index and clean up empty entries
+                self.contracts_per_subscriber
+                    .remove_if_mut(&peer.addr, |_, contracts| {
+                        contracts.remove(contract);
+                        contracts.is_empty()
+                    });
                 tracing::debug!(
                     contract = %contract,
                     peer = %peer,
@@ -484,11 +537,11 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_subscriber_removes_by_location() {
+    fn test_prune_subscriber_by_addr() {
         let seeding_manager = SeedingManager::new();
         let contract_key = make_contract_key(1);
 
-        // Create peers with specific addresses (location is derived from address)
+        // Create peers with specific addresses
         let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
         let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5001);
 
@@ -507,16 +560,93 @@ mod tests {
             2
         );
 
-        // Prune by peer1's location
-        if let Some(loc) = peer1.location() {
-            seeding_manager.prune_subscriber(loc);
-        }
+        // Prune by peer1's address using the efficient O(1) method
+        seeding_manager.prune_subscriber_by_addr(addr1);
 
         // Should have removed peer1
         let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
         assert_eq!(subs.len(), 1);
         assert!(!subs.iter().any(|p| p.socket_addr() == Some(addr1)));
         assert!(subs.iter().any(|p| p.socket_addr() == Some(addr2)));
+    }
+
+    #[test]
+    fn test_reverse_index_cleanup_no_empty_entries() {
+        let seeding_manager = SeedingManager::new();
+        let contract_key1 = make_contract_key(1);
+        let contract_key2 = make_contract_key(2);
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let peer = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr);
+
+        // Subscribe the peer to both contracts
+        seeding_manager
+            .add_subscriber(&contract_key1, peer.clone(), None)
+            .unwrap();
+        seeding_manager
+            .add_subscriber(&contract_key2, peer.clone(), None)
+            .unwrap();
+
+        // Verify reverse index has the entry
+        assert!(seeding_manager.contracts_per_subscriber.contains_key(&addr));
+        assert_eq!(
+            seeding_manager
+                .contracts_per_subscriber
+                .get(&addr)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Prune the subscriber
+        seeding_manager.prune_subscriber_by_addr(addr);
+
+        // Verify reverse index entry was removed (not left as empty)
+        assert!(
+            !seeding_manager.contracts_per_subscriber.contains_key(&addr),
+            "Empty reverse index entries should be cleaned up"
+        );
+
+        // Verify forward index is also clean
+        assert!(seeding_manager.subscribers_of(&contract_key1).is_none());
+        assert!(seeding_manager.subscribers_of(&contract_key2).is_none());
+    }
+
+    #[test]
+    fn test_eviction_cleans_reverse_index() {
+        use super::super::seeding_cache::AccessType;
+
+        let seeding_manager = SeedingManager::new();
+        let contract_key = make_contract_key(1);
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let peer = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr);
+
+        // Add contract to cache and subscribe peer
+        seeding_manager.record_contract_access(contract_key, 1000, AccessType::Get);
+        seeding_manager
+            .add_subscriber(&contract_key, peer.clone(), None)
+            .unwrap();
+
+        // Verify reverse index has the entry
+        assert!(seeding_manager.contracts_per_subscriber.contains_key(&addr));
+
+        // Add a large contract that will evict the first one (cache budget is 100MB)
+        let large_contract = make_contract_key(2);
+        seeding_manager.record_contract_access(
+            large_contract,
+            DEFAULT_SEEDING_BUDGET_BYTES + 1,
+            AccessType::Get,
+        );
+
+        // The first contract should be evicted
+        assert!(!seeding_manager.is_seeding_contract(&contract_key));
+
+        // Reverse index should be cleaned up (entry removed since peer has no subscriptions left)
+        assert!(
+            !seeding_manager.contracts_per_subscriber.contains_key(&addr),
+            "Reverse index entry should be removed when all contracts are evicted"
+        );
     }
 
     #[test]
