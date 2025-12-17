@@ -23,7 +23,10 @@ concurrency:
 jobs:
   benchmark:
     name: Performance Benchmarks
-    runs-on: self-hosted
+    # NOTE: Using ubuntu-latest instead of self-hosted because the self-hosted
+    # runner is missing liblzma-dev and doesn't have passwordless sudo.
+    # When the self-hosted runner is updated, change back for consistent hardware.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     # Don't fail the whole workflow if benchmarks detect regressions
     continue-on-error: true
@@ -36,20 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Check/install system dependencies required for linking
-      # On self-hosted runners, liblzma-dev should be pre-installed
-      - name: Check system dependencies
+      # Install system dependencies required for linking
+      - name: Install system dependencies
         run: |
-          if pkg-config --exists liblzma 2>/dev/null; then
-            echo "✅ liblzma found"
-          elif command -v apt-get >/dev/null && sudo -n true 2>/dev/null; then
-            echo "Installing liblzma-dev..."
-            sudo apt-get update && sudo apt-get install -y liblzma-dev
-          else
-            echo "⚠️ liblzma not found and cannot install automatically"
-            echo "Please install liblzma-dev on the self-hosted runner"
-            # Continue anyway - linking will fail if library is truly missing
-          fi
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
