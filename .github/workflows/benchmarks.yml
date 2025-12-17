@@ -23,7 +23,10 @@ concurrency:
 jobs:
   benchmark:
     name: Performance Benchmarks
-    runs-on: self-hosted
+    # NOTE: Using ubuntu-latest instead of self-hosted because the self-hosted
+    # runner is missing liblzma-dev and doesn't have passwordless sudo.
+    # When the self-hosted runner is updated, change back for consistent hardware.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     # Don't fail the whole workflow if benchmarks detect regressions
     continue-on-error: true
@@ -35,6 +38,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      # Install system dependencies required for linking
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -83,7 +92,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Run transport benchmarks (requires bench feature)
-          cargo bench --bench transport_perf --features bench -- transport 2>&1 | tee bench_output.txt
+          # Uses transport_ci benchmark suite - fast, deterministic subset for CI
+          cargo bench --bench transport_ci --features bench 2>&1 | tee bench_output.txt
 
           if grep -q "regressed" bench_output.txt; then
             echo "regression_detected=true" >> $GITHUB_OUTPUT

@@ -116,10 +116,23 @@ ureq = { version = "3.1", features = ["json"] }
 which = "8.0"
 regex = "1"
 
+# CI-optimized benchmark suite (~8 min, deterministic)
 [[bench]]
-name = "transport_perf"
+name = "transport_ci"
 harness = false
 required-features = ["bench"]
+
+# LEDBAT validation benchmarks (manual, ~60 min)
+[[bench]]
+name = "transport_ledbat"
+harness = false
+required-features = ["bench"]
+
+# Full benchmark suite (manual, ~78 min, requires bench_full feature)
+[[bench]]
+name = "transport_full"
+harness = false
+required-features = ["bench", "bench_full"]
 
 [build-dependencies]
 chrono = "0.4"
@@ -134,3 +147,4 @@ testing = ["freenet-stdlib/testing"]
 console-subscriber = ["dep:console-subscriber"]
 test-network = ["dep:freenet-test-network"]
 bench = []  # Exposes internal test infrastructure for benchmarking
+bench_full = []  # Enables full benchmark suite (slow, ~78 min)

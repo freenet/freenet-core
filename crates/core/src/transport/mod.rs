@@ -30,8 +30,10 @@ mod received_packet_tracker;
 /// Syscall batching for improved UDP throughput.
 /// Uses sendmmsg on Linux, falls back to sequential sends on other platforms.
 mod batching;
+pub(crate) mod ledbat;
 mod sent_packet_tracker;
 mod symmetric_message;
+pub(crate) mod token_bucket;
 
 type MessagePayload = Vec<u8>;
 
@@ -207,7 +209,7 @@ mod tests {
         // Get receipts and simulate acknowledging them
         let receipts = received_tracker.get_receipts();
         assert_eq!(receipts, vec![1u32, 3, 5]);
-        sent_tracker.report_received_receipts(&receipts);
+        let _ = sent_tracker.report_received_receipts(&receipts);
 
         // Check resend action for lost packets
         sent_tracker

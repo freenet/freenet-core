@@ -21,11 +21,13 @@ mod outbound_stream;
 
 use super::{
     connection_handler::SerializedMessage,
+    ledbat::LedbatController,
     packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
     received_packet_tracker::ReportResult,
     sent_packet_tracker::{ResendAction, SentPacketTracker},
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
+    token_bucket::TokenBucket,
     TransportError,
 };
 use crate::util::time_source::InstantTimeSrc;
@@ -68,7 +70,10 @@ pub(crate) struct RemoteConnection {
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
     pub(super) transport_secret_key: TransportSecretKey,
-    pub(super) bandwidth_limit: Option<usize>,
+    /// LEDBAT congestion controller (RFC 6817) - adapts to network conditions
+    pub(super) ledbat: Arc<LedbatController>,
+    /// Token bucket rate limiter - smooths packet pacing based on LEDBAT rate
+    pub(super) token_bucket: Arc<TokenBucket>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -129,6 +134,9 @@ pub struct PeerConnection {
     first_failure_time: Option<std::time::Instant>,
     last_packet_report_time: Instant,
     keep_alive_handle: Option<JoinHandle<()>>,
+    /// Last time we updated the TokenBucket rate from LEDBAT
+    /// Used to implement RTT-adaptive rate updates (update approximately once per RTT)
+    last_rate_update: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for PeerConnection {
@@ -267,6 +275,7 @@ impl PeerConnection {
             first_failure_time: None,
             last_packet_report_time: Instant::now(),
             keep_alive_handle: Some(keep_alive_handle),
+            last_rate_update: None,
         }
     }
 
@@ -317,6 +326,14 @@ impl PeerConnection {
             ACK_CHECK_INTERVAL,
         );
         ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Rate update timer - updates TokenBucket rate based on LEDBAT cwnd every 100ms
+        // This allows the token bucket to adapt to network conditions dynamically
+        let mut rate_update_check = tokio::time::interval_at(
+            tokio::time::Instant::now() + ACK_CHECK_INTERVAL,
+            ACK_CHECK_INTERVAL,
+        );
+        rate_update_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         loop {
@@ -487,10 +504,16 @@ impl PeerConnection {
                         false
                     };
 
-                    self.remote_conn
+                    // Process ACKs and update LEDBAT congestion controller
+                    let (rtt_samples, _loss_rate) = self.remote_conn
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
+
+                    // Feed RTT samples to LEDBAT for congestion window adjustment
+                    for (rtt_sample, packet_size) in rtt_samples {
+                        self.remote_conn.ledbat.on_ack(rtt_sample, packet_size);
+                    }
 
                     let report_result = self.received_tracker.report_received_packet(packet_id);
                     match (report_result, should_send_receipts) {
@@ -617,6 +640,9 @@ impl PeerConnection {
                                 break;
                             }
                             ResendAction::Resend(idx, packet) => {
+                                // Notify LEDBAT of packet loss (timeout-based retransmission)
+                                self.remote_conn.ledbat.on_timeout();
+
                                 self.remote_conn
                                     .outbound_packets
                                     .send_async((self.remote_conn.remote_addr, packet.clone()))
@@ -638,6 +664,65 @@ impl PeerConnection {
                             "Background ACK timer: sending pending receipts"
                         );
                         self.noop(receipts).await?;
+                    }
+                }
+                // Rate update timer - update TokenBucket rate based on LEDBAT cwnd
+                // RTT-adaptive: only update if at least one RTT has elapsed since last update
+                _ = rate_update_check.tick() => {
+                    let now = std::time::Instant::now();
+
+                    // Use LEDBAT's base delay for rate calculation (consistent with its internal state)
+                    // Fallback to min_rtt only if base_delay is not yet established
+                    let base_delay = self.remote_conn.ledbat.base_delay();
+                    let rtt = if base_delay.is_zero() {
+                        self.remote_conn.sent_tracker.lock().min_rtt()
+                    } else {
+                        base_delay
+                    };
+
+                    // RTT-adaptive update: only update if at least one RTT has elapsed since last update
+                    // This prevents updating too frequently at high RTT or too slowly at low RTT
+                    let should_update = match self.last_rate_update {
+                        None => true, // First update
+                        Some(last_update) => {
+                            let elapsed = now.duration_since(last_update);
+                            // Update if at least one RTT has passed, with bounds (50ms min, 500ms max)
+                            let min_interval = rtt.max(Duration::from_millis(50)).min(Duration::from_millis(500));
+                            elapsed >= min_interval
+                        }
+                    };
+
+                    if should_update {
+                        let new_rate = self.remote_conn.ledbat.current_rate(rtt);
+                        let cwnd = self.remote_conn.ledbat.current_cwnd();
+                        let queuing_delay = self.remote_conn.ledbat.queuing_delay();
+
+                        // Calculate time since last update for debugging RTT-adaptive timing
+                        let since_last_update_ms = self.last_rate_update
+                            .map(|last| now.duration_since(last).as_millis())
+                            .unwrap_or(0);
+
+                        self.remote_conn.token_bucket.set_rate(new_rate);
+                        self.last_rate_update = Some(now);
+
+                        tracing::debug!(
+                            peer_addr = %self.remote_conn.remote_addr,
+                            // Rate control
+                            new_rate_bytes_per_sec = new_rate,
+                            new_rate_mbps = (new_rate as f64) / 1_000_000.0,
+                            // LEDBAT state
+                            cwnd_bytes = cwnd,
+                            cwnd_packets = cwnd / MAX_DATA_SIZE,
+                            // Delay measurements
+                            base_delay_ms = base_delay.as_millis(),
+                            rtt_ms = rtt.as_millis(),
+                            queuing_delay_ms = queuing_delay.as_millis(),
+                            target_delay_ms = 100, // TARGET constant
+                            // Derived metrics
+                            off_target_ms = (queuing_delay.as_millis() as i64) - 100,
+                            since_last_update_ms = since_last_update_ms,
+                            "LEDBAT metrics (RTT-adaptive rate update)"
+                        );
                     }
                 }
             }
@@ -772,7 +857,8 @@ impl PeerConnection {
                 data,
                 self.remote_conn.outbound_symmetric_key.clone(),
                 self.remote_conn.sent_tracker.clone(),
-                self.remote_conn.bandwidth_limit,
+                self.remote_conn.token_bucket.clone(),
+                self.remote_conn.ledbat.clone(),
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
@@ -988,6 +1074,10 @@ mod tests {
         let cipher = Aes128Gcm::new(&key.into());
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
 
+        // Initialize LEDBAT and TokenBucket for test
+        let ledbat = Arc::new(LedbatController::new(2928, 2928, 1_000_000_000));
+        let token_bucket = Arc::new(TokenBucket::new(10_000, 10_000_000));
+
         let stream_id = StreamId::next();
         // Send a long message using the outbound stream
         let outbound = tokio::task::spawn(send_stream(
@@ -998,7 +1088,8 @@ mod tests {
             message.clone(),
             cipher.clone(),
             sent_tracker,
-            None, // No bandwidth limit for test
+            token_bucket,
+            ledbat,
         ))
         .map_err(|e| e.into());
 
