@@ -101,67 +101,64 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
         for delay_ms in [10, 50, 100] {
             let delay = Duration::from_millis(delay_ms);
 
-            group.bench_function(
-                format!("{}kb_{}ms_warm", transfer_size_kb, delay_ms),
-                |b| {
-                    // Setup connection and warmup OUTSIDE measurement
-                    let (conn_a, conn_b) = rt.block_on(async {
-                        let channels = Arc::new(DashMap::new());
+            group.bench_function(format!("{}kb_{}ms_warm", transfer_size_kb, delay_ms), |b| {
+                // Setup connection and warmup OUTSIDE measurement
+                let (conn_a, conn_b) = rt.block_on(async {
+                    let channels = Arc::new(DashMap::new());
 
-                        let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
-                            PacketDropPolicy::ReceiveAll,
-                            PacketDelayPolicy::Fixed(delay),
-                            channels.clone(),
-                        )
-                        .await
-                        .unwrap();
+                    let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
+                        PacketDropPolicy::ReceiveAll,
+                        PacketDelayPolicy::Fixed(delay),
+                        channels.clone(),
+                    )
+                    .await
+                    .unwrap();
 
-                        let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_delay(
-                            PacketDropPolicy::ReceiveAll,
-                            PacketDelayPolicy::Fixed(delay),
-                            channels,
-                        )
-                        .await
-                        .unwrap();
+                    let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_delay(
+                        PacketDropPolicy::ReceiveAll,
+                        PacketDelayPolicy::Fixed(delay),
+                        channels,
+                    )
+                    .await
+                    .unwrap();
 
-                        let (conn_a_inner, conn_b_inner) = futures::join!(
-                            peer_a.connect(peer_b_pub, peer_b_addr),
-                            peer_b.connect(peer_a_pub, peer_a_addr),
-                        );
-                        let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-                        let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
-
-                        // Warmup: 10 x 100KB transfers to stabilize LEDBAT
-                        for _ in 0..10 {
-                            let msg = vec![0xABu8; 102400];
-                            conn_a.send(msg).await.unwrap();
-                            let _: Vec<u8> = conn_b.recv().await.unwrap();
-                        }
-
-                        (conn_a, conn_b)
-                    });
-
-                    let conn_a = Arc::new(tokio::sync::Mutex::new(conn_a));
-                    let conn_b = Arc::new(tokio::sync::Mutex::new(conn_b));
-
-                    b.to_async(&rt).iter_batched(
-                        || vec![0xABu8; transfer_size],
-                        |message| {
-                            let conn_a = conn_a.clone();
-                            let conn_b = conn_b.clone();
-                            async move {
-                                let mut conn_a = conn_a.lock().await;
-                                let mut conn_b = conn_b.lock().await;
-
-                                conn_a.send(message).await.unwrap();
-                                let received: Vec<u8> = conn_b.recv().await.unwrap();
-                                std_black_box(received);
-                            }
-                        },
-                        BatchSize::SmallInput,
+                    let (conn_a_inner, conn_b_inner) = futures::join!(
+                        peer_a.connect(peer_b_pub, peer_b_addr),
+                        peer_b.connect(peer_a_pub, peer_a_addr),
                     );
-                },
-            );
+                    let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
+                    let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+
+                    // Warmup: 10 x 100KB transfers to stabilize LEDBAT
+                    for _ in 0..10 {
+                        let msg = vec![0xABu8; 102400];
+                        conn_a.send(msg).await.unwrap();
+                        let _: Vec<u8> = conn_b.recv().await.unwrap();
+                    }
+
+                    (conn_a, conn_b)
+                });
+
+                let conn_a = Arc::new(tokio::sync::Mutex::new(conn_a));
+                let conn_b = Arc::new(tokio::sync::Mutex::new(conn_b));
+
+                b.to_async(&rt).iter_batched(
+                    || vec![0xABu8; transfer_size],
+                    |message| {
+                        let conn_a = conn_a.clone();
+                        let conn_b = conn_b.clone();
+                        async move {
+                            let mut conn_a = conn_a.lock().await;
+                            let mut conn_b = conn_b.lock().await;
+
+                            conn_a.send(message).await.unwrap();
+                            let received: Vec<u8> = conn_b.recv().await.unwrap();
+                            std_black_box(received);
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
         }
     }
     group.finish();
