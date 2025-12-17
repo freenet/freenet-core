@@ -36,6 +36,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Install system dependencies required for linking
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable

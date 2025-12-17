@@ -2,6 +2,11 @@
 //!
 //! This module re-exports all transport benchmark functions from their
 //! respective submodules for use in benchmark binaries.
+//!
+//! Note: dead_code warnings are expected since each benchmark binary
+//! only uses a subset of these functions.
+
+#![allow(dead_code)]
 
 pub mod blackbox;
 pub mod ledbat_validation;
