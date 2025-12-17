@@ -348,8 +348,21 @@ impl ConfigArgs {
             }
 
             remotely_loaded_gateways
+        } else if self.network_api.skip_load_from_network && self.network_api.is_gateway {
+            // When skip_load_from_network is set for a gateway, run fully isolated.
+            // Don't connect to any other gateways - this enables isolated test networks
+            // where the test gateway doesn't mesh with production.
+            if remotely_loaded_gateways.gateways.is_empty() {
+                tracing::info!(
+                    "Gateway running in isolated mode (skip_load_from_network), not connecting to other gateways"
+                );
+                Gateways { gateways: vec![] }
+            } else {
+                // Inline gateways were provided via --gateways flag, use those
+                remotely_loaded_gateways
+            }
         } else {
-            // When skip_load_from_network is set or remote fetch failed, use local gateways
+            // When skip_load_from_network is set for a regular peer, use local gateways file
             let mut gateways = match File::open(&*gateways_file) {
                 Ok(mut file) => {
                     let mut content = String::new();
