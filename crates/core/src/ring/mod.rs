@@ -181,22 +181,14 @@ impl Ring {
         }
     }
 
-    /// Record an access to a contract (GET, PUT, or SUBSCRIBE).
-    ///
-    /// This adds the contract to the seeding cache if not present, or refreshes
-    /// its LRU position if already cached. Returns the list of evicted contract keys.
-    ///
-    /// Note: Cache eviction is purely for memory management. Subscriptions are NOT
-    /// affected - the contract can be recovered from disk if needed.
+    /// Record a PUT access to a contract in the seeding cache.
     pub fn seed_contract(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
         use seeding_cache::AccessType;
         self.seeding_manager
             .record_contract_access(key, size_bytes, AccessType::Put)
     }
 
-    /// Record a GET access to a contract.
-    ///
-    /// Returns a list of evicted contract keys (for memory management only).
+    /// Record a GET access to a contract in the seeding cache.
     pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
         use seeding_cache::AccessType;
         self.seeding_manager
