@@ -16,17 +16,8 @@ use dashmap::DashMap;
 use freenet::transport::mock_transport::{
     create_mock_peer_with_delay, Channels, PacketDelayPolicy, PacketDropPolicy,
 };
-use freenet::transport::{OutboundConnectionHandler, PeerConnection};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// Helper struct to keep connection and its peer handler alive together
-struct LiveConnection {
-    conn: PeerConnection,
-    /// Must keep peer alive - it holds the inbound_packet_sender channel
-    #[allow(dead_code)]
-    peer: OutboundConnectionHandler,
-}
 
 /// Run a manual throughput benchmark with specified parameters
 async fn bench_throughput(
