@@ -129,6 +129,9 @@ pub(crate) struct JoinerState {
     pub observed_address: Option<SocketAddr>,
     pub accepted: HashSet<PeerKeyLocation>,
     pub last_progress: Instant,
+    /// True if the joiner started without knowing their external address.
+    /// Used for invariant checking: if true, we must receive ObservedAddress.
+    pub started_without_address: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -548,11 +551,13 @@ impl ConnectOp {
         backoff: Option<Backoff>,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
     ) -> Self {
+        let started_without_address = observed_address.is_none();
         let state = ConnectState::WaitingForResponses(JoinerState {
             target_connections,
             observed_address,
             accepted: HashSet::new(),
             last_progress: Instant::now(),
+            started_without_address,
         });
         Self {
             id,
@@ -704,6 +709,16 @@ impl ConnectOp {
                     "connect: register_acceptance result"
                 );
                 if result.satisfied {
+                    // INVARIANT: If the joiner started without knowing their external address,
+                    // they must have received ObservedAddress by the time the connect completes.
+                    // This catches bugs where ObservedAddress is not emitted (e.g., if the
+                    // transport layer prematurely fills in the address).
+                    debug_assert!(
+                        !state.started_without_address || state.observed_address.is_some(),
+                        "BUG: Connect completed but joiner never received ObservedAddress. \
+                         This indicates the transport layer may have prematurely filled in \
+                         the joiner's address, preventing ObservedAddress emission."
+                    );
                     tracing::info!(
                         tx = %self.id,
                         elapsed_ms = self.id.elapsed().as_millis(),
@@ -1742,6 +1757,7 @@ mod tests {
             observed_address: None,
             accepted: HashSet::new(),
             last_progress: Instant::now(),
+            started_without_address: true,
         };
 
         let response = ConnectResponse {
