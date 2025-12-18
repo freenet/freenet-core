@@ -39,6 +39,8 @@ The CI benchmark suite tests the fast, deterministic subset of benchmarks.
 
 ### Transport: Integration Benchmarks
 
+#### Cold Start (Connection Per Iteration)
+
 | Benchmark | Payload | Time | Throughput |
 |-----------|---------|------|------------|
 | **Connection Establish** | - | ~243 ms | - |
@@ -46,6 +48,25 @@ The CI benchmark suite tests the fast, deterministic subset of benchmarks.
 | | 256 B | ~248 ms | ~1.0 KiB/s |
 | | 1024 B | ~237 ms | ~4.2 KiB/s |
 | | 1364 B | ~245 ms | ~5.4 KiB/s |
+
+#### Warm Connection (Reused Connection)
+
+**Updated 2024-12-18** - Connection reuse fix implemented.
+
+| Benchmark | Payload | Time | Throughput | Speedup vs Cold |
+|-----------|---------|------|------------|-----------------|
+| **Warm Connection** | 1 KB | ~1.66 ms | ~603 KiB/s | **137x** |
+
+**Why warm connection throughput is much higher:**
+- Cold start includes ~220ms connection establishment overhead
+- Warm connection measures pure transfer throughput only
+- At 1KB message size, per-message overhead (encryption, serialization) still matters
+
+**Why throughput appears lower than 10 MB/s rate limit:**
+- Small messages (1KB) have high per-message overhead vs payload
+- Mock transport has specific characteristics (instant RTT)
+- 64KB+ transfers cause criterion timeout issues (needs investigation)
+- Real throughput testing requires larger sustained transfers
 
 ## Notes
 
