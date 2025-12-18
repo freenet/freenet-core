@@ -122,10 +122,15 @@ name = "transport_ci"
 harness = false
 required-features = ["bench"]
 
-# LEDBAT validation benchmarks (manual, ~60 min)
+# LEDBAT validation benchmarks (manual, ~3-5 min)
 [[bench]]
 name = "transport_ledbat"
 harness = false
+required-features = ["bench"]
+
+# Manual throughput benchmarks (test harness, no criterion, ~3 sec)
+[[bench]]
+name = "transport_manual"
 required-features = ["bench"]
 
 # Full benchmark suite (manual, ~78 min, requires bench_full feature)

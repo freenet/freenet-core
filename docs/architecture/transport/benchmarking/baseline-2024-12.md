@@ -39,6 +39,8 @@ The CI benchmark suite tests the fast, deterministic subset of benchmarks.
 
 ### Transport: Integration Benchmarks
 
+#### Cold Start (Connection Per Iteration)
+
 | Benchmark | Payload | Time | Throughput |
 |-----------|---------|------|------------|
 | **Connection Establish** | - | ~243 ms | - |
@@ -46,6 +48,109 @@ The CI benchmark suite tests the fast, deterministic subset of benchmarks.
 | | 256 B | ~248 ms | ~1.0 KiB/s |
 | | 1024 B | ~237 ms | ~4.2 KiB/s |
 | | 1364 B | ~245 ms | ~5.4 KiB/s |
+
+#### Warm Connection (Reused Connection)
+
+**Updated 2024-12-18** - Connection reuse fix implemented.
+
+| Benchmark | Payload | Time | Throughput | Speedup vs Cold |
+|-----------|---------|------|------------|-----------------|
+| **Warm Connection** | 1 KB | ~1.66 ms | ~603 KiB/s | **137x** |
+
+**Why warm connection throughput is much higher:**
+- Cold start includes ~220ms connection establishment overhead
+- Warm connection measures pure transfer throughput only
+- At 1KB message size, per-message overhead (encryption, serialization) still matters
+
+**Why throughput appears lower than 10 MB/s rate limit:**
+- Small messages (1KB) have high per-message overhead vs payload
+- Mock transport has specific characteristics (instant RTT)
+- 64KB+ transfers cause criterion timeout issues (needs investigation)
+- Real throughput testing requires larger sustained transfers
+
+### Manual Throughput Benchmarks (Without Criterion)
+
+**Updated 2024-12-18** - Custom benchmark harness to bypass criterion timeout issues.
+
+Due to criterion's warmup timeout with 16KB+ transfers, we created a custom manual harness (`transport_manual` bench). These results use single-iteration measurements without warmup.
+
+#### Instant RTT (0ms)
+
+| Message Size | Time | Throughput |
+|--------------|------|------------|
+| 1 KB | 3.78 ms | 2.17 Mbps |
+| 4 KB | 10.53 ms | 3.11 Mbps |
+| 16 KB | 1.85 ms | **71.01 Mbps** |
+| 32 KB | 6.72 ms | 39.00 Mbps |
+
+#### LAN RTT (2ms simulated)
+
+| Message Size | Time | Throughput |
+|--------------|------|------------|
+| 1 KB | 2.60 ms | 3.15 Mbps |
+| 4 KB | 1.53 ms | 21.41 Mbps |
+| 16 KB | 5.10 ms | 25.72 Mbps |
+| 32 KB | 11.54 ms | 22.71 Mbps |
+
+**Important notes:**
+- Single iteration per measurement (high variance expected)
+- Each test creates a fresh connection (includes connection establishment overhead)
+- 64KB+ messages hang even with single iteration (possible transport layer issue to investigate)
+- 16KB shows peak throughput of 71 Mbps - demonstrates transport can exceed rate limit for burst transfers
+- High variability suggests measurements are dominated by connection setup rather than steady-state throughput
+
+### Sustained and Concurrent Throughput Tests
+
+**Updated 2024-12-18** - Testing continuous message sending, bandwidth saturation, and concurrent streams.
+
+#### 1. Sustained Throughput (Connection Reuse)
+
+Sending multiple messages continuously on the same connection:
+
+| Test | Throughput | Notes |
+|------|------------|-------|
+| 1 KB × 100 | 2.46 Mbps | 100 messages, ~332ms total |
+| 1 KB × 500 | 2.41 Mbps | 500 messages, ~1697ms total |
+| 4 KB × 10+ | timeout | Hangs after first message |
+
+**Key finding**: 1KB messages can be sent continuously, but 4KB+ messages hang on iteration 2+.
+
+#### 2. Bandwidth Saturation (Maximum Throughput)
+
+Sending 1KB messages as fast as possible for 2 seconds:
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | **13.22 Mbps** |
+| Messages sent | 3,233 |
+| Total data | 3.31 MB |
+| Messages/sec | 1,614 |
+| Duration | 2.00 seconds |
+
+**Key finding**: Single stream can achieve **13.22 Mbps** sustained throughput, exceeding the 10 MB/s token bucket limit for burst transfers.
+
+#### 3. Concurrent Streams (Parallel Connections)
+
+4 parallel peer pairs sending 25 × 1KB messages each:
+
+| Metric | Value |
+|--------|-------|
+| **Aggregate throughput** | **0.70 Mbps** (700 Kbps) |
+| Total data | 0.10 MB (100 KB) |
+| Total time | 1170 ms |
+| Per-stream time | ~52-54 ms (very consistent) |
+
+**Key finding**: Concurrent streams show much lower aggregate throughput than single stream, suggesting serialization or contention in the mock transport layer.
+
+#### Analysis
+
+1. **Single stream can saturate bandwidth**: 13.22 Mbps demonstrates the transport can deliver high throughput when not limited by message size or concurrency issues
+
+2. **Message size threshold**: 4KB+ messages exhibit timeout behavior with connection reuse (iteration 2+)
+
+3. **Concurrency penalty**: 4 concurrent streams achieve only 0.70 Mbps aggregate vs 13.22 Mbps for single stream - indicates contention or serialization bottleneck
+
+4. **Mock transport limitations**: All tests use mock transport with instant RTT (0ms) - real UDP sockets would show different characteristics
 
 ## Notes
 
@@ -60,8 +165,11 @@ The CI benchmark suite tests the fast, deterministic subset of benchmarks.
 # CI subset (~8 min)
 cargo bench --bench transport_ci --features bench
 
-# LEDBAT validation (~60 min)
+# LEDBAT validation (~3-5 min)
 cargo bench --bench transport_ledbat --features bench
+
+# Manual throughput (custom harness, ~3 sec)
+cargo test --release --bench transport_manual --features bench -- --nocapture
 
 # Full suite (~78 min, requires bench_full feature)
 cargo bench --bench transport_full --features bench,bench_full

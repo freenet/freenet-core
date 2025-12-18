@@ -14,5 +14,6 @@ pub mod level0;
 pub mod level1;
 pub mod level2;
 pub mod level3;
+pub mod manual_throughput;
 pub mod slow_start;
 pub mod streaming;
