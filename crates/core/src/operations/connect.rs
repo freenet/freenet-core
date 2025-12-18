@@ -238,6 +238,13 @@ impl RelayState {
         estimator: &ConnectForwardEstimator,
     ) -> RelayActions {
         let mut actions = RelayActions::default();
+        // DEBUG: Log state at start of step()
+        tracing::warn!(
+            joiner_addr = ?self.request.joiner.peer_addr,
+            upstream_addr = %self.upstream_addr,
+            observed_sent = self.observed_sent,
+            "DEBUG: RelayState::step() start"
+        );
         // Add upstream's address (determined from transport layer) to visited list
         push_unique_addr(&mut self.request.visited, self.upstream_addr);
         // Add our own address to visited list
@@ -248,17 +255,32 @@ impl RelayState {
         // Fill in joiner's external address from transport layer if unknown.
         // This is the key step where the first recipient (gateway) determines the joiner's
         // external address from the actual packet source address.
-        if self.request.joiner.peer_addr.is_unknown() {
+        let discovered_joiner_addr = if self.request.joiner.peer_addr.is_unknown() {
             self.request.joiner.set_addr(self.upstream_addr);
-        }
+            true
+        } else {
+            false
+        };
 
-        // If joiner's address is now known (was filled in above or by network bridge from packet source)
-        // and we haven't yet sent the ObservedAddress notification, do so now.
-        // This tells the joiner their external address for future connections.
-        if let PeerAddr::Known(joiner_addr) = &self.request.joiner.peer_addr {
-            if !self.observed_sent {
-                self.observed_sent = true;
-                actions.observed_address = Some((self.request.joiner.clone(), *joiner_addr));
+        // Only send ObservedAddress if WE discovered the joiner's address (it was unknown
+        // and we just filled it in from the packet source). If the address was already known
+        // in the incoming request, the upstream relay already sent ObservedAddress.
+        // NOTE: Always emit ObservedAddress from the first hop (gateway) since it observes
+        // the joiner's external address from the packet source. The `discovered_joiner_addr`
+        // flag indicates we just filled in the address from the transport layer.
+        if discovered_joiner_addr {
+            if let PeerAddr::Known(joiner_addr) = &self.request.joiner.peer_addr {
+                if !self.observed_sent {
+                    self.observed_sent = true;
+                    let expected_location = crate::ring::Location::from_address(joiner_addr);
+                    tracing::warn!(
+                        joiner_addr = %joiner_addr,
+                        expected_location = %expected_location,
+                        upstream_addr = %self.upstream_addr,
+                        "DEBUG: discovered joiner addr, emitting ObservedAddress"
+                    );
+                    actions.observed_address = Some((self.request.joiner.clone(), *joiner_addr));
+                }
             }
         }
 
@@ -610,10 +632,6 @@ impl ConnectOp {
         self.first_hop.as_deref().cloned()
     }
 
-    fn take_desired_location(&mut self) -> Option<Location> {
-        self.desired_location.take()
-    }
-
     pub(crate) fn initiate_join_request(
         own: PeerKeyLocation,
         target: PeerKeyLocation,
@@ -778,6 +796,25 @@ impl Operation for ConnectOp {
                         tracing::warn!(tx = %tx, phase = "error", "connect request received without source address");
                         return Err(OpError::OpNotPresent(tx));
                     }
+                    (ConnectMsg::ObservedAddress { address, .. }, _) => {
+                        // ObservedAddress arrived but no operation exists - this can happen if:
+                        // 1. We're not the joiner (wrong recipient)
+                        // 2. The operation was never created (shouldn't happen)
+                        // Still try to update our address since this might be meant for us
+                        let location = Location::from_address(address);
+                        op_manager.ring.connection_manager.set_own_addr(*address);
+                        op_manager
+                            .ring
+                            .connection_manager
+                            .update_location(Some(location));
+                        tracing::info!(
+                            tx = %tx,
+                            observed_address = %address,
+                            location = %location,
+                            "connect: updated own_addr from ObservedAddress (no op state found)"
+                        );
+                        return Err(OpError::OpNotPresent(tx));
+                    }
                     _ => {
                         tracing::debug!(%tx, "connect received message without existing state");
                         return Err(OpError::OpNotPresent(tx));
@@ -785,7 +822,29 @@ impl Operation for ConnectOp {
                 };
                 Ok(OpInitialization { op, source_addr })
             }
-            Err(err) => Err(err.into()),
+            Err(err) => {
+                // Special case: ObservedAddress can arrive when the operation is in various states:
+                // - Completed: The joiner received Response before ObservedAddress
+                // - Running: The operation is currently being processed elsewhere
+                // We still need to update our external address in both cases.
+                if let ConnectMsg::ObservedAddress { address, .. } = msg {
+                    let location = Location::from_address(address);
+                    op_manager.ring.connection_manager.set_own_addr(*address);
+                    op_manager
+                        .ring
+                        .connection_manager
+                        .update_location(Some(location));
+                    tracing::info!(
+                        tx = %tx,
+                        observed_address = %address,
+                        location = %location,
+                        error = ?err,
+                        "connect: updated own_addr from ObservedAddress (op state: {:?})",
+                        err
+                    );
+                }
+                Err(err.into())
+            }
         }
     }
 
@@ -822,6 +881,12 @@ impl Operation for ConnectOp {
                         };
                         // Route through upstream (where the request came from) using hop-by-hop routing.
                         // Note: upstream_addr is already validated from source_addr at the start of this match arm.
+                        tracing::debug!(
+                            tx = %self.id,
+                            observed_address = %address,
+                            sending_to = %upstream_addr,
+                            "Sending ObservedAddress to joiner"
+                        );
                         network_bridge
                             .send(upstream_addr, NetMessage::V1(NetMessageV1::Connect(msg)))
                             .await?;
@@ -949,19 +1014,10 @@ impl Operation for ConnectOp {
                     if let Some(ConnectState::WaitingForResponses(_)) = &self.state {
                         // Joiner: process the response and connect to acceptor
                         if let Some(acceptance) = self.handle_response(&payload, Instant::now()) {
-                            if acceptance.assigned_location {
-                                if let Some(location) = self.take_desired_location() {
-                                    tracing::info!(
-                                        tx=%self.id,
-                                        assigned_location = %location.0,
-                                        "connect: assigning joiner location"
-                                    );
-                                    op_manager
-                                        .ring
-                                        .connection_manager
-                                        .update_location(Some(location));
-                                }
-                            }
+                            // Note: Location assignment happens in ObservedAddress handler,
+                            // not here. The joiner's ring location is derived from their
+                            // external IP address (observed by the gateway), not from
+                            // the routing target (desired_location).
 
                             if let Some(new_acceptor) = acceptance.new_acceptor {
                                 if let Some(addr) = new_acceptor.peer.socket_addr() {
@@ -1049,7 +1105,43 @@ impl Operation for ConnectOp {
                     }
                 }
                 ConnectMsg::ObservedAddress { address, .. } => {
+                    // DEBUG: Log what state we're in when receiving ObservedAddress
+                    let state_desc = match &self.state {
+                        Some(ConnectState::WaitingForResponses(_)) => {
+                            "WaitingForResponses (joiner)"
+                        }
+                        Some(ConnectState::Relaying(_)) => "Relaying (relay/gateway)",
+                        Some(ConnectState::Completed) => "Completed",
+                        None => "None",
+                    };
+                    let current_addr = op_manager.ring.connection_manager.get_own_addr();
+                    tracing::debug!(
+                        tx = %self.id,
+                        state = state_desc,
+                        current_own_addr = ?current_addr,
+                        received_observed_address = %address,
+                        "ObservedAddress received"
+                    );
+
                     self.handle_observed_address(*address, Instant::now());
+                    // Update this node's external address and ring location based on the observed
+                    // address. The joiner doesn't know their external IP (behind NAT), so the
+                    // gateway observes it from the UDP packet source and sends it back.
+                    // We must update both:
+                    // 1. own_addr - so diagnostics reports the correct address
+                    // 2. own_location - so routing uses the correct ring location
+                    let location = Location::from_address(address);
+                    op_manager.ring.connection_manager.set_own_addr(*address);
+                    op_manager
+                        .ring
+                        .connection_manager
+                        .update_location(Some(location));
+                    tracing::info!(
+                        tx = %self.id,
+                        observed_address = %address,
+                        location = %location,
+                        "connect: updated own_addr and location from observed address"
+                    );
                     Ok(store_operation_state(&mut self))
                 }
             }
@@ -1531,27 +1623,35 @@ mod tests {
     }
 
     #[test]
-    fn relay_emits_observed_address_for_private_joiner() {
+    fn relay_emits_observed_address_when_discovering_joiner_addr() {
+        // Test the gateway/relay discovering the joiner's external address.
+        // The joiner sends ConnectRequest with Unknown address (doesn't know their NAT address).
+        // The gateway/relay observes the actual packet source address and sends ObservedAddress back.
         let self_loc = make_peer(4050);
         let joiner_base = make_peer(5050);
-        let observed_addr = SocketAddr::new(
+
+        // The joiner's EXTERNAL address as seen by the gateway (from the UDP packet source)
+        // This is what the gateway will discover and send back via ObservedAddress
+        let external_nat_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
             joiner_base
                 .socket_addr()
                 .expect("test peer must have address")
                 .port(),
         );
-        // Create a joiner with the observed address (simulating what the network
-        // bridge does when it fills in the address from the packet source)
-        let joiner_with_observed_addr =
-            PeerKeyLocation::new(joiner_base.pub_key().clone(), observed_addr);
+
+        // Create joiner with UNKNOWN address - the joiner doesn't know their external NAT address
+        let joiner_with_unknown_addr =
+            PeerKeyLocation::with_unknown_addr(joiner_base.pub_key().clone());
+
         let mut state = RelayState {
-            upstream_addr: joiner_base
-                .socket_addr()
-                .expect("test peer must have address"),
+            // upstream_addr is the ACTUAL source address from the transport layer
+            // This is the joiner's external NAT address as seen by the gateway
+            upstream_addr: external_nat_addr,
             request: ConnectRequest {
                 desired_location: Location::random(),
-                joiner: joiner_with_observed_addr.clone(),
+                // Joiner has Unknown address in the request
+                joiner: joiner_with_unknown_addr.clone(),
                 ttl: 3,
                 visited: vec![],
             },
@@ -1566,21 +1666,72 @@ mod tests {
         let estimator = ConnectForwardEstimator::new();
         let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
 
-        let (target, addr) = actions
-            .observed_address
-            .expect("expected observed address update");
-        assert_eq!(addr, observed_addr);
+        // Gateway should emit ObservedAddress since it discovered the joiner's external address
+        let (target, addr) = actions.observed_address.expect(
+            "gateway should emit ObservedAddress when discovering joiner's external address",
+        );
+
+        // The address in ObservedAddress should be the external NAT address
+        assert_eq!(addr, external_nat_addr);
+
+        // The target should have the discovered address
         assert_eq!(
             target.socket_addr().expect("target must have address"),
-            observed_addr
+            external_nat_addr
         );
+
+        // The request's joiner should be updated with the discovered address
         assert_eq!(
             state
                 .request
                 .joiner
                 .socket_addr()
-                .expect("joiner must have address"),
-            observed_addr
+                .expect("joiner must have address after discovery"),
+            external_nat_addr
+        );
+    }
+
+    #[test]
+    fn relay_does_not_emit_observed_address_when_joiner_addr_already_known() {
+        // Test that ObservedAddress is NOT emitted when the joiner already has a known address.
+        // This happens for non-first hops in the routing path.
+        let self_loc = make_peer(4051);
+        let joiner_base = make_peer(5051);
+        let known_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)),
+            joiner_base
+                .socket_addr()
+                .expect("test peer must have address")
+                .port(),
+        );
+
+        // Joiner already has a Known address (filled in by the gateway/first hop)
+        let joiner_with_known_addr =
+            PeerKeyLocation::new(joiner_base.pub_key().clone(), known_addr);
+
+        let mut state = RelayState {
+            upstream_addr: known_addr,
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner_with_known_addr.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc);
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        // Should NOT emit ObservedAddress since the address was already known
+        assert!(
+            actions.observed_address.is_none(),
+            "non-first hop should NOT emit ObservedAddress when joiner addr already known"
         );
     }
 

@@ -22,16 +22,16 @@
 //! The snapshots are stored under the network's `run_root()/large-soak/` directory for later
 //! inspection or visualization.
 
-use anyhow::{anyhow, bail, ensure, Context};
+mod common;
+
+use anyhow::{ensure, Context};
+use common::{RiverSession, RiverUser};
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
-use regex::Regex;
 use serde_json::to_string_pretty;
 use std::{
     env, fs,
-    path::PathBuf,
     time::{Duration, Instant},
 };
-use tempfile::TempDir;
 use tokio::time::sleep;
 use which::which;
 
@@ -180,152 +180,4 @@ async fn large_network_soak() -> anyhow::Result<()> {
         snapshots_dir.display()
     );
     Ok(())
-}
-
-struct RiverSession {
-    riverctl: PathBuf,
-    alice_dir: TempDir,
-    bob_dir: TempDir,
-    alice_url: String,
-    bob_url: String,
-    room_key: String,
-    invite_regex: Regex,
-    room_regex: Regex,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum RiverUser {
-    Alice,
-    Bob,
-}
-
-impl RiverSession {
-    async fn initialize(
-        riverctl: PathBuf,
-        alice_url: String,
-        bob_url: String,
-    ) -> anyhow::Result<Self> {
-        let alice_dir = TempDir::new().context("failed to create Alice temp config dir")?;
-        let bob_dir = TempDir::new().context("failed to create Bob temp config dir")?;
-
-        let mut session = Self {
-            riverctl,
-            alice_dir,
-            bob_dir,
-            alice_url,
-            bob_url,
-            room_key: String::new(),
-            invite_regex: Regex::new(r"[A-Za-z0-9+/=]{40,}").unwrap(),
-            room_regex: Regex::new(r"[A-Za-z0-9]{40,}").unwrap(),
-        };
-
-        session.setup_room().await?;
-        Ok(session)
-    }
-
-    async fn setup_room(&mut self) -> anyhow::Result<()> {
-        let create_output = self
-            .run_riverctl(
-                RiverUser::Alice,
-                &[
-                    "room",
-                    "create",
-                    "--name",
-                    "large-network-soak",
-                    "--nickname",
-                    "Alice",
-                ],
-            )
-            .await?;
-        self.room_key = self
-            .room_regex
-            .find(&create_output)
-            .map(|m| m.as_str().to_string())
-            .ok_or_else(|| anyhow!("failed to parse room owner key from riverctl output"))?;
-
-        let invite_output = self
-            .run_riverctl(
-                RiverUser::Alice,
-                &["invite", "create", self.room_key.as_str()],
-            )
-            .await?;
-        let invitation_code = self
-            .invite_regex
-            .find_iter(&invite_output)
-            .filter(|m| m.as_str() != self.room_key)
-            .last()
-            .map(|m| m.as_str().to_string())
-            .ok_or_else(|| anyhow!("failed to parse invitation code from riverctl output"))?;
-
-        self.run_riverctl(
-            RiverUser::Bob,
-            &["invite", "accept", &invitation_code, "--nickname", "Bob"],
-        )
-        .await?;
-
-        self.send_message(RiverUser::Alice, "Soak test initialized")
-            .await?;
-        self.send_message(RiverUser::Bob, "Bob joined the soak test")
-            .await?;
-        Ok(())
-    }
-
-    async fn send_message(&self, user: RiverUser, body: &str) -> anyhow::Result<()> {
-        self.run_riverctl(user, &["message", "send", self.room_key.as_str(), body])
-            .await
-            .map(|_| ())
-    }
-
-    async fn list_messages(&self, user: RiverUser) -> anyhow::Result<()> {
-        self.run_riverctl(user, &["message", "list", self.room_key.as_str()])
-            .await
-            .map(|_| ())
-    }
-
-    async fn run_riverctl(&self, user: RiverUser, args: &[&str]) -> anyhow::Result<String> {
-        let (url, config_dir) = match user {
-            RiverUser::Alice => (&self.alice_url, self.alice_dir.path()),
-            RiverUser::Bob => (&self.bob_url, self.bob_dir.path()),
-        };
-
-        const MAX_RETRIES: usize = 3;
-        const RETRY_DELAY: Duration = Duration::from_secs(5);
-
-        for attempt in 1..=MAX_RETRIES {
-            let mut cmd = tokio::process::Command::new(&self.riverctl);
-            cmd.arg("--node-url").arg(url);
-            cmd.args(args);
-            cmd.env("RIVER_CONFIG_DIR", config_dir);
-
-            let output = cmd
-                .output()
-                .await
-                .context("failed to execute riverctl command")?;
-            if output.status.success() {
-                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-            }
-
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            // Only retry on transient infrastructure errors, not application-level bugs.
-            // "missing contract" errors indicate contract propagation bugs and should fail
-            // immediately rather than being masked by retries (see issue #2306).
-            let retriable = stderr.contains("Timeout waiting for")
-                || stderr.contains("connection refused")
-                || stderr.contains("HTTP request failed");
-            if attempt == MAX_RETRIES || !retriable {
-                bail!("riverctl failed (user {:?}): {}", user, stderr);
-            }
-            println!(
-                "riverctl attempt {}/{} failed for {:?}: {}; retrying in {}s",
-                attempt,
-                MAX_RETRIES,
-                user,
-                stderr.trim(),
-                RETRY_DELAY.as_secs()
-            );
-            sleep(RETRY_DELAY).await;
-        }
-
-        unreachable!("riverctl retry loop should always return or bail")
-    }
 }

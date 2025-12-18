@@ -328,29 +328,34 @@ impl ConnectionManager {
         }
     }
 
-    /// Returns this node location in the ring, if any (must have joined the ring already).
+    /// Returns this node's PeerKeyLocation.
     ///
-    /// # Panic
-    ///
-    /// Will panic if the node has no address assigned yet.
+    /// If the node's external address is not yet known (e.g., peer behind NAT
+    /// that hasn't received ObservedAddress yet), returns a PeerKeyLocation
+    /// with PeerAddr::Unknown.
     pub fn own_location(&self) -> PeerKeyLocation {
-        let location = f64::from_le_bytes(
-            self.own_location
-                .load(std::sync::atomic::Ordering::Acquire)
-                .to_le_bytes(),
-        );
-        let _location = if (location - -1f64).abs() < f64::EPSILON {
-            None
-        } else {
-            Some(Location::new(location))
-        };
-        let addr = self.get_own_addr().expect("own address not set");
-        PeerKeyLocation::new((*self.pub_key).clone(), addr)
+        match self.get_own_addr() {
+            Some(addr) => PeerKeyLocation::new((*self.pub_key).clone(), addr),
+            None => PeerKeyLocation::with_unknown_addr((*self.pub_key).clone()),
+        }
     }
 
     /// Returns our own socket address if set.
     pub fn get_own_addr(&self) -> Option<SocketAddr> {
         *self.own_addr.lock()
+    }
+
+    /// Returns the stored ring location, if set.
+    /// This is the location that was set by update_location(), typically from
+    /// the externally observed address received via ObservedAddress message.
+    pub fn get_stored_location(&self) -> Option<Location> {
+        let bits = self.own_location.load(std::sync::atomic::Ordering::Acquire);
+        let val = f64::from_le_bytes(bits.to_le_bytes());
+        if val < 0.0 {
+            None
+        } else {
+            Some(Location::new(val))
+        }
     }
 
     /// Look up a PeerKeyLocation by socket address from connections_by_location or transient connections.
@@ -463,10 +468,32 @@ impl ConnectionManager {
         let mut own_addr = self.own_addr.lock();
         if own_addr.is_none() {
             *own_addr = Some(addr);
+            tracing::info!(
+                addr = %addr,
+                "try_set_own_addr: initialized own address"
+            );
             None
         } else {
+            tracing::debug!(
+                existing = ?*own_addr,
+                attempted = %addr,
+                "try_set_own_addr: address already set, keeping existing"
+            );
             *own_addr
         }
+    }
+
+    /// Sets the own address unconditionally.
+    /// Used when a peer behind NAT learns their external address from ObservedAddress.
+    pub fn set_own_addr(&self, addr: SocketAddr) {
+        let mut own_addr = self.own_addr.lock();
+        let old_addr = *own_addr;
+        *own_addr = Some(addr);
+        tracing::warn!(
+            old_addr = ?old_addr,
+            new_addr = %addr,
+            "set_own_addr called - DEBUG: tracing address overwrites"
+        );
     }
 
     pub fn prune_alive_connection(&self, addr: SocketAddr) -> Option<Location> {
@@ -490,7 +517,8 @@ impl ConnectionManager {
             was_reserved = %was_reserved,
             "Adding connection to topology"
         );
-        debug_assert!(self.get_own_addr().expect("should be set") != addr);
+        // Verify we're not adding a connection to ourselves (if we know our own address)
+        debug_assert!(self.get_own_addr().map(|own| own != addr).unwrap_or(true));
         if was_reserved {
             self.pending_reservations.write().remove(&addr);
         }
