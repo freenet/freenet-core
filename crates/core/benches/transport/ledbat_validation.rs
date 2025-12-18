@@ -177,3 +177,13 @@ pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
 
     group.finish();
 }
+
+// NOTE: Benchmarks with 32KB+ transfers timeout during criterion warmup phase.
+// This appears to be an interaction between criterion's async benchmarking and
+// larger message sizes. The transport layer itself handles large transfers fine
+// (verified by unit tests). This needs further investigation.
+//
+// To properly test throughput approaching the 10 MB/s rate limit, we need either:
+// 1. A custom benchmark harness that doesn't use criterion's iter()
+// 2. Investigation into why criterion's warmup estimation hangs with large transfers
+// 3. Real UDP socket benchmarks instead of mock transport

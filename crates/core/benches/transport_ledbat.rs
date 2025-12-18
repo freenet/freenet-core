@@ -36,6 +36,7 @@ criterion_group!(
     targets =
         bench_large_transfer_validation,  // Cold start: 1KB, 4KB, 16KB
         bench_1mb_transfer_validation,    // Warm connection: 1KB, 4KB, 16KB
+        // NOTE: 32KB+ transfers timeout during criterion warmup - see ledbat_validation.rs
 );
 
 // Main entry point - LEDBAT validation benchmarks
