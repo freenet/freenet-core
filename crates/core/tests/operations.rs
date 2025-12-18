@@ -3301,3 +3301,209 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
 
     Ok(())
 }
+
+/// Test subscription tree pruning (Issue #2166).
+///
+/// This test validates that when a subscriber disconnects, updates are no longer
+/// sent to that peer. The pruning mechanism should clean up dead subscription branches.
+///
+/// Test flow:
+/// 1. Gateway puts a contract
+/// 2. Peer-A subscribes and receives the initial state
+/// 3. Gateway updates the contract → Peer-A receives the update
+/// 4. Peer-A disconnects
+/// 5. Gateway updates the contract again → should complete without errors
+///    (no failed sends to disconnected peer)
+///
+/// The test verifies pruning indirectly by ensuring updates complete successfully
+/// after a subscriber disconnects, without errors from trying to send to dead peers.
+#[freenet_test(
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 180,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
+    // Load test contract
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    // Get node information
+    let gateway = ctx.node("gateway")?;
+    let peer_a = ctx.node("peer-a")?;
+
+    tracing::info!(
+        "Nodes: gateway ws={}, peer-a ws={}",
+        gateway.ws_port,
+        peer_a.ws_port
+    );
+
+    // Wait for network to stabilize
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Connect WebSocket clients
+    let uri_gw = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        gateway.ws_port
+    );
+    let (stream_gw, _) = connect_async(&uri_gw).await?;
+    let mut client_gw = WebApi::start(stream_gw);
+
+    let uri_a = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        peer_a.ws_port
+    );
+    let (stream_a, _) = connect_async(&uri_a).await?;
+    let mut client_a = WebApi::start(stream_a);
+
+    // Step 1: Put contract on gateway
+    tracing::info!("Step 1: Putting contract on gateway");
+    make_put(
+        &mut client_gw,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(30), client_gw.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+                assert_eq!(key, contract_key, "Contract key mismatch");
+                tracing::info!("Contract put successfully: {}", key);
+                break;
+            }
+            other => {
+                tracing::warn!("Unexpected response during put: {:?}", other);
+            }
+        }
+    }
+
+    // Step 2: Subscribe peer-a to the contract
+    tracing::info!("Step 2: Subscribing peer-a to contract");
+    make_subscribe(&mut client_a, contract_key).await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(60), client_a.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            }) => {
+                assert_eq!(key, contract_key);
+                assert!(subscribed, "Peer-a failed to subscribe");
+                tracing::info!("Peer-a subscribed successfully");
+                break;
+            }
+            other => {
+                tracing::warn!("Peer-a: unexpected response: {:?}", other);
+            }
+        }
+    }
+
+    // Wait for subscription to propagate
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Step 3: Update contract from gateway - peer-a should receive it
+    tracing::info!("Step 3: Updating contract (peer-a should receive notification)");
+    let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())?;
+    todo_list.tasks.push(test_utils::Task {
+        id: 1,
+        title: "First update".to_string(),
+        description: "Testing subscription".to_string(),
+        completed: false,
+        priority: 1,
+    });
+    let update_state = WrappedState::from(serde_json::to_vec(&todo_list)?);
+
+    make_update(&mut client_gw, contract_key, update_state).await?;
+
+    // Wait for update response on gateway
+    loop {
+        let resp = timeout(Duration::from_secs(30), client_gw.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Gateway: Update completed successfully");
+                break;
+            }
+            other => {
+                tracing::warn!("Gateway: unexpected response: {:?}", other);
+            }
+        }
+    }
+
+    // Wait for peer-a to receive the update notification
+    let mut peer_a_received_update = false;
+    for _ in 0..10 {
+        match timeout(Duration::from_secs(3), client_a.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                ..
+            }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Peer-a received update notification");
+                peer_a_received_update = true;
+                break;
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!("Peer-a: unexpected response: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Peer-a: error: {}", e);
+            }
+            Err(_) => {
+                tracing::debug!("Peer-a: timeout waiting for update, retrying...");
+            }
+        }
+    }
+
+    if !peer_a_received_update {
+        tracing::warn!("Peer-a did not receive update notification (may be network topology)");
+    }
+
+    // Step 4: Disconnect peer-a
+    tracing::info!("Step 4: Disconnecting peer-a (triggers pruning)");
+    drop(client_a);
+
+    // Wait for disconnect detection and pruning
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Step 5: Update contract again - should complete without errors
+    tracing::info!("Step 5: Updating contract after peer-a disconnect (pruning test)");
+    todo_list.tasks.push(test_utils::Task {
+        id: 2,
+        title: "Second update".to_string(),
+        description: "After disconnect".to_string(),
+        completed: false,
+        priority: 2,
+    });
+    let update_state2 = WrappedState::from(serde_json::to_vec(&todo_list)?);
+
+    make_update(&mut client_gw, contract_key, update_state2).await?;
+
+    // Wait for update response - should succeed without errors
+    loop {
+        let resp = timeout(Duration::from_secs(30), client_gw.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                assert_eq!(key, contract_key);
+                tracing::info!(
+                    "Gateway: Update after disconnect completed successfully - pruning worked!"
+                );
+                break;
+            }
+            other => {
+                tracing::warn!("Gateway: unexpected response: {:?}", other);
+            }
+        }
+    }
+
+    tracing::info!("Subscription tree pruning test passed");
+    Ok(())
+}

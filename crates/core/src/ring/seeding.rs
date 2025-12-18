@@ -1,90 +1,460 @@
 use super::seeding_cache::{AccessType, SeedingCache};
-use super::PeerKeyLocation;
+use super::{Location, PeerKeyLocation};
+use crate::node::PeerId;
 use crate::transport::ObservedAddr;
 use crate::util::time_source::InstantTimeSrc;
-use dashmap::{mapref::one::Ref as DmRef, DashMap, DashSet};
+use dashmap::DashMap;
 use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default seeding cache budget: 100MB
 /// This can be made configurable via node configuration in the future.
 const DEFAULT_SEEDING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Role of a peer in a subscription relationship for a specific contract.
+///
+/// The subscription system forms a tree where updates flow from the contract
+/// source (root) down to all interested peers (leaves). Each peer in the tree
+/// has relationships with its neighbors:
+///
+/// ```text
+///                    [Source/Provider]
+///                          |
+///                    [Intermediate]  <-- has Upstream to Source
+///                    /           \
+///             [PeerA]           [PeerB]  <-- Downstream from Intermediate's perspective
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionRole {
+    /// This peer subscribed through us - they expect updates FROM us.
+    /// We are responsible for forwarding updates to them.
+    /// When all downstream peers disconnect and there's no local interest,
+    /// we should unsubscribe from our upstream.
+    Downstream,
+
+    /// We subscribed through this peer - we expect updates FROM them.
+    /// This is our source for contract updates.
+    /// There should be at most one upstream per contract.
+    Upstream,
+}
+
+/// A subscription entry tracking both the peer and their role in the subscription tree.
+#[derive(Clone, Debug)]
+pub struct SubscriptionEntry {
+    pub peer: PeerKeyLocation,
+    pub role: SubscriptionRole,
+}
+
+impl SubscriptionEntry {
+    pub fn new(peer: PeerKeyLocation, role: SubscriptionRole) -> Self {
+        Self { peer, role }
+    }
+
+    /// Check if this entry matches a given peer (by public key and address).
+    pub fn matches_peer(&self, peer_id: &PeerId) -> bool {
+        self.peer.pub_key == peer_id.pub_key && self.peer.socket_addr() == Some(peer_id.addr)
+    }
+
+    /// Check if this entry matches a given location.
+    pub fn matches_location(&self, loc: Location) -> bool {
+        self.peer.location() == Some(loc)
+    }
+}
+
+/// Error type for subscription operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscriptionError {
+    /// Maximum number of downstream subscribers reached for this contract.
+    MaxSubscribersReached,
+}
+
+/// Result of removing a subscriber, indicating whether upstream notification is needed.
+#[derive(Debug)]
+pub struct RemoveSubscriberResult {
+    /// The upstream peer to notify with Unsubscribed message, if pruning is needed.
+    /// This is Some when:
+    /// - The removed peer was downstream
+    /// - No more downstream subscribers remain
+    /// - No local interest in this contract
+    pub notify_upstream: Option<PeerKeyLocation>,
+}
+
+/// Result of pruning a peer from all contracts.
+#[derive(Debug)]
+pub struct PrunePeerResult {
+    /// List of (contract, upstream) pairs where upstream notification is needed.
+    pub notifications: Vec<(ContractKey, PeerKeyLocation)>,
+}
+
 pub(crate) struct SeedingManager {
-    /// The container for subscriber is a vec instead of something like a hashset
-    /// that would allow for blind inserts of duplicate peers subscribing because
-    /// of data locality, since we are likely to end up iterating over the whole sequence
-    /// of subscribers more often than inserting, and anyways is a relatively short sequence
-    /// then is more optimal to just use a vector for it's compact memory layout.
-    subscribers: DashMap<ContractKey, Vec<PeerKeyLocation>>,
+    /// Subscriptions per contract with explicit upstream/downstream roles.
+    /// This replaces the flat Vec<PeerKeyLocation> to enable proper tree pruning.
+    subscriptions: DashMap<ContractKey, Vec<SubscriptionEntry>>,
+
+    /// Contracts where a local client (WebSocket) is actively subscribed.
+    /// Prevents upstream unsubscribe while client subscriptions exist, even if
+    /// all network downstream peers have disconnected.
+    client_subscriptions: DashMap<ContractKey, HashSet<crate::client_events::ClientId>>,
+
     /// LRU cache of contracts this peer is seeding, with byte-budget awareness.
     seeding_cache: RwLock<SeedingCache<InstantTimeSrc>>,
-    /// Reverse index: SocketAddr -> Set of contracts they're subscribed to.
-    /// This allows O(1) lookup for prune_subscriber instead of O(n) alter_all.
-    contracts_per_subscriber: DashMap<SocketAddr, DashSet<ContractKey>>,
 }
 
 impl SeedingManager {
-    /// Max number of subscribers for a contract.
-    const MAX_SUBSCRIBERS: usize = 10;
-
-    /// All subscribers, including the upstream subscriber.
-    const TOTAL_MAX_SUBSCRIPTIONS: usize = Self::MAX_SUBSCRIBERS + 1;
+    /// Max number of downstream subscribers for a contract.
+    const MAX_DOWNSTREAM: usize = 10;
 
     pub fn new() -> Self {
         Self {
-            subscribers: DashMap::new(),
+            subscriptions: DashMap::new(),
+            client_subscriptions: DashMap::new(),
             seeding_cache: RwLock::new(SeedingCache::new(
                 DEFAULT_SEEDING_BUDGET_BYTES,
                 InstantTimeSrc::new(),
             )),
-            contracts_per_subscriber: DashMap::new(),
         }
     }
 
-    /// Record an access to a contract (GET, PUT, or SUBSCRIBE).
-    ///
-    /// This adds the contract to the seeding cache if not present, or refreshes
-    /// its LRU position if already cached. Returns the list of evicted contracts
-    /// that need cleanup (unsubscription, state removal, etc.).
-    ///
-    /// The `size_bytes` should be the size of the contract state.
-    ///
-    /// # Eviction handling
-    ///
-    /// Currently, eviction only removes local subscriber tracking. Full subscription
-    /// tree pruning (sending Unsubscribed to upstream peers) requires tracking
-    /// upstream->downstream relationships per contract, which is planned for #2164.
-    pub fn record_contract_access(
-        &self,
-        key: ContractKey,
-        size_bytes: u64,
-        access_type: AccessType,
-    ) -> Vec<ContractKey> {
-        let evicted = self
-            .seeding_cache
-            .write()
-            .record_access(key, size_bytes, access_type);
+    // ==================== Subscription Management ====================
 
-        // Clean up subscribers for evicted contracts
-        for evicted_key in &evicted {
-            if let Some((_, subs)) = self.subscribers.remove(evicted_key) {
-                for sub in subs {
-                    if let Some(addr) = sub.socket_addr() {
-                        // Remove contract from reverse index and clean up empty entries
-                        self.contracts_per_subscriber
-                            .remove_if_mut(&addr, |_, contracts| {
-                                contracts.remove(evicted_key);
-                                contracts.is_empty()
-                            });
+    /// Add a downstream subscriber (a peer that wants updates FROM us).
+    ///
+    /// The `observed_addr` parameter is the transport-level address from which the subscribe
+    /// message was received. This is used instead of the address embedded in `subscriber`
+    /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
+    pub fn add_downstream(
+        &self,
+        contract: &ContractKey,
+        subscriber: PeerKeyLocation,
+        observed_addr: Option<ObservedAddr>,
+    ) -> Result<(), SubscriptionError> {
+        // Use the transport-level address if available
+        let subscriber = if let Some(addr) = observed_addr {
+            PeerKeyLocation::new(subscriber.pub_key.clone(), addr.socket_addr())
+        } else {
+            subscriber
+        };
+
+        let mut subs = self.subscriptions.entry(*contract).or_default();
+
+        // Count current downstream subscribers
+        let downstream_count = subs
+            .iter()
+            .filter(|e| e.role == SubscriptionRole::Downstream)
+            .count();
+
+        if downstream_count >= Self::MAX_DOWNSTREAM {
+            warn!(
+                %contract,
+                subscriber = %subscriber.pub_key,
+                "add_downstream: max downstream subscribers reached"
+            );
+            return Err(SubscriptionError::MaxSubscribersReached);
+        }
+
+        // Check for duplicate
+        let already_exists = subs.iter().any(|e| {
+            e.role == SubscriptionRole::Downstream
+                && e.peer.pub_key == subscriber.pub_key
+                && e.peer.socket_addr() == subscriber.socket_addr()
+        });
+
+        if already_exists {
+            info!(
+                %contract,
+                subscriber = %subscriber.pub_key,
+                "add_downstream: subscriber already registered"
+            );
+            return Ok(());
+        }
+
+        let subscriber_addr = subscriber
+            .socket_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".into());
+
+        subs.push(SubscriptionEntry::new(
+            subscriber,
+            SubscriptionRole::Downstream,
+        ));
+
+        info!(
+            %contract,
+            subscriber = %subscriber_addr,
+            downstream_count = downstream_count + 1,
+            "add_downstream: registered new downstream subscriber"
+        );
+
+        Ok(())
+    }
+
+    /// Set the upstream source for a contract (the peer we get updates FROM).
+    ///
+    /// There can be at most one upstream per contract. If an upstream already exists,
+    /// it will be replaced.
+    pub fn set_upstream(&self, contract: &ContractKey, upstream: PeerKeyLocation) {
+        let mut subs = self.subscriptions.entry(*contract).or_default();
+
+        // Remove any existing upstream
+        subs.retain(|e| e.role != SubscriptionRole::Upstream);
+
+        let upstream_addr = upstream
+            .socket_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".into());
+
+        subs.push(SubscriptionEntry::new(upstream, SubscriptionRole::Upstream));
+
+        info!(
+            %contract,
+            upstream = %upstream_addr,
+            "set_upstream: registered upstream source"
+        );
+    }
+
+    /// Get the upstream peer for a contract (if any).
+    pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
+        self.subscriptions.get(contract).and_then(|subs| {
+            subs.iter()
+                .find(|e| e.role == SubscriptionRole::Upstream)
+                .map(|e| e.peer.clone())
+        })
+    }
+
+    /// Get all downstream subscribers for a contract (for broadcast targeting).
+    pub fn get_downstream(&self, contract: &ContractKey) -> Vec<PeerKeyLocation> {
+        self.subscriptions
+            .get(contract)
+            .map(|subs| {
+                subs.iter()
+                    .filter(|e| e.role == SubscriptionRole::Downstream)
+                    .map(|e| e.peer.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Check if we have any subscription entries for a contract.
+    pub fn has_subscriptions(&self, contract: &ContractKey) -> bool {
+        self.subscriptions
+            .get(contract)
+            .map(|subs| !subs.is_empty())
+            .unwrap_or(false)
+    }
+
+    // ==================== Client Subscription Management ====================
+
+    /// Register a client subscription for a contract (WebSocket client subscribed).
+    pub fn add_client_subscription(
+        &self,
+        contract: &ContractKey,
+        client_id: crate::client_events::ClientId,
+    ) {
+        self.client_subscriptions
+            .entry(*contract)
+            .or_default()
+            .insert(client_id);
+        debug!(
+            %contract,
+            %client_id,
+            "add_client_subscription: registered client subscription"
+        );
+    }
+
+    /// Remove a client subscription.
+    /// Returns true if this was the last client subscription for this contract.
+    pub fn remove_client_subscription(
+        &self,
+        contract: &ContractKey,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        let mut no_more_subscriptions = false;
+
+        if let Some(mut clients) = self.client_subscriptions.get_mut(contract) {
+            clients.remove(&client_id);
+            if clients.is_empty() {
+                no_more_subscriptions = true;
+            }
+        }
+
+        if no_more_subscriptions {
+            self.client_subscriptions.remove(contract);
+        }
+
+        debug!(
+            %contract,
+            %client_id,
+            no_more_client_subscriptions = no_more_subscriptions,
+            "remove_client_subscription: removed client subscription"
+        );
+
+        no_more_subscriptions
+    }
+
+    /// Check if there are any client subscriptions for a contract.
+    pub fn has_client_subscriptions(&self, contract: &ContractKey) -> bool {
+        self.client_subscriptions
+            .get(contract)
+            .map(|clients| !clients.is_empty())
+            .unwrap_or(false)
+    }
+
+    // ==================== Subscriber Removal & Pruning ====================
+
+    /// Remove a subscriber by peer ID from a specific contract.
+    ///
+    /// Returns information about whether upstream notification is needed:
+    /// - If the removed peer was downstream AND no more downstream remain AND no local interest,
+    ///   returns the upstream peer to notify with Unsubscribed.
+    pub fn remove_subscriber(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerId,
+    ) -> RemoveSubscriberResult {
+        let mut notify_upstream = None;
+
+        if let Some(mut subs) = self.subscriptions.get_mut(contract) {
+            // Find and remove the peer
+            if let Some(pos) = subs.iter().position(|e| e.matches_peer(peer)) {
+                let removed = subs.swap_remove(pos);
+
+                debug!(
+                    %contract,
+                    peer = %peer,
+                    role = ?removed.role,
+                    "remove_subscriber: removed peer"
+                );
+
+                // Only check for pruning if we removed a downstream subscriber
+                if removed.role == SubscriptionRole::Downstream {
+                    let has_downstream =
+                        subs.iter().any(|e| e.role == SubscriptionRole::Downstream);
+                    let has_local = self.has_client_subscriptions(contract);
+
+                    if !has_downstream && !has_local {
+                        // Find upstream to notify
+                        notify_upstream = subs
+                            .iter()
+                            .find(|e| e.role == SubscriptionRole::Upstream)
+                            .map(|e| e.peer.clone());
+
+                        if notify_upstream.is_some() {
+                            info!(
+                                %contract,
+                                "remove_subscriber: no downstream or local interest, will notify upstream"
+                            );
+                        }
+
+                        // Clean up the entire subscription entry
+                        drop(subs);
+                        self.subscriptions.remove(contract);
                     }
                 }
             }
         }
 
+        RemoveSubscriberResult { notify_upstream }
+    }
+
+    /// Prune all subscriptions for a peer that disconnected (by location).
+    ///
+    /// Returns a list of (contract, upstream) pairs where upstream notification is needed.
+    pub fn prune_peer(&self, loc: Location) -> PrunePeerResult {
+        let mut notifications = Vec::new();
+
+        // Collect contracts that need modification to avoid holding locks
+        let contracts_to_check: Vec<ContractKey> = self
+            .subscriptions
+            .iter()
+            .filter(|entry| entry.value().iter().any(|e| e.matches_location(loc)))
+            .map(|entry| *entry.key())
+            .collect();
+
+        for contract in contracts_to_check {
+            if let Some(mut subs) = self.subscriptions.get_mut(&contract) {
+                // Find the entry to remove
+                if let Some(pos) = subs.iter().position(|e| e.matches_location(loc)) {
+                    let removed = subs.swap_remove(pos);
+
+                    debug!(
+                        %contract,
+                        removed_location = ?loc,
+                        role = ?removed.role,
+                        "prune_peer: removed peer by location"
+                    );
+
+                    // Check for pruning if we removed a downstream
+                    if removed.role == SubscriptionRole::Downstream {
+                        let has_downstream =
+                            subs.iter().any(|e| e.role == SubscriptionRole::Downstream);
+                        let has_local = self.has_client_subscriptions(&contract);
+
+                        if !has_downstream && !has_local {
+                            if let Some(upstream) = subs
+                                .iter()
+                                .find(|e| e.role == SubscriptionRole::Upstream)
+                                .map(|e| e.peer.clone())
+                            {
+                                notifications.push((contract, upstream));
+                            }
+
+                            // Clean up
+                            drop(subs);
+                            self.subscriptions.remove(&contract);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !notifications.is_empty() {
+            info!(
+                contracts_to_notify = notifications.len(),
+                "prune_peer: will notify upstream for contracts with no remaining interest"
+            );
+        }
+
+        PrunePeerResult { notifications }
+    }
+
+    // ==================== Seeding Cache Integration ====================
+
+    /// Record an access to a contract (GET, PUT, or SUBSCRIBE).
+    ///
+    /// Returns a list of (evicted_contract, upstream_to_notify) pairs.
+    /// The upstream should be sent an Unsubscribed message for each evicted contract.
+    pub fn record_contract_access(
+        &self,
+        key: ContractKey,
+        size_bytes: u64,
+        access_type: AccessType,
+    ) -> Vec<(ContractKey, Option<PeerKeyLocation>)> {
+        let evicted = self
+            .seeding_cache
+            .write()
+            .record_access(key, size_bytes, access_type);
+
+        // Clean up subscriptions for evicted contracts and collect upstream notifications
         evicted
+            .into_iter()
+            .map(|evicted_key| {
+                let upstream = self.get_upstream(&evicted_key);
+                self.subscriptions.remove(&evicted_key);
+                self.client_subscriptions.remove(&evicted_key);
+
+                if upstream.is_some() {
+                    info!(
+                        contract = %evicted_key,
+                        "record_contract_access: contract evicted, will notify upstream"
+                    );
+                }
+
+                (evicted_key, upstream)
+            })
+            .collect()
     }
 
     /// Whether this node is currently caching/seeding this contract.
@@ -93,679 +463,556 @@ impl SeedingManager {
         self.seeding_cache.read().contains(key)
     }
 
-    /// Remove a contract from the seeding cache (for future use in cleanup paths).
+    /// Remove a contract from the seeding cache.
     ///
-    /// Returns true if the contract was present and removed.
+    /// Returns the upstream peer to notify if any.
     #[allow(dead_code)]
-    pub fn remove_seeded_contract(&self, key: &ContractKey) -> bool {
+    pub fn remove_seeded_contract(&self, key: &ContractKey) -> Option<PeerKeyLocation> {
         let removed = self.seeding_cache.write().remove(key).is_some();
         if removed {
-            // Clean up subscribers and reverse index
-            if let Some((_, subs)) = self.subscribers.remove(key) {
-                for sub in subs {
-                    if let Some(addr) = sub.socket_addr() {
-                        // Remove contract from reverse index and clean up empty entries
-                        self.contracts_per_subscriber
-                            .remove_if_mut(&addr, |_, contracts| {
-                                contracts.remove(key);
-                                contracts.is_empty()
-                            });
-                    }
-                }
-            }
+            let upstream = self.get_upstream(key);
+            self.subscriptions.remove(key);
+            self.client_subscriptions.remove(key);
+            return upstream;
         }
-        removed
+        None
     }
 
-    /// Will return an error in case the max number of subscribers has been added.
-    ///
-    /// The `upstream_addr` parameter is the transport-level address from which the subscribe
-    /// message was received. This is used instead of the address embedded in `subscriber`
-    /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
-    /// The transport address is the only reliable way to route back to them.
-    pub fn add_subscriber(
-        &self,
-        contract: &ContractKey,
-        subscriber: PeerKeyLocation,
-        upstream_addr: Option<ObservedAddr>,
-    ) -> Result<(), ()> {
-        // Use the transport-level address if available, otherwise fall back to the embedded address
-        let subscriber = if let Some(addr) = upstream_addr {
-            PeerKeyLocation::new(subscriber.pub_key.clone(), addr.socket_addr())
+    // ==================== Legacy API (for compatibility during migration) ====================
+
+    /// Get all downstream subscribers for a contract.
+    /// This is the replacement for the old `subscribers_of` method.
+    pub fn subscribers_of(&self, contract: &ContractKey) -> Option<Vec<PeerKeyLocation>> {
+        let downstream = self.get_downstream(contract);
+        if downstream.is_empty() {
+            None
         } else {
-            subscriber
-        };
-        let subscriber_addr = subscriber.socket_addr();
-        let mut subs = self
-            .subscribers
-            .entry(*contract)
-            .or_insert(Vec::with_capacity(Self::TOTAL_MAX_SUBSCRIPTIONS));
-        let before = subs
-            .iter()
-            .map(|loc| format!("{:.8}", loc.pub_key))
-            .collect::<Vec<_>>();
-        info!(
-            %contract,
-            subscriber = %subscriber.pub_key,
-            subscribers_before = ?before,
-            current_len = subs.len(),
-            "seeding_manager: attempting to add subscriber"
-        );
-        if subs.len() >= Self::MAX_SUBSCRIBERS {
-            warn!(
-                %contract,
-                subscriber = %subscriber.pub_key,
-                subscribers_before = ?before,
-                "seeding_manager: max subscribers reached"
-            );
-            return Err(());
-        }
-        let subs_vec = subs.value_mut();
-        match subs_vec.binary_search(&subscriber) {
-            Ok(_) => {
-                info!(
-                    %contract,
-                    subscriber = %subscriber.pub_key,
-                    subscribers_before = ?before,
-                    "seeding_manager: subscriber already registered"
-                );
-                Ok(())
-            }
-            Err(next_idx) => {
-                if subs_vec.len() == Self::MAX_SUBSCRIBERS {
-                    warn!(
-                        %contract,
-                        subscriber = %subscriber.pub_key,
-                        subscribers_before = ?before,
-                        "seeding_manager: max subscribers reached during insert"
-                    );
-                    Err(())
-                } else {
-                    // Update reverse index first to prevent race condition:
-                    // If prune_subscriber_by_addr runs concurrently, it will find
-                    // the contract in the reverse index and clean up properly.
-                    if let Some(addr) = subscriber_addr {
-                        self.contracts_per_subscriber
-                            .entry(addr)
-                            .or_default()
-                            .insert(*contract);
-                    }
-                    subs_vec.insert(next_idx, subscriber);
-                    let after = subs_vec
-                        .iter()
-                        .map(|loc| format!("{:.8}", loc.pub_key))
-                        .collect::<Vec<_>>();
-                    info!(
-                        %contract,
-                        subscribers_after = ?after,
-                        "seeding_manager: subscriber added"
-                    );
-                    Ok(())
-                }
-            }
+            Some(downstream)
         }
     }
 
-    pub fn subscribers_of(
+    /// Get all subscriptions across all contracts (for debugging/introspection).
+    pub fn all_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
+        self.subscriptions
+            .iter()
+            .map(|entry| {
+                let downstream: Vec<PeerKeyLocation> = entry
+                    .value()
+                    .iter()
+                    .filter(|e| e.role == SubscriptionRole::Downstream)
+                    .map(|e| e.peer.clone())
+                    .collect();
+                (*entry.key(), downstream)
+            })
+            .filter(|(_, subs)| !subs.is_empty())
+            .collect()
+    }
+
+    /// Get detailed subscription info for debugging.
+    pub fn subscription_details(
         &self,
         contract: &ContractKey,
-    ) -> Option<DmRef<'_, ContractKey, Vec<PeerKeyLocation>>> {
-        self.subscribers.get(contract)
-    }
+    ) -> Option<(Option<SocketAddr>, Vec<SocketAddr>, bool)> {
+        let subs = self.subscriptions.get(contract)?;
 
-    /// Prune a subscriber by their socket address.
-    /// Uses reverse index for O(1) lookup instead of O(n) full-map iteration.
-    pub fn prune_subscriber_by_addr(&self, addr: SocketAddr) {
-        // Use reverse index to find contracts this peer is subscribed to
-        if let Some((_, contracts)) = self.contracts_per_subscriber.remove(&addr) {
-            for contract_key_ref in contracts.iter() {
-                let contract_key = *contract_key_ref;
-                // Remove subscriber and clean up empty entries
-                self.subscribers.remove_if_mut(&contract_key, |_, subs| {
-                    if let Some(pos) = subs.iter().position(|l| l.socket_addr() == Some(addr)) {
-                        let removed = subs[pos].clone();
-                        tracing::debug!(
-                            %contract_key,
-                            removed_peer = %removed.pub_key,
-                            removed_addr = %addr,
-                            "seeding_manager: pruning subscriber by address"
-                        );
-                        subs.swap_remove(pos);
-                    }
-                    subs.is_empty()
-                });
-            }
-        }
-    }
-
-    /// Remove a subscriber by peer ID from a specific contract
-    pub fn remove_subscriber_by_peer(&self, contract: &ContractKey, peer: &crate::node::PeerId) {
-        if let Some(mut subs) = self.subscribers.get_mut(contract) {
-            if let Some(pos) = subs
-                .iter()
-                .position(|l| l.pub_key == peer.pub_key && l.socket_addr() == Some(peer.addr))
-            {
-                subs.swap_remove(pos);
-                // Update reverse index and clean up empty entries
-                self.contracts_per_subscriber
-                    .remove_if_mut(&peer.addr, |_, contracts| {
-                        contracts.remove(contract);
-                        contracts.is_empty()
-                    });
-                tracing::debug!(
-                    contract = %contract,
-                    peer = %peer,
-                    "Removed peer from subscriber list"
-                );
-            }
-        }
-    }
-
-    /// Get all subscriptions across all contracts
-    pub fn all_subscriptions(&self) -> Vec<(ContractKey, Vec<PeerKeyLocation>)> {
-        self.subscribers
+        let upstream = subs
             .iter()
-            .map(|entry| (*entry.key(), entry.value().clone()))
-            .collect()
+            .find(|e| e.role == SubscriptionRole::Upstream)
+            .and_then(|e| e.peer.socket_addr());
+
+        let downstream: Vec<SocketAddr> = subs
+            .iter()
+            .filter(|e| e.role == SubscriptionRole::Downstream)
+            .filter_map(|e| e.peer.socket_addr())
+            .collect();
+
+        let has_local = self.has_client_subscriptions(contract);
+
+        Some((upstream, downstream, has_local))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::PeerId;
     use crate::transport::TransportKeypair;
-    use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use freenet_stdlib::prelude::ContractInstanceId;
+    use std::net::{IpAddr, Ipv4Addr};
 
-    // Helper to create test PeerIds without expensive key generation
     fn test_peer_id(id: u8) -> PeerId {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, id)), 1000 + id as u16);
+        // Use different IP prefixes to get different locations
+        // Location is computed from IP with last byte masked out,
+        // so we vary the third octet to get different locations
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, id, 1)), 1000 + id as u16);
         let pub_key = TransportKeypair::new().public().clone();
         PeerId::new(addr, pub_key)
     }
 
-    #[test]
-    fn test_remove_subscriber_by_peer() {
-        let seeding_manager = SeedingManager::new();
-        let contract_key = ContractKey::from(ContractInstanceId::new([1u8; 32]));
-
-        // Create test peers
-        let peer1 = test_peer_id(1);
-        let peer2 = test_peer_id(2);
-        let peer3 = test_peer_id(3);
-
-        // Location is now computed from address automatically
-        let peer_loc1 = PeerKeyLocation::new(peer1.pub_key.clone(), peer1.addr);
-        let peer_loc2 = PeerKeyLocation::new(peer2.pub_key.clone(), peer2.addr);
-        let peer_loc3 = PeerKeyLocation::new(peer3.pub_key.clone(), peer3.addr);
-
-        // Add subscribers (test setup - no upstream_addr)
-        assert!(seeding_manager
-            .add_subscriber(&contract_key, peer_loc1.clone(), None)
-            .is_ok());
-        assert!(seeding_manager
-            .add_subscriber(&contract_key, peer_loc2.clone(), None)
-            .is_ok());
-        assert!(seeding_manager
-            .add_subscriber(&contract_key, peer_loc3.clone(), None)
-            .is_ok());
-
-        // Verify all subscribers are present
-        {
-            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-            assert_eq!(subs.len(), 3);
-        }
-
-        // Remove peer2
-        seeding_manager.remove_subscriber_by_peer(&contract_key, &peer2);
-
-        // Verify peer2 was removed
-        {
-            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-            assert_eq!(subs.len(), 2);
-            assert!(!subs
-                .iter()
-                .any(|p| p.pub_key == peer2.pub_key && p.socket_addr() == Some(peer2.addr)));
-            assert!(subs
-                .iter()
-                .any(|p| p.pub_key == peer1.pub_key && p.socket_addr() == Some(peer1.addr)));
-            assert!(subs
-                .iter()
-                .any(|p| p.pub_key == peer3.pub_key && p.socket_addr() == Some(peer3.addr)));
-        }
-
-        // Remove peer1
-        seeding_manager.remove_subscriber_by_peer(&contract_key, &peer1);
-
-        // Verify peer1 was removed
-        {
-            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-            assert_eq!(subs.len(), 1);
-            assert!(!subs
-                .iter()
-                .any(|p| p.pub_key == peer1.pub_key && p.socket_addr() == Some(peer1.addr)));
-            assert!(subs
-                .iter()
-                .any(|p| p.pub_key == peer3.pub_key && p.socket_addr() == Some(peer3.addr)));
-        }
-
-        // Remove non-existent peer (should not error)
-        seeding_manager.remove_subscriber_by_peer(&contract_key, &peer2);
-
-        // Verify count unchanged
-        {
-            let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-            assert_eq!(subs.len(), 1);
-        }
-    }
-
-    #[test]
-    fn test_remove_subscriber_from_nonexistent_contract() {
-        let seeding_manager = SeedingManager::new();
-        let contract_key = ContractKey::from(ContractInstanceId::new([2u8; 32]));
-        let peer = test_peer_id(1);
-
-        // Should not panic when removing from non-existent contract
-        seeding_manager.remove_subscriber_by_peer(&contract_key, &peer);
+    fn test_peer_loc(id: u8) -> PeerKeyLocation {
+        let peer = test_peer_id(id);
+        PeerKeyLocation::new(peer.pub_key, peer.addr)
     }
 
     fn make_contract_key(seed: u8) -> ContractKey {
         ContractKey::from(ContractInstanceId::new([seed; 32]))
     }
 
-    #[test]
-    fn test_record_contract_access_adds_to_cache() {
-        use super::super::seeding_cache::AccessType;
-
-        let seeding_manager = SeedingManager::new();
-        let key = make_contract_key(1);
-
-        // Initially not seeding
-        assert!(!seeding_manager.is_seeding_contract(&key));
-
-        // Record access
-        let evicted = seeding_manager.record_contract_access(key, 1000, AccessType::Get);
-
-        // Now seeding
-        assert!(seeding_manager.is_seeding_contract(&key));
-        assert!(evicted.is_empty()); // No eviction needed for small contract
-    }
+    // ==================== Basic Downstream/Upstream Tests ====================
 
     #[test]
-    fn test_record_contract_access_evicts_when_over_budget() {
-        use super::super::seeding_cache::AccessType;
+    fn test_add_downstream_basic() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let peer = test_peer_loc(1);
 
-        let seeding_manager = SeedingManager::new();
-
-        // Add a contract that takes up most of the budget (100MB default)
-        let large_key = make_contract_key(1);
-        let evicted = seeding_manager.record_contract_access(
-            large_key,
-            90 * 1024 * 1024, // 90MB
-            AccessType::Get,
-        );
-        assert!(evicted.is_empty());
-        assert!(seeding_manager.is_seeding_contract(&large_key));
-
-        // Add another large contract that should cause eviction
-        let another_large_key = make_contract_key(2);
-        let evicted = seeding_manager.record_contract_access(
-            another_large_key,
-            20 * 1024 * 1024, // 20MB - total would be 110MB, over 100MB budget
-            AccessType::Put,
-        );
-
-        // The first contract should have been evicted
-        assert!(!evicted.is_empty());
-        assert!(evicted.contains(&large_key));
-        assert!(!seeding_manager.is_seeding_contract(&large_key));
-        assert!(seeding_manager.is_seeding_contract(&another_large_key));
-    }
-
-    #[test]
-    fn test_eviction_clears_subscribers() {
-        use super::super::seeding_cache::AccessType;
-
-        let seeding_manager = SeedingManager::new();
-
-        // Add a contract and a subscriber
-        let key = make_contract_key(1);
-        seeding_manager.record_contract_access(key, 90 * 1024 * 1024, AccessType::Get);
-
-        let peer = PeerKeyLocation::new(
-            TransportKeypair::new().public().clone(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000),
-        );
-        seeding_manager.add_subscriber(&key, peer, None).unwrap();
-        assert!(seeding_manager.subscribers_of(&key).is_some());
-
-        // Force eviction with another large contract
-        let new_key = make_contract_key(2);
-        let evicted =
-            seeding_manager.record_contract_access(new_key, 20 * 1024 * 1024, AccessType::Get);
-
-        // Original contract should be evicted and subscribers cleared
-        assert!(evicted.contains(&key));
-        assert!(seeding_manager.subscribers_of(&key).is_none());
-    }
-
-    #[test]
-    fn test_add_subscriber_rejects_at_max_capacity() {
-        let seeding_manager = SeedingManager::new();
-        let contract_key = make_contract_key(1);
-
-        // Add MAX_SUBSCRIBERS (10) subscribers
-        for i in 0..10 {
-            let peer = PeerKeyLocation::new(
-                TransportKeypair::new().public().clone(),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, i + 1)), 5000),
-            );
-            let result = seeding_manager.add_subscriber(&contract_key, peer, None);
-            assert!(result.is_ok(), "Should accept subscriber {}", i);
-        }
-
-        // Verify we have 10 subscribers
-        assert_eq!(
-            seeding_manager.subscribers_of(&contract_key).unwrap().len(),
-            10
-        );
-
-        // Try to add 11th subscriber - should fail
-        let extra_peer = PeerKeyLocation::new(
-            TransportKeypair::new().public().clone(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100)), 5000),
-        );
-        let result = seeding_manager.add_subscriber(&contract_key, extra_peer, None);
-        assert!(result.is_err(), "Should reject subscriber beyond max");
-
-        // Count should still be 10
-        assert_eq!(
-            seeding_manager.subscribers_of(&contract_key).unwrap().len(),
-            10
-        );
-    }
-
-    #[test]
-    fn test_add_subscriber_allows_duplicate() {
-        let seeding_manager = SeedingManager::new();
-        let contract_key = make_contract_key(1);
-
-        let peer = PeerKeyLocation::new(
-            TransportKeypair::new().public().clone(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000),
-        );
-
-        // Add same subscriber twice
-        assert!(seeding_manager
-            .add_subscriber(&contract_key, peer.clone(), None)
-            .is_ok());
-        assert!(seeding_manager
-            .add_subscriber(&contract_key, peer.clone(), None)
+        assert!(manager
+            .add_downstream(&contract, peer.clone(), None)
             .is_ok());
 
-        // Should only have 1 subscriber (deduplicated)
-        assert_eq!(
-            seeding_manager.subscribers_of(&contract_key).unwrap().len(),
-            1
-        );
+        let downstream = manager.get_downstream(&contract);
+        assert_eq!(downstream.len(), 1);
+        assert_eq!(downstream[0].socket_addr(), peer.socket_addr());
     }
 
     #[test]
-    fn test_add_subscriber_uses_upstream_addr_when_provided() {
-        let seeding_manager = SeedingManager::new();
-        let contract_key = make_contract_key(1);
+    fn test_add_downstream_with_observed_addr() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
 
-        // Create a peer with one address embedded
+        // Peer reports loopback address (behind NAT)
         let embedded_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000);
         let peer = PeerKeyLocation::new(TransportKeypair::new().public().clone(), embedded_addr);
 
-        // Provide a different upstream address (as would happen with NAT)
+        // But we observed their real address
         let observed_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 12345);
-        let upstream = ObservedAddr::from(observed_addr);
+        let observed = ObservedAddr::from(observed_addr);
 
-        seeding_manager
-            .add_subscriber(&contract_key, peer.clone(), Some(upstream))
-            .unwrap();
+        assert!(manager
+            .add_downstream(&contract, peer.clone(), Some(observed))
+            .is_ok());
 
-        // The stored subscriber should have the observed address, not the embedded one
-        let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-        assert_eq!(subs.len(), 1);
-        let stored = &subs[0];
-        assert_eq!(stored.socket_addr(), Some(observed_addr));
-        assert_eq!(stored.pub_key, peer.pub_key);
+        let downstream = manager.get_downstream(&contract);
+        assert_eq!(downstream.len(), 1);
+        assert_eq!(downstream[0].socket_addr(), Some(observed_addr));
+        assert_eq!(downstream[0].pub_key, peer.pub_key);
     }
 
     #[test]
-    fn test_prune_subscriber_by_addr() {
-        let seeding_manager = SeedingManager::new();
-        let contract_key = make_contract_key(1);
+    fn test_add_downstream_duplicate() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let peer = test_peer_loc(1);
 
-        // Create peers with specific addresses
-        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5001);
+        assert!(manager
+            .add_downstream(&contract, peer.clone(), None)
+            .is_ok());
+        assert!(manager
+            .add_downstream(&contract, peer.clone(), None)
+            .is_ok());
 
-        let peer1 = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr1);
-        let peer2 = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr2);
+        // Should still only have 1 subscriber
+        let downstream = manager.get_downstream(&contract);
+        assert_eq!(downstream.len(), 1);
+    }
 
-        seeding_manager
-            .add_subscriber(&contract_key, peer1.clone(), None)
-            .unwrap();
-        seeding_manager
-            .add_subscriber(&contract_key, peer2.clone(), None)
-            .unwrap();
+    #[test]
+    fn test_add_downstream_max_limit() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+
+        // Add MAX_DOWNSTREAM (10) subscribers
+        for i in 0..10 {
+            let peer = test_peer_loc(i + 1);
+            assert!(
+                manager.add_downstream(&contract, peer, None).is_ok(),
+                "Should accept subscriber {}",
+                i
+            );
+        }
+
+        // 11th should fail
+        let extra_peer = test_peer_loc(100);
+        assert_eq!(
+            manager.add_downstream(&contract, extra_peer, None),
+            Err(SubscriptionError::MaxSubscribersReached)
+        );
+
+        assert_eq!(manager.get_downstream(&contract).len(), 10);
+    }
+
+    #[test]
+    fn test_set_upstream_basic() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+
+        manager.set_upstream(&contract, upstream.clone());
+
+        let retrieved = manager.get_upstream(&contract);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().socket_addr(), upstream.socket_addr());
+    }
+
+    #[test]
+    fn test_set_upstream_replaces_existing() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream1 = test_peer_loc(1);
+        let upstream2 = test_peer_loc(2);
+
+        manager.set_upstream(&contract, upstream1.clone());
+        manager.set_upstream(&contract, upstream2.clone());
+
+        let retrieved = manager.get_upstream(&contract);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().socket_addr(), upstream2.socket_addr());
+    }
+
+    #[test]
+    fn test_upstream_and_downstream_coexist() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+        let downstream1 = test_peer_loc(2);
+        let downstream2 = test_peer_loc(3);
+
+        manager.set_upstream(&contract, upstream.clone());
+        assert!(manager
+            .add_downstream(&contract, downstream1.clone(), None)
+            .is_ok());
+        assert!(manager
+            .add_downstream(&contract, downstream2.clone(), None)
+            .is_ok());
 
         assert_eq!(
-            seeding_manager.subscribers_of(&contract_key).unwrap().len(),
-            2
+            manager.get_upstream(&contract).unwrap().socket_addr(),
+            upstream.socket_addr()
         );
+        assert_eq!(manager.get_downstream(&contract).len(), 2);
+    }
 
-        // Prune by peer1's address using the efficient O(1) method
-        seeding_manager.prune_subscriber_by_addr(addr1);
+    // ==================== Client Subscription Tests ====================
 
-        // Should have removed peer1
-        let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-        assert_eq!(subs.len(), 1);
-        assert!(!subs.iter().any(|p| p.socket_addr() == Some(addr1)));
-        assert!(subs.iter().any(|p| p.socket_addr() == Some(addr2)));
+    #[test]
+    fn test_client_subscription_basic() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let client_id = crate::client_events::ClientId::next();
+
+        assert!(!manager.has_client_subscriptions(&contract));
+
+        manager.add_client_subscription(&contract, client_id);
+        assert!(manager.has_client_subscriptions(&contract));
+
+        let no_more = manager.remove_client_subscription(&contract, client_id);
+        assert!(no_more);
+        assert!(!manager.has_client_subscriptions(&contract));
     }
 
     #[test]
-    fn test_reverse_index_cleanup_no_empty_entries() {
-        let seeding_manager = SeedingManager::new();
-        let contract_key1 = make_contract_key(1);
-        let contract_key2 = make_contract_key(2);
+    fn test_client_subscription_multiple_clients() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let client1 = crate::client_events::ClientId::next();
+        let client2 = crate::client_events::ClientId::next();
 
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
-        let peer = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr);
+        manager.add_client_subscription(&contract, client1);
+        manager.add_client_subscription(&contract, client2);
 
-        // Subscribe the peer to both contracts
-        seeding_manager
-            .add_subscriber(&contract_key1, peer.clone(), None)
-            .unwrap();
-        seeding_manager
-            .add_subscriber(&contract_key2, peer.clone(), None)
-            .unwrap();
+        let no_more = manager.remove_client_subscription(&contract, client1);
+        assert!(!no_more); // Still has client2
+        assert!(manager.has_client_subscriptions(&contract));
 
-        // Verify reverse index has the entry
-        assert!(seeding_manager.contracts_per_subscriber.contains_key(&addr));
+        let no_more = manager.remove_client_subscription(&contract, client2);
+        assert!(no_more);
+        assert!(!manager.has_client_subscriptions(&contract));
+    }
+
+    // ==================== Pruning Tests ====================
+
+    #[test]
+    fn test_remove_subscriber_no_pruning_with_other_downstream() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+        let downstream1 = test_peer_id(2);
+        let downstream2 = test_peer_loc(3);
+
+        manager.set_upstream(&contract, upstream.clone());
+        assert!(manager
+            .add_downstream(
+                &contract,
+                PeerKeyLocation::new(downstream1.pub_key.clone(), downstream1.addr),
+                None
+            )
+            .is_ok());
+        assert!(manager
+            .add_downstream(&contract, downstream2.clone(), None)
+            .is_ok());
+
+        let result = manager.remove_subscriber(&contract, &downstream1);
+
+        // Should NOT notify upstream because downstream2 still exists
+        assert!(result.notify_upstream.is_none());
+        assert_eq!(manager.get_downstream(&contract).len(), 1);
+    }
+
+    #[test]
+    fn test_remove_subscriber_no_pruning_with_client_subscription() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+        let downstream = test_peer_id(2);
+        let client_id = crate::client_events::ClientId::next();
+
+        manager.set_upstream(&contract, upstream.clone());
+        assert!(manager
+            .add_downstream(
+                &contract,
+                PeerKeyLocation::new(downstream.pub_key.clone(), downstream.addr),
+                None
+            )
+            .is_ok());
+        manager.add_client_subscription(&contract, client_id);
+
+        let result = manager.remove_subscriber(&contract, &downstream);
+
+        // Should NOT notify upstream because client subscription exists
+        assert!(result.notify_upstream.is_none());
+        assert!(manager.has_client_subscriptions(&contract));
+    }
+
+    #[test]
+    fn test_remove_subscriber_triggers_pruning() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+        let downstream = test_peer_id(2);
+
+        manager.set_upstream(&contract, upstream.clone());
+        assert!(manager
+            .add_downstream(
+                &contract,
+                PeerKeyLocation::new(downstream.pub_key.clone(), downstream.addr),
+                None
+            )
+            .is_ok());
+
+        let result = manager.remove_subscriber(&contract, &downstream);
+
+        // Should notify upstream because no downstream and no local interest
+        assert!(result.notify_upstream.is_some());
         assert_eq!(
-            seeding_manager
-                .contracts_per_subscriber
-                .get(&addr)
-                .unwrap()
-                .len(),
-            2
+            result.notify_upstream.unwrap().socket_addr(),
+            upstream.socket_addr()
         );
 
-        // Prune the subscriber
-        seeding_manager.prune_subscriber_by_addr(addr);
-
-        // Verify reverse index entry was removed (not left as empty)
-        assert!(
-            !seeding_manager.contracts_per_subscriber.contains_key(&addr),
-            "Empty reverse index entries should be cleaned up"
-        );
-
-        // Verify forward index is also clean
-        assert!(seeding_manager.subscribers_of(&contract_key1).is_none());
-        assert!(seeding_manager.subscribers_of(&contract_key2).is_none());
+        // Contract should be completely cleaned up
+        assert!(manager.get_downstream(&contract).is_empty());
+        assert!(manager.get_upstream(&contract).is_none());
     }
 
     #[test]
-    fn test_eviction_cleans_reverse_index() {
-        use super::super::seeding_cache::AccessType;
+    fn test_remove_upstream_no_pruning() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_id(1);
 
-        let seeding_manager = SeedingManager::new();
-        let contract_key = make_contract_key(1);
-
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
-        let peer = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr);
-
-        // Add contract to cache and subscribe peer
-        seeding_manager.record_contract_access(contract_key, 1000, AccessType::Get);
-        seeding_manager
-            .add_subscriber(&contract_key, peer.clone(), None)
-            .unwrap();
-
-        // Verify reverse index has the entry
-        assert!(seeding_manager.contracts_per_subscriber.contains_key(&addr));
-
-        // Add a large contract that will evict the first one (cache budget is 100MB)
-        let large_contract = make_contract_key(2);
-        seeding_manager.record_contract_access(
-            large_contract,
-            DEFAULT_SEEDING_BUDGET_BYTES + 1,
-            AccessType::Get,
+        manager.set_upstream(
+            &contract,
+            PeerKeyLocation::new(upstream.pub_key.clone(), upstream.addr),
         );
 
-        // The first contract should be evicted
-        assert!(!seeding_manager.is_seeding_contract(&contract_key));
+        let result = manager.remove_subscriber(&contract, &upstream);
 
-        // Reverse index should be cleaned up (entry removed since peer has no subscriptions left)
-        assert!(
-            !seeding_manager.contracts_per_subscriber.contains_key(&addr),
-            "Reverse index entry should be removed when all contracts are evicted"
+        // Removing upstream should NOT trigger pruning notifications
+        assert!(result.notify_upstream.is_none());
+    }
+
+    #[test]
+    fn test_prune_peer_by_location() {
+        let manager = SeedingManager::new();
+        let contract1 = make_contract_key(1);
+        let contract2 = make_contract_key(2);
+
+        let upstream1 = test_peer_loc(1);
+        let upstream2 = test_peer_loc(2);
+        let downstream = test_peer_loc(3);
+
+        manager.set_upstream(&contract1, upstream1.clone());
+        manager.set_upstream(&contract2, upstream2.clone());
+        assert!(manager
+            .add_downstream(&contract1, downstream.clone(), None)
+            .is_ok());
+        assert!(manager
+            .add_downstream(&contract2, downstream.clone(), None)
+            .is_ok());
+
+        // Prune the downstream peer
+        let loc = downstream.location().unwrap();
+        let result = manager.prune_peer(loc);
+
+        // Should have notifications for both contracts
+        assert_eq!(result.notifications.len(), 2);
+
+        // Both contracts should be cleaned up
+        assert!(manager.get_downstream(&contract1).is_empty());
+        assert!(manager.get_downstream(&contract2).is_empty());
+    }
+
+    #[test]
+    fn test_prune_peer_partial_with_client_subscription() {
+        let manager = SeedingManager::new();
+        let contract1 = make_contract_key(1);
+        let contract2 = make_contract_key(2);
+
+        let upstream1 = test_peer_loc(1);
+        let upstream2 = test_peer_loc(2);
+        let downstream = test_peer_loc(3);
+        let client_id = crate::client_events::ClientId::next();
+
+        manager.set_upstream(&contract1, upstream1.clone());
+        manager.set_upstream(&contract2, upstream2.clone());
+        assert!(manager
+            .add_downstream(&contract1, downstream.clone(), None)
+            .is_ok());
+        assert!(manager
+            .add_downstream(&contract2, downstream.clone(), None)
+            .is_ok());
+
+        // Add client subscription only to contract1
+        manager.add_client_subscription(&contract1, client_id);
+
+        let loc = downstream.location().unwrap();
+        let result = manager.prune_peer(loc);
+
+        // Should only notify for contract2 (contract1 has client subscription)
+        assert_eq!(result.notifications.len(), 1);
+        assert_eq!(result.notifications[0].0, contract2);
+    }
+
+    // ==================== Eviction Tests ====================
+
+    #[test]
+    fn test_eviction_returns_upstream() {
+        let manager = SeedingManager::new();
+        let key = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+
+        // Record large contract
+        manager.record_contract_access(key, 90 * 1024 * 1024, AccessType::Get);
+        manager.set_upstream(&key, upstream.clone());
+
+        // Force eviction
+        let new_key = make_contract_key(2);
+        let evictions = manager.record_contract_access(new_key, 20 * 1024 * 1024, AccessType::Get);
+
+        // Should have eviction with upstream
+        assert_eq!(evictions.len(), 1);
+        assert_eq!(evictions[0].0, key);
+        assert!(evictions[0].1.is_some());
+        assert_eq!(
+            evictions[0].1.as_ref().unwrap().socket_addr(),
+            upstream.socket_addr()
         );
     }
 
     #[test]
-    fn test_all_subscriptions_returns_all() {
-        let seeding_manager = SeedingManager::new();
+    fn test_eviction_clears_client_subscriptions() {
+        let manager = SeedingManager::new();
+        let key = make_contract_key(1);
+        let client_id = crate::client_events::ClientId::next();
 
-        let key1 = make_contract_key(1);
-        let key2 = make_contract_key(2);
+        manager.record_contract_access(key, 90 * 1024 * 1024, AccessType::Get);
+        manager.add_client_subscription(&key, client_id);
+        assert!(manager.has_client_subscriptions(&key));
 
-        let peer1 = PeerKeyLocation::new(
-            TransportKeypair::new().public().clone(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000),
-        );
-        let peer2 = PeerKeyLocation::new(
-            TransportKeypair::new().public().clone(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5001),
-        );
+        // Force eviction
+        let new_key = make_contract_key(2);
+        manager.record_contract_access(new_key, 20 * 1024 * 1024, AccessType::Get);
 
-        seeding_manager
-            .add_subscriber(&key1, peer1.clone(), None)
-            .unwrap();
-        seeding_manager
-            .add_subscriber(&key2, peer2.clone(), None)
-            .unwrap();
+        assert!(!manager.has_client_subscriptions(&key));
+    }
 
-        let all = seeding_manager.all_subscriptions();
+    // ==================== Legacy API Tests ====================
+
+    #[test]
+    fn test_subscribers_of_returns_downstream_only() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+        let downstream1 = test_peer_loc(2);
+        let downstream2 = test_peer_loc(3);
+
+        manager.set_upstream(&contract, upstream);
+        assert!(manager
+            .add_downstream(&contract, downstream1.clone(), None)
+            .is_ok());
+        assert!(manager
+            .add_downstream(&contract, downstream2.clone(), None)
+            .is_ok());
+
+        let subs = manager.subscribers_of(&contract).unwrap();
+
+        // Should only contain downstream, not upstream
+        assert_eq!(subs.len(), 2);
+        assert!(subs
+            .iter()
+            .any(|p| p.socket_addr() == downstream1.socket_addr()));
+        assert!(subs
+            .iter()
+            .any(|p| p.socket_addr() == downstream2.socket_addr()));
+    }
+
+    #[test]
+    fn test_all_subscriptions() {
+        let manager = SeedingManager::new();
+        let contract1 = make_contract_key(1);
+        let contract2 = make_contract_key(2);
+        let downstream1 = test_peer_loc(1);
+        let downstream2 = test_peer_loc(2);
+
+        assert!(manager
+            .add_downstream(&contract1, downstream1, None)
+            .is_ok());
+        assert!(manager
+            .add_downstream(&contract2, downstream2, None)
+            .is_ok());
+
+        let all = manager.all_subscriptions();
         assert_eq!(all.len(), 2);
+    }
 
-        // Verify both contracts are present
-        let keys: Vec<_> = all.iter().map(|(k, _)| *k).collect();
-        assert!(keys.contains(&key1));
-        assert!(keys.contains(&key2));
+    #[test]
+    fn test_subscription_details() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+        let downstream = test_peer_loc(2);
+        let client_id = crate::client_events::ClientId::next();
+
+        manager.set_upstream(&contract, upstream.clone());
+        assert!(manager
+            .add_downstream(&contract, downstream.clone(), None)
+            .is_ok());
+        manager.add_client_subscription(&contract, client_id);
+
+        let details = manager.subscription_details(&contract).unwrap();
+
+        assert_eq!(details.0, upstream.socket_addr()); // upstream
+        assert_eq!(details.1.len(), 1); // downstream
+        assert!(details.2); // has_local
     }
 
     #[test]
     fn test_is_seeding_contract() {
-        use super::super::seeding_cache::AccessType;
-
-        let seeding_manager = SeedingManager::new();
+        let manager = SeedingManager::new();
         let key = make_contract_key(1);
 
-        assert!(!seeding_manager.is_seeding_contract(&key));
+        assert!(!manager.is_seeding_contract(&key));
 
-        seeding_manager.record_contract_access(key, 1000, AccessType::Get);
+        manager.record_contract_access(key, 1000, AccessType::Get);
 
-        assert!(seeding_manager.is_seeding_contract(&key));
-    }
-
-    /// Test that validates the broadcast target filtering logic used by
-    /// `get_broadcast_targets_update` in update.rs.
-    ///
-    /// **Architecture Note (Issue #2075):**
-    /// After decoupling local from network subscriptions, `get_broadcast_targets_update`
-    /// simply filters out the sender from the subscriber list. This test validates
-    /// that the seeding_manager correctly stores and retrieves network subscribers,
-    /// which is the foundation for UPDATE broadcast targeting.
-    #[test]
-    fn test_subscribers_for_broadcast_targeting() {
-        let seeding_manager = SeedingManager::new();
-        let contract_key = ContractKey::from(ContractInstanceId::new([3u8; 32]));
-
-        // Create network peers (not local clients)
-        let peer1 = test_peer_id(1);
-        let peer2 = test_peer_id(2);
-        let peer3 = test_peer_id(3);
-
-        let peer_loc1 = PeerKeyLocation::new(peer1.pub_key.clone(), peer1.addr);
-        let peer_loc2 = PeerKeyLocation::new(peer2.pub_key.clone(), peer2.addr);
-        let peer_loc3 = PeerKeyLocation::new(peer3.pub_key.clone(), peer3.addr);
-
-        // Register network subscribers
-        seeding_manager
-            .add_subscriber(&contract_key, peer_loc1.clone(), None)
-            .expect("should add peer1");
-        seeding_manager
-            .add_subscriber(&contract_key, peer_loc2.clone(), None)
-            .expect("should add peer2");
-        seeding_manager
-            .add_subscriber(&contract_key, peer_loc3.clone(), None)
-            .expect("should add peer3");
-
-        // Retrieve subscribers (as get_broadcast_targets_update would)
-        let subs = seeding_manager.subscribers_of(&contract_key).unwrap();
-
-        // All network peers should be in the list
-        assert_eq!(subs.len(), 3, "Should have 3 network subscribers");
-
-        // Simulate filtering out the sender (as get_broadcast_targets_update does)
-        // If peer1 is the sender of an UPDATE, it should be filtered out
-        let sender_addr = peer1.addr;
-        let broadcast_targets: Vec<_> = subs
-            .iter()
-            .filter(|pk| pk.socket_addr().as_ref() != Some(&sender_addr))
-            .cloned()
-            .collect();
-
-        // Only peer2 and peer3 should receive the broadcast
-        assert_eq!(
-            broadcast_targets.len(),
-            2,
-            "Should exclude sender from broadcast targets"
-        );
-        assert!(
-            broadcast_targets
-                .iter()
-                .any(|p| p.socket_addr() == Some(peer2.addr)),
-            "peer2 should be in broadcast targets"
-        );
-        assert!(
-            broadcast_targets
-                .iter()
-                .any(|p| p.socket_addr() == Some(peer3.addr)),
-            "peer3 should be in broadcast targets"
-        );
-        assert!(
-            !broadcast_targets
-                .iter()
-                .any(|p| p.socket_addr() == Some(peer1.addr)),
-            "sender (peer1) should NOT be in broadcast targets"
-        );
+        assert!(manager.is_seeding_contract(&key));
     }
 }

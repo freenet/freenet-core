@@ -1131,17 +1131,14 @@ impl P2pConnManager {
                                         // Get actual subscriber information from OpManager
                                         let subscribers_info =
                                             op_manager.ring.subscribers_of(contract_key);
-                                        let subscriber_count = subscribers_info
-                                            .as_ref()
-                                            .map(|s| s.value().len())
-                                            .unwrap_or(0);
+                                        let subscriber_count =
+                                            subscribers_info.as_ref().map(|s| s.len()).unwrap_or(0);
                                         let subscriber_peer_ids: Vec<String> =
                                             if config.include_subscriber_peer_ids {
                                                 subscribers_info
                                                     .as_ref()
                                                     .map(|s| {
-                                                        s.value()
-                                                            .iter()
+                                                        s.iter()
                                                             .map(|pk| pk.pub_key().to_string())
                                                             .collect()
                                                     })

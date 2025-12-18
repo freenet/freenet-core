@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.43"
+version = "0.1.51"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1322,6 +1322,7 @@ dependencies = [
  "headers",
  "hickory-resolver",
  "itertools 0.14.0",
+ "libc",
  "notify",
  "once_cell",
  "opentelemetry",

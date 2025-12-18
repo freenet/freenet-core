@@ -11,10 +11,11 @@ use std::{
 };
 use tracing::Instrument;
 
-use dashmap::mapref::one::Ref as DmRef;
 use either::Either;
 use freenet_stdlib::prelude::ContractKey;
 use parking_lot::RwLock;
+
+pub use seeding::{PrunePeerResult, RemoveSubscriberResult, SubscriptionError};
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -187,14 +188,27 @@ impl Ring {
     /// that need cleanup (unsubscription, state removal, etc.).
     ///
     /// The `size_bytes` should be the size of the contract state.
-    pub fn seed_contract(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
+    ///
+    /// Returns a list of (evicted_contract, upstream_to_notify) pairs.
+    /// The upstream should be sent an Unsubscribed message for each evicted contract.
+    pub fn seed_contract(
+        &self,
+        key: ContractKey,
+        size_bytes: u64,
+    ) -> Vec<(ContractKey, Option<PeerKeyLocation>)> {
         use seeding_cache::AccessType;
         self.seeding_manager
             .record_contract_access(key, size_bytes, AccessType::Put)
     }
 
     /// Record a GET access to a contract.
-    pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
+    ///
+    /// Returns a list of (evicted_contract, upstream_to_notify) pairs.
+    pub fn record_get_access(
+        &self,
+        key: ContractKey,
+        size_bytes: u64,
+    ) -> Vec<(ContractKey, Option<PeerKeyLocation>)> {
         use seeding_cache::AccessType;
         self.seeding_manager
             .record_contract_access(key, size_bytes, AccessType::Get)
@@ -203,7 +217,11 @@ impl Ring {
     /// Record a subscribe access for a contract (for future use when subscribe
     /// operations directly record access rather than delegating to GET).
     #[allow(dead_code)]
-    pub fn record_subscribe_access(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
+    pub fn record_subscribe_access(
+        &self,
+        key: ContractKey,
+        size_bytes: u64,
+    ) -> Vec<(ContractKey, Option<PeerKeyLocation>)> {
         use seeding_cache::AccessType;
         self.seeding_manager
             .record_contract_access(key, size_bytes, AccessType::Subscribe)
@@ -216,8 +234,10 @@ impl Ring {
     }
 
     /// Remove a contract from the seeding cache (for future use in cleanup paths).
+    ///
+    /// Returns the upstream peer to notify with Unsubscribed if any.
     #[allow(dead_code)]
-    pub fn remove_seeded_contract(&self, key: &ContractKey) -> bool {
+    pub fn remove_seeded_contract(&self, key: &ContractKey) -> Option<PeerKeyLocation> {
         self.seeding_manager.remove_seeded_contract(key)
     }
 
@@ -346,32 +366,50 @@ impl Ring {
         self.router.write().add_event(event);
     }
 
-    /// Will return an error in case the max number of subscribers has been added.
+    // ==================== Subscription Management ====================
+
+    /// Add a downstream subscriber (a peer that wants updates FROM us).
     ///
-    /// The `upstream_addr` parameter is the transport-level address from which the subscribe
+    /// The `observed_addr` parameter is the transport-level address from which the subscribe
     /// message was received. This is used instead of the address embedded in `subscriber`
     /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
-    /// The transport address is the only reliable way to route back to them.
-    pub fn add_subscriber(
+    pub fn add_downstream(
         &self,
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
-        upstream_addr: Option<ObservedAddr>,
-    ) -> Result<(), ()> {
+        observed_addr: Option<ObservedAddr>,
+    ) -> Result<(), SubscriptionError> {
         self.seeding_manager
-            .add_subscriber(contract, subscriber, upstream_addr)
+            .add_downstream(contract, subscriber, observed_addr)
     }
 
-    /// Remove a subscriber by peer ID from a specific contract
-    pub fn remove_subscriber(&self, contract: &ContractKey, peer: &PeerId) {
-        self.seeding_manager
-            .remove_subscriber_by_peer(contract, peer)
+    /// Set the upstream source for a contract (the peer we get updates FROM).
+    pub fn set_upstream(&self, contract: &ContractKey, upstream: PeerKeyLocation) {
+        self.seeding_manager.set_upstream(contract, upstream)
     }
 
-    pub fn subscribers_of(
+    /// Get the upstream peer for a contract (if any).
+    pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
+        self.seeding_manager.get_upstream(contract)
+    }
+
+    /// Get all downstream subscribers for a contract (for broadcast targeting).
+    pub fn get_downstream(&self, contract: &ContractKey) -> Vec<PeerKeyLocation> {
+        self.seeding_manager.get_downstream(contract)
+    }
+
+    /// Remove a subscriber and check if upstream notification is needed.
+    pub fn remove_subscriber(
         &self,
         contract: &ContractKey,
-    ) -> Option<DmRef<'_, ContractKey, Vec<PeerKeyLocation>>> {
+        peer: &PeerId,
+    ) -> RemoveSubscriberResult {
+        self.seeding_manager.remove_subscriber(contract, peer)
+    }
+
+    /// Get downstream subscribers for a contract.
+    /// Returns None if no downstream subscribers exist.
+    pub fn subscribers_of(&self, contract: &ContractKey) -> Option<Vec<PeerKeyLocation>> {
         self.seeding_manager.subscribers_of(contract)
     }
 
@@ -380,18 +418,57 @@ impl Ring {
         self.seeding_manager.all_subscriptions()
     }
 
-    pub async fn prune_connection(&self, peer: PeerId) {
-        tracing::debug!(peer = %peer, "Removing connection");
+    // ==================== Client Subscription Management ====================
+
+    /// Register a client subscription for a contract (WebSocket client subscribed).
+    pub fn add_client_subscription(
+        &self,
+        contract: &ContractKey,
+        client_id: crate::client_events::ClientId,
+    ) {
+        self.seeding_manager
+            .add_client_subscription(contract, client_id)
+    }
+
+    /// Remove a client subscription.
+    /// Returns true if this was the last client subscription for this contract.
+    pub fn remove_client_subscription(
+        &self,
+        contract: &ContractKey,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        self.seeding_manager
+            .remove_client_subscription(contract, client_id)
+    }
+
+    /// Check if there are any client subscriptions for a contract.
+    pub fn has_client_subscriptions(&self, contract: &ContractKey) -> bool {
+        self.seeding_manager.has_client_subscriptions(contract)
+    }
+
+    // ==================== Connection Pruning ====================
+
+    /// Prune a peer connection and return notifications needed for subscription tree pruning.
+    ///
+    /// Returns a list of (contract, upstream) pairs where Unsubscribed messages should be sent.
+    pub async fn prune_connection(&self, peer: PeerId) -> PrunePeerResult {
+        tracing::debug!(%peer, "Removing connection");
         self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
-        // This case would be when a connection is being open, so peer location hasn't been recorded yet and we can ignore everything below
-        let Some(_loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
-            return;
+
+        // This case would be when a connection is being open, so peer location hasn't been recorded yet
+        let Some(loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
+            return PrunePeerResult {
+                notifications: Vec::new(),
+            };
         };
-        // Use address-based pruning for O(1) lookup via reverse index
-        self.seeding_manager.prune_subscriber_by_addr(peer.addr);
+
+        let prune_result = self.seeding_manager.prune_peer(loc);
+
         self.event_register
             .register_events(Either::Left(NetEventLog::disconnected(self, &peer)))
             .await;
+
+        prune_result
     }
 
     async fn connection_maintenance(
@@ -449,11 +526,11 @@ impl Ring {
             let active_count = live_tx_tracker.active_connect_transaction_count();
             if let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if active_count < MAX_CONCURRENT_CONNECTIONS {
-                    tracing::debug!(
+                    tracing::info!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
-                        target_location = %ideal_location,
-                        "Attempting to acquire new connection"
+                        "Attempting to acquire new connection for location: {:?}",
+                        ideal_location
                     );
                     let tx = self
                         .acquire_new(
@@ -466,7 +543,7 @@ impl Ring {
                         .await
                         .map_err(|error| {
                             tracing::error!(
-                                error = ?error,
+                                ?error,
                                 "FATAL: Connection maintenance task failed - shutting down"
                             );
                             error
@@ -474,12 +551,11 @@ impl Ring {
                     if tx.is_none() {
                         let conns = self.connection_manager.connection_count();
                         tracing::warn!(
-                            connections = conns,
-                            target_location = %ideal_location,
-                            "acquire_new returned None - likely no peers to query through"
+                            "acquire_new returned None - likely no peers to query through (connections: {})",
+                            conns
                         );
                     } else {
-                        tracing::debug!(
+                        tracing::info!(
                             active_connections = active_count + 1,
                             "Successfully initiated connection acquisition"
                         );
@@ -488,8 +564,8 @@ impl Ring {
                     tracing::debug!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
-                        target_location = %ideal_location,
-                        "At max concurrent connections, re-queuing location"
+                        "At max concurrent connections, re-queuing location {}",
+                        ideal_location
                     );
                     pending_conn_adds.insert(ideal_location);
                 }

@@ -429,6 +429,24 @@ async fn start_subscription_after_put(
     }
 }
 
+impl OpManager {
+    fn get_broadcast_targets(
+        &self,
+        key: &ContractKey,
+        sender: &PeerKeyLocation,
+    ) -> Vec<PeerKeyLocation> {
+        self.ring
+            .subscribers_of(key)
+            .map(|subs| {
+                subs.iter()
+                    .filter(|pk| pk.pub_key() != sender.pub_key())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// Helper to start an Update operation when a PUT on a subscribed contract results in state change.
 /// This propagates the merged state to other subscribers.
 async fn start_update_after_put(

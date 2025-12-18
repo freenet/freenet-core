@@ -326,7 +326,7 @@ impl Operation for SubscribeOp {
         _conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        _source_addr: Option<std::net::SocketAddr>,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let id = self.id;
@@ -350,13 +350,13 @@ impl Operation for SubscribeOp {
                     if super::has_contract(op_manager, *key).await? {
                         // We have the contract - register upstream as subscriber and respond
                         if let Some(upstream_addr) = self.upstream_addr {
-                            // Register the upstream peer as subscriber
+                            // Register the upstream peer as downstream subscriber (they want updates FROM us)
                             if let Some(upstream_peer) = op_manager
                                 .ring
                                 .connection_manager
                                 .get_peer_location_by_addr(upstream_addr)
                             {
-                                let _ = op_manager.ring.add_subscriber(
+                                let _ = op_manager.ring.add_downstream(
                                     key,
                                     upstream_peer,
                                     Some(upstream_addr.into()),
@@ -395,7 +395,7 @@ impl Operation for SubscribeOp {
                                 .connection_manager
                                 .get_peer_location_by_addr(upstream_addr)
                             {
-                                let _ = op_manager.ring.add_subscriber(
+                                let _ = op_manager.ring.add_downstream(
                                     key,
                                     upstream_peer,
                                     Some(upstream_addr.into()),
@@ -505,17 +505,56 @@ impl Operation for SubscribeOp {
                         %key,
                         subscribed,
                         upstream_addr = ?self.upstream_addr,
+                        source_addr = ?source_addr,
                         "subscribe: processing Response"
                     );
 
                     if *subscribed {
                         // Fetch contract if we don't have it
                         fetch_contract_if_missing(op_manager, *key).await?;
+
+                        // Register the sender as our upstream source (we'll receive updates from them)
+                        if let Some(sender_addr) = source_addr {
+                            if let Some(sender_peer) = op_manager
+                                .ring
+                                .connection_manager
+                                .get_peer_location_by_addr(sender_addr)
+                            {
+                                op_manager.ring.set_upstream(key, sender_peer.clone());
+                                tracing::debug!(
+                                    tx = %msg_id,
+                                    %key,
+                                    upstream = %sender_addr,
+                                    "subscribe: registered upstream source"
+                                );
+                            }
+                        }
                     }
 
                     // Forward response upstream or complete
                     if let Some(upstream_addr) = self.upstream_addr {
                         // We're an intermediate node - forward response upstream
+                        // Also register the peer we're forwarding to as downstream (they want updates from us)
+                        if *subscribed {
+                            if let Some(downstream_peer) = op_manager
+                                .ring
+                                .connection_manager
+                                .get_peer_location_by_addr(upstream_addr)
+                            {
+                                let _ = op_manager.ring.add_downstream(
+                                    key,
+                                    downstream_peer,
+                                    Some(upstream_addr.into()),
+                                );
+                                tracing::debug!(
+                                    tx = %msg_id,
+                                    %key,
+                                    downstream = %upstream_addr,
+                                    "subscribe: registered downstream subscriber (forwarding peer)"
+                                );
+                            }
+                        }
+
                         tracing::debug!(tx = %msg_id, %key, upstream = %upstream_addr, "Forwarding response upstream");
                         Ok(OperationResult {
                             return_msg: Some(NetMessage::from(SubscribeMsg::Response {
