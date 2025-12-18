@@ -73,10 +73,12 @@ struct TestConfig {
 impl TestConfig {
     fn from_env() -> Self {
         Self {
+            // Require at least 2 peers for meaningful topology tests
             peer_count: env::var("VALIDATION_PEER_COUNT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_PEER_COUNT),
+                .unwrap_or(DEFAULT_PEER_COUNT)
+                .max(2),
             min_connections: env::var("VALIDATION_MIN_CONNECTIONS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -89,17 +91,21 @@ impl TestConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_STABILIZATION_SECS),
+            // Require at least 1 snapshot to avoid panic
             snapshot_count: env::var("VALIDATION_SNAPSHOT_COUNT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_SNAPSHOT_COUNT),
+                .unwrap_or(DEFAULT_SNAPSHOT_COUNT)
+                .max(1),
             snapshot_interval_secs: env::var("VALIDATION_SNAPSHOT_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_SNAPSHOT_INTERVAL_SECS),
+            // Clamp connectivity_target to valid range (0.0, 1.0]
             connectivity_target: env::var("VALIDATION_CONNECTIVITY_TARGET")
                 .ok()
                 .and_then(|v| v.parse().ok())
+                .map(|v: f64| v.clamp(0.01, 1.0))
                 .unwrap_or(DEFAULT_CONNECTIVITY_TARGET),
         }
     }

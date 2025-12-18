@@ -489,10 +489,10 @@ impl ConnectionManager {
         let mut own_addr = self.own_addr.lock();
         let old_addr = *own_addr;
         *own_addr = Some(addr);
-        tracing::warn!(
+        tracing::debug!(
             old_addr = ?old_addr,
             new_addr = %addr,
-            "set_own_addr called - DEBUG: tracing address overwrites"
+            "set_own_addr called"
         );
     }
 

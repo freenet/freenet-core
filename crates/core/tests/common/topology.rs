@@ -9,6 +9,10 @@ use anyhow::Result;
 use freenet_test_network::TestNetwork;
 use std::collections::{HashMap, HashSet};
 
+/// Ring distance threshold for "local" connections (0.0-0.5 scale).
+/// Connections within this distance are considered nearby on the ring.
+const LOCAL_CONNECTION_THRESHOLD: f64 = 0.2;
+
 /// Analysis results for network topology.
 #[derive(Debug, Clone)]
 pub struct TopologyAnalysis {
@@ -165,8 +169,7 @@ fn compute_ring_distance_metrics(peer_details: &HashMap<String, PeerTopologyInfo
             total_distance += distance;
             total_measured_connections += 1;
 
-            // "Local" connection: within 0.2 ring distance
-            if distance < 0.2 {
+            if distance < LOCAL_CONNECTION_THRESHOLD {
                 local_connections += 1;
             }
         }

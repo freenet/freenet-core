@@ -238,12 +238,11 @@ impl RelayState {
         estimator: &ConnectForwardEstimator,
     ) -> RelayActions {
         let mut actions = RelayActions::default();
-        // DEBUG: Log state at start of step()
-        tracing::warn!(
+        tracing::debug!(
             joiner_addr = ?self.request.joiner.peer_addr,
             upstream_addr = %self.upstream_addr,
             observed_sent = self.observed_sent,
-            "DEBUG: RelayState::step() start"
+            "RelayState::step() start"
         );
         // Add upstream's address (determined from transport layer) to visited list
         push_unique_addr(&mut self.request.visited, self.upstream_addr);
@@ -273,11 +272,11 @@ impl RelayState {
                 if !self.observed_sent {
                     self.observed_sent = true;
                     let expected_location = crate::ring::Location::from_address(joiner_addr);
-                    tracing::warn!(
+                    tracing::debug!(
                         joiner_addr = %joiner_addr,
                         expected_location = %expected_location,
                         upstream_addr = %self.upstream_addr,
-                        "DEBUG: discovered joiner addr, emitting ObservedAddress"
+                        "discovered joiner addr, emitting ObservedAddress"
                     );
                     actions.observed_address = Some((self.request.joiner.clone(), *joiner_addr));
                 }
