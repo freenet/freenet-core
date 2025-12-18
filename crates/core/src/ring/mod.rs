@@ -184,15 +184,11 @@ impl Ring {
     /// Record an access to a contract (GET, PUT, or SUBSCRIBE).
     ///
     /// This adds the contract to the seeding cache if not present, or refreshes
-    /// its LRU position if already cached. Returns the list of contracts that
-    /// were removed from the cache due to capacity limits.
+    /// its LRU position if already cached. Returns the list of evicted contract keys.
     ///
-    /// The `size_bytes` should be the size of the contract state.
-    pub fn seed_contract(
-        &self,
-        key: ContractKey,
-        size_bytes: u64,
-    ) -> Vec<seeding::UnseededContractInfo> {
+    /// Note: Cache eviction is purely for memory management. Subscriptions are NOT
+    /// affected - the contract can be recovered from disk if needed.
+    pub fn seed_contract(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
         use seeding_cache::AccessType;
         self.seeding_manager
             .record_contract_access(key, size_bytes, AccessType::Put)
@@ -200,12 +196,8 @@ impl Ring {
 
     /// Record a GET access to a contract.
     ///
-    /// Returns a list of contracts that were removed from the cache.
-    pub fn record_get_access(
-        &self,
-        key: ContractKey,
-        size_bytes: u64,
-    ) -> Vec<seeding::UnseededContractInfo> {
+    /// Returns a list of evicted contract keys (for memory management only).
+    pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
         use seeding_cache::AccessType;
         self.seeding_manager
             .record_contract_access(key, size_bytes, AccessType::Get)

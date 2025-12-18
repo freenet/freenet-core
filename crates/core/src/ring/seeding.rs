@@ -88,16 +88,6 @@ pub struct PruneSubscriptionsResult {
     pub notifications: Vec<(ContractKey, PeerKeyLocation)>,
 }
 
-/// Information about a contract that was removed from the seeding cache.
-/// Contains the contract key and optionally the upstream peer to notify.
-#[derive(Debug, Clone)]
-pub struct UnseededContractInfo {
-    /// The contract that was removed from the seeding cache.
-    pub contract: ContractKey,
-    /// The upstream peer to notify with an Unsubscribed message, if any.
-    pub upstream_to_notify: Option<PeerKeyLocation>,
-}
-
 pub(crate) struct SeedingManager {
     /// Subscriptions per contract with explicit upstream/downstream roles.
     /// This replaces the flat Vec<PeerKeyLocation> to enable proper tree pruning.
@@ -497,40 +487,17 @@ impl SeedingManager {
 
     /// Record an access to a contract (GET, PUT, or SUBSCRIBE).
     ///
-    /// Returns a list of contracts that were removed from the seeding cache.
-    /// Each entry contains the contract and optionally the upstream peer to notify.
+    /// This adds the contract to the seeding cache if not present, or refreshes
+    /// its LRU position if already cached. Returns the list of evicted contract keys.
     pub fn record_contract_access(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
-    ) -> Vec<UnseededContractInfo> {
-        let evicted = self
-            .seeding_cache
+    ) -> Vec<ContractKey> {
+        self.seeding_cache
             .write()
-            .record_access(key, size_bytes, access_type);
-
-        // Clean up subscriptions for evicted contracts and collect upstream notifications
-        evicted
-            .into_iter()
-            .map(|evicted_key| {
-                let upstream = self.get_upstream(&evicted_key);
-                self.subscriptions.remove(&evicted_key);
-                self.client_subscriptions.remove(&evicted_key);
-
-                if upstream.is_some() {
-                    info!(
-                        contract = %evicted_key,
-                        "record_contract_access: contract evicted, will notify upstream"
-                    );
-                }
-
-                UnseededContractInfo {
-                    contract: evicted_key,
-                    upstream_to_notify: upstream,
-                }
-            })
-            .collect()
+            .record_access(key, size_bytes, access_type)
     }
 
     /// Whether this node is currently caching/seeding this contract.
