@@ -58,3 +58,47 @@ async fn test_multiple_connections() -> TestResult {
     println!("✓ Multiple WebSocket connections work");
     Ok(())
 }
+
+/// Verify that all peers have ring locations after network startup.
+///
+/// This test catches bugs where ObservedAddress is not properly sent to peers,
+/// which would leave them without a ring location (loc=N/A).
+///
+/// See PR #2333 for context on why this validation is important.
+#[tokio::test]
+async fn test_all_peers_have_ring_locations() -> TestResult {
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let network = get_network().await;
+
+    // Give network time to fully establish connections and exchange locations
+    sleep(Duration::from_secs(5)).await;
+
+    let diagnostics = network.collect_diagnostics().await?;
+
+    let mut missing_locations = Vec::new();
+    for peer in &diagnostics.peers {
+        let has_location = peer
+            .location
+            .as_ref()
+            .map(|s| !s.is_empty() && s != "N/A")
+            .unwrap_or(false);
+
+        if !has_location {
+            missing_locations.push(peer.peer_id.clone());
+        }
+    }
+
+    assert!(
+        missing_locations.is_empty(),
+        "Peers missing ring locations (ObservedAddress may not be working): {:?}",
+        missing_locations
+    );
+
+    println!(
+        "✓ All {} peers have ring locations",
+        diagnostics.peers.len()
+    );
+    Ok(())
+}

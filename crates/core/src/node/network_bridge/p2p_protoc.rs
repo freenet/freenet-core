@@ -26,7 +26,6 @@ use crate::node::network_bridge::handshake::{
 };
 use crate::node::network_bridge::priority_select;
 use crate::node::MessageProcessor;
-use crate::operations::connect::ConnectMsg;
 use crate::ring::Location;
 use crate::transport::{
     create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
@@ -44,7 +43,7 @@ use crate::{
         handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager,
         PeerId,
     },
-    ring::{PeerAddr, PeerKeyLocation},
+    ring::PeerKeyLocation,
     tracing::NetEventLog,
 };
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
@@ -204,8 +203,11 @@ impl P2pConnManager {
         let key_pair = config.key_pair.clone();
 
         // Initialize our peer identity before any connection attempts so join requests can
-        // Initialize our peer identity before any connection attempts so join requests can
         // reference the correct address.
+        // Note: For peers behind NAT, this initial address is a fallback - the correct
+        // external address is learned via ObservedAddress and updated via set_own_addr().
+        // The ring location should be computed from the observed external address,
+        // not from this initial fallback.
         let advertised_addr = {
             let advertised_ip = config
                 .own_addr
@@ -368,7 +370,7 @@ impl P2pConnManager {
                     match *event {
                         ConnEvent::InboundMessage(inbound) => {
                             let remote = inbound.remote_addr;
-                            let mut msg = inbound.msg;
+                            let msg = inbound.msg;
                             tracing::debug!(
                                 tx = %msg.id(),
                                 msg_type = %msg,
@@ -377,24 +379,13 @@ impl P2pConnManager {
                                 phase = "receive",
                                 "Received inbound message from peer"
                             );
-                            // Only the hop that owns the transport socket (gateway/first hop in
-                            // practice) knows the UDP source address; tag the connect request here
-                            // so downstream relays don't guess at the joiner's address.
-                            // The joiner creates the request with PeerAddr::Unknown because it
-                            // doesn't know its own external address (especially behind NAT).
-                            // We fill it in from the transport layer's observed source address.
-                            if let (
-                                Some(remote_addr),
-                                NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
-                                    payload,
-                                    ..
-                                })),
-                            ) = (remote, &mut msg)
-                            {
-                                if payload.joiner.peer_addr.is_unknown() {
-                                    payload.joiner.peer_addr = PeerAddr::Known(remote_addr);
-                                }
-                            }
+                            // NOTE: Do NOT fill in the joiner's address here!
+                            // The connect::handle_request() function handles address discovery
+                            // and emits ObservedAddress to inform the joiner of their external
+                            // address. If we fill it in here, handle_request() won't know that
+                            // WE discovered the address and won't send ObservedAddress.
+                            // The source_addr is passed to handle_inbound_message and propagates
+                            // to the connect operation via source_addr parameter.
                             // Pass the source address through to operations for routing.
                             // This replaces the old rewrite_sender_addr hack - instead of mutating
                             // message contents, we pass the observed transport address separately.
@@ -1049,15 +1040,14 @@ impl P2pConnManager {
 
                                 // Collect node information
                                 if config.include_node_info {
-                                    // Calculate location and address if set
-                                    let (addr, location) = if let Some(own_addr) =
-                                        op_manager.ring.connection_manager.get_own_addr()
-                                    {
-                                        let location = Location::from_address(&own_addr);
-                                        (Some(own_addr), Some(location))
-                                    } else {
-                                        (None, None)
-                                    };
+                                    // Get stored location (set by ObservedAddress handler) and address
+                                    // IMPORTANT: Use get_stored_location() rather than computing from
+                                    // get_own_addr() because the address may be a fallback value for
+                                    // peers behind NAT, while the stored location comes from the
+                                    // externally observed address.
+                                    let addr = op_manager.ring.connection_manager.get_own_addr();
+                                    let location =
+                                        op_manager.ring.connection_manager.get_stored_location();
 
                                     // Always include basic node info, but only include address/location if available
                                     response.node_info = Some(NodeInfo {
