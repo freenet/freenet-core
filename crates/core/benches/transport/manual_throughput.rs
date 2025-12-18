@@ -58,7 +58,10 @@ async fn bench_throughput(
     let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
     let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
 
-    eprintln!("  [DEBUG] Running {} warmup iterations...", warmup_iterations);
+    eprintln!(
+        "  [DEBUG] Running {} warmup iterations...",
+        warmup_iterations
+    );
     // Warmup phase
     for i in 0..warmup_iterations {
         let msg = vec![0xABu8; message_size];
@@ -137,7 +140,9 @@ async fn manual_throughput_benchmarks() {
 
     // Test with instant RTT (0ms) - single iteration only due to timeout issues
     println!("--- Instant RTT (0ms) ---\n");
-    println!("NOTE: Using single iteration per size due to hang issues with 16KB+ on second iteration\n");
+    println!(
+        "NOTE: Using single iteration per size due to hang issues with 16KB+ on second iteration\n"
+    );
     for (size, label) in &test_configs {
         eprintln!("[DEBUG] Starting benchmark for {}", label);
         let (elapsed, mbps) = bench_throughput(*size, 1, None, 0).await;
@@ -154,8 +159,7 @@ async fn manual_throughput_benchmarks() {
     println!("NOTE: Using single iteration per size due to timeout issues\n");
     for (size, label) in &test_configs {
         eprintln!("[DEBUG] Starting benchmark for {} with 2ms RTT", label);
-        let (elapsed, mbps) =
-            bench_throughput(*size, 1, Some(Duration::from_millis(2)), 0).await;
+        let (elapsed, mbps) = bench_throughput(*size, 1, Some(Duration::from_millis(2)), 0).await;
         println!(
             "{:>8}: time={:>12} throughput={:>12}",
             label,
@@ -175,8 +179,8 @@ async fn manual_sustained_throughput() {
 
     let test_configs = vec![
         (1024, 100, "1 KB × 100"),
-        (1024, 500, "1 KB × 500"),  // Test more iterations with size that works
-        (4096, 10, "4 KB × 10"),    // Reduce iterations for larger sizes
+        (1024, 500, "1 KB × 500"), // Test more iterations with size that works
+        (4096, 10, "4 KB × 10"),   // Reduce iterations for larger sizes
     ];
 
     for (size, iterations, label) in test_configs {
@@ -187,10 +191,13 @@ async fn manual_sustained_throughput() {
         let drop_policy = PacketDropPolicy::ReceiveAll;
 
         // Create peers
-        let (peer_a_pub, mut peer_a, peer_a_addr) =
-            create_mock_peer_with_delay(drop_policy.clone(), delay_policy.clone(), channels.clone())
-                .await
-                .unwrap();
+        let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
+            drop_policy.clone(),
+            delay_policy.clone(),
+            channels.clone(),
+        )
+        .await
+        .unwrap();
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer_with_delay(drop_policy, delay_policy, channels)
                 .await
@@ -204,7 +211,10 @@ async fn manual_sustained_throughput() {
         let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
         let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
 
-        eprintln!("  [DEBUG] Sending {} messages of {} bytes...", iterations, size);
+        eprintln!(
+            "  [DEBUG] Sending {} messages of {} bytes...",
+            iterations, size
+        );
         let start = Instant::now();
         for i in 0..iterations {
             let msg = vec![0xABu8; size];
@@ -261,10 +271,13 @@ async fn manual_concurrent_streams() {
             eprintln!("  [DEBUG] Stream {} starting...", stream_id);
 
             // Create peers for this stream
-            let (peer_a_pub, mut peer_a, peer_a_addr) =
-                create_mock_peer_with_delay(drop_policy_clone.clone(), delay_policy_clone.clone(), channels_clone.clone())
-                    .await
-                    .unwrap();
+            let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
+                drop_policy_clone.clone(),
+                delay_policy_clone.clone(),
+                channels_clone.clone(),
+            )
+            .await
+            .unwrap();
             let (peer_b_pub, mut peer_b, peer_b_addr) =
                 create_mock_peer_with_delay(drop_policy_clone, delay_policy_clone, channels_clone)
                     .await
@@ -311,7 +324,10 @@ async fn manual_concurrent_streams() {
     println!("Messages per stream: {}", iterations);
     println!("Total data: {:.2} MB", total_bytes / 1_000_000.0);
     println!("Total time: {}", format_duration(total_elapsed));
-    println!("Aggregate throughput: {}", format_throughput(aggregate_mbps));
+    println!(
+        "Aggregate throughput: {}",
+        format_throughput(aggregate_mbps)
+    );
 
     println!("\nPer-stream times:");
     for result in results {
