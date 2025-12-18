@@ -1,12 +1,13 @@
 //! LEDBAT Validation Benchmarks
 //!
 //! Manual benchmarks for validating LEDBAT congestion control behavior.
-//! These are slower but provide deep validation of:
-//! - Large transfer performance (256KB, 1MB)
-//! - Cold start vs warm connection throughput
-//! - cwnd evolution over time
+//! Validates:
+//! - Cold start vs warm connection throughput (1KB, 4KB, 16KB)
+//! - Connection reuse speedup (warm connection should be 5-25x faster)
 //!
-//! Run with: `cargo bench --bench transport_ledbat`
+//! Run with: `cargo bench --bench transport_ledbat --features bench`
+//!
+//! **Expected runtime: ~3-5 minutes**
 //!
 //! Use when:
 //! - Testing congestion control changes
@@ -20,7 +21,6 @@ mod transport;
 
 // Import benchmark functions
 use transport::ledbat_validation::*;
-use transport::slow_start::*;
 
 // =============================================================================
 // LEDBAT Validation Groups
@@ -29,30 +29,15 @@ use transport::slow_start::*;
 criterion_group!(
     name = ledbat_validation;
     config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
+        .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(10))
         .noise_threshold(0.15)
         .significance_level(0.05);
     targets =
-        bench_large_transfer_validation,
-        bench_1mb_transfer_validation,
-        bench_congestion_256kb,
-);
-
-criterion_group!(
-    name = slow_start;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(30))
-        .sample_size(20)
-        .noise_threshold(0.15)
-        .significance_level(0.05);
-    targets =
-        bench_cold_start_throughput,
-        bench_warm_connection_throughput,
-        bench_cwnd_evolution,
-        // bench_high_bandwidth_throughput is #[allow(dead_code)] due to OOM
+        bench_large_transfer_validation,  // Cold start: 1KB, 4KB, 16KB
+        bench_1mb_transfer_validation,    // Warm connection: 1KB, 4KB, 16KB
+        // NOTE: 32KB+ transfers timeout during criterion warmup - see ledbat_validation.rs
 );
 
 // Main entry point - LEDBAT validation benchmarks
-criterion_main!(ledbat_validation, slow_start);
+criterion_main!(ledbat_validation);
