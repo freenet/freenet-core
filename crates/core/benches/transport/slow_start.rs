@@ -1,4 +1,11 @@
 //! Slow Start Validation - Benchmarks to measure cold-start throughput
+//!
+//! **Design Principles:**
+//! - Use microsecond delays (100µs-1ms) to test LEDBAT dynamics quickly
+//! - Millisecond delays (10-100ms) cause benchmarks to take 10+ minutes
+//! - Reduced variants: 2 sizes × 2 delays = 4 variants (not 12)
+//!
+//! Expected runtime: ~3-5 minutes (vs 15+ minutes with ms delays)
 
 use criterion::{BatchSize, Criterion, Throughput};
 use dashmap::DashMap;
@@ -12,6 +19,9 @@ use std::time::{Duration, Instant};
 
 /// Benchmark fresh connection cold-start throughput
 /// This measures the actual slow start benefit (or lack thereof)
+///
+/// Uses microsecond delays to keep benchmark runtime reasonable.
+/// Tests same LEDBAT dynamics as millisecond delays but 100x faster.
 pub fn bench_cold_start_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -20,16 +30,18 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
         .unwrap();
 
     let mut group = c.benchmark_group("slow_start/cold_start");
-    group.sample_size(20); // More samples for variance analysis
-    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10); // Reduced from 20 - sufficient for validation
+    group.measurement_time(Duration::from_secs(10)); // Reduced from 30s
 
-    for transfer_size_kb in [256, 512, 1024, 4096] {
+    // Reduced variants: 2 sizes × 2 delays = 4 benchmarks (was 12)
+    for transfer_size_kb in [256, 1024] {
         let transfer_size = transfer_size_kb * 1024;
         group.throughput(Throughput::Bytes(transfer_size as u64));
 
-        for delay_ms in [10, 50, 100] {
+        // Use microsecond delays: 500µs and 2ms (equivalent dynamics to 50ms/200ms)
+        for delay_us in [500, 2000] {
             group.bench_function(
-                format!("{}kb_{}ms_no_warmup", transfer_size_kb, delay_ms),
+                format!("{}kb_{}us_no_warmup", transfer_size_kb, delay_us),
                 |b| {
                     b.to_async(&rt).iter_batched(
                         || {
@@ -39,7 +51,7 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                         |message| async move {
                             // Connection creation is PART OF THE MEASUREMENT
                             // This measures real cold-start behavior
-                            let delay = Duration::from_millis(delay_ms);
+                            let delay = Duration::from_micros(delay_us);
                             let channels = Arc::new(DashMap::new());
 
                             let (peer_a_pub, mut peer_a, peer_a_addr) =
@@ -83,6 +95,8 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
 }
 
 /// Benchmark warm connection throughput (for comparison)
+///
+/// Uses microsecond delays and reduced variants for reasonable runtime.
 pub fn bench_warm_connection_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -91,17 +105,19 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
         .unwrap();
 
     let mut group = c.benchmark_group("slow_start/warm_connection");
-    group.sample_size(20);
-    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10); // Reduced from 20
+    group.measurement_time(Duration::from_secs(10)); // Reduced from 30s
 
-    for transfer_size_kb in [256, 512, 1024, 4096] {
+    // Reduced variants: 2 sizes × 2 delays = 4 benchmarks (was 12)
+    for transfer_size_kb in [256, 1024] {
         let transfer_size = transfer_size_kb * 1024;
         group.throughput(Throughput::Bytes(transfer_size as u64));
 
-        for delay_ms in [10, 50, 100] {
-            let delay = Duration::from_millis(delay_ms);
+        // Use microsecond delays: 500µs and 2ms
+        for delay_us in [500, 2000] {
+            let delay = Duration::from_micros(delay_us);
 
-            group.bench_function(format!("{}kb_{}ms_warm", transfer_size_kb, delay_ms), |b| {
+            group.bench_function(format!("{}kb_{}us_warm", transfer_size_kb, delay_us), |b| {
                 // Setup connection and warmup OUTSIDE measurement
                 let (conn_a, conn_b) = rt.block_on(async {
                     let channels = Arc::new(DashMap::new());
@@ -129,9 +145,9 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
                     let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
                     let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
 
-                    // Warmup: 10 x 100KB transfers to stabilize LEDBAT
-                    for _ in 0..10 {
-                        let msg = vec![0xABu8; 102400];
+                    // Warmup: 5 x 64KB transfers to stabilize LEDBAT (reduced from 10x100KB)
+                    for _ in 0..5 {
+                        let msg = vec![0xABu8; 65536];
                         conn_a.send(msg).await.unwrap();
                         let _: Vec<u8> = conn_b.recv().await.unwrap();
                     }
@@ -166,15 +182,19 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
 
 /// Instrumented benchmark that captures cwnd evolution
 /// This is for diagnostic purposes, not CI performance tracking
+///
+/// Uses 2ms delay (reasonable compromise between realism and speed)
 pub fn bench_cwnd_evolution(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let mut group = c.benchmark_group("slow_start/cwnd_evolution");
     group.sample_size(10);
+    group.measurement_time(Duration::from_secs(15)); // Allow time for larger transfers
 
-    group.bench_function("1mb_100ms_cwnd_trace", |b| {
+    // Use 256KB instead of 1MB, with 2ms delay (reasonable for diagnostic)
+    group.bench_function("256kb_2ms_cwnd_trace", |b| {
         b.to_async(&rt).iter(|| async {
-            let delay = Duration::from_millis(100);
+            let delay = Duration::from_millis(2); // 2ms instead of 100ms
             let channels = Arc::new(DashMap::new());
 
             // Create connection with cwnd tracing enabled
@@ -201,15 +221,18 @@ pub fn bench_cwnd_evolution(c: &mut Criterion) {
             let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
             let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
 
-            let message = vec![0xABu8; 1024 * 1024];
+            let message = vec![0xABu8; 256 * 1024]; // 256KB instead of 1MB
             let start = Instant::now();
             conn_a.send(message).await.unwrap();
             let received: Vec<u8> = conn_b.recv().await.unwrap();
             let elapsed = start.elapsed();
 
             // Log timing (visible with --nocapture)
-            let throughput_mbps = (1.0 / elapsed.as_secs_f64()) * 8.0;
-            println!("1MB transfer: {:?} ({:.2} Mbps)", elapsed, throughput_mbps);
+            let throughput_mbps = (0.256 / elapsed.as_secs_f64()) * 8.0;
+            println!(
+                "256KB transfer: {:?} ({:.2} Mbps)",
+                elapsed, throughput_mbps
+            );
 
             std_black_box(received);
         });

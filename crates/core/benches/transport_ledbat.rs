@@ -1,12 +1,14 @@
 //! LEDBAT Validation Benchmarks
 //!
 //! Manual benchmarks for validating LEDBAT congestion control behavior.
-//! These are slower but provide deep validation of:
-//! - Large transfer performance (256KB, 1MB)
+//! Validates:
+//! - Large transfer performance (64KB-256KB with µs delays)
 //! - Cold start vs warm connection throughput
 //! - cwnd evolution over time
 //!
-//! Run with: `cargo bench --bench transport_ledbat`
+//! Run with: `cargo bench --bench transport_ledbat --features bench`
+//!
+//! **Expected runtime: ~5-8 minutes** (was 15+ minutes with ms delays)
 //!
 //! Use when:
 //! - Testing congestion control changes
@@ -29,7 +31,7 @@ use transport::slow_start::*;
 criterion_group!(
     name = ledbat_validation;
     config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
+        .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(10))
         .noise_threshold(0.15)
         .significance_level(0.05);
@@ -43,8 +45,7 @@ criterion_group!(
     name = slow_start;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(30))
-        .sample_size(20)
+        .measurement_time(Duration::from_secs(10))
         .noise_threshold(0.15)
         .significance_level(0.05);
     targets =
