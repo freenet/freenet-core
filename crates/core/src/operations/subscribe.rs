@@ -109,7 +109,7 @@ pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
     SubscribeOp {
         id,
         state,
-        upstream_addr: None, // Local operation, no upstream peer
+        requester_addr: None, // Local operation, we are the originator
     }
 }
 
@@ -119,7 +119,7 @@ pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp
     SubscribeOp {
         id,
         state,
-        upstream_addr: None, // Local operation, no upstream peer
+        requester_addr: None, // Local operation, we are the originator
     }
 }
 
@@ -186,7 +186,7 @@ pub(crate) async fn request_subscribe(
         state: Some(SubscribeState::AwaitingResponse {
             next_hop: Some(target_addr),
         }),
-        upstream_addr: None, // We're the originator
+        requester_addr: None, // We're the originator
     };
 
     op_manager
@@ -237,9 +237,9 @@ async fn complete_local_subscription(
 pub(crate) struct SubscribeOp {
     pub id: Transaction,
     state: Option<SubscribeState>,
-    /// The address we received this operation's message from.
-    /// Used for connection-based routing: responses are sent back to this address.
-    upstream_addr: Option<std::net::SocketAddr>,
+    /// The address of the peer that requested this subscription.
+    /// Used for routing responses back and registering them as downstream subscribers.
+    requester_addr: Option<std::net::SocketAddr>,
 }
 
 impl SubscribeOp {
@@ -308,7 +308,7 @@ impl Operation for SubscribeOp {
                         state: Some(SubscribeState::AwaitingResponse {
                             next_hop: None, // Will be determined during processing
                         }),
-                        upstream_addr: source_addr, // Store who sent us this request
+                        requester_addr: source_addr, // Store who sent us this request
                     },
                     source_addr,
                 })
@@ -342,24 +342,24 @@ impl Operation for SubscribeOp {
                         tx = %id,
                         %key,
                         htl,
-                        upstream_addr = ?self.upstream_addr,
+                        requester_addr = ?self.requester_addr,
                         "subscribe: processing Request"
                     );
 
                     // Check if we have the contract
                     if super::has_contract(op_manager, *key).await? {
                         // We have the contract - register upstream as subscriber and respond
-                        if let Some(upstream_addr) = self.upstream_addr {
+                        if let Some(requester_addr) = self.requester_addr {
                             // Register the upstream peer as downstream subscriber (they want updates FROM us)
                             if let Some(upstream_peer) = op_manager
                                 .ring
                                 .connection_manager
-                                .get_peer_location_by_addr(upstream_addr)
+                                .get_peer_location_by_addr(requester_addr)
                             {
                                 let _ = op_manager.ring.add_downstream(
                                     key,
                                     upstream_peer,
-                                    Some(upstream_addr.into()),
+                                    Some(requester_addr.into()),
                                 );
                             }
 
@@ -370,7 +370,7 @@ impl Operation for SubscribeOp {
                                     key: *key,
                                     subscribed: true,
                                 })),
-                                next_hop: Some(upstream_addr),
+                                next_hop: Some(requester_addr),
                                 state: None,
                             });
                         } else {
@@ -389,16 +389,16 @@ impl Operation for SubscribeOp {
                         .await?
                     {
                         // Contract arrived - handle same as above
-                        if let Some(upstream_addr) = self.upstream_addr {
+                        if let Some(requester_addr) = self.requester_addr {
                             if let Some(upstream_peer) = op_manager
                                 .ring
                                 .connection_manager
-                                .get_peer_location_by_addr(upstream_addr)
+                                .get_peer_location_by_addr(requester_addr)
                             {
                                 let _ = op_manager.ring.add_downstream(
                                     key,
                                     upstream_peer,
-                                    Some(upstream_addr.into()),
+                                    Some(requester_addr.into()),
                                 );
                             }
 
@@ -408,7 +408,7 @@ impl Operation for SubscribeOp {
                                     key: *key,
                                     subscribed: true,
                                 })),
-                                next_hop: Some(upstream_addr),
+                                next_hop: Some(requester_addr),
                                 state: None,
                             });
                         } else {
@@ -424,14 +424,14 @@ impl Operation for SubscribeOp {
                     // Contract still not found - try to forward
                     if *htl == 0 {
                         tracing::warn!(tx = %id, contract = %key, htl = 0, phase = "error", "Subscribe request exhausted HTL");
-                        if let Some(upstream_addr) = self.upstream_addr {
+                        if let Some(requester_addr) = self.requester_addr {
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
                                     key: *key,
                                     subscribed: false,
                                 })),
-                                next_hop: Some(upstream_addr),
+                                next_hop: Some(requester_addr),
                                 state: None,
                             });
                         }
@@ -447,8 +447,8 @@ impl Operation for SubscribeOp {
                         .expect("own address");
                     let mut new_skip_list = skip_list.clone();
                     new_skip_list.insert(own_addr);
-                    if let Some(upstream) = self.upstream_addr {
-                        new_skip_list.insert(upstream);
+                    if let Some(requester) = self.requester_addr {
+                        new_skip_list.insert(requester);
                     }
 
                     let candidates =
@@ -458,14 +458,14 @@ impl Operation for SubscribeOp {
 
                     let Some(next_hop) = candidates.first() else {
                         // No forward target
-                        if let Some(upstream_addr) = self.upstream_addr {
+                        if let Some(requester_addr) = self.requester_addr {
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
                                     key: *key,
                                     subscribed: false,
                                 })),
-                                next_hop: Some(upstream_addr),
+                                next_hop: Some(requester_addr),
                                 state: None,
                             });
                         }
@@ -490,7 +490,7 @@ impl Operation for SubscribeOp {
                             state: Some(SubscribeState::AwaitingResponse {
                                 next_hop: None, // Already routing via next_hop in OperationResult
                             }),
-                            upstream_addr: self.upstream_addr,
+                            requester_addr: self.requester_addr,
                         })),
                     })
                 }
@@ -504,7 +504,7 @@ impl Operation for SubscribeOp {
                         tx = %msg_id,
                         %key,
                         subscribed,
-                        upstream_addr = ?self.upstream_addr,
+                        requester_addr = ?self.requester_addr,
                         source_addr = ?source_addr,
                         "subscribe: processing Response"
                     );
@@ -513,7 +513,7 @@ impl Operation for SubscribeOp {
                         // Fetch contract if we don't have it
                         fetch_contract_if_missing(op_manager, *key).await?;
 
-                        // Register the sender as our upstream source (we'll receive updates from them)
+                        // Register the sender as our upstream source
                         if let Some(sender_addr) = source_addr {
                             if let Some(sender_peer) = op_manager
                                 .ring
@@ -531,42 +531,42 @@ impl Operation for SubscribeOp {
                         }
                     }
 
-                    // Forward response upstream or complete
-                    if let Some(upstream_addr) = self.upstream_addr {
-                        // We're an intermediate node - forward response upstream
-                        // Also register the peer we're forwarding to as downstream (they want updates from us)
+                    // Forward response to requester or complete
+                    if let Some(requester_addr) = self.requester_addr {
+                        // We're an intermediate node - forward response to the requester
+                        // Register them as downstream (they want updates from us)
                         if *subscribed {
                             if let Some(downstream_peer) = op_manager
                                 .ring
                                 .connection_manager
-                                .get_peer_location_by_addr(upstream_addr)
+                                .get_peer_location_by_addr(requester_addr)
                             {
                                 let _ = op_manager.ring.add_downstream(
                                     key,
                                     downstream_peer,
-                                    Some(upstream_addr.into()),
+                                    Some(requester_addr.into()),
                                 );
                                 tracing::debug!(
                                     tx = %msg_id,
                                     %key,
-                                    downstream = %upstream_addr,
-                                    "subscribe: registered downstream subscriber (forwarding peer)"
+                                    downstream = %requester_addr,
+                                    "subscribe: registered requester as downstream subscriber"
                                 );
                             }
                         }
 
-                        tracing::debug!(tx = %msg_id, %key, upstream = %upstream_addr, "Forwarding response upstream");
+                        tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding response to requester");
                         Ok(OperationResult {
                             return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                 id: *msg_id,
                                 key: *key,
                                 subscribed: *subscribed,
                             })),
-                            next_hop: Some(upstream_addr),
+                            next_hop: Some(requester_addr),
                             state: Some(OpEnum::Subscribe(SubscribeOp {
                                 id,
                                 state: Some(SubscribeState::Completed { key: *key }),
-                                upstream_addr: None,
+                                requester_addr: None,
                             })),
                         })
                     } else {
@@ -578,7 +578,7 @@ impl Operation for SubscribeOp {
                             state: Some(OpEnum::Subscribe(SubscribeOp {
                                 id,
                                 state: Some(SubscribeState::Completed { key: *key }),
-                                upstream_addr: None,
+                                requester_addr: None,
                             })),
                         })
                     }
@@ -604,7 +604,7 @@ mod messages {
 
     /// Subscribe operation messages.
     ///
-    /// Uses hop-by-hop routing: each node stores `upstream_addr` from the transport layer
+    /// Uses hop-by-hop routing: each node stores `requester_addr` from the transport layer
     /// to route responses back. No `PeerKeyLocation` is embedded in wire messages.
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub(crate) enum SubscribeMsg {

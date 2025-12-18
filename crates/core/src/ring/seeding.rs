@@ -213,6 +213,7 @@ impl SeedingManager {
     }
 
     /// Get the upstream peer for a contract (if any).
+    #[cfg(test)]
     pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
         self.subscriptions.get(contract).and_then(|subs| {
             subs.iter()
@@ -493,21 +494,6 @@ impl SeedingManager {
     #[inline]
     pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
         self.seeding_cache.read().contains(key)
-    }
-
-    /// Remove a contract from the seeding cache.
-    ///
-    /// Returns the upstream peer to notify if any.
-    #[allow(dead_code)]
-    pub fn remove_seeded_contract(&self, key: &ContractKey) -> Option<PeerKeyLocation> {
-        let removed = self.seeding_cache.write().remove(key).is_some();
-        if removed {
-            let upstream = self.get_upstream(key);
-            self.subscriptions.remove(key);
-            self.client_subscriptions.remove(key);
-            return upstream;
-        }
-        None
     }
 
     /// Get all downstream subscribers for a contract.

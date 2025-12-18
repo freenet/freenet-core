@@ -160,19 +160,6 @@ impl<T: TimeSource> SeedingCache<T> {
         self.contracts.get(key)
     }
 
-    /// Remove a contract from the cache.
-    ///
-    /// Returns the removed contract metadata, if it was present.
-    pub fn remove(&mut self, key: &ContractKey) -> Option<CachedContract> {
-        if let Some(removed) = self.contracts.remove(key) {
-            self.lru_order.retain(|k| k != key);
-            self.current_bytes = self.current_bytes.saturating_sub(removed.size_bytes);
-            Some(removed)
-        } else {
-            None
-        }
-    }
-
     /// Get the current number of cached contracts.
     #[allow(dead_code)] // Public API for introspection
     pub fn len(&self) -> usize {
@@ -354,32 +341,6 @@ mod tests {
         assert!(cache.contains(&key1));
         assert!(!cache.contains(&key2));
         assert!(cache.contains(&key3));
-    }
-
-    #[test]
-    fn test_remove_contract() {
-        let mut cache = make_cache(1000);
-        let key = make_key(1);
-
-        cache.record_access(key, 100, AccessType::Get);
-        assert!(cache.contains(&key));
-        assert_eq!(cache.current_bytes(), 100);
-
-        let removed = cache.remove(&key);
-        assert!(removed.is_some());
-        assert_eq!(removed.unwrap().size_bytes, 100);
-        assert!(!cache.contains(&key));
-        assert_eq!(cache.current_bytes(), 0);
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn test_remove_nonexistent() {
-        let mut cache = make_cache(1000);
-        let key = make_key(1);
-
-        let removed = cache.remove(&key);
-        assert!(removed.is_none());
     }
 
     #[test]
