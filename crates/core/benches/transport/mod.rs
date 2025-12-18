@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 pub mod blackbox;
+pub mod common; // Shared utilities for reducing duplication
 pub mod ledbat_validation;
 pub mod level0;
 pub mod level1;
