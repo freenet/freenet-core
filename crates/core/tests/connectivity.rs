@@ -10,11 +10,6 @@ use freenet_stdlib::{
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
 
-// Fixed ring locations for the three-node connectivity test.
-fn fixed_three_node_locations() -> Vec<f64> {
-    vec![0.1, 0.5, 0.9]
-}
-
 /// Test gateway reconnection:
 /// 1. Start a gateway and a peer connected to it
 /// 2. Perform operations to verify connectivity
@@ -263,7 +258,8 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 300,
     startup_wait_secs = 30,
-    node_locations_fn = fixed_three_node_locations,
+    // Locations are derived from varied loopback IPs (127.x.y.1) which gives each node
+    // a unique location without needing explicit configuration
     aggregate_events = "always",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4

@@ -253,7 +253,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
-                            // Bind to localhost (127.0.0.1) for actual sockets
+                            // Bind to localhost (127.0.0.1) for WebSocket API
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
                             ws_api_port: Some(ws_port),
                             token_ttl_seconds: None,
@@ -268,8 +268,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             gateways: Some(vec![]),
                             location: Some(location),
                             ignore_protocol_checking: true,
-                            // Bind to localhost (127.0.0.1) for actual sockets
-                            address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                            // Bind to the same varied IP so ObservedAddress reports consistent address
+                            address: Some(node_ip.into()),
                             network_port: Some(network_port),
                             min_connections: None,
                             max_connections: None,
@@ -307,8 +307,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
             setup_code.push(quote! {
                 let #gateway_info_var = freenet::config::InlineGwConfig {
-                    // Use LOCALHOST for actual connectivity
-                    address: (std::net::Ipv4Addr::LOCALHOST, #config_var.network_api.public_port.unwrap()).into(),
+                    // Use the varied IP for connectivity (same as what the gateway binds to)
+                    address: (#config_var.network_api.address.unwrap(), #config_var.network_api.public_port.unwrap()).into(),
                     location: #config_var.network_api.location,
                     public_key_path: #temp_var.path().join("public.pem"),
                 };
@@ -384,7 +384,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
 
                     let config = freenet::config::ConfigArgs {
                         ws_api: freenet::config::WebsocketApiArgs {
-                            // Bind to localhost (127.0.0.1) for actual sockets
+                            // Bind to localhost (127.0.0.1) for WebSocket API
                             address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
                             ws_api_port: Some(ws_port),
                             token_ttl_seconds: None,
@@ -399,8 +399,8 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             gateways: #gateways_config,
                             location: Some(location),
                             ignore_protocol_checking: true,
-                            // Bind to localhost (127.0.0.1) for actual sockets
-                            address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                            // Bind to the same varied IP so ObservedAddress reports consistent address
+                            address: Some(node_ip.into()),
                             network_port: Some(network_port),
                             min_connections: None,
                             max_connections: None,
