@@ -20,7 +20,8 @@
 
 use dashmap::DashMap;
 use freenet::transport::mock_transport::{
-    create_mock_peer, create_mock_peer_with_delay, Channels, PacketDelayPolicy, PacketDropPolicy,
+    create_mock_peer, create_mock_peer_with_delay, Channels, MockSocket, PacketDelayPolicy,
+    PacketDropPolicy,
 };
 use freenet::transport::{OutboundConnectionHandler, PeerConnection, TransportPublicKey};
 use std::net::SocketAddr;
@@ -52,10 +53,10 @@ pub fn create_benchmark_runtime() -> tokio::runtime::Runtime {
 /// bidirectional connections and get a `ConnectedPeerPair`.
 pub struct PeerPair {
     pub peer_a_pub: TransportPublicKey,
-    pub peer_a: OutboundConnectionHandler,
+    pub peer_a: OutboundConnectionHandler<MockSocket>,
     pub peer_a_addr: SocketAddr,
     pub peer_b_pub: TransportPublicKey,
-    pub peer_b: OutboundConnectionHandler,
+    pub peer_b: OutboundConnectionHandler<MockSocket>,
     pub peer_b_addr: SocketAddr,
 }
 
@@ -73,14 +74,14 @@ pub struct PeerPair {
 /// let received: Vec<u8> = conn_b.recv().await.unwrap();
 /// ```
 pub struct ConnectedPeerPair {
-    pub conn_a: PeerConnection,
-    pub conn_b: PeerConnection,
+    pub conn_a: PeerConnection<MockSocket>,
+    pub conn_b: PeerConnection<MockSocket>,
     /// Must keep peer_a alive - it holds the inbound_packet_sender channel
     #[allow(dead_code)]
-    peer_a: OutboundConnectionHandler,
+    peer_a: OutboundConnectionHandler<MockSocket>,
     /// Must keep peer_b alive - it holds the inbound_packet_sender channel
     #[allow(dead_code)]
-    peer_b: OutboundConnectionHandler,
+    peer_b: OutboundConnectionHandler<MockSocket>,
 }
 
 impl PeerPair {
@@ -128,7 +129,12 @@ impl ConnectedPeerPair {
     /// Get mutable references to both connections
     ///
     /// Useful when you need to pass connections separately to different tasks.
-    pub fn connections_mut(&mut self) -> (&mut PeerConnection, &mut PeerConnection) {
+    pub fn connections_mut(
+        &mut self,
+    ) -> (
+        &mut PeerConnection<MockSocket>,
+        &mut PeerConnection<MockSocket>,
+    ) {
         (&mut self.conn_a, &mut self.conn_b)
     }
 }

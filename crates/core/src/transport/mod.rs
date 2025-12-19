@@ -23,7 +23,6 @@ pub use connection_handler::mock_transport;
 pub mod fast_channel;
 mod packet_data;
 pub mod peer_connection;
-mod rate_limiter;
 // todo: optimize trackers
 mod received_packet_tracker;
 
@@ -105,7 +104,6 @@ pub(crate) trait Socket: Sized + Send + Sync + 'static {
         &self,
         buf: &mut [u8],
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
-    #[allow(dead_code)] // Kept for completeness; blocking variant is used for rate-limiter
     fn send_to(
         &self,
         buf: &[u8],
@@ -114,27 +112,9 @@ pub(crate) trait Socket: Sized + Send + Sync + 'static {
 
     /// Synchronous send for use in blocking contexts (e.g., spawn_blocking).
     /// For UDP, this typically succeeds immediately since there's no flow control.
+    /// Used by MockSocket implementations in tests.
+    #[allow(dead_code)]
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize>;
-
-    /// Batch send for syscall optimization. Sends multiple packets in a single syscall
-    /// where supported (Linux sendmmsg), falls back to sequential sends elsewhere.
-    ///
-    /// Returns the number of packets successfully sent.
-    fn send_batch_blocking(&self, packets: &[(&[u8], SocketAddr)]) -> io::Result<usize> {
-        // Default implementation: sequential sends
-        let mut sent = 0;
-        for (buf, target) in packets {
-            self.send_to_blocking(buf, *target)?;
-            sent += 1;
-        }
-        Ok(sent)
-    }
-
-    /// Returns the optimal batch size for this socket implementation.
-    /// Returns 1 for implementations that don't benefit from batching.
-    fn optimal_batch_size(&self) -> usize {
-        1
-    }
 }
 
 impl Socket for UdpSocket {
@@ -168,17 +148,6 @@ impl Socket for UdpSocket {
                 Err(e) => return Err(e),
             }
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn send_batch_blocking(&self, packets: &[(&[u8], SocketAddr)]) -> io::Result<usize> {
-        use std::os::unix::io::AsRawFd;
-        batching::linux::send_batch(self.as_raw_fd(), packets)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn optimal_batch_size(&self) -> usize {
-        batching::BATCH_SIZE
     }
 }
 
