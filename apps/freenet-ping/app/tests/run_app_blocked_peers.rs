@@ -202,7 +202,11 @@ async fn run_blocked_peers_test_inner(
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config_from_path_with_ip(public_port, &path, gw_ip)?)
+        (
+            cfg,
+            preset,
+            gw_config_from_path_with_ip(public_port, &path, gw_ip)?,
+        )
     };
 
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
