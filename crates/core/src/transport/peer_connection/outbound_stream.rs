@@ -7,7 +7,6 @@ use aes_gcm::Aes128Gcm;
 
 use crate::{
     transport::{
-        fast_channel::FastSender,
         packet_data,
         sent_packet_tracker::SentPacketTracker,
         symmetric_message::{self},
@@ -29,10 +28,10 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
 /// piped streams which start forwarding before the stream has been received.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn send_stream(
+pub(super) async fn send_stream<S: super::super::Socket>(
     stream_id: StreamId,
     last_packet_id: Arc<AtomicU32>,
-    sender: FastSender<(SocketAddr, Arc<[u8]>)>,
+    socket: Arc<S>,
     destination_addr: SocketAddr,
     mut stream_to_send: SerializedStream,
     outbound_symmetric_key: Aes128Gcm,
@@ -128,7 +127,7 @@ pub(super) async fn send_stream(
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
         super::packet_sending(
             destination_addr,
-            &sender,
+            &socket,
             packet_id,
             &outbound_symmetric_key,
             vec![],
@@ -166,10 +165,46 @@ mod tests {
         symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
         *,
     };
-    use crate::transport::fast_channel;
+    use crate::transport::fast_channel::{self, FastSender};
     use crate::transport::ledbat::LedbatController;
     use crate::transport::packet_data::PacketData;
     use crate::transport::token_bucket::TokenBucket;
+
+    /// Simple test socket that writes to a channel
+    struct TestSocket {
+        sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>,
+    }
+
+    impl TestSocket {
+        fn new(sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>) -> Self {
+            Self { sender }
+        }
+    }
+
+    impl crate::transport::Socket for TestSocket {
+        async fn bind(_addr: SocketAddr) -> std::io::Result<Self> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            unimplemented!()
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.sender
+                .send_async((target, buf.into()))
+                .await
+                .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            Ok(buf.len())
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.sender
+                .send((target, buf.into()))
+                .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            Ok(buf.len())
+        }
+    }
 
     #[tokio::test]
     async fn test_send_stream_success() -> Result<(), Box<dyn std::error::Error>> {
@@ -193,7 +228,7 @@ mod tests {
         let background_task = tokio::spawn(send_stream(
             StreamId::next(),
             Arc::new(AtomicU32::new(0)),
-            outbound_sender,
+            Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
             message.clone(),
             cipher.clone(),
@@ -283,7 +318,7 @@ mod tests {
         let send_task = tokio::spawn(send_stream(
             stream_id,
             last_packet_id.clone(),
-            outbound_sender,
+            Arc::new(TestSocket::new(outbound_sender)),
             destination_addr,
             message.clone(),
             key.clone(),
@@ -362,7 +397,7 @@ mod tests {
         let send_task = tokio::spawn(send_stream(
             stream_id,
             last_packet_id.clone(),
-            outbound_sender,
+            Arc::new(TestSocket::new(outbound_sender)),
             destination_addr,
             message.clone(),
             key.clone(),

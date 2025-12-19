@@ -42,6 +42,8 @@
 //! let packet = rx.recv_async().await.unwrap();
 //! ```
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -193,6 +195,9 @@ pub struct FastReceiver<T> {
     send_notify: Arc<Notify>,
     /// Tracks if the receiver has been dropped (shared with senders for is_closed())
     closed: Arc<AtomicBool>,
+    /// Counts recv_async poll iterations (test-only, for verifying no busy-loop)
+    #[cfg(test)]
+    poll_count: Arc<AtomicU64>,
 }
 
 impl<T> Drop for FastReceiver<T> {
@@ -208,8 +213,15 @@ impl<T> FastReceiver<T> {
     /// Receives a message asynchronously.
     ///
     /// This is the primary receive method for async contexts.
+    /// Uses exponential backoff when the channel is empty.
     pub async fn recv_async(&self) -> Result<T, RecvError> {
+        let mut backoff_us = 1u64;
+        const MAX_BACKOFF_US: u64 = 1000; // 1ms max
+
         loop {
+            #[cfg(test)]
+            self.poll_count.fetch_add(1, Ordering::Relaxed);
+
             match self.inner.try_recv() {
                 Ok(msg) => {
                     // Notify senders that space is available
@@ -217,14 +229,21 @@ impl<T> FastReceiver<T> {
                     return Ok(msg);
                 }
                 Err(crossbeam::channel::TryRecvError::Empty) => {
-                    // Channel is empty - yield to let other tasks run, then check again
-                    tokio::task::yield_now().await;
+                    // Channel is empty - wait with exponential backoff
+                    tokio::time::sleep(std::time::Duration::from_micros(backoff_us)).await;
+                    backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
                 }
                 Err(crossbeam::channel::TryRecvError::Disconnected) => {
                     return Err(RecvError);
                 }
             }
         }
+    }
+
+    /// Returns the number of poll iterations in recv_async (test-only).
+    #[cfg(test)]
+    pub fn poll_count(&self) -> u64 {
+        self.poll_count.load(Ordering::Relaxed)
     }
 
     /// Receives a message synchronously (blocking).
@@ -286,6 +305,8 @@ pub fn bounded<T>(capacity: usize) -> (FastSender<T>, FastReceiver<T>) {
         inner: rx,
         send_notify,
         closed,
+        #[cfg(test)]
+        poll_count: Arc::new(AtomicU64::new(0)),
     };
 
     (sender, receiver)
@@ -391,5 +412,38 @@ mod tests {
         sender.await.unwrap();
         let received = receiver.await.unwrap();
         assert_eq!(received, count);
+    }
+
+    #[tokio::test]
+    async fn test_recv_async_no_busy_loop() {
+        // Verify recv_async uses exponential backoff, not busy-looping.
+        // With 1s wait and 1ms max backoff, expect ~1000 iterations max.
+        // A busy-loop with yield_now() would do millions of iterations.
+        let (tx, rx) = bounded::<i32>(10);
+
+        // Spawn sender that waits 1 second before sending
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tx.send_async(42).await.unwrap();
+        });
+
+        // Receive (will wait ~1s for the message)
+        let result = rx.recv_async().await.unwrap();
+        assert_eq!(result, 42);
+
+        sender.await.unwrap();
+
+        // Check poll count - with exponential backoff (1μs -> 1ms max),
+        // 1 second of waiting should result in roughly:
+        // - First 10 iterations: 1+2+4+8+16+32+64+128+256+512 = ~1ms total
+        // - Remaining ~999ms at 1ms each = ~999 iterations
+        // Total: ~1009 iterations, let's say < 2000 to be safe
+        let polls = rx.poll_count();
+        assert!(
+            polls < 2000,
+            "Too many poll iterations ({polls}), likely busy-looping"
+        );
+        // Also verify we actually polled (not zero)
+        assert!(polls > 0, "Should have polled at least once");
     }
 }
