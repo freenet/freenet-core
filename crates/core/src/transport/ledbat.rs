@@ -484,11 +484,14 @@ impl LedbatController {
         let current_cwnd = self.cwnd.load(Ordering::Acquire);
         self.cwnd.store(new_cwnd, Ordering::Release);
 
-        tracing::error!(
-            old_cwnd_kb = current_cwnd / 1024,
-            new_cwnd_kb = new_cwnd / 1024,
-            "LEDBAT retransmission timeout - reset to 1*MSS"
-        );
+        // Only log when cwnd actually changes to avoid spam when already at minimum
+        if current_cwnd != new_cwnd {
+            tracing::warn!(
+                old_cwnd_kb = current_cwnd / 1024,
+                new_cwnd_kb = new_cwnd / 1024,
+                "LEDBAT retransmission timeout - reset to 1*MSS"
+            );
+        }
     }
 
     /// Get current congestion window (bytes).
