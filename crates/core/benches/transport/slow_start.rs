@@ -17,6 +17,8 @@ use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::common::{create_peer_pair_with_delay, new_channels, DELAY_MICROS, TRANSFER_SIZES_KB};
+
 /// Benchmark fresh connection cold-start throughput
 /// This measures the actual slow start benefit (or lack thereof)
 ///
@@ -34,12 +36,12 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10)); // Reduced from 30s
 
     // Reduced variants: 2 sizes × 2 delays = 4 benchmarks (was 12)
-    for transfer_size_kb in [256, 1024] {
+    for &transfer_size_kb in TRANSFER_SIZES_KB {
         let transfer_size = transfer_size_kb * 1024;
         group.throughput(Throughput::Bytes(transfer_size as u64));
 
         // Use microsecond delays: 500µs and 2ms (equivalent dynamics to 50ms/200ms)
-        for delay_us in [500, 2000] {
+        for &delay_us in DELAY_MICROS {
             group.bench_function(
                 format!("{}kb_{}us_no_warmup", transfer_size_kb, delay_us),
                 |b| {
@@ -52,36 +54,14 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
                             // Connection creation is PART OF THE MEASUREMENT
                             // This measures real cold-start behavior
                             let delay = Duration::from_micros(delay_us);
-                            let channels = Arc::new(DashMap::new());
-
-                            let (peer_a_pub, mut peer_a, peer_a_addr) =
-                                create_mock_peer_with_delay(
-                                    PacketDropPolicy::ReceiveAll,
-                                    PacketDelayPolicy::Fixed(delay),
-                                    channels.clone(),
-                                )
+                            let mut peers = create_peer_pair_with_delay(new_channels(), delay)
                                 .await
-                                .unwrap();
-
-                            let (peer_b_pub, mut peer_b, peer_b_addr) =
-                                create_mock_peer_with_delay(
-                                    PacketDropPolicy::ReceiveAll,
-                                    PacketDelayPolicy::Fixed(delay),
-                                    channels,
-                                )
-                                .await
-                                .unwrap();
-
-                            let (conn_a_inner, conn_b_inner) = futures::join!(
-                                peer_a.connect(peer_b_pub, peer_b_addr),
-                                peer_b.connect(peer_a_pub, peer_a_addr),
-                            );
-                            let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-                            let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+                                .connect()
+                                .await;
 
                             // Measured transfer - FIRST transfer on fresh connection
-                            conn_a.send(message).await.unwrap();
-                            let received: Vec<u8> = conn_b.recv().await.unwrap();
+                            peers.conn_a.send(message).await.unwrap();
+                            let received: Vec<u8> = peers.conn_b.recv().await.unwrap();
 
                             std_black_box(received);
                         },
@@ -109,66 +89,44 @@ pub fn bench_warm_connection_throughput(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10)); // Reduced from 30s
 
     // Reduced variants: 2 sizes × 2 delays = 4 benchmarks (was 12)
-    for transfer_size_kb in [256, 1024] {
+    for &transfer_size_kb in TRANSFER_SIZES_KB {
         let transfer_size = transfer_size_kb * 1024;
         group.throughput(Throughput::Bytes(transfer_size as u64));
 
         // Use microsecond delays: 500µs and 2ms
-        for delay_us in [500, 2000] {
+        for &delay_us in DELAY_MICROS {
             let delay = Duration::from_micros(delay_us);
 
             group.bench_function(format!("{}kb_{}us_warm", transfer_size_kb, delay_us), |b| {
                 // Setup connection and warmup OUTSIDE measurement
-                let (conn_a, conn_b) = rt.block_on(async {
-                    let channels = Arc::new(DashMap::new());
-
-                    let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
-                        PacketDropPolicy::ReceiveAll,
-                        PacketDelayPolicy::Fixed(delay),
-                        channels.clone(),
-                    )
-                    .await
-                    .unwrap();
-
-                    let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_delay(
-                        PacketDropPolicy::ReceiveAll,
-                        PacketDelayPolicy::Fixed(delay),
-                        channels,
-                    )
-                    .await
-                    .unwrap();
-
-                    let (conn_a_inner, conn_b_inner) = futures::join!(
-                        peer_a.connect(peer_b_pub, peer_b_addr),
-                        peer_b.connect(peer_a_pub, peer_a_addr),
-                    );
-                    let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-                    let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+                // Keep peers alive to prevent channel closure
+                let peers = rt.block_on(async {
+                    let mut peers = create_peer_pair_with_delay(new_channels(), delay)
+                        .await
+                        .connect()
+                        .await;
 
                     // Warmup: 5 x 64KB transfers to stabilize LEDBAT (reduced from 10x100KB)
                     for _ in 0..5 {
                         let msg = vec![0xABu8; 65536];
-                        conn_a.send(msg).await.unwrap();
-                        let _: Vec<u8> = conn_b.recv().await.unwrap();
+                        peers.conn_a.send(msg).await.unwrap();
+                        let _: Vec<u8> = peers.conn_b.recv().await.unwrap();
                     }
 
-                    (conn_a, conn_b)
+                    peers
                 });
 
-                let conn_a = Arc::new(tokio::sync::Mutex::new(conn_a));
-                let conn_b = Arc::new(tokio::sync::Mutex::new(conn_b));
+                let peers = Arc::new(tokio::sync::Mutex::new(peers));
 
                 b.to_async(&rt).iter_batched(
                     || vec![0xABu8; transfer_size],
                     |message| {
-                        let conn_a = conn_a.clone();
-                        let conn_b = conn_b.clone();
+                        let peers = peers.clone();
                         async move {
-                            let mut conn_a = conn_a.lock().await;
-                            let mut conn_b = conn_b.lock().await;
+                            let mut p = peers.lock().await;
 
-                            conn_a.send(message).await.unwrap();
-                            let received: Vec<u8> = conn_b.recv().await.unwrap();
+                            p.conn_a.send(message).await.unwrap();
+                            let received: Vec<u8> = p.conn_b.recv().await.unwrap();
                             std_black_box(received);
                         }
                     },

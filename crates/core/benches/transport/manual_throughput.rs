@@ -1,23 +1,28 @@
 //! Manual Throughput Benchmarks
 //!
 //! Custom harness for testing large transfer throughput without criterion.
-//! Criterion's warmup estimation hangs with 32KB+ transfers, so we use
+//! Criterion's warmup phase hangs with 16KB+ transfers, so we use
 //! manual timing instead.
 //!
-//! Run with: `cargo test --release --bench transport_manual -- --nocapture`
-//!
 //! Tests:
-//! - Large message sizes (32KB, 64KB, 128KB, 256KB)
-//! - Warm connection (reused across iterations)
-//! - Manual timing and throughput calculation
-//! - Both instant RTT (0ms) and LAN RTT (2ms)
+//! - Cold start vs warm connection throughput (1KB, 4KB, 16KB)
+//! - Connection reuse speedup (warm connection should be 5-25x faster)
+//!
+//! Run with: `cargo test --release --bench transport_manual --features bench -- --nocapture`
+//!
+//! **Expected runtime: ~3-5 minutes**
+//!
+//! Use when:
+//! - Testing congestion control changes
+//! - Validating slow start behavior
+//! - Measuring cold-start vs steady-state performance
 
-use dashmap::DashMap;
-use freenet::transport::mock_transport::{
-    create_mock_peer_with_delay, Channels, PacketDelayPolicy, PacketDropPolicy,
-};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use super::common::{
+    calculate_throughput_mbps, create_connected_peers, create_connected_peers_with_delay,
+    format_duration, format_throughput, new_channels,
+};
 
 /// Run a manual throughput benchmark with specified parameters
 async fn bench_throughput(
@@ -27,36 +32,12 @@ async fn bench_throughput(
     warmup_iterations: usize,
 ) -> (Duration, f64) {
     eprintln!("  [DEBUG] Creating channels...");
-    let channels: Channels = Arc::new(DashMap::new());
 
-    // Apply RTT delay if specified
-    let drop_policy = PacketDropPolicy::ReceiveAll;
-    let delay_policy = if let Some(delay) = rtt_delay {
-        PacketDelayPolicy::Fixed(delay)
+    let mut peers = if let Some(delay) = rtt_delay {
+        create_connected_peers_with_delay(delay).await
     } else {
-        PacketDelayPolicy::NoDelay
+        create_connected_peers().await
     };
-
-    eprintln!("  [DEBUG] Creating peers...");
-    // Create peers
-    let (peer_a_pub, mut peer_a, peer_a_addr) =
-        create_mock_peer_with_delay(drop_policy.clone(), delay_policy.clone(), channels.clone())
-            .await
-            .unwrap();
-
-    let (peer_b_pub, mut peer_b, peer_b_addr) =
-        create_mock_peer_with_delay(drop_policy, delay_policy, channels)
-            .await
-            .unwrap();
-
-    eprintln!("  [DEBUG] Establishing connection...");
-    // Establish connection
-    let (conn_a_inner, conn_b_inner) = futures::join!(
-        peer_a.connect(peer_b_pub, peer_b_addr),
-        peer_b.connect(peer_a_pub, peer_a_addr),
-    );
-    let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-    let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
 
     eprintln!(
         "  [DEBUG] Running {} warmup iterations...",
@@ -65,8 +46,8 @@ async fn bench_throughput(
     // Warmup phase
     for i in 0..warmup_iterations {
         let msg = vec![0xABu8; message_size];
-        conn_a.send(msg).await.unwrap();
-        let _: Vec<u8> = conn_b.recv().await.unwrap();
+        peers.conn_a.send(msg).await.unwrap();
+        let _: Vec<u8> = peers.conn_b.recv().await.unwrap();
         if i == 0 {
             eprintln!("  [DEBUG] First warmup iteration complete");
         }
@@ -77,8 +58,8 @@ async fn bench_throughput(
     let start = Instant::now();
     for i in 0..iterations {
         let msg = vec![0xABu8; message_size];
-        conn_a.send(msg).await.unwrap();
-        let _: Vec<u8> = conn_b.recv().await.unwrap();
+        peers.conn_a.send(msg).await.unwrap();
+        let _: Vec<u8> = peers.conn_b.recv().await.unwrap();
         if i == 0 {
             eprintln!("  [DEBUG] First benchmark iteration complete");
         }
@@ -87,32 +68,11 @@ async fn bench_throughput(
     eprintln!("  [DEBUG] Benchmark complete");
 
     // Calculate throughput
-    let total_bytes = (message_size * iterations) as f64;
-    let throughput_mbps = (total_bytes * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
+    let total_bytes = message_size * iterations;
+    let throughput_mbps = calculate_throughput_mbps(total_bytes, elapsed);
 
-    // Keep peers alive until we're done
-    drop(peer_a);
-    drop(peer_b);
-
+    // Peers kept alive until function completes
     (elapsed, throughput_mbps)
-}
-
-/// Format duration for display
-fn format_duration(d: Duration) -> String {
-    if d.as_millis() > 0 {
-        format!("{:.2}ms", d.as_secs_f64() * 1000.0)
-    } else {
-        format!("{:.2}µs", d.as_micros())
-    }
-}
-
-/// Format throughput for display
-fn format_throughput(mbps: f64) -> String {
-    if mbps >= 1.0 {
-        format!("{:.2} Mbps", mbps)
-    } else {
-        format!("{:.2} Kbps", mbps * 1000.0)
-    }
 }
 
 #[tokio::test]
@@ -186,30 +146,7 @@ async fn manual_sustained_throughput() {
     for (size, iterations, label) in test_configs {
         eprintln!("[DEBUG] Starting sustained test: {}", label);
 
-        let channels: Channels = Arc::new(DashMap::new());
-        let delay_policy = PacketDelayPolicy::NoDelay;
-        let drop_policy = PacketDropPolicy::ReceiveAll;
-
-        // Create peers
-        let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
-            drop_policy.clone(),
-            delay_policy.clone(),
-            channels.clone(),
-        )
-        .await
-        .unwrap();
-        let (peer_b_pub, mut peer_b, peer_b_addr) =
-            create_mock_peer_with_delay(drop_policy, delay_policy, channels)
-                .await
-                .unwrap();
-
-        eprintln!("  [DEBUG] Establishing connection...");
-        let (conn_a_inner, conn_b_inner) = futures::join!(
-            peer_a.connect(peer_b_pub, peer_b_addr),
-            peer_b.connect(peer_a_pub, peer_a_addr),
-        );
-        let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-        let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+        let mut peers = create_connected_peers().await;
 
         eprintln!(
             "  [DEBUG] Sending {} messages of {} bytes...",
@@ -218,16 +155,16 @@ async fn manual_sustained_throughput() {
         let start = Instant::now();
         for i in 0..iterations {
             let msg = vec![0xABu8; size];
-            conn_a.send(msg).await.unwrap();
-            let _: Vec<u8> = conn_b.recv().await.unwrap();
+            peers.conn_a.send(msg).await.unwrap();
+            let _: Vec<u8> = peers.conn_b.recv().await.unwrap();
             if i == 0 {
                 eprintln!("  [DEBUG] First message complete");
             }
         }
         let elapsed = start.elapsed();
 
-        let total_bytes = (size * iterations) as f64;
-        let throughput_mbps = (total_bytes * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
+        let total_bytes = size * iterations;
+        let throughput_mbps = calculate_throughput_mbps(total_bytes, elapsed);
 
         println!(
             "{:>12}: total_time={:>10} aggregate_throughput={:>12}",
@@ -235,9 +172,6 @@ async fn manual_sustained_throughput() {
             format_duration(elapsed),
             format_throughput(throughput_mbps)
         );
-
-        drop(peer_a);
-        drop(peer_b);
     }
 
     println!("\n=== Sustained Test Complete ===\n");
@@ -255,53 +189,29 @@ async fn manual_concurrent_streams() {
 
     eprintln!("[DEBUG] Creating {} concurrent streams", num_streams);
 
-    let channels: Channels = Arc::new(DashMap::new());
-    let delay_policy = PacketDelayPolicy::NoDelay;
-    let drop_policy = PacketDropPolicy::ReceiveAll;
+    let channels = new_channels();
 
     // Create multiple peer pairs
     let mut tasks = Vec::new();
 
     for stream_id in 0..num_streams {
         let channels_clone = channels.clone();
-        let delay_policy_clone = delay_policy.clone();
-        let drop_policy_clone = drop_policy.clone();
 
         let task = tokio::spawn(async move {
             eprintln!("  [DEBUG] Stream {} starting...", stream_id);
 
-            // Create peers for this stream
-            let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_delay(
-                drop_policy_clone.clone(),
-                delay_policy_clone.clone(),
-                channels_clone.clone(),
-            )
-            .await
-            .unwrap();
-            let (peer_b_pub, mut peer_b, peer_b_addr) =
-                create_mock_peer_with_delay(drop_policy_clone, delay_policy_clone, channels_clone)
-                    .await
-                    .unwrap();
-
-            // Connect
-            let (conn_a_inner, conn_b_inner) = futures::join!(
-                peer_a.connect(peer_b_pub, peer_b_addr),
-                peer_b.connect(peer_a_pub, peer_a_addr),
-            );
-            let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-            let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+            // Create connected peers for this stream
+            use super::common::create_peer_pair;
+            let mut peers = create_peer_pair(channels_clone).await.connect().await;
 
             // Send messages
             let start = Instant::now();
             for _ in 0..iterations {
                 let msg = vec![0xABu8; message_size];
-                conn_a.send(msg).await.unwrap();
-                let _: Vec<u8> = conn_b.recv().await.unwrap();
+                peers.conn_a.send(msg).await.unwrap();
+                let _: Vec<u8> = peers.conn_b.recv().await.unwrap();
             }
             let elapsed = start.elapsed();
-
-            drop(peer_a);
-            drop(peer_b);
 
             eprintln!("  [DEBUG] Stream {} complete in {:?}", stream_id, elapsed);
             (stream_id, elapsed)
@@ -316,13 +226,13 @@ async fn manual_concurrent_streams() {
     let total_elapsed = start.elapsed();
 
     // Calculate aggregate throughput
-    let total_bytes = (message_size * iterations * num_streams) as f64;
-    let aggregate_mbps = (total_bytes * 8.0) / total_elapsed.as_secs_f64() / 1_000_000.0;
+    let total_bytes = message_size * iterations * num_streams;
+    let aggregate_mbps = calculate_throughput_mbps(total_bytes, total_elapsed);
 
     println!("Streams: {}", num_streams);
     println!("Message size: {} KB", message_size / 1024);
     println!("Messages per stream: {}", iterations);
-    println!("Total data: {:.2} MB", total_bytes / 1_000_000.0);
+    println!("Total data: {:.2} MB", total_bytes as f64 / 1_000_000.0);
     println!("Total time: {}", format_duration(total_elapsed));
     println!(
         "Aggregate throughput: {}",
@@ -347,25 +257,7 @@ async fn manual_bandwidth_saturation() {
     let duration_secs = 2; // Send for 2 seconds
 
     eprintln!("[DEBUG] Creating connection...");
-    let channels: Channels = Arc::new(DashMap::new());
-    let delay_policy = PacketDelayPolicy::NoDelay;
-    let drop_policy = PacketDropPolicy::ReceiveAll;
-
-    let (peer_a_pub, mut peer_a, peer_a_addr) =
-        create_mock_peer_with_delay(drop_policy.clone(), delay_policy.clone(), channels.clone())
-            .await
-            .unwrap();
-    let (peer_b_pub, mut peer_b, peer_b_addr) =
-        create_mock_peer_with_delay(drop_policy, delay_policy, channels)
-            .await
-            .unwrap();
-
-    let (conn_a_inner, conn_b_inner) = futures::join!(
-        peer_a.connect(peer_b_pub, peer_b_addr),
-        peer_b.connect(peer_a_pub, peer_a_addr),
-    );
-    let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-    let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+    let mut peers = create_connected_peers().await;
 
     eprintln!("[DEBUG] Sending messages for {} seconds...", duration_secs);
     let start = Instant::now();
@@ -374,8 +266,8 @@ async fn manual_bandwidth_saturation() {
 
     while Instant::now() < deadline {
         let msg = vec![0xABu8; message_size];
-        conn_a.send(msg).await.unwrap();
-        let _: Vec<u8> = conn_b.recv().await.unwrap();
+        peers.conn_a.send(msg).await.unwrap();
+        let _: Vec<u8> = peers.conn_b.recv().await.unwrap();
         count += 1;
 
         if count == 1 {
@@ -384,17 +276,14 @@ async fn manual_bandwidth_saturation() {
     }
 
     let elapsed = start.elapsed();
-    let total_bytes = (message_size * count) as f64;
-    let throughput_mbps = (total_bytes * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
+    let total_bytes = message_size * count;
+    let throughput_mbps = calculate_throughput_mbps(total_bytes, elapsed);
 
     println!("Duration: {}", format_duration(elapsed));
     println!("Messages sent: {}", count);
-    println!("Total data: {:.2} MB", total_bytes / 1_000_000.0);
+    println!("Total data: {:.2} MB", total_bytes as f64 / 1_000_000.0);
     println!("Throughput: {}", format_throughput(throughput_mbps));
     println!("Messages/sec: {:.2}", count as f64 / elapsed.as_secs_f64());
-
-    drop(peer_a);
-    drop(peer_b);
 
     println!("\n=== Saturation Test Complete ===\n");
 }
