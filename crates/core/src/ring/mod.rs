@@ -471,11 +471,11 @@ impl Ring {
             let active_count = live_tx_tracker.active_connect_transaction_count();
             if let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if active_count < MAX_CONCURRENT_CONNECTIONS {
-                    tracing::info!(
+                    tracing::debug!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
-                        "Attempting to acquire new connection for location: {:?}",
-                        ideal_location
+                        target_location = %ideal_location,
+                        "Attempting to acquire new connection"
                     );
                     let tx = self
                         .acquire_new(
