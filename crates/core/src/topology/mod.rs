@@ -1,3 +1,63 @@
+//! # Topology Management
+//!
+//! This module manages peer connection decisions: when to add connections, when to remove them,
+//! and whether to accept incoming connection requests.
+//!
+//! ## Core Concepts
+//!
+//! - **Request Density**: Tracks which ring locations receive outbound requests. Used to identify
+//!   "hot" areas of the ring where we should have more connections.
+//! - **Connection Evaluator**: Compares incoming connection candidates against recent candidates
+//!   in a time window. Only accepts if the candidate scores better than all others in the window.
+//! - **Resource Usage**: Tracks bandwidth consumption per peer to identify underperforming connections.
+//!
+//! ## Connection Lifecycle
+//!
+//! ### Adding Connections (`adjust_topology`)
+//!
+//! The decision depends on current connection count:
+//!
+//! | Connections | Target Location Strategy |
+//! |-------------|-------------------------|
+//! | 0 to DENSITY_SELECTION_THRESHOLD-1 | Own location (if known), else random |
+//! | DENSITY_SELECTION_THRESHOLD+       | Density-based (target high-request areas) |
+//!
+//! See `constants::DENSITY_SELECTION_THRESHOLD` (currently 5).
+//!
+//! Once at min_connections, additions are driven by resource usage:
+//! - Usage < 50% of limits → add connections (underutilized)
+//! - Usage 50-90% → no change
+//! - Usage > 90% → remove connections (overloaded)
+//!
+//! ### Accepting Incoming Connections (`evaluate_new_connection`)
+//!
+//! Used by `should_accept()` in connection_manager when a peer has between min and max connections.
+//! (Below min: always accept. At max: always reject.)
+//!
+//! 1. Computes a "density score" for the candidate's location (higher = more requests go there)
+//! 2. Compares against other candidates seen in a time window
+//! 3. Accepts only if this candidate scores higher than ALL others in the window
+//!
+//! The window duration depends on acquisition strategy:
+//! - **Fast** (default): 60-second window, more accepting
+//! - **Slow**: 5-minute window, more selective (used when over max_connections)
+//!
+//! ### Removing Connections
+//!
+//! When resource usage is high or over max_connections:
+//! 1. Calculate value-per-usage ratio for each peer: `request_count / bandwidth_used`
+//! 2. Remove the peer with the worst ratio (least useful for bandwidth consumed)
+//! 3. Fallback: if no peer qualifies, remove the most distant peer on the ring
+//!
+//! ## Important Notes
+//!
+//! - **Density tracking is about outbound requests**, not ring locality. The goal is to have
+//!   connections near locations we frequently query, not necessarily near our own location.
+//! - **Ring distance is NOT considered** when accepting connections between min and max.
+//!   This means we may accept distant peers if they score well on density.
+//! - **Early connections (0-4) target own location** when known, falling back to random.
+//!   This helps build local neighborhoods for small-world topology.
+
 use crate::{message::TransactionType, ring::Location};
 use anyhow::anyhow;
 use connection_evaluator::ConnectionEvaluator;
@@ -347,28 +407,18 @@ impl TopologyManager {
                         }
                     }
                 }
-                // If we have 1-4 connections, use random locations for diversity
-                else if current_connections < 5 {
-                    for _i in 0..below_threshold {
-                        locations.push(Location::random());
-                    }
-                    #[cfg(debug_assertions)]
-                    {
-                        thread_local! {
-                            static LAST_LOG: std::cell::RefCell<Instant> = std::cell::RefCell::new(Instant::now());
+                // If we have 1-4 connections, target own location to build local neighborhood
+                else if current_connections < DENSITY_SELECTION_THRESHOLD {
+                    match my_location {
+                        Some(location) => {
+                            for _i in 0..below_threshold {
+                                locations.push(*location);
+                            }
                         }
-                        if LAST_LOG.with(|last_log| {
-                            last_log.borrow().elapsed() > std::time::Duration::from_secs(10)
-                        }) {
-                            LAST_LOG.with(|last_log| {
-                                tracing::trace!(
-                                    minimum_num_peers_hard_limit = self.limits.min_connections,
-                                    num_peers = current_connections,
-                                    to_add = below_threshold,
-                                    "Early stage: adding connections at random locations for diversity"
-                                );
-                                *last_log.borrow_mut() = Instant::now();
-                            });
+                        None => {
+                            for _i in 0..below_threshold {
+                                locations.push(Location::random());
+                            }
                         }
                     }
                 }
@@ -395,7 +445,7 @@ impl TopologyManager {
 
         // Skip resource-based removal in very small networks to avoid destabilizing them
         // During startup or in small test networks, we need stability more than optimization
-        if current_connections < 5 {
+        if current_connections < DENSITY_SELECTION_THRESHOLD {
             debug!(
                 current_connections,
                 "Skipping resource-based topology adjustment for small network"
@@ -1048,10 +1098,10 @@ mod tests {
         );
     }
 
-    // Test that with 1 connection and min_connections=25, we get diverse random locations
-    // instead of 24 duplicates of the same location
+    // Test that with 1 connection (below DENSITY_SELECTION_THRESHOLD), we target our own
+    // location to build a local neighborhood. This is critical for small-world topology.
     #[test_log::test]
-    fn test_no_duplicate_connections_with_few_peers() {
+    fn test_early_connections_target_own_location() {
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
             max_downstream_bandwidth: Rate::new_per_second(1000.0),
@@ -1060,16 +1110,17 @@ mod tests {
         };
         let mut topology_manager = TopologyManager::new(limits);
 
-        // Simulate having 1 existing connection
+        // Simulate having 1 existing connection (below DENSITY_SELECTION_THRESHOLD of 5)
         let mut neighbor_locations = BTreeMap::new();
         let peer = PeerKeyLocation::random();
         neighbor_locations.insert(peer.location().unwrap(), vec![]);
 
+        let my_location = Location::new(0.5);
         let adjustment = topology_manager.adjust_topology(
             &neighbor_locations,
-            &Some(Location::new(0.5)),
+            &Some(my_location),
             Instant::now(),
-            1, // 1 current connection
+            1, // 1 current connection (below threshold of 5)
         );
 
         match adjustment {
@@ -1077,14 +1128,52 @@ mod tests {
                 // Should request 24 more connections to reach min of 25
                 assert_eq!(locations.len(), 24);
 
-                // With random locations, we should NOT get all duplicates
-                // Check that we have at least some diversity (not all identical)
-                let unique_locations: std::collections::HashSet<_> = locations.iter().collect();
+                // When below DENSITY_SELECTION_THRESHOLD, ALL locations should target
+                // our own location to build a local neighborhood
+                for loc in &locations {
+                    assert_eq!(
+                        *loc, my_location,
+                        "Early connections (below threshold) should target own location"
+                    );
+                }
+            }
+            _ => panic!("Expected AddConnections, got {adjustment:?}"),
+        }
+    }
 
-                // Should have more than 1 unique location (proving no duplicates)
+    // Test that when no location is known, we fall back to random locations
+    #[test_log::test]
+    fn test_early_connections_use_random_when_no_location() {
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 25,
+        };
+        let mut topology_manager = TopologyManager::new(limits);
+
+        // Simulate having 1 existing connection (below DENSITY_SELECTION_THRESHOLD of 5)
+        let mut neighbor_locations = BTreeMap::new();
+        let peer = PeerKeyLocation::random();
+        neighbor_locations.insert(peer.location().unwrap(), vec![]);
+
+        // No known location - should fall back to random
+        let adjustment = topology_manager.adjust_topology(
+            &neighbor_locations,
+            &None, // Unknown location
+            Instant::now(),
+            1,
+        );
+
+        match adjustment {
+            TopologyAdjustment::AddConnections(locations) => {
+                assert_eq!(locations.len(), 24);
+
+                // With random locations, we should get diverse values
+                let unique_locations: std::collections::HashSet<_> = locations.iter().collect();
                 assert!(
                     unique_locations.len() > 1,
-                    "Expected diverse locations but got {} unique locations out of {}",
+                    "Random fallback should produce diverse locations, got {} unique out of {}",
                     unique_locations.len(),
                     locations.len()
                 );

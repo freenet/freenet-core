@@ -1,6 +1,10 @@
 mod common;
 
-use std::{net::TcpListener, path::PathBuf, time::Duration};
+use std::{
+    net::{Ipv4Addr, TcpListener},
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use freenet::{local_node::NodeConfig, server::serve_gateway};
@@ -194,12 +198,14 @@ async fn test_node_diagnostics_query() -> TestResult {
         "gw_diagnostics", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
+        None,             // bind_ip
         &mut test_rng,
     )
     .await?;
     let public_port = config_gw.network_api.public_port.unwrap();
     let path = preset_cfg_gw.temp_dir.path().to_path_buf();
-    let config_gw_info = gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?;
+    let config_gw_info =
+        gw_config_from_path_with_rng(public_port, &path, &mut test_rng, Ipv4Addr::LOCALHOST)?;
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure client node
@@ -211,6 +217,7 @@ async fn test_node_diagnostics_query() -> TestResult {
         "node_diagnostics", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
+        None,               // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -489,6 +496,7 @@ async fn test_ping_multi_node() -> TestResult {
             "gw_multi_node", // data_dir_suffix
             None,            // base_tmp_dir
             None,            // blocked_addresses
+            None,            // bind_ip
             &mut test_rng,
         )
         .await?;
@@ -497,7 +505,7 @@ async fn test_ping_multi_node() -> TestResult {
         (
             cfg,
             preset,
-            gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?,
+            gw_config_from_path_with_rng(public_port, &path, &mut test_rng, Ipv4Addr::LOCALHOST)?,
         )
     };
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
@@ -511,6 +519,7 @@ async fn test_ping_multi_node() -> TestResult {
         "node1_multi_node", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
+        None,               // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -525,6 +534,7 @@ async fn test_ping_multi_node() -> TestResult {
         "node2_multi_node", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
+        None,               // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -1121,6 +1131,7 @@ async fn test_ping_application_loop() -> TestResult {
             "gw_app_loop", // data_dir_suffix
             None,          // base_tmp_dir
             None,          // blocked_addresses
+            None,          // bind_ip
             &mut test_rng,
         )
         .await?;
@@ -1129,7 +1140,7 @@ async fn test_ping_application_loop() -> TestResult {
         (
             cfg,
             preset,
-            gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?,
+            gw_config_from_path_with_rng(public_port, &path, &mut test_rng, Ipv4Addr::LOCALHOST)?,
         )
     };
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
@@ -1143,6 +1154,7 @@ async fn test_ping_application_loop() -> TestResult {
         "node1_app_loop", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
+        None,             // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -1157,6 +1169,7 @@ async fn test_ping_application_loop() -> TestResult {
         "node2_app_loop", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
+        None,             // bind_ip
         &mut test_rng,
     )
     .await?;
