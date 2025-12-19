@@ -132,7 +132,7 @@ async fn manual_throughput_benchmarks() {
     // Limited sizes due to timeout issues with 64KB+
     // 64KB+ appears to hang even on single iteration (likely in cleanup/teardown)
     let test_configs = vec![
-        (1 * 1024, "1 KB"),
+        (1024, "1 KB"),
         (4 * 1024, "4 KB"),
         (16 * 1024, "16 KB"),
         (32 * 1024, "32 KB"),
@@ -330,10 +330,8 @@ async fn manual_concurrent_streams() {
     );
 
     println!("\nPer-stream times:");
-    for result in results {
-        if let Ok((stream_id, elapsed)) = result {
-            println!("  Stream {}: {}", stream_id, format_duration(elapsed));
-        }
+    for (stream_id, elapsed) in results.into_iter().flatten() {
+        println!("  Stream {}: {}", stream_id, format_duration(elapsed));
     }
 
     println!("\n=== Concurrent Test Complete ===\n");
