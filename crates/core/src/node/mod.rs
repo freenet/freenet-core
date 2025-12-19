@@ -425,34 +425,43 @@ async fn report_result(
                 );
             }
 
-            // Send to result router
+            // Send to result router (skip for sub-operations - parent handles notification)
             if let Some(transaction) = tx {
-                let host_result = op_res.to_host_result();
-                let router_tx_clone = op_manager.result_router_tx.clone();
-                let event_notifier = op_manager.to_event_listener.clone();
+                // Sub-operations (e.g., Subscribe spawned by PUT) don't notify clients directly;
+                // the parent operation handles the client response.
+                if op_manager.is_sub_operation(transaction) {
+                    tracing::debug!(
+                        tx = %transaction,
+                        "Skipping client notification for sub-operation"
+                    );
+                } else {
+                    let host_result = op_res.to_host_result();
+                    let router_tx_clone = op_manager.result_router_tx.clone();
+                    let event_notifier = op_manager.to_event_listener.clone();
 
-                // Spawn fire-and-forget task to avoid blocking report_result()
-                // while still guaranteeing message delivery
-                tokio::spawn(async move {
-                    if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
-                        tracing::error!(
-                            "CRITICAL: Result router channel closed - dual-path delivery broken. \
-                             Router or session actor has crashed. Transaction: {}. Error: {}. \
-                             Consider restarting node.",
-                            transaction,
-                            e
-                        );
-                        // TODO: Consider implementing circuit breaker or automatic recovery
-                    } else {
-                        // Transaction completed successfully, notify to clean up subscriptions
-                        use crate::message::NodeEvent;
-                        use either::Either;
-                        let _ = event_notifier
-                            .notifications_sender
-                            .send(Either::Right(NodeEvent::TransactionCompleted(transaction)))
-                            .await;
-                    }
-                });
+                    // Spawn fire-and-forget task to avoid blocking report_result()
+                    // while still guaranteeing message delivery
+                    tokio::spawn(async move {
+                        if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
+                            tracing::error!(
+                                "CRITICAL: Result router channel closed - dual-path delivery broken. \
+                                 Router or session actor has crashed. Transaction: {}. Error: {}. \
+                                 Consider restarting node.",
+                                transaction,
+                                e
+                            );
+                            // TODO: Consider implementing circuit breaker or automatic recovery
+                        } else {
+                            // Transaction completed successfully, notify to clean up subscriptions
+                            use crate::message::NodeEvent;
+                            use either::Either;
+                            let _ = event_notifier
+                                .notifications_sender
+                                .send(Either::Right(NodeEvent::TransactionCompleted(transaction)))
+                                .await;
+                        }
+                    });
+                }
             }
 
             // check operations.rs:handle_op_result to see what's the meaning of each state

@@ -235,15 +235,6 @@ impl SeedingManager {
             .unwrap_or_default()
     }
 
-    /// Check if we have any subscription entries for a contract.
-    #[cfg(test)]
-    pub fn has_subscriptions(&self, contract: &ContractKey) -> bool {
-        self.subscriptions
-            .get(contract)
-            .map(|subs| !subs.is_empty())
-            .unwrap_or(false)
-    }
-
     /// Register a client subscription for a contract (WebSocket client subscribed).
     pub fn add_client_subscription(
         &self,

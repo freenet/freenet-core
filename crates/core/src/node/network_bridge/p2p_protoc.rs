@@ -1294,77 +1294,80 @@ impl P2pConnManager {
                                 key,
                                 subscribed,
                             } => {
+                                // This event is only fired for STANDALONE subscriptions (no remote peers).
+                                // Normal subscribe flow now goes through handle_op_result which sends
+                                // results via result_router_tx directly.
                                 tracing::debug!(
                                     tx = %tx,
                                     contract = %key,
                                     phase = "complete",
-                                    "Local subscribe operation completed"
+                                    "Standalone subscribe operation completed"
                                 );
 
-                                // If this is a child operation, complete it and let the parent flow handle result delivery.
+                                // If this is a child operation (e.g., Subscribe spawned by PUT),
+                                // just mark it complete - parent operation handles client response.
                                 if op_manager.is_sub_operation(tx) {
                                     tracing::debug!(
                                         tx = %tx,
                                         contract = %key,
                                         phase = "complete",
-                                        "Completing child subscribe operation"
+                                        "Completing standalone child subscribe operation"
                                     );
                                     op_manager.completed(tx);
                                     continue;
                                 }
 
-                                if !op_manager.is_sub_operation(tx) {
-                                    let response = Ok(HostResponse::ContractResponse(
-                                        ContractResponse::SubscribeResponse { key, subscribed },
-                                    ));
+                                // Standalone parent operation - send response to client
+                                let response = Ok(HostResponse::ContractResponse(
+                                    ContractResponse::SubscribeResponse { key, subscribed },
+                                ));
 
-                                    match op_manager.result_router_tx.send((tx, response)).await {
-                                        Ok(()) => {
-                                            tracing::debug!(
+                                match op_manager.result_router_tx.send((tx, response)).await {
+                                    Ok(()) => {
+                                        tracing::debug!(
+                                            tx = %tx,
+                                            phase = "response",
+                                            "Sent standalone subscribe response to client"
+                                        );
+                                        if let Some(clients) = state.tx_to_client.remove(&tx) {
+                                            tracing::trace!(
                                                 tx = %tx,
-                                                phase = "response",
-                                                "Sent subscribe response to client"
+                                                client_count = clients.len(),
+                                                "Removed waiting clients for completed transaction"
                                             );
-                                            if let Some(clients) = state.tx_to_client.remove(&tx) {
-                                                tracing::trace!(
-                                                    tx = %tx,
-                                                    client_count = clients.len(),
-                                                    "Removed waiting clients for completed transaction"
-                                                );
-                                            } else if let Some(pos) = state
-                                                .client_waiting_transaction
-                                                .iter()
-                                                .position(|(waiting, _)| match waiting {
-                                                    WaitingTransaction::Subscription {
-                                                        contract_key,
-                                                    } => contract_key == key.id(),
-                                                    _ => false,
-                                                })
-                                            {
-                                                let (_, clients) =
-                                                    state.client_waiting_transaction.remove(pos);
-                                                tracing::trace!(
-                                                    tx = %tx,
-                                                    contract = %key,
-                                                    waiter_count = clients.len(),
-                                                    "Matched subscription waiters by contract"
-                                                );
-                                            } else {
-                                                tracing::warn!(
-                                                    tx = %tx,
-                                                    phase = "complete",
-                                                    "Subscribe complete but no waiting clients found"
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
+                                        } else if let Some(pos) = state
+                                            .client_waiting_transaction
+                                            .iter()
+                                            .position(|(waiting, _)| match waiting {
+                                                WaitingTransaction::Subscription {
+                                                    contract_key,
+                                                } => contract_key == key.id(),
+                                                _ => false,
+                                            })
+                                        {
+                                            let (_, clients) =
+                                                state.client_waiting_transaction.remove(pos);
+                                            tracing::trace!(
                                                 tx = %tx,
-                                                error = %e,
-                                                phase = "error",
-                                                "Failed to send subscribe response to client"
+                                                contract = %key,
+                                                waiter_count = clients.len(),
+                                                "Matched subscription waiters by contract"
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                tx = %tx,
+                                                phase = "complete",
+                                                "Standalone subscribe complete but no waiting clients found"
                                             );
                                         }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            tx = %tx,
+                                            error = %e,
+                                            phase = "error",
+                                            "Failed to send standalone subscribe response to client"
+                                        );
                                     }
                                 }
                             }

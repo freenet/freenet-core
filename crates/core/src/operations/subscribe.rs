@@ -142,6 +142,15 @@ pub(crate) async fn request_subscribe(
     // Check if we already have the contract locally
     let has_contract_locally = super::has_contract(op_manager, *key).await?;
 
+    // IMPORTANT: Even if we have the contract locally (e.g., from PUT forwarding),
+    // we MUST send a Subscribe::Request to the network to register ourselves as a
+    // downstream subscriber in the subscription tree. Otherwise, when the contract
+    // is updated at the source, we won't receive the update because we're not
+    // registered in the upstream peer's subscriber list.
+    //
+    // The local subscription completion happens when we receive the Response back.
+    // This ensures proper subscription tree management for update propagation.
+
     // Find a peer to forward the request to (needed even if we have contract locally)
     let mut skip_list: HashSet<std::net::SocketAddr> = HashSet::new();
     skip_list.insert(own_addr);
@@ -150,14 +159,13 @@ pub(crate) async fn request_subscribe(
         .ring
         .k_closest_potentially_caching(key, &skip_list, 3);
 
-    // If we have the contract locally, complete locally - no need to forward to network
-    // The contract is already being seeded, so updates will flow to this client
-    if has_contract_locally {
-        tracing::info!(tx = %id, contract = %key, phase = "complete", "Contract available locally, completing subscription locally");
-        return complete_local_subscription(op_manager, *id, *key).await;
-    }
-
     let Some(target) = candidates.first() else {
+        // No remote peers available - if we have contract locally, we can complete subscription locally
+        // This handles the case of a standalone node or when we're the only node with the contract
+        if has_contract_locally {
+            tracing::info!(tx = %id, contract = %key, phase = "complete", "Contract available locally and no remote peers, completing subscription locally");
+            return complete_local_subscription(op_manager, *id, *key).await;
+        }
         tracing::warn!(tx = %id, contract = %key, phase = "error", "No remote peers available for subscription");
         return Err(RingError::NoCachingPeers(*key).into());
     };
@@ -196,7 +204,11 @@ pub(crate) async fn request_subscribe(
     Ok(())
 }
 
-/// Complete a local subscription by notifying the client layer.
+/// Complete a **standalone** local subscription by notifying the client layer.
+///
+/// **IMPORTANT:** This function is ONLY used when no remote peers are available (standalone node).
+/// For normal network subscriptions, the operation returns a `Completed` state and goes through
+/// `handle_op_result`, which sends results via `result_router_tx` directly.
 ///
 /// **Architecture Note (Issue #2075):**
 /// Local client subscriptions are deliberately kept separate from network subscriptions:
@@ -204,10 +216,6 @@ pub(crate) async fn request_subscribe(
 ///   for peer-to-peer UPDATE propagation between nodes
 /// - **Local subscriptions** are managed by the contract executor via `update_notifications`
 ///   channels, which deliver `UpdateNotification` directly to WebSocket clients
-///
-/// This separation eliminates the need for workarounds like the previous `allow_self` hack
-/// in `get_broadcast_targets_update()`, and ensures clean architectural boundaries between
-/// the network layer (ops/) and the client layer (client_events/).
 async fn complete_local_subscription(
     op_manager: &OpManager,
     id: Transaction,
@@ -375,11 +383,15 @@ impl Operation for SubscribeOp {
                             });
                         } else {
                             // We're the originator and have the contract locally
-                            complete_local_subscription(op_manager, *id, *key).await?;
+                            tracing::info!(tx = %id, contract = %key, phase = "complete", "Subscribe completed (originator has contract locally)");
                             return Ok(OperationResult {
                                 return_msg: None,
                                 next_hop: None,
-                                state: None,
+                                state: Some(OpEnum::Subscribe(SubscribeOp {
+                                    id: *id,
+                                    state: Some(SubscribeState::Completed { key: *key }),
+                                    requester_addr: None,
+                                })),
                             });
                         }
                     }
@@ -412,11 +424,15 @@ impl Operation for SubscribeOp {
                                 state: None,
                             });
                         } else {
-                            complete_local_subscription(op_manager, *id, *key).await?;
+                            tracing::info!(tx = %id, contract = %key, phase = "complete", "Subscribe completed (originator, contract arrived after wait)");
                             return Ok(OperationResult {
                                 return_msg: None,
                                 next_hop: None,
-                                state: None,
+                                state: Some(OpEnum::Subscribe(SubscribeOp {
+                                    id: *id,
+                                    state: Some(SubscribeState::Completed { key: *key }),
+                                    requester_addr: None,
+                                })),
                             });
                         }
                     }
@@ -570,17 +586,31 @@ impl Operation for SubscribeOp {
                             })),
                         })
                     } else {
-                        // We're the originator - complete the operation
-                        tracing::info!(tx = %msg_id, contract = %key, subscribed, phase = "complete", "Subscribe completed (originator)");
-                        Ok(OperationResult {
-                            return_msg: None,
-                            next_hop: None,
-                            state: Some(OpEnum::Subscribe(SubscribeOp {
-                                id,
-                                state: Some(SubscribeState::Completed { key: *key }),
-                                requester_addr: None,
-                            })),
-                        })
+                        // We're the originator - return completed state for handle_op_result
+                        if *subscribed {
+                            tracing::info!(tx = %msg_id, contract = %key, phase = "complete", "Subscribe completed (originator)");
+                            Ok(OperationResult {
+                                return_msg: None,
+                                next_hop: None,
+                                state: Some(OpEnum::Subscribe(SubscribeOp {
+                                    id,
+                                    state: Some(SubscribeState::Completed { key: *key }),
+                                    requester_addr: None,
+                                })),
+                            })
+                        } else {
+                            tracing::warn!(tx = %msg_id, contract = %key, phase = "failed", "Subscribe failed (originator)");
+                            // Return op with no inner state - to_host_result() will return error
+                            Ok(OperationResult {
+                                return_msg: None,
+                                next_hop: None,
+                                state: Some(OpEnum::Subscribe(SubscribeOp {
+                                    id,
+                                    state: None,
+                                    requester_addr: None,
+                                })),
+                            })
+                        }
                     }
                 }
             }
