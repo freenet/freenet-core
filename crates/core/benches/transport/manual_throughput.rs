@@ -283,10 +283,7 @@ async fn manual_bandwidth_saturation() {
     println!("Messages sent: {}", count);
     println!("Total data: {:.2} MB", total_bytes as f64 / 1_000_000.0);
     println!("Throughput: {}", format_throughput(throughput_mbps));
-    println!(
-        "Messages/sec: {:.2}",
-        count as f64 / elapsed.as_secs_f64()
-    );
+    println!("Messages/sec: {:.2}", count as f64 / elapsed.as_secs_f64());
 
     println!("\n=== Saturation Test Complete ===\n");
 }

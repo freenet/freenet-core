@@ -15,7 +15,9 @@ use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use super::common::{create_benchmark_runtime, create_connected_peers, ConnectedPeerPair, SMALL_SIZES};
+use super::common::{
+    create_benchmark_runtime, create_connected_peers, ConnectedPeerPair, SMALL_SIZES,
+};
 
 /// Cold start benchmark: measures connection establishment + transfer
 ///
