@@ -234,9 +234,11 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
             let ws_port_var_local = format_ident!("ws_port_{}", idx);
             let node_ip_var = format_ident!("node_ip_{}", idx);
             setup_code.push(quote! {
-                // Use varied loopback IPs (127.x.y.1) for public_address (location calculation)
+                // Use varied loopback IPs (127.x.y.1) for both socket binding and location calculation
                 let #node_ip_var = freenet::test_utils::test_ip_for_node(#idx_lit);
-                let #network_port_var = freenet::test_utils::reserve_local_port()?;
+                // Reserve network port on the varied IP to match the socket binding address
+                let #network_port_var = freenet::test_utils::reserve_local_port_on_ip(#node_ip_var)?;
+                // WebSocket listener uses localhost
                 let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
@@ -361,13 +363,16 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
             // Peer node configuration
             // Use varied loopback IPs for public_address so each node gets a unique ring location
             // (Location is derived from IP address, masking the last byte)
-            // Actual socket binding is on 127.0.0.1 (LOCALHOST)
+            // Socket binding is on the varied IP to match reserved port
             let network_port_var = format_ident!("network_port_{}", idx);
             let ws_port_var_local = format_ident!("ws_port_{}", idx);
             let node_ip_var = format_ident!("node_ip_{}", idx);
             setup_code.push(quote! {
+                // Use varied loopback IPs (127.x.y.1) for both socket binding and location calculation
                 let #node_ip_var = freenet::test_utils::test_ip_for_node(#idx_lit);
-                let #network_port_var = freenet::test_utils::reserve_local_port()?;
+                // Reserve network port on the varied IP to match the socket binding address
+                let #network_port_var = freenet::test_utils::reserve_local_port_on_ip(#node_ip_var)?;
+                // WebSocket listener uses localhost
                 let #ws_port_var_local = freenet::test_utils::reserve_local_port()?;
                 let (#config_var, #temp_var) = {
                     let temp_dir = tempfile::tempdir()?;
