@@ -42,8 +42,6 @@ use super::{
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
 
-const DEFAULT_BW_TRACKER_WINDOW_SIZE: Duration = Duration::from_secs(10);
-
 /// Size of RSA-2048 encrypted intro packets (PKCS#1 v1.5 padding).
 /// RSA-2048 produces 256-byte ciphertext for any input up to 245 bytes.
 /// Used to detect new peer identities from existing addresses (issue #2277).
@@ -55,11 +53,11 @@ const RSA_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
 
 pub type SerializedMessage = Vec<u8>;
 
-type GatewayConnectionFuture = BoxFuture<
+type GatewayConnectionFuture<S> = BoxFuture<
     'static,
     Result<
         (
-            RemoteConnection,
+            RemoteConnection<S>,
             InboundRemoteConnection,
             PacketData<SymmetricAES>,
         ),
@@ -67,8 +65,8 @@ type GatewayConnectionFuture = BoxFuture<
     >,
 >;
 
-type TraverseNatFuture =
-    BoxFuture<'static, Result<(RemoteConnection, InboundRemoteConnection), TransportError>>;
+type TraverseNatFuture<S> =
+    BoxFuture<'static, Result<(RemoteConnection<S>, InboundRemoteConnection), TransportError>>;
 
 /// Maximum retries for socket binding in case of transient port conflicts.
 /// This handles race conditions in test environments where ports are released
@@ -82,7 +80,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     listen_port: u16,
     is_gateway: bool,
     bandwidth_limit: Option<usize>,
-) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError> {
+) -> Result<(OutboundConnectionHandler<S>, InboundConnectionHandler<S>), TransportError> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
     tracing::debug!(
@@ -152,48 +150,51 @@ async fn bind_socket_with_retry<S: Socket>(
 }
 
 /// Receives  new inbound connections from the network.
-pub struct InboundConnectionHandler {
-    new_connection_notifier: mpsc::Receiver<PeerConnection>,
+pub struct InboundConnectionHandler<S = UdpSocket> {
+    new_connection_notifier: mpsc::Receiver<PeerConnection<S>>,
 }
 
-impl InboundConnectionHandler {
-    pub async fn next_connection(&mut self) -> Option<PeerConnection> {
+impl<S> InboundConnectionHandler<S> {
+    pub async fn next_connection(&mut self) -> Option<PeerConnection<S>> {
         self.new_connection_notifier.recv().await
     }
 }
 
 /// Requests a new outbound connection to a remote peer.
-#[derive(Clone)]
-pub struct OutboundConnectionHandler {
-    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent)>,
+pub struct OutboundConnectionHandler<S = UdpSocket> {
+    send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S>)>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
 }
 
-impl OutboundConnectionHandler {
+impl<S> Clone for OutboundConnectionHandler<S> {
+    fn clone(&self) -> Self {
+        Self {
+            send_queue: self.send_queue.clone(),
+            expected_non_gateway: self.expected_non_gateway.clone(),
+        }
+    }
+}
+
+#[allow(private_bounds)]
+impl<S: Socket> OutboundConnectionHandler<S> {
     fn config_listener(
-        socket: Arc<impl Socket>,
+        socket: Arc<S>,
         keypair: TransportKeypair,
         is_gateway: bool,
         socket_addr: SocketAddr,
         bandwidth_limit: Option<usize>,
-    ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
-        // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
+    ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
-
-        // Channel buffer is one so senders will await until the receiver is ready, important for bandwidth limiting
-        // Using fast_channel for high-throughput packet routing
-        let (outbound_sender, outbound_recv) = fast_channel::bounded(1000);
         let expected_non_gateway = Arc::new(DashSet::new());
 
         let transport = UdpPacketsListener {
             is_gateway,
-            socket_listener: socket.clone(),
+            socket_listener: socket,
             this_peer_keypair: keypair,
             remote_connections: BTreeMap::new(),
             connection_handler: conn_handler_receiver,
             new_connection_notifier: new_connection_sender,
-            outbound_packets: outbound_sender,
             this_addr: socket_addr,
             dropped_packets: HashMap::new(),
             last_drop_warning: Instant::now(),
@@ -201,25 +202,14 @@ impl OutboundConnectionHandler {
             expected_non_gateway: expected_non_gateway.clone(),
             last_rsa_attempt: HashMap::new(),
         };
-        let bw_tracker = super::rate_limiter::PacketRateLimiter::new(
-            DEFAULT_BW_TRACKER_WINDOW_SIZE,
-            outbound_recv,
-        );
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
             expected_non_gateway,
         };
 
-        // IMPORTANT: The general packet rate limiter is disabled (passing None) due to reliability issues.
-        // It was serializing all packets and grinding transfers to a halt.
-        //
-        // Bandwidth limiting is now only applied to large streaming transfers via send_stream()
-        // in RemoteConnection. The bandwidth_limit parameter is still passed to RemoteConnection
-        // for this purpose (default: 3 MB/s).
-        //
-        // The rate limiter runs in a blocking thread via spawn_blocking for ~3x better throughput
-        // than async (using crossbeam's blocking recv() instead of tokio's async recv).
-        task::spawn_blocking(move || bw_tracker.rate_limiter(None, socket));
+        // Packets are now sent directly to socket from each connection,
+        // bypassing the centralized rate limiter that was causing serialization bottlenecks.
+        // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
         task::spawn(RANDOM_U64.scope(
             {
                 let mut rng = StdRng::seed_from_u64(rand::random());
@@ -234,21 +224,21 @@ impl OutboundConnectionHandler {
     #[cfg(any(test, feature = "bench"))]
     pub(crate) fn new_test(
         socket_addr: SocketAddr,
-        socket: Arc<impl Socket>,
+        socket: Arc<S>,
         keypair: TransportKeypair,
         is_gateway: bool,
-    ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
+    ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
         Self::config_listener(socket, keypair, is_gateway, socket_addr, None)
     }
 
     #[cfg(any(test, feature = "bench"))]
     pub(crate) fn new_test_with_bandwidth(
         socket_addr: SocketAddr,
-        socket: Arc<impl Socket>,
+        socket: Arc<S>,
         keypair: TransportKeypair,
         is_gateway: bool,
         bandwidth_limit: Option<usize>,
-    ) -> Result<(Self, mpsc::Receiver<PeerConnection>), TransportError> {
+    ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
         Self::config_listener(socket, keypair, is_gateway, socket_addr, bandwidth_limit)
     }
 
@@ -256,7 +246,7 @@ impl OutboundConnectionHandler {
         &mut self,
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = Result<PeerConnection, TransportError>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PeerConnection<S>, TransportError>> + Send>> {
         if self.expected_non_gateway.insert(remote_addr.ip()) {
             tracing::debug!(
                 peer_addr = %remote_addr,
@@ -305,11 +295,10 @@ impl OutboundConnectionHandler {
 struct UdpPacketsListener<S = UdpSocket> {
     socket_listener: Arc<S>,
     remote_connections: BTreeMap<SocketAddr, InboundRemoteConnection>,
-    connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent)>,
+    connection_handler: mpsc::Receiver<(SocketAddr, ConnectionEvent<S>)>,
     this_peer_keypair: TransportKeypair,
     is_gateway: bool,
-    new_connection_notifier: mpsc::Sender<PeerConnection>,
-    outbound_packets: FastSender<(SocketAddr, Arc<[u8]>)>,
+    new_connection_notifier: mpsc::Sender<PeerConnection<S>>,
     this_addr: SocketAddr,
     dropped_packets: HashMap<SocketAddr, u64>,
     last_drop_warning: Instant,
@@ -319,23 +308,23 @@ struct UdpPacketsListener<S = UdpSocket> {
     last_rsa_attempt: HashMap<SocketAddr, Instant>,
 }
 
-type OngoingConnection = (
+type OngoingConnection<S> = (
     FastSender<PacketData<UnknownEncryption>>,
-    oneshot::Sender<Result<RemoteConnection, TransportError>>,
+    oneshot::Sender<Result<RemoteConnection<S>, TransportError>>,
 );
 
-type OngoingConnectionResult = Option<
+type OngoingConnectionResult<S> = Option<
     Result<
-        Result<(RemoteConnection, InboundRemoteConnection), (TransportError, SocketAddr)>,
+        Result<(RemoteConnection<S>, InboundRemoteConnection), (TransportError, SocketAddr)>,
         tokio::task::JoinError,
     >,
 >;
 
-type GwOngoingConnectionResult = Option<
+type GwOngoingConnectionResult<S> = Option<
     Result<
         Result<
             (
-                RemoteConnection,
+                RemoteConnection<S>,
                 InboundRemoteConnection,
                 PacketData<SymmetricAES>,
             ),
@@ -370,7 +359,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             "Listening for packets"
         );
         let mut buf = [0u8; MAX_PACKET_SIZE];
-        let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection> = BTreeMap::new();
+        let mut ongoing_connections: BTreeMap<SocketAddr, OngoingConnection<S>> = BTreeMap::new();
         let mut ongoing_gw_connections: BTreeMap<
             SocketAddr,
             FastSender<PacketData<UnknownEncryption>>,
@@ -652,7 +641,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     }
                 },
                 gw_connection_handshake = gw_connection_tasks.next(), if !gw_connection_tasks.is_empty() => {
-                    let Some(res): GwOngoingConnectionResult = gw_connection_handshake else {
+                    let Some(res): GwOngoingConnectionResult<S> = gw_connection_handshake else {
                         unreachable!("gw_connection_tasks.next() should only return None if empty, which is guarded");
                     };
                     match res.expect("task shouldn't panic") {
@@ -699,7 +688,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     }
                 }
                 connection_handshake = connection_tasks.next(), if !connection_tasks.is_empty() => {
-                    let Some(res): OngoingConnectionResult = connection_handshake else {
+                    let Some(res): OngoingConnectionResult<S> = connection_handshake else {
                         unreachable!("connection_tasks.next() should only return None if empty, which is guarded");
                     };
                     match res.expect("task shouldn't panic") {
@@ -857,12 +846,12 @@ impl<S: Socket> UdpPacketsListener<S> {
         remote_addr: SocketAddr,
         inbound_key_bytes: [u8; 16],
     ) -> (
-        GatewayConnectionFuture,
+        GatewayConnectionFuture<S>,
         FastSender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
-        let outbound_packets = self.outbound_packets.clone();
         let bandwidth_limit = self.bandwidth_limit;
+        let socket = self.socket_listener.clone();
 
         let (inbound_from_remote, next_inbound) =
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
@@ -897,8 +886,8 @@ impl<S: Socket> UdpPacketsListener<S> {
             })?;
             if protoc != PROTOC_VERSION {
                 let packet = SymmetricMessage::ack_error(&outbound_key)?;
-                outbound_packets
-                    .send_async((remote_addr, packet.prepared_send()))
+                socket
+                    .send_to(&packet.prepared_send(), remote_addr)
                     .await
                     .map_err(|_| TransportError::ChannelClosed)?;
                 return Err(TransportError::ProtocolVersionMismatch {
@@ -918,8 +907,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                 "Sending outbound ack packet"
             );
 
-            outbound_packets
-                .send_async((remote_addr, outbound_ack_packet.clone().prepared_send()))
+            socket
+                .send_to(&outbound_ack_packet.clone().prepared_send(), remote_addr)
                 .await
                 .map_err(|_| TransportError::ChannelClosed)?;
 
@@ -968,7 +957,6 @@ impl<S: Socket> UdpPacketsListener<S> {
 
             let (inbound_packet_tx, inbound_packet_rx) = fast_channel::bounded(1000);
             let remote_conn = RemoteConnection {
-                outbound_packets,
                 outbound_symmetric_key: outbound_key,
                 remote_addr,
                 sent_tracker: sent_tracker.clone(),
@@ -980,6 +968,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 transport_secret_key: secret,
                 ledbat,
                 token_bucket,
+                socket,
             };
 
             let inbound_conn = InboundRemoteConnection {
@@ -1001,7 +990,10 @@ impl<S: Socket> UdpPacketsListener<S> {
         &mut self,
         remote_addr: SocketAddr,
         remote_public_key: TransportPublicKey,
-    ) -> (TraverseNatFuture, FastSender<PacketData<UnknownEncryption>>) {
+    ) -> (
+        TraverseNatFuture<S>,
+        FastSender<PacketData<UnknownEncryption>>,
+    ) {
         tracing::debug!(
             peer_addr = %remote_addr,
             direction = "outbound",
@@ -1061,9 +1053,9 @@ impl<S: Socket> UdpPacketsListener<S> {
             Err(())
         }
 
-        let outbound_packets = self.outbound_packets.clone();
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
+        let socket = self.socket_listener.clone();
         let (inbound_from_remote, next_inbound) =
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
@@ -1106,8 +1098,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 direction = "outbound",
                                 "Sending protocol version and inbound key"
                             );
-                            outbound_packets
-                                .send_async((remote_addr, outbound_intro_packet.data().into()))
+                            socket
+                                .send_to(outbound_intro_packet.data(), remote_addr)
                                 .await
                                 .map_err(|_| TransportError::ChannelClosed)?;
                             attempts += 1;
@@ -1123,8 +1115,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 inbound_sym_key_bytes,
                                 remote_addr,
                             )?;
-                            outbound_packets
-                                .send_async((remote_addr, our_inbound.data().into()))
+                            socket
+                                .send_to(our_inbound.data(), remote_addr)
                                 .await
                                 .map_err(|_| TransportError::ChannelClosed)?;
                             sent_tracker.report_sent_packet(
@@ -1198,17 +1190,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 direction = "outbound",
                                                 "Sending back ack connection"
                                             );
-                                            outbound_packets
-                                                .send_async((
-                                                    remote_addr,
-                                                    SymmetricMessage::ack_ok(
-                                                        &outbound_sym_key,
-                                                        inbound_sym_key_bytes,
-                                                        remote_addr,
-                                                    )?
-                                                    .data()
-                                                    .into(),
-                                                ))
+                                            let ack_packet = SymmetricMessage::ack_ok(
+                                                &outbound_sym_key,
+                                                inbound_sym_key_bytes,
+                                                remote_addr,
+                                            )?;
+                                            socket
+                                                .send_to(ack_packet.data(), remote_addr)
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) =
@@ -1238,7 +1226,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             );
                                             return Ok((
                                                 RemoteConnection {
-                                                    outbound_packets: outbound_packets.clone(),
                                                     outbound_symmetric_key: outbound_sym_key,
                                                     remote_addr,
                                                     sent_tracker: Arc::new(
@@ -1254,6 +1241,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                         .clone(),
                                                     ledbat,
                                                     token_bucket,
+                                                    socket: socket.clone(),
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
@@ -1335,7 +1323,6 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 );
                                 return Ok((
                                     RemoteConnection {
-                                        outbound_packets: outbound_packets.clone(),
                                         outbound_symmetric_key: outbound_sym_key
                                             .expect("should be set at this stage"),
                                         remote_addr,
@@ -1350,6 +1337,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         transport_secret_key: transport_secret_key.clone(),
                                         ledbat,
                                         token_bucket,
+                                        socket: socket.clone(),
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,
@@ -1435,10 +1423,10 @@ fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
     hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
-pub(crate) enum ConnectionEvent {
+pub(crate) enum ConnectionEvent<S = UdpSocket> {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
-        open_connection: oneshot::Sender<Result<RemoteConnection, TransportError>>,
+        open_connection: oneshot::Sender<Result<RemoteConnection<S>, TransportError>>,
     },
 }
 
@@ -1756,7 +1744,11 @@ pub mod mock_transport {
     pub async fn create_mock_peer(
         packet_drop_policy: PacketDropPolicy,
         channels: Channels,
-    ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket>,
+        SocketAddr,
+    )> {
         create_mock_peer_internal(
             packet_drop_policy,
             PacketDelayPolicy::NoDelay,
@@ -1775,7 +1767,11 @@ pub mod mock_transport {
         packet_drop_policy: PacketDropPolicy,
         packet_delay_policy: PacketDelayPolicy,
         channels: Channels,
-    ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket>,
+        SocketAddr,
+    )> {
         create_mock_peer_internal(
             packet_drop_policy,
             packet_delay_policy,
@@ -1795,7 +1791,11 @@ pub mod mock_transport {
         packet_delay_policy: PacketDelayPolicy,
         channels: Channels,
         bandwidth_limit: Option<usize>,
-    ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket>,
+        SocketAddr,
+    )> {
         create_mock_peer_internal(
             packet_drop_policy,
             packet_delay_policy,
@@ -1816,7 +1816,10 @@ pub mod mock_transport {
     ) -> Result<
         (
             TransportPublicKey,
-            (OutboundConnectionHandler, mpsc::Receiver<PeerConnection>),
+            (
+                OutboundConnectionHandler<MockSocket>,
+                mpsc::Receiver<PeerConnection<MockSocket>>,
+            ),
             SocketAddr,
         ),
         anyhow::Error,
@@ -1840,7 +1843,10 @@ pub mod mock_transport {
     ) -> Result<
         (
             TransportPublicKey,
-            (OutboundConnectionHandler, mpsc::Receiver<PeerConnection>),
+            (
+                OutboundConnectionHandler<MockSocket>,
+                mpsc::Receiver<PeerConnection<MockSocket>>,
+            ),
             SocketAddr,
         ),
         anyhow::Error,
@@ -2767,7 +2773,11 @@ pub mod mock_transport {
         packet_drop_policy: PacketDropPolicy,
         addr: SocketAddr,
         channels: Channels,
-    ) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)> {
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket>,
+        SocketAddr,
+    )> {
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
         let socket = Arc::new(

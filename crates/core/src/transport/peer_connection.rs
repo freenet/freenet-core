@@ -58,8 +58,7 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[must_use]
-pub(crate) struct RemoteConnection {
-    pub(super) outbound_packets: FastSender<(SocketAddr, Arc<[u8]>)>,
+pub(crate) struct RemoteConnection<S = super::UdpSocket> {
     pub(super) outbound_symmetric_key: Aes128Gcm,
     pub(super) remote_addr: SocketAddr,
     pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
@@ -74,6 +73,8 @@ pub(crate) struct RemoteConnection {
     pub(super) ledbat: Arc<LedbatController>,
     /// Token bucket rate limiter - smooths packet pacing based on LEDBAT rate
     pub(super) token_bucket: Arc<TokenBucket>,
+    /// Socket for direct packet sending (bypasses centralized rate limiter)
+    pub(super) socket: Arc<S>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -124,8 +125,8 @@ type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 ///
 /// The `packet_sending` function is a helper function used to send packets to the remote peer.
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
-pub struct PeerConnection {
-    remote_conn: RemoteConnection,
+pub struct PeerConnection<S = super::UdpSocket> {
+    remote_conn: RemoteConnection<S>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     inbound_streams: HashMap<StreamId, FastSender<(u32, Vec<u8>)>>,
     inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
@@ -139,7 +140,7 @@ pub struct PeerConnection {
     last_rate_update: Option<std::time::Instant>,
 }
 
-impl std::fmt::Debug for PeerConnection {
+impl<S> std::fmt::Debug for PeerConnection<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerConnection")
             .field("remote_conn", &self.remote_conn.remote_addr)
@@ -147,7 +148,7 @@ impl std::fmt::Debug for PeerConnection {
     }
 }
 
-impl Drop for PeerConnection {
+impl<S> Drop for PeerConnection<S> {
     fn drop(&mut self) {
         if let Some(handle) = self.keep_alive_handle.take() {
             tracing::debug!(
@@ -159,13 +160,14 @@ impl Drop for PeerConnection {
     }
 }
 
-impl PeerConnection {
-    pub(super) fn new(remote_conn: RemoteConnection) -> Self {
+#[allow(private_bounds)]
+impl<S: super::Socket> PeerConnection<S> {
+    pub(super) fn new(remote_conn: RemoteConnection<S>) -> Self {
         const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
         // Start the keep-alive task before creating Self
         let remote_addr = remote_conn.remote_addr;
-        let outbound_packets = remote_conn.outbound_packets.clone();
+        let socket = remote_conn.socket.clone();
         let outbound_key = remote_conn.outbound_symmetric_key.clone();
         let last_packet_id = remote_conn.last_packet_id.clone();
 
@@ -217,7 +219,7 @@ impl PeerConnection {
                     }
                 };
 
-                // Send the keep-alive packet
+                // Send the keep-alive packet directly to socket
                 tracing::debug!(
                     target: "freenet_core::transport::keepalive_lifecycle",
                     remote = ?remote_addr,
@@ -225,10 +227,7 @@ impl PeerConnection {
                     "Sending keep-alive NoOp packet"
                 );
 
-                match outbound_packets
-                    .send_async((remote_addr, noop_packet))
-                    .await
-                {
+                match socket.send_to(&noop_packet, remote_addr).await {
                     Ok(_) => {
                         tracing::debug!(
                             target: "freenet_core::transport::keepalive_lifecycle",
@@ -244,7 +243,7 @@ impl PeerConnection {
                             error = ?e,
                             elapsed_since_start_secs = task_start.elapsed().as_secs_f64(),
                             total_ticks = tick_count,
-                            "Keep-alive task STOPPING - channel closed"
+                            "Keep-alive task STOPPING - socket error"
                         );
                         break;
                     }
@@ -387,8 +386,8 @@ impl PeerConnection {
 
                                     if let Ok(ack) = ack_packet {
                                         if let Err(send_err) = self.remote_conn
-                                            .outbound_packets
-                                            .send_async((self.remote_conn.remote_addr, ack.data().into()))
+                                            .socket
+                                            .send_to(ack.data(), self.remote_conn.remote_addr)
                                             .await
                                         {
                                             tracing::warn!(
@@ -644,8 +643,8 @@ impl PeerConnection {
                                 self.remote_conn.ledbat.on_timeout();
 
                                 self.remote_conn
-                                    .outbound_packets
-                                    .send_async((self.remote_conn.remote_addr, packet.clone()))
+                                    .socket
+                                    .send_to(&packet, self.remote_conn.remote_addr)
                                     .await
                                     .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
@@ -756,8 +755,8 @@ impl PeerConnection {
                     self.remote_conn.remote_addr,
                 )?;
                 self.remote_conn
-                    .outbound_packets
-                    .send_async((self.remote_conn.remote_addr, packet.data().into()))
+                    .socket
+                    .send_to(packet.data(), self.remote_conn.remote_addr)
                     .await
                     .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                 Ok(None)
@@ -814,7 +813,7 @@ impl PeerConnection {
     async fn noop(&mut self, receipts: Vec<u32>) -> Result<()> {
         packet_sending(
             self.remote_conn.remote_addr,
-            &self.remote_conn.outbound_packets,
+            &self.remote_conn.socket,
             self.remote_conn
                 .last_packet_id
                 .fetch_add(1, std::sync::atomic::Ordering::Release),
@@ -835,7 +834,7 @@ impl PeerConnection {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         packet_sending(
             self.remote_conn.remote_addr,
-            &self.remote_conn.outbound_packets,
+            &self.remote_conn.socket,
             packet_id,
             &self.remote_conn.outbound_symmetric_key,
             receipts,
@@ -852,7 +851,7 @@ impl PeerConnection {
             outbound_stream::send_stream(
                 stream_id,
                 self.remote_conn.last_packet_id.clone(),
-                self.remote_conn.outbound_packets.clone(),
+                self.remote_conn.socket.clone(),
                 self.remote_conn.remote_addr,
                 data,
                 self.remote_conn.outbound_symmetric_key.clone(),
@@ -866,9 +865,9 @@ impl PeerConnection {
     }
 }
 
-async fn packet_sending(
+async fn packet_sending<S: super::Socket>(
     remote_addr: SocketAddr,
-    outbound_packets: &FastSender<(SocketAddr, Arc<[u8]>)>,
+    socket: &Arc<S>,
     packet_id: u32,
     outbound_sym_key: &Aes128Gcm,
     confirm_receipt: Vec<u32>,
@@ -896,10 +895,8 @@ async fn packet_sending(
                 packet_size,
                 "Sending single packet"
             );
-            match outbound_packets
-                .send_async((remote_addr, packet.clone().prepared_send()))
-                .await
-            {
+            let packet_data = packet.prepared_send();
+            match socket.send_to(&packet_data, remote_addr).await {
                 Ok(_) => {
                     let elapsed = start_time.elapsed();
                     tracing::trace!(
@@ -910,7 +907,7 @@ async fn packet_sending(
                     );
                     sent_tracker
                         .lock()
-                        .report_sent_packet(packet_id, packet.prepared_send());
+                        .report_sent_packet(packet_id, packet_data);
                     Ok(())
                 }
                 Err(e) => {
@@ -918,7 +915,7 @@ async fn packet_sending(
                         peer_addr = %remote_addr,
                         packet_id,
                         error = %e,
-                        "Failed to send packet - channel closed"
+                        "Failed to send packet"
                     );
                     Err(TransportError::ConnectionClosed(remote_addr))
                 }
@@ -933,13 +930,14 @@ async fn packet_sending(
             macro_rules! send {
                 ($packets:ident) => {{
                     for packet in $packets {
-                        outbound_packets
-                            .send_async((remote_addr, packet.clone().prepared_send()))
+                        let packet_data = packet.prepared_send();
+                        socket
+                            .send_to(&packet_data, remote_addr)
                             .await
                             .map_err(|_| TransportError::ConnectionClosed(remote_addr))?;
                         sent_tracker
                             .lock()
-                            .report_sent_packet(packet_id, packet.prepared_send());
+                            .report_sent_packet(packet_id, packet_data);
                     }
                 }};
             }
@@ -1013,6 +1011,42 @@ mod tests {
     use crate::transport::received_packet_tracker::MAX_PENDING_RECEIPTS;
     use crate::transport::sent_packet_tracker::MAX_CONFIRMATION_DELAY;
 
+    /// Simple test socket that writes to a channel
+    struct TestSocket {
+        sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>,
+    }
+
+    impl TestSocket {
+        fn new(sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>) -> Self {
+            Self { sender }
+        }
+    }
+
+    impl crate::transport::Socket for TestSocket {
+        async fn bind(_addr: SocketAddr) -> std::io::Result<Self> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            unimplemented!()
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.sender
+                .send_async((target, buf.into()))
+                .await
+                .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            Ok(buf.len())
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.sender
+                .send((target, buf.into()))
+                .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            Ok(buf.len())
+        }
+    }
+
     /// Verify that ACK_CHECK_INTERVAL is properly configured relative to MAX_CONFIRMATION_DELAY.
     /// The ACK timer should ensure ACKs are sent within the sender's expected confirmation window.
     #[test]
@@ -1083,7 +1117,7 @@ mod tests {
         let outbound = tokio::task::spawn(send_stream(
             stream_id,
             Arc::new(AtomicU32::new(0)),
-            sender,
+            Arc::new(TestSocket::new(sender)),
             remote_addr,
             message.clone(),
             cipher.clone(),
