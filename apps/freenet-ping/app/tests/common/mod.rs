@@ -181,22 +181,30 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
 }
 
 pub fn gw_config_from_path(port: u16, path: &Path) -> Result<InlineGwConfig> {
+    gw_config_from_path_with_ip(port, path, Ipv4Addr::LOCALHOST)
+}
+
+/// Same as `gw_config_from_path` but allows specifying a custom IP address.
+/// Use this when the gateway binds to a varied loopback IP (e.g., 127.1.1.1)
+/// to ensure peers can connect to the correct address.
+pub fn gw_config_from_path_with_ip(port: u16, path: &Path, ip: Ipv4Addr) -> Result<InlineGwConfig> {
     // Create RNG seeded from path for reproducibility while maintaining isolation
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
     let seed = hasher.finish();
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    gw_config_from_path_with_rng(port, path, &mut rng)
+    gw_config_from_path_with_rng(port, path, &mut rng, ip)
 }
 
 pub fn gw_config_from_path_with_rng<R: Rng>(
     port: u16,
     path: &Path,
     rng: &mut R,
+    ip: Ipv4Addr,
 ) -> Result<InlineGwConfig> {
     Ok(InlineGwConfig {
-        address: (Ipv4Addr::LOCALHOST, port).into(),
+        address: (ip, port).into(),
         location: Some(rng.random()),
         public_key_path: path.join("public.pem"),
     })

@@ -45,8 +45,8 @@ use std::{
 
 use anyhow::anyhow;
 use common::{
-    base_node_test_config_with_ip, get_all_ping_states, gw_config_from_path, ping_states_equal,
-    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    base_node_test_config_with_ip, get_all_ping_states, gw_config_from_path_with_ip,
+    ping_states_equal, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_ping_app::ping_client::{
@@ -202,7 +202,7 @@ async fn run_blocked_peers_test_inner(
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config_from_path(public_port, &path)?)
+        (cfg, preset, gw_config_from_path_with_ip(public_port, &path, gw_ip)?)
     };
 
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();

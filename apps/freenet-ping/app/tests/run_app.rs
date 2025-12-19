@@ -1,6 +1,10 @@
 mod common;
 
-use std::{net::TcpListener, path::PathBuf, time::Duration};
+use std::{
+    net::{Ipv4Addr, TcpListener},
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use freenet::{local_node::NodeConfig, server::serve_gateway};
@@ -200,7 +204,8 @@ async fn test_node_diagnostics_query() -> TestResult {
     .await?;
     let public_port = config_gw.network_api.public_port.unwrap();
     let path = preset_cfg_gw.temp_dir.path().to_path_buf();
-    let config_gw_info = gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?;
+    let config_gw_info =
+        gw_config_from_path_with_rng(public_port, &path, &mut test_rng, Ipv4Addr::LOCALHOST)?;
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure client node
@@ -500,7 +505,7 @@ async fn test_ping_multi_node() -> TestResult {
         (
             cfg,
             preset,
-            gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?,
+            gw_config_from_path_with_rng(public_port, &path, &mut test_rng, Ipv4Addr::LOCALHOST)?,
         )
     };
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
@@ -1135,7 +1140,7 @@ async fn test_ping_application_loop() -> TestResult {
         (
             cfg,
             preset,
-            gw_config_from_path_with_rng(public_port, &path, &mut test_rng)?,
+            gw_config_from_path_with_rng(public_port, &path, &mut test_rng, Ipv4Addr::LOCALHOST)?,
         )
     };
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
