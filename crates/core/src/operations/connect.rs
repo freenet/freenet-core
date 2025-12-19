@@ -400,7 +400,7 @@ impl RelayState {
         // Forward if we have a next hop
         if let Some(next) = next_hop {
             let dist = ring_distance(next.location(), Some(self.request.desired_location));
-            tracing::info!(
+            tracing::debug!(
                 target = %self.request.desired_location,
                 ttl = self.request.ttl,
                 next_peer = %next.pub_key(),
@@ -538,10 +538,14 @@ impl RelayContext for RelayEnv<'_> {
             // GREEDY ROUTING: Only consider neighbors that are CLOSER to the target than we are.
             // This is essential for proper terminus detection - we're at terminus when no
             // neighbor is closer to the target than we are.
+            //
+            // Note: We use `>` (not `>=`) to allow forwarding to equally-distant peers.
+            // This prevents routing deadlocks when multiple peers are equidistant to the target
+            // (common near ring boundary 0.0/1.0).
             if let (Some(cand_loc), Some(my_dist)) = (cand.location(), my_distance) {
                 let cand_distance = cand_loc.distance(desired_location);
-                if cand_distance >= my_dist {
-                    // Neighbor is not closer to target than us - skip
+                if cand_distance > my_dist {
+                    // Neighbor is farther from target than us - skip
                     continue;
                 }
             }
