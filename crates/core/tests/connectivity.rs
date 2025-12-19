@@ -25,7 +25,8 @@ fn fixed_three_node_locations() -> Vec<f64> {
 /// connecting to the gateway.
 #[freenet_test(
     nodes = ["gateway", "peer"],
-    timeout_secs = 180,
+    // Increased timeout for CI where 8 parallel tests compete for resources
+    timeout_secs = 300,
     startup_wait_secs = 15,
     aggregate_events = "always",
     tokio_flavor = "multi_thread",
@@ -180,7 +181,8 @@ async fn test_gateway_reconnection(ctx: &mut TestContext) -> TestResult {
 /// Simplified test to verify basic gateway connectivity
 #[freenet_test(
     nodes = ["gateway"],
-    timeout_secs = 30,
+    // Increased timeout for CI where 8 parallel tests compete for resources
+    timeout_secs = 60,
     startup_wait_secs = 5,
     aggregate_events = "always",
     tokio_flavor = "multi_thread",
@@ -258,7 +260,8 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
 ///
 #[freenet_test(
     nodes = ["gateway", "peer1", "peer2"],
-    timeout_secs = 180,
+    // Increased timeout for CI where 8 parallel tests compete for resources
+    timeout_secs = 300,
     startup_wait_secs = 30,
     node_locations_fn = fixed_three_node_locations,
     aggregate_events = "always",
@@ -688,7 +691,8 @@ async fn perform_put_with_retries(
 /// when promoting transients.
 #[freenet_test(
     nodes = ["gateway", "peer"],
-    timeout_secs = 60,
+    // Increased timeout for CI where 8 parallel tests compete for resources
+    timeout_secs = 120,
     startup_wait_secs = 15,
     aggregate_events = "always",
     tokio_flavor = "multi_thread",
