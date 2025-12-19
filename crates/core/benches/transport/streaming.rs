@@ -6,10 +6,9 @@
 //! This is critical for measuring the impact of congestion control improvements.
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
-use dashmap::DashMap;
-use freenet::transport::mock_transport::{create_mock_peer, Channels, PacketDropPolicy};
 use std::hint::black_box as std_black_box;
-use std::sync::Arc;
+
+use super::common::{create_peer_pair, new_channels, STREAM_SIZES};
 
 /// Benchmark large message streaming (multi-packet transfers)
 ///
@@ -25,36 +24,19 @@ pub fn bench_stream_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("transport/streaming/throughput");
 
     // Test STREAM_SIZES: 4KB, 16KB, 64KB
-    for &size in &[4096, 16384, 65536] {
+    for &size in STREAM_SIZES {
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(BenchmarkId::new("rate_limited", size), &size, |b, &sz| {
             b.to_async(&rt).iter_batched(
-                || {
-                    let message = vec![0xABu8; sz];
-                    (Arc::new(DashMap::new()) as Channels, message)
-                },
-                |(channels, message)| async move {
-                    // Create connected peers
-                    let (peer_a_pub, mut peer_a, peer_a_addr) =
-                        create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
-                            .await
-                            .unwrap();
-                    let (peer_b_pub, mut peer_b, peer_b_addr) =
-                        create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
-                            .await
-                            .unwrap();
-
-                    let (conn_a_inner, conn_b_inner) = futures::join!(
-                        peer_a.connect(peer_b_pub, peer_b_addr),
-                        peer_b.connect(peer_a_pub, peer_a_addr),
-                    );
-                    let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-                    let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+                || vec![0xABu8; sz],
+                |message| async move {
+                    // Create connected peers (cold-start measurement)
+                    let mut peers = create_peer_pair(new_channels()).await.connect().await;
 
                     // Send large message (will be fragmented)
-                    conn_a.send(message.clone()).await.unwrap();
-                    let received: Vec<u8> = conn_b.recv().await.unwrap();
+                    peers.conn_a.send(message.clone()).await.unwrap();
+                    let received: Vec<u8> = peers.conn_b.recv().await.unwrap();
 
                     // Note: received length may differ slightly due to serialization overhead
                     // Just verify we got data back
@@ -89,24 +71,14 @@ pub fn bench_concurrent_streams(c: &mut Criterion) {
             &num_streams,
             |b, &n| {
                 b.to_async(&rt).iter_batched(
-                    || Arc::new(DashMap::new()) as Channels,
-                    |channels| async move {
-                        // Create connected peers
-                        let (peer_a_pub, mut peer_a, peer_a_addr) =
-                            create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
-                                .await
-                                .unwrap();
-                        let (peer_b_pub, mut peer_b, peer_b_addr) =
-                            create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
-                                .await
-                                .unwrap();
+                    || (),
+                    |_| async move {
+                        // Create connected peers (cold-start measurement)
+                        let peers = create_peer_pair(new_channels()).await.connect().await;
 
-                        let (conn_a_inner, conn_b_inner) = futures::join!(
-                            peer_a.connect(peer_b_pub, peer_b_addr),
-                            peer_b.connect(peer_a_pub, peer_a_addr),
-                        );
-                        let (conn_a, conn_b) = futures::join!(conn_a_inner, conn_b_inner);
-                        let (mut conn_a, mut conn_b) = (conn_a.unwrap(), conn_b.unwrap());
+                        // Destructure to get separate connections for concurrent tasks
+                        let mut conn_a = peers.conn_a;
+                        let mut conn_b = peers.conn_b;
 
                         // Send n messages concurrently (connection handles concurrency internally)
                         let message = vec![0xABu8; 16384]; // 16KB each
