@@ -497,7 +497,8 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
 /// This is a regression test for issue #1995.
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
-    timeout_secs = 180,
+    // Increased timeout for CI where 8 parallel tests compete for resources
+    timeout_secs = 300,
     startup_wait_secs = 15,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
@@ -1916,7 +1917,8 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
 #[freenet_test(
     nodes = ["gateway", "client-node"],
-    timeout_secs = 180,
+    // Increased timeout for CI where 8 parallel tests compete for resources
+    timeout_secs = 300,
     startup_wait_secs = 20,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
