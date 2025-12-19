@@ -42,9 +42,9 @@
 //! let packet = rx.recv_async().await.unwrap();
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
