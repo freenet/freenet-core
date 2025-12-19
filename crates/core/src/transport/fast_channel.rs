@@ -42,7 +42,7 @@
 //! let packet = rx.recv_async().await.unwrap();
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -106,16 +106,34 @@ pub struct FastSender<T> {
     inner: crossbeam::channel::Sender<T>,
     /// Notifies senders that space is available (for backpressure)
     send_notify: Arc<Notify>,
+    /// Notifies receivers that a message is available
+    recv_notify: Arc<Notify>,
     /// Tracks if the receiver has been dropped
     closed: Arc<AtomicBool>,
+    /// Count of active senders (for notifying receiver on last sender drop)
+    sender_count: Arc<AtomicUsize>,
 }
 
 impl<T> Clone for FastSender<T> {
     fn clone(&self) -> Self {
+        self.sender_count.fetch_add(1, Ordering::AcqRel);
         Self {
             inner: self.inner.clone(),
             send_notify: self.send_notify.clone(),
+            recv_notify: self.recv_notify.clone(),
             closed: self.closed.clone(),
+            sender_count: self.sender_count.clone(),
+        }
+    }
+}
+
+impl<T> Drop for FastSender<T> {
+    fn drop(&mut self) {
+        // Decrement sender count; if this was the last sender, notify receiver
+        if self.sender_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // This was the last sender - wake up any waiting receivers
+            // so they can detect the disconnection
+            self.recv_notify.notify_waiters();
         }
     }
 }
@@ -129,7 +147,11 @@ impl<T> FastSender<T> {
     #[inline]
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
         match self.inner.send(msg) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Notify any waiting receivers
+                self.recv_notify.notify_one();
+                Ok(())
+            }
             Err(crossbeam::channel::SendError(msg)) => Err(SendError(msg)),
         }
     }
@@ -143,6 +165,8 @@ impl<T> FastSender<T> {
         loop {
             match self.inner.try_send(msg) {
                 Ok(()) => {
+                    // Notify any waiting receivers
+                    self.recv_notify.notify_one();
                     return Ok(());
                 }
                 Err(crossbeam::channel::TrySendError::Full(returned)) => {
@@ -164,7 +188,11 @@ impl<T> FastSender<T> {
     #[inline]
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
         match self.inner.try_send(msg) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Notify any waiting receivers
+                self.recv_notify.notify_one();
+                Ok(())
+            }
             Err(crossbeam::channel::TrySendError::Full(msg)) => Err(TrySendError::Full(msg)),
             Err(crossbeam::channel::TrySendError::Disconnected(msg)) => {
                 Err(TrySendError::Disconnected(msg))
@@ -191,6 +219,8 @@ pub struct FastReceiver<T> {
     inner: crossbeam::channel::Receiver<T>,
     /// Notifies senders that space is available
     send_notify: Arc<Notify>,
+    /// Notifies receivers that a message is available
+    recv_notify: Arc<Notify>,
     /// Tracks if the receiver has been dropped (shared with senders for is_closed())
     closed: Arc<AtomicBool>,
 }
@@ -208,6 +238,7 @@ impl<T> FastReceiver<T> {
     /// Receives a message asynchronously.
     ///
     /// This is the primary receive method for async contexts.
+    /// Waits efficiently for a message to become available.
     pub async fn recv_async(&self) -> Result<T, RecvError> {
         loop {
             match self.inner.try_recv() {
@@ -217,8 +248,8 @@ impl<T> FastReceiver<T> {
                     return Ok(msg);
                 }
                 Err(crossbeam::channel::TryRecvError::Empty) => {
-                    // Channel is empty - yield to let other tasks run, then check again
-                    tokio::task::yield_now().await;
+                    // Wait for a sender to notify us that a message is available
+                    self.recv_notify.notified().await;
                 }
                 Err(crossbeam::channel::TryRecvError::Disconnected) => {
                     return Err(RecvError);
@@ -274,17 +305,22 @@ impl<T> FastReceiver<T> {
 pub fn bounded<T>(capacity: usize) -> (FastSender<T>, FastReceiver<T>) {
     let (tx, rx) = crossbeam::channel::bounded(capacity);
     let send_notify = Arc::new(Notify::new());
+    let recv_notify = Arc::new(Notify::new());
     let closed = Arc::new(AtomicBool::new(false));
+    let sender_count = Arc::new(AtomicUsize::new(1)); // Start with 1 sender
 
     let sender = FastSender {
         inner: tx,
         send_notify: send_notify.clone(),
+        recv_notify: recv_notify.clone(),
         closed: closed.clone(),
+        sender_count,
     };
 
     let receiver = FastReceiver {
         inner: rx,
         send_notify,
+        recv_notify,
         closed,
     };
 
@@ -391,5 +427,27 @@ mod tests {
         sender.await.unwrap();
         let received = receiver.await.unwrap();
         assert_eq!(received, count);
+    }
+
+    #[tokio::test]
+    async fn test_recv_async_does_not_busy_loop() {
+        // This test verifies that recv_async doesn't busy-loop when the channel is empty.
+        // It spawns a receiver that waits for a message, then after a delay sends a message.
+        // If recv_async was busy-looping, it would consume 100% CPU during the wait.
+        let (tx, rx) = bounded::<i32>(10);
+
+        let receiver = tokio::spawn(async move {
+            // This should block efficiently, not busy-loop
+            rx.recv_async().await.unwrap()
+        });
+
+        // Wait a bit to ensure receiver is waiting
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send a message - this should wake up the receiver
+        tx.send_async(42).await.unwrap();
+
+        let result = receiver.await.unwrap();
+        assert_eq!(result, 42);
     }
 }
