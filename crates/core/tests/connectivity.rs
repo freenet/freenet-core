@@ -405,24 +405,31 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
             format!("{:?}", peer2_peers),
         );
 
-        let expected_gateway_connections = 2; // peers
-        let gateway_sees_all = gw_peers.len() >= expected_gateway_connections;
-
-        // Require each peer to maintain at least one live connection (typically
-        // the gateway). The topology maintenance loop can continue dialing more
-        // neighbors, but the test should pass once the network is fully
-        // reachable through the gateway.
+        // With terminus-only acceptance (accept only when we can't forward to a closer peer),
+        // the gateway may have fewer direct connections in small networks. What matters is
+        // that the network is connected (all nodes can reach each other through some path).
+        //
+        // Minimum connectivity requirements:
+        // - Gateway: at least 1 connection (to be part of the network)
+        // - Each peer: at least 1 connection
+        //
+        // Note: In a 3-node network with terminus-only acceptance, the topology might be:
+        // - Gateway ← Peer1 ← Peer2 (linear)
+        // - Gateway ← Peer1 ↔ Peer2 (gateway to peer1, peer1 to both)
+        // Both topologies are valid as long as the network is connected.
+        let gateway_has_minimum = !gw_peers.is_empty();
         let peer1_has_minimum = !peer1_peers.is_empty();
         let peer2_has_minimum = !peer2_peers.is_empty();
 
-        if gateway_sees_all && peer1_has_minimum && peer2_has_minimum {
-            if peer1_peers.len() >= expected_gateway_connections
-                && peer2_peers.len() >= expected_gateway_connections
-            {
+        if gateway_has_minimum && peer1_has_minimum && peer2_has_minimum {
+            // Check if we have full mesh (ideal) or minimum connectivity (acceptable)
+            let is_full_mesh =
+                gw_peers.len() >= 2 && peer1_peers.len() >= 2 && peer2_peers.len() >= 2;
+            if is_full_mesh {
                 tracing::info!("✅ Full mesh connectivity established!");
             } else {
                 tracing::info!(
-                    "✅ Minimum connectivity achieved (gateway sees all peers; each peer has at least one neighbor)"
+                    "✅ Minimum connectivity achieved (all nodes connected, network is reachable)"
                 );
             }
             mesh_established = true;
