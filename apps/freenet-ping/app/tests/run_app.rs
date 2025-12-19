@@ -194,6 +194,7 @@ async fn test_node_diagnostics_query() -> TestResult {
         "gw_diagnostics", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
+        None,             // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -211,6 +212,7 @@ async fn test_node_diagnostics_query() -> TestResult {
         "node_diagnostics", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
+        None,               // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -489,6 +491,7 @@ async fn test_ping_multi_node() -> TestResult {
             "gw_multi_node", // data_dir_suffix
             None,            // base_tmp_dir
             None,            // blocked_addresses
+            None,            // bind_ip
             &mut test_rng,
         )
         .await?;
@@ -511,6 +514,7 @@ async fn test_ping_multi_node() -> TestResult {
         "node1_multi_node", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
+        None,               // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -525,6 +529,7 @@ async fn test_ping_multi_node() -> TestResult {
         "node2_multi_node", // data_dir_suffix
         None,               // base_tmp_dir
         None,               // blocked_addresses
+        None,               // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -1121,6 +1126,7 @@ async fn test_ping_application_loop() -> TestResult {
             "gw_app_loop", // data_dir_suffix
             None,          // base_tmp_dir
             None,          // blocked_addresses
+            None,          // bind_ip
             &mut test_rng,
         )
         .await?;
@@ -1143,6 +1149,7 @@ async fn test_ping_application_loop() -> TestResult {
         "node1_app_loop", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
+        None,             // bind_ip
         &mut test_rng,
     )
     .await?;
@@ -1157,6 +1164,7 @@ async fn test_ping_application_loop() -> TestResult {
         "node2_app_loop", // data_dir_suffix
         None,             // base_tmp_dir
         None,             // blocked_addresses
+        None,             // bind_ip
         &mut test_rng,
     )
     .await?;

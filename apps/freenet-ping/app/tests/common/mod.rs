@@ -63,6 +63,33 @@ pub async fn base_node_test_config(
     base_tmp_dir: Option<&Path>,
     blocked_addresses: Option<Vec<SocketAddr>>,
 ) -> Result<(ConfigArgs, PresetConfig)> {
+    base_node_test_config_with_ip(
+        is_gateway,
+        gateways,
+        public_port,
+        ws_api_port,
+        data_dir_suffix,
+        base_tmp_dir,
+        blocked_addresses,
+        None, // Use default LOCALHOST
+    )
+    .await
+}
+
+/// Same as `base_node_test_config` but allows specifying a custom bind IP address.
+/// Use varied loopback IPs (e.g., 127.1.x.1) to ensure unique ring locations
+/// when ObservedAddress derives location from IP.
+#[allow(clippy::too_many_arguments)]
+pub async fn base_node_test_config_with_ip(
+    is_gateway: bool,
+    gateways: Vec<String>,
+    public_port: Option<u16>,
+    ws_api_port: u16,
+    data_dir_suffix: &str,
+    base_tmp_dir: Option<&Path>,
+    blocked_addresses: Option<Vec<SocketAddr>>,
+    bind_ip: Option<Ipv4Addr>,
+) -> Result<(ConfigArgs, PresetConfig)> {
     // Create RNG seeded from test name for reproducibility while maintaining isolation
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -78,6 +105,7 @@ pub async fn base_node_test_config(
         data_dir_suffix,
         base_tmp_dir,
         blocked_addresses,
+        bind_ip,
         &mut rng,
     )
     .await
@@ -92,6 +120,7 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
     data_dir_suffix: &str,
     base_tmp_dir: Option<&Path>,
     blocked_addresses: Option<Vec<SocketAddr>>,
+    bind_ip: Option<Ipv4Addr>,
     rng: &mut R,
 ) -> Result<(ConfigArgs, PresetConfig)> {
     if is_gateway {
@@ -109,22 +138,27 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
     key.save(&transport_keypair)?;
     key.public().save(temp_dir.path().join("public.pem"))?;
 
+    // Use provided bind_ip or default to LOCALHOST
+    let network_bind_ip = bind_ip.unwrap_or(Ipv4Addr::LOCALHOST);
+
     let config = ConfigArgs {
         ws_api: WebsocketApiArgs {
+            // WebSocket always binds to localhost
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(ws_api_port),
             token_ttl_seconds: None,
             token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
-            public_address: Some(Ipv4Addr::LOCALHOST.into()),
+            // Use varied IP for network socket to get unique ring locations
+            public_address: Some(network_bind_ip.into()),
             public_port,
             is_gateway,
             skip_load_from_network: true,
             gateways: Some(gateways),
             location: Some(rng.random()),
             ignore_protocol_checking: true,
-            address: Some(Ipv4Addr::LOCALHOST.into()),
+            address: Some(network_bind_ip.into()),
             network_port: public_port, // if None, node will pick a free one or use default
             min_connections: None,
             max_connections: None,
