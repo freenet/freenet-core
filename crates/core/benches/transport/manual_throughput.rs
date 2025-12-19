@@ -17,12 +17,11 @@
 //! - Validating slow start behavior
 //! - Measuring cold-start vs steady-state performance
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::common::{
     calculate_throughput_mbps, create_connected_peers, create_connected_peers_with_delay,
-    format_duration, format_throughput, new_channels, ConnectedPeerPair,
+    format_duration, format_throughput, new_channels,
 };
 
 /// Run a manual throughput benchmark with specified parameters

@@ -76,7 +76,7 @@ pub fn bench_1mb_transfer_validation(c: &mut Criterion) {
 
         group.bench_function(name, |b| {
             // Create connection once, keep both peers AND connections alive
-            let mut peers = rt.block_on(async {
+            let peers = rt.block_on(async {
                 let mut peers = create_connected_peers().await;
 
                 // Warmup: 5 transfers to stabilize LEDBAT cwnd

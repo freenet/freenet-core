@@ -3,10 +3,11 @@
 //! This module re-exports all transport benchmark functions from their
 //! respective submodules for use in benchmark binaries.
 //!
-//! Note: dead_code warnings are expected since each benchmark binary
-//! only uses a subset of these functions.
+//! Note: dead_code and unused_imports warnings are expected since each
+//! benchmark binary only uses a subset of these functions.
 
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 pub mod blackbox;
 pub mod common; // Shared utilities for reducing duplication
