@@ -43,6 +43,8 @@
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -193,6 +195,9 @@ pub struct FastReceiver<T> {
     send_notify: Arc<Notify>,
     /// Tracks if the receiver has been dropped (shared with senders for is_closed())
     closed: Arc<AtomicBool>,
+    /// Counts recv_async poll iterations (test-only, for verifying no busy-loop)
+    #[cfg(test)]
+    poll_count: Arc<AtomicU64>,
 }
 
 impl<T> Drop for FastReceiver<T> {
@@ -214,6 +219,9 @@ impl<T> FastReceiver<T> {
         const MAX_BACKOFF_US: u64 = 1000; // 1ms max
 
         loop {
+            #[cfg(test)]
+            self.poll_count.fetch_add(1, Ordering::Relaxed);
+
             match self.inner.try_recv() {
                 Ok(msg) => {
                     // Notify senders that space is available
@@ -230,6 +238,12 @@ impl<T> FastReceiver<T> {
                 }
             }
         }
+    }
+
+    /// Returns the number of poll iterations in recv_async (test-only).
+    #[cfg(test)]
+    pub fn poll_count(&self) -> u64 {
+        self.poll_count.load(Ordering::Relaxed)
     }
 
     /// Receives a message synchronously (blocking).
@@ -291,6 +305,8 @@ pub fn bounded<T>(capacity: usize) -> (FastSender<T>, FastReceiver<T>) {
         inner: rx,
         send_notify,
         closed,
+        #[cfg(test)]
+        poll_count: Arc::new(AtomicU64::new(0)),
     };
 
     (sender, receiver)
@@ -399,20 +415,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recv_async_with_delayed_send() {
-        // This test verifies recv_async works when the sender is delayed.
-        // Note: This doesn't actually verify the absence of busy-looping - that would
-        // require CPU monitoring. It just confirms the basic functionality works.
+    async fn test_recv_async_no_busy_loop() {
+        // Verify recv_async uses exponential backoff, not busy-looping.
+        // With 1s wait and 1ms max backoff, expect ~1000 iterations max.
+        // A busy-loop with yield_now() would do millions of iterations.
         let (tx, rx) = bounded::<i32>(10);
 
-        let receiver = tokio::spawn(async move { rx.recv_async().await.unwrap() });
+        // Spawn sender that waits 1 second before sending
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tx.send_async(42).await.unwrap();
+        });
 
-        // Delay before sending
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        tx.send_async(42).await.unwrap();
-
-        let result = receiver.await.unwrap();
+        // Receive (will wait ~1s for the message)
+        let result = rx.recv_async().await.unwrap();
         assert_eq!(result, 42);
+
+        sender.await.unwrap();
+
+        // Check poll count - with exponential backoff (1μs -> 1ms max),
+        // 1 second of waiting should result in roughly:
+        // - First 10 iterations: 1+2+4+8+16+32+64+128+256+512 = ~1ms total
+        // - Remaining ~999ms at 1ms each = ~999 iterations
+        // Total: ~1009 iterations, let's say < 2000 to be safe
+        let polls = rx.poll_count();
+        assert!(
+            polls < 2000,
+            "Too many poll iterations ({polls}), likely busy-looping"
+        );
+        // Also verify we actually polled (not zero)
+        assert!(polls > 0, "Should have polled at least once");
     }
 }
