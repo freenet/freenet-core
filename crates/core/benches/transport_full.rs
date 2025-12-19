@@ -117,7 +117,6 @@ criterion_group!(
     targets =
         bench_large_transfer_validation,
         bench_1mb_transfer_validation,
-        bench_congestion_256kb,
 );
 
 criterion_group!(
