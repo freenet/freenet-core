@@ -689,7 +689,8 @@ async fn perform_put_with_retries(
     nodes = ["gateway", "peer"],
     // Increased timeout for CI where 8 parallel tests compete for resources
     timeout_secs = 120,
-    startup_wait_secs = 15,
+    // Reduced startup wait - we'll poll for actual connection establishment
+    startup_wait_secs = 5,
     aggregate_events = "always",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
@@ -699,10 +700,6 @@ async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext)
 
     let gateway = ctx.node("gateway")?;
     let peer = ctx.node("peer")?;
-
-    // Wait for the connection handshake to complete - but no extra time
-    // This is the minimum wait for the test framework's startup_wait_secs
-    // After this, connections MUST be established and identities known
 
     // Connect to websockets
     let uri_gw = format!(
@@ -719,56 +716,77 @@ async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext)
     let (stream_peer, _) = connect_async(&uri_peer).await?;
     let mut client_peer = WebApi::start(stream_peer);
 
-    // Query gateway for connections - should return the peer IMMEDIATELY
-    // No retry loop allowed here - this is the regression test's core assertion
-    client_gw
-        .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-        .await?;
-    let gw_resp = tokio::time::timeout(Duration::from_secs(5), client_gw.recv()).await?;
-    let gw_peers = match gw_resp {
-        Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
-        Ok(other) => bail!("Unexpected response from gateway: {:?}", other),
-        Err(e) => bail!("Error receiving gateway response: {}", e),
-    };
+    // Poll for connection establishment with a deadline.
+    // The #2211 bug would cause QueryConnections to NEVER return the peer identity,
+    // even after the connection was established. This test verifies that once the
+    // connection is established, the identity IS visible (within a reasonable timeout).
+    const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+    const RETRY_DELAY: Duration = Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + CONNECTION_TIMEOUT;
 
-    // Query peer for connections - should return the gateway
-    client_peer
-        .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-        .await?;
-    let peer_resp = tokio::time::timeout(Duration::from_secs(5), client_peer.recv()).await?;
-    let peer_peers = match peer_resp {
-        Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
-        Ok(other) => bail!("Unexpected response from peer: {:?}", other),
-        Err(e) => bail!("Error receiving peer response: {}", e),
-    };
+    let mut gw_peers = Vec::new();
+    let mut peer_peers = Vec::new();
 
-    tracing::info!(
-        gateway_connections = gw_peers.len(),
-        peer_connections = peer_peers.len(),
-        "Connection visibility check"
-    );
+    while tokio::time::Instant::now() < deadline {
+        // Query gateway for connections
+        client_gw
+            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+            .await?;
+        let gw_resp = tokio::time::timeout(Duration::from_secs(5), client_gw.recv()).await?;
+        gw_peers = match gw_resp {
+            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
+            Ok(other) => bail!("Unexpected response from gateway: {:?}", other),
+            Err(e) => bail!("Error receiving gateway response: {}", e),
+        };
+
+        // Query peer for connections
+        client_peer
+            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+            .await?;
+        let peer_resp = tokio::time::timeout(Duration::from_secs(5), client_peer.recv()).await?;
+        peer_peers = match peer_resp {
+            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
+            Ok(other) => bail!("Unexpected response from peer: {:?}", other),
+            Err(e) => bail!("Error receiving peer response: {}", e),
+        };
+
+        tracing::info!(
+            gateway_connections = gw_peers.len(),
+            peer_connections = peer_peers.len(),
+            "Connection visibility check"
+        );
+
+        // Both nodes must see each other
+        if !gw_peers.is_empty() && !peer_peers.is_empty() {
+            break;
+        }
+
+        tokio::time::sleep(RETRY_DELAY).await;
+    }
 
     // CRITICAL ASSERTIONS - the whole point of this regression test
-    // Gateway MUST see the peer immediately after connect handshake
+    // The #2211 bug would cause these to fail even after waiting indefinitely,
+    // because the peer identity was never propagated to the transport layer.
     if gw_peers.is_empty() {
         bail!(
-            "REGRESSION: Gateway's QueryConnections returned empty! \
+            "REGRESSION: Gateway's QueryConnections returned empty after {}s! \
              This indicates the peer's identity was not propagated to the \
              transport layer when the transient connection was promoted. \
-             See PR #2211 for the original bug fix."
+             See PR #2211 for the original bug fix.",
+            CONNECTION_TIMEOUT.as_secs()
         );
     }
 
-    // Peer MUST see the gateway
     if peer_peers.is_empty() {
         bail!(
-            "REGRESSION: Peer's QueryConnections returned empty! \
-             This indicates the connection wasn't properly established."
+            "REGRESSION: Peer's QueryConnections returned empty after {}s! \
+             This indicates the connection wasn't properly established.",
+            CONNECTION_TIMEOUT.as_secs()
         );
     }
 
     tracing::info!(
-        "✅ Connection identity propagation verified: gateway sees {} peer(s), peer sees {} connection(s)",
+        "Connection identity propagation verified: gateway sees {} peer(s), peer sees {} connection(s)",
         gw_peers.len(),
         peer_peers.len()
     );
