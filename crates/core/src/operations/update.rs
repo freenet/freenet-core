@@ -342,8 +342,7 @@ impl Operation for UpdateOp {
                                     .ring
                                     .subscribers_of(key)
                                     .map(|subs| {
-                                        subs.value()
-                                            .iter()
+                                        subs.iter()
                                             .filter_map(|loc| loc.socket_addr())
                                             .map(|addr| format!("{:.8}", addr))
                                             .collect::<Vec<_>>()
@@ -590,8 +589,7 @@ impl OpManager {
             .ring
             .subscribers_of(key)
             .map(|subs| {
-                subs.value()
-                    .iter()
+                subs.iter()
                     // Filter out the sender to avoid sending the update back to where it came from
                     .filter(|pk| pk.socket_addr().as_ref() != Some(sender))
                     // Only include peers we're actually connected to
@@ -1024,7 +1022,7 @@ pub(crate) async fn request_update(
             // Subscribe on behalf of the requesting peer (no upstream_addr - direct registration)
             op_manager
                 .ring
-                .add_subscriber(&key, sender.clone(), None)
+                .add_downstream(&key, sender.clone(), None)
                 .map_err(|_| RingError::NoCachingPeers(key))?;
 
             target

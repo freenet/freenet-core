@@ -419,12 +419,30 @@ async fn websocket_interface(
                     }
                     Ok(None) => continue,
                     Err(None) => {
-                        tracing::debug!("client channel closed on request");
+                        tracing::debug!(%client_id, "Client channel closed, notifying node for subscription cleanup");
+                        // Notify node about client disconnect to trigger subscription cleanup
+                        let _ = request_sender
+                            .send(ClientConnection::Request {
+                                client_id,
+                                req: Box::new(ClientRequest::Disconnect { cause: None }),
+                                auth_token: auth_token.as_ref().map(|t| t.0.clone()),
+                                attested_contract: auth_token.as_ref().map(|t| t.1),
+                            })
+                            .await;
                         let _ = server_sink.send(Message::Close(None)).await;
                         return Ok(())
                     },
                     Err(Some(err)) => {
-                        tracing::debug!(err = %err, "client channel error on request");
+                        tracing::debug!(%client_id, err = %err, "Client channel error, notifying node for subscription cleanup");
+                        // Notify node about client disconnect to trigger subscription cleanup even on error
+                        let _ = request_sender
+                            .send(ClientConnection::Request {
+                                client_id,
+                                req: Box::new(ClientRequest::Disconnect { cause: None }),
+                                auth_token: auth_token.as_ref().map(|t| t.0.clone()),
+                                attested_contract: auth_token.as_ref().map(|t| t.1),
+                            })
+                            .await;
                         return Err(err)
                     },
                 }

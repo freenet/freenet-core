@@ -74,6 +74,47 @@ impl P2pBridge {
             log_register: Arc::new(event_register),
         }
     }
+
+    /// Send Unsubscribed messages to upstream peers after subscription tree pruning.
+    ///
+    /// This is called after `prune_connection()` or `remove_client_from_all_subscriptions()`
+    /// to notify upstream peers that we're no longer subscribed to certain contracts.
+    /// Notifications are sent concurrently for better performance.
+    pub(crate) async fn send_prune_notifications(
+        &self,
+        notifications: Vec<(freenet_stdlib::prelude::ContractKey, PeerKeyLocation)>,
+    ) {
+        if notifications.is_empty() {
+            return;
+        }
+
+        let own_location = self.op_manager.ring.connection_manager.own_location();
+
+        let futures: Vec<_> = notifications
+            .into_iter()
+            .filter_map(|(contract_key, upstream)| {
+                let upstream_addr = upstream.socket_addr()?;
+                let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
+                    transaction: Transaction::new::<crate::operations::subscribe::SubscribeMsg>(),
+                    key: contract_key,
+                    from: own_location.clone(),
+                });
+
+                Some(async move {
+                    if let Err(e) = self.send(upstream_addr, unsubscribe_msg).await {
+                        tracing::warn!(
+                            %contract_key,
+                            %upstream_addr,
+                            error = %e,
+                            "Failed to send Unsubscribed to upstream after pruning"
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        futures::future::join_all(futures).await;
+    }
 }
 
 impl NetworkBridge for P2pBridge {
@@ -672,13 +713,18 @@ impl P2pConnManager {
                                                 peer_addr,
                                             )
                                         };
-                                        ctx.bridge
+                                        let prune_result = ctx
+                                            .bridge
                                             .op_manager
                                             .ring
                                             .prune_connection(PeerId::new(
                                                 peer_addr,
                                                 peer.pub_key().clone(),
                                             ))
+                                            .await;
+
+                                        ctx.bridge
+                                            .send_prune_notifications(prune_result.notifications)
                                             .await;
 
                                         // Remove from connection map
@@ -781,13 +827,18 @@ impl P2pConnManager {
                                         );
                                     }
                                     // Immediately prune topology counters so we don't leak open connection slots.
-                                    ctx.bridge
+                                    let prune_result = ctx
+                                        .bridge
                                         .op_manager
                                         .ring
                                         .prune_connection(PeerId::new(
                                             peer_addr,
                                             peer.pub_key().clone(),
                                         ))
+                                        .await;
+
+                                    ctx.bridge
+                                        .send_prune_notifications(prune_result.notifications)
                                         .await;
 
                                     // Clean up proximity cache for disconnected peer
@@ -1131,17 +1182,14 @@ impl P2pConnManager {
                                         // Get actual subscriber information from OpManager
                                         let subscribers_info =
                                             op_manager.ring.subscribers_of(contract_key);
-                                        let subscriber_count = subscribers_info
-                                            .as_ref()
-                                            .map(|s| s.value().len())
-                                            .unwrap_or(0);
+                                        let subscriber_count =
+                                            subscribers_info.as_ref().map(|s| s.len()).unwrap_or(0);
                                         let subscriber_peer_ids: Vec<String> =
                                             if config.include_subscriber_peer_ids {
                                                 subscribers_info
                                                     .as_ref()
                                                     .map(|s| {
-                                                        s.value()
-                                                            .iter()
+                                                        s.iter()
                                                             .map(|pk| pk.pub_key().to_string())
                                                             .collect()
                                                     })
@@ -1249,77 +1297,80 @@ impl P2pConnManager {
                                 key,
                                 subscribed,
                             } => {
+                                // This event is only fired for STANDALONE subscriptions (no remote peers).
+                                // Normal subscribe flow now goes through handle_op_result which sends
+                                // results via result_router_tx directly.
                                 tracing::debug!(
                                     tx = %tx,
                                     contract = %key,
                                     phase = "complete",
-                                    "Local subscribe operation completed"
+                                    "Standalone subscribe operation completed"
                                 );
 
-                                // If this is a child operation, complete it and let the parent flow handle result delivery.
+                                // If this is a child operation (e.g., Subscribe spawned by PUT),
+                                // just mark it complete - parent operation handles client response.
                                 if op_manager.is_sub_operation(tx) {
                                     tracing::debug!(
                                         tx = %tx,
                                         contract = %key,
                                         phase = "complete",
-                                        "Completing child subscribe operation"
+                                        "Completing standalone child subscribe operation"
                                     );
                                     op_manager.completed(tx);
                                     continue;
                                 }
 
-                                if !op_manager.is_sub_operation(tx) {
-                                    let response = Ok(HostResponse::ContractResponse(
-                                        ContractResponse::SubscribeResponse { key, subscribed },
-                                    ));
+                                // Standalone parent operation - send response to client
+                                let response = Ok(HostResponse::ContractResponse(
+                                    ContractResponse::SubscribeResponse { key, subscribed },
+                                ));
 
-                                    match op_manager.result_router_tx.send((tx, response)).await {
-                                        Ok(()) => {
-                                            tracing::debug!(
+                                match op_manager.result_router_tx.send((tx, response)).await {
+                                    Ok(()) => {
+                                        tracing::debug!(
+                                            tx = %tx,
+                                            phase = "response",
+                                            "Sent standalone subscribe response to client"
+                                        );
+                                        if let Some(clients) = state.tx_to_client.remove(&tx) {
+                                            tracing::trace!(
                                                 tx = %tx,
-                                                phase = "response",
-                                                "Sent subscribe response to client"
+                                                client_count = clients.len(),
+                                                "Removed waiting clients for completed transaction"
                                             );
-                                            if let Some(clients) = state.tx_to_client.remove(&tx) {
-                                                tracing::trace!(
-                                                    tx = %tx,
-                                                    client_count = clients.len(),
-                                                    "Removed waiting clients for completed transaction"
-                                                );
-                                            } else if let Some(pos) = state
-                                                .client_waiting_transaction
-                                                .iter()
-                                                .position(|(waiting, _)| match waiting {
-                                                    WaitingTransaction::Subscription {
-                                                        contract_key,
-                                                    } => contract_key == key.id(),
-                                                    _ => false,
-                                                })
-                                            {
-                                                let (_, clients) =
-                                                    state.client_waiting_transaction.remove(pos);
-                                                tracing::trace!(
-                                                    tx = %tx,
-                                                    contract = %key,
-                                                    waiter_count = clients.len(),
-                                                    "Matched subscription waiters by contract"
-                                                );
-                                            } else {
-                                                tracing::warn!(
-                                                    tx = %tx,
-                                                    phase = "complete",
-                                                    "Subscribe complete but no waiting clients found"
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
+                                        } else if let Some(pos) = state
+                                            .client_waiting_transaction
+                                            .iter()
+                                            .position(|(waiting, _)| match waiting {
+                                                WaitingTransaction::Subscription {
+                                                    contract_key,
+                                                } => contract_key == key.id(),
+                                                _ => false,
+                                            })
+                                        {
+                                            let (_, clients) =
+                                                state.client_waiting_transaction.remove(pos);
+                                            tracing::trace!(
                                                 tx = %tx,
-                                                error = %e,
-                                                phase = "error",
-                                                "Failed to send subscribe response to client"
+                                                contract = %key,
+                                                waiter_count = clients.len(),
+                                                "Matched subscription waiters by contract"
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                tx = %tx,
+                                                phase = "complete",
+                                                "Standalone subscribe complete but no waiting clients found"
                                             );
                                         }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            tx = %tx,
+                                            error = %e,
+                                            phase = "error",
+                                            "Failed to send standalone subscribe response to client"
+                                        );
                                     }
                                 }
                             }
@@ -1361,6 +1412,15 @@ impl P2pConnManager {
                                     "Disconnecting from network"
                                 );
                                 break;
+                            }
+                            NodeEvent::ClientDisconnected { client_id } => {
+                                tracing::debug!(%client_id, "Client disconnected");
+
+                                let notifications = op_manager
+                                    .ring
+                                    .remove_client_from_all_subscriptions(client_id);
+
+                                ctx.bridge.send_prune_notifications(notifications).await;
                             }
                         },
                     }
@@ -2376,11 +2436,17 @@ impl P2pConnManager {
                         self.addr_by_pub_key.remove(&pub_key);
                     }
                     tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer, socket_addr = %remote_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportClosed - removing from connections HashMap");
-                    self.bridge
+                    let prune_result = self
+                        .bridge
                         .op_manager
                         .ring
                         .prune_connection(PeerId::new(remote_addr, peer.pub_key().clone()))
                         .await;
+
+                    self.bridge
+                        .send_prune_notifications(prune_result.notifications)
+                        .await;
+
                     if let Err(error) = handshake_commands
                         .send(HandshakeCommand::DropConnection { peer: peer.clone() })
                         .await

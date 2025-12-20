@@ -453,7 +453,7 @@ async fn test_subscription_validates_k_closest_usage() {
         let op = SubscribeOp {
             id: transaction_id,
             state: Some(SubscribeState::AwaitingResponse { next_hop: None }),
-            upstream_addr: None,
+            requester_addr: None,
         };
 
         // State is simplified - skip list is now in the Request message, not state

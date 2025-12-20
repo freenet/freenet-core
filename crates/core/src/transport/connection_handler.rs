@@ -2350,7 +2350,7 @@ pub mod mock_transport {
 
     /// This one is the maximum size (1324 currently) of a short message from user side
     /// by using public send API can be directly sent
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn simulate_send_max_short_message() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =

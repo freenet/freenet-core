@@ -5,13 +5,15 @@ use freenet::{
     local_node::NodeConfig,
     server::serve_gateway,
     test_utils::{
-        self, load_delegate, make_get, make_put, make_subscribe, make_update,
-        verify_contract_exists, TestContext,
+        self, load_delegate, make_get, make_node_diagnostics, make_put, make_subscribe,
+        make_update, verify_contract_exists, TestContext,
     },
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractResponse, HostResponse, QueryResponse, WebApi},
+    client_api::{
+        ClientRequest, ContractResponse, HostResponse, NodeDiagnosticsConfig, QueryResponse, WebApi,
+    },
     prelude::*,
 };
 use futures::FutureExt;
@@ -3308,5 +3310,788 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
 
     tracing::info!("Issue #2326 regression test passed: PUT then immediate Subscribe works");
 
+    Ok(())
+}
+
+/// Test subscription tree pruning (Issue #2166).
+///
+/// This test validates that when a subscriber disconnects, updates are no longer
+/// sent to that peer. The pruning mechanism should clean up dead subscription branches.
+///
+/// Test flow:
+/// 1. Gateway puts a contract
+/// 2. Peer-A subscribes and receives the initial state
+/// 3. Gateway updates the contract → Peer-A receives the update
+/// 4. Peer-A disconnects
+/// 5. Gateway updates the contract again → should complete without errors
+///    (no failed sends to disconnected peer)
+///
+/// The test verifies pruning indirectly by ensuring updates complete successfully
+/// after a subscriber disconnects, without errors from trying to send to dead peers.
+#[freenet_test(
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 180,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    let gateway = ctx.node("gateway")?;
+    let peer_a = ctx.node("peer-a")?;
+
+    tracing::info!(
+        "Nodes: gateway ws={}, peer-a ws={}",
+        gateway.ws_port,
+        peer_a.ws_port
+    );
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let uri_gw = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        gateway.ws_port
+    );
+    let (stream_gw, _) = connect_async(&uri_gw).await?;
+    let mut client_gw = WebApi::start(stream_gw);
+
+    let uri_a = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        peer_a.ws_port
+    );
+    let (stream_a, _) = connect_async(&uri_a).await?;
+    let mut client_a = WebApi::start(stream_a);
+
+    tracing::info!("Step 1: Putting contract on gateway");
+    make_put(
+        &mut client_gw,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(30), client_gw.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+                assert_eq!(key, contract_key, "Contract key mismatch");
+                tracing::info!("Contract put successfully: {}", key);
+                break;
+            }
+            other => {
+                tracing::warn!("Unexpected response during put: {:?}", other);
+            }
+        }
+    }
+
+    tracing::info!("Step 2: Subscribing peer-a to contract");
+    make_subscribe(&mut client_a, contract_key).await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(60), client_a.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            }) => {
+                assert_eq!(key, contract_key);
+                assert!(subscribed, "Peer-a failed to subscribe");
+                tracing::info!("Peer-a subscribed successfully");
+                break;
+            }
+            other => {
+                tracing::warn!("Peer-a: unexpected response: {:?}", other);
+            }
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    tracing::info!("Step 2.5: Verifying peer-a is in gateway's subscribers");
+    let peer_a_diag_config = NodeDiagnosticsConfig {
+        include_node_info: true,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: false,
+    };
+    make_node_diagnostics(&mut client_a, peer_a_diag_config).await?;
+
+    let peer_a_peer_id = loop {
+        let resp = timeout(Duration::from_secs(10), client_a.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let node_info = diag
+                    .node_info
+                    .ok_or_else(|| anyhow!("Missing node_info in peer-a diagnostics"))?;
+                tracing::info!("Peer-a peer_id: {}", node_info.peer_id);
+                break node_info.peer_id;
+            }
+            other => {
+                tracing::warn!(
+                    "Peer-a: unexpected response while getting peer_id: {:?}",
+                    other
+                );
+            }
+        }
+    };
+
+    let gw_diag_config = NodeDiagnosticsConfig {
+        include_node_info: false,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![contract_key],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: true,
+    };
+    make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
+
+    let gateway_subscribers_before = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let contract_state = diag.contract_states.get(&contract_key);
+                let subscribers = contract_state
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
+                tracing::info!(
+                    "Gateway subscribers for contract (before disconnect): {:?}",
+                    subscribers
+                );
+                break subscribers;
+            }
+            other => {
+                tracing::warn!(
+                    "Gateway: unexpected response while getting subscribers: {:?}",
+                    other
+                );
+            }
+        }
+    };
+
+    assert!(
+        gateway_subscribers_before.contains(&peer_a_peer_id),
+        "Peer-a should be in gateway's subscriber list. peer_id {} not in {:?}",
+        peer_a_peer_id,
+        gateway_subscribers_before
+    );
+    tracing::info!("Verified: peer-a is in gateway's subscription tree");
+
+    tracing::info!("Step 3: Updating contract");
+    let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())?;
+    todo_list.tasks.push(test_utils::Task {
+        id: 1,
+        title: "First update".to_string(),
+        description: "Testing subscription".to_string(),
+        completed: false,
+        priority: 1,
+    });
+    let update_state = WrappedState::from(serde_json::to_vec(&todo_list)?);
+
+    make_update(&mut client_gw, contract_key, update_state).await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(30), client_gw.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Gateway: Update completed successfully");
+                break;
+            }
+            other => {
+                tracing::warn!("Gateway: unexpected response: {:?}", other);
+            }
+        }
+    }
+
+    let mut peer_a_received_update = false;
+    for _ in 0..10 {
+        match timeout(Duration::from_secs(3), client_a.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                ..
+            }))) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Peer-a received update notification");
+                peer_a_received_update = true;
+                break;
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!("Peer-a: unexpected response: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Peer-a: error: {}", e);
+            }
+            Err(_) => {
+                tracing::debug!("Peer-a: timeout waiting for update, retrying...");
+            }
+        }
+    }
+
+    if !peer_a_received_update {
+        tracing::warn!("Peer-a did not receive update notification (may be network topology)");
+    }
+
+    tracing::info!("Step 4: Disconnecting peer-a (triggers pruning)");
+    drop(client_a);
+
+    tracing::info!("Waiting for disconnect processing...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    tracing::info!("Step 4.5: Verifying peer-a removed from gateway's subscribers");
+
+    make_node_diagnostics(&mut client_gw, gw_diag_config).await?;
+
+    let gateway_subscribers_after = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let contract_state = diag.contract_states.get(&contract_key);
+                let subscribers = contract_state
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
+                tracing::info!(
+                    "Gateway subscribers for contract (after disconnect): {:?}",
+                    subscribers
+                );
+                break subscribers;
+            }
+            other => {
+                tracing::warn!(
+                    "Gateway: unexpected response while getting subscribers after disconnect: {:?}",
+                    other
+                );
+            }
+        }
+    };
+
+    assert!(
+        !gateway_subscribers_after.contains(&peer_a_peer_id),
+        "Peer-a should NOT be in gateway's subscriber list after disconnect. \
+         peer_id {} found in {:?}",
+        peer_a_peer_id,
+        gateway_subscribers_after
+    );
+
+    tracing::info!("Subscription tree pruning test passed");
+    Ok(())
+}
+
+/// Test that multiple client subscriptions prevent premature upstream notification (Issue #2166).
+///
+/// This test validates that the subscription tree is NOT pruned while ANY local client
+/// remains subscribed. Only when ALL clients disconnect should the Unsubscribed message
+/// be sent to the upstream peer.
+///
+/// Test flow:
+/// 1. Gateway puts a contract
+/// 2. Two clients on Peer-A subscribe to the contract
+/// 3. First client disconnects → Peer-A should still be in Gateway's subscribers
+///    (because second client is still subscribed)
+/// 4. Second client disconnects → Peer-A should be removed from Gateway's subscribers
+///    (no remaining client subscriptions)
+#[freenet_test(
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 180,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    let gateway = ctx.node("gateway")?;
+    let peer_a = ctx.node("peer-a")?;
+
+    tracing::info!(
+        "Nodes: gateway ws={}, peer-a ws={}",
+        gateway.ws_port,
+        peer_a.ws_port
+    );
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Connect gateway client
+    let uri_gw = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        gateway.ws_port
+    );
+    let (stream_gw, _) = connect_async(&uri_gw).await?;
+    let mut client_gw = WebApi::start(stream_gw);
+
+    // Step 1: Gateway puts contract
+    tracing::info!("Step 1: Putting contract on gateway");
+    make_put(
+        &mut client_gw,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(30), client_gw.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+                assert_eq!(key, contract_key, "Contract key mismatch");
+                tracing::info!("Contract put successfully: {}", key);
+                break;
+            }
+            other => {
+                tracing::warn!("Unexpected response during put: {:?}", other);
+            }
+        }
+    }
+
+    // Step 2: Connect two clients on peer-a and subscribe both
+    let uri_a = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        peer_a.ws_port
+    );
+    let (stream_a1, _) = connect_async(&uri_a).await?;
+    let mut client_a1 = WebApi::start(stream_a1);
+
+    let (stream_a2, _) = connect_async(&uri_a).await?;
+    let mut client_a2 = WebApi::start(stream_a2);
+
+    tracing::info!("Step 2: Subscribing first client on peer-a");
+    make_subscribe(&mut client_a1, contract_key).await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(60), client_a1.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            }) => {
+                assert_eq!(key, contract_key);
+                assert!(subscribed, "First client failed to subscribe");
+                tracing::info!("First client subscribed successfully");
+                break;
+            }
+            other => {
+                tracing::warn!("Client 1: unexpected response: {:?}", other);
+            }
+        }
+    }
+
+    tracing::info!("Step 2b: Subscribing second client on peer-a");
+    make_subscribe(&mut client_a2, contract_key).await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(60), client_a2.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            }) => {
+                assert_eq!(key, contract_key);
+                assert!(subscribed, "Second client failed to subscribe");
+                tracing::info!("Second client subscribed successfully");
+                break;
+            }
+            other => {
+                tracing::warn!("Client 2: unexpected response: {:?}", other);
+            }
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Step 3: Get peer-a's peer_id for verification
+    let peer_a_diag_config = NodeDiagnosticsConfig {
+        include_node_info: true,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: false,
+    };
+    make_node_diagnostics(&mut client_a1, peer_a_diag_config).await?;
+
+    let peer_a_peer_id = loop {
+        let resp = timeout(Duration::from_secs(10), client_a1.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let node_info = diag
+                    .node_info
+                    .ok_or_else(|| anyhow!("Missing node_info in peer-a diagnostics"))?;
+                tracing::info!("Peer-a peer_id: {}", node_info.peer_id);
+                break node_info.peer_id;
+            }
+            other => {
+                tracing::warn!("Peer-a: unexpected response: {:?}", other);
+            }
+        }
+    };
+
+    // Step 4: Verify gateway has peer-a in subscribers
+    let gw_diag_config = NodeDiagnosticsConfig {
+        include_node_info: false,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![contract_key],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: true,
+    };
+    make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
+
+    let gateway_subscribers_initial = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let contract_state = diag.contract_states.get(&contract_key);
+                let subscribers = contract_state
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
+                tracing::info!(
+                    "Gateway subscribers (both clients connected): {:?}",
+                    subscribers
+                );
+                break subscribers;
+            }
+            other => {
+                tracing::warn!("Gateway: unexpected response: {:?}", other);
+            }
+        }
+    };
+
+    assert!(
+        gateway_subscribers_initial.contains(&peer_a_peer_id),
+        "Peer-a should be in gateway's subscriber list initially"
+    );
+
+    // Step 5: Disconnect first client - peer-a should STILL be in subscribers
+    tracing::info!("Step 5: Disconnecting first client (pruning should NOT occur)");
+    drop(client_a1);
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
+
+    let gateway_subscribers_after_first = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let contract_state = diag.contract_states.get(&contract_key);
+                let subscribers = contract_state
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
+                tracing::info!(
+                    "Gateway subscribers (after first client disconnect): {:?}",
+                    subscribers
+                );
+                break subscribers;
+            }
+            other => {
+                tracing::warn!("Gateway: unexpected response: {:?}", other);
+            }
+        }
+    };
+
+    assert!(
+        gateway_subscribers_after_first.contains(&peer_a_peer_id),
+        "Peer-a should STILL be in gateway's subscriber list (second client still connected). \
+         peer_id {} not in {:?}",
+        peer_a_peer_id,
+        gateway_subscribers_after_first
+    );
+    tracing::info!("Verified: peer-a still in subscribers after first client disconnect");
+
+    // Step 6: Disconnect second client - peer-a should be REMOVED
+    tracing::info!("Step 6: Disconnecting second client (pruning SHOULD occur)");
+    drop(client_a2);
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    make_node_diagnostics(&mut client_gw, gw_diag_config).await?;
+
+    let gateway_subscribers_final = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let contract_state = diag.contract_states.get(&contract_key);
+                let subscribers = contract_state
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
+                tracing::info!(
+                    "Gateway subscribers (after second client disconnect): {:?}",
+                    subscribers
+                );
+                break subscribers;
+            }
+            other => {
+                tracing::warn!("Gateway: unexpected response: {:?}", other);
+            }
+        }
+    };
+
+    assert!(
+        !gateway_subscribers_final.contains(&peer_a_peer_id),
+        "Peer-a should NOT be in gateway's subscriber list after both clients disconnect. \
+         peer_id {} found in {:?}",
+        peer_a_peer_id,
+        gateway_subscribers_final
+    );
+
+    tracing::info!("Multiple clients prevent premature pruning test passed");
+    Ok(())
+}
+
+/// Test that verifies the complete subscription tree pruning mechanism (Issue #2166).
+///
+/// This test validates:
+/// 1. Initial state: No subscriptions exist
+/// 2. After subscribe: Gateway has Peer-A as downstream, Peer-A has local client subscription
+/// 3. After client disconnect: Unsubscribed is sent, Gateway removes Peer-A from subscribers
+///
+/// The pruning conditions are:
+/// - Downstream subscriber disconnects (client WebSocket closes)
+/// - No remaining downstream subscribers on Peer-A
+/// - No remaining local client subscriptions on Peer-A
+/// - → Peer-A sends Unsubscribed to Gateway (upstream)
+#[freenet_test(
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 180,
+    startup_wait_secs = 10,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_subscription_pruning_sends_unsubscribed(ctx: &mut TestContext) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    let gateway = ctx.node("gateway")?;
+    let peer_a = ctx.node("peer-a")?;
+
+    tracing::info!(
+        "Nodes: gateway ws={}, peer-a ws={}",
+        gateway.ws_port,
+        peer_a.ws_port
+    );
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Connect clients
+    let uri_gw = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        gateway.ws_port
+    );
+    let (stream_gw, _) = connect_async(&uri_gw).await?;
+    let mut client_gw = WebApi::start(stream_gw);
+
+    let uri_a = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        peer_a.ws_port
+    );
+    let (stream_a, _) = connect_async(&uri_a).await?;
+    let mut client_a = WebApi::start(stream_a);
+
+    // ========== STEP 1: Put contract on gateway ==========
+    tracing::info!("Step 1: Putting contract on gateway");
+    make_put(
+        &mut client_gw,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(30), client_gw.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+                assert_eq!(key, contract_key);
+                tracing::info!("Contract put successfully");
+                break;
+            }
+            other => tracing::warn!("Unexpected response: {:?}", other),
+        }
+    }
+
+    // ========== STEP 2: Verify initial state - no subscribers ==========
+    tracing::info!("Step 2: Verifying initial state - gateway has no subscribers");
+
+    let gw_diag_config = NodeDiagnosticsConfig {
+        include_node_info: false,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![contract_key],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: true,
+    };
+    make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
+
+    let initial_subscribers = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let subs = diag
+                    .contract_states
+                    .get(&contract_key)
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
+                tracing::info!("Initial gateway subscribers: {:?}", subs);
+                break subs;
+            }
+            other => tracing::warn!("Unexpected: {:?}", other),
+        }
+    };
+
+    assert!(
+        initial_subscribers.is_empty(),
+        "Gateway should have no subscribers initially"
+    );
+
+    // ========== STEP 3: Peer-A subscribes ==========
+    tracing::info!("Step 3: Peer-A subscribing to contract");
+    make_subscribe(&mut client_a, contract_key).await?;
+
+    loop {
+        let resp = timeout(Duration::from_secs(60), client_a.recv()).await??;
+        match resp {
+            HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                key,
+                subscribed,
+            }) => {
+                assert_eq!(key, contract_key);
+                assert!(subscribed, "Peer-A failed to subscribe");
+                tracing::info!("Peer-A subscribed successfully");
+                break;
+            }
+            other => tracing::warn!("Peer-A unexpected: {:?}", other),
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // ========== STEP 4: Verify subscription state ==========
+    tracing::info!("Step 4: Verifying subscription state on both nodes");
+
+    // Get Peer-A's peer_id
+    let peer_a_diag_config = NodeDiagnosticsConfig {
+        include_node_info: true,
+        include_network_info: false,
+        include_subscriptions: true, // Check local subscriptions
+        contract_keys: vec![],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: false,
+    };
+    make_node_diagnostics(&mut client_a, peer_a_diag_config.clone()).await?;
+
+    let (peer_a_peer_id, peer_a_subscriptions) = loop {
+        let resp = timeout(Duration::from_secs(10), client_a.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let peer_id = diag
+                    .node_info
+                    .ok_or_else(|| anyhow!("Missing node_info"))?
+                    .peer_id;
+                let subs = diag.subscriptions;
+                tracing::info!("Peer-A peer_id: {}, subscriptions: {:?}", peer_id, subs);
+                break (peer_id, subs);
+            }
+            other => tracing::warn!("Peer-A unexpected: {:?}", other),
+        }
+    };
+
+    // Verify Peer-A has local subscription
+    assert!(
+        peer_a_subscriptions
+            .iter()
+            .any(|s| s.contract_key == contract_key),
+        "Peer-A should have local subscription to contract. Subscriptions: {:?}",
+        peer_a_subscriptions
+    );
+    tracing::info!("✓ Peer-A has local client subscription");
+
+    // Verify Gateway has Peer-A as subscriber
+    make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
+
+    let gateway_subscribers_after_subscribe = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let subs = diag
+                    .contract_states
+                    .get(&contract_key)
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
+                tracing::info!("Gateway subscribers after subscribe: {:?}", subs);
+                break subs;
+            }
+            other => tracing::warn!("Unexpected: {:?}", other),
+        }
+    };
+
+    assert!(
+        gateway_subscribers_after_subscribe.contains(&peer_a_peer_id),
+        "Gateway should have Peer-A as subscriber. peer_id={}, subscribers={:?}",
+        peer_a_peer_id,
+        gateway_subscribers_after_subscribe
+    );
+    tracing::info!("✓ Gateway has Peer-A as downstream subscriber");
+
+    // ========== STEP 5: Disconnect Peer-A's client (triggers pruning) ==========
+    tracing::info!("Step 5: Disconnecting Peer-A's client - this should trigger pruning");
+    tracing::info!("  Expected: Peer-A sends Unsubscribed to Gateway");
+
+    drop(client_a);
+
+    // Wait for disconnect to be processed and Unsubscribed to be sent/received
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // ========== STEP 6: Verify pruning occurred ==========
+    tracing::info!("Step 6: Verifying pruning - Gateway should have no subscribers");
+
+    make_node_diagnostics(&mut client_gw, gw_diag_config).await?;
+
+    let gateway_subscribers_after_disconnect = loop {
+        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+        match resp {
+            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                let subs = diag
+                    .contract_states
+                    .get(&contract_key)
+                    .map(|cs| cs.subscriber_peer_ids.clone())
+                    .unwrap_or_default();
+                tracing::info!("Gateway subscribers after disconnect: {:?}", subs);
+                break subs;
+            }
+            other => tracing::warn!("Unexpected: {:?}", other),
+        }
+    };
+
+    assert!(
+        !gateway_subscribers_after_disconnect.contains(&peer_a_peer_id),
+        "Pruning FAILED: Peer-A should NOT be in Gateway's subscribers after disconnect.\n\
+         This means Unsubscribed was NOT sent or NOT processed correctly.\n\
+         peer_id={}, subscribers={:?}",
+        peer_a_peer_id,
+        gateway_subscribers_after_disconnect
+    );
+
+    tracing::info!("✓ Pruning successful: Gateway removed Peer-A after receiving Unsubscribed");
+    tracing::info!("Test PASSED: Subscription tree pruning works correctly");
     Ok(())
 }

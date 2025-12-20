@@ -425,34 +425,43 @@ async fn report_result(
                 );
             }
 
-            // Send to result router
+            // Send to result router (skip for sub-operations - parent handles notification)
             if let Some(transaction) = tx {
-                let host_result = op_res.to_host_result();
-                let router_tx_clone = op_manager.result_router_tx.clone();
-                let event_notifier = op_manager.to_event_listener.clone();
+                // Sub-operations (e.g., Subscribe spawned by PUT) don't notify clients directly;
+                // the parent operation handles the client response.
+                if op_manager.is_sub_operation(transaction) {
+                    tracing::debug!(
+                        tx = %transaction,
+                        "Skipping client notification for sub-operation"
+                    );
+                } else {
+                    let host_result = op_res.to_host_result();
+                    let router_tx_clone = op_manager.result_router_tx.clone();
+                    let event_notifier = op_manager.to_event_listener.clone();
 
-                // Spawn fire-and-forget task to avoid blocking report_result()
-                // while still guaranteeing message delivery
-                tokio::spawn(async move {
-                    if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
-                        tracing::error!(
-                            "CRITICAL: Result router channel closed - dual-path delivery broken. \
-                             Router or session actor has crashed. Transaction: {}. Error: {}. \
-                             Consider restarting node.",
-                            transaction,
-                            e
-                        );
-                        // TODO: Consider implementing circuit breaker or automatic recovery
-                    } else {
-                        // Transaction completed successfully, notify to clean up subscriptions
-                        use crate::message::NodeEvent;
-                        use either::Either;
-                        let _ = event_notifier
-                            .notifications_sender
-                            .send(Either::Right(NodeEvent::TransactionCompleted(transaction)))
-                            .await;
-                    }
-                });
+                    // Spawn fire-and-forget task to avoid blocking report_result()
+                    // while still guaranteeing message delivery
+                    tokio::spawn(async move {
+                        if let Err(e) = router_tx_clone.send((transaction, host_result)).await {
+                            tracing::error!(
+                                "CRITICAL: Result router channel closed - dual-path delivery broken. \
+                                 Router or session actor has crashed. Transaction: {}. Error: {}. \
+                                 Consider restarting node.",
+                                transaction,
+                                e
+                            );
+                            // TODO: Consider implementing circuit breaker or automatic recovery
+                        } else {
+                            // Transaction completed successfully, notify to clean up subscriptions
+                            use crate::message::NodeEvent;
+                            use either::Either;
+                            let _ = event_notifier
+                                .notifications_sender
+                                .send(Either::Right(NodeEvent::TransactionCompleted(transaction)))
+                                .await;
+                        }
+                    });
+                }
             }
 
             // check operations.rs:handle_op_result to see what's the meaning of each state
@@ -848,21 +857,37 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Unsubscribed {
-                ref key, ref from, ..
+                ref key,
+                ref from,
+                ref transaction,
             } => {
-                tracing::debug!(
-                    "Received Unsubscribed message for contract {} from peer {}",
-                    key,
-                    from
-                );
-                // Convert PeerKeyLocation to PeerId for remove_subscriber
+                tracing::debug!(%key, %from, "Received Unsubscribed");
                 let peer_id = PeerId {
                     addr: from
                         .socket_addr()
                         .expect("from peer should have socket address"),
                     pub_key: from.pub_key().clone(),
                 };
-                op_manager.ring.remove_subscriber(key, &peer_id);
+
+                let result = op_manager.ring.remove_subscriber(key, &peer_id);
+
+                if let Some(upstream) = result.notify_upstream {
+                    let upstream_addr = upstream
+                        .socket_addr()
+                        .expect("upstream must have socket address");
+                    tracing::debug!(%key, %upstream_addr, "Propagating Unsubscribed");
+
+                    let own_location = op_manager.ring.connection_manager.own_location();
+                    let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
+                        transaction: *transaction,
+                        key: *key,
+                        from: own_location,
+                    });
+
+                    if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await {
+                        tracing::warn!(%key, %upstream_addr, error = %e, "Failed to propagate Unsubscribed");
+                    }
+                }
                 break;
             }
             NetMessageV1::ProximityCache { .. } => {
@@ -1096,21 +1121,37 @@ where
                 .await;
             }
             NetMessageV1::Unsubscribed {
-                ref key, ref from, ..
+                ref key,
+                ref from,
+                ref transaction,
             } => {
-                tracing::debug!(
-                    "Received Unsubscribed message for contract {} from peer {}",
-                    key,
-                    from
-                );
-                // Convert PeerKeyLocation to PeerId for remove_subscriber
+                tracing::debug!(%key, %from, "Received Unsubscribed");
                 let peer_id = PeerId {
                     addr: from
                         .socket_addr()
                         .expect("from peer should have socket address"),
                     pub_key: from.pub_key().clone(),
                 };
-                op_manager.ring.remove_subscriber(key, &peer_id);
+
+                let result = op_manager.ring.remove_subscriber(key, &peer_id);
+
+                if let Some(upstream) = result.notify_upstream {
+                    let upstream_addr = upstream
+                        .socket_addr()
+                        .expect("upstream must have socket address");
+                    tracing::debug!(%key, %upstream_addr, "Propagating Unsubscribed");
+
+                    let own_location = op_manager.ring.connection_manager.own_location();
+                    let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
+                        transaction: *transaction,
+                        key: *key,
+                        from: own_location,
+                    });
+
+                    if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await {
+                        tracing::warn!(%key, %upstream_addr, error = %e, "Failed to propagate Unsubscribed");
+                    }
+                }
                 break;
             }
             NetMessageV1::ProximityCache { ref message } => {
