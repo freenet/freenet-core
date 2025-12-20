@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::vec;
 
 use aes_gcm::Aes128Gcm;
@@ -17,11 +17,6 @@ use crate::{
 };
 
 use super::StreamId;
-
-/// Maximum time to wait for cwnd space before logging a warning.
-/// If this timeout is reached, it likely indicates ACKs aren't being processed
-/// (e.g., the caller isn't calling recv() on this connection).
-const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) type SerializedStream = Vec<u8>;
 
@@ -64,11 +59,19 @@ pub(super) async fn send_stream<S: super::super::Socket>(
 
         let packet_size = stream_to_send.len().min(MAX_DATA_SIZE);
 
-        // LEDBAT congestion control - wait until cwnd has space for this packet
+        // LEDBAT congestion control - wait until cwnd has space for this packet.
         // This enforces the congestion window calculated by LEDBAT's slow start
-        // and congestion avoidance algorithms
+        // and congestion avoidance algorithms.
+        //
+        // IMPORTANT: This loop requires that recv() is being called on this connection
+        // to process incoming ACKs. ACKs reduce flightsize via on_ack(), which opens
+        // cwnd space. If recv() is never called, flightsize never decreases and this
+        // loop will block forever.
+        //
+        // In production, PeerConnection is always used in a bidirectional select! loop
+        // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
+        // always being polled. Tests must follow the same pattern.
         let mut cwnd_wait_iterations = 0;
-        let cwnd_wait_start = Instant::now();
         loop {
             let flightsize = ledbat.flightsize();
             let cwnd = ledbat.current_cwnd();
@@ -85,28 +88,8 @@ pub(super) async fn send_stream<S: super::super::Socket>(
                     flightsize_kb = flightsize / 1024,
                     cwnd_kb = cwnd / 1024,
                     packet_size,
-                    "Waiting for cwnd space"
+                    "Waiting for cwnd space (ensure recv() is being called to process ACKs)"
                 );
-            }
-
-            // Check for timeout - indicates ACKs aren't being processed
-            let elapsed = cwnd_wait_start.elapsed();
-            if elapsed > CWND_WAIT_TIMEOUT {
-                tracing::warn!(
-                    stream_id = %stream_id.0,
-                    flightsize_kb = flightsize / 1024,
-                    cwnd_kb = cwnd / 1024,
-                    packet_size,
-                    elapsed_secs = elapsed.as_secs_f64(),
-                    sent_packets = sent_so_far,
-                    total_packets,
-                    "CWND wait timeout - ACKs may not be getting processed. \
-                     This usually means recv() isn't being called on this connection. \
-                     Proceeding without cwnd enforcement to prevent hang."
-                );
-                // Break out of cwnd wait to prevent infinite hang
-                // The stream will continue sending, relying on token bucket rate limiting
-                break;
             }
 
             // Exponential backoff to balance responsiveness and CPU usage
@@ -116,9 +99,9 @@ pub(super) async fn send_stream<S: super::super::Socket>(
             if cwnd_wait_iterations <= 10 {
                 tokio::task::yield_now().await;
             } else if cwnd_wait_iterations <= 100 {
-                tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                tokio::time::sleep(Duration::from_micros(100)).await;
             } else {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
 
