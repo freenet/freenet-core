@@ -19,7 +19,7 @@ The Freenet transport layer provides low-level network communication over UDP wi
 | Slow Start (IW26) | ✅ Complete | Week 4 |
 | cwnd Enforcement | ✅ Complete | Week 4 |
 | Bandwidth Configuration | ✅ Complete | Week 4 |
-| Global Bandwidth Pool | 📋 Planned | Phase 2 |
+| Global Bandwidth Pool | ✅ Complete | Week 5 |
 
 ## Document Map
 
@@ -50,15 +50,17 @@ Historical baselines and validation results from development.
 - **[Baseline (Week 0)](historical/baseline-week0.md)** - Performance metrics before congestion control implementation (pre-LEDBAT baseline)
 - **[RTT Validation (Week 1)](historical/rtt-validation-week1.md)** - RFC 6298 RTT implementation validation
 
-### Future Work
-Planned enhancements not yet implemented.
+### Implemented Features
+Documentation for completed transport features.
 
-- **[Global Bandwidth Pool](future/global-bandwidth-pool.md)** - ⚠️ **NOT IMPLEMENTED** - Design for total bandwidth management across all connections (Phase 2)
+- **[Global Bandwidth Pool](future/global-bandwidth-pool.md)** - ✅ **IMPLEMENTED** - Fair bandwidth sharing across all connections with atomic connection counting
 
 ## Quick Reference
 
 ### Default Configuration
 - **Per-connection bandwidth limit**: 10 MB/s (configurable)
+- **Global bandwidth pool**: Disabled by default (enable with `--total-bandwidth-limit`)
+- **Min per-connection rate**: 1 MB/s (when global pool enabled)
 - **Initial window (IW26)**: 38 KB (26 × 1,464-byte MSS)
 - **Slow start threshold**: 100 KB
 - **Maximum cwnd**: 1 GB
@@ -87,6 +89,7 @@ cargo bench --bench transport_perf -- slow_start
 - **Transport module**: `crates/core/src/transport/`
 - **LEDBAT controller**: `crates/core/src/transport/ledbat.rs`
 - **Token bucket**: `crates/core/src/transport/token_bucket.rs`
+- **Global bandwidth pool**: `crates/core/src/transport/global_bandwidth.rs`
 - **RTT tracking**: `crates/core/src/transport/sent_packet_tracker.rs`
 - **Connection handling**: `crates/core/src/transport/connection_handler.rs`
 - **Stream sending**: `crates/core/src/transport/peer_connection/outbound_stream.rs`
@@ -104,11 +107,13 @@ cargo bench --bench transport_perf -- slow_start
         │  (Fragment & Queue)     │
         └────┬───────────┬────────┘
              │           │
-    ┌────────▼───┐  ┌───▼──────────┐
-    │   LEDBAT   │  │ Token Bucket │
-    │   (cwnd)   │  │ (rate limit) │
-    └────┬───────┘  └───┬──────────┘
+    ┌────────▼───┐  ┌───▼──────────┐  ┌──────────────────┐
+    │   LEDBAT   │  │ Token Bucket │  │ Global Bandwidth │
+    │   (cwnd)   │  │ (rate limit) │◄─│ Pool (optional)  │
+    └────┬───────┘  └───┬──────────┘  │ total/N = rate   │
+         │              │             └──────────────────┘
          │              │
+         │    rate = min(ledbat_rate, global_rate)
          └──────┬───────┘
                 │
       ┌─────────▼──────────┐
@@ -128,26 +133,29 @@ cargo bench --bench transport_perf -- slow_start
 **Send Path:**
 1. Application calls `PeerConnection::send(message)`
 2. **cwnd check**: Wait if `flightsize + packet_size > cwnd` (LEDBAT enforcement)
-3. **Token reservation**: Reserve tokens, wait if needed (rate limiting)
-4. **Packet assembly**: Serialize + encrypt
-5. **Send tracking**: Record packet for RTT measurement and retransmission
-6. **LEDBAT update**: Increment flightsize
+3. **Rate calculation**: `min(ledbat_rate, global_pool_rate)` if global pool enabled
+4. **Token reservation**: Reserve tokens at calculated rate, wait if needed
+5. **Packet assembly**: Serialize + encrypt
+6. **Send tracking**: Record packet for RTT measurement and retransmission
+7. **LEDBAT update**: Increment flightsize
 
 **Receive Path:**
 1. UDP socket receives packet
 2. Decrypt + deserialize
 3. **RTT update**: If ACK, update smoothed RTT and cwnd (LEDBAT feedback)
-4. **Flightsize update**: Decrement flightsize on ACK
-5. Deliver to application
+4. **Rate update**: Recalculate `min(ledbat_rate, global_pool_rate)` (RTT-adaptive timing)
+5. **Flightsize update**: Decrement flightsize on ACK
+6. Deliver to application
 
 ## Development History
 
-The transport layer was developed over 4 weeks:
+The transport layer was developed over 5 weeks:
 - **Week 0**: Baseline with hardcoded 3 MB/s rate limit (no congestion control)
 - **Week 1**: RTT estimation (RFC 6298) with Karn's algorithm
 - **Week 2**: Token bucket rate limiter with dynamic rate updates
 - **Week 3**: LEDBAT controller (RFC 6817) with delay-based congestion control
 - **Week 4**: Slow start (IW26), cwnd enforcement, bandwidth configuration
+- **Week 5**: Global bandwidth pool with atomic connection counting
 
 See [Performance Comparison](analysis/performance-comparison.md) for detailed before/after analysis.
 
