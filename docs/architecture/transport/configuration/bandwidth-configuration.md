@@ -1,128 +1,232 @@
 # Transport Bandwidth Configuration
 
-## Summary
+## Overview
 
-The Freenet transport layer now supports configurable bandwidth limits through the `bandwidth_limit` parameter in `create_connection_handler()`.
+The Freenet transport layer supports two bandwidth configuration modes:
 
-## Key Findings
+1. **Per-connection mode** (default): Each connection gets an independent bandwidth limit
+2. **Global pool mode**: Total bandwidth is shared fairly across all connections
 
-### Bottleneck Analysis
+## Quick Start
 
-After implementing LEDBAT slow start with IW26 and cwnd enforcement, we discovered that the **token bucket rate limiter** was the actual throughput ceiling, not LEDBAT's congestion window.
+### Per-Connection Mode (Default)
 
-| Component | Configuration | Theoretical Max |
-|-----------|---------------|-----------------|
-| LEDBAT cwnd | 1 GB max | ~10 GB/s @ 100ms RTT |
-| Token Bucket | 10 MB/s default | **10 MB/s** (bottleneck) |
+```bash
+# Each connection can use up to 10 MB/s (default)
+freenet
 
-At 10ms RTT with high bandwidth:
-- **LEDBAT alone** could theoretically support ~100 GB/s (1GB cwnd / 10ms RTT)
-- **Token bucket** limits actual throughput to 10 MB/s
-
-### Configuration Interface
-
-```rust
-// In connection_handler.rs
-pub(crate) async fn create_connection_handler<S: Socket>(
-    socket: Arc<S>,
-    keypair: TransportKeypair,
-    listen_host: IpAddr,
-    listen_port: u16,
-    is_gateway: bool,
-    bandwidth_limit: Option<usize>,  // ← Controls token bucket rate (bytes/sec)
-) -> Result<(OutboundConnectionHandler, InboundConnectionHandler), TransportError>
+# Custom per-connection limit
+freenet --bandwidth-limit 5000000  # 5 MB/s per connection
 ```
 
-**Default behavior:**
-- `None` → 10 MB/s (10,000,000 bytes/sec)
-- `Some(100_000_000)` → 100 MB/s
+### Global Pool Mode (Recommended for bandwidth-constrained environments)
 
-### New Test Infrastructure
-
-Added `create_mock_peer_with_bandwidth()` for testing:
-
-```rust
-// In mock_transport module
-pub async fn create_mock_peer_with_bandwidth(
-    packet_drop_policy: PacketDropPolicy,
-    packet_delay_policy: PacketDelayPolicy,
-    channels: Channels,
-    bandwidth_limit: Option<usize>,
-) -> anyhow::Result<(TransportPublicKey, OutboundConnectionHandler, SocketAddr)>
+```bash
+# Share 50 MB/s total across all connections
+freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 ```
 
-### Benchmark Added
+## Configuration Options
 
-New benchmark in `transport_perf.rs`:
+### CLI Arguments
 
-```rust
-slow_start_validation::bench_high_bandwidth_throughput
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit | 10,000,000 (10 MB/s) |
+| `--total-bandwidth-limit <bytes/sec>` | Total bandwidth across ALL connections | None (disabled) |
+| `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection rate (prevents starvation) | 1,000,000 (1 MB/s) |
+
+### Config File (TOML)
+
+```toml
+[network-api]
+# Per-connection mode (traditional)
+bandwidth-limit = 10000000  # 10 MB/s per connection
+
+# OR Global pool mode (recommended)
+total-bandwidth-limit = 50000000           # 50 MB/s total
+min-bandwidth-per-connection = 1000000     # 1 MB/s minimum
 ```
 
-This tests 1MB transfers with:
-- 100 MB/s bandwidth limit (10x default)
-- 10ms RTT
-- IW26 slow start
-- Full cwnd enforcement
+**Note**: If `total-bandwidth-limit` is set, it overrides `bandwidth-limit`.
 
-**Expected results:**
-- With 10 MB/s limit: ~10 MB/s throughput (bottlenecked by token bucket)
-- With 100 MB/s limit: >10 MB/s throughput (now cwnd-gated, should see improvement)
+## Global Pool Mode Details
 
-## Implications for >3 MB/s Goal
+When `total-bandwidth-limit` is configured, bandwidth is distributed using this formula:
 
-### Current State
+```
+per_connection_rate = max(total_limit / active_connections, min_per_connection)
+```
 
-With the default 10 MB/s token bucket:
-- ✅ Per-stream throughput can reach **up to 10 MB/s** (well above 3 MB/s target)
-- ✅ LEDBAT slow start + IW26 helps reach this limit faster
-- ✅ cwnd enforcement ensures "good network citizen" behavior
-- ✅ Multiple connections share bandwidth fairly through per-connection token buckets
+### Example: 1 Gbps Connection
 
-### High-Bandwidth Scenarios
+For a user with 1 Gbps (125 MB/s) wanting Freenet to use 80% of available bandwidth:
 
-For users on gigabit+ connections:
-1. **Configuration is available** - `bandwidth_limit` parameter exists
-2. **Needs exposure** - Currently only accessible at connection handler creation
-3. **Testing required** - Benchmarks should verify >10 MB/s achievable
+```toml
+[network-api]
+total-bandwidth-limit = 100000000          # 100 MB/s total
+min-bandwidth-per-connection = 2000000     # 2 MB/s minimum
+```
 
-### Fairness Between Connections
+| Active Connections | Per-Connection Rate | Total Usage |
+|-------------------|---------------------|-------------|
+| 1 | 100 MB/s | 100 MB/s |
+| 5 | 20 MB/s | 100 MB/s |
+| 10 | 10 MB/s | 100 MB/s |
+| 25 | 4 MB/s | 100 MB/s |
+| 50 | 2 MB/s (min enforced) | 100 MB/s |
+| 100 | 2 MB/s (min enforced) | 200 MB/s* |
 
-The current design provides fairness:
-- Each connection has its own token bucket (initialized from `bandwidth_limit`)
-- Each connection has its own LEDBAT controller
-- Connections compete for actual network resources naturally
-- LEDBAT's delay-based signaling helps connections yield to foreground traffic
+*When `min × connections > total`, the minimum is honored to prevent connection starvation.
 
-## Next Steps
+### Example: Home DSL Connection
 
-1. **Expose bandwidth_limit** in higher-level APIs (e.g., node configuration)
-2. **Run high-bandwidth benchmarks** to verify >10 MB/s achievable
-3. **Document configuration** for users who need custom bandwidth limits
-4. **Consider adaptive limits** - could auto-detect available bandwidth
+For a user with 50 Mbps (6.25 MB/s) upload wanting conservative bandwidth usage:
 
-## Files Modified
+```toml
+[network-api]
+total-bandwidth-limit = 3000000            # 3 MB/s total (~50% of upload)
+min-bandwidth-per-connection = 500000      # 500 KB/s minimum
+```
 
-### Core Implementation
-- `crates/core/src/transport/connection_handler.rs`
-  - Added `new_test_with_bandwidth()` (line 244-253)
-  - Updated `create_mock_peer_internal()` to accept bandwidth_limit (line 1818-1859)
-  - Added `create_mock_peer_with_bandwidth()` (line 1790-1799)
+## How It Integrates with LEDBAT
 
-- `crates/core/src/transport/peer_connection/outbound_stream.rs`
-  - Lines 62-97: cwnd enforcement with exponential backoff
-  - Lines 107-117: Token bucket rate limiting
+The global bandwidth pool works alongside LEDBAT congestion control:
 
-- `crates/core/src/transport/ledbat.rs`
-  - Lines 70-84: IW26 configuration (38KB initial window)
+```
+final_rate = min(ledbat_rate, global_pool_rate)
+```
 
-### Benchmarks
-- `crates/core/benches/transport_perf.rs`
-  - Lines 1786-1858: `bench_high_bandwidth_throughput()`
-  - Line 1976: Added to `slow_start` criterion_group
+- **LEDBAT** measures network conditions and adjusts rate to avoid congestion
+- **Global pool** enforces your bandwidth budget across all connections
+- The **minimum** of both rates is used
+
+This means:
+- If the network is congested, LEDBAT will reduce the rate below the global limit
+- If the network is clear, the global limit caps bandwidth to your configured total
+- LEDBAT's delay-based feedback is never confused by artificial throttling
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    PeerConnection                           │
+│                                                             │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │    LEDBAT    │    │   Global     │    │  TokenBucket │  │
+│  │  Controller  │    │  Bandwidth   │    │   (Pacer)    │  │
+│  │              │    │   Manager    │    │              │  │
+│  │ Measures RTT │    │ Counts conns │    │ Paces packets│  │
+│  │ & queuing    │    │ Divides fair │    │ at final     │  │
+│  │ delay        │    │ share        │    │ rate         │  │
+│  └──────┬───────┘    └──────┬───────┘    └──────▲───────┘  │
+│         │                   │                   │          │
+│         │   ledbat_rate     │   global_rate     │          │
+│         └─────────┬─────────┘                   │          │
+│                   │                             │          │
+│                   ▼                             │          │
+│            ┌──────────────┐                     │          │
+│            │  min(a, b)   │─────────────────────┘          │
+│            └──────────────┘     final_rate                 │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Implementation Details
+
+### Token Bucket
+
+The transport uses a token bucket for smooth packet pacing:
+
+| Parameter | Value |
+|-----------|-------|
+| Bucket capacity | 10 KB burst |
+| Rate | Dynamically adjusted (LEDBAT + global pool) |
+| Update frequency | RTT-adaptive (50-500ms) |
+
+### Rate Update Timing
+
+Rates are recalculated on an RTT-adaptive schedule:
+
+| RTT Range | Update Interval |
+|-----------|-----------------|
+| < 10ms | ~50ms |
+| 10-100ms | ~100-200ms |
+| > 100ms | ~500ms |
+
+### Connection Lifecycle
+
+1. **Connection established**: `GlobalBandwidthManager::register_connection()` called
+2. **During transfer**: Rate updated periodically via `current_per_connection_rate()`
+3. **Connection closed**: `RemoteConnection::drop()` calls `unregister_connection()`
+
+## Backward Compatibility
+
+The default behavior (no `total-bandwidth-limit`) is unchanged:
+- Each connection gets an independent 10 MB/s limit
+- N connections can use up to N × 10 MB/s total
+
+## Recommendations
+
+### For Gateway Operators
+
+```toml
+[network-api]
+# Dedicate significant bandwidth to serving the network
+total-bandwidth-limit = 100000000          # 100 MB/s
+min-bandwidth-per-connection = 1000000     # 1 MB/s minimum
+```
+
+### For Regular Peers
+
+```toml
+[network-api]
+# Conservative settings for residential connections
+total-bandwidth-limit = 10000000           # 10 MB/s total
+min-bandwidth-per-connection = 500000      # 500 KB/s minimum
+```
+
+### For Testing/Development
+
+```toml
+[network-api]
+# Higher limits for local testing
+bandwidth-limit = 100000000                # 100 MB/s per connection
+# OR
+total-bandwidth-limit = 500000000          # 500 MB/s total
+```
+
+## Troubleshooting
+
+### Slow transfers despite high bandwidth limit
+
+1. Check LEDBAT is not detecting congestion (high queuing delay)
+2. Verify the receiving peer has sufficient bandwidth
+3. Check if too many connections are sharing the global pool
+
+### Connections getting starved
+
+Increase `min-bandwidth-per-connection`:
+```bash
+freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 2000000
+```
+
+### Total bandwidth exceeding limit
+
+This happens when `min × connections > total`. Either:
+- Reduce `min-bandwidth-per-connection`
+- Increase `total-bandwidth-limit`
+- Accept the overage (connections won't starve)
+
+## Source Code
+
+- **GlobalBandwidthManager**: `crates/core/src/transport/global_bandwidth.rs`
+- **TokenBucket**: `crates/core/src/transport/token_bucket.rs`
+- **LEDBAT**: `crates/core/src/transport/ledbat.rs`
+- **Configuration**: `crates/core/src/config/mod.rs`
 
 ## References
 
-- Phase 1 optimization: IW26 + cwnd enforcement (outbound_stream.rs)
-- Token bucket implementation: connection_handler.rs:959-963
-- LEDBAT configuration: ledbat.rs:70-84
+- [Global Bandwidth Pool Design](../future/global-bandwidth-pool.md)
+- [LEDBAT Slow Start Design](../design/ledbat-slow-start.md)
+- [RFC 6817: LEDBAT](https://tools.ietf.org/html/rfc6817)

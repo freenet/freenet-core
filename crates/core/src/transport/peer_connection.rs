@@ -21,6 +21,7 @@ mod outbound_stream;
 
 use super::{
     connection_handler::SerializedMessage,
+    global_bandwidth::GlobalBandwidthManager,
     ledbat::LedbatController,
     packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
@@ -75,6 +76,23 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket> {
     pub(super) token_bucket: Arc<TokenBucket>,
     /// Socket for direct packet sending (bypasses centralized rate limiter)
     pub(super) socket: Arc<S>,
+    /// Global bandwidth manager for fair sharing across connections.
+    /// When Some, the token_bucket rate is periodically updated based on connection count.
+    pub(super) global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+}
+
+impl<S> Drop for RemoteConnection<S> {
+    fn drop(&mut self) {
+        // Unregister from global bandwidth manager so other connections can use the freed bandwidth
+        if let Some(ref global) = self.global_bandwidth {
+            global.unregister_connection();
+            tracing::debug!(
+                peer_addr = %self.remote_addr,
+                remaining_connections = global.connection_count(),
+                "Unregistered connection from global bandwidth pool"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -692,9 +710,20 @@ impl<S: super::Socket> PeerConnection<S> {
                     };
 
                     if should_update {
-                        let new_rate = self.remote_conn.ledbat.current_rate(rtt);
+                        let ledbat_rate = self.remote_conn.ledbat.current_rate(rtt);
                         let cwnd = self.remote_conn.ledbat.current_cwnd();
                         let queuing_delay = self.remote_conn.ledbat.queuing_delay();
+
+                        // Apply global bandwidth limit if configured
+                        // Take minimum of LEDBAT rate and global fair-share rate
+                        let (new_rate, global_limit) = if let Some(ref global) =
+                            self.remote_conn.global_bandwidth
+                        {
+                            let global_rate = global.current_per_connection_rate();
+                            (ledbat_rate.min(global_rate), Some(global_rate))
+                        } else {
+                            (ledbat_rate, None)
+                        };
 
                         // Calculate time since last update for debugging RTT-adaptive timing
                         let since_last_update_ms = self.last_rate_update
@@ -709,6 +738,8 @@ impl<S: super::Socket> PeerConnection<S> {
                             // Rate control
                             new_rate_bytes_per_sec = new_rate,
                             new_rate_mbps = (new_rate as f64) / 1_000_000.0,
+                            ledbat_rate_mbps = (ledbat_rate as f64) / 1_000_000.0,
+                            global_limit_mbps = global_limit.map(|r| (r as f64) / 1_000_000.0),
                             // LEDBAT state
                             cwnd_bytes = cwnd,
                             cwnd_packets = cwnd / MAX_DATA_SIZE,

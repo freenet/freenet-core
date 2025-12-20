@@ -26,6 +26,7 @@ pub mod peer_connection;
 // todo: optimize trackers
 mod received_packet_tracker;
 
+pub mod global_bandwidth;
 pub(crate) mod ledbat;
 mod sent_packet_tracker;
 mod symmetric_message;

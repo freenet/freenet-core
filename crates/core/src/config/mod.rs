@@ -99,6 +99,8 @@ impl Default for ConfigArgs {
                 gateways: None,
                 location: None,
                 bandwidth_limit: Some(3_000_000), // 3 MB/s default for streaming transfers only
+                total_bandwidth_limit: None,
+                min_bandwidth_per_connection: None,
                 blocked_addresses: None,
                 transient_budget: Some(DEFAULT_TRANSIENT_BUDGET),
                 transient_ttl_secs: Some(DEFAULT_TRANSIENT_TTL_SECS),
@@ -419,6 +421,8 @@ impl ConfigArgs {
                 public_port: self.network_api.public_port,
                 ignore_protocol_version: self.network_api.ignore_protocol_checking,
                 bandwidth_limit: self.network_api.bandwidth_limit,
+                total_bandwidth_limit: self.network_api.total_bandwidth_limit,
+                min_bandwidth_per_connection: self.network_api.min_bandwidth_per_connection,
                 blocked_addresses: self
                     .network_api
                     .blocked_addresses
@@ -617,6 +621,26 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
+    /// Total bandwidth limit across ALL connections (in bytes per second).
+    /// When set, individual connection rates are computed as: total / active_connections.
+    /// This overrides the per-connection bandwidth_limit.
+    #[arg(long)]
+    #[serde(
+        rename = "total-bandwidth-limit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub total_bandwidth_limit: Option<usize>,
+
+    /// Minimum bandwidth per connection when using total_bandwidth_limit (bytes/sec).
+    /// Prevents connection starvation when many connections are active.
+    /// Default: 1 MB/s (1,000,000 bytes/second)
+    #[arg(long)]
+    #[serde(
+        rename = "min-bandwidth-per-connection",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_bandwidth_per_connection: Option<usize>,
+
     /// List of IP:port addresses to refuse connections to/from.
     #[arg(long, num_args = 0..)]
     pub blocked_addresses: Option<Vec<SocketAddr>>,
@@ -707,7 +731,28 @@ pub struct NetworkApiConfig {
     /// NOTE: This applies to each connection independently - N connections may use N * bandwidth_limit total.
     /// Each connection uses LEDBAT congestion control to yield to foreground traffic.
     /// Default: 10 MB/s (10,000,000 bytes/second)
+    ///
+    /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
+    /// are derived from: `total_bandwidth_limit / active_connections`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<usize>,
+
+    /// Total bandwidth limit across ALL connections (in bytes per second).
+    /// When set, individual connection rates are computed as: `total / active_connections`.
+    /// This overrides the per-connection `bandwidth_limit`.
+    ///
+    /// Example: With 50 MB/s total and 5 connections, each gets 10 MB/s.
+    /// Default: None (use per-connection `bandwidth_limit` instead)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bandwidth_limit: Option<usize>,
+
+    /// Minimum bandwidth per connection when using `total_bandwidth_limit` (bytes/sec).
+    /// Prevents connection starvation when many connections are active.
+    ///
+    /// If `total / N < min`, each connection gets `min` (exceeding total is possible).
+    /// Default: 1 MB/s (1,000,000 bytes/second)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_bandwidth_per_connection: Option<usize>,
 
     /// List of IP:port addresses to refuse connections to/from.
     #[serde(skip_serializing_if = "Option::is_none")]

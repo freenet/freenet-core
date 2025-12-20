@@ -28,8 +28,8 @@ use crate::node::network_bridge::priority_select;
 use crate::node::MessageProcessor;
 use crate::ring::Location;
 use crate::transport::{
-    create_connection_handler, OutboundConnectionHandler, PeerConnection, TransportError,
-    TransportKeypair, TransportPublicKey,
+    create_connection_handler, global_bandwidth::GlobalBandwidthManager, OutboundConnectionHandler,
+    PeerConnection, TransportError, TransportKeypair, TransportPublicKey,
 };
 use crate::{
     client_events::ClientId,
@@ -222,6 +222,8 @@ pub(in crate::node) struct P2pConnManager {
     this_location: Option<Location>,
     check_version: bool,
     bandwidth_limit: Option<usize>,
+    /// Global bandwidth manager for fair sharing across all connections.
+    global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// MessageProcessor for clean client handling separation
     message_processor: Arc<MessageProcessor>,
@@ -289,6 +291,16 @@ impl P2pConnManager {
             this_location: config.location,
             check_version: !config.config.network_api.ignore_protocol_version,
             bandwidth_limit: config.config.network_api.bandwidth_limit,
+            global_bandwidth: config
+                .config
+                .network_api
+                .total_bandwidth_limit
+                .map(|total| {
+                    Arc::new(GlobalBandwidthManager::new(
+                        total,
+                        config.config.network_api.min_bandwidth_per_connection,
+                    ))
+                }),
             blocked_addresses: config.blocked_addresses.clone(),
             message_processor,
         })
@@ -320,6 +332,7 @@ impl P2pConnManager {
             this_location,
             check_version,
             bandwidth_limit,
+            global_bandwidth,
             blocked_addresses,
             message_processor,
         } = self;
@@ -330,6 +343,7 @@ impl P2pConnManager {
             listening_port,
             is_gateway,
             bandwidth_limit,
+            global_bandwidth,
         )
         .await?;
 
@@ -395,6 +409,7 @@ impl P2pConnManager {
             this_location,
             check_version,
             bandwidth_limit,
+            global_bandwidth: None, // Already used for connection handler, not needed in ctx
             blocked_addresses,
             message_processor,
         };

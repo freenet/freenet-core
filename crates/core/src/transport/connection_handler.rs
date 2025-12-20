@@ -30,6 +30,7 @@ use version_cmp::PROTOC_VERSION;
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
+    global_bandwidth::GlobalBandwidthManager,
     ledbat::LedbatController,
     packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
     peer_connection::{PeerConnection, RemoteConnection},
@@ -80,6 +81,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
     listen_port: u16,
     is_gateway: bool,
     bandwidth_limit: Option<usize>,
+    global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
 ) -> Result<(OutboundConnectionHandler<S>, InboundConnectionHandler<S>), TransportError> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
@@ -104,6 +106,7 @@ pub(crate) async fn create_connection_handler<S: Socket>(
         is_gateway,
         (listen_host, listen_port).into(),
         bandwidth_limit,
+        global_bandwidth,
     )?;
     Ok((
         och,
@@ -183,6 +186,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         is_gateway: bool,
         socket_addr: SocketAddr,
         bandwidth_limit: Option<usize>,
+        global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
@@ -199,6 +203,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             dropped_packets: HashMap::new(),
             last_drop_warning: Instant::now(),
             bandwidth_limit,
+            global_bandwidth,
             expected_non_gateway: expected_non_gateway.clone(),
             last_rsa_attempt: HashMap::new(),
         };
@@ -228,7 +233,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        Self::config_listener(socket, keypair, is_gateway, socket_addr, None)
+        Self::config_listener(socket, keypair, is_gateway, socket_addr, None, None)
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -239,7 +244,14 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         is_gateway: bool,
         bandwidth_limit: Option<usize>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        Self::config_listener(socket, keypair, is_gateway, socket_addr, bandwidth_limit)
+        Self::config_listener(
+            socket,
+            keypair,
+            is_gateway,
+            socket_addr,
+            bandwidth_limit,
+            None,
+        )
     }
 
     pub async fn connect(
@@ -303,6 +315,9 @@ struct UdpPacketsListener<S = UdpSocket> {
     dropped_packets: HashMap<SocketAddr, u64>,
     last_drop_warning: Instant,
     bandwidth_limit: Option<usize>,
+    /// Global bandwidth manager for fair sharing across all connections.
+    /// When set, per-connection rates are derived from total_limit / active_connections.
+    global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
     /// Rate limiting for RSA decryption attempts to prevent DoS (issue #2277).
     last_rsa_attempt: HashMap<SocketAddr, Instant>,
@@ -851,6 +866,7 @@ impl<S: Socket> UdpPacketsListener<S> {
     ) {
         let secret = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
+        let global_bandwidth = self.global_bandwidth.clone();
         let socket = self.socket_listener.clone();
 
         let (inbound_from_remote, next_inbound) =
@@ -949,7 +965,12 @@ impl<S: Socket> UdpPacketsListener<S> {
             ));
 
             // Initialize token bucket for smooth packet pacing
-            let initial_rate = bandwidth_limit.unwrap_or(10_000_000); // 10 MB/s default
+            // Use global bandwidth manager if configured, otherwise fall back to per-connection limit
+            let initial_rate = if let Some(ref global) = global_bandwidth {
+                global.register_connection()
+            } else {
+                bandwidth_limit.unwrap_or(10_000_000) // 10 MB/s default
+            };
             let token_bucket = Arc::new(TokenBucket::new(
                 10_000, // capacity = 10 KB burst
                 initial_rate,
@@ -964,6 +985,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                 inbound_packet_recv: inbound_packet_rx,
                 inbound_symmetric_key: inbound_key,
                 inbound_symmetric_key_bytes: inbound_key_bytes,
+                global_bandwidth: global_bandwidth.clone(),
                 my_address: None,
                 transport_secret_key: secret,
                 ledbat,
@@ -1055,6 +1077,7 @@ impl<S: Socket> UdpPacketsListener<S> {
 
         let transport_secret_key = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
+        let global_bandwidth = self.global_bandwidth.clone();
         let socket = self.socket_listener.clone();
         let (inbound_from_remote, next_inbound) =
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
@@ -1211,8 +1234,13 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 ));
 
                                             // Initialize token bucket
+                                            // Use global bandwidth manager if configured
                                             let initial_rate =
-                                                bandwidth_limit.unwrap_or(10_000_000);
+                                                if let Some(ref global) = global_bandwidth {
+                                                    global.register_connection()
+                                                } else {
+                                                    bandwidth_limit.unwrap_or(10_000_000)
+                                                };
                                             let token_bucket = Arc::new(TokenBucket::new(
                                                 10_000, // capacity = 10 KB burst
                                                 initial_rate,
@@ -1242,6 +1270,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     ledbat,
                                                     token_bucket,
                                                     socket: socket.clone(),
+                                                    global_bandwidth: global_bandwidth.clone(),
                                                 },
                                                 InboundRemoteConnection {
                                                     inbound_packet_sender: inbound_sender,
@@ -1309,7 +1338,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 ));
 
                                 // Initialize token bucket
-                                let initial_rate = bandwidth_limit.unwrap_or(10_000_000);
+                                // Use global bandwidth manager if configured
+                                let initial_rate = if let Some(ref global) = global_bandwidth {
+                                    global.register_connection()
+                                } else {
+                                    bandwidth_limit.unwrap_or(10_000_000)
+                                };
                                 let token_bucket = Arc::new(TokenBucket::new(
                                     10_000, // capacity = 10 KB burst
                                     initial_rate,
@@ -1338,6 +1372,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         ledbat,
                                         token_bucket,
                                         socket: socket.clone(),
+                                        global_bandwidth: global_bandwidth.clone(),
                                     },
                                     InboundRemoteConnection {
                                         inbound_packet_sender: inbound_sender,
