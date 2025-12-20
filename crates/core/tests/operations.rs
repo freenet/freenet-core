@@ -3322,7 +3322,7 @@ async fn test_put_then_immediate_subscribe_succeeds_locally_regression_2326(
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
     timeout_secs = 180,
-    startup_wait_secs = 20,
+    startup_wait_secs = 10,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3593,7 +3593,7 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
     timeout_secs = 180,
-    startup_wait_secs = 20,
+    startup_wait_secs = 10,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
@@ -3859,7 +3859,7 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
     timeout_secs = 180,
-    startup_wait_secs = 20,
+    startup_wait_secs = 10,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
