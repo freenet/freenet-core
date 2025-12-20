@@ -2372,7 +2372,7 @@ pub mod mock_transport {
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
             let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_b_conn).await??;
-            let msg = conn.recv().await?;
+            let msg = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await??;
             assert!(msg.len() <= MAX_DATA_SIZE);
             Ok::<_, anyhow::Error>(())
         });

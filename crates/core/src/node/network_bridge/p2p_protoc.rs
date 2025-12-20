@@ -1194,8 +1194,11 @@ impl P2pConnManager {
 
                                 // Collect system metrics
                                 if config.include_system_metrics {
+                                    // Use the actual seeding cache count, not the subscriber count.
+                                    // The seeding cache tracks contracts this node is actively caching,
+                                    // while subscribers tracks remote peers subscribed to updates.
                                     let seeding_contracts =
-                                        op_manager.ring.all_network_subscriptions().len() as u32;
+                                        op_manager.ring.seeding_contracts_count() as u32;
                                     response.system_metrics = Some(SystemMetrics {
                                         active_connections: connected_peer_ids.len() as u32,
                                         seeding_contracts,
