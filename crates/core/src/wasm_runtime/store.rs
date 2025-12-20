@@ -71,9 +71,11 @@ impl<S: StoreFsManagement> SafeWriter<S> {
         Ok(current_offset - traversed as u64)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    /// Sync the underlying file to ensure data is persisted to disk
+    fn sync(&mut self) -> std::io::Result<()> {
         self.check_lock();
-        self.file.flush()
+        self.file.flush()?;
+        self.file.get_ref().sync_all()
     }
 }
 
@@ -181,6 +183,7 @@ pub(super) trait StoreFsManagement: Sized {
     }
 
     /// Insert in index file and returns the offset at which this record resides.
+    /// The write is synced to disk to ensure durability.
     fn insert(
         file: &mut SafeWriter<Self>,
         key: Self::Key,
@@ -192,6 +195,11 @@ pub(super) trait StoreFsManagement: Sized {
         // The full key is the tombstone marker byte + kind + [internal key content]  + size of value
         let internal_key: StoreKey = key.into();
         let offset = file.insert_record(internal_key, value.as_ref())?;
+        // Sync to disk to ensure the index is persisted before we return.
+        // This is critical for durability - without it, the WASM file might be
+        // persisted (via sync_all in store_contract) but the index entry might
+        // be lost if the system crashes or the OS buffer isn't flushed.
+        file.sync()?;
         Ok(offset)
     }
 
@@ -372,8 +380,11 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
         return Ok(());
     }
 
-    // Clean up and finalize the compaction process
-    if let Err(e) = temp_writer.flush() {
+    // Clean up and finalize the compaction process.
+    // Use sync() instead of flush() to ensure durability before renaming.
+    // This is critical: if we only flush and the system crashes after rename
+    // but before the OS writes the buffer to disk, we could lose index data.
+    if let Err(e) = temp_writer.sync() {
         if let Err(e) = fs::remove_file(&lock_file_path) {
             error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
         }
