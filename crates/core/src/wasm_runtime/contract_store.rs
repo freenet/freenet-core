@@ -128,6 +128,21 @@ impl ContractStore {
         let key_path = code_hash.encode();
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
         if let Ok((code, _ver)) = ContractCode::load_versioned_from_path(&key_path) {
+            // WASM file exists on disk. Add to cache AND ensure the index is updated.
+            // This is critical: if the index doesn't have this entry (e.g., after a
+            // crash where WASM was synced but index wasn't), we must add it now.
+            // Otherwise, when TinyLFU evicts this contract, fetch_contract() will
+            // fail because the index lookup returns None.
+            // See issue #2344.
+            if !self.key_to_code_part.contains_key(key.id()) {
+                let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
+                self.key_to_code_part
+                    .insert(*key.id(), (offset, *code_hash));
+                tracing::debug!(
+                    contract = %key,
+                    "Added missing index entry for existing WASM file"
+                );
+            }
             let size = code.data().len() as i64;
             self.contract_cache.insert(*code_hash, Arc::new(code), size);
             return Ok(());
@@ -271,6 +286,116 @@ mod test {
         assert_eq!(
             fetch_failures, 0,
             "Contracts should be fetchable immediately after store"
+        );
+
+        Ok(())
+    }
+
+    /// Test for issue #2344: Contract store index must be persisted to disk.
+    /// This test simulates a node restart by creating a new ContractStore from
+    /// the same directory, then verifies contracts are still fetchable.
+    #[test]
+    fn test_index_persistence_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1, 2, 3, 4, 5])),
+            [10, 20].as_ref().into(),
+        );
+        let key = *contract.key();
+        let params: Parameters = [10, 20].as_ref().into();
+
+        // Store the contract
+        {
+            let mut store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+            let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract));
+            store.store_contract(container)?;
+
+            // Verify it's fetchable in the same instance
+            assert!(
+                store.fetch_contract(&key, &params).is_some(),
+                "Contract should be fetchable immediately after store"
+            );
+        }
+        // ContractStore dropped here - simulates process exit
+
+        // Create a NEW ContractStore from the same directory - simulates node restart
+        {
+            let store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+
+            // The contract should be fetchable because both:
+            // 1. The WASM file was persisted to disk
+            // 2. The index (KEY_DATA) was persisted to disk
+            // Issue #2344: Before the fix, the index wasn't synced, so the contract
+            // would not be found after restart.
+            let fetched = store.fetch_contract(&key, &params);
+            assert!(
+                fetched.is_some(),
+                "Contract should be fetchable after simulated restart - index must be persisted"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Test for issue #2344: When WASM file exists but index entry is missing
+    /// (e.g., after a crash), store_contract should add the missing index entry.
+    #[test]
+    fn test_wasm_exists_but_index_missing() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![7, 8, 9])),
+            [30, 40].as_ref().into(),
+        );
+        let key = *contract.key();
+        let code_hash = key.code_hash().unwrap();
+        let params: Parameters = [30, 40].as_ref().into();
+
+        // Manually create the WASM file on disk (simulating a crash scenario
+        // where WASM was synced but index wasn't)
+        let wasm_path = contract_dir
+            .path()
+            .join(code_hash.encode())
+            .with_extension("wasm");
+        {
+            let code_bytes = contract
+                .code()
+                .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+                .unwrap();
+            let mut file = std::fs::File::create(&wasm_path)?;
+            file.write_all(&code_bytes)?;
+            file.sync_all()?;
+        }
+
+        // Create a ContractStore - the KEY_DATA file will be empty (no index entries)
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+
+        // The contract is NOT fetchable yet because the index doesn't have the entry
+        // and it's not in cache
+        assert!(
+            store.fetch_contract(&key, &params).is_none(),
+            "Contract should NOT be fetchable when WASM exists but index entry is missing"
+        );
+
+        // Now call store_contract - this should detect the WASM file exists,
+        // add the missing index entry, and add to cache
+        let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract));
+        store.store_contract(container)?;
+
+        // Drop the store and create a new one to verify the index was persisted
+        drop(store);
+        let store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+
+        // Now the contract should be fetchable because the fix adds the index entry
+        let fetched = store.fetch_contract(&key, &params);
+        assert!(
+            fetched.is_some(),
+            "Contract should be fetchable after store_contract adds missing index entry"
         );
 
         Ok(())

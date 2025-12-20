@@ -75,6 +75,13 @@ impl<S: StoreFsManagement> SafeWriter<S> {
         self.check_lock();
         self.file.flush()
     }
+
+    /// Sync the underlying file to ensure data is persisted to disk
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.check_lock();
+        self.file.flush()?;
+        self.file.get_ref().sync_all()
+    }
 }
 
 impl<S> SafeWriter<S> {
@@ -181,6 +188,7 @@ pub(super) trait StoreFsManagement: Sized {
     }
 
     /// Insert in index file and returns the offset at which this record resides.
+    /// The write is synced to disk to ensure durability.
     fn insert(
         file: &mut SafeWriter<Self>,
         key: Self::Key,
@@ -192,6 +200,11 @@ pub(super) trait StoreFsManagement: Sized {
         // The full key is the tombstone marker byte + kind + [internal key content]  + size of value
         let internal_key: StoreKey = key.into();
         let offset = file.insert_record(internal_key, value.as_ref())?;
+        // Sync to disk to ensure the index is persisted before we return.
+        // This is critical for durability - without it, the WASM file might be
+        // persisted (via sync_all in store_contract) but the index entry might
+        // be lost if the system crashes or the OS buffer isn't flushed.
+        file.sync()?;
         Ok(offset)
     }
 
