@@ -380,6 +380,12 @@ impl Ring {
         self.seeding_manager.all_subscriptions()
     }
 
+    /// Get the number of contracts in the seeding cache.
+    /// This is the actual count of contracts this node is caching/seeding.
+    pub fn seeding_contracts_count(&self) -> usize {
+        self.seeding_manager.seeding_contracts_count()
+    }
+
     pub async fn prune_connection(&self, peer: PeerId) {
         tracing::debug!(peer = %peer, "Removing connection");
         self.live_tx_tracker.prune_transactions_from_peer(peer.addr);

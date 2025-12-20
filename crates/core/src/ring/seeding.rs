@@ -268,6 +268,12 @@ impl SeedingManager {
             .map(|entry| (*entry.key(), entry.value().clone()))
             .collect()
     }
+
+    /// Get the number of contracts in the seeding cache.
+    /// This is the actual count of contracts this node is caching/seeding.
+    pub fn seeding_contracts_count(&self) -> usize {
+        self.seeding_cache.read().len()
+    }
 }
 
 #[cfg(test)]
@@ -767,5 +773,34 @@ mod tests {
                 .any(|p| p.socket_addr() == Some(peer1.addr)),
             "sender (peer1) should NOT be in broadcast targets"
         );
+    }
+
+    #[test]
+    fn test_seeding_contracts_count() {
+        use super::super::seeding_cache::AccessType;
+
+        let seeding_manager = SeedingManager::new();
+
+        // Initially no contracts are seeded
+        assert_eq!(seeding_manager.seeding_contracts_count(), 0);
+
+        // Add first contract
+        let key1 = make_contract_key(1);
+        seeding_manager.record_contract_access(key1, 1000, AccessType::Put);
+        assert_eq!(seeding_manager.seeding_contracts_count(), 1);
+
+        // Add second contract
+        let key2 = make_contract_key(2);
+        seeding_manager.record_contract_access(key2, 1000, AccessType::Put);
+        assert_eq!(seeding_manager.seeding_contracts_count(), 2);
+
+        // Add third contract
+        let key3 = make_contract_key(3);
+        seeding_manager.record_contract_access(key3, 1000, AccessType::Get);
+        assert_eq!(seeding_manager.seeding_contracts_count(), 3);
+
+        // Re-accessing a contract doesn't increase count
+        seeding_manager.record_contract_access(key1, 1000, AccessType::Get);
+        assert_eq!(seeding_manager.seeding_contracts_count(), 3);
     }
 }
