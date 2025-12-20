@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::vec;
 
 use aes_gcm::Aes128Gcm;
@@ -16,6 +17,11 @@ use crate::{
 };
 
 use super::StreamId;
+
+/// Maximum time to wait for cwnd space before logging a warning.
+/// If this timeout is reached, it likely indicates ACKs aren't being processed
+/// (e.g., the caller isn't calling recv() on this connection).
+const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) type SerializedStream = Vec<u8>;
 
@@ -62,6 +68,7 @@ pub(super) async fn send_stream<S: super::super::Socket>(
         // This enforces the congestion window calculated by LEDBAT's slow start
         // and congestion avoidance algorithms
         let mut cwnd_wait_iterations = 0;
+        let cwnd_wait_start = Instant::now();
         loop {
             let flightsize = ledbat.flightsize();
             let cwnd = ledbat.current_cwnd();
@@ -80,6 +87,26 @@ pub(super) async fn send_stream<S: super::super::Socket>(
                     packet_size,
                     "Waiting for cwnd space"
                 );
+            }
+
+            // Check for timeout - indicates ACKs aren't being processed
+            let elapsed = cwnd_wait_start.elapsed();
+            if elapsed > CWND_WAIT_TIMEOUT {
+                tracing::warn!(
+                    stream_id = %stream_id.0,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    packet_size,
+                    elapsed_secs = elapsed.as_secs_f64(),
+                    sent_packets = sent_so_far,
+                    total_packets,
+                    "CWND wait timeout - ACKs may not be getting processed. \
+                     This usually means recv() isn't being called on this connection. \
+                     Proceeding without cwnd enforcement to prevent hang."
+                );
+                // Break out of cwnd wait to prevent infinite hang
+                // The stream will continue sending, relying on token bucket rate limiting
+                break;
             }
 
             // Exponential backoff to balance responsiveness and CPU usage
