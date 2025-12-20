@@ -625,12 +625,20 @@ pub struct NetworkArgs {
     /// When set, individual connection rates are computed as: total / active_connections.
     /// This overrides the per-connection bandwidth_limit.
     #[arg(long)]
+    #[serde(
+        rename = "total-bandwidth-limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub total_bandwidth_limit: Option<usize>,
 
     /// Minimum bandwidth per connection when using total_bandwidth_limit (bytes/sec).
     /// Prevents connection starvation when many connections are active.
     /// Default: 1 MB/s (1,000,000 bytes/second)
     #[arg(long)]
+    #[serde(
+        rename = "min-bandwidth-per-connection",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub min_bandwidth_per_connection: Option<usize>,
 
     /// List of IP:port addresses to refuse connections to/from.
