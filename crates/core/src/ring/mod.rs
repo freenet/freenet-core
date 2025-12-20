@@ -391,6 +391,12 @@ impl Ring {
             .remove_client_from_all_subscriptions(client_id)
     }
 
+    /// Get the number of contracts in the seeding cache.
+    /// This is the actual count of contracts this node is caching/seeding.
+    pub fn seeding_contracts_count(&self) -> usize {
+        self.seeding_manager.seeding_contracts_count()
+    }
+
     // ==================== Connection Pruning ====================
 
     /// Prune a peer connection and return notifications needed for subscription tree pruning.

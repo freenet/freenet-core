@@ -1,7 +1,92 @@
-//! Implementation of the simplified two-message connect flow.
+//! # Connect Protocol
 //!
-//! The legacy multi-stage connect operation has been removed; this module now powers the node’s
-//! connection and maintenance paths end-to-end.
+//! This module implements the connect protocol for establishing peer connections in the Freenet
+//! network. Understanding this protocol is essential for working on topology and routing.
+//!
+//! ## Key Concepts
+//!
+//! - **Joiner**: The peer initiating the connection request
+//! - **Relay**: Any peer that receives and processes the request (first hop is often a gateway,
+//!   but can be any known peer)
+//! - **Acceptor**: A peer that agrees to connect with the joiner
+//!
+//! ## Critical Behavior: Accept Only at Terminus
+//!
+//! **Relays only ACCEPT when they can't forward to a closer peer** (terminus). This means:
+//!
+//! ```text
+//! Joiner sends ConnectRequest targeting location 0.3
+//!     |
+//!     v
+//! Gateway (loc=0.7) ──> FORWARDS toward 0.3 (not at terminus, doesn't accept)
+//!     |
+//!     v
+//! Relay A (loc=0.5) ──> FORWARDS toward 0.3 (not at terminus, doesn't accept)
+//!     |
+//!     v
+//! Relay B (loc=0.35) ──> FORWARDS toward 0.3 (not at terminus, doesn't accept)
+//!     |
+//!     v
+//! Relay C (loc=0.31) ──> ACCEPTS (at terminus - no closer peer to forward to)
+//! ```
+//!
+//! The joiner typically receives ONE ConnectResponse from the terminus peer. To get multiple
+//! connections, the joiner sends multiple ConnectRequests (potentially targeting different
+//! locations). This ensures connections are naturally local (short ring distance).
+//!
+//! ## Message Flow
+//!
+//! 1. **ConnectRequest**: Joiner → Relay₁ → Relay₂ → ... (routed toward `desired_location`)
+//! 2. **ConnectResponse**: Each acceptor → back through relay chain → Joiner
+//! 3. **ObservedAddress**: First relay → Joiner (tells joiner their external IP for NAT traversal)
+//!
+//! ## Address Discovery (NAT Traversal)
+//!
+//! The joiner typically doesn't know its external address (behind NAT). The protocol handles this:
+//!
+//! 1. Joiner creates ConnectRequest with `joiner.peer_addr = Unknown`
+//! 2. First relay observes joiner's address from UDP packet source
+//! 3. First relay fills in `joiner.peer_addr` and sends `ObservedAddress` back to joiner
+//! 4. Subsequent relays see the already-filled address
+//!
+//! ## Acceptance Criteria: Accept Only at Terminus
+//!
+//! Relays only accept connect requests when they're at the routing terminus - meaning they
+//! can't forward to a peer closer to the target location. This naturally creates local
+//! connections without arbitrary distance thresholds.
+//!
+//! **Algorithm:**
+//! 1. First, check if we can forward to a closer peer via `select_next_hop()`
+//! 2. If we CAN forward: forward only (don't accept)
+//! 3. If we CAN'T forward (terminus): accept if `should_accept()` allows
+//!
+//! `should_accept()` still uses capacity-based evaluation:
+//! - Below min_connections → **accept**
+//! - At max_connections → **reject**
+//! - Between min and max → use density-based evaluation
+//!
+//! **Why this works for small-world topology:**
+//! - Requests route toward the target location via greedy routing
+//! - Only peers that can't forward further (near the target) accept
+//! - Gateway and early relays forward without accepting
+//! - Result: connections are naturally local (short ring distance)
+//!
+//! ## Routing
+//!
+//! The request is routed toward `desired_location` using greedy routing:
+//! - Each relay forwards to its neighbor closest to `desired_location`
+//! - The `visited` list prevents routing loops
+//! - TTL decrements at each hop
+//!
+//! ## Why Target Location Matters
+//!
+//! If the joiner targets their own location, the request routes toward peers near them on the
+//! ring. With accept-only-at-terminus, only the peer closest to the target (who can't forward
+//! further) accepts. This naturally creates local connections.
+//!
+//! To build multiple connections, the joiner sends multiple ConnectRequests. Early in bootstrap
+//! (0-4 connections), peers target their own location to build local neighborhoods. Later,
+//! density-based targeting is used to optimize for request patterns.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -286,7 +371,72 @@ impl RelayState {
             }
         }
 
-        if !self.accepted_locally && ctx.should_accept(&self.request.joiner) {
+        // ACCEPT ONLY AT TERMINUS: Relays only accept when they can't forward to a closer peer.
+        // This naturally creates local connections because only peers near the target accept.
+        //
+        // Algorithm:
+        // 1. First, check if we can forward to a closer peer
+        // 2. If we can forward: forward only (don't accept)
+        // 3. If we can't forward (terminus): accept if should_accept() allows
+        //
+        // This prevents early relays (gateway, first hops) from accepting connections that
+        // would be non-local on the ring. Only peers that are actually close to the target
+        // (and thus can't forward further) will accept.
+
+        let can_forward = self.forwarded_to.is_none() && self.request.ttl > 0;
+        let next_hop = if can_forward {
+            ctx.select_next_hop(
+                self.request.desired_location,
+                &self.request.visited,
+                recency,
+                estimator,
+            )
+        } else {
+            None
+        };
+
+        let is_terminus = next_hop.is_none();
+
+        // Forward if we have a next hop
+        if let Some(next) = next_hop {
+            let dist = ring_distance(next.location(), Some(self.request.desired_location));
+            tracing::debug!(
+                target = %self.request.desired_location,
+                ttl = self.request.ttl,
+                next_peer = %next.pub_key(),
+                next_loc = ?next.location(),
+                ring_distance_to_target = ?dist,
+                "connect: forwarding join request to next hop (not accepting - not at terminus)"
+            );
+            let mut forward_req = self.request.clone();
+            forward_req.ttl = forward_req.ttl.saturating_sub(1);
+            if let Some(self_addr) = ctx.self_location().socket_addr() {
+                push_unique_addr(&mut forward_req.visited, self_addr);
+            }
+            let forward_snapshot = forward_req.clone();
+            self.forwarded_to = Some(next.clone());
+            self.request = forward_req;
+            forward_attempts.insert(
+                next.clone(),
+                ForwardAttempt {
+                    peer: next.clone(),
+                    desired: self.request.desired_location,
+                    sent_at: Instant::now(),
+                },
+            );
+            actions.forward = Some((next, forward_snapshot));
+        }
+
+        // Only accept at terminus (can't forward to a closer peer)
+        // IMPORTANT: Also check that we haven't already forwarded - once we forward,
+        // we're committed to that path and should not also accept. This prevents
+        // the "double-accept" bug where a retry call could trigger acceptance
+        // after we've already forwarded the request elsewhere.
+        if is_terminus
+            && !self.accepted_locally
+            && self.forwarded_to.is_none()
+            && ctx.should_accept(&self.request.joiner)
+        {
             self.accepted_locally = true;
             // Use unknown address for the acceptor - the acceptor doesn't know their own
             // external address (especially behind NAT). The first relay that receives this
@@ -306,54 +456,21 @@ impl RelayState {
                 acceptor_loc = ?self_loc.location(),
                 joiner_loc = ?self.request.joiner.location(),
                 ring_distance = ?dist,
-                "connect: acceptance issued (acceptor addr will be filled by relay)"
+                "connect: acceptance issued at terminus (acceptor addr will be filled by relay)"
             );
-        }
-
-        if self.forwarded_to.is_none() && self.request.ttl > 0 {
-            match ctx.select_next_hop(
-                self.request.desired_location,
-                &self.request.visited,
-                recency,
-                estimator,
-            ) {
-                Some(next) => {
-                    let dist = ring_distance(next.location(), Some(self.request.desired_location));
-                    tracing::info!(
-                        target = %self.request.desired_location,
-                        ttl = self.request.ttl,
-                        next_peer = %next.pub_key(),
-                        next_loc = ?next.location(),
-                        ring_distance_to_target = ?dist,
-                        "connect: forwarding join request to next hop"
-                    );
-                    let mut forward_req = self.request.clone();
-                    forward_req.ttl = forward_req.ttl.saturating_sub(1);
-                    if let Some(self_addr) = ctx.self_location().socket_addr() {
-                        push_unique_addr(&mut forward_req.visited, self_addr);
-                    }
-                    let forward_snapshot = forward_req.clone();
-                    self.forwarded_to = Some(next.clone());
-                    self.request = forward_req;
-                    forward_attempts.insert(
-                        next.clone(),
-                        ForwardAttempt {
-                            peer: next.clone(),
-                            desired: self.request.desired_location,
-                            sent_at: Instant::now(),
-                        },
-                    );
-                    actions.forward = Some((next, forward_snapshot));
-                }
-                None => {
-                    tracing::info!(
-                        target = %self.request.desired_location,
-                        ttl = self.request.ttl,
-                        visited = ?self.request.visited,
-                        "connect: no next hop candidates available"
-                    );
-                }
-            }
+        } else if is_terminus && !self.accepted_locally && self.forwarded_to.is_none() {
+            tracing::info!(
+                target = %self.request.desired_location,
+                ttl = self.request.ttl,
+                visited = ?self.request.visited,
+                "connect: at terminus but should_accept() returned false"
+            );
+        } else if is_terminus && self.forwarded_to.is_some() {
+            tracing::debug!(
+                target = %self.request.desired_location,
+                forwarded_to = ?self.forwarded_to,
+                "connect: at terminus but already forwarded - waiting for response"
+            );
         }
 
         actions
@@ -415,6 +532,12 @@ impl RelayContext for RelayEnv<'_> {
             skip,
         );
 
+        // Calculate our own distance to the target for greedy routing check
+        let my_distance = self
+            .self_location
+            .location()
+            .map(|loc| loc.distance(desired_location));
+
         let now = Instant::now();
         let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::new();
         let mut eligible: Vec<PeerKeyLocation> = Vec::new();
@@ -422,6 +545,22 @@ impl RelayContext for RelayEnv<'_> {
         for cand in candidates {
             if let Some(ts) = recency.get(&cand) {
                 if now.duration_since(*ts) < RECENCY_COOLDOWN {
+                    continue;
+                }
+            }
+
+            // GREEDY ROUTING: Only consider neighbors that are CLOSER to the target than we are.
+            // This is essential for proper terminus detection - we're at terminus when no
+            // neighbor is closer to the target than we are.
+            //
+            // Note: We use `>` (not `>=`) to allow forwarding to equally-distant peers.
+            // This gives more routing flexibility when peers are equidistant to the target
+            // (common near ring boundary 0.0/1.0). Routing loops are prevented by the
+            // `visited` list, not by this distance check.
+            if let (Some(cand_loc), Some(my_dist)) = (cand.location(), my_distance) {
+                let cand_distance = cand_loc.distance(desired_location);
+                if cand_distance > my_dist {
+                    // Neighbor is farther from target than us - skip
                     continue;
                 }
             }
@@ -1636,6 +1775,48 @@ mod tests {
             .contains(&joiner.socket_addr().expect("test peer must have address")));
     }
 
+    /// Test the terminus-only acceptance behavior: relays should NOT accept when they can
+    /// forward to a closer peer, even if should_accept() returns true.
+    #[test]
+    fn relay_does_not_accept_when_not_at_terminus() {
+        let self_loc = make_peer(4150);
+        let joiner = make_peer(5150);
+        let next_hop = make_peer(6150);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // should_accept() returns true, but we have a next_hop - so we're NOT at terminus
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(true) // Relay WANTS to accept
+            .next_hop(Some(next_hop.clone())); // But there's a closer peer
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        // Should NOT accept (not at terminus)
+        assert!(
+            actions.accept_response.is_none(),
+            "relay should NOT accept when not at terminus, even if should_accept() is true"
+        );
+
+        // Should forward to next hop
+        let (forward_to, _) = actions
+            .forward
+            .expect("relay should forward when not at terminus");
+        assert_eq!(forward_to.pub_key(), next_hop.pub_key());
+    }
+
     #[test]
     fn relay_emits_observed_address_when_discovering_joiner_addr() {
         // Test the gateway/relay discovering the joiner's external address.
@@ -1997,6 +2178,169 @@ mod tests {
             response.acceptor.pub_key(),
             acceptor_peer.pub_key(),
             "acceptor pub_key should match"
+        );
+    }
+
+    /// Test that a relay does NOT accept after it has already forwarded, even on retry.
+    ///
+    /// This tests the "double-accept vulnerability" fix: once we commit to forwarding,
+    /// we should NOT accept on subsequent handle_request() calls, even if is_terminus
+    /// becomes true (because we already forwarded, so select_next_hop returns None).
+    ///
+    /// Bug scenario this prevents:
+    /// 1. First handle_request(): We forward to next_hop, set forwarded_to = Some(...)
+    /// 2. Second handle_request(): can_forward = false (already forwarded), so next_hop = None
+    /// 3. is_terminus = true (because next_hop.is_none())
+    /// 4. BUG: Without the fix, we would accept (is_terminus && !accepted_locally && should_accept)
+    /// 5. This violates the "accept OR forward, not both" invariant
+    #[test]
+    fn relay_does_not_accept_after_forwarding_on_retry() {
+        let self_loc = make_peer(4200);
+        let joiner = make_peer(5200);
+        let next_hop = make_peer(6200);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // First call: should forward (next_hop available)
+        let ctx = TestRelayContext::new(self_loc.clone())
+            .accept(true) // would accept if at terminus
+            .next_hop(Some(next_hop.clone()));
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions1 = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        // Verify we forwarded, not accepted
+        assert!(
+            actions1.accept_response.is_none(),
+            "first call should forward, not accept"
+        );
+        assert!(
+            actions1.forward.is_some(),
+            "first call should produce a forward action"
+        );
+        assert!(
+            state.forwarded_to.is_some(),
+            "forwarded_to should be set after forwarding"
+        );
+
+        // Second call: simulate retry after forwarding
+        // Now select_next_hop returns None (no next hop), so is_terminus = true
+        // But we've already forwarded, so we should NOT accept
+        let ctx_retry = TestRelayContext::new(self_loc)
+            .accept(true) // would accept if allowed
+            .next_hop(None); // no next hop available anymore
+
+        let actions2 =
+            state.handle_request(&ctx_retry, &recency, &mut forward_attempts, &estimator);
+
+        // CRITICAL: Should NOT accept (we already forwarded)
+        assert!(
+            actions2.accept_response.is_none(),
+            "second call should NOT accept even though is_terminus=true (already forwarded)"
+        );
+
+        // Should NOT forward again either (already forwarded)
+        assert!(
+            actions2.forward.is_none(),
+            "second call should not forward again"
+        );
+    }
+
+    /// Test that greedy routing excludes peers farther from target than ourselves.
+    /// This is tested indirectly through the terminus behavior - if we have no closer
+    /// peers, we should be at terminus.
+    #[test]
+    fn terminus_reached_when_no_closer_peers() {
+        let self_loc = make_peer(4300);
+        let joiner = make_peer(5300);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // No next hop available (we're at terminus)
+        let ctx = TestRelayContext::new(self_loc).accept(true).next_hop(None); // No closer peers
+
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        // Should accept because we're at terminus
+        assert!(
+            actions.accept_response.is_some(),
+            "should accept at terminus (no closer peers)"
+        );
+
+        // Should not forward
+        assert!(actions.forward.is_none(), "should not forward at terminus");
+    }
+
+    /// Test TTL exhaustion: when TTL reaches 0, we can't forward even if next_hop exists.
+    /// This should result in terminus behavior.
+    #[test]
+    fn ttl_zero_prevents_forwarding() {
+        let self_loc = make_peer(4400);
+        let joiner = make_peer(5400);
+        let next_hop = make_peer(6400);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 0, // TTL exhausted
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // Next hop exists, but TTL is 0
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(true)
+            .next_hop(Some(next_hop)); // Would forward if TTL > 0
+
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        // Should NOT forward (TTL = 0)
+        assert!(
+            actions.forward.is_none(),
+            "should not forward when TTL is 0"
+        );
+
+        // Should accept (at terminus due to TTL exhaustion)
+        assert!(
+            actions.accept_response.is_some(),
+            "should accept at terminus (TTL exhausted)"
         );
     }
 }

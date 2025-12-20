@@ -39,16 +39,16 @@
 mod common;
 
 use std::{
-    net::{Ipv4Addr, SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener},
     time::Duration,
 };
 
 use anyhow::anyhow;
 use common::{
-    base_node_test_config, get_all_ping_states, gw_config_from_path, ping_states_equal, APP_TAG,
-    PACKAGE_DIR, PATH_TO_CONTRACT,
+    base_node_test_config_with_ip, get_all_ping_states, gw_config_from_path_with_ip,
+    ping_states_equal, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
-use freenet::{local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
@@ -157,21 +157,29 @@ async fn run_blocked_peers_test_inner(
         MAX_PORT_RETRY_ATTEMPTS
     );
 
-    // Network setup - get all ports upfront
-    let network_socket_gw = TcpListener::bind("127.0.0.1:0")?;
+    // Network setup - use varied loopback IPs for unique ring locations
+    // This is essential because ring locations are derived from IP addresses.
+    // Without varied IPs, all nodes would have the same location, breaking routing.
+    let gw_ip = test_ip_for_node(0);
+    let node1_ip = test_ip_for_node(1);
+    let node2_ip = test_ip_for_node(2);
+
+    // Bind network sockets to varied IPs
+    let network_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
     let gw_network_port = network_socket_gw.local_addr()?.port();
 
+    // WebSocket ports still use localhost
     let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
     let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
 
-    let network_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
+    let network_socket_node1 = TcpListener::bind(SocketAddr::new(node1_ip.into(), 0))?;
     let node1_network_port = network_socket_node1.local_addr()?.port();
-    let node1_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), node1_network_port);
+    let node1_network_addr = SocketAddr::new(node1_ip.into(), node1_network_port);
 
-    let network_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
+    let network_socket_node2 = TcpListener::bind(SocketAddr::new(node2_ip.into(), 0))?;
     let node2_network_port = network_socket_node2.local_addr()?.port();
-    let node2_network_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), node2_network_port);
+    let node2_network_addr = SocketAddr::new(node2_ip.into(), node2_network_port);
 
     // Configure gateway - include attempt number in dir suffix for isolation
     let dir_suffix = if attempt > 1 {
@@ -181,25 +189,30 @@ async fn run_blocked_peers_test_inner(
     };
 
     let (config_gw, preset_cfg_gw, config_gw_info) = {
-        let (cfg, preset) = base_node_test_config(
+        let (cfg, preset) = base_node_test_config_with_ip(
             true, // is_gateway
             vec![],
             Some(gw_network_port),
             ws_api_port_socket_gw.local_addr()?.port(),
             &format!("gw_{}", dir_suffix),
             None,
-            None, // Gateway doesn't block any peers
+            None,        // Gateway doesn't block any peers
+            Some(gw_ip), // Use varied IP for unique ring location
         )
         .await?;
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        (cfg, preset, gw_config_from_path(public_port, &path)?)
+        (
+            cfg,
+            preset,
+            gw_config_from_path_with_ip(public_port, &path, gw_ip)?,
+        )
     };
 
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure Node1 (blocks Node2)
-    let (config_node1, preset_cfg_node1) = base_node_test_config(
+    let (config_node1, preset_cfg_node1) = base_node_test_config_with_ip(
         false, // is_gateway
         vec![serde_json::to_string(&config_gw_info)?],
         Some(node1_network_port),
@@ -207,12 +220,13 @@ async fn run_blocked_peers_test_inner(
         &format!("node1_{}", dir_suffix),
         None,
         Some(vec![node2_network_addr]), // Node1 blocks Node2
+        Some(node1_ip),                 // Use varied IP for unique ring location
     )
     .await?;
     let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
 
     // Configure Node2 (blocks Node1)
-    let (config_node2, preset_cfg_node2) = base_node_test_config(
+    let (config_node2, preset_cfg_node2) = base_node_test_config_with_ip(
         false, // is_gateway
         vec![serde_json::to_string(&config_gw_info)?],
         Some(node2_network_port),
@@ -220,6 +234,7 @@ async fn run_blocked_peers_test_inner(
         &format!("node2_{}", dir_suffix),
         None,
         Some(vec![node1_network_addr]), // Node2 blocks Node1
+        Some(node2_ip),                 // Use varied IP for unique ring location
     )
     .await?;
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::time::Duration;
 use std::vec;
 
 use aes_gcm::Aes128Gcm;
@@ -58,9 +59,18 @@ pub(super) async fn send_stream<S: super::super::Socket>(
 
         let packet_size = stream_to_send.len().min(MAX_DATA_SIZE);
 
-        // LEDBAT congestion control - wait until cwnd has space for this packet
+        // LEDBAT congestion control - wait until cwnd has space for this packet.
         // This enforces the congestion window calculated by LEDBAT's slow start
-        // and congestion avoidance algorithms
+        // and congestion avoidance algorithms.
+        //
+        // IMPORTANT: This loop requires that recv() is being called on this connection
+        // to process incoming ACKs. ACKs reduce flightsize via on_ack(), which opens
+        // cwnd space. If recv() is never called, flightsize never decreases and this
+        // loop will block forever.
+        //
+        // In production, PeerConnection is always used in a bidirectional select! loop
+        // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
+        // always being polled. Tests must follow the same pattern.
         let mut cwnd_wait_iterations = 0;
         loop {
             let flightsize = ledbat.flightsize();
@@ -78,7 +88,7 @@ pub(super) async fn send_stream<S: super::super::Socket>(
                     flightsize_kb = flightsize / 1024,
                     cwnd_kb = cwnd / 1024,
                     packet_size,
-                    "Waiting for cwnd space"
+                    "Waiting for cwnd space (ensure recv() is being called to process ACKs)"
                 );
             }
 
@@ -89,9 +99,9 @@ pub(super) async fn send_stream<S: super::super::Socket>(
             if cwnd_wait_iterations <= 10 {
                 tokio::task::yield_now().await;
             } else if cwnd_wait_iterations <= 100 {
-                tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                tokio::time::sleep(Duration::from_micros(100)).await;
             } else {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
 
