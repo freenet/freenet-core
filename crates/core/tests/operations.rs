@@ -78,6 +78,8 @@ async fn base_node_test_config(
             blocked_addresses: None,
             transient_budget: None,
             transient_ttl_secs: None,
+            total_bandwidth_limit: None,
+            min_bandwidth_per_connection: None,
         },
         config_paths: {
             freenet::config::ConfigPathsArgs {
