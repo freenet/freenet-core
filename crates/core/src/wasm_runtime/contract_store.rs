@@ -134,10 +134,15 @@ impl ContractStore {
             // Otherwise, when TinyLFU evicts this contract, fetch_contract() will
             // fail because the index lookup returns None.
             // See issue #2344.
-            if !self.key_to_code_part.contains_key(key.id()) {
+            //
+            // Use DashMap's atomic entry API to avoid TOCTOU race condition.
+            // Multiple threads could otherwise both see the key as missing and
+            // try to insert, causing duplicate index entries.
+            if let dashmap::mapref::entry::Entry::Vacant(v) =
+                self.key_to_code_part.entry(*key.id())
+            {
                 let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
-                self.key_to_code_part
-                    .insert(*key.id(), (offset, *code_hash));
+                v.insert((offset, *code_hash));
                 tracing::debug!(
                     contract = %key,
                     "Added missing index entry for existing WASM file"
