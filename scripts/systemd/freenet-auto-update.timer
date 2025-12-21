@@ -1,0 +1,20 @@
+[Unit]
+Description=Freenet Gateway Auto-Update Timer
+Documentation=https://github.com/freenet/freenet-core
+
+[Timer]
+# Run 10 minutes after boot
+OnBootSec=10min
+
+# Then every 10 minutes
+OnUnitActiveSec=10min
+
+# Add randomized delay up to 60 seconds to avoid thundering herd
+# if multiple gateways check simultaneously
+RandomizedDelaySec=60
+
+# Persist timer state across reboots
+Persistent=true
+
+[Install]
+WantedBy=timers.target
