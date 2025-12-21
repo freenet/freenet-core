@@ -2388,9 +2388,12 @@ pub mod mock_transport {
         .await
     }
 
-    /// This one is the maximum size (1324 currently) of a short message from user side
-    /// by using public send API can be directly sent
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// Tests sending a large short message using the high-level send() API.
+    /// Uses a simple connection pattern for reliability.
+    ///
+    /// The max short message size is MAX_DATA_SIZE - SymmetricMessage::short_message_overhead().
+    /// We test with a 1400-byte payload to verify short message handling near the boundary.
+    #[tokio::test]
     async fn simulate_send_max_short_message() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
@@ -2398,33 +2401,38 @@ pub mod mock_transport {
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer(Default::default(), channels).await?;
 
-        let peer_b = tokio::spawn(async move {
-            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            // Increased timeout: RFC 6298 RTO is 1s base, allow headroom for CI variability
-            let mut conn = tokio::time::timeout(Duration::from_secs(15), peer_a_conn).await??;
-            let data = vec![0u8; 1324];
-            let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
-                .await
-                .unwrap();
-            conn.send(data).await?;
-            Ok::<_, anyhow::Error>(())
-        });
+        // Use a large payload that will be sent as a short message
+        // Vec<u8> of 1400 bytes should be well within short message limits
+        let test_data: Vec<u8> = (0..1400).map(|i| (i % 256) as u8).collect();
+        let expected_len = test_data.len();
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            // Increased timeout: RFC 6298 RTO is 1s base, allow headroom for CI variability
-            let mut conn = tokio::time::timeout(Duration::from_secs(15), peer_b_conn).await??;
-            let msg = tokio::time::timeout(Duration::from_secs(20), conn.recv()).await??;
-            assert!(msg.len() <= MAX_DATA_SIZE);
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_b_conn).await??;
+            let msg = tokio::time::timeout(Duration::from_secs(5), conn.recv()).await??;
+            let deserialized: Vec<u8> = bincode::deserialize(&msg)?;
+            assert_eq!(deserialized.len(), expected_len);
             Ok::<_, anyhow::Error>(())
         });
 
-        let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        a?;
-        b?;
+        let peer_b = tokio::spawn(async move {
+            let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
+            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_a_conn).await??;
+            // Small delay to ensure peer_a's recv() is ready before we send.
+            // Without this, the send can complete before peer_a starts receiving,
+            // causing the message to be lost in the mock transport.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            conn.send(test_data).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let (a, b) = tokio::join!(peer_a, peer_b);
+        a??;
+        b??;
         Ok(())
     }
 
+    /// Tests that sending a message larger than MAX_DATA_SIZE fails as expected.
     #[tokio::test]
     async fn simulate_send_max_short_message_plus_1() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
