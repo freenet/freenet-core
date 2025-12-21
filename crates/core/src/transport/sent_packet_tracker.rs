@@ -28,6 +28,12 @@ pub(super) const MESSAGE_CONFIRMATION_TIMEOUT: Duration = {
     Duration::from_millis(millis as u64)
 };
 
+/// Maximum RTO backoff multiplier (RFC 6298 Section 5.5).
+/// With a minimum/base RTO of 1s and a max effective RTO cap of 60s, a backoff of 64 is
+/// sufficient to ensure we can reach the 60s limit; for higher base RTO values, the cap is
+/// reached with smaller backoff multipliers.
+const MAX_RTO_BACKOFF: u32 = 64;
+
 /// Determines the accuracy/sensitivity of the packet loss estimate. A lower value will result
 /// in a more accurate estimate, but it will take longer to converge to the true value.
 const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
@@ -82,6 +88,10 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
 
     /// Total packets sent (for statistics)
     total_packets_sent: usize,
+
+    /// RTO backoff multiplier for exponential backoff (RFC 6298 Section 5.5)
+    /// Doubles on each consecutive timeout, resets to 1 on valid ACK
+    rto_backoff: u32,
 }
 
 impl SentPacketTracker<InstantTimeSrc> {
@@ -98,6 +108,7 @@ impl SentPacketTracker<InstantTimeSrc> {
             rto: Duration::from_secs(1),
             retransmitted_packets: HashSet::new(),
             total_packets_sent: 0,
+            rto_backoff: 1, // No backoff initially
         }
     }
 }
@@ -107,8 +118,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
         let sent_time = self.time_source.now();
         self.pending_receipts
             .insert(packet_id, (payload, sent_time));
+        // Use effective_rto() which includes exponential backoff (RFC 6298 Section 5.5)
+        // This ensures retransmitted packets wait progressively longer (1s → 2s → 4s → ...)
         self.resend_queue.push_back(ResendQueueEntry {
-            timeout_at: sent_time + MESSAGE_CONFIRMATION_TIMEOUT,
+            timeout_at: sent_time + self.effective_rto(),
             packet_id,
         });
         self.total_packets_sent += 1;
@@ -136,6 +149,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     let packet_size = payload.len();
                     rtt_samples.push((rtt_sample, packet_size));
                     self.update_rtt(rtt_sample);
+
+                    // RFC 6298 Section 5.7: Reset backoff on valid ACK
+                    // (only for non-retransmitted packets to be safe)
+                    self.rto_backoff = 1;
                 }
             }
 
@@ -215,10 +232,46 @@ impl<T: TimeSource> SentPacketTracker<T> {
         self.min_rtt
     }
 
-    /// Get the current retransmission timeout
+    /// Get the base retransmission timeout (without backoff)
     #[allow(dead_code)] // Used in tests, may be useful for debugging
     pub(super) fn rto(&self) -> Duration {
         self.rto
+    }
+
+    /// Get the effective RTO with exponential backoff applied
+    /// This is the actual timeout to use for retransmissions
+    pub(super) fn effective_rto(&self) -> Duration {
+        let backed_off = self.rto.saturating_mul(self.rto_backoff);
+        // Cap at 60 seconds (RFC 6298 Section 2.5)
+        backed_off.min(Duration::from_secs(60))
+    }
+
+    /// Called on retransmission timeout - doubles the RTO backoff (RFC 6298 Section 5.5)
+    ///
+    /// This implements the "back off the timer" requirement from RFC 6298:
+    /// > (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer")
+    ///
+    /// The backoff is reset when a valid ACK is received (in report_received_receipts).
+    ///
+    /// Design note: We use a separate backoff multiplier rather than modifying RTO directly.
+    /// This preserves the base RTO for faster recovery when RTT improves, while still
+    /// achieving RFC-compliant exponential backoff behavior.
+    pub(super) fn on_timeout(&mut self) {
+        // Double the backoff, capped at MAX_RTO_BACKOFF
+        // With base RTO of 1s, 6 doublings (1→2→4→8→16→32→64) reach the 60s effective cap
+        self.rto_backoff = (self.rto_backoff.saturating_mul(2)).min(MAX_RTO_BACKOFF);
+
+        tracing::debug!(
+            rto_backoff = self.rto_backoff,
+            effective_rto_ms = self.effective_rto().as_millis(),
+            "RTO backoff increased on timeout"
+        );
+    }
+
+    /// Get the current backoff multiplier (for testing/debugging)
+    #[allow(dead_code)]
+    pub(super) fn rto_backoff(&self) -> u32 {
+        self.rto_backoff
     }
 
     /// Either get a packet that needs to be resent, or how long the caller should wait until
@@ -247,13 +300,17 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 // Mark as retransmitted for Karn's algorithm
                 self.mark_retransmitted(entry.packet_id);
 
+                // RFC 6298 Section 5.5: Back off the timer on retransmission
+                self.on_timeout();
+
                 return ResendAction::Resend(entry.packet_id, packet);
             }
             // If the packet is no longer in pending_receipts, it means its receipt has been received.
             // No action needed, continue to check the next entry in the queue.
         }
 
-        ResendAction::WaitUntil(now + MESSAGE_CONFIRMATION_TIMEOUT)
+        // Use effective RTO (with backoff) for the wait time
+        ResendAction::WaitUntil(now + self.effective_rto())
     }
 }
 
@@ -289,6 +346,7 @@ pub(in crate::transport) mod tests {
             rto: Duration::from_secs(1),
             retransmitted_packets: HashSet::new(),
             total_packets_sent: 0,
+            rto_backoff: 1,
         }
     }
 
@@ -318,9 +376,8 @@ pub(in crate::transport) mod tests {
     fn test_packet_lost() {
         let mut tracker = mock_sent_packet_tracker();
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
-        tracker
-            .time_source
-            .advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
+        // Packets now use effective_rto() which is 1s initially (not MESSAGE_CONFIRMATION_TIMEOUT)
+        tracker.time_source.advance_time(tracker.effective_rto());
         let resend_action = tracker.get_resend();
         assert_eq!(resend_action, ResendAction::Resend(1, vec![1, 2, 3].into()));
         assert_eq!(tracker.pending_receipts.len(), 0);
@@ -331,6 +388,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_immediate_receipt_then_resend() {
         let mut tracker = mock_sent_packet_tracker();
+        let initial_rto = tracker.effective_rto();
 
         // Report two packets sent
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
@@ -342,7 +400,7 @@ pub(in crate::transport) mod tests {
         // Simulate time just before the resend time for packet 2
         tracker
             .time_source
-            .advance_time(MESSAGE_CONFIRMATION_TIMEOUT - Duration::from_millis(1));
+            .advance_time(initial_rto - Duration::from_millis(1));
 
         // This should not trigger a resend yet
         match tracker.get_resend() {
@@ -368,9 +426,11 @@ pub(in crate::transport) mod tests {
 
         tracker.time_source.advance_time(Duration::from_millis(10));
 
+        // Capture the effective RTO at the time packet 1 is sent
+        let effective_rto_at_send = tracker.effective_rto();
         tracker.report_sent_packet(1, MessagePayload::new().into());
 
-        let packet_1_timeout = tracker.time_source.now() + MESSAGE_CONFIRMATION_TIMEOUT;
+        let packet_1_timeout = tracker.time_source.now() + effective_rto_at_send;
 
         // Acknowledge receipt of the first packet
         let _ = tracker.report_received_receipts(&[0]);
@@ -495,10 +555,8 @@ pub(in crate::transport) mod tests {
         // Send packet
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
 
-        // Wait for timeout
-        tracker
-            .time_source
-            .advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
+        // Wait for timeout (using effective_rto which is 1s initially)
+        tracker.time_source.advance_time(tracker.effective_rto());
 
         // Get resend action
         match tracker.get_resend() {
@@ -509,5 +567,233 @@ pub(in crate::transport) mod tests {
             }
             _ => panic!("Expected Resend action"),
         }
+    }
+
+    // RTO Exponential Backoff Tests (RFC 6298 Section 5.5)
+
+    #[test]
+    fn test_rto_backoff_doubles_on_timeout() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Initial backoff should be 1
+        assert_eq!(tracker.rto_backoff(), 1);
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
+
+        // First timeout - backoff doubles to 2
+        tracker.on_timeout();
+        assert_eq!(tracker.rto_backoff(), 2);
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(2));
+
+        // Second timeout - backoff doubles to 4
+        tracker.on_timeout();
+        assert_eq!(tracker.rto_backoff(), 4);
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(4));
+
+        // Third timeout - backoff doubles to 8
+        tracker.on_timeout();
+        assert_eq!(tracker.rto_backoff(), 8);
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn test_rto_backoff_capped_at_60_seconds() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Trigger many timeouts to exceed the 60s cap
+        for _ in 0..10 {
+            tracker.on_timeout();
+        }
+
+        // Effective RTO should be capped at 60 seconds
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(60));
+
+        // Backoff multiplier should be capped at MAX_RTO_BACKOFF
+        assert_eq!(tracker.rto_backoff(), MAX_RTO_BACKOFF);
+    }
+
+    #[test]
+    fn test_rto_backoff_resets_on_valid_ack() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Trigger some timeouts
+        tracker.on_timeout();
+        tracker.on_timeout();
+        assert_eq!(tracker.rto_backoff(), 4);
+
+        // Send a new packet
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+
+        // Advance time slightly and receive ACK
+        tracker.time_source.advance_time(Duration::from_millis(50));
+        tracker.report_received_receipts(&[1]);
+
+        // Backoff should be reset to 1
+        assert_eq!(tracker.rto_backoff(), 1);
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_rto_backoff_not_reset_on_retransmitted_ack() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Trigger some timeouts
+        tracker.on_timeout();
+        tracker.on_timeout();
+        assert_eq!(tracker.rto_backoff(), 4);
+
+        // Send a packet and mark it as retransmitted
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+        tracker.mark_retransmitted(1);
+
+        // Advance time slightly and receive ACK
+        tracker.time_source.advance_time(Duration::from_millis(50));
+        tracker.report_received_receipts(&[1]);
+
+        // Backoff should NOT be reset for retransmitted packets (Karn's algorithm)
+        assert_eq!(tracker.rto_backoff(), 4);
+    }
+
+    #[test]
+    fn test_get_resend_triggers_backoff() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Initial backoff
+        assert_eq!(tracker.rto_backoff(), 1);
+        let initial_rto = tracker.effective_rto();
+
+        // Send packet
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+
+        // Wait for timeout (using initial effective_rto)
+        tracker.time_source.advance_time(initial_rto);
+
+        // Get resend - this should trigger backoff
+        match tracker.get_resend() {
+            ResendAction::Resend(packet_id, _) => {
+                assert_eq!(packet_id, 1);
+            }
+            _ => panic!("Expected Resend action"),
+        }
+
+        // Backoff should have doubled
+        assert_eq!(tracker.rto_backoff(), 2);
+    }
+
+    #[test]
+    fn test_consecutive_resends_increase_backoff() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Send packet - will timeout after effective_rto() = 1s
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+        assert_eq!(tracker.rto_backoff(), 1);
+
+        // First timeout after 1s, resend triggers backoff to 2
+        tracker.time_source.advance_time(Duration::from_secs(1));
+        match tracker.get_resend() {
+            ResendAction::Resend(_, payload) => {
+                // Re-register the packet - now enqueued with effective_rto() = 2s
+                tracker.report_sent_packet(1, payload);
+            }
+            _ => panic!("Expected Resend"),
+        }
+        assert_eq!(tracker.rto_backoff(), 2);
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(2));
+
+        // Second timeout after 2s (not 1s!), resend triggers backoff to 4
+        tracker.time_source.advance_time(Duration::from_secs(2));
+        match tracker.get_resend() {
+            ResendAction::Resend(_, payload) => {
+                // Re-register - now enqueued with effective_rto() = 4s
+                tracker.report_sent_packet(1, payload);
+            }
+            _ => panic!("Expected Resend"),
+        }
+        assert_eq!(tracker.rto_backoff(), 4);
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(4));
+
+        // Third timeout after 4s (not 1s or 2s!), resend triggers backoff to 8
+        tracker.time_source.advance_time(Duration::from_secs(4));
+        match tracker.get_resend() {
+            ResendAction::Resend(_, _) => {}
+            _ => panic!("Expected Resend"),
+        }
+        assert_eq!(tracker.rto_backoff(), 8);
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(8));
+    }
+
+    /// End-to-end test verifying that timeout intervals actually increase.
+    /// This is the critical test that validates the fix works correctly.
+    #[test]
+    fn test_timeout_intervals_actually_increase() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Initial state: 1s RTO, no backoff
+        assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
+
+        // Send packet
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+
+        // Verify: if we wait less than 1s, we should NOT get a resend
+        tracker.time_source.advance_time(Duration::from_millis(999));
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => {} // Expected
+            ResendAction::Resend(_, _) => panic!("Should not resend before RTO expires"),
+        }
+
+        // Advance 1 more ms to trigger timeout
+        tracker.time_source.advance_time(Duration::from_millis(1));
+        let payload = match tracker.get_resend() {
+            ResendAction::Resend(id, payload) => {
+                assert_eq!(id, 1);
+                payload
+            }
+            _ => panic!("Expected Resend after 1s"),
+        };
+
+        // Backoff is now 2, re-register packet with 2s timeout
+        assert_eq!(tracker.rto_backoff(), 2);
+        tracker.report_sent_packet(1, payload);
+
+        // Verify: if we wait less than 2s, we should NOT get a resend
+        tracker
+            .time_source
+            .advance_time(Duration::from_millis(1999));
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => {} // Expected
+            ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (2s)"),
+        }
+
+        // Advance 1 more ms to trigger timeout
+        tracker.time_source.advance_time(Duration::from_millis(1));
+        let payload = match tracker.get_resend() {
+            ResendAction::Resend(id, payload) => {
+                assert_eq!(id, 1);
+                payload
+            }
+            _ => panic!("Expected Resend after 2s"),
+        };
+
+        // Backoff is now 4, re-register packet with 4s timeout
+        assert_eq!(tracker.rto_backoff(), 4);
+        tracker.report_sent_packet(1, payload);
+
+        // Verify: if we wait less than 4s, we should NOT get a resend
+        tracker
+            .time_source
+            .advance_time(Duration::from_millis(3999));
+        match tracker.get_resend() {
+            ResendAction::WaitUntil(_) => {} // Expected
+            ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (4s)"),
+        }
+
+        // Advance 1 more ms to trigger timeout
+        tracker.time_source.advance_time(Duration::from_millis(1));
+        match tracker.get_resend() {
+            ResendAction::Resend(id, _) => assert_eq!(id, 1),
+            _ => panic!("Expected Resend after 4s"),
+        }
+
+        // Backoff is now 8
+        assert_eq!(tracker.rto_backoff(), 8);
     }
 }

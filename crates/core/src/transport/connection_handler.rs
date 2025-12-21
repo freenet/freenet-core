@@ -2184,12 +2184,17 @@ pub mod mock_transport {
         let channels = Arc::new(DashMap::new());
         let (peer_a_pub, mut peer_a, peer_a_addr) =
             create_mock_peer(Default::default(), channels.clone()).await?;
+        // Drop pattern: packet 0 dropped (retry succeeds at count 1), packets 1-2 succeed
+        // (backoff resets), packets 3-4 dropped (retry succeeds at count 5).
+        // With RFC 6298 exponential backoff: 1s + 2s = 3s for the 3..5 range.
+        // Original 3..9 (6 consecutive drops) would take 1+2+4+8+16+32=63s, exceeding
+        // reasonable connection timeout - that scenario should fail, not recover.
         let (peer_b_pub, mut peer_b, peer_b_addr) =
-            create_mock_peer(PacketDropPolicy::Ranges(vec![0..1, 3..9]), channels).await?;
+            create_mock_peer(PacketDropPolicy::Ranges(vec![0..1, 3..5]), channels).await?;
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_a_conn)
+            let mut conn = tokio::time::timeout(Duration::from_secs(15), peer_a_conn)
                 .await
                 .inspect_err(|_| tracing::error!("peer a timed out"))?
                 .inspect_err(|error| tracing::error!(%error, "error while connecting to peer a"))?;
@@ -2202,13 +2207,13 @@ pub mod mock_transport {
             conn.send("some data").await.inspect_err(|error| {
                 tracing::error!(%error, "error while sending 2nd message");
             })?;
-            let _ = tokio::time::timeout(Duration::from_secs(3), conn.recv()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
             Ok::<_, anyhow::Error>(conn)
         });
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(2), peer_b_conn)
+            let mut conn = tokio::time::timeout(Duration::from_secs(15), peer_b_conn)
                 .await
                 .inspect_err(|_| tracing::error!("peer b timed out"))?
                 .inspect_err(|error| tracing::error!(%error, "error while connecting to peer b"))?;
@@ -2395,7 +2400,8 @@ pub mod mock_transport {
 
         let peer_b = tokio::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_a_conn).await??;
+            // Increased timeout: RFC 6298 RTO is 1s base, allow headroom for CI variability
+            let mut conn = tokio::time::timeout(Duration::from_secs(15), peer_a_conn).await??;
             let data = vec![0u8; 1324];
             let data = tokio::task::spawn_blocking(move || bincode::serialize(&data).unwrap())
                 .await
@@ -2406,8 +2412,9 @@ pub mod mock_transport {
 
         let peer_a = tokio::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let mut conn = tokio::time::timeout(Duration::from_secs(5), peer_b_conn).await??;
-            let msg = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await??;
+            // Increased timeout: RFC 6298 RTO is 1s base, allow headroom for CI variability
+            let mut conn = tokio::time::timeout(Duration::from_secs(15), peer_b_conn).await??;
+            let msg = tokio::time::timeout(Duration::from_secs(20), conn.recv()).await??;
             assert!(msg.len() <= MAX_DATA_SIZE);
             Ok::<_, anyhow::Error>(())
         });
