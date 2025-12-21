@@ -28,8 +28,10 @@ pub(super) const MESSAGE_CONFIRMATION_TIMEOUT: Duration = {
     Duration::from_millis(millis as u64)
 };
 
-/// Maximum RTO backoff multiplier (RFC 6298 Section 5.5)
-/// With base RTO of 1s and max effective RTO of 60s, caps at 64 to ensure we hit the 60s limit
+/// Maximum RTO backoff multiplier (RFC 6298 Section 5.5).
+/// With a minimum/base RTO of 1s and a max effective RTO cap of 60s, a backoff of 64 is
+/// sufficient to ensure we can reach the 60s limit; for higher base RTO values, the cap is
+/// reached with smaller backoff multipliers.
 const MAX_RTO_BACKOFF: u32 = 64;
 
 /// Determines the accuracy/sensitivity of the packet loss estimate. A lower value will result
