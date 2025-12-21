@@ -1,0 +1,27 @@
+[Unit]
+Description=Freenet Gateway Auto-Update
+Documentation=https://github.com/freenet/freenet-core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gateway-auto-update.sh
+# Allow the script to manage services
+# Note: The script calls deploy-local-gateway.sh which uses sudo internally
+
+# Security hardening (compatible with update operations)
+ProtectSystem=false
+PrivateTmp=true
+NoNewPrivileges=false
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=freenet-auto-update
+
+# Timeout for download and deploy operations
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
