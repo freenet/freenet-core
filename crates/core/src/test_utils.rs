@@ -715,6 +715,98 @@ pub fn create_todo_list_with_item(title: &str) -> Vec<u8> {
     serde_json::to_vec(&todo_list).unwrap_or_default()
 }
 
+// ============ Edge Case Test Factories (Priority 6) ============
+
+/// Creates a large todo list near the practical size limit (1MB) for testing
+///
+/// This tests edge cases around large contract states without exceeding reasonable limits.
+pub fn create_large_todo_list() -> Vec<u8> {
+    // Create enough tasks to approach ~1MB state size
+    // Each task is ~200 bytes when serialized
+    const TARGET_SIZE: usize = 1024 * 1024; // 1MB
+    const APPROX_TASK_SIZE: usize = 200;
+    let num_tasks = TARGET_SIZE / APPROX_TASK_SIZE;
+
+    let tasks: Vec<Task> = (0..num_tasks)
+        .map(|i| Task {
+            id: i as u64,
+            title: format!("Task {} - Large state boundary test", i),
+            description: format!(
+                "This is task number {} in a large state test. \
+                 It contains enough text to make the serialized size predictable.",
+                i
+            ),
+            completed: i % 2 == 0,
+            priority: ((i % 5) + 1) as u8,
+        })
+        .collect();
+
+    let todo_list = TodoList { tasks, version: 1 };
+
+    serde_json::to_vec(&todo_list).unwrap_or_default()
+}
+
+/// Creates an oversized todo list that exceeds practical limits for testing
+///
+/// Used to test that the system properly rejects or handles oversized states.
+/// Creates a state > 10MB which should trigger size validation errors.
+pub fn create_oversized_todo_list() -> Vec<u8> {
+    // Create a state that's definitely too large (10MB+)
+    const TARGET_SIZE: usize = 10 * 1024 * 1024; // 10MB
+    const APPROX_TASK_SIZE: usize = 200;
+    let num_tasks = TARGET_SIZE / APPROX_TASK_SIZE;
+
+    let tasks: Vec<Task> = (0..num_tasks)
+        .map(|i| Task {
+            id: i as u64,
+            title: format!("Oversized task {}", i),
+            description: "X".repeat(150), // Pad to ensure size
+            completed: false,
+            priority: 1,
+        })
+        .collect();
+
+    let todo_list = TodoList { tasks, version: 1 };
+
+    serde_json::to_vec(&todo_list).unwrap_or_default()
+}
+
+/// Creates an empty delta update for testing no-change scenarios
+///
+/// This represents an UPDATE operation that doesn't actually change state.
+/// Used to test UpdateResponse with NoChange result.
+pub fn create_empty_delta_update() -> Vec<u8> {
+    // Serialize an empty TodoOperation that represents no change
+    let operation = TodoOperation::Remove(u64::MAX); // Non-existent task
+    serde_json::to_vec(&operation).unwrap_or_default()
+}
+
+/// Creates a minimal valid state (single byte) for testing
+///
+/// Tests the lower bound of state size.
+pub fn create_minimal_state() -> Vec<u8> {
+    vec![b'{', b'}'] // Minimal valid JSON
+}
+
+/// Creates a state with exactly the maximum allowed number of tasks
+///
+/// Used to test boundary conditions in state validation.
+pub fn create_max_tasks_todo_list(max_tasks: usize) -> Vec<u8> {
+    let tasks: Vec<Task> = (0..max_tasks)
+        .map(|i| Task {
+            id: i as u64,
+            title: format!("Task {}", i),
+            description: String::new(),
+            completed: false,
+            priority: 3,
+        })
+        .collect();
+
+    let todo_list = TodoList { tasks, version: 1 };
+
+    serde_json::to_vec(&todo_list).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -824,6 +916,96 @@ mod test {
             json_str.contains("test_peer") || json_str.contains("gateway"),
             "Should contain span information"
         );
+    }
+
+    // ============ Edge Case Factory Tests (Priority 6) ============
+
+    #[test]
+    fn test_create_large_todo_list() {
+        let large_state = create_large_todo_list();
+
+        // Verify it's actually large (~1MB)
+        assert!(
+            large_state.len() > 900_000,
+            "Large state should be close to 1MB, got {} bytes",
+            large_state.len()
+        );
+        assert!(
+            large_state.len() < 1_200_000,
+            "Large state shouldn't exceed 1.2MB, got {} bytes",
+            large_state.len()
+        );
+
+        // Verify it's valid JSON
+        let parsed: Result<TodoList, _> = serde_json::from_slice(&large_state);
+        assert!(parsed.is_ok(), "Large state should be valid JSON");
+    }
+
+    #[test]
+    fn test_create_oversized_todo_list() {
+        let oversized_state = create_oversized_todo_list();
+
+        // Verify it's actually oversized (>10MB)
+        assert!(
+            oversized_state.len() > 10_000_000,
+            "Oversized state should exceed 10MB, got {} bytes",
+            oversized_state.len()
+        );
+
+        // Verify it's still valid JSON (just really big)
+        let parsed: Result<TodoList, _> = serde_json::from_slice(&oversized_state);
+        assert!(parsed.is_ok(), "Oversized state should still be valid JSON");
+    }
+
+    #[test]
+    fn test_create_minimal_state() {
+        let minimal = create_minimal_state();
+
+        assert_eq!(minimal.len(), 2, "Minimal state should be 2 bytes");
+        assert_eq!(minimal, vec![b'{', b'}'], "Should be empty JSON object");
+    }
+
+    #[test]
+    fn test_create_empty_delta_update() {
+        let delta = create_empty_delta_update();
+
+        // Verify it's valid JSON
+        let parsed: Result<TodoOperation, _> = serde_json::from_slice(&delta);
+        assert!(parsed.is_ok(), "Empty delta should be valid TodoOperation");
+    }
+
+    #[test]
+    fn test_create_max_tasks_todo_list() {
+        const MAX_TASKS: usize = 1000;
+        let state = create_max_tasks_todo_list(MAX_TASKS);
+
+        // Verify it has exactly MAX_TASKS tasks
+        let parsed: TodoList = serde_json::from_slice(&state).unwrap();
+        assert_eq!(
+            parsed.tasks.len(),
+            MAX_TASKS,
+            "Should have exactly {} tasks",
+            MAX_TASKS
+        );
+    }
+
+    #[test]
+    fn test_empty_todo_list_is_valid() {
+        let empty = create_empty_todo_list();
+        let parsed: TodoList = serde_json::from_slice(&empty).unwrap();
+
+        assert_eq!(parsed.tasks.len(), 0, "Empty list should have 0 tasks");
+        assert_eq!(parsed.version, 0, "Empty list should be version 0");
+    }
+
+    #[test]
+    fn test_todo_list_with_item_is_valid() {
+        let state = create_todo_list_with_item("Test task");
+        let parsed: TodoList = serde_json::from_slice(&state).unwrap();
+
+        assert_eq!(parsed.tasks.len(), 1, "Should have 1 task");
+        assert_eq!(parsed.tasks[0].title, "Test task");
+        assert_eq!(parsed.version, 1);
     }
 }
 
