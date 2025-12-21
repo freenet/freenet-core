@@ -131,7 +131,10 @@ async fn test_large_state_put_get(ctx: &mut TestContext) -> TestResult {
             ..
         }))) => {
             assert_eq!(recv_state, wrapped_state, "Large state should round-trip");
-            tracing::info!("Large state GET successful, verified {} bytes", large_state.len());
+            tracing::info!(
+                "Large state GET successful, verified {} bytes",
+                large_state.len()
+            );
         }
         other => panic!("Unexpected GET response: {:?}", other),
     }
