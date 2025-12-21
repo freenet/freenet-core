@@ -54,6 +54,17 @@ impl ContractExecutor for Executor<Runtime> {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
+        // CRITICAL: When a ContractContainer is provided, use its key instead of the passed-in key.
+        // The container's key is authoritative and includes the code hash, which is needed for
+        // proper contract store lookups. The passed-in key may have code=None (e.g., from GET
+        // responses where only the ContractInstanceId was preserved in the message).
+        // See issue #2306 and related debugging.
+        let key = if let Some(ref container) = code {
+            container.key()
+        } else {
+            key
+        };
+
         // Opportunistically clean up any stale initializations to prevent resource leaks
         let stale = self
             .init_tracker
