@@ -162,7 +162,7 @@ done
 check_dependencies() {
     local missing=()
 
-    for cmd in curl jq unzip; do
+    for cmd in curl jq tar; do
         if ! command -v "$cmd" &> /dev/null; then
             missing+=("$cmd")
         fi
@@ -261,14 +261,14 @@ download_release() {
     local arch
     arch=$(detect_arch)
 
-    local asset_name="freenet-${arch}-linux.zip"
+    local asset_name="freenet-${arch}-unknown-linux-gnu.tar.gz"
     local download_url="https://github.com/$GITHUB_REPO/releases/download/v${version}/${asset_name}"
 
     log INFO "Downloading $asset_name from release v$version..."
     log DEBUG "URL: $download_url"
 
     mkdir -p "$DOWNLOAD_DIR"
-    local zip_path="$DOWNLOAD_DIR/$asset_name"
+    local tarball_path="$DOWNLOAD_DIR/$asset_name"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log INFO "[DRY RUN] Would download: $download_url"
@@ -276,20 +276,20 @@ download_release() {
     fi
 
     # Download with progress
-    if ! curl -L --progress-bar -o "$zip_path" "$download_url"; then
+    if ! curl -L --progress-bar -o "$tarball_path" "$download_url"; then
         log ERROR "Failed to download release"
         return 1
     fi
 
     # Verify download
-    if [[ ! -f "$zip_path" ]] || [[ ! -s "$zip_path" ]]; then
+    if [[ ! -f "$tarball_path" ]] || [[ ! -s "$tarball_path" ]]; then
         log ERROR "Downloaded file is missing or empty"
         return 1
     fi
 
     # Extract
     log INFO "Extracting binary..."
-    if ! unzip -o "$zip_path" -d "$DOWNLOAD_DIR"; then
+    if ! tar xzf "$tarball_path" -C "$DOWNLOAD_DIR"; then
         log ERROR "Failed to extract release"
         return 1
     fi
