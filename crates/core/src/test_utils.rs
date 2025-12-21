@@ -781,11 +781,16 @@ pub fn create_empty_delta_update() -> Vec<u8> {
     serde_json::to_vec(&operation).unwrap_or_default()
 }
 
-/// Creates a minimal valid state (single byte) for testing
+/// Creates a minimal valid state for testing
 ///
-/// Tests the lower bound of state size.
+/// Tests the lower bound of state size - the smallest valid TodoList.
 pub fn create_minimal_state() -> Vec<u8> {
-    vec![b'{', b'}'] // Minimal valid JSON
+    // Smallest valid TodoList: empty task array with version
+    let todo_list = TodoList {
+        tasks: vec![],
+        version: 1,
+    };
+    serde_json::to_vec(&todo_list).unwrap_or_default()
 }
 
 /// Creates a state with exactly the maximum allowed number of tasks
@@ -961,8 +966,18 @@ mod test {
     fn test_create_minimal_state() {
         let minimal = create_minimal_state();
 
-        assert_eq!(minimal.len(), 2, "Minimal state should be 2 bytes");
-        assert_eq!(minimal, vec![b'{', b'}'], "Should be empty JSON object");
+        // Minimal valid TodoList: {"tasks":[],"version":1}
+        assert!(
+            minimal.len() < 50,
+            "Minimal state should be small (got {} bytes)",
+            minimal.len()
+        );
+
+        // Verify it's valid JSON and deserializes correctly
+        let parsed: TodoList =
+            serde_json::from_slice(&minimal).expect("Minimal state should be valid TodoList JSON");
+        assert_eq!(parsed.tasks.len(), 0, "Should have no tasks");
+        assert_eq!(parsed.version, 1, "Should have version 1");
     }
 
     #[test]

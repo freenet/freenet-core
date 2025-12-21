@@ -19,9 +19,10 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 
-/// Test that minimal states (2 bytes) can be stored and retrieved
+/// Test that minimal states can be stored and retrieved
 ///
 /// Verifies the lower bound of contract state size handling.
+/// Uses the smallest valid TodoList: {"tasks":[],"version":1}
 #[freenet_test(
     nodes = ["gateway"],
     timeout_secs = 60,
