@@ -146,7 +146,7 @@ type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 pub struct PeerConnection<S = super::UdpSocket> {
     remote_conn: RemoteConnection<S>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
-    inbound_streams: HashMap<StreamId, FastSender<(u32, Vec<u8>)>>,
+    inbound_streams: HashMap<StreamId, FastSender<(u32, bytes::Bytes)>>,
     inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
     outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
     failure_count: usize,
@@ -775,7 +775,7 @@ impl<S: super::Socket> PeerConnection<S> {
     ) -> Result<Option<Vec<u8>>> {
         use SymmetricMessagePayload::*;
         match payload {
-            ShortMessage { payload } => Ok(Some(payload)),
+            ShortMessage { payload } => Ok(Some(payload.to_vec())),
             AckConnection { result: Err(cause) } => {
                 Err(TransportError::ConnectionEstablishmentFailure { cause })
             }
@@ -869,7 +869,7 @@ impl<S: super::Socket> PeerConnection<S> {
             packet_id,
             &self.remote_conn.outbound_symmetric_key,
             receipts,
-            symmetric_message::ShortMessage(data),
+            symmetric_message::ShortMessage(data.into()),
             &self.remote_conn.sent_tracker,
         )
         .await?;
@@ -884,7 +884,7 @@ impl<S: super::Socket> PeerConnection<S> {
                 self.remote_conn.last_packet_id.clone(),
                 self.remote_conn.socket.clone(),
                 self.remote_conn.remote_addr,
-                data,
+                data.into(),
                 self.remote_conn.outbound_symmetric_key.clone(),
                 self.remote_conn.sent_tracker.clone(),
                 self.remote_conn.token_bucket.clone(),
@@ -1150,7 +1150,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(sender)),
             remote_addr,
-            message.clone(),
+            bytes::Bytes::from(message.clone()),
             cipher.clone(),
             sent_tracker,
             token_bucket,

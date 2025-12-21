@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+pub mod allocation_overhead;
 pub mod blackbox;
 pub mod common; // Shared utilities for reducing duplication
 pub mod ledbat_validation;

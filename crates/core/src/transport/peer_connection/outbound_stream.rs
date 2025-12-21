@@ -2,9 +2,9 @@ use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
-use std::vec;
 
 use aes_gcm::Aes128Gcm;
+use bytes::Bytes;
 
 use crate::{
     transport::{
@@ -18,7 +18,9 @@ use crate::{
 
 use super::StreamId;
 
-pub(crate) type SerializedStream = Vec<u8>;
+/// Stream payload type using zero-copy Bytes for efficient fragmentation.
+/// Using Bytes::slice() instead of Vec::split_off() eliminates per-fragment allocations.
+pub(crate) type SerializedStream = Bytes;
 
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
 /// since we need to account for the space overhead of SymmetricMessage::StreamFragment metadata.
@@ -125,11 +127,13 @@ pub(super) async fn send_stream<S: super::super::Socket>(
             tokio::time::sleep(wait_time).await;
         }
 
-        let rest = {
+        // Zero-copy fragmentation using Bytes::slice()
+        // This avoids allocating a new Vec for each fragment
+        let fragment = {
             if stream_to_send.len() > MAX_DATA_SIZE {
-                let mut rest = stream_to_send.split_off(MAX_DATA_SIZE);
-                std::mem::swap(&mut stream_to_send, &mut rest);
-                rest
+                let fragment = stream_to_send.slice(..MAX_DATA_SIZE);
+                stream_to_send = stream_to_send.slice(MAX_DATA_SIZE..);
+                fragment
             } else {
                 std::mem::take(&mut stream_to_send)
             }
@@ -145,7 +149,7 @@ pub(super) async fn send_stream<S: super::super::Socket>(
                 stream_id,
                 total_length_bytes: total_length_bytes as u64,
                 fragment_number: next_fragment_number,
-                payload: rest,
+                payload: fragment,
             },
             &sent_packet_tracker,
         )
@@ -240,7 +244,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
-            message.clone(),
+            Bytes::from(message.clone()),
             cipher.clone(),
             sent_tracker,
             token_bucket,
@@ -330,7 +334,7 @@ mod tests {
             last_packet_id.clone(),
             Arc::new(TestSocket::new(outbound_sender)),
             destination_addr,
-            message.clone(),
+            Bytes::from(message.clone()),
             key.clone(),
             sent_tracker.clone(),
             token_bucket,
@@ -409,7 +413,7 @@ mod tests {
             last_packet_id.clone(),
             Arc::new(TestSocket::new(outbound_sender)),
             destination_addr,
-            message.clone(),
+            Bytes::from(message.clone()),
             key.clone(),
             sent_tracker.clone(),
             token_bucket,
