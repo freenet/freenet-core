@@ -1255,6 +1255,126 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // ============ Self-routing prevention tests (Priority 2) ============
+
+    /// Test that add_connection rejects own address
+    ///
+    /// Verifies the invariant that nodes cannot add connections to themselves.
+    /// This is enforced by the debug_assert in add_connection (line 521).
+    /// Regression test for issues #1806, #1786, #1781, #1827
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    #[cfg(debug_assertions)]
+    fn test_add_connection_rejects_own_address() {
+        let own_addr = make_addr(8000);
+        let cm = make_connection_manager(Some(own_addr), 1, 10, false);
+        let keypair = TransportKeypair::new();
+        let own_loc = Location::new(0.5);
+
+        // This should panic in debug mode due to the debug_assert
+        cm.add_connection(own_loc, own_addr, keypair.public().clone(), false);
+    }
+
+    /// Test that routing_candidates() respects requester parameter
+    ///
+    /// When a node receives a request from another peer, it should not route back
+    /// to the requester. This is handled by the `requesting` parameter.
+    /// Regression test for issues #1806, #1786
+    #[test]
+    fn test_routing_candidates_respects_requester() {
+        let own_addr = make_addr(8000);
+        let cm = make_connection_manager(Some(own_addr), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        // Add several peers
+        let requester_addr = make_addr(8001);
+        let requester_loc = Location::new(0.3);
+        cm.add_connection(
+            requester_loc,
+            requester_addr,
+            keypair.public().clone(),
+            false,
+        );
+
+        let peer2_addr = make_addr(8002);
+        let peer2_loc = Location::new(0.5);
+        cm.add_connection(peer2_loc, peer2_addr, keypair.public().clone(), false);
+
+        let peer3_addr = make_addr(8003);
+        let peer3_loc = Location::new(0.7);
+        cm.add_connection(peer3_loc, peer3_addr, keypair.public().clone(), false);
+
+        // Get routing candidates with requester specified
+        let empty_set: HashSet<SocketAddr> = HashSet::new();
+        let target = Location::new(0.5);
+        let candidates = cm.routing_candidates(target, Some(requester_addr), &empty_set);
+
+        // Should have 2 candidates (excluding requester)
+        assert_eq!(
+            candidates.len(),
+            2,
+            "routing_candidates should exclude requester"
+        );
+
+        // Verify requester is not in candidates
+        for peer in &candidates {
+            let addr = peer.socket_addr().expect("Peer should have address");
+            assert_ne!(
+                addr, requester_addr,
+                "routing_candidates must not include requester address"
+            );
+        }
+
+        // Verify other peers are included
+        let addrs: HashSet<SocketAddr> =
+            candidates.iter().filter_map(|p| p.socket_addr()).collect();
+        assert!(addrs.contains(&peer2_addr));
+        assert!(addrs.contains(&peer3_addr));
+    }
+
+    /// Test that should_accept rejects self-connection with various address formats
+    ///
+    /// Verifies self-connection rejection works for different address formats.
+    /// Extends the existing rejects_self_connection test.
+    #[test]
+    fn test_should_accept_rejects_own_addr_ipv6() {
+        let keypair = TransportKeypair::new();
+
+        // Test with IPv6 loopback
+        let ipv6_addr: SocketAddr = "[::1]:8000".parse().unwrap();
+        let cm = ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            1,
+            10,
+            7,
+            (
+                keypair.public().clone(),
+                Some(ipv6_addr),
+                AtomicU64::new(u64::from_le_bytes(0.5f64.to_le_bytes())),
+            ),
+            false,
+            10,
+            Duration::from_secs(60),
+        );
+
+        assert_eq!(cm.get_own_addr(), Some(ipv6_addr));
+        let location = Location::new(0.5);
+        let accepted = cm.should_accept(location, ipv6_addr);
+        assert!(
+            !accepted,
+            "should_accept must reject self-connection for IPv6 addresses"
+        );
+
+        // Verify different address is accepted
+        let other_addr: SocketAddr = "[::1]:8001".parse().unwrap();
+        let accepted_other = cm.should_accept(location, other_addr);
+        assert!(
+            accepted_other,
+            "should_accept must accept connection from different IPv6 address"
+        );
+    }
+
     // ============ get_connections_by_location tests ============
 
     #[test]

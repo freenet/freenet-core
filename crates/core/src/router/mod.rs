@@ -568,4 +568,60 @@ mod tests {
 
         peers
     }
+
+    // ============ Self-routing prevention support tests (Priority 2) ============
+
+    /// Test that select_peer returns None for empty candidate list
+    ///
+    /// This supports self-routing prevention: when all candidates are filtered out
+    /// (e.g., only self remains after filtering), routing should fail gracefully.
+    #[test]
+    fn test_select_peer_empty_candidates() {
+        let router = Router::new(&[]);
+        let empty_peers: Vec<PeerKeyLocation> = vec![];
+        let target = Location::random();
+
+        let result = router.select_peer(&empty_peers, target);
+        assert!(
+            result.is_none(),
+            "select_peer should return None for empty candidate list"
+        );
+    }
+
+    /// Test that select_k_best_peers handles empty candidate list
+    ///
+    /// When no valid routing candidates exist (e.g., all filtered due to self-exclusion),
+    /// should return empty result.
+    #[test]
+    fn test_select_k_best_empty_candidates() {
+        let router = Router::new(&[]).considering_n_closest_peers(5);
+        let empty_peers: Vec<PeerKeyLocation> = vec![];
+        let target = Location::random();
+
+        let result = router.select_closest_peers(&empty_peers, &target);
+        assert!(
+            result.is_empty(),
+            "select_closest_peers should return empty vec for empty candidates"
+        );
+    }
+
+    /// Test that select_peer works correctly with single candidate
+    ///
+    /// Ensures Router correctly handles the edge case where only one peer remains
+    /// after filtering (common when self + requester are excluded from small networks).
+    #[test]
+    fn test_select_peer_single_candidate() {
+        let router = Router::new(&[]);
+        let single_peer = PeerKeyLocation::random();
+        let peers = vec![single_peer.clone()];
+        let target = Location::random();
+
+        let result = router.select_peer(&peers, target);
+        assert!(result.is_some(), "Should select the only available peer");
+        assert_eq!(
+            *result.unwrap(),
+            single_peer,
+            "Should return the single candidate"
+        );
+    }
 }
