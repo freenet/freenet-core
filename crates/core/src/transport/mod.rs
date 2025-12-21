@@ -153,12 +153,15 @@ impl Socket for UdpSocket {
 mod tests {
     use super::*;
     use crate::transport::received_packet_tracker::ReportResult;
-    use crate::transport::sent_packet_tracker::{ResendAction, MESSAGE_CONFIRMATION_TIMEOUT};
+    use crate::transport::sent_packet_tracker::ResendAction;
 
     #[test]
     fn test_packet_send_receive_acknowledge_flow() {
         let mut sent_tracker = sent_packet_tracker::tests::mock_sent_packet_tracker();
         let mut received_tracker = received_packet_tracker::tests::mock_received_packet_tracker();
+
+        // Capture effective RTO before sending (packets use this for timeout)
+        let effective_rto = sent_tracker.effective_rto();
 
         // Simulate sending packets
         for id in 1..=5 {
@@ -179,9 +182,8 @@ mod tests {
         let _ = sent_tracker.report_received_receipts(&receipts);
 
         // Check resend action for lost packets
-        sent_tracker
-            .time_source
-            .advance_time(MESSAGE_CONFIRMATION_TIMEOUT);
+        // Packets now use effective_rto() for timeout (not MESSAGE_CONFIRMATION_TIMEOUT)
+        sent_tracker.time_source.advance_time(effective_rto);
         for id in [2, 4] {
             match sent_tracker.get_resend() {
                 ResendAction::Resend(packet_id, packet) => {
