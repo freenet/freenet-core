@@ -2,7 +2,7 @@
 use std::backtrace::Backtrace as StdTrace;
 use std::{pin::Pin, time::Duration};
 
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use futures::Future;
 use tokio::sync::mpsc::error::SendError;
 
@@ -433,7 +433,7 @@ fn start_subscription_request_internal(
     tokio::spawn(async move {
         tokio::task::yield_now().await;
 
-        let sub_op = subscribe::start_op_with_id(key, child_tx);
+        let sub_op = subscribe::start_op_with_id(*key.id(), child_tx);
 
         match subscribe::request_subscribe(&op_manager_cloned, sub_op).await {
             Ok(_) => {
@@ -456,18 +456,21 @@ fn start_subscription_request_internal(
     child_tx
 }
 
-async fn has_contract(op_manager: &OpManager, key: ContractKey) -> Result<bool, OpError> {
+async fn has_contract(
+    op_manager: &OpManager,
+    instance_id: ContractInstanceId,
+) -> Result<Option<ContractKey>, OpError> {
     match op_manager
         .notify_contract_handler(crate::contract::ContractHandlerEvent::GetQuery {
-            key,
+            instance_id,
             return_contract_code: false,
         })
         .await?
     {
         crate::contract::ContractHandlerEvent::GetResponse {
+            key,
             response: Ok(crate::contract::StoreResponse { state: Some(_), .. }),
-            ..
-        } => Ok(true),
-        _ => Ok(false),
+        } => Ok(key),
+        _ => Ok(None),
     }
 }

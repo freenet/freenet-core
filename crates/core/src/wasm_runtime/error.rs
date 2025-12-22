@@ -81,9 +81,6 @@ pub(crate) enum RuntimeInnerError {
     #[error(transparent)]
     ContractExecError(#[from] runtime::ContractExecError),
 
-    #[error("failed while unwrapping contract to raw bytes")]
-    UnwrapContract,
-
     // wasm runtime errors
     #[error(transparent)]
     WasmCompileError(#[from] wasmer::CompileError),

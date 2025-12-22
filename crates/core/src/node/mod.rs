@@ -19,7 +19,7 @@ use anyhow::Context;
 use either::Either;
 use freenet_stdlib::{
     client_api::{ClientRequest, ErrorKind},
-    prelude::ContractKey,
+    prelude::ContractInstanceId,
 };
 use std::{
     borrow::Cow,
@@ -1237,22 +1237,22 @@ async fn handle_pure_network_result(
 #[allow(dead_code)]
 pub async fn subscribe(
     op_manager: Arc<OpManager>,
-    key: ContractKey,
+    instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
 ) -> Result<Transaction, OpError> {
-    subscribe_with_id(op_manager, key, client_id, None).await
+    subscribe_with_id(op_manager, instance_id, client_id, None).await
 }
 
 /// Attempts to subscribe to a contract with a specific transaction ID (for deduplication)
 pub async fn subscribe_with_id(
     op_manager: Arc<OpManager>,
-    key: ContractKey,
+    instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
     transaction_id: Option<Transaction>,
 ) -> Result<Transaction, OpError> {
     let op = match transaction_id {
-        Some(id) => subscribe::start_op_with_id(key, id),
-        None => subscribe::start_op(key),
+        Some(id) => subscribe::start_op_with_id(instance_id, id),
+        None => subscribe::start_op(instance_id),
     };
     let id = op.id;
     if let Some(client_id) = client_id {
@@ -1261,7 +1261,7 @@ pub async fn subscribe_with_id(
         let request_id = RequestId::new();
         let _ = op_manager
             .ch_outbound
-            .waiting_for_subscription_result(id, *key.id(), client_id, request_id)
+            .waiting_for_subscription_result(id, instance_id, client_id, request_id)
             .await;
     }
     // Initialize a subscribe op.

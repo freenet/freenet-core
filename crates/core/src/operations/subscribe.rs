@@ -33,20 +33,20 @@ const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
 /// 5. Final verification of actual state
 async fn wait_for_contract_with_timeout(
     op_manager: &OpManager,
-    key: ContractKey,
+    instance_id: ContractInstanceId,
     timeout_ms: u64,
-) -> Result<bool, OpError> {
+) -> Result<Option<ContractKey>, OpError> {
     // Fast path - contract already exists
-    if super::has_contract(op_manager, key).await? {
-        return Ok(true);
+    if let Some(key) = super::has_contract(op_manager, instance_id).await? {
+        return Ok(Some(key));
     }
 
     // Register waiter BEFORE second check to avoid race condition
-    let notifier = op_manager.wait_for_contract(key);
+    let notifier = op_manager.wait_for_contract(instance_id);
 
     // Check again - contract may have arrived between first check and registration
-    if super::has_contract(op_manager, key).await? {
-        return Ok(true);
+    if let Some(key) = super::has_contract(op_manager, instance_id).await? {
+        return Ok(Some(key));
     }
 
     // Wait for notification or timeout (we don't care which triggers first)
@@ -56,30 +56,31 @@ async fn wait_for_contract_with_timeout(
     };
 
     // Always verify actual state - don't trust notification alone
-    super::has_contract(op_manager, key).await
+    super::has_contract(op_manager, instance_id).await
 }
 
 async fn fetch_contract_if_missing(
     op_manager: &OpManager,
-    key: ContractKey,
-) -> Result<(), OpError> {
-    if super::has_contract(op_manager, key).await? {
-        return Ok(());
+    instance_id: ContractInstanceId,
+) -> Result<Option<ContractKey>, OpError> {
+    if let Some(key) = super::has_contract(op_manager, instance_id).await? {
+        return Ok(Some(key));
     }
 
     // Start a GET operation to fetch the contract
-    let get_op = get::start_op(key, true, false);
+    let get_op = get::start_op(instance_id, true, false);
     get::request_get(op_manager, get_op, HashSet::new()).await?;
 
     // Wait for contract to arrive
-    wait_for_contract_with_timeout(op_manager, key, CONTRACT_WAIT_TIMEOUT_MS).await?;
-
-    Ok(())
+    wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
 }
 #[derive(Debug)]
 enum SubscribeState {
     /// Prepare the request to subscribe.
-    PrepareRequest { id: Transaction, key: ContractKey },
+    PrepareRequest {
+        id: Transaction,
+        instance_id: ContractInstanceId,
+    },
     /// Awaiting response from downstream peer.
     AwaitingResponse {
         /// The target we're sending to (for hop-by-hop routing)
@@ -103,9 +104,9 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
     }
 }
 
-pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
+pub(crate) fn start_op(instance_id: ContractInstanceId) -> SubscribeOp {
     let id = Transaction::new::<SubscribeMsg>();
-    let state = Some(SubscribeState::PrepareRequest { id, key });
+    let state = Some(SubscribeState::PrepareRequest { id, instance_id });
     SubscribeOp {
         id,
         state,
@@ -114,8 +115,8 @@ pub(crate) fn start_op(key: ContractKey) -> SubscribeOp {
 }
 
 /// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
-pub(crate) fn start_op_with_id(key: ContractKey, id: Transaction) -> SubscribeOp {
-    let state = Some(SubscribeState::PrepareRequest { id, key });
+pub(crate) fn start_op_with_id(instance_id: ContractInstanceId, id: Transaction) -> SubscribeOp {
+    let state = Some(SubscribeState::PrepareRequest { id, instance_id });
     SubscribeOp {
         id,
         state,
@@ -128,7 +129,7 @@ pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
 ) -> Result<(), OpError> {
-    let Some(SubscribeState::PrepareRequest { id, key }) = &sub_op.state else {
+    let Some(SubscribeState::PrepareRequest { id, instance_id }) = &sub_op.state else {
         return Err(OpError::UnexpectedOpState);
     };
 
@@ -137,10 +138,11 @@ pub(crate) async fn request_subscribe(
         .socket_addr()
         .expect("own location must have socket address");
 
-    tracing::debug!(tx = %id, %key, "subscribe: request_subscribe invoked");
+    tracing::debug!(tx = %id, contract = %instance_id, "subscribe: request_subscribe invoked");
 
-    // Check if we already have the contract locally
-    let has_contract_locally = super::has_contract(op_manager, *key).await?;
+    // Note: We don't check for local contract existence here because:
+    // 1. Even if we have it, we still need to register with network for updates
+    // 2. The lookup can happen later when processing the response
 
     // IMPORTANT: Even if we have the contract locally (e.g., from PUT forwarding),
     // we MUST send a Subscribe::Request to the network to register ourselves as a
@@ -157,17 +159,17 @@ pub(crate) async fn request_subscribe(
 
     let candidates = op_manager
         .ring
-        .k_closest_potentially_caching(key, &skip_list, 3);
+        .k_closest_potentially_caching(instance_id, &skip_list, 3);
 
     let Some(target) = candidates.first() else {
-        // No remote peers available - if we have contract locally, we can complete subscription locally
-        // This handles the case of a standalone node or when we're the only node with the contract
-        if has_contract_locally {
+        // No remote peers available - if we have contract locally, complete subscription locally.
+        // This handles the case of a standalone node or when we're the only node with the contract.
+        if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
             tracing::info!(tx = %id, contract = %key, phase = "complete", "Contract available locally and no remote peers, completing subscription locally");
-            return complete_local_subscription(op_manager, *id, *key).await;
+            return complete_local_subscription(op_manager, *id, key).await;
         }
-        tracing::warn!(tx = %id, contract = %key, phase = "error", "No remote peers available for subscription");
-        return Err(RingError::NoCachingPeers(*key).into());
+        tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
+        return Err(RingError::NoCachingPeers(*instance_id).into());
     };
 
     let target_addr = target
@@ -177,14 +179,14 @@ pub(crate) async fn request_subscribe(
 
     tracing::debug!(
         tx = %id,
-        %key,
+        contract = %instance_id,
         target_peer = %target_addr,
         "subscribe: forwarding Request to target peer"
     );
 
     let msg = SubscribeMsg::Request {
         id: *id,
-        key: *key,
+        instance_id: *instance_id,
         htl: op_manager.ring.max_hops_to_live,
         skip_list,
     };
@@ -342,20 +344,20 @@ impl Operation for SubscribeOp {
             match input {
                 SubscribeMsg::Request {
                     id,
-                    key,
+                    instance_id,
                     htl,
                     skip_list,
                 } => {
                     tracing::debug!(
                         tx = %id,
-                        %key,
+                        %instance_id,
                         htl,
                         requester_addr = ?self.requester_addr,
                         "subscribe: processing Request"
                     );
 
                     // Check if we have the contract
-                    if super::has_contract(op_manager, *key).await? {
+                    if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
                         // We have the contract - register upstream as subscriber and respond
                         if let Some(requester_addr) = self.requester_addr {
                             // Register the upstream peer as downstream subscriber (they want updates FROM us)
@@ -365,7 +367,7 @@ impl Operation for SubscribeOp {
                                 .get_peer_location_by_addr(requester_addr)
                             {
                                 let _ = op_manager.ring.add_downstream(
-                                    key,
+                                    &key,
                                     upstream_peer,
                                     Some(requester_addr.into()),
                                 );
@@ -375,7 +377,7 @@ impl Operation for SubscribeOp {
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
-                                    key: *key,
+                                    key,
                                     subscribed: true,
                                 })),
                                 next_hop: Some(requester_addr),
@@ -389,7 +391,7 @@ impl Operation for SubscribeOp {
                                 next_hop: None,
                                 state: Some(OpEnum::Subscribe(SubscribeOp {
                                     id: *id,
-                                    state: Some(SubscribeState::Completed { key: *key }),
+                                    state: Some(SubscribeState::Completed { key }),
                                     requester_addr: None,
                                 })),
                             });
@@ -397,8 +399,12 @@ impl Operation for SubscribeOp {
                     }
 
                     // Contract not found - wait briefly for in-flight PUT
-                    if wait_for_contract_with_timeout(op_manager, *key, CONTRACT_WAIT_TIMEOUT_MS)
-                        .await?
+                    if let Some(key) = wait_for_contract_with_timeout(
+                        op_manager,
+                        *instance_id,
+                        CONTRACT_WAIT_TIMEOUT_MS,
+                    )
+                    .await?
                     {
                         // Contract arrived - handle same as above
                         if let Some(requester_addr) = self.requester_addr {
@@ -408,7 +414,7 @@ impl Operation for SubscribeOp {
                                 .get_peer_location_by_addr(requester_addr)
                             {
                                 let _ = op_manager.ring.add_downstream(
-                                    key,
+                                    &key,
                                     upstream_peer,
                                     Some(requester_addr.into()),
                                 );
@@ -417,7 +423,7 @@ impl Operation for SubscribeOp {
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
-                                    key: *key,
+                                    key,
                                     subscribed: true,
                                 })),
                                 next_hop: Some(requester_addr),
@@ -430,7 +436,7 @@ impl Operation for SubscribeOp {
                                 next_hop: None,
                                 state: Some(OpEnum::Subscribe(SubscribeOp {
                                     id: *id,
-                                    state: Some(SubscribeState::Completed { key: *key }),
+                                    state: Some(SubscribeState::Completed { key }),
                                     requester_addr: None,
                                 })),
                             });
@@ -439,19 +445,9 @@ impl Operation for SubscribeOp {
 
                     // Contract still not found - try to forward
                     if *htl == 0 {
-                        tracing::warn!(tx = %id, contract = %key, htl = 0, phase = "error", "Subscribe request exhausted HTL");
-                        if let Some(requester_addr) = self.requester_addr {
-                            return Ok(OperationResult {
-                                return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                    id: *id,
-                                    key: *key,
-                                    subscribed: false,
-                                })),
-                                next_hop: Some(requester_addr),
-                                state: None,
-                            });
-                        }
-                        return Err(RingError::NoCachingPeers(*key).into());
+                        tracing::warn!(tx = %id, contract = %instance_id, htl = 0, phase = "error", "Subscribe request exhausted HTL");
+                        // Can't send a response without the full key - just return error
+                        return Err(RingError::NoCachingPeers(*instance_id).into());
                     }
 
                     // Find next hop
@@ -467,36 +463,26 @@ impl Operation for SubscribeOp {
                         new_skip_list.insert(requester);
                     }
 
-                    let candidates =
-                        op_manager
-                            .ring
-                            .k_closest_potentially_caching(key, &new_skip_list, 3);
+                    let candidates = op_manager.ring.k_closest_potentially_caching(
+                        instance_id,
+                        &new_skip_list,
+                        3,
+                    );
 
                     let Some(next_hop) = candidates.first() else {
                         // No forward target
-                        if let Some(requester_addr) = self.requester_addr {
-                            return Ok(OperationResult {
-                                return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                    id: *id,
-                                    key: *key,
-                                    subscribed: false,
-                                })),
-                                next_hop: Some(requester_addr),
-                                state: None,
-                            });
-                        }
-                        return Err(RingError::NoCachingPeers(*key).into());
+                        return Err(RingError::NoCachingPeers(*instance_id).into());
                     };
 
                     let next_addr = next_hop.socket_addr().expect("next hop address");
                     new_skip_list.insert(next_addr);
 
-                    tracing::debug!(tx = %id, %key, next = %next_addr, "Forwarding subscribe request");
+                    tracing::debug!(tx = %id, %instance_id, next = %next_addr, "Forwarding subscribe request");
 
                     Ok(OperationResult {
                         return_msg: Some(NetMessage::from(SubscribeMsg::Request {
                             id: *id,
-                            key: *key,
+                            instance_id: *instance_id,
                             htl: htl.saturating_sub(1),
                             skip_list: new_skip_list,
                         })),
@@ -527,7 +513,7 @@ impl Operation for SubscribeOp {
 
                     if *subscribed {
                         // Fetch contract if we don't have it
-                        fetch_contract_if_missing(op_manager, *key).await?;
+                        fetch_contract_if_missing(op_manager, *key.id()).await?;
 
                         // Register the sender as our upstream source
                         if let Some(sender_addr) = source_addr {
@@ -641,7 +627,8 @@ mod messages {
         /// Request to subscribe to a contract. Forwarded hop-by-hop toward contract location.
         Request {
             id: Transaction,
-            key: ContractKey,
+            /// Contract instance to subscribe to (full key not needed for routing)
+            instance_id: ContractInstanceId,
             /// Hops to live - decremented at each hop
             htl: usize,
             /// Addresses to skip when selecting next hop (prevents loops)
@@ -650,6 +637,7 @@ mod messages {
         /// Response indicating subscription result. Routed hop-by-hop back to originator.
         Response {
             id: Transaction,
+            /// Full contract key (includes code hash, resolved when contract is found)
             key: ContractKey,
             subscribed: bool,
         },
@@ -664,9 +652,8 @@ mod messages {
 
         fn requested_location(&self) -> Option<Location> {
             match self {
-                Self::Request { key, .. } | Self::Response { key, .. } => {
-                    Some(Location::from(key.id()))
-                }
+                Self::Request { instance_id, .. } => Some(Location::from(instance_id)),
+                Self::Response { key, .. } => Some(Location::from(key.id())),
             }
         }
     }
@@ -675,7 +662,9 @@ mod messages {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             let id = self.id();
             match self {
-                Self::Request { key, .. } => write!(f, "Subscribe::Request(id: {id}, key: {key})"),
+                Self::Request { instance_id, .. } => {
+                    write!(f, "Subscribe::Request(id: {id}, contract: {instance_id})")
+                }
                 Self::Response {
                     key, subscribed, ..
                 } => {

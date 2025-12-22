@@ -90,7 +90,6 @@ mod tests {
     use super::*;
     use crate::operations::get;
     use crate::operations::OpEnum;
-    use freenet_stdlib::prelude::ContractKey;
     use tokio::sync::mpsc;
 
     fn create_test_transaction() -> Transaction {
@@ -99,8 +98,8 @@ mod tests {
 
     fn create_success_host_result() -> Option<HostResult> {
         use freenet_stdlib::prelude::ContractInstanceId;
-        let key = ContractKey::from(ContractInstanceId::new([1u8; 32]));
-        let get_op = get::start_op(key, false, false);
+        let instance_id = ContractInstanceId::new([1u8; 32]);
+        let get_op = get::start_op(instance_id, false, false);
         Some(OpEnum::Get(get_op).to_host_result())
     }
 

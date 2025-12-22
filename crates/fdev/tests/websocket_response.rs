@@ -27,7 +27,9 @@ async fn test_websocket_client_waits_for_put_response() {
     let port = PORT.fetch_add(1, Ordering::SeqCst);
 
     // Create a mock contract key for the response (base58 encoded)
-    let mock_key = ContractKey::from_id("11111111111111111111111111111111").expect("valid key");
+    let instance_id = ContractInstanceId::try_from("11111111111111111111111111111111".to_string())
+        .expect("valid id");
+    let mock_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
     let response: HostResponse<WrappedState> =
         HostResponse::ContractResponse(ContractResponse::PutResponse { key: mock_key });
 

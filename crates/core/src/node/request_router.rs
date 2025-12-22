@@ -10,7 +10,7 @@ use crate::{
     message::Transaction,
 };
 use dashmap::DashMap;
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use tracing::{debug, info};
@@ -19,8 +19,9 @@ use tracing::{debug, info};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestResource {
     /// GET requests with their parameters that affect the result
+    /// Uses instance_id since clients may not know the full key
     Get {
-        key: ContractKey,
+        key: ContractInstanceId,
         return_contract_code: bool,
         subscribe: bool,
     },
@@ -33,7 +34,8 @@ pub enum RequestResource {
         subscribe: bool,
     },
     /// SUBSCRIBE requests - multiple clients subscribing to same contract should be deduplicated
-    Subscribe { key: ContractKey },
+    /// Uses instance_id since clients may not know the full key
+    Subscribe { key: ContractInstanceId },
     /// UPDATE requests with their parameters that affect the operation
     Update {
         key: ContractKey,
@@ -145,7 +147,8 @@ impl Hash for RequestResource {
 #[derive(Debug, Clone)]
 pub enum DeduplicatedRequest {
     Get {
-        key: ContractKey,
+        /// Client requests use instance_id since they may not know the full key
+        key: ContractInstanceId,
         return_contract_code: bool,
         subscribe: bool,
         client_id: ClientId,
@@ -164,7 +167,8 @@ pub enum DeduplicatedRequest {
     /// race conditions with instant-completion. Kept for potential future use.
     #[allow(dead_code)]
     Subscribe {
-        key: ContractKey,
+        /// Uses instance_id since clients may not know the full key
+        key: ContractInstanceId,
         client_id: ClientId,
         request_id: RequestId,
     },
@@ -342,13 +346,17 @@ impl RequestRouter {
 mod tests {
     use super::*;
     use freenet_stdlib::prelude::{
-        ContractCode, ContractContainer, ContractInstanceId, ContractWasmAPIVersion, Parameters,
-        RelatedContracts, WrappedContract, WrappedState,
+        CodeHash, ContractCode, ContractContainer, ContractInstanceId, ContractWasmAPIVersion,
+        Parameters, RelatedContracts, WrappedContract, WrappedState,
     };
     use std::sync::Arc;
 
+    fn create_test_instance_id() -> ContractInstanceId {
+        ContractInstanceId::new([1u8; 32])
+    }
+
     fn create_test_contract_key() -> ContractKey {
-        ContractInstanceId::new([1u8; 32]).into()
+        ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
     }
 
     fn create_test_contract() -> ContractContainer {
@@ -381,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_request_deduplication() {
         let router = RequestRouter::new();
-        let key = create_test_contract_key();
+        let instance_id = create_test_instance_id();
         let client_id_1 = ClientId::next();
         let client_id_2 = ClientId::next();
         let request_id_1 = RequestId::new();
@@ -389,7 +397,7 @@ mod tests {
 
         // First GET request
         let request_1 = DeduplicatedRequest::Get {
-            key,
+            key: instance_id,
             return_contract_code: true,
             subscribe: false,
             client_id: client_id_1,
@@ -398,7 +406,7 @@ mod tests {
 
         // Identical GET request from different client
         let request_2 = DeduplicatedRequest::Get {
-            key,
+            key: instance_id,
             return_contract_code: true,
             subscribe: false,
             client_id: client_id_2,
@@ -418,14 +426,14 @@ mod tests {
     #[tokio::test]
     async fn test_get_request_different_parameters_no_deduplication() {
         let router = RequestRouter::new();
-        let key = create_test_contract_key();
+        let instance_id = create_test_instance_id();
         let client_id = create_test_client_id();
         let request_id_1 = RequestId::new();
         let request_id_2 = RequestId::new();
 
         // GET request with return_contract_code=true
         let request_1 = DeduplicatedRequest::Get {
-            key,
+            key: instance_id,
             return_contract_code: true,
             subscribe: false,
             client_id,
@@ -434,7 +442,7 @@ mod tests {
 
         // GET request with return_contract_code=false (different result expected)
         let request_2 = DeduplicatedRequest::Get {
-            key,
+            key: instance_id,
             return_contract_code: false,
             subscribe: false,
             client_id,
@@ -451,16 +459,16 @@ mod tests {
 
     #[test]
     fn test_request_resource_hash_consistency() {
-        let key = create_test_contract_key();
+        let instance_id = create_test_instance_id();
 
         // Same GET requests should have same hash
         let get_1 = RequestResource::Get {
-            key,
+            key: instance_id,
             return_contract_code: true,
             subscribe: false,
         };
         let get_2 = RequestResource::Get {
-            key,
+            key: instance_id,
             return_contract_code: true,
             subscribe: false,
         };
@@ -469,7 +477,7 @@ mod tests {
 
         // Different parameters should have different hashes
         let get_3 = RequestResource::Get {
-            key,
+            key: instance_id,
             return_contract_code: false, // Different parameter
             subscribe: false,
         };
@@ -607,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_request_deduplication() {
         let router = RequestRouter::new();
-        let key = create_test_contract_key();
+        let instance_id = create_test_instance_id();
         let client_id_1 = ClientId::next();
         let client_id_2 = ClientId::next();
         let request_id_1 = RequestId::new();
@@ -615,14 +623,14 @@ mod tests {
 
         // First SUBSCRIBE request
         let request_1 = DeduplicatedRequest::Subscribe {
-            key,
+            key: instance_id,
             client_id: client_id_1,
             request_id: request_id_1,
         };
 
         // Identical SUBSCRIBE request from different client (should be deduplicated)
         let request_2 = DeduplicatedRequest::Subscribe {
-            key,
+            key: instance_id,
             client_id: client_id_2,
             request_id: request_id_2,
         };
@@ -640,22 +648,22 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_different_contract_no_deduplication() {
         let router = RequestRouter::new();
-        let key1 = create_test_contract_key();
-        let key2 = ContractInstanceId::new([2u8; 32]).into(); // Different contract
+        let instance_id_1 = create_test_instance_id();
+        let instance_id_2 = ContractInstanceId::new([2u8; 32]); // Different contract
         let client_id = create_test_client_id();
         let request_id_1 = RequestId::new();
         let request_id_2 = RequestId::new();
 
         // SUBSCRIBE request for first contract
         let request_1 = DeduplicatedRequest::Subscribe {
-            key: key1,
+            key: instance_id_1,
             client_id,
             request_id: request_id_1,
         };
 
         // SUBSCRIBE request for different contract (should not be deduplicated)
         let request_2 = DeduplicatedRequest::Subscribe {
-            key: key2,
+            key: instance_id_2,
             client_id,
             request_id: request_id_2,
         };
@@ -757,7 +765,10 @@ mod tests {
     async fn test_update_request_different_contract_no_deduplication() {
         let router = RequestRouter::new();
         let key1 = create_test_contract_key();
-        let key2 = ContractInstanceId::new([3u8; 32]).into(); // Different contract
+        let key2 = ContractKey::from_id_and_code(
+            ContractInstanceId::new([3u8; 32]),
+            CodeHash::new([4u8; 32]),
+        ); // Different contract
         let related_contracts = create_test_related_contracts();
         let new_state = create_test_wrapped_state();
         let update_data = freenet_stdlib::prelude::UpdateData::State(
@@ -795,25 +806,26 @@ mod tests {
 
     #[test]
     fn test_all_operation_types_resource_hash_consistency() {
+        let instance_id = create_test_instance_id();
         let key = create_test_contract_key();
         let related_contracts = create_test_related_contracts();
         let state = create_test_wrapped_state();
 
         // Same operations should have same hashes
         let get_1 = RequestResource::Get {
-            key,
+            key: instance_id,
             return_contract_code: true,
             subscribe: false,
         };
         let get_2 = RequestResource::Get {
-            key,
+            key: instance_id,
             return_contract_code: true,
             subscribe: false,
         };
         assert_eq!(get_1, get_2);
 
-        let subscribe_1 = RequestResource::Subscribe { key };
-        let subscribe_2 = RequestResource::Subscribe { key };
+        let subscribe_1 = RequestResource::Subscribe { key: instance_id };
+        let subscribe_2 = RequestResource::Subscribe { key: instance_id };
         assert_eq!(subscribe_1, subscribe_2);
 
         let update_data = freenet_stdlib::prelude::UpdateData::State(
@@ -838,7 +850,7 @@ mod tests {
 
         // Same operation type with different parameters should have different hashes
         let subscribe_different = RequestResource::Subscribe {
-            key: ContractInstanceId::new([4u8; 32]).into(),
+            key: ContractInstanceId::new([4u8; 32]),
         };
         assert_ne!(subscribe_1, subscribe_different);
 

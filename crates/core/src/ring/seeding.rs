@@ -4,7 +4,7 @@ use crate::node::PeerId;
 use crate::transport::ObservedAddr;
 use crate::util::time_source::InstantTimeSrc;
 use dashmap::DashMap;
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use tracing::{debug, info, warn};
@@ -96,7 +96,7 @@ pub(crate) struct SeedingManager {
     /// Contracts where a local client (WebSocket) is actively subscribed.
     /// Prevents upstream unsubscribe while client subscriptions exist, even if
     /// all network downstream peers have disconnected.
-    client_subscriptions: DashMap<ContractKey, HashSet<crate::client_events::ClientId>>,
+    client_subscriptions: DashMap<ContractInstanceId, HashSet<crate::client_events::ClientId>>,
 
     /// LRU cache of contracts this peer is seeding, with byte-budget awareness.
     seeding_cache: RwLock<SeedingCache<InstantTimeSrc>>,
@@ -238,15 +238,15 @@ impl SeedingManager {
     /// Register a client subscription for a contract (WebSocket client subscribed).
     pub fn add_client_subscription(
         &self,
-        contract: &ContractKey,
+        instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
     ) {
         self.client_subscriptions
-            .entry(*contract)
+            .entry(*instance_id)
             .or_default()
             .insert(client_id);
         debug!(
-            %contract,
+            contract = %instance_id,
             %client_id,
             "add_client_subscription: registered client subscription"
         );
@@ -256,12 +256,12 @@ impl SeedingManager {
     /// Returns true if this was the last client subscription for this contract.
     pub fn remove_client_subscription(
         &self,
-        contract: &ContractKey,
+        instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
     ) -> bool {
         let mut no_more_subscriptions = false;
 
-        if let Some(mut clients) = self.client_subscriptions.get_mut(contract) {
+        if let Some(mut clients) = self.client_subscriptions.get_mut(instance_id) {
             clients.remove(&client_id);
             if clients.is_empty() {
                 no_more_subscriptions = true;
@@ -269,11 +269,11 @@ impl SeedingManager {
         }
 
         if no_more_subscriptions {
-            self.client_subscriptions.remove(contract);
+            self.client_subscriptions.remove(instance_id);
         }
 
         debug!(
-            %contract,
+            contract = %instance_id,
             %client_id,
             no_more_client_subscriptions = no_more_subscriptions,
             "remove_client_subscription: removed client subscription"
@@ -283,9 +283,9 @@ impl SeedingManager {
     }
 
     /// Check if there are any client subscriptions for a contract.
-    pub fn has_client_subscriptions(&self, contract: &ContractKey) -> bool {
+    pub fn has_client_subscriptions(&self, instance_id: &ContractInstanceId) -> bool {
         self.client_subscriptions
-            .get(contract)
+            .get(instance_id)
             .map(|clients| !clients.is_empty())
             .unwrap_or(false)
     }
@@ -305,41 +305,52 @@ impl SeedingManager {
     ) -> Vec<(ContractKey, PeerKeyLocation)> {
         let mut notifications = Vec::new();
 
-        // Find all contracts where this client is subscribed
-        let contracts_with_client: Vec<ContractKey> = self
+        // Find all contracts (by instance_id) where this client is subscribed
+        let instance_ids_with_client: Vec<ContractInstanceId> = self
             .client_subscriptions
             .iter()
             .filter(|entry| entry.value().contains(&client_id))
             .map(|entry| *entry.key())
             .collect();
 
-        for contract in contracts_with_client {
+        for instance_id in instance_ids_with_client {
             // Remove client from this contract's subscriptions
-            let was_last_client = self.remove_client_subscription(&contract, client_id);
+            let was_last_client = self.remove_client_subscription(&instance_id, client_id);
 
             if was_last_client {
-                // Check if we need to prune upstream
-                if let Some(subs) = self.subscriptions.get(&contract) {
-                    let has_downstream = subs.iter().any(|e| e.role == SubscriberType::Downstream);
+                // Find the full ContractKey in subscriptions that matches this instance_id
+                // (subscriptions are keyed by ContractKey, client_subscriptions by ContractInstanceId)
+                let matching_contract: Option<ContractKey> = self
+                    .subscriptions
+                    .iter()
+                    .find(|entry| *entry.key().id() == instance_id)
+                    .map(|entry| *entry.key());
 
-                    if !has_downstream {
-                        // No downstream and no clients - need to notify upstream
-                        if let Some(upstream) = subs
-                            .iter()
-                            .find(|e| e.role == SubscriberType::Upstream)
-                            .map(|e| e.peer.clone())
-                        {
-                            info!(
-                                %contract,
-                                %client_id,
-                                "remove_client_from_all_subscriptions: client disconnect triggers pruning"
-                            );
-                            notifications.push((contract, upstream));
+                if let Some(contract) = matching_contract {
+                    // Check if we need to prune upstream
+                    if let Some(subs) = self.subscriptions.get(&contract) {
+                        let has_downstream =
+                            subs.iter().any(|e| e.role == SubscriberType::Downstream);
+
+                        if !has_downstream {
+                            // No downstream and no clients - need to notify upstream
+                            if let Some(upstream) = subs
+                                .iter()
+                                .find(|e| e.role == SubscriberType::Upstream)
+                                .map(|e| e.peer.clone())
+                            {
+                                info!(
+                                    %contract,
+                                    %client_id,
+                                    "remove_client_from_all_subscriptions: client disconnect triggers pruning"
+                                );
+                                notifications.push((contract, upstream));
+                            }
+
+                            // Clean up the subscription entry
+                            drop(subs);
+                            self.subscriptions.remove(&contract);
                         }
-
-                        // Clean up the subscription entry
-                        drop(subs);
-                        self.subscriptions.remove(&contract);
                     }
                 }
             }
@@ -381,7 +392,7 @@ impl SeedingManager {
                 // Only check for pruning if we removed a downstream subscriber
                 if removed.role == SubscriberType::Downstream {
                     let has_downstream = subs.iter().any(|e| e.role == SubscriberType::Downstream);
-                    let has_client = self.has_client_subscriptions(contract);
+                    let has_client = self.has_client_subscriptions(contract.id());
 
                     if !has_downstream && !has_client {
                         // Find upstream to notify
@@ -439,7 +450,7 @@ impl SeedingManager {
                     if removed.role == SubscriberType::Downstream {
                         let has_downstream =
                             subs.iter().any(|e| e.role == SubscriberType::Downstream);
-                        let has_client = self.has_client_subscriptions(&contract);
+                        let has_client = self.has_client_subscriptions(contract.id());
 
                         if !has_downstream && !has_client {
                             if let Some(upstream) = subs
@@ -525,7 +536,7 @@ impl SeedingManager {
 mod tests {
     use super::*;
     use crate::transport::TransportKeypair;
-    use freenet_stdlib::prelude::ContractInstanceId;
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn test_peer_id(id: u8) -> PeerId {
@@ -543,7 +554,10 @@ mod tests {
     }
 
     fn make_contract_key(seed: u8) -> ContractKey {
-        ContractKey::from(ContractInstanceId::new([seed; 32]))
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([seed; 32]),
+            CodeHash::new([seed.wrapping_add(1); 32]),
+        )
     }
 
     #[test]
@@ -661,14 +675,14 @@ mod tests {
         let contract = make_contract_key(1);
         let client_id = crate::client_events::ClientId::next();
 
-        assert!(!manager.has_client_subscriptions(&contract));
+        assert!(!manager.has_client_subscriptions(contract.id()));
 
-        manager.add_client_subscription(&contract, client_id);
-        assert!(manager.has_client_subscriptions(&contract));
+        manager.add_client_subscription(contract.id(), client_id);
+        assert!(manager.has_client_subscriptions(contract.id()));
 
-        let no_more = manager.remove_client_subscription(&contract, client_id);
+        let no_more = manager.remove_client_subscription(contract.id(), client_id);
         assert!(no_more);
-        assert!(!manager.has_client_subscriptions(&contract));
+        assert!(!manager.has_client_subscriptions(contract.id()));
     }
 
     #[test]
@@ -678,16 +692,16 @@ mod tests {
         let client1 = crate::client_events::ClientId::next();
         let client2 = crate::client_events::ClientId::next();
 
-        manager.add_client_subscription(&contract, client1);
-        manager.add_client_subscription(&contract, client2);
+        manager.add_client_subscription(contract.id(), client1);
+        manager.add_client_subscription(contract.id(), client2);
 
-        let no_more = manager.remove_client_subscription(&contract, client1);
+        let no_more = manager.remove_client_subscription(contract.id(), client1);
         assert!(!no_more); // Still has client2
-        assert!(manager.has_client_subscriptions(&contract));
+        assert!(manager.has_client_subscriptions(contract.id()));
 
-        let no_more = manager.remove_client_subscription(&contract, client2);
+        let no_more = manager.remove_client_subscription(contract.id(), client2);
         assert!(no_more);
-        assert!(!manager.has_client_subscriptions(&contract));
+        assert!(!manager.has_client_subscriptions(contract.id()));
     }
 
     #[test]
@@ -733,13 +747,13 @@ mod tests {
                 None
             )
             .is_ok());
-        manager.add_client_subscription(&contract, client_id);
+        manager.add_client_subscription(contract.id(), client_id);
 
         let result = manager.remove_subscriber(&contract, &downstream);
 
         // Should NOT notify upstream because client subscription exists
         assert!(result.notify_upstream.is_none());
-        assert!(manager.has_client_subscriptions(&contract));
+        assert!(manager.has_client_subscriptions(contract.id()));
     }
 
     #[test]
@@ -841,7 +855,7 @@ mod tests {
             .is_ok());
 
         // Add client subscription only to contract1
-        manager.add_client_subscription(&contract1, client_id);
+        manager.add_client_subscription(contract1.id(), client_id);
 
         let loc = downstream.location().unwrap();
         let result = manager.prune_subscriptions_for_peer(loc);
@@ -903,11 +917,11 @@ mod tests {
         // Setup: client subscribed to 2 contracts
         manager.set_upstream(&contract1, upstream1.clone());
         manager.set_upstream(&contract2, upstream2.clone());
-        manager.add_client_subscription(&contract1, client_id);
-        manager.add_client_subscription(&contract2, client_id);
+        manager.add_client_subscription(contract1.id(), client_id);
+        manager.add_client_subscription(contract2.id(), client_id);
 
-        assert!(manager.has_client_subscriptions(&contract1));
-        assert!(manager.has_client_subscriptions(&contract2));
+        assert!(manager.has_client_subscriptions(contract1.id()));
+        assert!(manager.has_client_subscriptions(contract2.id()));
 
         // Remove client from all subscriptions
         let notifications = manager.remove_client_from_all_subscriptions(client_id);
@@ -916,8 +930,8 @@ mod tests {
         assert_eq!(notifications.len(), 2);
 
         // Client subscriptions should be gone
-        assert!(!manager.has_client_subscriptions(&contract1));
-        assert!(!manager.has_client_subscriptions(&contract2));
+        assert!(!manager.has_client_subscriptions(contract1.id()));
+        assert!(!manager.has_client_subscriptions(contract2.id()));
     }
 
     #[test]
@@ -935,19 +949,19 @@ mod tests {
 
         // Setup contract1: only client subscription
         manager.set_upstream(&contract1, upstream1.clone());
-        manager.add_client_subscription(&contract1, client_id);
+        manager.add_client_subscription(contract1.id(), client_id);
 
         // Setup contract2: client + downstream
         manager.set_upstream(&contract2, upstream2.clone());
         assert!(manager
             .add_downstream(&contract2, downstream2.clone(), None)
             .is_ok());
-        manager.add_client_subscription(&contract2, client_id);
+        manager.add_client_subscription(contract2.id(), client_id);
 
         // Setup contract3: client + other client
         manager.set_upstream(&contract3, upstream3.clone());
-        manager.add_client_subscription(&contract3, client_id);
-        manager.add_client_subscription(&contract3, other_client);
+        manager.add_client_subscription(contract3.id(), client_id);
+        manager.add_client_subscription(contract3.id(), other_client);
 
         // Remove client from all
         let notifications = manager.remove_client_from_all_subscriptions(client_id);
@@ -961,7 +975,7 @@ mod tests {
         assert!(!manager.get_downstream(&contract2).is_empty());
 
         // contract3 should still have other_client
-        assert!(manager.has_client_subscriptions(&contract3));
+        assert!(manager.has_client_subscriptions(contract3.id()));
     }
 
     #[test]

@@ -5,7 +5,6 @@ use freenet_stdlib::prelude::*;
 use stretto::Cache;
 
 use super::{
-    error::RuntimeInnerError,
     store::{SafeWriter, StoreFsManagement},
     RuntimeResult,
 };
@@ -70,18 +69,11 @@ impl ContractStore {
         key: &ContractKey,
         params: &Parameters<'_>,
     ) -> Option<ContractContainer> {
-        let result = key
-            .code_hash()
-            .and_then(|code_hash| {
-                self.contract_cache.get(code_hash).map(|data| {
-                    Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-                        WrappedContract::new(data.value().clone(), params.clone().into_owned()),
-                    )))
-                })
-            })
-            .flatten();
-        if result.is_some() {
-            return result;
+        let code_hash = key.code_hash();
+        if let Some(data) = self.contract_cache.get(code_hash) {
+            return Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                WrappedContract::new(data.value().clone(), params.clone().into_owned()),
+            )));
         }
 
         self.key_to_code_part.get(key.id()).and_then(|key| {
@@ -118,10 +110,7 @@ impl ContractStore {
             }
             _ => unimplemented!(),
         };
-        let code_hash = key.code_hash().ok_or_else(|| {
-            tracing::warn!("trying to store partially unspecified contract `{}`", key);
-            RuntimeInnerError::UnwrapContract
-        })?;
+        let code_hash = key.code_hash();
         if self.contract_cache.get(code_hash).is_some() {
             return Ok(());
         }
@@ -197,25 +186,13 @@ impl ContractStore {
     }
 
     pub fn get_contract_path(&mut self, key: &ContractKey) -> RuntimeResult<PathBuf> {
-        let contract_hash = match key.code_hash() {
-            Some(k) => *k,
-            None => self.code_hash_from_key(key).ok_or_else(|| {
-                tracing::warn!("trying to get partially unspecified contract `{key}`");
-                RuntimeInnerError::UnwrapContract
-            })?,
-        };
+        let contract_hash = *key.code_hash();
         let key_path = contract_hash.encode();
         Ok(self.contracts_dir.join(key_path).with_extension("wasm"))
     }
 
     pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
-        let contract_hash = match key.code_hash() {
-            Some(k) => *k,
-            None => self.code_hash_from_key(key).ok_or_else(|| {
-                tracing::warn!("trying to get partially unspecified contract `{key}`");
-                RuntimeInnerError::UnwrapContract
-            })?,
-        };
+        let contract_hash = *key.code_hash();
         if let Some((_, (offset, _))) = self.key_to_code_part.remove(key.id()) {
             Self::remove(&self.key_file, offset)?;
         }
@@ -229,6 +206,12 @@ impl ContractStore {
 
     pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<CodeHash> {
         self.key_to_code_part.get(key.id()).map(|r| r.value().1)
+    }
+
+    /// Look up the code hash for a contract given only its instance ID.
+    /// Used when clients request contracts without knowing the code hash.
+    pub fn code_hash_from_id(&self, id: &ContractInstanceId) -> Option<CodeHash> {
+        self.key_to_code_part.get(id).map(|r| r.value().1)
     }
 }
 
@@ -357,7 +340,7 @@ mod test {
             [30, 40].as_ref().into(),
         );
         let key = *contract.key();
-        let code_hash = key.code_hash().unwrap();
+        let code_hash = key.code_hash();
         let params: Parameters = [30, 40].as_ref().into();
 
         // Manually create the WASM file on disk (simulating a crash scenario

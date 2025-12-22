@@ -462,7 +462,7 @@ pub(crate) enum NodeEvent {
 
 #[derive(Debug, Clone)]
 pub struct SubscriptionInfo {
-    pub contract_key: ContractKey,
+    pub instance_id: ContractInstanceId,
     pub client_id: ClientId,
     pub last_update: Option<std::time::SystemTime>,
 }

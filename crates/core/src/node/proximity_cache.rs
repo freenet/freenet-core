@@ -242,14 +242,14 @@ impl ProximityCacheManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet_stdlib::prelude::ContractInstanceId;
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
 
     fn test_contract_key() -> ContractKey {
-        ContractKey::from(ContractInstanceId::new([1u8; 32]))
+        ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
     }
 
     fn test_contract_key_2() -> ContractKey {
-        ContractKey::from(ContractInstanceId::new([2u8; 32]))
+        ContractKey::from_id_and_code(ContractInstanceId::new([3u8; 32]), CodeHash::new([4u8; 32]))
     }
 
     #[test]

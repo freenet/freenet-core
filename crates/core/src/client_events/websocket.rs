@@ -162,7 +162,7 @@ impl WebSocketProxy {
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                         if let Some(ch) = self.response_channels.get(&client_id) {
                             ch.send(HostCallbackResult::SubscriptionChannel {
-                                key: contract.key(),
+                                key: *contract.key().id(),
                                 id: client_id,
                                 callback: rx,
                             })
@@ -489,7 +489,7 @@ async fn new_client_connection(
 }
 
 struct NewSubscription {
-    key: ContractKey,
+    key: ContractInstanceId,
     callback: mpsc::UnboundedReceiver<HostResult>,
 }
 

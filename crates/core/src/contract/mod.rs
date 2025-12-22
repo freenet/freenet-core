@@ -37,75 +37,114 @@ where
         );
         match event {
             ContractHandlerEvent::GetQuery {
-                key,
+                instance_id,
                 return_contract_code,
             } => {
-                match contract_handler
-                    .executor()
-                    .fetch_contract(key, return_contract_code)
-                    .instrument(tracing::info_span!("fetch_contract", %key, %return_contract_code))
-                    .await
-                {
-                    Ok((state, contract)) => {
-                        tracing::debug!(
-                            contract = %key,
-                            with_contract_code = return_contract_code,
-                            has_contract = contract.is_some(),
-                            has_state = state.is_some(),
-                            phase = "get_complete",
-                            "Fetched contract"
-                        );
-                        // Send response back to caller. If the caller disconnected, just log and continue.
-                        if let Err(error) = contract_handler
-                            .channel()
-                            .send_to_sender(
-                                id,
-                                ContractHandlerEvent::GetResponse {
-                                    key,
-                                    response: Ok(StoreResponse { state, contract }),
-                                },
+                // Look up the full key from the instance_id
+                let key = contract_handler.executor().lookup_key(&instance_id);
+                match key {
+                    Some(key) => {
+                        match contract_handler
+                            .executor()
+                            .fetch_contract(key, return_contract_code)
+                            .instrument(
+                                tracing::info_span!("fetch_contract", %key, %return_contract_code),
                             )
                             .await
                         {
-                            tracing::debug!(
-                                error = %error,
-                                contract = %key,
-                                "Failed to send GET response (client may have disconnected)"
-                            );
+                            Ok((state, contract)) => {
+                                tracing::debug!(
+                                    contract = %key,
+                                    with_contract_code = return_contract_code,
+                                    has_contract = contract.is_some(),
+                                    has_state = state.is_some(),
+                                    phase = "get_complete",
+                                    "Fetched contract"
+                                );
+                                // Send response back to caller. If the caller disconnected, just log and continue.
+                                if let Err(error) = contract_handler
+                                    .channel()
+                                    .send_to_sender(
+                                        id,
+                                        ContractHandlerEvent::GetResponse {
+                                            key: Some(key),
+                                            response: Ok(StoreResponse { state, contract }),
+                                        },
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        error = %error,
+                                        contract = %key,
+                                        "Failed to send GET response (client may have disconnected)"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "get_failed",
+                                    "Error executing get contract query"
+                                );
+                                if err.is_fatal() {
+                                    tracing::error!(
+                                        contract = %key,
+                                        error = %err,
+                                        phase = "fatal_error",
+                                        "Fatal executor error during get query"
+                                    );
+                                    return Err(ContractError::FatalExecutorError {
+                                        key,
+                                        error: err,
+                                    });
+                                }
+                                // Send error response back to caller. If the caller disconnected, just log and continue.
+                                if let Err(error) = contract_handler
+                                    .channel()
+                                    .send_to_sender(
+                                        id,
+                                        ContractHandlerEvent::GetResponse {
+                                            key: Some(key),
+                                            response: Err(err),
+                                        },
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        error = %error,
+                                        contract = %key,
+                                        "Failed to send GET error response (client may have disconnected)"
+                                    );
+                                }
+                            }
                         }
                     }
-                    Err(err) => {
-                        tracing::warn!(
-                            contract = %key,
-                            error = %err,
-                            phase = "get_failed",
-                            "Error executing get contract query"
+                    None => {
+                        // Contract not found locally - return None for key
+                        tracing::debug!(
+                            instance_id = %instance_id,
+                            phase = "not_found",
+                            "Contract not found in local store"
                         );
-                        if err.is_fatal() {
-                            tracing::error!(
-                                contract = %key,
-                                error = %err,
-                                phase = "fatal_error",
-                                "Fatal executor error during get query"
-                            );
-                            return Err(ContractError::FatalExecutorError { key, error: err });
-                        }
-                        // Send error response back to caller. If the caller disconnected, just log and continue.
                         if let Err(error) = contract_handler
                             .channel()
                             .send_to_sender(
                                 id,
                                 ContractHandlerEvent::GetResponse {
-                                    key,
-                                    response: Err(err),
+                                    key: None,
+                                    response: Ok(StoreResponse {
+                                        state: None,
+                                        contract: None,
+                                    }),
                                 },
                             )
                             .await
                         {
                             tracing::debug!(
                                 error = %error,
-                                contract = %key,
-                                "Failed to send GET error response (client may have disconnected)"
+                                instance_id = %instance_id,
+                                "Failed to send GET not-found response (client may have disconnected)"
                             );
                         }
                     }

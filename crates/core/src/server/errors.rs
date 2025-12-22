@@ -1,7 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use freenet_stdlib::client_api::ErrorKind;
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::ContractInstanceId;
 use std::fmt::{Display, Formatter};
 
 /// Marker string used to identify EmptyRing errors without needing to modify freenet-stdlib.
@@ -21,7 +21,7 @@ pub(super) enum WebSocketApiError {
         error: ErrorKind,
     },
     MissingContract {
-        key: ContractKey,
+        instance_id: ContractInstanceId,
     },
 }
 
@@ -42,7 +42,9 @@ impl WebSocketApiError {
             }
             WebSocketApiError::NodeError { error_cause } => format!("Node error: {error_cause}"),
             WebSocketApiError::AxumError { error } => format!("Server error: {error}"),
-            WebSocketApiError::MissingContract { key } => format!("Missing contract {key}"),
+            WebSocketApiError::MissingContract { instance_id } => {
+                format!("Missing contract {}", instance_id.encode())
+            }
         }
     }
 }

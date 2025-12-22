@@ -393,7 +393,7 @@ async fn test_concurrent_gets(
     for i in 0..concurrent_requests {
         let request_start = std::time::Instant::now();
         let get_request = ClientRequest::ContractOp(ContractRequest::Get {
-            key: *contract_key,
+            key: *contract_key.id(),
             return_contract_code: false,
             subscribe: false,
         });
@@ -478,7 +478,7 @@ async fn test_mass_subscription(
     #[allow(clippy::needless_range_loop)]
     for i in 0..subscribers {
         let subscribe_request = ClientRequest::ContractOp(ContractRequest::Subscribe {
-            key: *contract_key,
+            key: *contract_key.id(),
             summary: None,
         });
 
@@ -599,7 +599,7 @@ async fn test_update_propagation(
     #[allow(clippy::needless_range_loop)]
     for i in 1..=verification_nodes {
         let get_request = ClientRequest::ContractOp(ContractRequest::Get {
-            key: *contract_key,
+            key: *contract_key.id(),
             return_contract_code: false,
             subscribe: false,
         });

@@ -216,7 +216,7 @@ impl From<CommandInfo> for OpenRequest<'static> {
         let key = cmd.contract.key();
         let req = match cmd.cmd {
             Command::Get => ContractRequest::Get {
-                key,
+                key: *key.id(),
                 return_contract_code: false,
                 subscribe: false,
             }
@@ -306,7 +306,7 @@ impl ClientEventsProxy for StdInput {
                             let node = &mut *self.app_state.local_node.write().await;
                             let key = self.contract.key();
                             node.send(ClientRequest::ContractOp(ContractRequest::Get {
-                                key,
+                                key: *key.id(),
                                 return_contract_code: true,
                                 subscribe: false,
                             }))

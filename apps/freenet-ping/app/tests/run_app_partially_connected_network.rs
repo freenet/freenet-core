@@ -328,7 +328,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         for (i, client) in node_clients.iter_mut().enumerate() {
             client
                 .send(ClientRequest::ContractOp(ContractRequest::Get {
-                    key: contract_key,
+                    key: *contract_key.id(),
                     return_contract_code: true,
                     subscribe: false,
                 }))
@@ -343,7 +343,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
         for (i, client) in gateway_clients.iter_mut().enumerate() {
             client
                 .send(ClientRequest::ContractOp(ContractRequest::Get {
-                    key: contract_key,
+                    key: *contract_key.id(),
                     return_contract_code: true,
                     subscribe: false,
                 }))
@@ -444,7 +444,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 );
                 node_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key: contract_key,
+                        key: *contract_key.id(),
                         return_contract_code: true,
                         subscribe: false,
                     }))
@@ -515,7 +515,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 println!("Node {i} has contract, subscribing to it");
                 node_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                        key: contract_key,
+                        key: *contract_key.id(),
                         summary: None,
                     }))
                     .await?;
@@ -534,7 +534,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
                 println!("Gateway {i} has contract, subscribing to it");
                 gateway_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                        key: contract_key,
+                        key: *contract_key.id(),
                         summary: None,
                     }))
                     .await?;
@@ -677,7 +677,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             if *subscribed {
                 node_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key: contract_key,
+                        key: *contract_key.id(),
                         return_contract_code: false,
                         subscribe: false,
                     }))
@@ -694,7 +694,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             if *subscribed {
                 gateway_clients[i]
                     .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key: contract_key,
+                        key: *contract_key.id(),
                         return_contract_code: false,
                         subscribe: false,
                     }))

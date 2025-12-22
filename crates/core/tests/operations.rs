@@ -4021,7 +4021,7 @@ async fn test_subscription_pruning_sends_unsubscribed(ctx: &mut TestContext) -> 
     assert!(
         peer_a_subscriptions
             .iter()
-            .any(|s| s.contract_key == contract_key),
+            .any(|s| s.contract_key == *contract_key.id()),
         "Peer-A should have local subscription to contract. Subscriptions: {:?}",
         peer_a_subscriptions
     );
