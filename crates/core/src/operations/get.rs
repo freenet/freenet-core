@@ -50,7 +50,6 @@ pub(crate) fn start_op(
             first_response_time: None,
         })),
         upstream_addr: None, // Local operation, no upstream peer
-        not_found_instance_id: None,
     }
 }
 
@@ -80,7 +79,6 @@ pub(crate) fn start_op_with_id(
             first_response_time: None,
         })),
         upstream_addr: None, // Local operation, no upstream peer
-        not_found_instance_id: None,
     }
 }
 
@@ -158,7 +156,6 @@ pub(crate) async fn request_get(
                 }),
                 stats: get_op.stats,
                 upstream_addr: get_op.upstream_addr,
-                not_found_instance_id: None,
             };
 
             op_manager.push(*id, OpEnum::Get(completed_op)).await?;
@@ -247,7 +244,6 @@ pub(crate) async fn request_get(
                     s
                 }),
                 upstream_addr: get_op.upstream_addr,
-                not_found_instance_id: None,
             };
 
             op_manager
@@ -298,8 +294,6 @@ enum GetState {
     },
     /// Operation completed successfully
     Finished { key: ContractKey },
-    /// Operation completed with NotFound - contract doesn't exist after exhaustive search
-    NotFound { instance_id: ContractInstanceId },
 }
 
 impl Display for GetState {
@@ -328,7 +322,6 @@ impl Display for GetState {
                 write!(f, "AwaitingResponse(requester: {requester:?}, fetch_contract: {fetch_contract}, retries: {retries}, current_hop: {current_hop}, subscribe: {subscribe})")
             }
             GetState::Finished { key, .. } => write!(f, "Finished(key: {key})"),
-            GetState::NotFound { instance_id } => write!(f, "NotFound(instance_id: {instance_id})"),
         }
     }
 }
@@ -369,10 +362,6 @@ pub(crate) struct GetOp {
     /// The address we received this operation's message from.
     /// Used for connection-based routing: responses are sent back to this address.
     upstream_addr: Option<std::net::SocketAddr>,
-    /// Set when the operation completes with NotFound - the contract was not found
-    /// after exhaustive search. This allows to_host_result to return a proper
-    /// NotFound response instead of a generic error.
-    not_found_instance_id: Option<ContractInstanceId>,
 }
 
 impl GetOp {
@@ -471,7 +460,6 @@ impl GetOp {
                     result: None,
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
-                    not_found_instance_id: None,
                 };
 
                 op_manager
@@ -534,7 +522,6 @@ impl GetOp {
                         result: None,
                         stats: self.stats,
                         upstream_addr: self.upstream_addr,
-                        not_found_instance_id: None,
                     };
 
                     op_manager
@@ -560,7 +547,6 @@ impl GetOp {
                 result: None,
                 stats: self.stats,
                 upstream_addr: self.upstream_addr,
-                not_found_instance_id: Some(instance_id),
             };
             op_manager.push(self.id, OpEnum::Get(failed_op)).await?;
             return Ok(());
@@ -573,30 +559,10 @@ impl GetOp {
     }
 
     pub(super) fn finalized(&self) -> bool {
-        // Finished with a result, or NotFound (terminal state without a result)
-        (self.result.is_some() && matches!(self.state, Some(GetState::Finished { .. })))
-            || matches!(self.state, Some(GetState::NotFound { .. }))
+        self.result.is_some() && matches!(self.state, Some(GetState::Finished { .. }))
     }
 
     pub(super) fn to_host_result(&self) -> HostResult {
-        // Check for NotFound state first - explicit "contract doesn't exist" response
-        if let Some(GetState::NotFound { instance_id }) = &self.state {
-            return Ok(HostResponse::ContractResponse(
-                freenet_stdlib::client_api::ContractResponse::NotFound {
-                    instance_id: *instance_id,
-                },
-            ));
-        }
-
-        // Also check the not_found_instance_id field (for handle_abort case)
-        if let Some(instance_id) = &self.not_found_instance_id {
-            return Ok(HostResponse::ContractResponse(
-                freenet_stdlib::client_api::ContractResponse::NotFound {
-                    instance_id: *instance_id,
-                },
-            ));
-        }
-
         match &self.result {
             Some(GetResult {
                 key,
@@ -665,7 +631,6 @@ impl Operation for GetOp {
                         result: None,
                         stats: None, // don't care about stats in target peers
                         upstream_addr: source_addr, // Connection-based routing: store who sent us this request
-                        not_found_instance_id: None,
                     },
                     source_addr,
                 })
@@ -1134,9 +1099,11 @@ impl Operation for GetOp {
                                         phase = "not_found",
                                         "Failed getting contract, not found after max retries"
                                     );
-                                    // Set NotFound state - to_host_result will return NotFound response
+                                    // Set result to None - to_host_result will return an error
+                                    // This is appropriate because the contract was not found
                                     return_msg = None;
-                                    new_state = Some(GetState::NotFound { instance_id });
+                                    new_state = None;
+                                    // Don't set result - let it remain None to indicate failure
                                 }
                             } else {
                                 // Max retries reached
@@ -1173,9 +1140,9 @@ impl Operation for GetOp {
                                         phase = "not_found",
                                         "Failed getting contract, reached max retries"
                                     );
-                                    // Set NotFound state - to_host_result will return NotFound response
                                     return_msg = None;
-                                    new_state = Some(GetState::NotFound { instance_id });
+                                    new_state = None;
+                                    // Don't set result - let it remain None to indicate failure
                                 }
                             }
                         }
@@ -1269,7 +1236,6 @@ impl Operation for GetOp {
                                         result: None,
                                         stats,
                                         upstream_addr: self.upstream_addr,
-                                        not_found_instance_id: None,
                                     }),
                                 )
                                 .await?;
@@ -1566,7 +1532,6 @@ fn build_op_result(
         result,
         stats,
         upstream_addr,
-        not_found_instance_id: None,
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
@@ -1684,10 +1649,7 @@ async fn try_forward_or_return(
 
 impl IsOperationCompleted for GetOp {
     fn is_completed(&self) -> bool {
-        matches!(
-            self.state,
-            Some(GetState::Finished { .. }) | Some(GetState::NotFound { .. })
-        )
+        matches!(self.state, Some(GetState::Finished { .. }))
     }
 }
 
@@ -1800,7 +1762,6 @@ mod tests {
             result,
             stats: None,
             upstream_addr: None,
-            not_found_instance_id: None,
         }
     }
 
