@@ -162,7 +162,12 @@ pub(crate) async fn request_subscribe(
         .k_closest_potentially_caching(instance_id, &skip_list, 3);
 
     let Some(target) = candidates.first() else {
-        // No remote peers available - cannot subscribe without network
+        // No remote peers available - if we have contract locally, complete subscription locally.
+        // This handles the case of a standalone node or when we're the only node with the contract.
+        if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
+            tracing::info!(tx = %id, contract = %key, phase = "complete", "Contract available locally and no remote peers, completing subscription locally");
+            return complete_local_subscription(op_manager, *id, key).await;
+        }
         tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
         return Err(RingError::NoCachingPeers(*instance_id).into());
     };
