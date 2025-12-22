@@ -15,7 +15,7 @@ use std::{
 
 use dashmap::{DashMap, DashSet};
 use either::Either;
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
@@ -218,7 +218,8 @@ pub(crate) struct OpManager {
     sub_op_tracker: SubOperationTracker,
     /// Waiters for contract storage notification.
     /// Operations can register to be notified when a specific contract is stored.
-    contract_waiters: Arc<Mutex<std::collections::HashMap<ContractKey, Vec<oneshot::Sender<()>>>>>,
+    contract_waiters:
+        Arc<Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>>,
     /// Proximity cache manager for tracking neighbor contract caches
     pub proximity_cache: Arc<ProximityCacheManager>,
 }
@@ -713,10 +714,10 @@ impl OpManager {
     /// Returns a receiver that will be signaled when the contract is stored.
     /// This is used to handle race conditions where a subscription arrives before
     /// the contract has been propagated via PUT.
-    pub fn wait_for_contract(&self, key: ContractKey) -> oneshot::Receiver<()> {
+    pub fn wait_for_contract(&self, instance_id: ContractInstanceId) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         let mut waiters = self.contract_waiters.lock();
-        waiters.entry(key).or_default().push(tx);
+        waiters.entry(instance_id).or_default().push(tx);
         rx
     }
 
@@ -728,7 +729,7 @@ impl OpManager {
     /// for dropped receivers, which is harmless.
     pub fn notify_contract_stored(&self, key: &ContractKey) {
         let mut waiters = self.contract_waiters.lock();
-        if let Some(senders) = waiters.remove(key) {
+        if let Some(senders) = waiters.remove(key.id()) {
             let count = senders.len();
             for sender in senders {
                 // Ignore errors if receiver was dropped (e.g., operation timed out)

@@ -13,7 +13,7 @@ use crate::message::NetMessage;
 use crate::node::{ConnectionError, NetworkBridge};
 use crate::ring::PeerKeyLocation;
 use crate::transport::TransportKeypair;
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
 
 type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
@@ -104,7 +104,10 @@ pub fn make_peer_with_ip(ip: [u8; 4], port: u16) -> PeerKeyLocation {
 
 /// Helper to create a test ContractKey from a seed byte
 pub fn make_contract_key(seed: u8) -> ContractKey {
-    ContractKey::from(ContractInstanceId::new([seed; 32]))
+    ContractKey::from_id_and_code(
+        ContractInstanceId::new([seed; 32]),
+        CodeHash::new([seed.wrapping_add(1); 32]),
+    )
 }
 
 /// A mock ring that tracks routing decisions for testing.

@@ -1183,7 +1183,7 @@ impl P2pConnManager {
                                             .into_iter()
                                             .map(|sub| {
                                                 freenet_stdlib::client_api::SubscriptionInfo {
-                                                    contract_key: sub.contract_key,
+                                                    contract_key: sub.instance_id,
                                                     client_id: sub.client_id.into(),
                                                 }
                                             })

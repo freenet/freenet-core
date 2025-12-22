@@ -295,7 +295,9 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     if config.release {
         anyhow::bail!("Cannot publish contracts in the network yet");
     }
-    let key: ContractKey = ContractInstanceId::try_from(config.key)?.into();
+    // Create ContractKey with placeholder code hash - the node will look up the actual key
+    let instance_id = ContractInstanceId::try_from(config.key)?;
+    let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
     println!("Updating contract {key}");
     let data = {
         let mut buf = vec![];

@@ -206,20 +206,20 @@ pub trait ClientEventsProxy {
 /// Helper function to register a subscription listener for GET/PUT operations with auto-subscribe
 async fn register_subscription_listener(
     op_manager: &OpManager,
-    key: ContractKey,
+    instance_id: ContractInstanceId,
     client_id: ClientId,
     subscription_listener: UnboundedSender<HostResult>,
     operation_type: &str,
 ) -> Result<(), Error> {
     tracing::debug!(
         client_id = %client_id,
-        contract = %key,
+        contract = %instance_id,
         operation = operation_type,
         "Registering subscription listener"
     );
     let register_listener = op_manager
         .notify_contract_handler(ContractHandlerEvent::RegisterSubscriberListener {
-            key,
+            key: instance_id,
             client_id,
             summary: None, // No summary for GET/PUT-based subscriptions
             subscriber_listener: subscription_listener,
@@ -228,7 +228,7 @@ async fn register_subscription_listener(
         .inspect_err(|err| {
             tracing::error!(
                 client_id = %client_id,
-                contract = %key,
+                contract = %instance_id,
                 operation = operation_type,
                 error = %err,
                 "Register subscriber listener failed"
@@ -238,18 +238,20 @@ async fn register_subscription_listener(
         Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
             tracing::debug!(
                 client_id = %client_id,
-                contract = %key,
+                contract = %instance_id,
                 operation = operation_type,
                 "Subscriber listener registered successfully"
             );
             // Register client subscription to prevent upstream unsubscription while this client is active
-            op_manager.ring.add_client_subscription(&key, client_id);
+            op_manager
+                .ring
+                .add_client_subscription(&instance_id, client_id);
             Ok(())
         }
         _ => {
             tracing::error!(
                 client_id = %client_id,
-                contract = %key,
+                contract = %instance_id,
                 operation = operation_type,
                 phase = "registration_failed",
                 "Subscriber listener registration failed"
@@ -377,7 +379,7 @@ where
                                 // Convert internal types to stdlib types
                                 let subscriptions = debug_info.application_subscriptions.into_iter().map(|sub| {
                                     freenet_stdlib::client_api::SubscriptionInfo {
-                                        contract_key: sub.contract_key,
+                                        contract_key: sub.instance_id,
                                         client_id: sub.client_id.into(),
                                     }
                                 }).collect();
@@ -772,7 +774,7 @@ async fn process_open_request(
                             if let Some(subscription_listener) = subscription_listener {
                                 register_subscription_listener(
                                     &op_manager,
-                                    contract_key,
+                                    *contract_key.id(),
                                     client_id,
                                     subscription_listener,
                                     "PUT",
@@ -1053,24 +1055,33 @@ async fn process_open_request(
                             return Err(Error::Disconnected);
                         };
 
-                        let (state, contract) = match op_manager
+                        // Query local store by instance_id (key from request is ContractInstanceId)
+                        let (full_key, state, contract) = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                                key,
+                                instance_id: key,
                                 return_contract_code,
                             })
                             .await
                         {
                             Ok(ContractHandlerEvent::GetResponse {
+                                key: Some(full_key),
                                 response: Ok(StoreResponse { state, contract }),
-                                ..
-                            }) => (state, contract),
+                            }) => (Some(full_key), state, contract),
+                            Ok(ContractHandlerEvent::GetResponse {
+                                key: None,
+                                response:
+                                    Ok(StoreResponse {
+                                        state: None,
+                                        contract: None,
+                                    }),
+                            }) => (None, None, None), // Contract not found locally
                             Ok(ContractHandlerEvent::GetResponse {
                                 response: Err(err), ..
                             }) => {
                                 tracing::error!(
                                     client_id = %client_id,
                                     request_id = %request_id,
-                                    contract = %key,
+                                    %key,
                                     error = %err,
                                     phase = "error",
                                     "GET query failed (executor error)"
@@ -1081,7 +1092,7 @@ async fn process_open_request(
                                 tracing::error!(
                                     client_id = %client_id,
                                     request_id = %request_id,
-                                    contract = %key,
+                                    %key,
                                     error = %err,
                                     phase = "error",
                                     "GET query failed (contract error)"
@@ -1092,7 +1103,7 @@ async fn process_open_request(
                                 tracing::error!(
                                     client_id = %client_id,
                                     request_id = %request_id,
-                                    contract = %key,
+                                    %key,
                                     phase = "error",
                                     "GET query failed (unexpected state)"
                                 );
@@ -1100,15 +1111,14 @@ async fn process_open_request(
                             }
                         };
 
-                        if (!return_contract_code && state.is_some())
-                            || (return_contract_code && state.is_some() && contract.is_some())
-                        {
-                            if let Some(state) = state {
+                        // Check if we found the contract locally with state (and code if requested)
+                        if let (Some(full_key), Some(state)) = (full_key, state) {
+                            if !return_contract_code || contract.is_some() {
                                 tracing::debug!(
                                     client_id = %client_id,
                                     request_id = %request_id,
                                     peer = %peer_id,
-                                    contract = %key,
+                                    contract = %full_key,
                                     phase = "local_found",
                                     "Contract found locally, returning GET result"
                                 );
@@ -1118,7 +1128,7 @@ async fn process_open_request(
                                     if let Some(subscription_listener) = subscription_listener {
                                         register_subscription_listener(
                                             &op_manager,
-                                            key,
+                                            *full_key.id(),
                                             client_id,
                                             subscription_listener,
                                             "local GET",
@@ -1127,19 +1137,22 @@ async fn process_open_request(
                                     } else {
                                         tracing::warn!(
                                             client_id = %client_id,
-                                            contract = %key,
+                                            contract = %full_key,
                                             "GET with subscribe=true but no subscription_listener"
                                         );
                                     }
                                 }
 
                                 return Ok(Some(Either::Left(QueryResult::GetResult {
-                                    key,
+                                    key: full_key,
                                     state,
                                     contract,
                                 })));
                             }
-                        } else if let Some(router) = &request_router {
+                        }
+
+                        // Contract not found locally or missing code, route through network
+                        if let Some(router) = &request_router {
                             tracing::debug!(
                                 client_id = %client_id,
                                 request_id = %request_id,
@@ -2061,7 +2074,7 @@ pub(crate) mod test {
                             }
                             let key = contract.key();
                             let request = ContractRequest::Get {
-                                key,
+                                key: *key.id(),
                                 return_contract_code: true,
                                 subscribe: false,
                             };
@@ -2098,7 +2111,7 @@ pub(crate) mod test {
                             continue;
                         }
                         let request = ContractRequest::Subscribe {
-                            key,
+                            key: *key.id(),
                             summary: Some(summary),
                         };
                         return Some(request.into());

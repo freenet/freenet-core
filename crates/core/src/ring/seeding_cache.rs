@@ -195,11 +195,14 @@ impl<T: TimeSource> SeedingCache<T> {
 mod tests {
     use super::*;
     use crate::util::time_source::MockTimeSource;
-    use freenet_stdlib::prelude::ContractInstanceId;
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
     use std::time::Duration;
 
     fn make_key(seed: u8) -> ContractKey {
-        ContractKey::from(ContractInstanceId::new([seed; 32]))
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([seed; 32]),
+            CodeHash::new([seed.wrapping_add(1); 32]),
+        )
     }
 
     fn make_cache(budget: u64) -> SeedingCache<MockTimeSource> {

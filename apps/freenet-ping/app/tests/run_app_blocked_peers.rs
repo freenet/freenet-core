@@ -378,7 +378,7 @@ async fn run_blocked_peers_test_inner(
         tracing::info!("Node 1 getting contract...");
         client_node1
             .send(ClientRequest::ContractOp(ContractRequest::Get {
-                key: contract_key,
+                key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: config.subscribe_immediately,
             }))
@@ -397,7 +397,7 @@ async fn run_blocked_peers_test_inner(
         tracing::info!("Node 2 getting contract...");
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
-                key: contract_key,
+                key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: config.subscribe_immediately,
             }))
@@ -419,7 +419,7 @@ async fn run_blocked_peers_test_inner(
             // Gateway subscribes
             client_gw
                 .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                    key: contract_key,
+                    key: *contract_key.id(),
                     summary: None,
                 }))
                 .await?;
@@ -435,7 +435,7 @@ async fn run_blocked_peers_test_inner(
             // Node1 subscribes
             client_node1
                 .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                    key: contract_key,
+                    key: *contract_key.id(),
                     summary: None,
                 }))
                 .await?;
@@ -451,7 +451,7 @@ async fn run_blocked_peers_test_inner(
             // Node2 subscribes
             client_node2
                 .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-                    key: contract_key,
+                    key: *contract_key.id(),
                     summary: None,
                 }))
                 .await?;

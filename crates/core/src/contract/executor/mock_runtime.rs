@@ -46,6 +46,11 @@ impl Executor<MockRuntime> {
 }
 
 impl ContractExecutor for Executor<MockRuntime> {
+    fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {
+        let code_hash = self.runtime.contract_store.code_hash_from_id(instance_id)?;
+        Some(ContractKey::from_id_and_code(*instance_id, code_hash))
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
@@ -111,7 +116,7 @@ impl ContractExecutor for Executor<MockRuntime> {
 
     fn register_contract_notifier(
         &mut self,
-        _key: ContractKey,
+        _key: ContractInstanceId,
         _cli_id: ClientId,
         _notification_ch: UnboundedSender<HostResult>,
         _summary: Option<StateSummary<'_>>,

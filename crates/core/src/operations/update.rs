@@ -197,7 +197,7 @@ impl Operation for UpdateOp {
                         // First check if we have the contract locally
                         let has_contract = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                                key: *key,
+                                instance_id: *key.id(),
                                 return_contract_code: false,
                             })
                             .await
@@ -366,7 +366,9 @@ impl Operation for UpdateOp {
                                     phase = "error",
                                     "Cannot handle UPDATE: contract not found locally and no peers to forward to"
                                 );
-                                return Err(OpError::RingError(RingError::NoCachingPeers(*key)));
+                                return Err(OpError::RingError(RingError::NoCachingPeers(
+                                    *key.id(),
+                                )));
                             }
                         }
                     }
@@ -731,7 +733,7 @@ async fn update_contract(
 ) -> Result<UpdateExecution, OpError> {
     let previous_state = match op_manager
         .notify_contract_handler(ContractHandlerEvent::GetQuery {
-            key,
+            instance_id: *key.id(),
             return_contract_code: false,
         })
         .await
@@ -808,7 +810,7 @@ async fn update_contract(
                 None => {
                     match op_manager
                         .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                            key,
+                            instance_id: *key.id(),
                             return_contract_code: false,
                         })
                         .await
@@ -1022,7 +1024,7 @@ pub(crate) async fn request_update(
             op_manager
                 .ring
                 .add_downstream(&key, sender.clone(), None)
-                .map_err(|_| RingError::NoCachingPeers(key))?;
+                .map_err(|_| RingError::NoCachingPeers(*key.id()))?;
 
             target
         } else {
@@ -1045,7 +1047,7 @@ pub(crate) async fn request_update(
                     phase = "error",
                     "UPDATE: Cannot update contract on isolated node - contract not seeded and no subscribers"
                 );
-                return Err(OpError::RingError(RingError::NoCachingPeers(key)));
+                return Err(OpError::RingError(RingError::NoCachingPeers(*key.id())));
             }
 
             // Update the contract locally. This path is reached when:

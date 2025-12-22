@@ -28,22 +28,22 @@ pub(super) async fn contract_home(
     assigned_token: AuthToken,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     debug!(
-        "contract_home: Converting string key to ContractKey: {}",
+        "contract_home: Converting string key to ContractInstanceId: {}",
         key
     );
-    let key = ContractKey::from_id(key).map_err(|err| {
+    let instance_id = ContractInstanceId::from_bytes(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
         WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
         }
     })?;
-    debug!("contract_home: Successfully parsed contract key");
+    debug!("contract_home: Successfully parsed contract instance id");
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     debug!("contract_home: Sending NewConnection request");
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token: Some((assigned_token, key.into())),
+            assigned_token: Some((assigned_token, instance_id)),
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -62,7 +62,7 @@ pub(super) async fn contract_home(
             client_id,
             req: Box::new(
                 ContractRequest::Get {
-                    key,
+                    key: instance_id,
                     return_contract_code: true,
                     subscribe: false,
                 }
@@ -88,10 +88,10 @@ pub(super) async fn contract_home(
         }) => match contract {
             Some(contract) => {
                 let key = contract.key();
-                let path = contract_web_path(&key);
+                let path = contract_web_path(key.id());
                 let state_bytes = state.as_ref();
                 let current_hash = hash_state(state_bytes);
-                let hash_path = state_hash_path(&key);
+                let hash_path = state_hash_path(key.id());
 
                 let needs_update = match tokio::fs::read(&hash_path).await {
                     Ok(stored_hash_bytes) if stored_hash_bytes.len() == 8 => {
@@ -147,7 +147,7 @@ pub(super) async fn contract_home(
                 }
             }
             None => {
-                return Err(WebSocketApiError::MissingContract { key });
+                return Err(WebSocketApiError::MissingContract { instance_id });
             }
         },
         Some(HostCallbackResult::Result {
@@ -194,10 +194,11 @@ pub(super) async fn variable_content(
         key, req_path
     );
     // compose the correct absolute path
-    let key = ContractKey::from_id(key).map_err(|err| WebSocketApiError::InvalidParam {
-        error_cause: format!("{err}"),
-    })?;
-    let base_path = contract_web_path(&key);
+    let instance_id =
+        ContractInstanceId::from_bytes(&key).map_err(|err| WebSocketApiError::InvalidParam {
+            error_cause: format!("{err}"),
+        })?;
+    let base_path = contract_web_path(&instance_id);
     debug!("variable_content: Base path resolved to: {:?}", base_path);
 
     // Parse the full request path URI to extract the relative path using the v1 helper.
@@ -263,11 +264,11 @@ async fn get_web_body(path: &Path) -> Result<impl IntoResponse, WebSocketApiErro
     Ok(Html(body))
 }
 
-fn contract_web_path(key: &ContractKey) -> PathBuf {
+fn contract_web_path(instance_id: &ContractInstanceId) -> PathBuf {
     std::env::temp_dir()
         .join("freenet")
         .join("webapp_cache")
-        .join(key.encoded_contract_id())
+        .join(instance_id.encode())
 }
 
 fn hash_state(state: &[u8]) -> u64 {
@@ -277,9 +278,9 @@ fn hash_state(state: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn state_hash_path(key: &ContractKey) -> PathBuf {
+fn state_hash_path(instance_id: &ContractInstanceId) -> PathBuf {
     std::env::temp_dir()
         .join("freenet")
         .join("webapp_cache")
-        .join(format!("{}.hash", key.encoded_contract_id()))
+        .join(format!("{}.hash", instance_id.encode()))
 }

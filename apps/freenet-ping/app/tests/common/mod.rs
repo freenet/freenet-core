@@ -504,7 +504,7 @@ pub async fn deploy_contract(
 pub async fn subscribe_to_contract(client: &mut WebApi, key: ContractKey) -> Result<()> {
     client
         .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-            key,
+            key: *key.id(),
             summary: None,
         }))
         .await?;
@@ -520,7 +520,7 @@ pub async fn get_contract_state(
 ) -> Result<Ping> {
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
+            key: *key.id(),
             return_contract_code: fetch_contract,
             subscribe: false,
         }))
@@ -557,7 +557,7 @@ pub async fn get_all_ping_states(
 
     client_gw
         .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
+            key: *key.id(),
             return_contract_code: false,
             subscribe: false,
         }))
@@ -565,7 +565,7 @@ pub async fn get_all_ping_states(
 
     client_node1
         .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
+            key: *key.id(),
             return_contract_code: false,
             subscribe: false,
         }))
@@ -573,7 +573,7 @@ pub async fn get_all_ping_states(
 
     client_node2
         .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
+            key: *key.id(),
             return_contract_code: false,
             subscribe: false,
         }))

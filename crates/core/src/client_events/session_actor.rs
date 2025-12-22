@@ -620,7 +620,7 @@ mod tests {
         use crate::contract::client_responses_channel;
         use crate::operations::subscribe::SubscribeMsg;
         use freenet_stdlib::client_api::{ContractResponse, HostResponse};
-        use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
 
         let (session_tx, session_rx) = mpsc::channel(100);
         let (mut client_responses_rx, client_responses_tx) = client_responses_channel();
@@ -631,7 +631,10 @@ mod tests {
         });
 
         let tx = Transaction::new::<SubscribeMsg>();
-        let contract_key = ContractKey::from(ContractInstanceId::new([7u8; 32]));
+        let contract_key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
         let host_result = Ok(HostResponse::ContractResponse(
             ContractResponse::SubscribeResponse {
                 key: contract_key,

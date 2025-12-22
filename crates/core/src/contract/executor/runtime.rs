@@ -20,6 +20,11 @@ enum ComputedStateUpdate {
 }
 
 impl ContractExecutor for Executor<Runtime> {
+    fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {
+        let code_hash = self.runtime.contract_store.code_hash_from_id(instance_id)?;
+        Some(ContractKey::from_id_and_code(*instance_id, code_hash))
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
@@ -372,20 +377,23 @@ impl ContractExecutor for Executor<Runtime> {
 
     fn register_contract_notifier(
         &mut self,
-        key: ContractKey,
+        instance_id: ContractInstanceId,
         cli_id: ClientId,
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>> {
-        let channels = self.update_notifications.entry(key).or_default();
+        let channels = self.update_notifications.entry(instance_id).or_default();
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
-                return Err(RequestError::from(StdContractError::Subscribe {
-                    key,
-                    cause: format!("Peer {cli_id} already subscribed").into(),
-                })
-                .into());
+                // Client is already subscribed with a different channel - update to the new channel
+                // This can happen when a client reconnects
+                tracing::info!(
+                    contract = %instance_id,
+                    client = %cli_id,
+                    "Client already subscribed, updating notification channel"
+                );
+                channels[i] = (cli_id, notification_ch);
             }
         } else {
             channels.push((cli_id, notification_ch));
@@ -393,13 +401,13 @@ impl ContractExecutor for Executor<Runtime> {
 
         if self
             .subscriber_summaries
-            .entry(key)
+            .entry(instance_id)
             .or_default()
             .insert(cli_id, summary.map(StateSummary::into_owned))
             .is_some()
         {
-            tracing::warn!(
-                contract = %key,
+            tracing::debug!(
+                contract = %instance_id,
                 client = %cli_id,
                 "Contract already registered for client, replaced summary"
             );
@@ -642,48 +650,75 @@ impl Executor<Runtime> {
                     .await
             }
             ContractRequest::Update { key, data } => self.perform_contract_update(key, data).await,
-            // FIXME
             // Handle Get requests by returning the contract state and optionally the contract code
             ContractRequest::Get {
-                key,
+                key: instance_id,
                 return_contract_code,
                 ..
-            } => match self.perform_contract_get(return_contract_code, key).await {
-                Ok((state, contract)) => Ok(ContractResponse::GetResponse {
-                    key,
-                    state: state.ok_or_else(|| {
-                        tracing::debug!(
-                            contract = %key,
-                            phase = "get_failed",
-                            "Contract state not found during get request"
-                        );
-                        ExecutorError::request(StdContractError::Get {
-                            key,
-                            cause: "contract state not found".into(),
-                        })
-                    })?,
-                    contract,
+            } => {
+                // Look up the full key from the instance_id
+                let full_key = self.lookup_key(&instance_id).ok_or_else(|| {
+                    tracing::debug!(
+                        contract = %instance_id,
+                        phase = "key_lookup_failed",
+                        "Contract not found during get request"
+                    );
+                    ExecutorError::request(StdContractError::MissingContract { key: instance_id })
+                })?;
+
+                match self
+                    .perform_contract_get(return_contract_code, full_key)
+                    .await
+                {
+                    Ok((state, contract)) => Ok(ContractResponse::GetResponse {
+                        key: full_key,
+                        state: state.ok_or_else(|| {
+                            tracing::debug!(
+                                contract = %full_key,
+                                phase = "get_failed",
+                                "Contract state not found during get request"
+                            );
+                            ExecutorError::request(StdContractError::Get {
+                                key: full_key,
+                                cause: "contract state not found".into(),
+                            })
+                        })?,
+                        contract,
+                    }
+                    .into()),
+                    Err(err) => Err(err),
                 }
-                .into()),
-                Err(err) => Err(err),
-            },
-            ContractRequest::Subscribe { key, summary } => {
+            }
+            ContractRequest::Subscribe {
+                key: instance_id,
+                summary,
+            } => {
                 tracing::debug!(
                     client = %cli_id,
-                    contract = %key,
+                    contract = %instance_id,
                     has_summary = summary.is_some(),
                     "subscribing to contract"
                 );
                 let updates = updates.ok_or_else(|| {
                     ExecutorError::other(anyhow::anyhow!("missing update channel"))
                 })?;
-                self.register_contract_notifier(key, cli_id, updates, summary)?;
+                self.register_contract_notifier(instance_id, cli_id, updates, summary)?;
+
+                // Look up the full key for storage operations
+                let full_key = self.lookup_key(&instance_id).ok_or_else(|| {
+                    tracing::debug!(
+                        contract = %instance_id,
+                        phase = "key_lookup_failed",
+                        "Contract not found during subscribe request"
+                    );
+                    ExecutorError::request(StdContractError::MissingContract { key: instance_id })
+                })?;
 
                 // by default a subscribe op has an implicit get
-                let _res = self.perform_contract_get(false, key).await?;
-                self.subscribe(key).await?;
+                let _res = self.perform_contract_get(false, full_key).await?;
+                self.subscribe(full_key).await?;
                 Ok(ContractResponse::SubscribeResponse {
-                    key,
+                    key: full_key,
                     subscribed: true,
                 }
                 .into())
@@ -946,15 +981,22 @@ impl Executor<Runtime> {
                         mode,
                     } in missing
                     {
-                        match self.state_store.get(&id.into()).await {
-                            Ok(state) => {
+                        // Try to look up the full key; if not found, treat as missing
+                        let local_state = if let Some(related_key) = self.lookup_key(&id) {
+                            self.state_store.get(&related_key).await.ok()
+                        } else {
+                            None
+                        };
+
+                        match local_state {
+                            Some(state) => {
                                 // Already have this contract locally
                                 updates.push(UpdateData::RelatedState {
                                     related_to: id,
                                     state: state.into(),
                                 });
                             }
-                            Err(StateStoreError::MissingContract(_)) => {
+                            None => {
                                 // Fetch from network
                                 let state =
                                     match self.local_state_or_from_network(&id, false).await? {
@@ -976,7 +1018,7 @@ impl Executor<Runtime> {
                                             // but does NOT commit the main contract's state update
                                             self.verify_and_store_contract(
                                                 state.clone(),
-                                                contract,
+                                                contract.clone(),
                                                 RelatedContracts::default(),
                                             )
                                             .await?;
@@ -987,12 +1029,12 @@ impl Executor<Runtime> {
                                 match mode {
                                     RelatedMode::StateOnce => {}
                                     RelatedMode::StateThenSubscribe => {
-                                        self.subscribe(id.into()).await?;
+                                        // After storing, we should be able to look up the key
+                                        if let Some(related_key) = self.lookup_key(&id) {
+                                            self.subscribe(related_key).await?;
+                                        }
                                     }
                                 }
-                            }
-                            Err(other_err) => {
-                                return Err(ExecutorError::other(other_err));
                             }
                         }
                     }
@@ -1198,8 +1240,15 @@ impl Executor<Runtime> {
                     mode,
                 } in missing
                 {
-                    match self.state_store.get(&id.into()).await {
-                        Ok(state) => {
+                    // Try to look up the full key; if not found, treat as missing
+                    let local_state = if let Some(related_key) = self.lookup_key(&id) {
+                        self.state_store.get(&related_key).await.ok()
+                    } else {
+                        None
+                    };
+
+                    match local_state {
+                        Some(state) => {
                             // in this case we are already subscribed to and are updating this contract,
                             // we can try first with the existing value
                             updates.push(UpdateData::RelatedState {
@@ -1207,8 +1256,7 @@ impl Executor<Runtime> {
                                 state: state.into(),
                             });
                         }
-
-                        Err(StateStoreError::MissingContract(_)) => {
+                        None => {
                             let state = match self.local_state_or_from_network(&id, false).await? {
                                 Either::Left(state) => state,
                                 Either::Right(GetResult {
@@ -1224,7 +1272,7 @@ impl Executor<Runtime> {
                                     };
                                     self.verify_and_store_contract(
                                         state.clone(),
-                                        contract,
+                                        contract.clone(),
                                         RelatedContracts::default(),
                                     )
                                     .await?;
@@ -1235,13 +1283,12 @@ impl Executor<Runtime> {
                             match mode {
                                 RelatedMode::StateOnce => {}
                                 RelatedMode::StateThenSubscribe => {
-                                    self.subscribe(id.into()).await?;
+                                    // After storing, we should be able to look up the key
+                                    if let Some(related_key) = self.lookup_key(&id) {
+                                        self.subscribe(related_key).await?;
+                                    }
                                 }
                             }
-                        }
-                        Err(other_err) => {
-                            let _ = mode;
-                            return Err(ExecutorError::other(other_err));
                         }
                     }
                 }
@@ -1305,7 +1352,12 @@ impl Executor<Runtime> {
         &self,
         id: &ContractInstanceId,
     ) -> Result<State<'static>, Either<Box<RequestError>, anyhow::Error>> {
-        let Ok(contract) = self.state_store.get(&(*id).into()).await else {
+        let Some(full_key) = self.lookup_key(id) else {
+            return Err(Either::Right(
+                StdContractError::MissingRelated { key: *id }.into(),
+            ));
+        };
+        let Ok(contract) = self.state_store.get(&full_key).await else {
             return Err(Either::Right(
                 StdContractError::MissingRelated { key: *id }.into(),
             ));
@@ -1402,13 +1454,12 @@ impl Executor<Runtime> {
                                 Either::Right(result) => {
                                     let Some(contract) = result.contract else {
                                         return Err(ExecutorError::request(
-                                            RequestError::ContractError(StdContractError::Get {
-                                                key: (*id).into(),
-                                                cause: "missing-contract".into(),
-                                            }),
+                                            RequestError::ContractError(
+                                                StdContractError::MissingRelated { key: *id },
+                                            ),
                                         ));
                                     };
-                                    trying_key = (*id).into();
+                                    trying_key = contract.key();
                                     trying_params = contract.params();
                                     trying_state = result.state;
                                     trying_contract = Some(contract);
@@ -1490,8 +1541,9 @@ impl Executor<Runtime> {
     ) -> Result<(), ExecutorError> {
         tracing::debug!(contract = %key, "notify of contract update");
         let key = *key;
-        if let Some(notifiers) = self.update_notifications.get_mut(&key) {
-            let summaries = self.subscriber_summaries.get_mut(&key).unwrap();
+        let instance_id = *key.id();
+        if let Some(notifiers) = self.update_notifications.get_mut(&instance_id) {
+            let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
             // in general there should be less than 32 failures
             let mut failures = Vec::with_capacity(32);
             for (peer_key, notifier) in notifiers.iter() {
@@ -1569,7 +1621,9 @@ impl Executor<Runtime> {
         if self.mode == OperationMode::Local {
             return Ok(());
         }
-        let request = SubscribeContract { key };
+        let request = SubscribeContract {
+            instance_id: *key.id(),
+        };
         let _sub: operations::subscribe::SubscribeResult = self.op_request(request).await?;
         Ok(())
     }
@@ -1580,11 +1634,15 @@ impl Executor<Runtime> {
         id: &ContractInstanceId,
         return_contract_code: bool,
     ) -> Result<Either<WrappedState, operations::get::GetResult>, ExecutorError> {
-        if let Ok(contract) = self.state_store.get(&(*id).into()).await {
-            return Ok(Either::Left(contract));
-        };
+        // Try to get locally if we have the full key
+        if let Some(full_key) = self.lookup_key(id) {
+            if let Ok(state) = self.state_store.get(&full_key).await {
+                return Ok(Either::Left(state));
+            }
+        }
+        // Fetch from network
         let request: GetContract = GetContract {
-            key: (*id).into(),
+            instance_id: *id,
             return_contract_code,
         };
         let get_result: operations::get::GetResult = self.op_request(request).await?;

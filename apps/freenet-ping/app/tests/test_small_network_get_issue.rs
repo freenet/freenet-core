@@ -216,7 +216,7 @@ async fn test_small_network_get_failure() -> TestResult {
 
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Get {
-                key: contract_key,
+                key: *contract_key.id(),
                 return_contract_code: false,
                 subscribe: false,
             }))
@@ -235,7 +235,7 @@ async fn test_small_network_get_failure() -> TestResult {
         let gw_get2_start = std::time::Instant::now();
         client_gw
             .send(ClientRequest::ContractOp(ContractRequest::Get {
-                key: contract_key,
+                key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
             }))
@@ -259,7 +259,7 @@ async fn test_small_network_get_failure() -> TestResult {
 
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
-                key: contract_key,
+                key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
             }))
@@ -311,7 +311,7 @@ async fn test_small_network_get_failure() -> TestResult {
         let get2_start = std::time::Instant::now();
         client_node2
             .send(ClientRequest::ContractOp(ContractRequest::Get {
-                key: contract_key,
+                key: *contract_key.id(),
                 return_contract_code: false,
                 subscribe: false,
             }))

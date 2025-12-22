@@ -484,12 +484,12 @@ pub(crate) enum ContractHandlerEvent {
     },
     /// Fetch a supposedly existing contract value in this node, and optionally the contract itself
     GetQuery {
-        key: ContractKey,
+        instance_id: ContractInstanceId,
         return_contract_code: bool,
     },
     /// The response to a get query event
     GetResponse {
-        key: ContractKey,
+        key: Option<ContractKey>,
         response: Result<StoreResponse, ExecutorError>,
     },
     /// Updates a supposedly existing contract in this node
@@ -507,7 +507,7 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
     },
     RegisterSubscriberListener {
-        key: ContractKey,
+        key: ContractInstanceId,
         client_id: ClientId,
         summary: Option<StateSummary<'static>>,
         subscriber_listener: UnboundedSender<HostResult>,
@@ -561,21 +561,21 @@ impl std::fmt::Display for ContractHandlerEvent {
                 }
             },
             ContractHandlerEvent::GetQuery {
-                key,
+                instance_id,
                 return_contract_code,
                 ..
             } => {
                 write!(
                     f,
-                    "get query {{ {key}, return contract code: {return_contract_code} }}",
+                    "get query {{ {instance_id}, return contract code: {return_contract_code} }}",
                 )
             }
             ContractHandlerEvent::GetResponse { key, response } => match response {
                 Ok(_) => {
-                    write!(f, "get query response {{ {key} }}",)
+                    write!(f, "get query response {{ {key:?} }}",)
                 }
                 Err(_) => {
-                    write!(f, "get query failed {{ {key} }}",)
+                    write!(f, "get query failed {{ {key:?} }}",)
                 }
             },
             ContractHandlerEvent::UpdateQuery { key, .. } => {

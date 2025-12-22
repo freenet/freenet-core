@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         // Get contract and wait for response
         client
             .send(ClientRequest::ContractOp(ContractRequest::Get {
-                key: contract_key,
+                key: *contract_key.id(),
                 return_contract_code: true,
                 subscribe: false,
             }))
@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     tracing::info!("Subscribing to contract...");
     client
         .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-            key: contract_key,
+            key: *contract_key.id(),
             summary: None,
         }))
         .await?;

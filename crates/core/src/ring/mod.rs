@@ -12,7 +12,7 @@ use std::{
 use tracing::Instrument;
 
 use either::Either;
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 
 pub use seeding::{PruneSubscriptionsResult, RemoveSubscriberResult, SubscriptionError};
@@ -280,15 +280,19 @@ impl Ring {
             .routing(Location::from(contract_key), None, skip_list, &router)
     }
 
-    /// Get k best peers for caching a contract, ranked by routing predictions
-    pub fn k_closest_potentially_caching(
+    /// Get k best peers for caching a contract, ranked by routing predictions.
+    /// Accepts either &ContractKey or &ContractInstanceId (both implement From<&T> for Location).
+    pub fn k_closest_potentially_caching<K>(
         &self,
-        contract_key: &ContractKey,
+        contract_id: &K,
         skip_list: impl Contains<std::net::SocketAddr> + Clone,
         k: usize,
-    ) -> Vec<PeerKeyLocation> {
+    ) -> Vec<PeerKeyLocation>
+    where
+        for<'a> Location: From<&'a K>,
+    {
         let router = self.router.read();
-        let target_location = Location::from(contract_key);
+        let target_location = Location::from(contract_id);
 
         let mut seen = HashSet::new();
         let mut candidates: Vec<PeerKeyLocation> = Vec::new();
@@ -373,11 +377,11 @@ impl Ring {
     /// Register a client subscription for a contract (WebSocket client subscribed).
     pub fn add_client_subscription(
         &self,
-        contract: &ContractKey,
+        instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
     ) {
         self.seeding_manager
-            .add_client_subscription(contract, client_id)
+            .add_client_subscription(instance_id, client_id)
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).
@@ -800,5 +804,5 @@ pub(crate) enum RingError {
     #[error("No ring connections found")]
     EmptyRing,
     #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
-    NoCachingPeers(ContractKey),
+    NoCachingPeers(ContractInstanceId),
 }

@@ -19,7 +19,11 @@ pub async fn diagnostics(base_cfg: BaseConfig, contract_keys: Vec<String>) -> an
                 let contract_id =
                     freenet_stdlib::prelude::ContractInstanceId::try_from(key.clone())
                         .map_err(|e| anyhow::anyhow!("Invalid contract key '{}': {}", key, e))?;
-                Ok(freenet_stdlib::prelude::ContractKey::from(contract_id))
+                // Create placeholder key - diagnostics API uses instance ID for lookup
+                Ok(freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                    contract_id,
+                    freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                ))
             })
             .collect();
 

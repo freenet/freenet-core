@@ -451,13 +451,13 @@ where
 
 #[allow(unused)]
 struct GetContract {
-    key: ContractKey,
+    instance_id: ContractInstanceId,
     return_contract_code: bool,
 }
 
 impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::get::GetOp {
-        operations::get::start_op(self.key, self.return_contract_code, false)
+        operations::get::start_op(self.instance_id, self.return_contract_code, false)
     }
 
     async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
@@ -467,12 +467,12 @@ impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
 
 #[allow(unused)]
 struct SubscribeContract {
-    key: ContractKey,
+    instance_id: ContractInstanceId,
 }
 
 impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeContract {
     fn initiate_op(self, _op_manager: &OpManager) -> operations::subscribe::SubscribeOp {
-        operations::subscribe::start_op(self.key)
+        operations::subscribe::start_op(self.instance_id)
     }
 
     async fn resume_op(
@@ -516,6 +516,10 @@ impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {
 }
 
 pub(crate) trait ContractExecutor: Send + 'static {
+    /// Look up the full ContractKey from a ContractInstanceId.
+    /// Returns None if the contract is not known to this node.
+    fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey>;
+
     fn fetch_contract(
         &mut self,
         key: ContractKey,
@@ -533,7 +537,7 @@ pub(crate) trait ContractExecutor: Send + 'static {
 
     fn register_contract_notifier(
         &mut self,
-        key: ContractKey,
+        key: ContractInstanceId,
         cli_id: ClientId,
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
         summary: Option<StateSummary<'_>>,
@@ -555,9 +559,11 @@ pub struct Executor<R = Runtime> {
     runtime: R,
     pub state_store: StateStore<Storage>,
     /// Notification channels for any clients subscribed to updates for a given contract.
-    update_notifications: HashMap<ContractKey, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
+    update_notifications:
+        HashMap<ContractInstanceId, Vec<(ClientId, mpsc::UnboundedSender<HostResult>)>>,
     /// Summaries of the state of all clients subscribed to a given contract.
-    subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
+    subscriber_summaries:
+        HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>,
     /// Attested contract instances for a given delegate.
     delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
     /// Tracks contracts that are being initialized and operations queued for them
@@ -667,10 +673,10 @@ impl<R> Executor<R> {
 
     pub fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         let mut subscriptions = Vec::new();
-        for (contract_key, client_list) in &self.update_notifications {
+        for (instance_id, client_list) in &self.update_notifications {
             for (client_id, _channel) in client_list {
                 subscriptions.push(crate::message::SubscriptionInfo {
-                    contract_key: *contract_key,
+                    instance_id: *instance_id,
                     client_id: *client_id,
                     last_update: None,
                 });

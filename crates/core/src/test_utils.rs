@@ -343,7 +343,7 @@ pub async fn make_update(
 pub async fn make_subscribe(client: &mut WebApi, key: ContractKey) -> anyhow::Result<()> {
     client
         .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-            key,
+            key: *key.id(),
             summary: None,
         }))
         .await?;
@@ -358,7 +358,7 @@ pub async fn make_get(
 ) -> anyhow::Result<()> {
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
+            key: *key.id(),
             return_contract_code,
             subscribe,
         }))
@@ -643,9 +643,7 @@ impl std::fmt::Display for PackageType {
 }
 
 pub async fn verify_contract_exists(dir: &Path, key: ContractKey) -> anyhow::Result<bool> {
-    let code_hash = key.encoded_code_hash().unwrap_or_else(|| {
-        panic!("Contract key does not have a code hash");
-    });
+    let code_hash = key.encoded_code_hash();
     let contract_path = dir.join("contracts").join(code_hash);
     Ok(tokio::fs::metadata(contract_path).await.is_ok())
 }
