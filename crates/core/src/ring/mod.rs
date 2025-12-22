@@ -32,6 +32,7 @@ use crate::{
     router::Router,
 };
 
+mod connection_backoff;
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
@@ -40,6 +41,8 @@ mod location;
 mod peer_key_location;
 mod seeding;
 mod seeding_cache;
+
+use connection_backoff::ConnectionBackoff;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
@@ -455,6 +458,9 @@ impl Ring {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let mut pending_conn_adds = BTreeSet::new();
+        let mut connection_backoff = ConnectionBackoff::new();
+        let mut last_backoff_cleanup = Instant::now();
+        const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         let mut this_peer = None;
         loop {
             let op_manager = match self.upgrade_op_manager() {
@@ -476,11 +482,24 @@ impl Ring {
             let mut skip_list = HashSet::new();
             skip_list.insert(*this_addr);
 
+            // Periodic cleanup of expired backoff entries
+            if last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {
+                connection_backoff.cleanup_expired();
+                last_backoff_cleanup = Instant::now();
+            }
+
             // Acquire new connections up to MAX_CONCURRENT_CONNECTIONS limit
             // Only count Connect transactions, not all operations (Get/Put/Subscribe/Update)
             let active_count = live_tx_tracker.active_connect_transaction_count();
             if let Some(ideal_location) = pending_conn_adds.pop_first() {
-                if active_count < MAX_CONCURRENT_CONNECTIONS {
+                // Check if this target is in backoff due to previous failures
+                if connection_backoff.is_in_backoff(ideal_location) {
+                    tracing::trace!(
+                        target_location = %ideal_location,
+                        "Skipping connection attempt - target in backoff"
+                    );
+                    // Don't re-queue, let topology manager request again later
+                } else if active_count < MAX_CONCURRENT_CONNECTIONS {
                     tracing::debug!(
                         active_connections = active_count,
                         max_concurrent = MAX_CONCURRENT_CONNECTIONS,
@@ -510,11 +529,15 @@ impl Ring {
                             target_location = %ideal_location,
                             "acquire_new returned None - likely no peers to query through"
                         );
+                        // Record failure for exponential backoff
+                        connection_backoff.record_failure(ideal_location);
                     } else {
                         tracing::info!(
                             active_connections = active_count + 1,
                             "Successfully initiated connection acquisition"
                         );
+                        // Clear any backoff for this location on successful initiation
+                        connection_backoff.record_success(ideal_location);
                     }
                 } else {
                     tracing::debug!(
