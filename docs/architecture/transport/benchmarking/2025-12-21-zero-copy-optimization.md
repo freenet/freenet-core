@@ -119,6 +119,28 @@ For a 1MB stream transfer:
 
 The fragmentation operation went from 37.7ms to 13.9µs for 1MB streams - a 2,700x improvement. This overhead was previously eating into available bandwidth.
 
+### Expected End-to-End Improvement
+
+The improvement scales with message size since fragmentation overhead increases with fragment count:
+
+| Message Size | Fragments | Frag Time (Before) | Frag Time (After) | Frag % of E2E | Expected E2E Improvement |
+|--------------|-----------|-------------------|-------------------|---------------|-------------------------|
+| 1 KB | 1 | N/A | N/A | 0% | None (no fragmentation) |
+| 32 KB | ~23 | ~0.2ms | ~0.5µs | 2-3% | ~2% |
+| 256 KB | ~180 | ~2.1ms | ~4µs | 10-15% | ~10-15% |
+| 1 MB | ~740 | **37.7ms** | ~14µs | **40-75%** | **40-75%** |
+
+**Key insight**: For small messages (<1.4KB), fragmentation doesn't occur, so no improvement is expected. For large streams (1MB+), the 37.7ms fragmentation overhead was a dominant factor, and eliminating it yields significant end-to-end improvement.
+
+### Verified Small Message Throughput (Unchanged)
+
+| Test | Before | After | Change |
+|------|--------|-------|--------|
+| 1 KB single message | 6.81 Mbps | 6.92 Mbps | ~+2% (noise) |
+| 1 KB × 100 sustained | 6.78 Mbps | 6.84 Mbps | ~+1% (noise) |
+
+Small message throughput is unchanged as expected since these don't require fragmentation.
+
 ### Wire Format Compatibility
 
 `bytes::Bytes` serializes identically to `Vec<u8>` via serde, so there's no wire format change. Existing peers can communicate with updated peers without issues.
