@@ -22,6 +22,7 @@ use std::time::Duration;
 mod transport;
 
 // Import benchmark functions
+use transport::allocation_overhead::*;
 use transport::blackbox::*;
 use transport::level0::*;
 use transport::level1::*;
@@ -29,6 +30,19 @@ use transport::level1::*;
 // =============================================================================
 // CI Benchmark Groups
 // =============================================================================
+
+criterion_group!(
+    name = allocation_ci;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(3))
+        .noise_threshold(0.02)  // 2% - should be rock stable
+        .significance_level(0.01);
+    targets =
+        bench_packet_allocation,
+        bench_fragmentation,
+        bench_packet_preparation,
+);
 
 criterion_group!(
     name = level0_ci;
@@ -69,4 +83,4 @@ criterion_group!(
 );
 
 // Main entry point - only CI-friendly benchmarks
-criterion_main!(level0_ci, level1_ci, transport_ci);
+criterion_main!(allocation_ci, level0_ci, level1_ci, transport_ci);

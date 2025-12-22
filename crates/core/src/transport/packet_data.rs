@@ -1,6 +1,5 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use aes_gcm::{aead::AeadInPlace, Aes128Gcm};
 use once_cell::sync::Lazy;
@@ -127,7 +126,7 @@ impl<const N: usize> PacketData<SymmetricAES, N> {
         })
     }
 
-    pub fn prepared_send(self) -> Arc<[u8]> {
+    pub fn prepared_send(self) -> Box<[u8]> {
         self.data[..self.size].into()
     }
 }

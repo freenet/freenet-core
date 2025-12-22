@@ -1,7 +1,6 @@
 use super::PacketId;
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const NETWORK_DELAY_ALLOWANCE: Duration = Duration::from_millis(500);
@@ -64,7 +63,7 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 pub(super) struct SentPacketTracker<T: TimeSource> {
     /// The list of packets that have been sent but not yet acknowledged
     /// Changed to store (payload, sent_time) for RTT calculation
-    pending_receipts: HashMap<PacketId, (Arc<[u8]>, Instant)>,
+    pending_receipts: HashMap<PacketId, (Box<[u8]>, Instant)>,
 
     resend_queue: VecDeque<ResendQueueEntry>,
 
@@ -114,7 +113,7 @@ impl SentPacketTracker<InstantTimeSrc> {
 }
 
 impl<T: TimeSource> SentPacketTracker<T> {
-    pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Arc<[u8]>) {
+    pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Box<[u8]>) {
         let sent_time = self.time_source.now();
         self.pending_receipts
             .insert(packet_id, (payload, sent_time));
@@ -317,7 +316,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
 #[derive(Debug, PartialEq)]
 pub enum ResendAction {
     WaitUntil(Instant),
-    Resend(u32, Arc<[u8]>),
+    Resend(u32, Box<[u8]>),
 }
 
 struct ResendQueueEntry {
@@ -329,7 +328,6 @@ struct ResendQueueEntry {
 #[cfg(test)]
 pub(in crate::transport) mod tests {
     use super::*;
-    use crate::transport::MessagePayload;
     use crate::util::time_source::MockTimeSource;
 
     pub(in crate::transport) fn mock_sent_packet_tracker() -> SentPacketTracker<MockTimeSource> {
@@ -422,13 +420,13 @@ pub(in crate::transport) mod tests {
     fn test_get_resend_with_pending_receipts() {
         let mut tracker = mock_sent_packet_tracker();
 
-        tracker.report_sent_packet(0, MessagePayload::new().into());
+        tracker.report_sent_packet(0, Box::from(&[][..]));
 
         tracker.time_source.advance_time(Duration::from_millis(10));
 
         // Capture the effective RTO at the time packet 1 is sent
         let effective_rto_at_send = tracker.effective_rto();
-        tracker.report_sent_packet(1, MessagePayload::new().into());
+        tracker.report_sent_packet(1, Box::from(&[][..]));
 
         let packet_1_timeout = tracker.time_source.now() + effective_rto_at_send;
 

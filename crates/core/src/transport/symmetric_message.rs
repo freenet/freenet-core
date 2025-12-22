@@ -4,6 +4,8 @@ use std::{
     sync::{LazyLock, OnceLock},
 };
 
+use bytes::Bytes;
+
 use crate::transport::packet_data::SymmetricAES;
 use aes_gcm::Aes128Gcm;
 use serde::{Deserialize, Serialize};
@@ -51,7 +53,7 @@ impl SymmetricMessage {
                 let blank = SymmetricMessage {
                     packet_id: u32::MAX,
                     confirm_receipt: vec![],
-                    payload: SymmetricMessagePayload::ShortMessage { payload: vec![] },
+                    payload: SymmetricMessagePayload::ShortMessage { payload: Bytes::new() },
                 };
                 bincode::serialized_size(&blank).unwrap() as usize
             };
@@ -85,7 +87,7 @@ impl SymmetricMessage {
                     stream_id: StreamId::next(),
                     total_length_bytes: u64::MAX,
                     fragment_number: u32::MAX,
-                    payload: vec![],
+                    payload: Bytes::new(),
                 },
             };
             bincode::serialized_size(&blank).unwrap() as usize
@@ -216,7 +218,9 @@ pub(super) struct ShortMessage(pub MessagePayload);
 #[cfg(test)]
 impl From<Vec<u8>> for SymmetricMessagePayload {
     fn from(payload: Vec<u8>) -> Self {
-        Self::ShortMessage { payload }
+        Self::ShortMessage {
+            payload: Bytes::from(payload),
+        }
     }
 }
 
@@ -338,19 +342,23 @@ mod test {
                 result: Err(Cow::Borrowed("error")),
             },
             SymmetricMessagePayload::ShortMessage {
-                payload: std::iter::repeat(())
-                    .take(100)
-                    .map(|_| rand::random::<u8>())
-                    .collect(),
+                payload: Bytes::from(
+                    std::iter::repeat(())
+                        .take(100)
+                        .map(|_| rand::random::<u8>())
+                        .collect::<Vec<_>>(),
+                ),
             },
             SymmetricMessagePayload::StreamFragment {
                 stream_id: StreamId::next(),
                 total_length_bytes: 100,
                 fragment_number: 1,
-                payload: std::iter::repeat(())
-                    .take(100)
-                    .map(|_| rand::random::<u8>())
-                    .collect(),
+                payload: Bytes::from(
+                    std::iter::repeat(())
+                        .take(100)
+                        .map(|_| rand::random::<u8>())
+                        .collect::<Vec<_>>(),
+                ),
             },
             SymmetricMessagePayload::NoOp,
         ];
@@ -421,7 +429,7 @@ mod test {
             packet_id: u32::MAX,
             confirm_receipt: vec![],
             payload: SymmetricMessagePayload::ShortMessage {
-                payload: vec![0; MAX_DATA_SIZE - overhead],
+                payload: Bytes::from(vec![0u8; MAX_DATA_SIZE - overhead]),
             },
         };
         let size = bincode::serialized_size(&msg).unwrap();
@@ -443,7 +451,7 @@ mod test {
                 stream_id: StreamId::next(),
                 total_length_bytes: u64::MAX,
                 fragment_number: u32::MAX,
-                payload: vec![0; MAX_DATA_SIZE - overhead],
+                payload: Bytes::from(vec![0u8; MAX_DATA_SIZE - overhead]),
             },
         };
         let size = bincode::serialized_size(&msg).unwrap();

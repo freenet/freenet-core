@@ -184,6 +184,23 @@ Example libvirt XML:
 
 These are **completely deterministic** and unaffected by OS:
 
+```bash
+# Run all Level 0 benchmarks
+cargo bench --bench transport_ci --features bench -- level0
+
+# Run allocation overhead benchmarks (fragmentation, packet preparation)
+cargo bench --bench transport_ci --features bench -- allocation
+```
+
+**Allocation Overhead Benchmarks** (`allocation_overhead.rs`):
+
+| Benchmark | What it measures |
+|-----------|-----------------|
+| `allocation/fragmentation/vec_split_off/*` | Vec::split_off fragmentation (baseline) |
+| `allocation/fragmentation/bytes_slice/*` | Bytes::slice zero-copy fragmentation |
+| `allocation/packet_preparation/encrypt_then_arc/*` | Arc<[u8]> packet packaging |
+| `allocation/packet_preparation/encrypt_then_box/*` | Box<[u8]> packet packaging |
+
 ```rust
 // bench_pure_logic.rs - Zero I/O, pure computation
 
@@ -206,11 +223,11 @@ fn bench_encrypt_pure(c: &mut Criterion) {
 fn bench_tracker_pure(c: &mut Criterion) {
     c.bench_function("tracker_report_sent", |b| {
         let mut tracker = SentPacketTracker::new();
-        let payload: Arc<[u8]> = vec![0u8; 1400].into();
         let mut id = 0u32;
 
         b.iter(|| {
-            tracker.report_sent_packet(id, payload.clone());
+            let payload: Box<[u8]> = vec![0u8; 1400].into();
+            tracker.report_sent_packet(id, payload);
             id += 1;
         })
     });
@@ -222,7 +239,7 @@ fn bench_serialize_pure(c: &mut Criterion) {
         packet_id: 12345,
         confirm_receipt: vec![1, 2, 3],
         payload: SymmetricMessagePayload::ShortMessage {
-            payload: vec![0u8; 1300]
+            payload: Bytes::from(vec![0u8; 1300])  // Uses bytes::Bytes
         },
     };
 

@@ -1,6 +1,8 @@
+use bytes::Bytes;
+use std::collections::BTreeMap;
+
 use crate::transport::fast_channel::FastReceiver;
 use crate::transport::peer_connection::outbound_stream::SerializedStream;
-use std::collections::BTreeMap;
 
 use super::StreamId;
 
@@ -8,7 +10,7 @@ type FragmentIdx = u32;
 
 pub(super) async fn recv_stream(
     stream_id: StreamId,
-    receiver: FastReceiver<(FragmentIdx, Vec<u8>)>,
+    receiver: FastReceiver<(FragmentIdx, Bytes)>,
     mut stream: InboundStream,
 ) -> Result<(StreamId, Vec<u8>), StreamId> {
     while let Ok((fragment_number, payload)) = receiver.recv_async().await {
@@ -23,7 +25,9 @@ pub(super) struct InboundStream {
     total_length_bytes: u64,
     /// Fragment numbers are 1-indexed
     last_contiguous_fragment_idx: FragmentIdx,
-    non_contiguous_fragments: BTreeMap<FragmentIdx, Vec<u8>>,
+    /// Out-of-order fragments stored until they can be appended
+    non_contiguous_fragments: BTreeMap<FragmentIdx, Bytes>,
+    /// Accumulated payload bytes
     payload: Vec<u8>,
 }
 
@@ -41,7 +45,7 @@ impl InboundStream {
     pub fn push_fragment(
         &mut self,
         fragment_number: FragmentIdx,
-        mut fragment: SerializedStream,
+        fragment: SerializedStream,
     ) -> Option<Vec<u8>> {
         // tracing::trace!(
         //     %fragment_number,
@@ -51,15 +55,15 @@ impl InboundStream {
         // );
         if fragment_number == self.last_contiguous_fragment_idx + 1 {
             self.last_contiguous_fragment_idx = fragment_number;
-            self.payload.append(&mut fragment);
+            self.payload.extend_from_slice(&fragment);
         } else {
             self.non_contiguous_fragments
                 .insert(fragment_number, fragment);
         }
-        while let Some((idx, mut v)) = self.non_contiguous_fragments.pop_first() {
+        while let Some((idx, v)) = self.non_contiguous_fragments.pop_first() {
             if idx == self.last_contiguous_fragment_idx + 1 {
                 self.last_contiguous_fragment_idx += 1;
-                self.payload.append(&mut v);
+                self.payload.extend_from_slice(&v);
             } else {
                 self.non_contiguous_fragments.insert(idx, v);
                 break;
@@ -79,14 +83,17 @@ impl InboundStream {
 
 #[cfg(test)]
 mod tests {
-    use super::InboundStream;
+    use super::*;
 
     #[test]
     fn test_simple_sequence() {
         let mut stream = InboundStream::new(6);
-        assert_eq!(stream.push_fragment(1, vec![1, 2, 3]), None);
         assert_eq!(
-            stream.push_fragment(2, vec![4, 5, 6]),
+            stream.push_fragment(1, Bytes::from_static(&[1, 2, 3])),
+            None
+        );
+        assert_eq!(
+            stream.push_fragment(2, Bytes::from_static(&[4, 5, 6])),
             Some(vec![1, 2, 3, 4, 5, 6])
         );
         assert!(stream.non_contiguous_fragments.is_empty());
@@ -96,10 +103,10 @@ mod tests {
     #[test]
     fn test_out_of_order_fragment_1() {
         let mut stream = InboundStream::new(6);
-        assert_eq!(stream.push_fragment(1, vec![1, 2]), None);
-        assert_eq!(stream.push_fragment(3, vec![5, 6]), None);
+        assert_eq!(stream.push_fragment(1, Bytes::from_static(&[1, 2])), None);
+        assert_eq!(stream.push_fragment(3, Bytes::from_static(&[5, 6])), None);
         assert_eq!(
-            stream.push_fragment(2, vec![3, 4]),
+            stream.push_fragment(2, Bytes::from_static(&[3, 4])),
             Some(vec![1, 2, 3, 4, 5, 6])
         );
         assert!(stream.non_contiguous_fragments.is_empty());
@@ -109,10 +116,10 @@ mod tests {
     #[test]
     fn test_out_of_order_fragment_2() {
         let mut stream = InboundStream::new(6);
-        assert_eq!(stream.push_fragment(2, vec![3, 4]), None);
-        assert_eq!(stream.push_fragment(3, vec![5, 6]), None);
+        assert_eq!(stream.push_fragment(2, Bytes::from_static(&[3, 4])), None);
+        assert_eq!(stream.push_fragment(3, Bytes::from_static(&[5, 6])), None);
         assert_eq!(
-            stream.push_fragment(1, vec![1, 2]),
+            stream.push_fragment(1, Bytes::from_static(&[1, 2])),
             Some(vec![1, 2, 3, 4, 5, 6])
         );
         assert!(stream.non_contiguous_fragments.is_empty());

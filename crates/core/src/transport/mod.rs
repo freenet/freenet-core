@@ -32,7 +32,7 @@ mod sent_packet_tracker;
 mod symmetric_message;
 pub(crate) mod token_bucket;
 
-type MessagePayload = Vec<u8>;
+type MessagePayload = bytes::Bytes;
 
 type PacketId = u32;
 
