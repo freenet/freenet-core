@@ -26,6 +26,7 @@ use crate::node::network_bridge::handshake::{
 };
 use crate::node::network_bridge::priority_select;
 use crate::node::MessageProcessor;
+use crate::operations::connect::ConnectMsg;
 use crate::ring::Location;
 use crate::transport::{
     create_connection_handler, global_bandwidth::GlobalBandwidthManager, OutboundConnectionHandler,
@@ -3039,13 +3040,22 @@ fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
 }
 
 /// Extract sender information from various message types.
-/// Note: Most message types use connection-based routing (sender determined from socket),
-/// so this only returns info for ObservedAddress which has a target field.
+/// Most message types use connection-based routing (sender determined from socket),
+/// but ConnectMsg::Request contains the joiner's identity (pub_key) which we need
+/// to associate with the transport-layer connection entry.
 fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
     match msg {
         NetMessage::V1(msg_v1) => match msg_v1 {
-            // All operations now use hop-by-hop routing via upstream_addr in operation state.
-            // No sender/target is embedded in messages - routing is determined by transport layer.
+            // ConnectMsg::Request contains the joiner's identity in payload.joiner.
+            // The address may be Unknown (peer behind NAT), but the pub_key is always present.
+            // We return the joiner so that the transport layer can update its connection entry
+            // with the peer's identity, enabling QueryConnections to return the peer.
+            NetMessageV1::Connect(ConnectMsg::Request { payload, .. }) => {
+                Some(payload.joiner.clone())
+            }
+            // Other Connect messages (Response, ObservedAddress) and all other operations
+            // use hop-by-hop routing via upstream_addr in operation state.
+            // No sender/target is embedded - routing is determined by transport layer.
             NetMessageV1::Connect(_)
             | NetMessageV1::Get(_)
             | NetMessageV1::Put(_)
