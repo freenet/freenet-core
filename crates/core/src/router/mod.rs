@@ -569,7 +569,7 @@ mod tests {
         peers
     }
 
-    // ============ Self-routing prevention support tests (Priority 2) ============
+    // ============ Self-routing prevention support tests ============
     //
     // These tests support the self-routing prevention tests in ConnectionManager.
     // While ConnectionManager handles filtering (excluding self/requester), Router

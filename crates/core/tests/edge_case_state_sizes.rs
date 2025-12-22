@@ -5,7 +5,7 @@
 //! - Large states (approaching 1MB)
 //! - Maximum allowed states
 //!
-//! Regression tests for issue #1885 Priority 6 - edge case handling.
+//! These tests validate that the system correctly handles edge cases in contract state sizes.
 
 use freenet::test_utils::{
     create_large_todo_list, create_minimal_state, create_oversized_todo_list, load_contract,

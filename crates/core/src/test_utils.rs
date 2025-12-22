@@ -715,7 +715,7 @@ pub fn create_todo_list_with_item(title: &str) -> Vec<u8> {
     serde_json::to_vec(&todo_list).unwrap_or_default()
 }
 
-// ============ Edge Case Test Factories (Priority 6) ============
+// ============ Edge Case Test Factories ============
 
 /// Creates a large todo list near the practical size limit (1MB) for testing
 ///
@@ -923,7 +923,7 @@ mod test {
         );
     }
 
-    // ============ Edge Case Factory Tests (Priority 6) ============
+    // ============ Edge Case Factory Tests ============
 
     #[test]
     fn test_create_large_todo_list() {

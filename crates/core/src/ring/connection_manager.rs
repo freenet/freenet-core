@@ -1265,7 +1265,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // ============ Self-routing prevention tests (Priority 2) ============
+    // ============ Self-routing prevention tests ============
     //
     // These tests prevent regression of self-routing bugs that caused infinite loops
     // and network congestion. The bugs manifested in several ways:
