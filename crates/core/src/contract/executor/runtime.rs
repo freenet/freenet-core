@@ -65,7 +65,21 @@ impl ContractExecutor for Executor<Runtime> {
         // responses where only the ContractInstanceId was preserved in the message).
         // See issue #2306 and related debugging.
         let key = if let Some(ref container) = code {
-            container.key()
+            let container_key = container.key();
+            // Validate that the instance IDs match - if they don't, something is seriously wrong
+            // (corrupted message, bug, or malicious peer). The code hashes may differ (that's
+            // expected - the container has the authoritative one), but instance IDs must match.
+            if key.id() != container_key.id() {
+                tracing::error!(
+                    passed_key = %key,
+                    container_key = %container_key,
+                    "CRITICAL: Contract key instance ID mismatch - passed key doesn't match container"
+                );
+                return Err(ExecutorError::other(anyhow::anyhow!(
+                    "contract key instance ID mismatch"
+                )));
+            }
+            container_key
         } else {
             key
         };
