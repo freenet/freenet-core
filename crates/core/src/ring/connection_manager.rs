@@ -835,6 +835,16 @@ mod tests {
         assert!(cm.is_gateway());
     }
 
+    /// Test that should_accept rejects connections from own address
+    ///
+    /// **Bug scenario prevented (#1806, #1786, #1781, #1827):**
+    /// A node must never accept a connection from itself. This can happen when:
+    /// - A node's external address is incorrectly resolved to itself
+    /// - NAT reflection causes packets to loop back
+    /// - Gateway advertises its own address to peers
+    ///
+    /// Self-connections cause infinite routing loops and state corruption.
+    /// This is the PRIMARY defense layer (runs in both debug and release).
     #[test]
     fn rejects_self_connection() {
         let keypair = TransportKeypair::new();
@@ -1256,12 +1266,36 @@ mod tests {
     }
 
     // ============ Self-routing prevention tests (Priority 2) ============
+    //
+    // These tests prevent regression of self-routing bugs that caused infinite loops
+    // and network congestion. The bugs manifested in several ways:
+    //
+    // - #1806: Nodes routing messages back to themselves, creating routing loops
+    // - #1786: Connection state inconsistency when a node appeared in its own peer list
+    // - #1781: PUT operations failing due to self-connections in the routing path
+    // - #1827: Gateway nodes incorrectly routing to themselves under high load
+    //
+    // The fix involves multiple defense layers:
+    // 1. should_accept() rejects connection attempts from own address
+    // 2. add_connection() has a debug_assert to catch violations in development
+    // 3. routing_candidates() filters out the requester to prevent echo routing
 
-    /// Test that add_connection rejects own address
+    /// Test that add_connection rejects own address (debug mode only)
     ///
-    /// Verifies the invariant that nodes cannot add connections to themselves.
-    /// This is enforced by the debug_assert in add_connection (line 521).
-    /// Regression test for issues #1806, #1786, #1781, #1827
+    /// **Bug scenario prevented (#1806, #1781, #1827):**
+    /// A node could accidentally add itself to its own connection list, typically
+    /// when processing connection messages with incorrectly resolved addresses.
+    /// This caused infinite routing loops where a node would route to itself,
+    /// then route again to itself, consuming CPU and blocking real operations.
+    ///
+    /// **Why debug-only is acceptable:**
+    /// This test verifies a debug_assert that catches programming errors during
+    /// development. In release builds, the should_accept() check (which IS tested
+    /// in release mode) provides the primary defense. The debug_assert is a
+    /// secondary safety net for catching bugs that bypass should_accept().
+    ///
+    /// **Note:** The should_accept() guard is tested in `rejects_self_connection`
+    /// which runs in both debug and release modes.
     #[test]
     #[should_panic(expected = "assertion failed")]
     #[cfg(debug_assertions)]
@@ -1277,9 +1311,17 @@ mod tests {
 
     /// Test that routing_candidates() respects requester parameter
     ///
-    /// When a node receives a request from another peer, it should not route back
-    /// to the requester. This is handled by the `requesting` parameter.
-    /// Regression test for issues #1806, #1786
+    /// **Bug scenario prevented (#1806, #1786):**
+    /// When processing a routing request, if the node sent the response back
+    /// to the original requester as a "next hop", this created echo patterns
+    /// where messages bounced between two nodes indefinitely. The requester
+    /// parameter ensures we never route back to whoever sent us the request.
+    ///
+    /// **How the original bug manifested:**
+    /// Node A sends GET to Node B. Node B, when selecting routing candidates,
+    /// would sometimes select Node A as the best candidate (if A was close to
+    /// the target location). This caused the GET to bounce back to A, which
+    /// would send it back to B, creating a ping-pong loop.
     #[test]
     fn test_routing_candidates_respects_requester() {
         let own_addr = make_addr(8000);
@@ -1332,10 +1374,14 @@ mod tests {
         assert!(addrs.contains(&peer3_addr));
     }
 
-    /// Test that should_accept rejects self-connection with various address formats
+    /// Test that should_accept rejects self-connection with IPv6 addresses
     ///
-    /// Verifies self-connection rejection works for different address formats.
-    /// Extends the existing rejects_self_connection test.
+    /// **Bug scenario prevented (#1806, #1786):**
+    /// Self-connection rejection must work regardless of address format.
+    /// Early implementations only checked IPv4 addresses, allowing IPv6
+    /// loopback connections to create self-loops.
+    ///
+    /// This test extends `rejects_self_connection` to cover IPv6 addresses.
     #[test]
     fn test_should_accept_rejects_own_addr_ipv6() {
         let keypair = TransportKeypair::new();

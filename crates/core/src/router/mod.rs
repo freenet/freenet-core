@@ -570,11 +570,24 @@ mod tests {
     }
 
     // ============ Self-routing prevention support tests (Priority 2) ============
+    //
+    // These tests support the self-routing prevention tests in ConnectionManager.
+    // While ConnectionManager handles filtering (excluding self/requester), Router
+    // must handle the edge cases that result from aggressive filtering:
+    // - Empty candidate lists (all peers filtered out)
+    // - Single candidate lists (only one peer remains)
+    //
+    // Related bugs: #1806, #1786, #1781, #1827
 
     /// Test that select_peer returns None for empty candidate list
     ///
-    /// This supports self-routing prevention: when all candidates are filtered out
-    /// (e.g., only self remains after filtering), routing should fail gracefully.
+    /// **Scenario this supports:**
+    /// After ConnectionManager filters out the requesting peer and any transient
+    /// connections, the candidate list may be empty. Router must return None
+    /// rather than panicking or returning an invalid peer.
+    ///
+    /// **Related to bug #1806:**
+    /// When routing filters were first added, empty candidate lists caused panics.
     #[test]
     fn test_select_peer_empty_candidates() {
         let router = Router::new(&[]);
@@ -588,10 +601,15 @@ mod tests {
         );
     }
 
-    /// Test that select_k_best_peers handles empty candidate list
+    /// Test that select_closest_peers handles empty candidate list
     ///
-    /// When no valid routing candidates exist (e.g., all filtered due to self-exclusion),
-    /// should return empty result.
+    /// **Scenario this supports:**
+    /// Internal method used by select_k_best_peers. Must handle edge cases
+    /// gracefully when filtering leaves no candidates.
+    ///
+    /// **Related to bugs #1806, #1786:**
+    /// Small networks with aggressive filtering can easily end up with zero
+    /// routing candidates. This must not cause crashes.
     #[test]
     fn test_select_k_best_empty_candidates() {
         let router = Router::new(&[]).considering_n_closest_peers(5);
@@ -607,8 +625,15 @@ mod tests {
 
     /// Test that select_peer works correctly with single candidate
     ///
-    /// Ensures Router correctly handles the edge case where only one peer remains
-    /// after filtering (common when self + requester are excluded from small networks).
+    /// **Scenario this supports:**
+    /// In a 3-node network, after excluding self and requester, only 1 peer remains.
+    /// Router must correctly select that peer without additional filtering that
+    /// could cause "no route found" errors.
+    ///
+    /// **Related to bug #1827:**
+    /// Gateway nodes in small networks sometimes failed to route because overly
+    /// aggressive filtering left only one candidate, which was then incorrectly
+    /// rejected by other criteria.
     #[test]
     fn test_select_peer_single_candidate() {
         let router = Router::new(&[]);
