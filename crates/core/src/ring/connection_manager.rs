@@ -835,6 +835,16 @@ mod tests {
         assert!(cm.is_gateway());
     }
 
+    /// Test that should_accept rejects connections from own address
+    ///
+    /// **Bug scenario prevented (#1806, #1786, #1781, #1827):**
+    /// A node must never accept a connection from itself. This can happen when:
+    /// - A node's external address is incorrectly resolved to itself
+    /// - NAT reflection causes packets to loop back
+    /// - Gateway advertises its own address to peers
+    ///
+    /// Self-connections cause infinite routing loops and state corruption.
+    /// This is the PRIMARY defense layer (runs in both debug and release).
     #[test]
     fn rejects_self_connection() {
         let keypair = TransportKeypair::new();
@@ -1253,6 +1263,162 @@ mod tests {
         let empty_set: HashSet<SocketAddr> = HashSet::new();
         let result = cm.routing(Location::new(0.5), None, &empty_set, &router);
         assert!(result.is_none());
+    }
+
+    // ============ Self-routing prevention tests ============
+    //
+    // These tests prevent regression of self-routing bugs that caused infinite loops
+    // and network congestion. The bugs manifested in several ways:
+    //
+    // - #1806: Nodes routing messages back to themselves, creating routing loops
+    // - #1786: Connection state inconsistency when a node appeared in its own peer list
+    // - #1781: PUT operations failing due to self-connections in the routing path
+    // - #1827: Gateway nodes incorrectly routing to themselves under high load
+    //
+    // The fix involves multiple defense layers:
+    // 1. should_accept() rejects connection attempts from own address
+    // 2. add_connection() has a debug_assert to catch violations in development
+    // 3. routing_candidates() filters out the requester to prevent echo routing
+
+    /// Test that add_connection rejects own address (debug mode only)
+    ///
+    /// **Bug scenario prevented (#1806, #1781, #1827):**
+    /// A node could accidentally add itself to its own connection list, typically
+    /// when processing connection messages with incorrectly resolved addresses.
+    /// This caused infinite routing loops where a node would route to itself,
+    /// then route again to itself, consuming CPU and blocking real operations.
+    ///
+    /// **Why debug-only is acceptable:**
+    /// This test verifies a debug_assert that catches programming errors during
+    /// development. In release builds, the should_accept() check (which IS tested
+    /// in release mode) provides the primary defense. The debug_assert is a
+    /// secondary safety net for catching bugs that bypass should_accept().
+    ///
+    /// **Note:** The should_accept() guard is tested in `rejects_self_connection`
+    /// which runs in both debug and release modes.
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    #[cfg(debug_assertions)]
+    fn test_add_connection_rejects_own_address() {
+        let own_addr = make_addr(8000);
+        let cm = make_connection_manager(Some(own_addr), 1, 10, false);
+        let keypair = TransportKeypair::new();
+        let own_loc = Location::new(0.5);
+
+        // This should panic in debug mode due to the debug_assert
+        cm.add_connection(own_loc, own_addr, keypair.public().clone(), false);
+    }
+
+    /// Test that routing_candidates() respects requester parameter
+    ///
+    /// **Bug scenario prevented (#1806, #1786):**
+    /// When processing a routing request, if the node sent the response back
+    /// to the original requester as a "next hop", this created echo patterns
+    /// where messages bounced between two nodes indefinitely. The requester
+    /// parameter ensures we never route back to whoever sent us the request.
+    ///
+    /// **How the original bug manifested:**
+    /// Node A sends GET to Node B. Node B, when selecting routing candidates,
+    /// would sometimes select Node A as the best candidate (if A was close to
+    /// the target location). This caused the GET to bounce back to A, which
+    /// would send it back to B, creating a ping-pong loop.
+    #[test]
+    fn test_routing_candidates_respects_requester() {
+        let own_addr = make_addr(8000);
+        let cm = make_connection_manager(Some(own_addr), 1, 10, false);
+        let keypair = TransportKeypair::new();
+
+        // Add several peers
+        let requester_addr = make_addr(8001);
+        let requester_loc = Location::new(0.3);
+        cm.add_connection(
+            requester_loc,
+            requester_addr,
+            keypair.public().clone(),
+            false,
+        );
+
+        let peer2_addr = make_addr(8002);
+        let peer2_loc = Location::new(0.5);
+        cm.add_connection(peer2_loc, peer2_addr, keypair.public().clone(), false);
+
+        let peer3_addr = make_addr(8003);
+        let peer3_loc = Location::new(0.7);
+        cm.add_connection(peer3_loc, peer3_addr, keypair.public().clone(), false);
+
+        // Get routing candidates with requester specified
+        let empty_set: HashSet<SocketAddr> = HashSet::new();
+        let target = Location::new(0.5);
+        let candidates = cm.routing_candidates(target, Some(requester_addr), &empty_set);
+
+        // Should have 2 candidates (excluding requester)
+        assert_eq!(
+            candidates.len(),
+            2,
+            "routing_candidates should exclude requester"
+        );
+
+        // Verify requester is not in candidates
+        for peer in &candidates {
+            let addr = peer.socket_addr().expect("Peer should have address");
+            assert_ne!(
+                addr, requester_addr,
+                "routing_candidates must not include requester address"
+            );
+        }
+
+        // Verify other peers are included
+        let addrs: HashSet<SocketAddr> =
+            candidates.iter().filter_map(|p| p.socket_addr()).collect();
+        assert!(addrs.contains(&peer2_addr));
+        assert!(addrs.contains(&peer3_addr));
+    }
+
+    /// Test that should_accept rejects self-connection with IPv6 addresses
+    ///
+    /// **Bug scenario prevented (#1806, #1786):**
+    /// Self-connection rejection must work regardless of address format.
+    /// Early implementations only checked IPv4 addresses, allowing IPv6
+    /// loopback connections to create self-loops.
+    ///
+    /// This test extends `rejects_self_connection` to cover IPv6 addresses.
+    #[test]
+    fn test_should_accept_rejects_own_addr_ipv6() {
+        let keypair = TransportKeypair::new();
+
+        // Test with IPv6 loopback
+        let ipv6_addr: SocketAddr = "[::1]:8000".parse().unwrap();
+        let cm = ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            1,
+            10,
+            7,
+            (
+                keypair.public().clone(),
+                Some(ipv6_addr),
+                AtomicU64::new(u64::from_le_bytes(0.5f64.to_le_bytes())),
+            ),
+            false,
+            10,
+            Duration::from_secs(60),
+        );
+
+        assert_eq!(cm.get_own_addr(), Some(ipv6_addr));
+        let location = Location::new(0.5);
+        let accepted = cm.should_accept(location, ipv6_addr);
+        assert!(
+            !accepted,
+            "should_accept must reject self-connection for IPv6 addresses"
+        );
+
+        // Verify different address is accepted
+        let other_addr: SocketAddr = "[::1]:8001".parse().unwrap();
+        let accepted_other = cm.should_accept(location, other_addr);
+        assert!(
+            accepted_other,
+            "should_accept must accept connection from different IPv6 address"
+        );
     }
 
     // ============ get_connections_by_location tests ============
