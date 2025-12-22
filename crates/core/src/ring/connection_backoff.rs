@@ -10,12 +10,13 @@ use super::Location;
 
 /// Tracks backoff state for failed connection targets.
 ///
-/// Uses exponential backoff: `base_interval * 2^consecutive_failures` capped at `max_backoff`.
+/// Uses exponential backoff: `base_interval * 2^(consecutive_failures-1)` capped at `max_backoff`.
+/// First failure = base_interval, second = 2x, third = 4x, etc.
 #[derive(Debug)]
 pub struct ConnectionBackoff {
     /// Failed targets with their backoff state
     failed_targets: HashMap<LocationBucket, BackoffState>,
-    /// Base backoff interval (first retry delay)
+    /// Base backoff interval (delay after first failure)
     base_interval: Duration,
     /// Maximum backoff interval (cap)
     max_backoff: Duration,
@@ -35,14 +36,20 @@ struct BackoffState {
 }
 
 /// Bucket for location - we group nearby locations to avoid tracking too many entries.
-/// Uses 256 buckets across the [0, 1) ring.
+/// Uses 256 buckets across the [0, 1] ring.
+///
+/// Note: This intentionally groups nearby locations together. If a connection to one
+/// location in a bucket fails, we'll delay retrying all locations in that bucket.
+/// This is a tradeoff: it reduces memory usage and prevents rapid retries to
+/// clustered locations, but may delay legitimate connections to nearby peers.
+/// With 256 buckets, each covers ~0.4% of the ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LocationBucket(u8);
 
 impl LocationBucket {
     fn from_location(loc: Location) -> Self {
-        // Location is in [0, 1), multiply by 256 to get bucket
-        let bucket = (loc.as_f64() * 256.0) as u8;
+        // Location is in [0, 1], multiply by 256 and clamp to handle edge case at 1.0
+        let bucket = (loc.as_f64() * 256.0).min(255.0) as u8;
         Self(bucket)
     }
 }
@@ -145,10 +152,19 @@ impl ConnectionBackoff {
     }
 
     /// Calculate backoff duration for a given failure count.
+    ///
+    /// Uses formula: base_interval * 2^(consecutive_failures - 1)
+    /// - 1st failure: base_interval (5s default)
+    /// - 2nd failure: 2 * base_interval (10s)
+    /// - 3rd failure: 4 * base_interval (20s)
+    /// - etc., capped at max_backoff
     fn calculate_backoff(&self, consecutive_failures: u32) -> Duration {
-        // Cap the exponent to avoid overflow
-        let exponent = consecutive_failures.min(10);
-        let multiplier = 1u64 << exponent; // 2^exponent
+        if consecutive_failures == 0 {
+            return Duration::ZERO;
+        }
+        // Cap the exponent to avoid overflow (consecutive_failures - 1, max 10)
+        let exponent = (consecutive_failures - 1).min(10);
+        let multiplier = 1u64 << exponent; // 2^(consecutive_failures - 1)
         let backoff = self.base_interval.saturating_mul(multiplier as u32);
 
         // Cap at max backoff
@@ -159,27 +175,30 @@ impl ConnectionBackoff {
         }
     }
 
-    /// Evict oldest entries if we exceed max_entries.
+    /// Evict oldest entries until we're at or below max_entries.
     fn evict_if_needed(&mut self) {
-        if self.failed_targets.len() <= self.max_entries {
-            return;
-        }
+        while self.failed_targets.len() > self.max_entries {
+            // Find and remove the entry with oldest last_failure
+            let oldest = self
+                .failed_targets
+                .iter()
+                .min_by_key(|(_, state)| state.last_failure)
+                .map(|(bucket, _)| *bucket);
 
-        // Find and remove the entry with oldest last_failure
-        let oldest = self
-            .failed_targets
-            .iter()
-            .min_by_key(|(_, state)| state.last_failure)
-            .map(|(bucket, _)| *bucket);
-
-        if let Some(bucket) = oldest {
-            self.failed_targets.remove(&bucket);
+            if let Some(bucket) = oldest {
+                self.failed_targets.remove(&bucket);
+            } else {
+                // No entries to remove (shouldn't happen, but avoid infinite loop)
+                break;
+            }
         }
     }
 
-    /// Clean up expired backoff entries (those past their retry time with low failure count).
+    /// Clean up expired backoff entries (those past their retry time and stale).
     ///
-    /// Called periodically to prevent unbounded growth.
+    /// Removes entries that are both past their retry_after time AND have been
+    /// in backoff for longer than max_backoff (i.e., stale entries that haven't
+    /// had recent failures). Called periodically to prevent unbounded growth.
     pub fn cleanup_expired(&mut self) {
         let now = Instant::now();
 
@@ -231,14 +250,15 @@ mod tests {
         let backoff =
             ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
 
-        // 2^0 = 1
-        assert_eq!(backoff.calculate_backoff(1), Duration::from_secs(2));
-        // 2^1 = 2
-        assert_eq!(backoff.calculate_backoff(2), Duration::from_secs(4));
-        // 2^2 = 4
-        assert_eq!(backoff.calculate_backoff(3), Duration::from_secs(8));
-        // 2^3 = 8
-        assert_eq!(backoff.calculate_backoff(4), Duration::from_secs(16));
+        // Formula: base * 2^(n-1)
+        // 1st failure: 1s * 2^0 = 1s
+        assert_eq!(backoff.calculate_backoff(1), Duration::from_secs(1));
+        // 2nd failure: 1s * 2^1 = 2s
+        assert_eq!(backoff.calculate_backoff(2), Duration::from_secs(2));
+        // 3rd failure: 1s * 2^2 = 4s
+        assert_eq!(backoff.calculate_backoff(3), Duration::from_secs(4));
+        // 4th failure: 1s * 2^3 = 8s
+        assert_eq!(backoff.calculate_backoff(4), Duration::from_secs(8));
     }
 
     #[test]

@@ -494,11 +494,15 @@ impl Ring {
             if let Some(ideal_location) = pending_conn_adds.pop_first() {
                 // Check if this target is in backoff due to previous failures
                 if connection_backoff.is_in_backoff(ideal_location) {
-                    tracing::trace!(
+                    tracing::debug!(
                         target_location = %ideal_location,
                         "Skipping connection attempt - target in backoff"
                     );
-                    // Don't re-queue, let topology manager request again later
+                    // Intentionally do NOT re-queue here:
+                    // - Avoids repeatedly popping and checking the same location while it is
+                    //   under backoff, which would waste work in this tight maintenance loop.
+                    // - The topology manager will re-request connections to this location
+                    //   in the next cycle if we're still below min_connections.
                 } else if active_count < MAX_CONCURRENT_CONNECTIONS {
                     tracing::debug!(
                         active_connections = active_count,
