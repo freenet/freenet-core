@@ -1437,8 +1437,18 @@ impl Operation for GetOp {
                         None => return Err(OpError::invalid_transition(self.id)),
                     };
                 }
-                // Handle Found response with empty state - treat as if NotFound since
-                // a Found response without state data isn't useful
+                // DEFENSIVE HANDLING: Found response with empty state
+                //
+                // This case should not occur in normal operation because:
+                // 1. Contracts are always stored with their state
+                // 2. If a peer has the contract, it should have state data
+                //
+                // However, we handle this defensively to avoid undefined behavior if:
+                // - A malformed response is received from a peer
+                // - There's a race condition during contract storage
+                //
+                // We treat this as NotFound because a Found response without usable
+                // state data is equivalent to not finding the contract.
                 GetMsg::Response {
                     id,
                     instance_id,
@@ -1908,6 +1918,131 @@ mod tests {
         assert!(
             display.contains("Finished"),
             "Display should contain state name"
+        );
+    }
+
+    #[test]
+    fn get_msg_response_found_display_formats_correctly() {
+        let tx = Transaction::new::<GetMsg>();
+        let key = make_contract_key(1);
+        let msg = GetMsg::Response {
+            id: tx,
+            instance_id: *key.id(),
+            result: GetMsgResult::Found {
+                key,
+                value: StoreResponse {
+                    state: Some(WrappedState::new(vec![1, 2, 3])),
+                    contract: None,
+                },
+            },
+        };
+        let display = format!("{}", msg);
+        assert!(
+            display.contains("Response"),
+            "Display should contain message type name"
+        );
+        assert!(
+            display.contains("Found"),
+            "Display should indicate Found result"
+        );
+    }
+
+    #[test]
+    fn get_msg_response_notfound_display_formats_correctly() {
+        let tx = Transaction::new::<GetMsg>();
+        let instance_id = *make_contract_key(1).id();
+        let msg = GetMsg::Response {
+            id: tx,
+            instance_id,
+            result: GetMsgResult::NotFound,
+        };
+        let display = format!("{}", msg);
+        assert!(
+            display.contains("Response"),
+            "Display should contain message type name"
+        );
+        assert!(
+            display.contains("NotFound"),
+            "Display should indicate NotFound result"
+        );
+    }
+
+    #[test]
+    fn get_msg_result_found_contains_key_and_value() {
+        let key = make_contract_key(1);
+        let state = WrappedState::new(vec![1, 2, 3]);
+        let result = GetMsgResult::Found {
+            key,
+            value: StoreResponse {
+                state: Some(state.clone()),
+                contract: None,
+            },
+        };
+        if let GetMsgResult::Found {
+            key: found_key,
+            value,
+        } = result
+        {
+            assert_eq!(found_key, key);
+            assert_eq!(value.state, Some(state));
+        } else {
+            panic!("Expected Found variant");
+        }
+    }
+
+    #[test]
+    fn get_msg_result_notfound_is_unit_variant() {
+        let result = GetMsgResult::NotFound;
+        assert!(
+            matches!(result, GetMsgResult::NotFound),
+            "NotFound should match NotFound"
+        );
+    }
+
+    #[test]
+    fn get_msg_response_requested_location_uses_instance_id() {
+        let tx = Transaction::new::<GetMsg>();
+        let key = make_contract_key(1);
+        let instance_id = *key.id();
+
+        // Test Found variant
+        let msg_found = GetMsg::Response {
+            id: tx,
+            instance_id,
+            result: GetMsgResult::Found {
+                key,
+                value: StoreResponse {
+                    state: Some(WrappedState::new(vec![])),
+                    contract: None,
+                },
+            },
+        };
+        let location_found = msg_found.requested_location();
+        assert!(
+            location_found.is_some(),
+            "Response should have a requested location"
+        );
+        assert_eq!(
+            location_found.unwrap(),
+            Location::from(&instance_id),
+            "Location should be derived from instance_id"
+        );
+
+        // Test NotFound variant
+        let msg_notfound = GetMsg::Response {
+            id: tx,
+            instance_id,
+            result: GetMsgResult::NotFound,
+        };
+        let location_notfound = msg_notfound.requested_location();
+        assert!(
+            location_notfound.is_some(),
+            "NotFound Response should have a requested location"
+        );
+        assert_eq!(
+            location_notfound.unwrap(),
+            Location::from(&instance_id),
+            "Location should be derived from instance_id for NotFound too"
         );
     }
 }
