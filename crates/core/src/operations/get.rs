@@ -17,7 +17,7 @@ use crate::{
 
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
-pub(crate) use self::messages::GetMsg;
+pub(crate) use self::messages::{GetMsg, GetMsgResult};
 
 /// Maximum number of retries to get values.
 const MAX_RETRIES: usize = 10;
@@ -723,57 +723,27 @@ impl Operation for GetOp {
                         return_msg = None;
                         result = self.result;
                     } else if htl == 0 {
-                        // HTL exhausted - try to look up key for failure response
+                        // HTL exhausted - send NotFound response
                         tracing::warn!(
                             tx = %id,
                             %instance_id,
                             peer_addr = %sender_display,
                             htl = 0,
-                            phase = "error",
-                            "Dropping GET Request with zero HTL"
+                            phase = "not_found",
+                            "GET Request exhausted HTL - sending NotFound response"
                         );
-                        // Try to look up the full key so we can send a proper failure Response
-                        let get_result = op_manager
-                            .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                        return build_op_result(
+                            id,
+                            None,
+                            Some(GetMsg::Response {
+                                id,
                                 instance_id,
-                                return_contract_code: false,
-                            })
-                            .await;
-                        if let Ok(ContractHandlerEvent::GetResponse { key: Some(key), .. }) =
-                            get_result
-                        {
-                            return build_op_result(
-                                id,
-                                None,
-                                Some(GetMsg::Response {
-                                    id,
-                                    key,
-                                    value: StoreResponse {
-                                        state: None,
-                                        contract: None,
-                                    },
-                                }),
-                                None,
-                                stats,
-                                self.upstream_addr,
-                            );
-                        } else {
-                            // We don't have the contract, can't send Response with key
-                            // The upstream will timeout and retry
-                            tracing::debug!(
-                                tx = %id,
-                                %instance_id,
-                                "Cannot send failure Response - contract key unknown"
-                            );
-                            return build_op_result(
-                                id,
-                                None,
-                                None,
-                                None,
-                                stats,
-                                self.upstream_addr,
-                            );
-                        }
+                                result: GetMsgResult::NotFound,
+                            }),
+                            None,
+                            stats,
+                            self.upstream_addr,
+                        );
                     } else {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
                         debug_assert!(matches!(
@@ -861,10 +831,13 @@ impl Operation for GetOp {
                                     new_state = None;
                                     return_msg = Some(GetMsg::Response {
                                         id,
-                                        key,
-                                        value: StoreResponse {
-                                            state: Some(state),
-                                            contract,
+                                        instance_id: *key.id(),
+                                        result: GetMsgResult::Found {
+                                            key,
+                                            value: StoreResponse {
+                                                state: Some(state),
+                                                contract,
+                                            },
                                         },
                                     });
                                 }
@@ -876,10 +849,13 @@ impl Operation for GetOp {
                                     tracing::debug!(tx = %id, "Returning contract {} to upstream", key);
                                     return_msg = Some(GetMsg::Response {
                                         id,
-                                        key,
-                                        value: StoreResponse {
-                                            state: Some(state),
-                                            contract,
+                                        instance_id: *key.id(),
+                                        result: GetMsgResult::Found {
+                                            key,
+                                            value: StoreResponse {
+                                                state: Some(state),
+                                                contract,
+                                            },
                                         },
                                     });
                                 }
@@ -938,34 +914,34 @@ impl Operation for GetOp {
                 }
                 GetMsg::Response {
                     id,
-                    key,
-                    value: StoreResponse { state: None, .. },
+                    instance_id,
+                    result: GetMsgResult::NotFound,
                 } => {
                     let id = *id;
-                    let key = *key;
+                    let instance_id = *instance_id;
 
                     // Use sender_from_addr for logging
                     let Some(sender) = sender_from_addr.clone() else {
                         tracing::warn!(
                             tx = %id,
-                            %key,
-                            "GET: Response without sender lookup - cannot process"
+                            %instance_id,
+                            "GET: NotFound response without sender lookup - cannot process"
                         );
                         return Err(OpError::invalid_transition(self.id));
                     };
 
                     tracing::info!(
                         tx = %id,
-                        contract = %key,
+                        %instance_id,
                         peer_addr = %sender,
-                        phase = "response",
-                        "GET Response received with empty value"
+                        phase = "not_found",
+                        "GET NotFound response received"
                     );
-                    // Handle case where neither contract nor state was found
+                    // Handle case where contract was not found
                     let this_peer = op_manager.ring.connection_manager.own_location();
                     tracing::warn!(
                         tx = %id,
-                        contract = %key,
+                        %instance_id,
                         peer_addr = %this_peer,
                         from = %sender,
                         phase = "retry",
@@ -984,17 +960,16 @@ impl Operation for GetOp {
                             attempts_at_hop,
                             next_hop: _,
                             skip_list,
+                            instance_id: state_instance_id,
                             ..
                         }) => {
-                            // todo: register in the stats for the outcome of the op that failed to get a response from this peer
+                            // Use instance_id from state for consistency
+                            let instance_id = state_instance_id;
 
                             // Add the failed peer to tried list
                             if let Some(addr) = sender.socket_addr() {
                                 tried_peers.insert(addr);
                             }
-
-                            // Extract instance_id from key for Request/AwaitingResponse
-                            let instance_id = *key.id();
 
                             // First, check if we have alternatives at this hop level
                             if !alternatives.is_empty() && attempts_at_hop < DEFAULT_MAX_BREADTH {
@@ -1003,7 +978,7 @@ impl Operation for GetOp {
 
                                 tracing::info!(
                                     tx = %id,
-                                    contract = %key,
+                                    %instance_id,
                                     peer_addr = %next_target,
                                     fetch_contract,
                                     attempts_at_hop = attempts_at_hop + 1,
@@ -1057,14 +1032,14 @@ impl Operation for GetOp {
                                     );
 
                                 tracing::info!(
-                                tx = %id,
-                                contract = %key,
-                                new_candidates = ?new_candidates,
-                                skip = ?new_skip_list,
-                                htl = current_hop,
-                                retries = retries + 1,
-                                phase = "retry",
-                                "GET seeking new candidates after exhausted alternatives"
+                                    tx = %id,
+                                    %instance_id,
+                                    new_candidates = ?new_candidates,
+                                    skip = ?new_skip_list,
+                                    htl = current_hop,
+                                    retries = retries + 1,
+                                    phase = "retry",
+                                    "GET seeking new candidates after exhausted alternatives"
                                 );
 
                                 if !new_candidates.is_empty() {
@@ -1098,102 +1073,87 @@ impl Operation for GetOp {
                                         skip_list: new_skip_list.clone(),
                                     });
                                 } else if let Some(requester_peer) = requester.clone() {
-                                    // No more peers to try, return failure to requester
+                                    // No more peers to try, return NotFound to requester
                                     tracing::warn!(
                                         tx = %id,
-                                        contract = %key,
+                                        %instance_id,
                                         peer_addr = %this_peer,
                                         target = %requester_peer,
                                         tried = ?tried_peers,
                                         skip = ?new_skip_list,
-                                        phase = "error",
-                                        "No other peers found while trying to get the contract, returning response to requester"
+                                        phase = "not_found",
+                                        "No other peers found while trying to get the contract, returning NotFound to requester"
                                     );
                                     return_msg = Some(GetMsg::Response {
                                         id,
-                                        key,
-                                        value: StoreResponse {
-                                            state: None,
-                                            contract: None,
-                                        },
+                                        instance_id,
+                                        result: GetMsgResult::NotFound,
                                     });
                                 } else {
-                                    // Original requester, operation failed
+                                    // Original requester, operation failed - contract not found
                                     tracing::error!(
-                                                            tx = %id,
-                                    contract = %key,
-                                    tried = ?tried_peers,
-                                    skip = ?skip_list,
-                                    phase = "error",
-                                    "Failed getting a value for contract, reached max retries"
-                                                        );
+                                        tx = %id,
+                                        %instance_id,
+                                        tried = ?tried_peers,
+                                        skip = ?skip_list,
+                                        phase = "not_found",
+                                        "Failed getting contract, not found after max retries"
+                                    );
+                                    // Set result to None - to_host_result will return an error
+                                    // This is appropriate because the contract was not found
                                     return_msg = None;
                                     new_state = None;
-                                    result = Some(GetResult {
-                                        key,
-                                        state: WrappedState::new(vec![]),
-                                        contract: None,
-                                    });
+                                    // Don't set result - let it remain None to indicate failure
                                 }
                             } else {
                                 // Max retries reached
                                 tracing::error!(
                                     tx = %id,
-                                    contract = %key,
-                                    phase = "error",
-                                    "Failed getting a value for contract, reached max retries"
+                                    %instance_id,
+                                    phase = "not_found",
+                                    "Failed getting contract, reached max retries"
                                 );
 
                                 if let Some(requester_peer) = requester.clone() {
-                                    // Return failure to requester
+                                    // Return NotFound to requester
                                     tracing::warn!(
                                         tx = %id,
-                                        contract = %key,
+                                        %instance_id,
                                         peer_addr = %this_peer,
                                         target = %requester_peer,
                                         tried = ?tried_peers,
                                         skip = ?skip_list,
-                                        phase = "error",
-                                        "No other peers found while trying to get the contract, returning response to requester"
+                                        phase = "not_found",
+                                        "No other peers found, returning NotFound to requester"
                                     );
                                     return_msg = Some(GetMsg::Response {
                                         id,
-                                        key,
-                                        value: StoreResponse {
-                                            state: None,
-                                            contract: None,
-                                        },
+                                        instance_id,
+                                        result: GetMsgResult::NotFound,
                                     });
                                     new_state = None;
                                 } else {
-                                    // Original requester, operation failed
+                                    // Original requester, operation failed - contract not found
                                     tracing::error!(
                                         tx = %id,
-                                        contract = %key,
-                                        phase = "error",
-                                        "Failed getting a value for contract, reached max retries"
+                                        %instance_id,
+                                        phase = "not_found",
+                                        "Failed getting contract, reached max retries"
                                     );
                                     return_msg = None;
                                     new_state = None;
-                                    result = Some(GetResult {
-                                        key,
-                                        state: WrappedState::new(vec![]),
-                                        contract: None,
-                                    });
+                                    // Don't set result - let it remain None to indicate failure
                                 }
                             }
                         }
                         Some(GetState::ReceivedRequest { .. }) => {
-                            // Return failure to sender
-                            tracing::debug!(tx = %id, "Returning contract {} to {}", key, sender);
+                            // Return NotFound to sender
+                            tracing::debug!(tx = %id, %instance_id, "Returning NotFound to {}", sender);
                             new_state = None;
                             return_msg = Some(GetMsg::Response {
                                 id,
-                                key,
-                                value: StoreResponse {
-                                    state: None,
-                                    contract: None,
-                                },
+                                instance_id,
+                                result: GetMsgResult::NotFound,
                             });
                         }
                         _ => return Err(OpError::invalid_transition(self.id)),
@@ -1201,12 +1161,16 @@ impl Operation for GetOp {
                 }
                 GetMsg::Response {
                     id,
-                    key,
-                    value:
-                        StoreResponse {
-                            state: Some(value),
-                            contract,
+                    result:
+                        GetMsgResult::Found {
+                            key,
+                            value:
+                                StoreResponse {
+                                    state: Some(value),
+                                    contract,
+                                },
                         },
+                    ..
                 } => {
                     let id = *id;
                     let key = *key;
@@ -1258,16 +1222,13 @@ impl Operation for GetOp {
                                 "Contract not received while required, returning response to upstream",
                             );
 
-                            // Forward error to requester
+                            // Forward NotFound to requester (contract was required but not provided)
                             op_manager
                                 .notify_op_change(
                                     NetMessage::from(GetMsg::Response {
                                         id,
-                                        key,
-                                        value: StoreResponse {
-                                            state: None,
-                                            contract: None,
-                                        },
+                                        instance_id: *key.id(),
+                                        result: GetMsgResult::NotFound,
                                     }),
                                     OpEnum::Get(GetOp {
                                         id,
@@ -1435,10 +1396,13 @@ impl Operation for GetOp {
                             new_state = None;
                             return_msg = Some(GetMsg::Response {
                                 id,
-                                key,
-                                value: StoreResponse {
-                                    state: Some(value.clone()),
-                                    contract: contract.clone(),
+                                instance_id: *key.id(),
+                                result: GetMsgResult::Found {
+                                    key,
+                                    value: StoreResponse {
+                                        state: Some(value.clone()),
+                                        contract: contract.clone(),
+                                    },
                                 },
                             });
                             tracing::debug!(tx = %id, %key, target = %requester, "Returning contract to requester");
@@ -1454,10 +1418,13 @@ impl Operation for GetOp {
                             new_state = None;
                             return_msg = Some(GetMsg::Response {
                                 id,
-                                key,
-                                value: StoreResponse {
-                                    state: Some(value.clone()),
-                                    contract: contract.clone(),
+                                instance_id: *key.id(),
+                                result: GetMsgResult::Found {
+                                    key,
+                                    value: StoreResponse {
+                                        state: Some(value.clone()),
+                                        contract: contract.clone(),
+                                    },
                                 },
                             });
                         }
@@ -1469,6 +1436,52 @@ impl Operation for GetOp {
                         }
                         None => return Err(OpError::invalid_transition(self.id)),
                     };
+                }
+                // Handle Found response with empty state - treat as if NotFound since
+                // a Found response without state data isn't useful
+                GetMsg::Response {
+                    id,
+                    instance_id,
+                    result:
+                        GetMsgResult::Found {
+                            value: StoreResponse { state: None, .. },
+                            ..
+                        },
+                } => {
+                    let id = *id;
+                    let instance_id = *instance_id;
+
+                    let Some(sender) = sender_from_addr.clone() else {
+                        tracing::warn!(
+                            tx = %id,
+                            %instance_id,
+                            "GET: Found response with empty state but no sender lookup"
+                        );
+                        return Err(OpError::invalid_transition(self.id));
+                    };
+
+                    tracing::warn!(
+                        tx = %id,
+                        %instance_id,
+                        peer_addr = %sender,
+                        phase = "response",
+                        "GET Found response with empty state - treating as NotFound"
+                    );
+
+                    // Forward as NotFound since Found with empty state isn't useful
+                    if self.upstream_addr.is_some() {
+                        return_msg = Some(GetMsg::Response {
+                            id,
+                            instance_id,
+                            result: GetMsgResult::NotFound,
+                        });
+                        new_state = None;
+                    } else {
+                        // Original requester - operation failed
+                        return_msg = None;
+                        new_state = None;
+                        // result remains None to indicate failure
+                    }
                 }
             }
 
@@ -1637,6 +1650,21 @@ mod messages {
 
     use super::*;
 
+    /// Result of a GET operation - either the contract was found or it wasn't.
+    ///
+    /// This provides explicit semantics for "contract not found" rather than
+    /// requiring interpretation of empty responses or timeouts.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub(crate) enum GetMsgResult {
+        /// Contract was found - includes full key and value
+        Found {
+            key: ContractKey,
+            value: StoreResponse,
+        },
+        /// Contract was not found after exhaustive search
+        NotFound,
+    }
+
     /// GET operation messages.
     ///
     /// Uses hop-by-hop routing: each node stores `upstream_addr` from the transport layer
@@ -1653,12 +1681,13 @@ mod messages {
             htl: usize,
             skip_list: HashSet<std::net::SocketAddr>,
         },
-        /// Response containing the contract data. Routed hop-by-hop back to originator.
-        /// Uses full ContractKey since the responding node has the contract.
+        /// Response for a GET operation. Routed hop-by-hop back to originator.
+        /// Uses instance_id for routing (always available from the request).
+        /// The full ContractKey is only present in GetMsgResult::Found.
         Response {
             id: Transaction,
-            key: ContractKey,
-            value: StoreResponse,
+            instance_id: ContractInstanceId,
+            result: GetMsgResult,
         },
     }
 
@@ -1671,8 +1700,9 @@ mod messages {
 
         fn requested_location(&self) -> Option<Location> {
             match self {
-                Self::Request { instance_id, .. } => Some(Location::from(instance_id)),
-                Self::Response { key, .. } => Some(Location::from(key.id())),
+                Self::Request { instance_id, .. } | Self::Response { instance_id, .. } => {
+                    Some(Location::from(instance_id))
+                }
             }
         }
     }
@@ -1689,7 +1719,20 @@ mod messages {
                         "Get::Request(id: {id}, instance_id: {instance_id}, htl: {htl})"
                     )
                 }
-                Self::Response { key, .. } => write!(f, "Get::Response(id: {id}, key: {key})"),
+                Self::Response {
+                    instance_id,
+                    result,
+                    ..
+                } => {
+                    let result_str = match result {
+                        GetMsgResult::Found { key, .. } => format!("Found({key})"),
+                        GetMsgResult::NotFound => "NotFound".to_string(),
+                    };
+                    write!(
+                        f,
+                        "Get::Response(id: {id}, instance_id: {instance_id}, result: {result_str})"
+                    )
+                }
             }
         }
     }

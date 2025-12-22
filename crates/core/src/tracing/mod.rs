@@ -14,7 +14,13 @@ use crate::{
     generated::ContractChange,
     message::{MessageStats, NetMessage, NetMessageV1, Transaction},
     node::PeerId,
-    operations::{connect, get::GetMsg, put::PutMsg, subscribe::SubscribeMsg, update::UpdateMsg},
+    operations::{
+        connect,
+        get::{GetMsg, GetMsgResult},
+        put::PutMsg,
+        subscribe::{SubscribeMsg, SubscribeMsgResult},
+        update::UpdateMsg,
+    },
     ring::{Location, PeerKeyLocation, Ring},
     router::RouteEvent,
 };
@@ -262,8 +268,12 @@ impl<'a> NetEventLog<'a> {
             }
             NetMessageV1::Get(GetMsg::Response {
                 id,
-                key,
-                value: StoreResponse { state: Some(_), .. },
+                result:
+                    GetMsgResult::Found {
+                        key,
+                        value: StoreResponse { state: Some(_), .. },
+                    },
+                ..
             }) => EventKind::Get {
                 id: *id,
                 key: *key,
@@ -274,8 +284,8 @@ impl<'a> NetEventLog<'a> {
             },
             NetMessageV1::Subscribe(SubscribeMsg::Response {
                 id,
-                subscribed: true,
-                key,
+                result: SubscribeMsgResult::Subscribed { key },
+                ..
             }) => EventKind::Subscribed {
                 id: *id,
                 key: *key,

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
-pub(crate) use self::messages::SubscribeMsg;
+pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
 use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::node::IsOperationCompleted;
 use crate::{
@@ -377,8 +377,8 @@ impl Operation for SubscribeOp {
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
-                                    key,
-                                    subscribed: true,
+                                    instance_id: *instance_id,
+                                    result: SubscribeMsgResult::Subscribed { key },
                                 })),
                                 next_hop: Some(requester_addr),
                                 state: None,
@@ -423,8 +423,8 @@ impl Operation for SubscribeOp {
                             return Ok(OperationResult {
                                 return_msg: Some(NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
-                                    key,
-                                    subscribed: true,
+                                    instance_id: *instance_id,
+                                    result: SubscribeMsgResult::Subscribed { key },
                                 })),
                                 next_hop: Some(requester_addr),
                                 state: None,
@@ -499,103 +499,125 @@ impl Operation for SubscribeOp {
 
                 SubscribeMsg::Response {
                     id: msg_id,
-                    key,
-                    subscribed,
+                    instance_id,
+                    result,
                 } => {
-                    tracing::debug!(
-                        tx = %msg_id,
-                        %key,
-                        subscribed,
-                        requester_addr = ?self.requester_addr,
-                        source_addr = ?source_addr,
-                        "subscribe: processing Response"
-                    );
+                    match result {
+                        SubscribeMsgResult::Subscribed { key } => {
+                            tracing::debug!(
+                                tx = %msg_id,
+                                %key,
+                                requester_addr = ?self.requester_addr,
+                                source_addr = ?source_addr,
+                                "subscribe: processing Subscribed response"
+                            );
 
-                    if *subscribed {
-                        // Fetch contract if we don't have it
-                        fetch_contract_if_missing(op_manager, *key.id()).await?;
+                            // Fetch contract if we don't have it
+                            fetch_contract_if_missing(op_manager, *key.id()).await?;
 
-                        // Register the sender as our upstream source
-                        if let Some(sender_addr) = source_addr {
-                            if let Some(sender_peer) = op_manager
-                                .ring
-                                .connection_manager
-                                .get_peer_location_by_addr(sender_addr)
-                            {
-                                op_manager.ring.set_upstream(key, sender_peer.clone());
-                                tracing::debug!(
-                                    tx = %msg_id,
-                                    %key,
-                                    upstream = %sender_addr,
-                                    "subscribe: registered upstream source"
-                                );
+                            // Register the sender as our upstream source
+                            if let Some(sender_addr) = source_addr {
+                                if let Some(sender_peer) = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_location_by_addr(sender_addr)
+                                {
+                                    op_manager.ring.set_upstream(key, sender_peer.clone());
+                                    tracing::debug!(
+                                        tx = %msg_id,
+                                        %key,
+                                        upstream = %sender_addr,
+                                        "subscribe: registered upstream source"
+                                    );
+                                }
+                            }
+
+                            // Forward response to requester or complete
+                            if let Some(requester_addr) = self.requester_addr {
+                                // We're an intermediate node - forward response to the requester
+                                // Register them as downstream (they want updates from us)
+                                if let Some(downstream_peer) = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_location_by_addr(requester_addr)
+                                {
+                                    let _ = op_manager.ring.add_downstream(
+                                        key,
+                                        downstream_peer,
+                                        Some(requester_addr.into()),
+                                    );
+                                    tracing::debug!(
+                                        tx = %msg_id,
+                                        %key,
+                                        downstream = %requester_addr,
+                                        "subscribe: registered requester as downstream subscriber"
+                                    );
+                                }
+
+                                tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
+                                Ok(OperationResult {
+                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                        id: *msg_id,
+                                        instance_id: *instance_id,
+                                        result: SubscribeMsgResult::Subscribed { key: *key },
+                                    })),
+                                    next_hop: Some(requester_addr),
+                                    state: Some(OpEnum::Subscribe(SubscribeOp {
+                                        id,
+                                        state: Some(SubscribeState::Completed { key: *key }),
+                                        requester_addr: None,
+                                    })),
+                                })
+                            } else {
+                                // We're the originator - return completed state for handle_op_result
+                                tracing::info!(tx = %msg_id, contract = %key, phase = "complete", "Subscribe completed (originator)");
+                                Ok(OperationResult {
+                                    return_msg: None,
+                                    next_hop: None,
+                                    state: Some(OpEnum::Subscribe(SubscribeOp {
+                                        id,
+                                        state: Some(SubscribeState::Completed { key: *key }),
+                                        requester_addr: None,
+                                    })),
+                                })
                             }
                         }
-                    }
+                        SubscribeMsgResult::NotFound => {
+                            tracing::debug!(
+                                tx = %msg_id,
+                                %instance_id,
+                                requester_addr = ?self.requester_addr,
+                                source_addr = ?source_addr,
+                                "subscribe: processing NotFound response"
+                            );
 
-                    // Forward response to requester or complete
-                    if let Some(requester_addr) = self.requester_addr {
-                        // We're an intermediate node - forward response to the requester
-                        // Register them as downstream (they want updates from us)
-                        if *subscribed {
-                            if let Some(downstream_peer) = op_manager
-                                .ring
-                                .connection_manager
-                                .get_peer_location_by_addr(requester_addr)
-                            {
-                                let _ = op_manager.ring.add_downstream(
-                                    key,
-                                    downstream_peer,
-                                    Some(requester_addr.into()),
-                                );
-                                tracing::debug!(
-                                    tx = %msg_id,
-                                    %key,
-                                    downstream = %requester_addr,
-                                    "subscribe: registered requester as downstream subscriber"
-                                );
-                            }
-                        }
-
-                        tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding response to requester");
-                        Ok(OperationResult {
-                            return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                id: *msg_id,
-                                key: *key,
-                                subscribed: *subscribed,
-                            })),
-                            next_hop: Some(requester_addr),
-                            state: Some(OpEnum::Subscribe(SubscribeOp {
-                                id,
-                                state: Some(SubscribeState::Completed { key: *key }),
-                                requester_addr: None,
-                            })),
-                        })
-                    } else {
-                        // We're the originator - return completed state for handle_op_result
-                        if *subscribed {
-                            tracing::info!(tx = %msg_id, contract = %key, phase = "complete", "Subscribe completed (originator)");
-                            Ok(OperationResult {
-                                return_msg: None,
-                                next_hop: None,
-                                state: Some(OpEnum::Subscribe(SubscribeOp {
-                                    id,
-                                    state: Some(SubscribeState::Completed { key: *key }),
-                                    requester_addr: None,
-                                })),
-                            })
-                        } else {
-                            tracing::warn!(tx = %msg_id, contract = %key, phase = "failed", "Subscribe failed (originator)");
-                            // Return op with no inner state - to_host_result() will return error
-                            Ok(OperationResult {
-                                return_msg: None,
-                                next_hop: None,
-                                state: Some(OpEnum::Subscribe(SubscribeOp {
-                                    id,
+                            // Forward NotFound response to requester or complete with failure
+                            if let Some(requester_addr) = self.requester_addr {
+                                // We're an intermediate node - forward NotFound to requester
+                                tracing::debug!(tx = %msg_id, %instance_id, requester = %requester_addr, "Forwarding NotFound response to requester");
+                                Ok(OperationResult {
+                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                        id: *msg_id,
+                                        instance_id: *instance_id,
+                                        result: SubscribeMsgResult::NotFound,
+                                    })),
+                                    next_hop: Some(requester_addr),
                                     state: None,
-                                    requester_addr: None,
-                                })),
-                            })
+                                })
+                            } else {
+                                // We're the originator - subscription failed, contract not found
+                                tracing::warn!(tx = %msg_id, %instance_id, phase = "not_found", "Subscribe failed - contract not found");
+                                // Return op with no inner state - to_host_result() will return error
+                                Ok(OperationResult {
+                                    return_msg: None,
+                                    next_hop: None,
+                                    state: Some(OpEnum::Subscribe(SubscribeOp {
+                                        id,
+                                        state: None,
+                                        requester_addr: None,
+                                    })),
+                                })
+                            }
                         }
                     }
                 }
@@ -618,6 +640,18 @@ mod messages {
 
     use super::*;
 
+    /// Result of a SUBSCRIBE operation - either subscription succeeded or contract was not found.
+    ///
+    /// This provides explicit semantics for "contract not found" rather than
+    /// requiring interpretation of `subscribed: false` which could also mean other failures.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub(crate) enum SubscribeMsgResult {
+        /// Subscription succeeded - includes full contract key
+        Subscribed { key: ContractKey },
+        /// Contract was not found after exhaustive search
+        NotFound,
+    }
+
     /// Subscribe operation messages.
     ///
     /// Uses hop-by-hop routing: each node stores `requester_addr` from the transport layer
@@ -634,12 +668,13 @@ mod messages {
             /// Addresses to skip when selecting next hop (prevents loops)
             skip_list: HashSet<std::net::SocketAddr>,
         },
-        /// Response indicating subscription result. Routed hop-by-hop back to originator.
+        /// Response for a SUBSCRIBE operation. Routed hop-by-hop back to originator.
+        /// Uses instance_id for routing (always available from the request).
+        /// The full ContractKey is only present in SubscribeMsgResult::Subscribed.
         Response {
             id: Transaction,
-            /// Full contract key (includes code hash, resolved when contract is found)
-            key: ContractKey,
-            subscribed: bool,
+            instance_id: ContractInstanceId,
+            result: SubscribeMsgResult,
         },
     }
 
@@ -652,8 +687,9 @@ mod messages {
 
         fn requested_location(&self) -> Option<Location> {
             match self {
-                Self::Request { instance_id, .. } => Some(Location::from(instance_id)),
-                Self::Response { key, .. } => Some(Location::from(key.id())),
+                Self::Request { instance_id, .. } | Self::Response { instance_id, .. } => {
+                    Some(Location::from(instance_id))
+                }
             }
         }
     }
@@ -666,11 +702,17 @@ mod messages {
                     write!(f, "Subscribe::Request(id: {id}, contract: {instance_id})")
                 }
                 Self::Response {
-                    key, subscribed, ..
+                    instance_id,
+                    result,
+                    ..
                 } => {
+                    let result_str = match result {
+                        SubscribeMsgResult::Subscribed { key } => format!("Subscribed({key})"),
+                        SubscribeMsgResult::NotFound => "NotFound".to_string(),
+                    };
                     write!(
                         f,
-                        "Subscribe::Response(id: {id}, key: {key}, subscribed: {subscribed})"
+                        "Subscribe::Response(id: {id}, instance_id: {instance_id}, result: {result_str})"
                     )
                 }
             }
