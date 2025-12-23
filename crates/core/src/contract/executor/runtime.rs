@@ -199,6 +199,10 @@ impl ContractExecutor for Executor<Runtime> {
             // that reuse the same WASM code with different parameters (e.g., different
             // River rooms). Without this, lookup_key() fails for the new instance_id.
             // See issue #2380.
+            //
+            // We only index when code was provided in this request (code.is_some()).
+            // When code is None, this is a state-only update to an existing contract
+            // that should already be indexed.
             if code.is_some() {
                 self.runtime
                     .contract_store
