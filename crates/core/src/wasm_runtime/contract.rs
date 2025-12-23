@@ -375,7 +375,15 @@ where
                 .enable_all()
                 .build()
                 .expect("failed to create tokio runtime for WASM execution");
-            rt.block_on(async { execute_wasm_async(store, wasm_call, timeout, operation).await })
+            let result = rt
+                .block_on(async { execute_wasm_async(store, wasm_call, timeout, operation).await });
+
+            // CRITICAL: When we timeout, the spawn_blocking task is still running.
+            // By default, dropping the runtime would wait for all blocking tasks to complete,
+            // which defeats the purpose of the timeout! We set a short shutdown timeout
+            // to avoid blocking indefinitely.
+            rt.shutdown_timeout(Duration::from_millis(100));
+            result
         }
     }
 }
