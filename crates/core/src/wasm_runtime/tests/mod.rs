@@ -12,6 +12,7 @@ use super::{ContractStore, DelegateStore, SecretsStore};
 
 mod contract;
 mod contract_metering;
+mod execution_handling;
 mod time;
 
 pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

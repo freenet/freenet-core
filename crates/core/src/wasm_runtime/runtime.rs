@@ -139,6 +139,12 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Check if the runtime is in a healthy state and can execute WASM.
+    /// Returns false if the wasm_store has been lost (e.g., due to a panic).
+    pub fn is_healthy(&self) -> bool {
+        self.wasm_store.is_some()
+    }
+
     pub fn build_with_config(
         contract_store: ContractStore,
         delegate_store: DelegateStore,

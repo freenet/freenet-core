@@ -1,4 +1,4 @@
-use std::{thread::JoinHandle, time::Duration};
+use std::time::Duration;
 
 use super::{ContractExecError, RuntimeResult};
 use freenet_stdlib::prelude::{
@@ -102,16 +102,18 @@ impl ContractRuntimeInterface for super::Runtime {
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let related_buf_ptr = related_buf_ptr as i64;
-        let t = std::thread::spawn(move || {
-            let r = validate_func.call(
-                &mut wasm_store,
-                param_buf_ptr,
-                state_buf_ptr,
-                related_buf_ptr,
-            );
-            (r, wasm_store)
-        });
-        let r = handle_execution_call(t, self);
+        let r = execute_wasm_blocking(
+            move || {
+                let r = validate_func.call(
+                    &mut wasm_store,
+                    param_buf_ptr,
+                    state_buf_ptr,
+                    related_buf_ptr,
+                );
+                (r, wasm_store)
+            },
+            self,
+        );
 
         let result = match_err(self, &running.instance, r)?;
         let is_valid = unsafe {
@@ -170,16 +172,18 @@ impl ContractRuntimeInterface for super::Runtime {
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let update_data_buf_ptr = update_data_buf_ptr as i64;
-        let t = std::thread::spawn(move || {
-            let r = update_state_func.call(
-                &mut wasm_store,
-                param_buf_ptr,
-                state_buf_ptr,
-                update_data_buf_ptr,
-            );
-            (r, wasm_store)
-        });
-        let r = handle_execution_call(t, self);
+        let r = execute_wasm_blocking(
+            move || {
+                let r = update_state_func.call(
+                    &mut wasm_store,
+                    param_buf_ptr,
+                    state_buf_ptr,
+                    update_data_buf_ptr,
+                );
+                (r, wasm_store)
+            },
+            self,
+        );
 
         let result = match_err(self, &running.instance, r)?;
         let update_res = unsafe {
@@ -227,11 +231,13 @@ impl ContractRuntimeInterface for super::Runtime {
 
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
-        let t = std::thread::spawn(move || {
-            let r = summary_func.call(&mut wasm_store, param_buf_ptr, state_buf_ptr);
-            (r, wasm_store)
-        });
-        let r = handle_execution_call(t, self);
+        let r = execute_wasm_blocking(
+            move || {
+                let r = summary_func.call(&mut wasm_store, param_buf_ptr, state_buf_ptr);
+                (r, wasm_store)
+            },
+            self,
+        );
 
         let result = match_err(self, &running.instance, r)?;
         let result = unsafe {
@@ -279,16 +285,18 @@ impl ContractRuntimeInterface for super::Runtime {
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let summary_buf_ptr = summary_buf_ptr as i64;
-        let t = std::thread::spawn(move || {
-            let r = get_state_delta_func.call(
-                &mut wasm_store,
-                param_buf_ptr,
-                state_buf_ptr,
-                summary_buf_ptr,
-            );
-            (r, wasm_store)
-        });
-        let r = handle_execution_call(t, self);
+        let r = execute_wasm_blocking(
+            move || {
+                let r = get_state_delta_func.call(
+                    &mut wasm_store,
+                    param_buf_ptr,
+                    state_buf_ptr,
+                    summary_buf_ptr,
+                );
+                (r, wasm_store)
+            },
+            self,
+        );
 
         let result = match_err(self, &running.instance, r)?;
         let result = unsafe {
@@ -301,55 +309,119 @@ impl ContractRuntimeInterface for super::Runtime {
     }
 }
 
-fn handle_execution_call(
-    r: JoinHandle<(Result<i64, wasmer::RuntimeError>, Store)>,
-    rt: &mut super::Runtime,
-) -> Result<i64, Errors> {
-    // Calculate timeout iterations: max_execution_seconds * 100 (since we check every 10ms)
-    let timeout_iterations = (rt.max_execution_seconds * 100.0) as u64;
+/// Result type for WASM execution.
+type WasmResult = (Result<i64, wasmer::RuntimeError>, Store);
 
-    // Check if we're in a tokio runtime context
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // We're in an async context, use block_in_place to avoid blocking the executor
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                // Check every 10ms for the configured timeout duration
-                for _ in 0..timeout_iterations {
-                    if r.is_finished() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+/// Execute WASM code on a blocking thread with timeout handling.
+///
+/// This function handles WASM execution in two modes:
+/// 1. **With Tokio runtime**: Uses `spawn_blocking` for integration with tokio's
+///    bounded blocking thread pool (controlled by `max_blocking_threads` config)
+/// 2. **Without Tokio runtime**: Falls back to `std::thread::spawn` for sync tests
+///
+/// In both cases, it polls for completion while respecting the timeout.
+fn execute_wasm_blocking<F>(f: F, rt: &mut super::Runtime) -> Result<i64, Errors>
+where
+    F: FnOnce() -> WasmResult + Send + 'static,
+{
+    let timeout = Duration::from_secs_f64(rt.max_execution_seconds);
+    let start = std::time::Instant::now();
+
+    // Check if we're inside a Tokio runtime
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // We have a Tokio runtime - use spawn_blocking for bounded parallelism
+            let task_handle = tokio::task::spawn_blocking(f);
+
+            // Poll until completion or timeout
+            loop {
+                if task_handle.is_finished() {
+                    break;
                 }
 
-                if !r.is_finished() {
+                if start.elapsed() >= timeout {
+                    task_handle.abort();
+                    tracing::warn!(
+                        timeout_secs = rt.max_execution_seconds,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "WASM execution timed out, aborting task"
+                    );
                     return Err(Errors::MaxComputeTimeExceeded);
                 }
 
-                let (r, s) = r
-                    .join()
-                    .map_err(|_| Errors::Other(anyhow::anyhow!("Failed to join thread")))?;
-                rt.wasm_store = Some(s);
-                r.map_err(Errors::Wasmer)
-            })
-        })
-    } else {
-        // We're not in an async context (e.g., in tests), fall back to thread::sleep
-        for _ in 0..timeout_iterations {
-            if r.is_finished() {
-                break;
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
-        }
 
-        if !r.is_finished() {
-            return Err(Errors::MaxComputeTimeExceeded);
-        }
+            // Get result using block_in_place to allow blocking within an async context.
+            // We use block_in_place + block_on because we're called from within a tokio task.
+            let join_result = tokio::task::block_in_place(|| handle.block_on(task_handle));
+            let (result, store) = join_result.map_err(|e| {
+                if e.is_panic() {
+                    tracing::error!("WASM blocking task panicked during execution");
+                    Errors::Other(anyhow::anyhow!("WASM execution panicked"))
+                } else if e.is_cancelled() {
+                    Errors::Other(anyhow::anyhow!("WASM execution was cancelled"))
+                } else {
+                    Errors::Other(anyhow::anyhow!("WASM execution failed: {}", e))
+                }
+            })?;
 
-        let (r, s) = r
-            .join()
-            .map_err(|_| Errors::Other(anyhow::anyhow!("Failed to join thread")))?;
-        rt.wasm_store = Some(s);
-        r.map_err(Errors::Wasmer)
+            rt.wasm_store = Some(store);
+            result.map_err(Errors::Wasmer)
+        }
+        Err(_) => {
+            // No Tokio runtime - fall back to std::thread::spawn for sync tests
+            let (tx, rx) = std::sync::mpsc::channel();
+            let thread_handle = std::thread::spawn(move || {
+                let result = f();
+                // Send result through channel (ignore errors if receiver dropped)
+                let _ = tx.send(result);
+            });
+
+            // Poll until completion or timeout
+            loop {
+                // Check if result is available
+                match rx.try_recv() {
+                    Ok((result, store)) => {
+                        rt.wasm_store = Some(store);
+                        // Wait for thread to fully complete
+                        let _ = thread_handle.join();
+                        return result.map_err(Errors::Wasmer);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Not ready yet
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Thread panicked - join to get the panic info
+                        return match thread_handle.join() {
+                            Err(_) => {
+                                tracing::error!("WASM thread panicked during execution");
+                                Err(Errors::Other(anyhow::anyhow!("WASM execution panicked")))
+                            }
+                            Ok(()) => {
+                                // This shouldn't happen - channel disconnected but no panic
+                                Err(Errors::Other(anyhow::anyhow!(
+                                    "WASM thread exited without sending result"
+                                )))
+                            }
+                        };
+                    }
+                }
+
+                if start.elapsed() >= timeout {
+                    tracing::warn!(
+                        timeout_secs = rt.max_execution_seconds,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "WASM execution timed out (no tokio runtime)"
+                    );
+                    // Can't abort std::thread, but we return the error
+                    // The thread will continue but result is ignored
+                    return Err(Errors::MaxComputeTimeExceeded);
+                }
+
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 }
 

@@ -82,6 +82,11 @@ pub struct ConfigArgs {
     /// Show the version of the application.
     #[arg(long, short)]
     pub version: bool,
+
+    /// Maximum number of threads for blocking operations (WASM execution, etc.).
+    /// Default: 2x CPU cores, clamped to 4-32.
+    #[arg(long, env = "MAX_BLOCKING_THREADS")]
+    pub max_blocking_threads: Option<usize>,
 }
 
 impl Default for ConfigArgs {
@@ -118,6 +123,7 @@ impl Default for ConfigArgs {
             config_paths: Default::default(),
             id: None,
             version: false,
+            max_blocking_threads: None,
         }
     }
 }
@@ -466,6 +472,9 @@ impl ConfigArgs {
             gateways: gateways.gateways.clone(),
             is_gateway: self.network_api.is_gateway,
             location: self.network_api.location,
+            max_blocking_threads: self
+                .max_blocking_threads
+                .unwrap_or_else(default_max_blocking_threads),
         };
 
         fs::create_dir_all(this.config_dir())?;
@@ -549,6 +558,16 @@ pub struct Config {
     pub(crate) gateways: Vec<GatewayConfig>,
     pub(crate) is_gateway: bool,
     pub(crate) location: Option<f64>,
+    /// Maximum number of threads for blocking operations (WASM execution, etc.).
+    #[serde(default = "default_max_blocking_threads")]
+    pub max_blocking_threads: usize,
+}
+
+/// Default max blocking threads: 2x CPU cores, clamped to 4-32.
+fn default_max_blocking_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() * 2).clamp(4, 32))
+        .unwrap_or(8)
 }
 
 impl Config {

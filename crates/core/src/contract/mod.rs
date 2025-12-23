@@ -10,8 +10,8 @@ mod handler;
 pub mod storages;
 
 pub(crate) use executor::{
-    executor_channel, mock_runtime::MockRuntime, Callback, ExecutorToEventLoopChannel,
-    NetworkEventListenerHalve, UpsertResult,
+    mediator_channels, mock_runtime::MockRuntime, op_request_channel, run_op_request_mediator,
+    Callback, ExecutorToEventLoopChannel, NetworkEventListenerHalve, UpsertResult,
 };
 pub(crate) use handler::{
     client_responses_channel, contract_handler_channel, in_memory::MemoryContractHandler,

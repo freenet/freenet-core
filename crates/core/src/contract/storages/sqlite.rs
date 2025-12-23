@@ -54,7 +54,7 @@ impl Pool {
 impl StateStorage for Pool {
     type Error = SqlDbError;
 
-    async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
+    async fn store(&self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
         sqlx::query(
             "INSERT INTO states (contract, state)
                      VALUES ($1, $2)
@@ -82,7 +82,7 @@ impl StateStorage for Pool {
     }
 
     async fn store_params(
-        &mut self,
+        &self,
         key: ContractKey,
         params: Parameters<'static>,
     ) -> Result<(), Self::Error> {

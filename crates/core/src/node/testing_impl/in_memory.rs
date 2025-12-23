@@ -6,7 +6,10 @@ use tracing::Instrument;
 use crate::{
     client_events::ClientEventsProxy,
     config::GlobalExecutor,
-    contract::{self, executor_channel, ContractHandler, MemoryContractHandler},
+    contract::{
+        self, mediator_channels, op_request_channel, run_op_request_mediator, ContractHandler,
+        MemoryContractHandler,
+    },
     node::{
         network_bridge::{event_loop_notification_channel, in_memory::MemoryConnManager},
         op_state_manager::OpManager,
@@ -48,11 +51,29 @@ impl<ER> Builder<ER> {
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
-        let (executor_listener, executor_sender) = executor_channel(op_manager.clone());
-        let contract_handler =
-            MemoryContractHandler::build(ch_channel, executor_sender, self.contract_handler_name)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
+
+        // Create channels for the mediator pattern:
+        // - op_request_channel: executors send (Transaction, oneshot::Sender) to mediator
+        // - mediator_channels: mediator forwards Transaction to event loop and routes responses back
+        let (op_request_receiver, op_sender) = op_request_channel();
+        let (executor_listener, to_event_loop_tx, from_event_loop_rx) =
+            mediator_channels(op_manager.clone());
+
+        // Spawn the mediator task that bridges between the pooled executors and the event loop
+        GlobalExecutor::spawn({
+            let mediator_task =
+                run_op_request_mediator(op_request_receiver, to_event_loop_tx, from_event_loop_rx);
+            mediator_task.instrument(tracing::info_span!("op_request_mediator"))
+        });
+
+        let contract_handler = MemoryContractHandler::build(
+            ch_channel,
+            op_sender,
+            op_manager.clone(),
+            self.contract_handler_name,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
         let conn_manager = MemoryConnManager::new(
             PeerId::new(

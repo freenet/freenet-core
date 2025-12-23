@@ -22,16 +22,15 @@ use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use super::executor::{ExecutorHalve, ExecutorToEventLoopChannel};
+use super::executor::{OpRequestSender, RuntimePool};
 use super::ExecutorError;
-use super::{
-    executor::{ContractExecutor, Executor},
-    ContractError,
-};
+use super::{executor::ContractExecutor, ContractError};
+use crate::client_events::ClientId;
 use crate::client_events::{AuthToken, HostResult, RequestId};
 use crate::config::Config;
 use crate::message::{QueryResult, Transaction};
-use crate::{client_events::ClientId, wasm_runtime::Runtime};
+use crate::node::OpManager;
+use std::num::NonZeroUsize;
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, RequestId, HostResult)>);
 
@@ -71,7 +70,8 @@ pub(crate) trait ContractHandler {
 
     fn build(
         contract_handler_channel: ContractHandlerChannel<ContractHandlerHalve>,
-        executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+        op_sender: OpRequestSender,
+        op_manager: Arc<OpManager>,
         builder: Self::Builder,
     ) -> impl Future<Output = anyhow::Result<Self>> + Send
     where
@@ -82,50 +82,39 @@ pub(crate) trait ContractHandler {
     fn executor(&mut self) -> &mut Self::ContractExecutor;
 }
 
-pub(crate) struct NetworkContractHandler<R = Runtime> {
-    executor: Executor<R>,
+pub(crate) struct NetworkContractHandler {
+    executor: RuntimePool,
     channel: ContractHandlerChannel<ContractHandlerHalve>,
 }
 
-impl ContractHandler for NetworkContractHandler<Runtime> {
+impl ContractHandler for NetworkContractHandler {
     type Builder = Arc<Config>;
-    type ContractExecutor = Executor<Runtime>;
+    type ContractExecutor = RuntimePool;
 
     async fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
-        executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+        op_sender: OpRequestSender,
+        op_manager: Arc<OpManager>,
         config: Self::Builder,
     ) -> anyhow::Result<Self>
     where
         Self: Sized + 'static,
     {
-        let executor = Executor::from_config(config.clone(), Some(executor_request_sender)).await?;
-        Ok(Self { executor, channel })
-    }
+        // Create a pool of executors sized to available CPU parallelism, clamped to 2-16.
+        // All executors share the same StateStore (ReDb database) via Arc<Database>.
+        let parallelism = std::thread::available_parallelism()
+            .unwrap_or(NonZeroUsize::new(4).unwrap())
+            .get();
+        let clamped = parallelism.clamp(2, 16);
+        let pool_size = NonZeroUsize::new(clamped).unwrap();
 
-    fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
-        &mut self.channel
-    }
+        tracing::info!(
+            pool_size = %pool_size,
+            available_parallelism = parallelism,
+            "Creating RuntimePool for contract execution"
+        );
 
-    fn executor(&mut self) -> &mut Self::ContractExecutor {
-        &mut self.executor
-    }
-}
-
-#[cfg(test)]
-impl ContractHandler for NetworkContractHandler<super::MockRuntime> {
-    type Builder = String;
-    type ContractExecutor = Executor<super::MockRuntime>;
-
-    async fn build(
-        channel: ContractHandlerChannel<ContractHandlerHalve>,
-        executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
-        identifier: Self::Builder,
-    ) -> anyhow::Result<Self>
-    where
-        Self: Sized + 'static,
-    {
-        let executor = Executor::new_mock(&identifier, executor_request_sender).await?;
+        let executor = RuntimePool::new(config.clone(), op_sender, op_manager, pool_size).await?;
         Ok(Self { executor, channel })
     }
 
@@ -747,12 +736,11 @@ pub mod test {
 
 pub(super) mod in_memory {
     use super::{
-        super::{
-            executor::{ExecutorHalve, ExecutorToEventLoopChannel},
-            Executor, MockRuntime,
-        },
+        super::{executor::OpRequestSender, Executor, MockRuntime},
         ContractHandler, ContractHandlerChannel, ContractHandlerHalve,
     };
+    use crate::node::OpManager;
+    use std::sync::Arc;
 
     pub(crate) struct MemoryContractHandler {
         channel: ContractHandlerChannel<ContractHandlerHalve>,
@@ -762,12 +750,13 @@ pub(super) mod in_memory {
     impl MemoryContractHandler {
         pub async fn new(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
-            executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+            op_sender: Option<OpRequestSender>,
+            op_manager: Option<Arc<OpManager>>,
             identifier: &str,
         ) -> Self {
             MemoryContractHandler {
                 channel,
-                runtime: Executor::new_mock(identifier, executor_request_sender)
+                runtime: Executor::new_mock(identifier, op_sender, op_manager)
                     .await
                     .expect("should start mock executor"),
             }
@@ -780,13 +769,17 @@ pub(super) mod in_memory {
 
         async fn build(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
-            executor_request_sender: ExecutorToEventLoopChannel<ExecutorHalve>,
+            op_sender: OpRequestSender,
+            op_manager: Arc<OpManager>,
             identifier: Self::Builder,
         ) -> anyhow::Result<Self>
         where
             Self: Sized + 'static,
         {
-            Ok(MemoryContractHandler::new(channel, executor_request_sender, &identifier).await)
+            Ok(
+                MemoryContractHandler::new(channel, Some(op_sender), Some(op_manager), &identifier)
+                    .await,
+            )
         }
 
         fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {

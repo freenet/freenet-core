@@ -1,4 +1,6 @@
 use super::*;
+use crate::node::OpManager;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub(crate) struct MockRuntime {
@@ -8,7 +10,8 @@ pub(crate) struct MockRuntime {
 impl Executor<MockRuntime> {
     pub async fn new_mock(
         identifier: &str,
-        event_loop_channel: ExecutorToEventLoopChannel<ExecutorHalve>,
+        op_sender: Option<OpRequestSender>,
+        op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         let data_dir = Self::test_data_dir(identifier);
 
@@ -29,7 +32,8 @@ impl Executor<MockRuntime> {
             || Ok(()),
             OperationMode::Local,
             MockRuntime { contract_store },
-            Some(event_loop_channel),
+            op_sender,
+            op_manager,
         )
         .await?;
         Ok(executor)
@@ -162,6 +166,7 @@ mod test {
             },
             OperationMode::Local,
             MockRuntime { contract_store },
+            None,
             None,
         )
         .await

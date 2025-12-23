@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use freenet_stdlib::prelude::*;
 use redb::{Database, DatabaseError, ReadableDatabase, TableDefinition};
@@ -9,7 +10,11 @@ const CONTRACT_PARAMS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("contract_params");
 const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
 
-pub struct ReDb(Database);
+/// ReDb wraps a redb Database in Arc for thread-safe sharing.
+/// redb supports MVCC (multiple concurrent readers, single writer) internally,
+/// so multiple clones of ReDb can safely access the same database.
+#[derive(Clone)]
+pub struct ReDb(Arc<Database>);
 
 impl ReDb {
     pub async fn new(data_dir: &Path) -> Result<Self, redb::Error> {
@@ -55,7 +60,7 @@ impl ReDb {
     }
 
     fn initialize_database(db: Database) -> Result<Self, redb::Error> {
-        let db = Self(db);
+        let db = Self(Arc::new(db));
         let txn = db.0.begin_write()?;
         {
             txn.open_table(STATE_TABLE).map_err(|e| {
@@ -149,7 +154,7 @@ impl ReDb {
 impl StateStorage for ReDb {
     type Error = redb::Error;
 
-    async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
+    async fn store(&self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
         let txn = self.0.begin_write()?;
 
         {
@@ -174,7 +179,7 @@ impl StateStorage for ReDb {
     }
 
     async fn store_params(
-        &mut self,
+        &self,
         key: ContractKey,
         params: Parameters<'static>,
     ) -> Result<(), Self::Error> {

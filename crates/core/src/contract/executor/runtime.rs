@@ -1,10 +1,402 @@
 use super::*;
 use super::{
-    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
-    ExecutorToEventLoopChannel, InitCheckResult, RequestError, Response, StateStoreError,
-    SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
+    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
+    OpRequestSender, RequestError, Response, StateStoreError, SLOW_INIT_THRESHOLD,
+    STALE_INIT_THRESHOLD,
 };
+use crate::node::OpManager;
 use freenet_stdlib::prelude::RelatedContract;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+// ============================================================================
+// RuntimePool - Pool of executors for concurrent contract execution
+// ============================================================================
+
+/// Health status information for the RuntimePool.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PoolHealthStatus {
+    /// Number of executors currently available in the pool
+    pub available: usize,
+    /// Number of executors currently checked out (in use)
+    pub checked_out: usize,
+    /// Total pool size (should equal available + checked_out)
+    pub total: usize,
+    /// Number of executors that were replaced due to failures
+    pub replacements: usize,
+}
+
+/// A pool of executors that enables concurrent contract execution.
+///
+/// This pool manages multiple `Executor<Runtime>` instances, allowing multiple
+/// contract operations to run in parallel. The pool uses a semaphore to control
+/// access to executors and ensures thread-safe executor borrowing and returning.
+///
+/// # Architecture
+///
+/// The pool maintains a fixed number of executors (typically CPU count) and uses
+/// a semaphore to gate access. When an operation needs an executor:
+/// 1. It acquires a semaphore permit (blocking if all executors are busy)
+/// 2. Takes an available executor from the pool
+/// 3. Executes the operation
+/// 4. Returns the executor to the pool and releases the permit
+///
+/// This design ensures:
+/// - Bounded parallelism (no unbounded thread spawning)
+/// - Fair access to executors
+/// - Proper cleanup on errors
+///
+/// # Pool Health Tracking
+///
+/// The pool tracks actual executor count separately from the semaphore to detect
+/// capacity degradation. If executors are lost due to panics or other issues,
+/// the pool can detect and report this mismatch.
+pub struct RuntimePool {
+    /// Pool of available executors. `None` slots indicate executors currently in use.
+    runtimes: Vec<Option<Executor<Runtime>>>,
+    /// Semaphore controlling access to executors (permits = available executors)
+    available: Semaphore,
+    /// Configuration for creating new executors
+    config: Arc<Config>,
+    /// Channel to send operation requests to the event loop (cloneable, shared by all executors)
+    op_sender: OpRequestSender,
+    /// Reference to the operation manager (cloneable, shared by all executors)
+    op_manager: Arc<OpManager>,
+    /// Total pool size (for health checking)
+    pool_size: usize,
+    /// Count of executors currently checked out (for health checking)
+    checked_out: AtomicUsize,
+    /// Count of executors that were lost/replaced (for monitoring)
+    replacements_count: AtomicUsize,
+    /// Shared StateStore used by all executors (ReDb uses exclusive file locking)
+    shared_state_store: StateStore<Storage>,
+}
+
+impl RuntimePool {
+    /// Create a new pool with the specified number of executors.
+    ///
+    /// # Arguments
+    /// * `config` - Configuration for executors
+    /// * `op_sender` - Channel to send operation requests to the event loop (cloneable)
+    /// * `op_manager` - Reference to the operation manager
+    /// * `pool_size` - Number of executors to create (typically CPU count)
+    pub async fn new(
+        config: Arc<Config>,
+        op_sender: OpRequestSender,
+        op_manager: Arc<OpManager>,
+        pool_size: NonZeroUsize,
+    ) -> anyhow::Result<Self> {
+        let pool_size_usize: usize = pool_size.into();
+        let mut runtimes = Vec::with_capacity(pool_size_usize);
+
+        // Create the shared StateStore once - it wraps a ReDb database that uses
+        // exclusive file locking, so we can only have one connection. ReDb is now
+        // Clone (wraps Arc<Database>), so we can share it across executors.
+        let (_, _, _, shared_state_store) = Executor::<Runtime>::get_stores(&config).await?;
+
+        // Create all executors sharing the same StateStore
+        for _ in 0..pool_size_usize {
+            let executor = Executor::from_config_with_shared_store(
+                config.clone(),
+                shared_state_store.clone(),
+                Some(op_sender.clone()),
+                Some(op_manager.clone()),
+            )
+            .await?;
+            runtimes.push(Some(executor));
+        }
+
+        tracing::info!(
+            pool_size = pool_size_usize,
+            "Created RuntimePool with {} executors sharing one database connection",
+            pool_size_usize
+        );
+
+        Ok(Self {
+            runtimes,
+            available: Semaphore::new(pool_size_usize),
+            config,
+            op_sender,
+            op_manager,
+            pool_size: pool_size_usize,
+            checked_out: AtomicUsize::new(0),
+            replacements_count: AtomicUsize::new(0),
+            shared_state_store,
+        })
+    }
+
+    /// Get the current health status of the pool.
+    ///
+    /// Returns a tuple of:
+    /// - `available`: Number of executors currently available
+    /// - `checked_out`: Number of executors currently in use
+    /// - `total`: Total pool size
+    /// - `replacements`: Number of executors that were replaced due to failures
+    pub fn health_status(&self) -> PoolHealthStatus {
+        let available = self.runtimes.iter().filter(|s| s.is_some()).count();
+        let checked_out = self.checked_out.load(Ordering::SeqCst);
+        let replacements = self.replacements_count.load(Ordering::SeqCst);
+
+        // Check for pool degradation
+        let expected_total = available + checked_out;
+        if expected_total != self.pool_size {
+            tracing::warn!(
+                available = available,
+                checked_out = checked_out,
+                expected = self.pool_size,
+                actual = expected_total,
+                "Pool capacity mismatch detected - possible semaphore drift"
+            );
+        }
+
+        PoolHealthStatus {
+            available,
+            checked_out,
+            total: self.pool_size,
+            replacements,
+        }
+    }
+
+    /// Log the pool health status at debug level.
+    /// Called periodically when there have been replacements to help diagnose issues.
+    fn log_health_if_degraded(&self) {
+        let status = self.health_status();
+        if status.replacements > 0 {
+            tracing::info!(
+                available = status.available,
+                checked_out = status.checked_out,
+                total = status.total,
+                replacements = status.replacements,
+                "RuntimePool health status (degraded - {} replacements)",
+                status.replacements
+            );
+        }
+    }
+
+    /// Pop an executor from the pool, blocking until one is available.
+    ///
+    /// The caller MUST return the executor via `return_executor` after use.
+    async fn pop_executor(&mut self) -> Executor<Runtime> {
+        // Wait for an available permit
+        let permit = self
+            .available
+            .acquire()
+            .await
+            .expect("Semaphore should not be closed");
+
+        // Consume the permit without returning it to the semaphore.
+        // The permit will be restored in `return_executor` via `add_permits(1)`.
+        permit.forget();
+
+        // Track that we're checking out an executor
+        self.checked_out.fetch_add(1, Ordering::SeqCst);
+
+        // Find the first available executor
+        for slot in &mut self.runtimes {
+            if let Some(executor) = slot.take() {
+                return executor;
+            }
+        }
+
+        // This should never happen because of the semaphore
+        // But if it does, we need to restore the checked_out count
+        self.checked_out.fetch_sub(1, Ordering::SeqCst);
+        unreachable!("No executors available despite semaphore permit")
+    }
+
+    /// Return an executor to the pool after use.
+    fn return_executor(&mut self, executor: Executor<Runtime>) {
+        // Track that we're returning an executor
+        self.checked_out.fetch_sub(1, Ordering::SeqCst);
+
+        // Find an empty slot
+        if let Some(empty_slot) = self.runtimes.iter_mut().find(|slot| slot.is_none()) {
+            *empty_slot = Some(executor);
+            self.available.add_permits(1);
+        } else {
+            // This should never happen, but log it if it does
+            tracing::error!(
+                pool_size = self.pool_size,
+                checked_out = self.checked_out.load(Ordering::SeqCst),
+                "No empty slot found when returning executor - pool may be corrupted"
+            );
+            // Still add the permit back to avoid deadlock
+            self.available.add_permits(1);
+        }
+    }
+
+    /// Check if an executor is healthy and can be reused.
+    /// An executor is unhealthy if its wasm_store is None (lost due to panic).
+    fn is_executor_healthy(executor: &Executor<Runtime>) -> bool {
+        executor.runtime.is_healthy()
+    }
+
+    /// Create a new executor to replace a broken one.
+    /// Uses the shared StateStore to avoid opening a new database connection.
+    async fn create_replacement_executor(&self) -> anyhow::Result<Executor<Runtime>> {
+        tracing::warn!("Creating replacement executor due to previous failure");
+        Executor::from_config_with_shared_store(
+            self.config.clone(),
+            self.shared_state_store.clone(),
+            Some(self.op_sender.clone()),
+            Some(self.op_manager.clone()),
+        )
+        .await
+    }
+}
+
+impl ContractExecutor for RuntimePool {
+    fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {
+        // Try to find the key in any available executor
+        self.runtimes.iter().flatten().find_map(|executor| {
+            executor
+                .runtime
+                .contract_store
+                .code_hash_from_id(instance_id)
+                .map(|key| ContractKey::from_id_and_code(*instance_id, key))
+        })
+    }
+
+    async fn fetch_contract(
+        &mut self,
+        key: ContractKey,
+        return_contract_code: bool,
+    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
+        let mut executor = self.pop_executor().await;
+        let result = executor.fetch_contract(key, return_contract_code).await;
+
+        // Check if executor is still healthy after the operation
+        // If the WASM execution panicked, the store is lost and we need a new executor
+        if !Self::is_executor_healthy(&executor) {
+            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
+            tracing::warn!(
+                contract = %key,
+                replacement_number = replacement_num,
+                "Executor became unhealthy after fetch_contract, creating replacement"
+            );
+            match self.create_replacement_executor().await {
+                Ok(new_executor) => {
+                    self.return_executor(new_executor);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create replacement executor");
+                    // Return the broken executor anyway - next operation will fail
+                    // but at least the pool isn't depleted
+                    self.return_executor(executor);
+                }
+            }
+            // Log health status after replacement
+            self.log_health_if_degraded();
+        } else {
+            self.return_executor(executor);
+        }
+        result
+    }
+
+    async fn upsert_contract_state(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+    ) -> Result<UpsertResult, ExecutorError> {
+        let mut executor = self.pop_executor().await;
+        let result = executor
+            .upsert_contract_state(key, update, related_contracts, code)
+            .await;
+
+        // Check if executor is still healthy after the operation
+        if !Self::is_executor_healthy(&executor) {
+            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
+            tracing::warn!(
+                contract = %key,
+                replacement_number = replacement_num,
+                "Executor became unhealthy after upsert_contract_state, creating replacement"
+            );
+            match self.create_replacement_executor().await {
+                Ok(new_executor) => {
+                    self.return_executor(new_executor);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create replacement executor");
+                    self.return_executor(executor);
+                }
+            }
+            // Log health status after replacement
+            self.log_health_if_degraded();
+        } else {
+            self.return_executor(executor);
+        }
+        result
+    }
+
+    fn register_contract_notifier(
+        &mut self,
+        instance_id: ContractInstanceId,
+        cli_id: ClientId,
+        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>> {
+        // Register with all available executors to ensure notifications work
+        // regardless of which executor handles subsequent operations
+        let owned_summary = summary.map(StateSummary::into_owned);
+
+        let last_error = self
+            .runtimes
+            .iter_mut()
+            .flatten()
+            .filter_map(|executor| {
+                executor
+                    .register_contract_notifier(
+                        instance_id,
+                        cli_id,
+                        notification_ch.clone(),
+                        owned_summary.clone(),
+                    )
+                    .err()
+            })
+            .last();
+
+        last_error.map_or(Ok(()), Err)
+    }
+
+    fn execute_delegate_request(
+        &mut self,
+        req: DelegateRequest<'_>,
+        attested_contract: Option<&ContractInstanceId>,
+    ) -> Response {
+        // For delegate requests, use the first available executor synchronously
+        // This is acceptable because delegate operations are typically quick
+        // Find the first available executor's index
+        let executor_idx = self.runtimes.iter().position(|slot| slot.is_some());
+
+        match executor_idx {
+            Some(idx) => {
+                let executor = self.runtimes[idx].as_mut().unwrap();
+                executor.execute_delegate_request(req, attested_contract)
+            }
+            None => Err(ExecutorError::other(anyhow::anyhow!(
+                "No executors available for delegate request"
+            ))),
+        }
+    }
+
+    fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
+        // Collect subscription info from all executors
+        self.runtimes
+            .iter()
+            .flatten()
+            .flat_map(|executor| executor.get_subscription_info())
+            .collect()
+    }
+}
+
+// ============================================================================
+// Single Executor Implementation
+// ============================================================================
 
 /// Result of computing a state update without committing.
 /// Used in network mode to separate state computation from commit,
@@ -576,9 +968,18 @@ impl Executor<Runtime> {
 }
 
 impl Executor<Runtime> {
-    pub async fn from_config(
+    /// Create an Executor for local-only mode (no network operations).
+    /// Use this from the binary for local mode execution.
+    pub async fn from_config_local(config: Arc<Config>) -> anyhow::Result<Self> {
+        Self::from_config(config, None, None).await
+    }
+
+    /// Create an Executor with optional network operation support.
+    /// This is `pub(crate)` because the parameters involve crate-internal types.
+    pub(crate) async fn from_config(
         config: Arc<Config>,
-        event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
+        op_sender: Option<OpRequestSender>,
+        op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
@@ -594,7 +995,30 @@ impl Executor<Runtime> {
             },
             OperationMode::Local,
             rt,
-            event_loop_channel,
+            op_sender,
+            op_manager,
+        )
+        .await
+    }
+
+    /// Create an Executor with a pre-created shared StateStore.
+    /// Used by RuntimePool to share the same database connection across executors.
+    pub(crate) async fn from_config_with_shared_store(
+        config: Arc<Config>,
+        shared_state_store: StateStore<Storage>,
+        op_sender: Option<OpRequestSender>,
+        op_manager: Option<Arc<OpManager>>,
+    ) -> anyhow::Result<Self> {
+        // Create only the Runtime stores (contract, delegate, secrets) - NOT StateStore
+        let (contract_store, delegate_store, secret_store) = Self::get_runtime_stores(&config)?;
+        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        Executor::new(
+            shared_state_store,
+            || Ok(()), // No cleanup handler for pooled executors
+            OperationMode::Local,
+            rt,
+            op_sender,
+            op_manager,
         )
         .await
     }
