@@ -1,11 +1,12 @@
-use std::{thread::JoinHandle, time::Duration};
+use std::time::Duration;
 
+use super::worker_pool::{get_worker_pool, WasmExecutionError, WasmExecutionHandle};
 use super::{ContractExecError, RuntimeResult};
 use freenet_stdlib::prelude::{
     ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
     UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
-use wasmer::{Instance, Store, TypedFunction};
+use wasmer::{Instance, TypedFunction};
 
 type FfiReturnTy = i64;
 
@@ -102,7 +103,7 @@ impl ContractRuntimeInterface for super::Runtime {
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let related_buf_ptr = related_buf_ptr as i64;
-        let t = std::thread::spawn(move || {
+        let handle = get_worker_pool().execute(move || {
             let r = validate_func.call(
                 &mut wasm_store,
                 param_buf_ptr,
@@ -111,7 +112,7 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             (r, wasm_store)
         });
-        let r = handle_execution_call(t, self);
+        let r = handle_execution_call(handle, self);
 
         let result = match_err(self, &running.instance, r)?;
         let is_valid = unsafe {
@@ -170,7 +171,7 @@ impl ContractRuntimeInterface for super::Runtime {
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let update_data_buf_ptr = update_data_buf_ptr as i64;
-        let t = std::thread::spawn(move || {
+        let handle = get_worker_pool().execute(move || {
             let r = update_state_func.call(
                 &mut wasm_store,
                 param_buf_ptr,
@@ -179,7 +180,7 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             (r, wasm_store)
         });
-        let r = handle_execution_call(t, self);
+        let r = handle_execution_call(handle, self);
 
         let result = match_err(self, &running.instance, r)?;
         let update_res = unsafe {
@@ -227,11 +228,11 @@ impl ContractRuntimeInterface for super::Runtime {
 
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
-        let t = std::thread::spawn(move || {
+        let handle = get_worker_pool().execute(move || {
             let r = summary_func.call(&mut wasm_store, param_buf_ptr, state_buf_ptr);
             (r, wasm_store)
         });
-        let r = handle_execution_call(t, self);
+        let r = handle_execution_call(handle, self);
 
         let result = match_err(self, &running.instance, r)?;
         let result = unsafe {
@@ -279,7 +280,7 @@ impl ContractRuntimeInterface for super::Runtime {
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let summary_buf_ptr = summary_buf_ptr as i64;
-        let t = std::thread::spawn(move || {
+        let handle = get_worker_pool().execute(move || {
             let r = get_state_delta_func.call(
                 &mut wasm_store,
                 param_buf_ptr,
@@ -288,7 +289,7 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             (r, wasm_store)
         });
-        let r = handle_execution_call(t, self);
+        let r = handle_execution_call(handle, self);
 
         let result = match_err(self, &running.instance, r)?;
         let result = unsafe {
@@ -301,23 +302,22 @@ impl ContractRuntimeInterface for super::Runtime {
     }
 }
 
-/// Handle the execution of a WASM call on a spawned thread.
+/// Handle the execution of a WASM call using the worker pool.
 ///
-/// This function waits for the WASM execution thread to complete, handling timeout
-/// and thread panics. It uses pure synchronous polling to avoid any interaction
-/// with tokio's thread pool, which prevents the thread explosion issues seen with
-/// `block_in_place`.
+/// This function waits for the WASM execution to complete, handling timeout
+/// and worker panics. It uses pure synchronous polling to avoid any interaction
+/// with tokio's thread pool.
 ///
-/// # Why we avoid `block_in_place`
+/// # Why we use a worker pool
 ///
-/// Using `block_in_place` causes tokio to potentially spawn new worker threads
-/// when we're waiting for WASM execution. Since WASM execution can take a while,
-/// this leads to unbounded thread creation. Instead, we:
-/// 1. Limit concurrency at the RuntimePool level (bounded number of executors)
-/// 2. Use pure sync polling here (no tokio involvement)
-/// 3. Each WASM call runs on an isolated thread for safety
+/// Using `std::thread::spawn` for each WASM call creates overhead from thread
+/// creation/destruction. Using a fixed-size worker pool:
+/// 1. Eliminates thread spawning overhead
+/// 2. Provides bounded parallelism (pool size = CPU count)
+/// 3. Reuses worker threads across many WASM calls
+/// 4. Isolates WASM panics from the main thread
 fn handle_execution_call(
-    r: JoinHandle<(Result<i64, wasmer::RuntimeError>, Store)>,
+    handle: WasmExecutionHandle,
     rt: &mut super::Runtime,
 ) -> Result<i64, Errors> {
     // Calculate timeout based on max_execution_seconds
@@ -327,19 +327,18 @@ fn handle_execution_call(
     // Poll every 10ms until completion or timeout
     // This is a sync operation - no tokio involvement
     loop {
-        if r.is_finished() {
+        if handle.is_finished() {
             break;
         }
 
         if start.elapsed() >= timeout {
-            // Timeout exceeded - the thread is still running but we won't wait anymore
-            // Note: The thread continues running in the background. This is a limitation
-            // of the current approach - we can't forcefully kill a WASM execution.
-            // The thread will eventually complete (or panic) and be cleaned up.
+            // Timeout exceeded - the worker is still running but we won't wait anymore
+            // Note: The worker will continue executing. When it completes, the result
+            // will be dropped since we're no longer waiting for it.
             tracing::warn!(
                 timeout_secs = rt.max_execution_seconds,
                 elapsed_ms = start.elapsed().as_millis(),
-                "WASM execution timed out, abandoning thread"
+                "WASM execution timed out, abandoning worker result"
             );
             return Err(Errors::MaxComputeTimeExceeded);
         }
@@ -349,18 +348,12 @@ fn handle_execution_call(
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Thread completed - join and get results
-    let (result, store) = r.join().map_err(|panic_info| {
-        // Thread panicked - log the panic info if available
-        let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = panic_info.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "Unknown panic".to_string()
-        };
-        tracing::error!(panic = %panic_msg, "WASM execution thread panicked");
-        Errors::Other(anyhow::anyhow!("WASM thread panicked: {}", panic_msg))
+    // Worker completed - get results
+    let (result, store) = handle.join().map_err(|e| match e {
+        WasmExecutionError::WorkerPanicked => {
+            tracing::error!("WASM worker panicked during execution");
+            Errors::Other(anyhow::anyhow!("WASM worker panicked"))
+        }
     })?;
 
     // Return the store to the runtime
