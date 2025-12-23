@@ -12,7 +12,6 @@ mod state_store;
 mod store;
 #[cfg(test)]
 mod tests;
-mod worker_pool;
 
 pub(crate) use contract::ContractRuntimeInterface;
 pub use contract_store::ContractStore;

@@ -199,25 +199,43 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     freenet::config::set_logger(None, None);
+
+    // Parse args first to get max_blocking_threads for runtime configuration
+    let config_args = ConfigArgs::parse();
+
+    if config_args.version {
+        println!("Freenet version: {}", config_args.current_version());
+        return Ok(());
+    }
+
+    // Calculate blocking threads: use CLI arg, or default (2x CPU cores, clamped to 4-32)
+    let max_blocking_threads = config_args.max_blocking_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| (n.get() * 2).clamp(4, 32))
+            .unwrap_or(8)
+    });
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(
             std::thread::available_parallelism()
                 .map(usize::from)
                 .unwrap_or(1),
         )
+        .max_blocking_threads(max_blocking_threads)
         // Name threads to distinguish main runtime from any rogue runtimes
         // Rogue runtimes would use default "tokio-runtime-w" name
         .thread_name("freenet-main")
         .enable_all()
         .build()
         .unwrap();
-    let config = ConfigArgs::parse();
+
+    tracing::info!(
+        max_blocking_threads,
+        "Tokio runtime configured with bounded blocking thread pool"
+    );
+
     rt.block_on(async move {
-        if config.version {
-            println!("Freenet version: {}", config.current_version());
-            return Ok(());
-        }
-        let config = config.build().await?;
+        let config = config_args.build().await?;
         run(config).await
     })?;
     Ok(())
