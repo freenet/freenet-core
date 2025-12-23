@@ -2487,16 +2487,22 @@ async fn test_gateway_packet_size_change_after_60s() -> TestResult {
     // Wait for test completion or node failures
     select! {
         gw1 = node_gw1 => {
-            let Err(e) = gw1;
-            return Err(anyhow!("Gateway 1 node failed: {}", e).into())
+            match gw1 {
+                Ok(_) => Err::<(), _>(anyhow!("Gateway 1 node stopped unexpectedly"))?,
+                Err(e) => Err::<(), _>(anyhow!("Gateway 1 node failed: {}", e))?,
+            }
         }
         gw2 = node_gw2 => {
-            let Err(e) = gw2;
-            return Err(anyhow!("Gateway 2 node failed: {}", e).into())
+            match gw2 {
+                Ok(_) => Err::<(), _>(anyhow!("Gateway 2 node stopped unexpectedly"))?,
+                Err(e) => Err::<(), _>(anyhow!("Gateway 2 node failed: {}", e))?,
+            }
         }
         client = node_client => {
-            let Err(e) = client;
-            return Err(anyhow!("Client node failed: {}", e).into())
+            match client {
+                Ok(_) => Err::<(), _>(anyhow!("Client node stopped unexpectedly"))?,
+                Err(e) => Err::<(), _>(anyhow!("Client node failed: {}", e))?,
+            }
         }
         r = test => {
             r??;
@@ -2678,12 +2684,16 @@ async fn test_production_decryption_error_scenario() -> TestResult {
     // Wait for test completion or node failures
     select! {
         gw = node_gw => {
-            let Err(e) = gw;
-            return Err(anyhow!("Gateway node failed: {}", e).into())
+            match gw {
+                Ok(_) => Err::<(), _>(anyhow!("Gateway node stopped unexpectedly"))?,
+                Err(e) => Err::<(), _>(anyhow!("Gateway node failed: {}", e))?,
+            }
         }
         client = node_client => {
-            let Err(e) = client;
-            return Err(anyhow!("Client node failed: {}", e).into())
+            match client {
+                Ok(_) => Err::<(), _>(anyhow!("Client node stopped unexpectedly"))?,
+                Err(e) => Err::<(), _>(anyhow!("Client node failed: {}", e))?,
+            }
         }
         r = test => {
             r??;

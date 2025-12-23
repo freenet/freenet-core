@@ -42,8 +42,7 @@ fi
 echo "Running clippy on packages:$packages"
 for pkg in $packages; do
     echo "  Checking $pkg..."
-    # Only check lib and bin targets, not tests (which may have pre-existing issues)
-    cargo clippy -p "$pkg" --lib --bins -- -D warnings || exit 1
+    cargo clippy -p "$pkg" --all-targets -- -D warnings || exit 1
 done
 
 echo "Clippy passed for all changed packages"
