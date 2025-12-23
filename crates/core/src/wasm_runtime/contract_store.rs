@@ -112,30 +112,18 @@ impl ContractStore {
         };
         let code_hash = key.code_hash();
         if self.contract_cache.get(code_hash).is_some() {
+            // WASM code is cached, but we still need to ensure this instance_id is indexed.
+            // Different ContractInstanceIds with the same code need their own mapping.
+            // See issue #2380.
+            self.ensure_key_indexed(&key)?;
             return Ok(());
         }
         let key_path = code_hash.encode();
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
         if let Ok((code, _ver)) = ContractCode::load_versioned_from_path(&key_path) {
             // WASM file exists on disk. Add to cache AND ensure the index is updated.
-            // This is critical: if the index doesn't have this entry (e.g., after a
-            // crash where WASM was synced but index wasn't), we must add it now.
-            // Otherwise, when TinyLFU evicts this contract, fetch_contract() will
-            // fail because the index lookup returns None.
-            // See issue #2344.
-            //
-            // Use DashMap's atomic entry API to avoid TOCTOU race condition.
-            // Multiple threads could otherwise both see the key as missing and
-            // try to insert, causing duplicate index entries.
-            if let dashmap::mapref::entry::Entry::Vacant(v) = self.key_to_code_part.entry(*key.id())
-            {
-                let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
-                v.insert((offset, *code_hash));
-                tracing::debug!(
-                    contract = %key,
-                    "Added missing index entry for existing WASM file"
-                );
-            }
+            // See issue #2344 for why this is critical after crash recovery.
+            self.ensure_key_indexed(&key)?;
             let size = code.data().len() as i64;
             self.contract_cache.insert(*code_hash, Arc::new(code), size);
             return Ok(());
@@ -213,10 +201,35 @@ impl ContractStore {
     pub fn code_hash_from_id(&self, id: &ContractInstanceId) -> Option<CodeHash> {
         self.key_to_code_part.get(id).map(|r| r.value().1)
     }
+
+    /// Ensures the key_to_code_part mapping exists for the given contract key.
+    /// This is needed because when contract code is already cached, store_contract
+    /// may not be called, but we still need to index new ContractInstanceIds that
+    /// use the same code (different parameters = different rooms).
+    /// See issue #2380.
+    pub fn ensure_key_indexed(&mut self, key: &ContractKey) -> RuntimeResult<()> {
+        let code_hash = key.code_hash();
+        if let dashmap::mapref::entry::Entry::Vacant(v) = self.key_to_code_part.entry(*key.id()) {
+            let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
+            v.insert((offset, *code_hash));
+            tracing::debug!(
+                contract = %key,
+                instance_id = %key.id(),
+                code_hash = %code_hash,
+                "Indexed contract instance (same code, different params)"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod test {
+    //! Tests for ContractStore
+    //!
+    //! Key invariant: For every contract stored, `code_hash_from_id(instance_id)`
+    //! must return the correct CodeHash. This is critical because `lookup_key()`
+    //! uses this to reconstruct ContractKey from just an instance ID.
     use super::*;
 
     #[test]
@@ -384,6 +397,79 @@ mod test {
             fetched.is_some(),
             "Contract should be fetchable after store_contract adds missing index entry"
         );
+
+        Ok(())
+    }
+
+    /// Regression test for issue #2380: Multiple contracts with same WASM code
+    /// but different parameters must all be indexed correctly.
+    ///
+    /// This bug manifested in River when creating multiple chat rooms:
+    /// - All rooms use the same room-contract WASM (same code_hash)
+    /// - Different parameters (owner key) create different ContractInstanceIds
+    /// - Only the first room's instance_id was indexed
+    /// - Subscribe to 2nd+ rooms failed because lookup_key() returned None
+    #[test]
+    fn test_multiple_contracts_same_code_different_params() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000)?;
+
+        // Same WASM code for all contracts (like River's room-contract)
+        let shared_code = vec![1, 2, 3, 4, 5];
+
+        // Create multiple contracts with SAME code but DIFFERENT parameters
+        // This simulates creating multiple River rooms
+        let mut contracts = Vec::new();
+        for i in 0..5u8 {
+            let params = Parameters::from(vec![i, i + 10, i + 20]); // Different params each time
+            let contract = WrappedContract::new(
+                Arc::new(ContractCode::from(shared_code.clone())),
+                params.clone(),
+            );
+            contracts.push((contract.clone(), params));
+
+            let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract));
+            store.store_contract(container)?;
+        }
+
+        // All contracts share the same code_hash
+        let expected_code_hash = contracts[0].0.key().code_hash();
+        for (contract, _) in &contracts {
+            assert_eq!(
+                contract.key().code_hash(),
+                expected_code_hash,
+                "All contracts should have the same code_hash"
+            );
+        }
+
+        // Critical assertion: code_hash_from_id must work for ALL instance IDs
+        // This is what lookup_key() uses, and what failed before the fix
+        for (i, (contract, _)) in contracts.iter().enumerate() {
+            let instance_id = contract.key().id();
+            let lookup_result = store.code_hash_from_id(instance_id);
+            assert!(
+                lookup_result.is_some(),
+                "code_hash_from_id() failed for contract {i} (instance_id: {instance_id}) - \
+                 this would cause Subscribe to fail!"
+            );
+            assert_eq!(
+                lookup_result.unwrap(),
+                *expected_code_hash,
+                "code_hash_from_id() returned wrong hash for contract {i}"
+            );
+        }
+
+        // Also verify fetch_contract works for all
+        for (i, (contract, params)) in contracts.iter().enumerate() {
+            let fetched = store.fetch_contract(contract.key(), params);
+            assert!(
+                fetched.is_some(),
+                "fetch_contract() failed for contract {i}"
+            );
+        }
 
         Ok(())
     }

@@ -268,7 +268,7 @@ download_release() {
     log DEBUG "URL: $download_url"
 
     mkdir -p "$DOWNLOAD_DIR"
-    local tarball_path="$DOWNLOAD_DIR/$asset_name"
+    local archive_path="$DOWNLOAD_DIR/$asset_name"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log INFO "[DRY RUN] Would download: $download_url"
@@ -276,20 +276,20 @@ download_release() {
     fi
 
     # Download with progress
-    if ! curl -L --progress-bar -o "$tarball_path" "$download_url"; then
+    if ! curl -L --progress-bar -o "$archive_path" "$download_url"; then
         log ERROR "Failed to download release"
         return 1
     fi
 
     # Verify download
-    if [[ ! -f "$tarball_path" ]] || [[ ! -s "$tarball_path" ]]; then
+    if [[ ! -f "$archive_path" ]] || [[ ! -s "$archive_path" ]]; then
         log ERROR "Downloaded file is missing or empty"
         return 1
     fi
 
     # Extract
     log INFO "Extracting binary..."
-    if ! tar xzf "$tarball_path" -C "$DOWNLOAD_DIR"; then
+    if ! tar -xzf "$archive_path" -C "$DOWNLOAD_DIR"; then
         log ERROR "Failed to extract release"
         return 1
     fi
