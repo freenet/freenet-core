@@ -112,6 +112,21 @@ impl ContractStore {
         };
         let code_hash = key.code_hash();
         if self.contract_cache.get(code_hash).is_some() {
+            // BUG FIX: Even if the WASM code is cached, we must still update key_to_code_part
+            // because different ContractInstanceIds (same code, different params) need their own mapping.
+            // Without this, lookup_key() fails for the new instance_id.
+            // See issue #2380.
+            if let dashmap::mapref::entry::Entry::Vacant(v) = self.key_to_code_part.entry(*key.id())
+            {
+                let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
+                v.insert((offset, *code_hash));
+                tracing::info!(
+                    contract = %key,
+                    instance_id = %key.id(),
+                    code_hash = %code_hash,
+                    "Added index entry for new instance of cached contract code"
+                );
+            }
             return Ok(());
         }
         let key_path = code_hash.encode();
@@ -212,6 +227,26 @@ impl ContractStore {
     /// Used when clients request contracts without knowing the code hash.
     pub fn code_hash_from_id(&self, id: &ContractInstanceId) -> Option<CodeHash> {
         self.key_to_code_part.get(id).map(|r| r.value().1)
+    }
+
+    /// Ensures the key_to_code_part mapping exists for the given contract key.
+    /// This is needed because when contract code is already cached, store_contract
+    /// may not be called, but we still need to index new ContractInstanceIds that
+    /// use the same code (different parameters = different rooms).
+    /// See issue #2380.
+    pub fn ensure_key_indexed(&mut self, key: &ContractKey) -> RuntimeResult<()> {
+        let code_hash = key.code_hash();
+        if let dashmap::mapref::entry::Entry::Vacant(v) = self.key_to_code_part.entry(*key.id()) {
+            let offset = Self::insert(&mut self.index_file, *key.id(), code_hash)?;
+            v.insert((offset, *code_hash));
+            tracing::info!(
+                contract = %key,
+                instance_id = %key.id(),
+                code_hash = %code_hash,
+                "Indexed new contract instance (same code, different params)"
+            );
+        }
+        Ok(())
     }
 }
 
