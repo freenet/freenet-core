@@ -361,14 +361,13 @@ async fn websocket_interface(
                         match listener.try_recv() {
                             Ok(r) => {
                                 active_listeners.push_back((key, listener));
-                                return Ok(r);
+                                return Ok::<_, anyhow::Error>(r);
                             }
                             Err(mpsc::error::TryRecvError::Empty) => {
                                 active_listeners.push_back((key, listener));
                             }
-                            Err(err @ mpsc::error::TryRecvError::Disconnected) => {
-                                tracing::debug!(err = ?err, "listener channel disconnected");
-                                return Err(anyhow::anyhow!(err));
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                tracing::debug!(contract = %key, "listener removed");
                             }
                         }
                     }

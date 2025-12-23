@@ -459,6 +459,29 @@ enum Error {
     Panic(#[from] tokio::task::JoinError),
 }
 
+impl From<crate::ring::RingError> for Error {
+    fn from(err: crate::ring::RingError) -> Self {
+        match err {
+            crate::ring::RingError::PeerNotJoined => Error::PeerNotJoined,
+            other => Error::Node(other.to_string()),
+        }
+    }
+}
+
+/// Check that the peer has completed network join before allowing operations.
+/// For gateways: always ready (their address is set from config).
+/// For regular peers: must wait for handshake to complete (peer_ready flag).
+fn ensure_peer_ready(op_manager: &OpManager) -> Result<std::net::SocketAddr, Error> {
+    if !op_manager.is_gateway
+        && !op_manager
+            .peer_ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(Error::PeerNotJoined);
+    }
+    Ok(op_manager.ring.connection_manager.peer_addr()?)
+}
+
 #[inline]
 async fn process_open_request(
     mut request: OpenRequest<'static>,
@@ -493,32 +516,7 @@ async fn process_open_request(
                         related_contracts,
                         subscribe,
                     } => {
-                        // For non-gateway peers: check if peer is ready (peer_id has been set via handshake)
-                        // For gateways: always ready (peer_id set from config)
-                        if !op_manager.is_gateway
-                            && !op_manager
-                                .peer_ready
-                                .load(std::sync::atomic::Ordering::SeqCst)
-                        {
-                            tracing::warn!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "peer_not_ready",
-                                "Client attempted PUT operation before peer initialization complete"
-                            );
-                            return Err(Error::PeerNotJoined);
-                        }
-
-                        let peer_id = op_manager.ring.connection_manager.peer_addr()
-                            .map_err(|_| {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    phase = "peer_not_joined",
-                                    "Peer address not found for PUT operation - peer has not joined network"
-                                );
-                                Error::PeerNotJoined
-                            })?;
+                        let peer_id = ensure_peer_ready(&op_manager)?;
 
                         tracing::debug!(
                             client_id = %client_id,
@@ -801,16 +799,7 @@ async fn process_open_request(
                         }
                     }
                     ContractRequest::Update { key, data } => {
-                        let peer_id = op_manager.ring.connection_manager.peer_addr()
-                            .map_err(|_| {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    phase = "peer_not_joined",
-                                    "Peer address not found for UPDATE operation - peer has not joined network"
-                                );
-                                Error::PeerNotJoined
-                            })?;
+                        let peer_id = ensure_peer_ready(&op_manager)?;
 
                         tracing::debug!(
                             client_id = %client_id,
@@ -1055,16 +1044,7 @@ async fn process_open_request(
                         return_contract_code,
                         subscribe,
                     } => {
-                        let peer_id = op_manager.ring.connection_manager.peer_addr()
-                            .map_err(|_| {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    phase = "peer_not_joined",
-                                    "Peer address not found for GET operation - peer has not joined network"
-                                );
-                                Error::PeerNotJoined
-                            })?;
+                        let peer_id = ensure_peer_ready(&op_manager)?;
 
                         // Query local store by instance_id (key from request is ContractInstanceId)
                         let (full_key, state, contract) = match op_manager
@@ -1365,16 +1345,7 @@ async fn process_open_request(
                         }
                     }
                     ContractRequest::Subscribe { key, summary } => {
-                        let peer_id = op_manager.ring.connection_manager.peer_addr()
-                            .map_err(|_| {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    phase = "peer_not_joined",
-                                    "Peer address not found for SUBSCRIBE operation - peer has not joined network"
-                                );
-                                Error::PeerNotJoined
-                            })?;
+                        let peer_id = ensure_peer_ready(&op_manager)?;
 
                         tracing::debug!(
                             client_id = %client_id,
