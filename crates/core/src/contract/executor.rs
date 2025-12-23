@@ -46,6 +46,7 @@ pub(super) mod runtime;
 pub(crate) use init_tracker::{
     ContractInitTracker, InitCheckResult, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
 };
+pub(crate) use runtime::RuntimePool;
 
 #[derive(Debug)]
 pub struct ExecutorError {

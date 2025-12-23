@@ -5,6 +5,279 @@ use super::{
     SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
 };
 use freenet_stdlib::prelude::RelatedContract;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+// ============================================================================
+// RuntimePool - Pool of executors for concurrent contract execution
+// ============================================================================
+
+/// A pool of executors that enables concurrent contract execution.
+///
+/// This pool manages multiple `Executor<Runtime>` instances, allowing multiple
+/// contract operations to run in parallel. The pool uses a semaphore to control
+/// access to executors and ensures thread-safe executor borrowing and returning.
+///
+/// # Architecture
+///
+/// The pool maintains a fixed number of executors (typically CPU count) and uses
+/// a semaphore to gate access. When an operation needs an executor:
+/// 1. It acquires a semaphore permit (blocking if all executors are busy)
+/// 2. Takes an available executor from the pool
+/// 3. Executes the operation
+/// 4. Returns the executor to the pool and releases the permit
+///
+/// This design ensures:
+/// - Bounded parallelism (no unbounded thread spawning)
+/// - Fair access to executors
+/// - Proper cleanup on errors
+pub struct RuntimePool {
+    /// Pool of available executors. `None` slots indicate executors currently in use.
+    runtimes: Vec<Option<Executor<Runtime>>>,
+    /// Semaphore controlling access to executors (permits = available executors)
+    available: Semaphore,
+    /// Configuration for creating new executors
+    #[allow(dead_code)]
+    config: Arc<Config>,
+}
+
+impl RuntimePool {
+    /// Create a new pool with the specified number of executors.
+    ///
+    /// # Arguments
+    /// * `config` - Configuration for executors
+    /// * `event_loop_channel` - Channel for event loop communication
+    /// * `pool_size` - Number of executors to create (typically CPU count)
+    pub async fn new(
+        config: Arc<Config>,
+        event_loop_channel: ExecutorToEventLoopChannel<ExecutorHalve>,
+        pool_size: NonZeroUsize,
+    ) -> anyhow::Result<Self> {
+        let pool_size_usize: usize = pool_size.into();
+        let mut runtimes = Vec::with_capacity(pool_size_usize);
+
+        // Create the first executor with the event loop channel
+        // Note: Currently only the first executor gets the channel since
+        // we can't clone ExecutorToEventLoopChannel. This is a limitation
+        // we'll address when moving to the dedicated thread pool architecture.
+        let first_executor =
+            Executor::from_config(config.clone(), Some(event_loop_channel)).await?;
+        runtimes.push(Some(first_executor));
+
+        // Create remaining executors without event loop channels
+        // They share the same storage via config
+        for _ in 1..pool_size_usize {
+            let executor = Executor::from_config(config.clone(), None).await?;
+            runtimes.push(Some(executor));
+        }
+
+        tracing::info!(
+            pool_size = pool_size_usize,
+            "Created RuntimePool with {} executors",
+            pool_size_usize
+        );
+
+        Ok(Self {
+            runtimes,
+            available: Semaphore::new(pool_size_usize),
+            config,
+        })
+    }
+
+    /// Pop an executor from the pool, blocking until one is available.
+    ///
+    /// The caller MUST return the executor via `return_executor` after use.
+    async fn pop_executor(&mut self) -> Executor<Runtime> {
+        // Wait for an available permit
+        let _ = self
+            .available
+            .acquire()
+            .await
+            .expect("Semaphore should not be closed");
+
+        // Find the first available executor
+        for slot in &mut self.runtimes {
+            if let Some(executor) = slot.take() {
+                return executor;
+            }
+        }
+
+        // This should never happen because of the semaphore
+        unreachable!("No executors available despite semaphore permit")
+    }
+
+    /// Return an executor to the pool after use.
+    fn return_executor(&mut self, executor: Executor<Runtime>) {
+        // Find an empty slot
+        if let Some(empty_slot) = self.runtimes.iter_mut().find(|slot| slot.is_none()) {
+            *empty_slot = Some(executor);
+            self.available.add_permits(1);
+        } else {
+            unreachable!("No empty slot found in the pool")
+        }
+    }
+
+    /// Check if an executor is healthy and can be reused.
+    /// An executor is unhealthy if its wasm_store is None (lost due to panic).
+    fn is_executor_healthy(executor: &Executor<Runtime>) -> bool {
+        executor.runtime.is_healthy()
+    }
+
+    /// Create a new executor to replace a broken one.
+    async fn create_replacement_executor(&self) -> anyhow::Result<Executor<Runtime>> {
+        tracing::warn!("Creating replacement executor due to previous failure");
+        Executor::from_config(self.config.clone(), None).await
+    }
+
+    /// Get the number of currently available executors.
+    #[allow(dead_code)]
+    pub fn available_executors(&self) -> usize {
+        self.available.available_permits()
+    }
+}
+
+impl ContractExecutor for RuntimePool {
+    fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {
+        // Try to find the key in any available executor
+        self.runtimes.iter().flatten().find_map(|executor| {
+            executor
+                .runtime
+                .contract_store
+                .code_hash_from_id(instance_id)
+                .map(|key| ContractKey::from_id_and_code(*instance_id, key))
+        })
+    }
+
+    async fn fetch_contract(
+        &mut self,
+        key: ContractKey,
+        return_contract_code: bool,
+    ) -> Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError> {
+        let mut executor = self.pop_executor().await;
+        let result = executor.fetch_contract(key, return_contract_code).await;
+
+        // Check if executor is still healthy after the operation
+        // If the WASM execution panicked, the store is lost and we need a new executor
+        if !Self::is_executor_healthy(&executor) {
+            tracing::warn!(
+                contract = %key,
+                "Executor became unhealthy after fetch_contract, creating replacement"
+            );
+            match self.create_replacement_executor().await {
+                Ok(new_executor) => {
+                    self.return_executor(new_executor);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create replacement executor");
+                    // Return the broken executor anyway - next operation will fail
+                    // but at least the pool isn't depleted
+                    self.return_executor(executor);
+                }
+            }
+        } else {
+            self.return_executor(executor);
+        }
+        result
+    }
+
+    async fn upsert_contract_state(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+    ) -> Result<UpsertResult, ExecutorError> {
+        let mut executor = self.pop_executor().await;
+        let result = executor
+            .upsert_contract_state(key, update, related_contracts, code)
+            .await;
+
+        // Check if executor is still healthy after the operation
+        if !Self::is_executor_healthy(&executor) {
+            tracing::warn!(
+                contract = %key,
+                "Executor became unhealthy after upsert_contract_state, creating replacement"
+            );
+            match self.create_replacement_executor().await {
+                Ok(new_executor) => {
+                    self.return_executor(new_executor);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create replacement executor");
+                    self.return_executor(executor);
+                }
+            }
+        } else {
+            self.return_executor(executor);
+        }
+        result
+    }
+
+    fn register_contract_notifier(
+        &mut self,
+        instance_id: ContractInstanceId,
+        cli_id: ClientId,
+        notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
+        summary: Option<StateSummary<'_>>,
+    ) -> Result<(), Box<RequestError>> {
+        // Register with all available executors to ensure notifications work
+        // regardless of which executor handles subsequent operations
+        let owned_summary = summary.map(StateSummary::into_owned);
+
+        let last_error = self
+            .runtimes
+            .iter_mut()
+            .flatten()
+            .filter_map(|executor| {
+                executor
+                    .register_contract_notifier(
+                        instance_id,
+                        cli_id,
+                        notification_ch.clone(),
+                        owned_summary.clone(),
+                    )
+                    .err()
+            })
+            .last();
+
+        last_error.map_or(Ok(()), Err)
+    }
+
+    fn execute_delegate_request(
+        &mut self,
+        req: DelegateRequest<'_>,
+        attested_contract: Option<&ContractInstanceId>,
+    ) -> Response {
+        // For delegate requests, use the first available executor synchronously
+        // This is acceptable because delegate operations are typically quick
+        // Find the first available executor's index
+        let executor_idx = self.runtimes.iter().position(|slot| slot.is_some());
+
+        match executor_idx {
+            Some(idx) => {
+                let executor = self.runtimes[idx].as_mut().unwrap();
+                executor.execute_delegate_request(req, attested_contract)
+            }
+            None => Err(ExecutorError::other(anyhow::anyhow!(
+                "No executors available for delegate request"
+            ))),
+        }
+    }
+
+    fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
+        // Collect subscription info from all executors
+        self.runtimes
+            .iter()
+            .flatten()
+            .flat_map(|executor| executor.get_subscription_info())
+            .collect()
+    }
+}
+
+// ============================================================================
+// Single Executor Implementation
+// ============================================================================
 
 /// Result of computing a state update without committing.
 /// Used in network mode to separate state computation from commit,

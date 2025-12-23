@@ -301,56 +301,72 @@ impl ContractRuntimeInterface for super::Runtime {
     }
 }
 
+/// Handle the execution of a WASM call on a spawned thread.
+///
+/// This function waits for the WASM execution thread to complete, handling timeout
+/// and thread panics. It uses pure synchronous polling to avoid any interaction
+/// with tokio's thread pool, which prevents the thread explosion issues seen with
+/// `block_in_place`.
+///
+/// # Why we avoid `block_in_place`
+///
+/// Using `block_in_place` causes tokio to potentially spawn new worker threads
+/// when we're waiting for WASM execution. Since WASM execution can take a while,
+/// this leads to unbounded thread creation. Instead, we:
+/// 1. Limit concurrency at the RuntimePool level (bounded number of executors)
+/// 2. Use pure sync polling here (no tokio involvement)
+/// 3. Each WASM call runs on an isolated thread for safety
 fn handle_execution_call(
     r: JoinHandle<(Result<i64, wasmer::RuntimeError>, Store)>,
     rt: &mut super::Runtime,
 ) -> Result<i64, Errors> {
-    // Calculate timeout iterations: max_execution_seconds * 100 (since we check every 10ms)
-    let timeout_iterations = (rt.max_execution_seconds * 100.0) as u64;
+    // Calculate timeout based on max_execution_seconds
+    let timeout = Duration::from_secs_f64(rt.max_execution_seconds);
+    let start = std::time::Instant::now();
 
-    // Check if we're in a tokio runtime context
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // We're in an async context, use block_in_place to avoid blocking the executor
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                // Check every 10ms for the configured timeout duration
-                for _ in 0..timeout_iterations {
-                    if r.is_finished() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-
-                if !r.is_finished() {
-                    return Err(Errors::MaxComputeTimeExceeded);
-                }
-
-                let (r, s) = r
-                    .join()
-                    .map_err(|_| Errors::Other(anyhow::anyhow!("Failed to join thread")))?;
-                rt.wasm_store = Some(s);
-                r.map_err(Errors::Wasmer)
-            })
-        })
-    } else {
-        // We're not in an async context (e.g., in tests), fall back to thread::sleep
-        for _ in 0..timeout_iterations {
-            if r.is_finished() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    // Poll every 10ms until completion or timeout
+    // This is a sync operation - no tokio involvement
+    loop {
+        if r.is_finished() {
+            break;
         }
 
-        if !r.is_finished() {
+        if start.elapsed() >= timeout {
+            // Timeout exceeded - the thread is still running but we won't wait anymore
+            // Note: The thread continues running in the background. This is a limitation
+            // of the current approach - we can't forcefully kill a WASM execution.
+            // The thread will eventually complete (or panic) and be cleaned up.
+            tracing::warn!(
+                timeout_secs = rt.max_execution_seconds,
+                elapsed_ms = start.elapsed().as_millis(),
+                "WASM execution timed out, abandoning thread"
+            );
             return Err(Errors::MaxComputeTimeExceeded);
         }
 
-        let (r, s) = r
-            .join()
-            .map_err(|_| Errors::Other(anyhow::anyhow!("Failed to join thread")))?;
-        rt.wasm_store = Some(s);
-        r.map_err(Errors::Wasmer)
+        // Sleep a short duration before checking again
+        // Using std::thread::sleep to avoid any async runtime involvement
+        std::thread::sleep(Duration::from_millis(10));
     }
+
+    // Thread completed - join and get results
+    let (result, store) = r.join().map_err(|panic_info| {
+        // Thread panicked - log the panic info if available
+        let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+        tracing::error!(panic = %panic_msg, "WASM execution thread panicked");
+        Errors::Other(anyhow::anyhow!("WASM thread panicked: {}", panic_msg))
+    })?;
+
+    // Return the store to the runtime
+    rt.wasm_store = Some(store);
+
+    result.map_err(Errors::Wasmer)
 }
 
 fn match_err(
