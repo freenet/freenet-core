@@ -7,12 +7,27 @@ use super::{
 use crate::node::OpManager;
 use freenet_stdlib::prelude::RelatedContract;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 // ============================================================================
 // RuntimePool - Pool of executors for concurrent contract execution
 // ============================================================================
+
+/// Health status information for the RuntimePool.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PoolHealthStatus {
+    /// Number of executors currently available in the pool
+    pub available: usize,
+    /// Number of executors currently checked out (in use)
+    pub checked_out: usize,
+    /// Total pool size (should equal available + checked_out)
+    pub total: usize,
+    /// Number of executors that were replaced due to failures
+    pub replacements: usize,
+}
 
 /// A pool of executors that enables concurrent contract execution.
 ///
@@ -33,6 +48,12 @@ use tokio::sync::Semaphore;
 /// - Bounded parallelism (no unbounded thread spawning)
 /// - Fair access to executors
 /// - Proper cleanup on errors
+///
+/// # Pool Health Tracking
+///
+/// The pool tracks actual executor count separately from the semaphore to detect
+/// capacity degradation. If executors are lost due to panics or other issues,
+/// the pool can detect and report this mismatch.
 pub struct RuntimePool {
     /// Pool of available executors. `None` slots indicate executors currently in use.
     runtimes: Vec<Option<Executor<Runtime>>>,
@@ -44,6 +65,12 @@ pub struct RuntimePool {
     op_sender: OpRequestSender,
     /// Reference to the operation manager (cloneable, shared by all executors)
     op_manager: Arc<OpManager>,
+    /// Total pool size (for health checking)
+    pool_size: usize,
+    /// Count of executors currently checked out (for health checking)
+    checked_out: AtomicUsize,
+    /// Count of executors that were lost/replaced (for monitoring)
+    replacements_count: AtomicUsize,
 }
 
 impl RuntimePool {
@@ -87,7 +114,58 @@ impl RuntimePool {
             config,
             op_sender,
             op_manager,
+            pool_size: pool_size_usize,
+            checked_out: AtomicUsize::new(0),
+            replacements_count: AtomicUsize::new(0),
         })
+    }
+
+    /// Get the current health status of the pool.
+    ///
+    /// Returns a tuple of:
+    /// - `available`: Number of executors currently available
+    /// - `checked_out`: Number of executors currently in use
+    /// - `total`: Total pool size
+    /// - `replacements`: Number of executors that were replaced due to failures
+    pub fn health_status(&self) -> PoolHealthStatus {
+        let available = self.runtimes.iter().filter(|s| s.is_some()).count();
+        let checked_out = self.checked_out.load(Ordering::SeqCst);
+        let replacements = self.replacements_count.load(Ordering::SeqCst);
+
+        // Check for pool degradation
+        let expected_total = available + checked_out;
+        if expected_total != self.pool_size {
+            tracing::warn!(
+                available = available,
+                checked_out = checked_out,
+                expected = self.pool_size,
+                actual = expected_total,
+                "Pool capacity mismatch detected - possible semaphore drift"
+            );
+        }
+
+        PoolHealthStatus {
+            available,
+            checked_out,
+            total: self.pool_size,
+            replacements,
+        }
+    }
+
+    /// Log the pool health status at debug level.
+    /// Called periodically when there have been replacements to help diagnose issues.
+    fn log_health_if_degraded(&self) {
+        let status = self.health_status();
+        if status.replacements > 0 {
+            tracing::info!(
+                available = status.available,
+                checked_out = status.checked_out,
+                total = status.total,
+                replacements = status.replacements,
+                "RuntimePool health status (degraded - {} replacements)",
+                status.replacements
+            );
+        }
     }
 
     /// Pop an executor from the pool, blocking until one is available.
@@ -105,6 +183,9 @@ impl RuntimePool {
         // The permit will be restored in `return_executor` via `add_permits(1)`.
         permit.forget();
 
+        // Track that we're checking out an executor
+        self.checked_out.fetch_add(1, Ordering::SeqCst);
+
         // Find the first available executor
         for slot in &mut self.runtimes {
             if let Some(executor) = slot.take() {
@@ -113,17 +194,29 @@ impl RuntimePool {
         }
 
         // This should never happen because of the semaphore
+        // But if it does, we need to restore the checked_out count
+        self.checked_out.fetch_sub(1, Ordering::SeqCst);
         unreachable!("No executors available despite semaphore permit")
     }
 
     /// Return an executor to the pool after use.
     fn return_executor(&mut self, executor: Executor<Runtime>) {
+        // Track that we're returning an executor
+        self.checked_out.fetch_sub(1, Ordering::SeqCst);
+
         // Find an empty slot
         if let Some(empty_slot) = self.runtimes.iter_mut().find(|slot| slot.is_none()) {
             *empty_slot = Some(executor);
             self.available.add_permits(1);
         } else {
-            unreachable!("No empty slot found in the pool")
+            // This should never happen, but log it if it does
+            tracing::error!(
+                pool_size = self.pool_size,
+                checked_out = self.checked_out.load(Ordering::SeqCst),
+                "No empty slot found when returning executor - pool may be corrupted"
+            );
+            // Still add the permit back to avoid deadlock
+            self.available.add_permits(1);
         }
     }
 
@@ -168,8 +261,10 @@ impl ContractExecutor for RuntimePool {
         // Check if executor is still healthy after the operation
         // If the WASM execution panicked, the store is lost and we need a new executor
         if !Self::is_executor_healthy(&executor) {
+            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
             tracing::warn!(
                 contract = %key,
+                replacement_number = replacement_num,
                 "Executor became unhealthy after fetch_contract, creating replacement"
             );
             match self.create_replacement_executor().await {
@@ -183,6 +278,8 @@ impl ContractExecutor for RuntimePool {
                     self.return_executor(executor);
                 }
             }
+            // Log health status after replacement
+            self.log_health_if_degraded();
         } else {
             self.return_executor(executor);
         }
@@ -203,8 +300,10 @@ impl ContractExecutor for RuntimePool {
 
         // Check if executor is still healthy after the operation
         if !Self::is_executor_healthy(&executor) {
+            let replacement_num = self.replacements_count.fetch_add(1, Ordering::SeqCst) + 1;
             tracing::warn!(
                 contract = %key,
+                replacement_number = replacement_num,
                 "Executor became unhealthy after upsert_contract_state, creating replacement"
             );
             match self.create_replacement_executor().await {
@@ -216,6 +315,8 @@ impl ContractExecutor for RuntimePool {
                     self.return_executor(executor);
                 }
             }
+            // Log health status after replacement
+            self.log_health_if_degraded();
         } else {
             self.return_executor(executor);
         }

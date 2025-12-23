@@ -292,6 +292,23 @@ pub(crate) fn mediator_channels(
     (listener_halve, waiting_for_op_tx, response_for_rx)
 }
 
+/// Maximum number of pending requests before the mediator starts rejecting new ones.
+/// This prevents unbounded memory growth if the event loop is slow or unresponsive.
+const MAX_PENDING_REQUESTS: usize = 10_000;
+
+/// How long to wait before cleaning up stale pending requests.
+/// This should be longer than OP_REQUEST_TIMEOUT to allow normal timeout handling.
+const STALE_REQUEST_THRESHOLD: Duration = Duration::from_secs(180);
+
+/// How often to run the stale request cleanup.
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Entry in the pending responses map, tracking when the request was added.
+struct PendingRequest {
+    response_tx: oneshot::Sender<Result<OpEnum, OpRequestError>>,
+    created_at: Instant,
+}
+
 /// Mediator task that bridges between the new `OpRequestReceiver` (from pooled executors)
 /// and the old event loop channels.
 ///
@@ -305,6 +322,7 @@ pub(crate) fn mediator_channels(
 /// 3. Stores the oneshot sender keyed by transaction
 /// 4. Receives responses from the event loop via `from_event_loop_rx`
 /// 5. Routes responses back to the correct executor via the stored oneshot sender
+/// 6. Periodically cleans up stale pending requests to prevent memory leaks
 pub(crate) async fn run_op_request_mediator(
     mut op_request_receiver: OpRequestReceiver,
     to_event_loop_tx: mpsc::Sender<Transaction>,
@@ -312,10 +330,9 @@ pub(crate) async fn run_op_request_mediator(
 ) {
     use std::collections::HashMap;
 
-    let mut pending_responses: HashMap<
-        Transaction,
-        oneshot::Sender<Result<OpEnum, OpRequestError>>,
-    > = HashMap::new();
+    let mut pending_responses: HashMap<Transaction, PendingRequest> = HashMap::new();
+    let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
+    cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     tracing::info!("Op request mediator starting");
 
@@ -329,8 +346,24 @@ pub(crate) async fn run_op_request_mediator(
                     "Mediator received operation request"
                 );
 
-                // Store the response channel
-                pending_responses.insert(transaction, response_tx);
+                // Check if we're at capacity
+                if pending_responses.len() >= MAX_PENDING_REQUESTS {
+                    tracing::warn!(
+                        tx = %transaction,
+                        max = MAX_PENDING_REQUESTS,
+                        "Mediator at capacity, rejecting request"
+                    );
+                    let _ = response_tx.send(Err(OpRequestError::Failed(
+                        "mediator at capacity".to_string()
+                    )));
+                    continue;
+                }
+
+                // Store the response channel with timestamp
+                pending_responses.insert(transaction, PendingRequest {
+                    response_tx,
+                    created_at: Instant::now(),
+                });
 
                 // Forward transaction to event loop
                 if let Err(e) = to_event_loop_tx.send(transaction).await {
@@ -340,8 +373,8 @@ pub(crate) async fn run_op_request_mediator(
                         "Failed to forward transaction to event loop - channel closed"
                     );
                     // Remove and notify the waiting executor
-                    if let Some(response_tx) = pending_responses.remove(&transaction) {
-                        let _ = response_tx.send(Err(OpRequestError::ChannelClosed));
+                    if let Some(pending) = pending_responses.remove(&transaction) {
+                        let _ = pending.response_tx.send(Err(OpRequestError::ChannelClosed));
                     }
                 }
             }
@@ -356,8 +389,8 @@ pub(crate) async fn run_op_request_mediator(
                 );
 
                 // Route response to the waiting executor
-                if let Some(response_tx) = pending_responses.remove(&transaction) {
-                    if response_tx.send(Ok(op_result)).is_err() {
+                if let Some(pending) = pending_responses.remove(&transaction) {
+                    if pending.response_tx.send(Ok(op_result)).is_err() {
                         tracing::debug!(
                             tx = %transaction,
                             "Executor dropped before receiving response"
@@ -371,6 +404,42 @@ pub(crate) async fn run_op_request_mediator(
                 }
             }
 
+            // Periodic cleanup of stale requests
+            _ = cleanup_interval.tick() => {
+                let now = Instant::now();
+                let stale_threshold = STALE_REQUEST_THRESHOLD;
+
+                // Collect stale transaction IDs
+                let stale_txs: Vec<Transaction> = pending_responses
+                    .iter()
+                    .filter(|(_, pending)| now.duration_since(pending.created_at) > stale_threshold)
+                    .map(|(tx, _)| *tx)
+                    .collect();
+
+                if !stale_txs.is_empty() {
+                    tracing::warn!(
+                        stale_count = stale_txs.len(),
+                        pending_count = pending_responses.len(),
+                        threshold_secs = stale_threshold.as_secs(),
+                        "Cleaning up stale pending requests"
+                    );
+
+                    for tx in stale_txs {
+                        if let Some(pending) = pending_responses.remove(&tx) {
+                            tracing::debug!(
+                                tx = %tx,
+                                age_secs = now.duration_since(pending.created_at).as_secs(),
+                                "Removing stale pending request"
+                            );
+                            // Try to notify the executor (likely already timed out)
+                            let _ = pending.response_tx.send(Err(OpRequestError::Failed(
+                                "request exceeded stale threshold".to_string()
+                            )));
+                        }
+                    }
+                }
+            }
+
             // Both channels closed - exit
             else => {
                 tracing::info!(
@@ -378,9 +447,9 @@ pub(crate) async fn run_op_request_mediator(
                     "Mediator channels closed, shutting down"
                 );
                 // Notify any remaining waiters
-                for (tx, response_tx) in pending_responses.drain() {
+                for (tx, pending) in pending_responses.drain() {
                     tracing::debug!(tx = %tx, "Notifying orphaned waiter of shutdown");
-                    let _ = response_tx.send(Err(OpRequestError::ChannelClosed));
+                    let _ = pending.response_tx.send(Err(OpRequestError::ChannelClosed));
                 }
                 break;
             }
@@ -692,12 +761,26 @@ impl<R> Executor<R> {
                 ExecutorError::other(e)
             })?;
 
-        // Wait for the response on our oneshot channel
-        let op_result = response_rx.await.map_err(|_| {
-            ExecutorError::other(anyhow::anyhow!(
-                "response channel closed before receiving result"
-            ))
-        })?;
+        // Wait for the response on our oneshot channel with timeout
+        const OP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+        let op_result = tokio::time::timeout(OP_REQUEST_TIMEOUT, response_rx)
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    tx = %transaction,
+                    timeout_secs = OP_REQUEST_TIMEOUT.as_secs(),
+                    "Network operation timed out waiting for response"
+                );
+                ExecutorError::other(anyhow::anyhow!(
+                    "network operation timed out after {} seconds",
+                    OP_REQUEST_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|_| {
+                ExecutorError::other(anyhow::anyhow!(
+                    "response channel closed before receiving result"
+                ))
+            })?;
 
         // Handle the result
         let op_enum = op_result.map_err(|e| ExecutorError::other(anyhow::anyhow!("{}", e)))?;
