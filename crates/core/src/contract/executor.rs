@@ -316,13 +316,78 @@ struct PendingRequest {
 /// `OpRequestSender`, while the event loop continues to use the existing
 /// `ExecutorToEventLoopChannel<NetworkEventListenerHalve>` interface.
 ///
-/// The mediator:
+/// # Architecture
+///
+/// ```text
+/// ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+/// │  Executor 1  │────┐    │              │    ┌────│  Event Loop  │
+/// ├──────────────┤    │    │   Mediator   │    │    ├──────────────┤
+/// │  Executor 2  │────┼───▶│              │────┼───▶│  Operations  │
+/// ├──────────────┤    │    │  (pending    │    │    │  Processing  │
+/// │  Executor N  │────┘    │   HashMap)   │◀───┘    └──────────────┘
+/// └──────────────┘         └──────────────┘
+/// ```
+///
+/// # Workflow
+///
 /// 1. Receives (Transaction, oneshot::Sender) from executors via `op_request_receiver`
 /// 2. Forwards the Transaction to the event loop via `to_event_loop_tx`
-/// 3. Stores the oneshot sender keyed by transaction
+/// 3. Stores the oneshot sender keyed by transaction in `pending_responses`
 /// 4. Receives responses from the event loop via `from_event_loop_rx`
 /// 5. Routes responses back to the correct executor via the stored oneshot sender
 /// 6. Periodically cleans up stale pending requests to prevent memory leaks
+///
+/// # Failure Scenarios and Recovery
+///
+/// ## Executor Drops Before Response
+///
+/// **Scenario**: An executor times out or is dropped before receiving its response.
+/// **Detection**: The `oneshot::Sender::send()` returns `Err` when the receiver is dropped.
+/// **Recovery**: The mediator logs a debug message and continues. No cleanup needed since
+/// the entry is removed from `pending_responses` when the response arrives.
+///
+/// ## Event Loop Channel Closes
+///
+/// **Scenario**: The event loop crashes or its receiving channel is dropped.
+/// **Detection**: `to_event_loop_tx.send()` returns `SendError`.
+/// **Recovery**: The mediator removes the pending request and notifies the executor
+/// with `OpRequestError::ChannelClosed`. The mediator continues running to handle
+/// cleanup of remaining pending requests.
+///
+/// ## Mediator Capacity Exceeded
+///
+/// **Scenario**: More than `MAX_PENDING_REQUESTS` (10,000) concurrent requests.
+/// **Detection**: `pending_responses.len() >= MAX_PENDING_REQUESTS`
+/// **Recovery**: New requests are immediately rejected with an error. This provides
+/// backpressure to prevent unbounded memory growth. Existing requests continue processing.
+///
+/// ## Stale Request Cleanup
+///
+/// **Scenario**: Requests that have been pending longer than `STALE_REQUEST_THRESHOLD` (180s).
+/// **Detection**: Periodic cleanup runs every `CLEANUP_INTERVAL` (30s) and checks timestamps.
+/// **Recovery**: Stale entries are removed from `pending_responses` and their executors are
+/// notified with an error. This handles edge cases where responses are never received
+/// (e.g., network partitions, event loop bugs).
+///
+/// ## Unknown Transaction Response
+///
+/// **Scenario**: Response received for a transaction not in `pending_responses`.
+/// **Detection**: `pending_responses.remove()` returns `None`.
+/// **Recovery**: The mediator logs a warning. This can happen legitimately when an executor
+/// times out and its response arrives later. No action needed.
+///
+/// ## All Channels Close
+///
+/// **Scenario**: Both the executor channel and event loop channel are closed.
+/// **Detection**: `tokio::select!` returns from the `else` branch.
+/// **Recovery**: The mediator notifies all remaining pending executors with `ChannelClosed`
+/// error, then exits gracefully.
+///
+/// # Thread Safety
+///
+/// The mediator is designed to be run as a single task. It is not `Sync` because
+/// it holds mutable state (`pending_responses`). The `OpRequestSender` is cloneable
+/// and can be shared across multiple executor tasks.
 pub(crate) async fn run_op_request_mediator(
     mut op_request_receiver: OpRequestReceiver,
     to_event_loop_tx: mpsc::Sender<Transaction>,
