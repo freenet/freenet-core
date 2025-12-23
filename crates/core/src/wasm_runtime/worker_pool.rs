@@ -125,7 +125,7 @@ impl WasmWorkerPool {
             let receiver = work_receiver.clone();
             let shutdown = shutdown.clone();
             let handle = thread::Builder::new()
-                .name(format!("wasm-worker-{}", i))
+                .name(format!("freenet-wasm-worker-{}", i))
                 .spawn(move || {
                     worker_loop(receiver, shutdown);
                 })
