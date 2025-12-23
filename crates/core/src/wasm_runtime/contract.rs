@@ -6,7 +6,7 @@ use freenet_stdlib::prelude::{
     ContractInterfaceResult, ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary,
     UpdateData, UpdateModification, ValidateResult, WrappedState,
 };
-use tokio::sync::{oneshot, Semaphore, SemaphorePermit};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use wasmer::{Instance, Store, TypedFunction};
 
 /// Semaphore to limit concurrent WASM operations.
@@ -14,28 +14,31 @@ use wasmer::{Instance, Store, TypedFunction};
 /// This prevents scheduling too many blocking WASM executions at once,
 /// which would cause thread explosion even without block_in_place.
 /// Limited to number of CPU cores to match available parallelism.
-static WASM_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+static WASM_SEMAPHORE: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
 
-fn get_wasm_semaphore() -> &'static Semaphore {
-    WASM_SEMAPHORE.get_or_init(|| {
-        let permits = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
-        tracing::info!(
-            target: "freenet::wasm_runtime",
-            permits,
-            "Initializing WASM execution semaphore"
-        );
-        Semaphore::new(permits)
-    })
+fn get_wasm_semaphore() -> std::sync::Arc<Semaphore> {
+    WASM_SEMAPHORE
+        .get_or_init(|| {
+            let permits = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4);
+            tracing::info!(
+                target: "freenet::wasm_runtime",
+                permits,
+                "Initializing WASM execution semaphore"
+            );
+            std::sync::Arc::new(Semaphore::new(permits))
+        })
+        .clone()
 }
 
 /// Acquire a permit for WASM execution, blocking if necessary.
 /// Uses polling since we're in a sync context but need to wait for a permit.
-fn acquire_wasm_permit() -> SemaphorePermit<'static> {
+/// Returns an owned permit that can be moved into the spawned thread.
+fn acquire_wasm_permit() -> OwnedSemaphorePermit {
     let sem = get_wasm_semaphore();
     loop {
-        match sem.try_acquire() {
+        match sem.clone().try_acquire_owned() {
             Ok(permit) => return permit,
             Err(_) => {
                 // No permit available, wait briefly and retry
@@ -95,6 +98,18 @@ pub(crate) trait ContractRuntimeInterface {
     ) -> RuntimeResult<StateDelta<'static>>;
 }
 
+/// Result type for WASM thread execution.
+/// On success: (Ok(result), store)
+/// On WASM error: (Err(runtime_error), store)
+/// On panic: we lose the store (it's consumed by the panicking closure)
+type WasmResult = (Result<i64, wasmer::RuntimeError>, Store);
+
+/// Result from thread execution
+enum ThreadResult {
+    /// Normal completion (success or WASM error) with Store returned
+    Completed(WasmResult),
+}
+
 impl ContractRuntimeInterface for super::Runtime {
     fn validate_state(
         &mut self,
@@ -124,7 +139,7 @@ impl ContractRuntimeInterface for super::Runtime {
             related_buf.ptr()
         };
 
-        let mut wasm_store = self.wasm_store.take().unwrap();
+        let wasm_store = self.wasm_store.take().unwrap();
         let validate_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = match running
             .instance
             .exports
@@ -141,27 +156,37 @@ impl ContractRuntimeInterface for super::Runtime {
         let state_buf_ptr = state_buf_ptr as i64;
         let related_buf_ptr = related_buf_ptr as i64;
 
-        // Acquire semaphore permit to limit concurrent WASM executions
-        let _permit = acquire_wasm_permit();
-
-        // Use oneshot channel to avoid block_in_place, which causes tokio to spawn
-        // replacement worker threads and leads to thread explosion under load.
-        // See: https://github.com/freenet/freenet-core/issues/2381
-        let (tx, rx) = oneshot::channel();
-        std::thread::Builder::new()
+        // Spawn WASM execution on dedicated thread.
+        // The permit is acquired INSIDE the thread to limit actual concurrent executions,
+        // not just concurrent waiters.
+        let (tx, rx) = oneshot::channel::<ThreadResult>();
+        let handle = match std::thread::Builder::new()
             .name("wasm-validate".to_string())
             .spawn(move || {
-                let r = validate_func.call(
-                    &mut wasm_store,
-                    param_buf_ptr,
-                    state_buf_ptr,
-                    related_buf_ptr,
+                // Acquire permit inside thread - this limits actual WASM executions
+                let _permit = acquire_wasm_permit();
+
+                // Execute WASM and return result with store
+                let mut store = wasm_store;
+                let result =
+                    validate_func.call(&mut store, param_buf_ptr, state_buf_ptr, related_buf_ptr);
+                let _ = tx.send(ThreadResult::Completed((result, store)));
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                // Thread spawn failed - return error
+                // Note: wasm_store was already taken, it's lost
+                tracing::error!(
+                    target: "freenet::wasm_runtime",
+                    error = %e,
+                    "Failed to spawn WASM validate thread"
                 );
-                let _ = tx.send((r, wasm_store));
-            })
-            .expect("failed to spawn wasm-validate thread");
-        let r = handle_execution_call(rx, self, "validate_state");
-        drop(_permit); // Release permit after execution completes
+                return Err(anyhow::anyhow!("Failed to spawn WASM thread: {}", e).into());
+            }
+        };
+
+        // Wait for result with timeout
+        let r = handle_execution_call(rx, handle, self, "validate_state");
 
         let result = match_err(self, &running.instance, r)?;
         let is_valid = unsafe {
@@ -179,9 +204,6 @@ impl ContractRuntimeInterface for super::Runtime {
         state: &WrappedState,
         update_data: &[UpdateData<'_>],
     ) -> RuntimeResult<UpdateModification<'static>> {
-        // todo: if we keep this hot in memory some things to take into account:
-        //       - over subsequent requests state size may change
-        //       - the delta may not be necessarily the same size
         let req_bytes =
             parameters.size() + state.size() + update_data.iter().map(|e| e.size()).sum::<usize>();
         let running = self.prepare_contract_call(key, parameters, req_bytes)?;
@@ -204,7 +226,7 @@ impl ContractRuntimeInterface for super::Runtime {
             update_data_buf.ptr()
         };
 
-        let mut wasm_store = self.wasm_store.take().unwrap();
+        let wasm_store = self.wasm_store.take().unwrap();
         let update_state_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = match running
             .instance
             .exports
@@ -221,25 +243,32 @@ impl ContractRuntimeInterface for super::Runtime {
         let state_buf_ptr = state_buf_ptr as i64;
         let update_data_buf_ptr = update_data_buf_ptr as i64;
 
-        // Acquire semaphore permit to limit concurrent WASM executions
-        let _permit = acquire_wasm_permit();
-
-        // Use oneshot channel to avoid block_in_place thread explosion
-        let (tx, rx) = oneshot::channel();
-        std::thread::Builder::new()
+        let (tx, rx) = oneshot::channel::<ThreadResult>();
+        let handle = match std::thread::Builder::new()
             .name("wasm-update".to_string())
             .spawn(move || {
-                let r = update_state_func.call(
-                    &mut wasm_store,
+                let _permit = acquire_wasm_permit();
+                let mut store = wasm_store;
+                let result = update_state_func.call(
+                    &mut store,
                     param_buf_ptr,
                     state_buf_ptr,
                     update_data_buf_ptr,
                 );
-                let _ = tx.send((r, wasm_store));
-            })
-            .expect("failed to spawn wasm-update thread");
-        let r = handle_execution_call(rx, self, "update_state");
-        drop(_permit);
+                let _ = tx.send(ThreadResult::Completed((result, store)));
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(
+                    target: "freenet::wasm_runtime",
+                    error = %e,
+                    "Failed to spawn WASM update thread"
+                );
+                return Err(anyhow::anyhow!("Failed to spawn WASM thread: {}", e).into());
+            }
+        };
+
+        let r = handle_execution_call(rx, handle, self, "update_state");
 
         let result = match_err(self, &running.instance, r)?;
         let update_res = unsafe {
@@ -272,7 +301,7 @@ impl ContractRuntimeInterface for super::Runtime {
             state_buf.ptr()
         };
 
-        let mut wasm_store = self.wasm_store.take().unwrap();
+        let wasm_store = self.wasm_store.take().unwrap();
         let summary_func: TypedFunction<(i64, i64), FfiReturnTy> = match running
             .instance
             .exports
@@ -288,20 +317,27 @@ impl ContractRuntimeInterface for super::Runtime {
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
 
-        // Acquire semaphore permit to limit concurrent WASM executions
-        let _permit = acquire_wasm_permit();
-
-        // Use oneshot channel to avoid block_in_place thread explosion
-        let (tx, rx) = oneshot::channel();
-        std::thread::Builder::new()
+        let (tx, rx) = oneshot::channel::<ThreadResult>();
+        let handle = match std::thread::Builder::new()
             .name("wasm-summarize".to_string())
             .spawn(move || {
-                let r = summary_func.call(&mut wasm_store, param_buf_ptr, state_buf_ptr);
-                let _ = tx.send((r, wasm_store));
-            })
-            .expect("failed to spawn wasm-summarize thread");
-        let r = handle_execution_call(rx, self, "summarize_state");
-        drop(_permit);
+                let _permit = acquire_wasm_permit();
+                let mut store = wasm_store;
+                let result = summary_func.call(&mut store, param_buf_ptr, state_buf_ptr);
+                let _ = tx.send(ThreadResult::Completed((result, store)));
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(
+                    target: "freenet::wasm_runtime",
+                    error = %e,
+                    "Failed to spawn WASM summarize thread"
+                );
+                return Err(anyhow::anyhow!("Failed to spawn WASM thread: {}", e).into());
+            }
+        };
+
+        let r = handle_execution_call(rx, handle, self, "summarize_state");
 
         let result = match_err(self, &running.instance, r)?;
         let result = unsafe {
@@ -340,35 +376,49 @@ impl ContractRuntimeInterface for super::Runtime {
             summary_buf.ptr()
         };
 
-        let mut wasm_store = self.wasm_store.take().unwrap();
-        let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = running
+        let wasm_store = self.wasm_store.take().unwrap();
+        let get_state_delta_func: TypedFunction<(i64, i64, i64), FfiReturnTy> = match running
             .instance
             .exports
-            .get_typed_function(&wasm_store, "get_state_delta")?;
+            .get_typed_function(&wasm_store, "get_state_delta")
+        {
+            Ok(f) => f,
+            Err(e) => {
+                self.wasm_store = Some(wasm_store);
+                return Err(e.into());
+            }
+        };
 
         let param_buf_ptr = param_buf_ptr as i64;
         let state_buf_ptr = state_buf_ptr as i64;
         let summary_buf_ptr = summary_buf_ptr as i64;
 
-        // Acquire semaphore permit to limit concurrent WASM executions
-        let _permit = acquire_wasm_permit();
-
-        // Use oneshot channel to avoid block_in_place thread explosion
-        let (tx, rx) = oneshot::channel();
-        std::thread::Builder::new()
+        let (tx, rx) = oneshot::channel::<ThreadResult>();
+        let handle = match std::thread::Builder::new()
             .name("wasm-delta".to_string())
             .spawn(move || {
-                let r = get_state_delta_func.call(
-                    &mut wasm_store,
+                let _permit = acquire_wasm_permit();
+                let mut store = wasm_store;
+                let result = get_state_delta_func.call(
+                    &mut store,
                     param_buf_ptr,
                     state_buf_ptr,
                     summary_buf_ptr,
                 );
-                let _ = tx.send((r, wasm_store));
-            })
-            .expect("failed to spawn wasm-delta thread");
-        let r = handle_execution_call(rx, self, "get_state_delta");
-        drop(_permit);
+                let _ = tx.send(ThreadResult::Completed((result, store)));
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(
+                    target: "freenet::wasm_runtime",
+                    error = %e,
+                    "Failed to spawn WASM delta thread"
+                );
+                return Err(anyhow::anyhow!("Failed to spawn WASM thread: {}", e).into());
+            }
+        };
+
+        let r = handle_execution_call(rx, handle, self, "get_state_delta");
 
         let result = match_err(self, &running.instance, r)?;
         let result = unsafe {
@@ -384,21 +434,21 @@ impl ContractRuntimeInterface for super::Runtime {
 /// Track concurrent WASM operations for diagnostics
 static CONCURRENT_WASM_OPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Wait for WASM execution result via oneshot channel.
+/// Wait for WASM execution result and join the thread.
 ///
 /// This replaces the previous `block_in_place` + poll loop pattern which caused
 /// tokio to spawn replacement worker threads, leading to thread explosion under
 /// concurrent contract operations.
 ///
-/// With oneshot channels:
-/// - We use simple polling with `try_recv` and `thread::sleep`
-/// - This does NOT trigger tokio's worker compensation mechanism
-/// - The WASM execution itself runs on a dedicated std::thread
-///
-/// See PR #1670 which introduced block_in_place and issue #2381 for the thread
-/// explosion problem it caused.
+/// Key design points:
+/// - Semaphore permit is acquired INSIDE the spawned thread, limiting actual
+///   concurrent WASM executions (not just concurrent waiters)
+/// - Thread handle is joined to ensure proper cleanup
+/// - Store is returned through the channel for reuse
+/// - Timeout causes us to abandon the thread (it will complete eventually)
 fn handle_execution_call(
-    rx: oneshot::Receiver<(Result<i64, wasmer::RuntimeError>, Store)>,
+    rx: oneshot::Receiver<ThreadResult>,
+    handle: std::thread::JoinHandle<()>,
     rt: &mut super::Runtime,
     operation: &str,
 ) -> Result<i64, Errors> {
@@ -416,15 +466,47 @@ fn handle_execution_call(
 
     let timeout = Duration::from_secs_f64(rt.max_execution_seconds);
 
-    // Use polling with try_recv to avoid block_in_place.
-    // This avoids triggering tokio's worker compensation mechanism.
-    let result = match recv_with_timeout(rx, timeout) {
-        Ok((r, s)) => {
-            rt.wasm_store = Some(s);
-            r.map_err(Errors::Wasmer)
+    // Wait for result with timeout using polling
+    let poll_result = recv_with_timeout(rx, timeout);
+
+    let result = match poll_result {
+        Ok(ThreadResult::Completed((wasm_result, store))) => {
+            // Store returned successfully - restore it
+            rt.wasm_store = Some(store);
+            wasm_result.map_err(Errors::Wasmer)
         }
-        Err(RecvTimeoutError::Timeout) => Err(Errors::MaxComputeTimeExceeded),
+        Err(RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                target: "freenet::wasm_runtime",
+                operation,
+                timeout_secs = rt.max_execution_seconds,
+                "WASM execution timed out - Store may be lost"
+            );
+            // Thread is still running - we can't recover the store
+            // The thread will eventually complete and the store will be dropped
+            Err(Errors::MaxComputeTimeExceeded)
+        }
         Err(RecvTimeoutError::Disconnected) => {
+            // Try to join the thread to see if it panicked
+            match handle.join() {
+                Ok(()) => {
+                    // Thread completed but didn't send - this shouldn't happen
+                    tracing::error!(
+                        target: "freenet::wasm_runtime",
+                        operation,
+                        "WASM thread completed without sending result"
+                    );
+                }
+                Err(panic_payload) => {
+                    let panic_msg = format_panic(&panic_payload);
+                    tracing::error!(
+                        target: "freenet::wasm_runtime",
+                        operation,
+                        panic_msg = %panic_msg,
+                        "WASM thread panicked"
+                    );
+                }
+            }
             Err(Errors::Other(anyhow::anyhow!("WASM thread disconnected")))
         }
     };
@@ -444,15 +526,27 @@ fn handle_execution_call(
     result
 }
 
+/// Format a panic payload into a readable message
+fn format_panic(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "Unknown panic".to_string()
+    }
+}
+
 enum RecvTimeoutError {
     Timeout,
     Disconnected,
 }
 
-/// Receive from oneshot channel with timeout, without using block_in_place.
+/// Receive from oneshot channel with timeout, using polling.
 ///
-/// Uses a simple polling approach with std::thread::sleep to avoid triggering
-/// tokio's worker compensation.
+/// Uses simple polling with try_recv + thread::sleep to avoid triggering
+/// tokio's worker compensation mechanism (which was the root cause of
+/// the thread explosion in issue #2381).
 fn recv_with_timeout<T>(
     mut rx: oneshot::Receiver<T>,
     timeout: Duration,
@@ -461,11 +555,9 @@ fn recv_with_timeout<T>(
     let poll_interval = Duration::from_millis(10);
 
     loop {
-        // Try non-blocking receive
         match rx.try_recv() {
             Ok(value) => return Ok(value),
             Err(oneshot::error::TryRecvError::Empty) => {
-                // Channel still open, value not ready yet
                 if start.elapsed() >= timeout {
                     return Err(RecvTimeoutError::Timeout);
                 }
@@ -485,7 +577,7 @@ fn match_err(
 ) -> RuntimeResult<i64> {
     match r {
         Ok(result) => Ok(result),
-        Err(Errors::Wasmer(e)) => Err(rt.handle_contract_error(e, instance, "get_state_delta")),
+        Err(Errors::Wasmer(e)) => Err(rt.handle_contract_error(e, instance, "wasm_execution")),
         Err(Errors::MaxComputeTimeExceeded) => {
             Err(ContractExecError::MaxComputeTimeExceeded.into())
         }
