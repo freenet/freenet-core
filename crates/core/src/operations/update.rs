@@ -302,9 +302,7 @@ impl Operation for UpdateOp {
                             }
                         } else {
                             // Contract not found locally - forward to another peer
-                            let self_addr = self_location
-                                .socket_addr()
-                                .expect("self location must have socket address");
+                            let self_addr = op_manager.ring.connection_manager.peer_addr()?;
                             let sender_addr = request_sender
                                 .socket_addr()
                                 .expect("request sender must have socket address");
@@ -572,8 +570,11 @@ impl OpManager {
     /// Local clients receive updates through a separate path via the contract executor's
     /// `update_notifications` channels (see `send_update_notification` in runtime.rs).
     ///
-    /// This clean separation eliminates the previous `allow_self` workaround that was needed
-    /// when local subscriptions were mixed with network subscriptions.
+    /// **Parameter `sender`:**
+    /// The address of the peer that initiated or forwarded this UPDATE to us.
+    /// - Used to filter out the sender from broadcast targets (avoid echo)
+    /// - When sender equals our own address (local UPDATE initiation), we include ourselves
+    ///   in proximity cache targets if we're seeding the contract
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
@@ -582,7 +583,7 @@ impl OpManager {
         use std::collections::HashSet;
 
         let self_addr = self.ring.connection_manager.get_own_addr();
-        let allow_self = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
+        let is_local_update_initiator = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
 
         // Collect explicit subscribers (downstream interest)
         // Only include subscribers we're currently connected to
@@ -614,21 +615,15 @@ impl OpManager {
         let mut proximity_targets: HashSet<PeerKeyLocation> = HashSet::new();
 
         for addr in proximity_addrs {
-            // Skip sender to avoid echo
-            if &addr == sender {
+            if &addr == sender && !is_local_update_initiator {
                 continue;
             }
-            // Skip self unless allowed
-            if !allow_self && self_addr.as_ref() == Some(&addr) {
+            if !is_local_update_initiator && self_addr.as_ref() == Some(&addr) {
                 continue;
             }
-            // Look up the PeerKeyLocation for this address via the connection manager
             if let Some(pkl) = self.ring.connection_manager.get_peer_by_addr(addr) {
                 proximity_targets.insert(pkl);
             } else {
-                // Neighbor is in proximity cache but no longer connected
-                // This is normal during connection churn - the proximity cache
-                // will be cleaned up when the disconnect is processed
                 tracing::debug!(
                     peer = %addr,
                     contract = %key,
@@ -943,14 +938,11 @@ pub(crate) async fn request_update(
         return Err(OpError::UnexpectedOpState);
     };
 
-    let sender = op_manager.ring.connection_manager.own_location();
-
     // the initial request must provide:
     // - a peer as close as possible to the contract location
     // - and the value to update
-    let sender_addr = sender
-        .socket_addr()
-        .expect("own location must have socket address");
+    let sender = op_manager.ring.connection_manager.own_location();
+    let sender_addr = op_manager.ring.connection_manager.peer_addr()?;
 
     let target_from_subscribers = if let Some(subscribers) = op_manager.ring.subscribers_of(&key) {
         // Clone and filter out self from subscribers to prevent self-targeting

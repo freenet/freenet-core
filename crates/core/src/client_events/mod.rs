@@ -322,6 +322,15 @@ where
                             tracing::debug!(client_id = %cli_id, "Client disconnected");
                             (cli_id, Err(ClientError::from(ErrorKind::Disconnect)))
                         }
+                        Err(Error::PeerNotJoined) => {
+                            tracing::warn!(
+                                client_id = %cli_id,
+                                "Operation rejected: peer has not joined network yet - client should retry after join"
+                            );
+                            (cli_id, Err(ErrorKind::OperationError {
+                                cause: "PEER_NOT_JOINED: peer has not joined the network yet - retry after node joins".into()
+                            }.into()))
+                        }
                         Err(err) => {
                             tracing::error!(
                                 client_id = %cli_id,
@@ -436,6 +445,8 @@ where
 enum Error {
     #[error("Node not connected to network")]
     Disconnected,
+    #[error("Peer has not joined the network yet (no ring location established)")]
+    PeerNotJoined,
     #[error("Node error: {0}")]
     Node(String),
     #[error(transparent)]
@@ -495,19 +506,19 @@ async fn process_open_request(
                                 phase = "peer_not_ready",
                                 "Client attempted PUT operation before peer initialization complete"
                             );
-                            return Err(Error::Disconnected);
+                            return Err(Error::PeerNotJoined);
                         }
 
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
-                        else {
-                            tracing::error!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "no_peer_address",
-                                "Peer address not found for PUT operation"
-                            );
-                            return Err(Error::Disconnected);
-                        };
+                        let peer_id = op_manager.ring.connection_manager.peer_addr()
+                            .map_err(|_| {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    phase = "peer_not_joined",
+                                    "Peer address not found for PUT operation - peer has not joined network"
+                                );
+                                Error::PeerNotJoined
+                            })?;
 
                         tracing::debug!(
                             client_id = %client_id,
@@ -790,16 +801,16 @@ async fn process_open_request(
                         }
                     }
                     ContractRequest::Update { key, data } => {
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
-                        else {
-                            tracing::error!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "no_peer_address",
-                                "Peer address not found for UPDATE operation"
-                            );
-                            return Err(Error::Disconnected);
-                        };
+                        let peer_id = op_manager.ring.connection_manager.peer_addr()
+                            .map_err(|_| {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    phase = "peer_not_joined",
+                                    "Peer address not found for UPDATE operation - peer has not joined network"
+                                );
+                                Error::PeerNotJoined
+                            })?;
 
                         tracing::debug!(
                             client_id = %client_id,
@@ -1044,16 +1055,16 @@ async fn process_open_request(
                         return_contract_code,
                         subscribe,
                     } => {
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
-                        else {
-                            tracing::error!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "no_peer_address",
-                                "Peer address not found for GET operation"
-                            );
-                            return Err(Error::Disconnected);
-                        };
+                        let peer_id = op_manager.ring.connection_manager.peer_addr()
+                            .map_err(|_| {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    phase = "peer_not_joined",
+                                    "Peer address not found for GET operation - peer has not joined network"
+                                );
+                                Error::PeerNotJoined
+                            })?;
 
                         // Query local store by instance_id (key from request is ContractInstanceId)
                         let (full_key, state, contract) = match op_manager
@@ -1354,16 +1365,16 @@ async fn process_open_request(
                         }
                     }
                     ContractRequest::Subscribe { key, summary } => {
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
-                        else {
-                            tracing::error!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "no_peer_address",
-                                "Peer address not found for SUBSCRIBE operation"
-                            );
-                            return Err(Error::Disconnected);
-                        };
+                        let peer_id = op_manager.ring.connection_manager.peer_addr()
+                            .map_err(|_| {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    phase = "peer_not_joined",
+                                    "Peer address not found for SUBSCRIBE operation - peer has not joined network"
+                                );
+                                Error::PeerNotJoined
+                            })?;
 
                         tracing::debug!(
                             client_id = %client_id,
