@@ -3,6 +3,8 @@ mod contract_store;
 mod delegate;
 mod delegate_store;
 mod error;
+#[cfg(test)]
+pub(crate) mod mock_state_storage;
 mod native_api;
 mod runtime;
 mod secrets_store;

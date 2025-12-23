@@ -34,7 +34,7 @@ wasmer = "6.1.0"
 wasmer-compiler-singlepass = "6.1.0"
 
 # freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib.git", branch = "main", package = "freenet-stdlib" }
-freenet-stdlib = { version = "0.1.29" }
+freenet-stdlib = { version = "0.1.28" }
 
 [profile.dev.package."*"]
 opt-level = 3
