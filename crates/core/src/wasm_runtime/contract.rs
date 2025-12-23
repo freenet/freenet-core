@@ -352,8 +352,9 @@ where
                 std::thread::sleep(Duration::from_millis(10));
             }
 
-            // Get result using the handle we captured earlier
-            let join_result = handle.block_on(task_handle);
+            // Get result using block_in_place to allow blocking within an async context.
+            // We use block_in_place + block_on because we're called from within a tokio task.
+            let join_result = tokio::task::block_in_place(|| handle.block_on(task_handle));
             let (result, store) = join_result.map_err(|e| {
                 if e.is_panic() {
                     tracing::error!("WASM blocking task panicked during execution");
