@@ -183,7 +183,7 @@ impl MockStateStorage {
 impl StateStorage for MockStateStorage {
     type Error = MockStorageError;
 
-    async fn store(&mut self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
+    async fn store(&self, key: ContractKey, state: WrappedState) -> Result<(), Self::Error> {
         self.store_count.fetch_add(1, Ordering::SeqCst);
 
         let mut inner = self.inner.lock().unwrap();
@@ -209,7 +209,7 @@ impl StateStorage for MockStateStorage {
     }
 
     async fn store_params(
-        &mut self,
+        &self,
         key: ContractKey,
         params: Parameters<'static>,
     ) -> Result<(), Self::Error> {
@@ -303,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_store_and_get() {
-        let mut storage = MockStateStorage::new();
+        let storage = MockStateStorage::new();
         let key = make_test_key();
         let state = make_test_state(&[1, 2, 3]);
 
@@ -317,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_params_store_and_get() {
-        let mut storage = MockStateStorage::new();
+        let storage = MockStateStorage::new();
         let key = make_test_key();
         let params = Parameters::from(vec![10, 20, 30]);
 
@@ -341,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_next_stores() {
-        let mut storage = MockStateStorage::new();
+        let storage = MockStateStorage::new();
         let key = make_test_key();
         let state = make_test_state(&[1, 2, 3]);
 
@@ -357,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_next_gets() {
-        let mut storage = MockStateStorage::new();
+        let storage = MockStateStorage::new();
         let key = make_test_key();
         let state = make_test_state(&[1, 2, 3]);
 
@@ -373,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_for_specific_key() {
-        let mut storage = MockStateStorage::new();
+        let storage = MockStateStorage::new();
         let key1 = make_test_key();
         let key2 = {
             let code = ContractCode::from(vec![5, 6, 7, 8]);
@@ -394,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_operation_tracking() {
-        let mut storage = MockStateStorage::new();
+        let storage = MockStateStorage::new();
         let key = make_test_key();
         let state = make_test_state(&[1, 2, 3]);
         let params = Parameters::from(vec![10, 20, 30]);
@@ -430,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clear() {
-        let mut storage = MockStateStorage::new();
+        let storage = MockStateStorage::new();
         let key = make_test_key();
         let state = make_test_state(&[1, 2, 3]);
 
@@ -447,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stored_keys() {
-        let mut storage = MockStateStorage::new();
+        let storage = MockStateStorage::new();
 
         let key1 = make_test_key();
         let key2 = {

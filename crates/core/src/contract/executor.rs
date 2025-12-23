@@ -761,7 +761,8 @@ impl<R> Executor<R> {
         std::env::temp_dir().join(format!("freenet-executor-{identifier}"))
     }
 
-    async fn get_stores(
+    /// Create all stores including StateStore. Used when creating a standalone executor.
+    pub(crate) async fn get_stores(
         config: &Config,
     ) -> Result<
         (
@@ -772,18 +773,27 @@ impl<R> Executor<R> {
         ),
         anyhow::Error,
     > {
-        const MAX_SIZE: i64 = 10 * 1024 * 1024;
         const MAX_MEM_CACHE: u32 = 10_000_000;
 
         let state_store =
             StateStore::new(Storage::new(&config.db_dir()).await?, MAX_MEM_CACHE).unwrap();
-        let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE)?;
-
-        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE)?;
-
-        let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone())?;
+        let (contract_store, delegate_store, secret_store) = Self::get_runtime_stores(config)?;
 
         Ok((contract_store, delegate_store, secret_store, state_store))
+    }
+
+    /// Create only the Runtime stores (contract, delegate, secrets) without StateStore.
+    /// Used by RuntimePool to create executors that share a StateStore.
+    pub(crate) fn get_runtime_stores(
+        config: &Config,
+    ) -> Result<(ContractStore, DelegateStore, SecretsStore), anyhow::Error> {
+        const MAX_SIZE: i64 = 10 * 1024 * 1024;
+
+        let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE)?;
+        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE)?;
+        let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone())?;
+
+        Ok((contract_store, delegate_store, secret_store))
     }
 
     async fn op_request<Op, M>(&mut self, request: M) -> Result<Op::Result, ExecutorError>

@@ -100,18 +100,18 @@ impl ContractHandler for NetworkContractHandler {
     where
         Self: Sized + 'static,
     {
-        // Use a single executor in the pool since WASM execution parallelism is handled
-        // by tokio's blocking thread pool via execute_wasm_blocking. Having multiple
-        // executors would cause database lock conflicts since each tries to open the
-        // same redb database file.
-        //
-        // The RuntimePool semaphore still provides bounded access to the single executor,
-        // preventing unbounded concurrent contract operations.
-        let pool_size = NonZeroUsize::new(1).unwrap();
+        // Create a pool of executors sized to available CPU parallelism, clamped to 2-16.
+        // All executors share the same StateStore (ReDb database) via Arc<Database>.
+        let parallelism = std::thread::available_parallelism()
+            .unwrap_or(NonZeroUsize::new(4).unwrap())
+            .get();
+        let clamped = parallelism.clamp(2, 16);
+        let pool_size = NonZeroUsize::new(clamped).unwrap();
 
         tracing::info!(
             pool_size = %pool_size,
-            "Creating RuntimePool for contract execution (WASM parallelism via blocking pool)"
+            available_parallelism = parallelism,
+            "Creating RuntimePool for contract execution"
         );
 
         let executor = RuntimePool::new(config.clone(), op_sender, op_manager, pool_size).await?;

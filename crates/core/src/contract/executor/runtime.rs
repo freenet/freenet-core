@@ -71,6 +71,8 @@ pub struct RuntimePool {
     checked_out: AtomicUsize,
     /// Count of executors that were lost/replaced (for monitoring)
     replacements_count: AtomicUsize,
+    /// Shared StateStore used by all executors (ReDb uses exclusive file locking)
+    shared_state_store: StateStore<Storage>,
 }
 
 impl RuntimePool {
@@ -90,11 +92,16 @@ impl RuntimePool {
         let pool_size_usize: usize = pool_size.into();
         let mut runtimes = Vec::with_capacity(pool_size_usize);
 
-        // Create all executors with clones of op_sender and op_manager
-        // Each executor can independently send requests to the event loop
+        // Create the shared StateStore once - it wraps a ReDb database that uses
+        // exclusive file locking, so we can only have one connection. ReDb is now
+        // Clone (wraps Arc<Database>), so we can share it across executors.
+        let (_, _, _, shared_state_store) = Executor::<Runtime>::get_stores(&config).await?;
+
+        // Create all executors sharing the same StateStore
         for _ in 0..pool_size_usize {
-            let executor = Executor::from_config(
+            let executor = Executor::from_config_with_shared_store(
                 config.clone(),
+                shared_state_store.clone(),
                 Some(op_sender.clone()),
                 Some(op_manager.clone()),
             )
@@ -104,7 +111,7 @@ impl RuntimePool {
 
         tracing::info!(
             pool_size = pool_size_usize,
-            "Created RuntimePool with {} executors",
+            "Created RuntimePool with {} executors sharing one database connection",
             pool_size_usize
         );
 
@@ -117,6 +124,7 @@ impl RuntimePool {
             pool_size: pool_size_usize,
             checked_out: AtomicUsize::new(0),
             replacements_count: AtomicUsize::new(0),
+            shared_state_store,
         })
     }
 
@@ -227,10 +235,12 @@ impl RuntimePool {
     }
 
     /// Create a new executor to replace a broken one.
+    /// Uses the shared StateStore to avoid opening a new database connection.
     async fn create_replacement_executor(&self) -> anyhow::Result<Executor<Runtime>> {
         tracing::warn!("Creating replacement executor due to previous failure");
-        Executor::from_config(
+        Executor::from_config_with_shared_store(
             self.config.clone(),
+            self.shared_state_store.clone(),
             Some(self.op_sender.clone()),
             Some(self.op_manager.clone()),
         )
@@ -983,6 +993,28 @@ impl Executor<Runtime> {
                     });
                 Ok(())
             },
+            OperationMode::Local,
+            rt,
+            op_sender,
+            op_manager,
+        )
+        .await
+    }
+
+    /// Create an Executor with a pre-created shared StateStore.
+    /// Used by RuntimePool to share the same database connection across executors.
+    pub(crate) async fn from_config_with_shared_store(
+        config: Arc<Config>,
+        shared_state_store: StateStore<Storage>,
+        op_sender: Option<OpRequestSender>,
+        op_manager: Option<Arc<OpManager>>,
+    ) -> anyhow::Result<Self> {
+        // Create only the Runtime stores (contract, delegate, secrets) - NOT StateStore
+        let (contract_store, delegate_store, secret_store) = Self::get_runtime_stores(&config)?;
+        let rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        Executor::new(
+            shared_state_store,
+            || Ok(()), // No cleanup handler for pooled executors
             OperationMode::Local,
             rt,
             op_sender,

@@ -25,13 +25,17 @@ impl From<StateStoreError> for crate::wasm_runtime::ContractError {
 
 pub trait StateStorage {
     type Error;
+    /// Store state for a contract. Takes `&self` because implementations
+    /// (like ReDb) handle internal locking for concurrent access.
     fn store(
-        &mut self,
+        &self,
         key: ContractKey,
         state: WrappedState,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    /// Store parameters for a contract. Takes `&self` because implementations
+    /// handle internal locking for concurrent access.
     fn store_params(
-        &mut self,
+        &self,
         key: ContractKey,
         state: Parameters<'static>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -45,6 +49,9 @@ pub trait StateStorage {
     ) -> impl Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a;
 }
 
+/// StateStore wraps a persistent storage backend with an in-memory cache.
+/// It is Clone when the underlying storage S is Clone (e.g., ReDb with Arc<Database>).
+#[derive(Clone)]
 pub struct StateStore<S: StateStorage> {
     state_mem_cache: AsyncCache<ContractKey, WrappedState>,
     // params_mem_cache: AsyncCache<ContractKey, Parameters<'static>>,
