@@ -342,17 +342,17 @@ enum WasmOutcome {
     Panicked(String),
 }
 
-/// Execute a WASM function on tokio's blocking thread pool.
+/// Execute a WASM function with proper concurrency control.
 ///
 /// This is the core execution function that:
 /// 1. Acquires a semaphore permit to limit concurrent WASM operations
-/// 2. Spawns the work onto tokio's blocking thread pool via `spawn_blocking`
+/// 2. Spawns the actual WASM work onto tokio's blocking thread pool via `spawn_blocking`
 /// 3. Applies a timeout to prevent runaway executions
 ///
-/// Using `spawn_blocking` instead of `block_in_place` avoids triggering tokio's
-/// worker compensation mechanism, which was the root cause of thread explosion
-/// (issue #2381). `spawn_blocking` moves work to a separate bounded thread pool
-/// rather than blocking a worker thread.
+/// The semaphore limits concurrent WASM operations to CPU count, preventing the
+/// thread explosion from issue #2381. Without this limit, many concurrent
+/// `block_in_place` calls would each trigger tokio's worker compensation mechanism,
+/// spawning 65+ threads during normal operations like creating a chat room.
 fn execute_wasm_blocking<F>(
     store: Store,
     wasm_call: F,
@@ -365,9 +365,18 @@ where
     // Try to get existing runtime handle, or create a temporary one for tests
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            // We have a runtime - use it
-            handle
-                .block_on(async { execute_wasm_async(store, wasm_call, timeout, operation).await })
+            // Inside a runtime - use block_in_place to safely run blocking code.
+            // This signals tokio that the current worker will block, allowing it
+            // to schedule other tasks appropriately.
+            //
+            // The semaphore inside execute_wasm_async limits concurrent WASM
+            // executions, preventing the thread explosion that would otherwise
+            // occur with many concurrent block_in_place calls.
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    execute_wasm_async(store, wasm_call, timeout, operation).await
+                })
+            })
         }
         Err(_) => {
             // No runtime (likely in tests) - create a temporary one
