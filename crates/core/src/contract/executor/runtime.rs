@@ -90,11 +90,15 @@ impl RuntimePool {
     /// The caller MUST return the executor via `return_executor` after use.
     async fn pop_executor(&mut self) -> Executor<Runtime> {
         // Wait for an available permit
-        let _ = self
+        let permit = self
             .available
             .acquire()
             .await
             .expect("Semaphore should not be closed");
+
+        // Consume the permit without returning it to the semaphore.
+        // The permit will be restored in `return_executor` via `add_permits(1)`.
+        permit.forget();
 
         // Find the first available executor
         for slot in &mut self.runtimes {

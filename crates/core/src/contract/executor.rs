@@ -41,6 +41,8 @@ use crate::{
 
 pub(super) mod init_tracker;
 pub(super) mod mock_runtime;
+#[cfg(test)]
+mod pool_tests;
 pub(super) mod runtime;
 
 pub(crate) use init_tracker::{
