@@ -18,7 +18,7 @@ bin-dir = "fdev"
 bytesize = "2.3"
 anyhow = "1"
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"], workspace = true }
-bincode = "1"
+bincode = "3"
 bs58 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
