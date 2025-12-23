@@ -1,9 +1,10 @@
 use super::*;
 use super::{
-    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, ExecutorHalve,
-    ExecutorToEventLoopChannel, InitCheckResult, RequestError, Response, StateStoreError,
-    SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
+    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
+    OpRequestSender, RequestError, Response, StateStoreError, SLOW_INIT_THRESHOLD,
+    STALE_INIT_THRESHOLD,
 };
+use crate::node::OpManager;
 use freenet_stdlib::prelude::RelatedContract;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -38,8 +39,11 @@ pub struct RuntimePool {
     /// Semaphore controlling access to executors (permits = available executors)
     available: Semaphore,
     /// Configuration for creating new executors
-    #[allow(dead_code)]
     config: Arc<Config>,
+    /// Channel to send operation requests to the event loop (cloneable, shared by all executors)
+    op_sender: OpRequestSender,
+    /// Reference to the operation manager (cloneable, shared by all executors)
+    op_manager: Arc<OpManager>,
 }
 
 impl RuntimePool {
@@ -47,28 +51,27 @@ impl RuntimePool {
     ///
     /// # Arguments
     /// * `config` - Configuration for executors
-    /// * `event_loop_channel` - Channel for event loop communication
+    /// * `op_sender` - Channel to send operation requests to the event loop (cloneable)
+    /// * `op_manager` - Reference to the operation manager
     /// * `pool_size` - Number of executors to create (typically CPU count)
     pub async fn new(
         config: Arc<Config>,
-        event_loop_channel: ExecutorToEventLoopChannel<ExecutorHalve>,
+        op_sender: OpRequestSender,
+        op_manager: Arc<OpManager>,
         pool_size: NonZeroUsize,
     ) -> anyhow::Result<Self> {
         let pool_size_usize: usize = pool_size.into();
         let mut runtimes = Vec::with_capacity(pool_size_usize);
 
-        // Create the first executor with the event loop channel
-        // Note: Currently only the first executor gets the channel since
-        // we can't clone ExecutorToEventLoopChannel. This is a limitation
-        // we'll address when moving to the dedicated thread pool architecture.
-        let first_executor =
-            Executor::from_config(config.clone(), Some(event_loop_channel)).await?;
-        runtimes.push(Some(first_executor));
-
-        // Create remaining executors without event loop channels
-        // They share the same storage via config
-        for _ in 1..pool_size_usize {
-            let executor = Executor::from_config(config.clone(), None).await?;
+        // Create all executors with clones of op_sender and op_manager
+        // Each executor can independently send requests to the event loop
+        for _ in 0..pool_size_usize {
+            let executor = Executor::from_config(
+                config.clone(),
+                Some(op_sender.clone()),
+                Some(op_manager.clone()),
+            )
+            .await?;
             runtimes.push(Some(executor));
         }
 
@@ -82,6 +85,8 @@ impl RuntimePool {
             runtimes,
             available: Semaphore::new(pool_size_usize),
             config,
+            op_sender,
+            op_manager,
         })
     }
 
@@ -131,13 +136,12 @@ impl RuntimePool {
     /// Create a new executor to replace a broken one.
     async fn create_replacement_executor(&self) -> anyhow::Result<Executor<Runtime>> {
         tracing::warn!("Creating replacement executor due to previous failure");
-        Executor::from_config(self.config.clone(), None).await
-    }
-
-    /// Get the number of currently available executors.
-    #[allow(dead_code)]
-    pub fn available_executors(&self) -> usize {
-        self.available.available_permits()
+        Executor::from_config(
+            self.config.clone(),
+            Some(self.op_sender.clone()),
+            Some(self.op_manager.clone()),
+        )
+        .await
     }
 }
 
@@ -853,9 +857,18 @@ impl Executor<Runtime> {
 }
 
 impl Executor<Runtime> {
-    pub async fn from_config(
+    /// Create an Executor for local-only mode (no network operations).
+    /// Use this from the binary for local mode execution.
+    pub async fn from_config_local(config: Arc<Config>) -> anyhow::Result<Self> {
+        Self::from_config(config, None, None).await
+    }
+
+    /// Create an Executor with optional network operation support.
+    /// This is `pub(crate)` because the parameters involve crate-internal types.
+    pub(crate) async fn from_config(
         config: Arc<Config>,
-        event_loop_channel: Option<ExecutorToEventLoopChannel<ExecutorHalve>>,
+        op_sender: Option<OpRequestSender>,
+        op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
@@ -871,7 +884,8 @@ impl Executor<Runtime> {
             },
             OperationMode::Local,
             rt,
-            event_loop_channel,
+            op_sender,
+            op_manager,
         )
         .await
     }

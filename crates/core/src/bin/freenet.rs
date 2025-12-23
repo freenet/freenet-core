@@ -65,7 +65,7 @@ async fn run_local(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in local mode");
     let socket = config.ws_api;
 
-    let executor = Executor::from_config(Arc::new(config), None)
+    let executor = Executor::from_config_local(Arc::new(config))
         .await
         .map_err(anyhow::Error::msg)?;
 

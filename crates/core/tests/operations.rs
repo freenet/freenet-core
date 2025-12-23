@@ -18,7 +18,7 @@ use freenet_stdlib::{
 };
 use futures::FutureExt;
 use rand::{random, Rng, SeedableRng};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
@@ -1991,7 +1991,6 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
     }
 
     // Create message for the delegate
-    use serde::{Deserialize, Serialize};
     #[derive(Debug, Serialize, Deserialize)]
     enum InboundAppMessage {
         TestRequest(String),
