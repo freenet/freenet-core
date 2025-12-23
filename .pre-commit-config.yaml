@@ -13,10 +13,16 @@ repos:
         description: Run cargo fmt on Rust code
         args: ['--all', '--', '--check']
 
+  # Custom clippy hook that only runs on packages with changed files
+  - repo: local
+    hooks:
       - id: clippy
         name: cargo clippy
-        description: Run cargo clippy for Rust linting
-        args: ['--all-targets', '--all-features', '--', '-D', 'warnings']
+        description: Run cargo clippy only on packages with changed files
+        entry: scripts/pre-commit-clippy.sh
+        language: script
+        pass_filenames: false
+        stages: [pre-commit]
 
   # Check for TODO-MUST-FIX markers
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -36,12 +42,12 @@ repos:
         name: Trim trailing whitespace
         args: [--markdown-linebreak-ext=md]
 
-  # Custom hook for TODO-MUST-FIX detection
+  # Custom hook to detect TODO-MUST-FIX markers in code (not config files)
   - repo: local
     hooks:
       - id: todo-must-fix
         name: Check for TODO-MUST-FIX markers
-        entry: bash -c 'if git diff --cached | grep -i "TODO-MUST-FIX"; then echo "❌ Found TODO-MUST-FIX in staged changes. Please fix before committing."; exit 1; fi'
+        entry: bash -c 'if git diff --cached -- "*.rs" "*.ts" "*.js" "*.py" | grep -i "TODO-MUST-FIX"; then echo "❌ Found TODO-MUST-FIX in staged changes. Please fix before committing."; exit 1; fi'
         language: system
         pass_filenames: false
         stages: [pre-commit]
