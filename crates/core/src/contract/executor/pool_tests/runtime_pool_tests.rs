@@ -263,11 +263,10 @@ async fn test_unhealthy_executor_detected() {
 async fn test_health_check_and_replace_pattern() {
     let mut pool = MockPool::new(2);
 
-    // Borrow executor, mark unhealthy, create replacement
-    let mut executor = pool.pop_executor().await;
-    executor.healthy = false;
+    // Borrow executor - in real code we'd detect it's unhealthy and discard it
+    let _broken_executor = pool.pop_executor().await;
 
-    // Simulate replacement: create new healthy executor
+    // Simulate replacement: create new healthy executor to return instead
     let replacement = MockExecutor {
         id: 100, // New ID
         healthy: true,
