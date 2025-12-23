@@ -385,11 +385,16 @@ impl ContractExecutor for RuntimePool {
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
-        // Collect subscription info from all executors
+        // Collect subscription info from all executors, deduplicating by (instance_id, client_id).
+        // Subscriptions are intentionally registered with ALL executors to ensure notifications
+        // work regardless of which executor handles subsequent operations, but we only want to
+        // report each unique subscription once.
+        let mut seen = std::collections::HashSet::new();
         self.runtimes
             .iter()
             .flatten()
             .flat_map(|executor| executor.get_subscription_info())
+            .filter(|sub| seen.insert((sub.instance_id, sub.client_id)))
             .collect()
     }
 }
