@@ -362,10 +362,22 @@ fn execute_wasm_blocking<F>(
 where
     F: FnOnce(&mut Store) -> Result<i64, wasmer::RuntimeError> + Send + 'static,
 {
-    // Use block_on to run async code from sync context.
-    // This is safe because we're on a blocking thread pool thread, not a tokio worker.
-    tokio::runtime::Handle::current()
-        .block_on(async { execute_wasm_async(store, wasm_call, timeout, operation).await })
+    // Try to get existing runtime handle, or create a temporary one for tests
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // We have a runtime - use it
+            handle
+                .block_on(async { execute_wasm_async(store, wasm_call, timeout, operation).await })
+        }
+        Err(_) => {
+            // No runtime (likely in tests) - create a temporary one
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create tokio runtime for WASM execution");
+            rt.block_on(async { execute_wasm_async(store, wasm_call, timeout, operation).await })
+        }
+    }
 }
 
 /// Async implementation of WASM execution.
