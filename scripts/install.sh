@@ -257,11 +257,24 @@ main() {
         fi
     fi
 
-    # Install binaries
+    # Verify extracted binaries exist
+    if [ ! -f "$tmp_dir/freenet" ]; then
+        error "Failed to extract freenet binary from archive"
+    fi
+    if [ ! -f "$tmp_dir/fdev" ]; then
+        error "Failed to extract fdev binary from archive"
+    fi
+
+    # Install binaries (all paths quoted for safety with spaces/special chars)
     info "Installing to $install_dir..."
-    mv "$tmp_dir/freenet" "$install_dir/freenet"
-    mv "$tmp_dir/fdev" "$install_dir/fdev"
+    mv -- "$tmp_dir/freenet" "$install_dir/freenet"
+    mv -- "$tmp_dir/fdev" "$install_dir/fdev"
     chmod +x "$install_dir/freenet" "$install_dir/fdev"
+
+    # Verify the installed binary works
+    if ! "$install_dir/freenet" --version >/dev/null 2>&1; then
+        error "Installed binary verification failed. The binary may be corrupted or incompatible with your system."
+    fi
 
     success "Freenet $version installed successfully!"
     echo ""

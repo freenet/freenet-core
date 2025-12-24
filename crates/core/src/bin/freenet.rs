@@ -241,7 +241,13 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     freenet::config::set_logger(None, None);
 
     if config_args.version {
-        println!("Freenet version: {}", config_args.current_version());
+        println!(
+            "Freenet version: {} ({}{})",
+            config_args.current_version(),
+            build_info::GIT_COMMIT,
+            build_info::GIT_DIRTY
+        );
+        println!("Build timestamp: {}", build_info::BUILD_TIMESTAMP);
         return Ok(());
     }
 

@@ -2,9 +2,11 @@
 
 use anyhow::{Context, Result};
 use clap::Args;
+use semver::Version;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
 
@@ -34,13 +36,19 @@ impl UpdateCommand {
         let latest_version = latest.tag_name.trim_start_matches('v');
         println!("Latest version: {}", latest_version);
 
-        if !self.force && latest_version == current_version {
+        // Use semver for proper version comparison
+        let current_ver =
+            Version::parse(current_version).context("Failed to parse current version as semver")?;
+        let latest_ver =
+            Version::parse(latest_version).context("Failed to parse latest version as semver")?;
+
+        if !self.force && latest_ver <= current_ver {
             println!("You are already running the latest version.");
             return Ok(());
         }
 
         if self.check {
-            if latest_version != current_version {
+            if latest_ver > current_ver {
                 println!(
                     "Update available: {} -> {}",
                     current_version, latest_version
@@ -209,12 +217,13 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
 
         if total_size > 0 {
             let progress = (downloaded as f64 / total_size as f64 * 100.0) as u32;
-            print!("\rDownloading... {}%", progress);
+            // Use ANSI escape to clear to end of line for clean output
+            print!("\rDownloading... {}%\x1b[K", progress);
             io::stdout().flush()?;
         }
     }
 
-    println!("\rDownload complete.     ");
+    println!("\rDownload complete.\x1b[K");
     Ok(())
 }
 
@@ -223,47 +232,149 @@ fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
 
-    archive
-        .unpack(dest_dir)
-        .context("Failed to extract archive")?;
+    // Extract with path traversal protection
+    let dest_dir_canonical = dest_dir
+        .canonicalize()
+        .context("Failed to canonicalize dest dir")?;
+
+    for entry in archive
+        .entries()
+        .context("Failed to read archive entries")?
+    {
+        let mut entry = entry.context("Failed to read archive entry")?;
+        let path = entry.path().context("Failed to get entry path")?;
+
+        // Security: Prevent path traversal attacks by ensuring extracted path is within dest_dir
+        let entry_dest = dest_dir.join(&path);
+        let entry_canonical = entry_dest
+            .canonicalize()
+            .unwrap_or_else(|_| entry_dest.clone());
+
+        // For new files, check parent directory is within dest_dir
+        let check_path = if entry_canonical.exists() {
+            entry_canonical.clone()
+        } else {
+            entry_dest
+                .parent()
+                .and_then(|p| p.canonicalize().ok())
+                .unwrap_or_else(|| dest_dir_canonical.clone())
+        };
+
+        if !check_path.starts_with(&dest_dir_canonical) {
+            anyhow::bail!(
+                "Security error: archive contains path traversal attempt: {}",
+                path.display()
+            );
+        }
+
+        entry
+            .unpack_in(dest_dir)
+            .context("Failed to extract entry")?;
+    }
 
     let binary_path = dest_dir.join("freenet");
     if !binary_path.exists() {
         anyhow::bail!("Binary not found in archive");
     }
 
+    // Verify the binary is executable and works
+    verify_binary(&binary_path)?;
+
     Ok(binary_path)
+}
+
+fn verify_binary(binary_path: &Path) -> Result<()> {
+    // Set executable permissions first
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(binary_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(binary_path, perms)?;
+    }
+
+    // Run --version to verify the binary works
+    let output = Command::new(binary_path)
+        .arg("--version")
+        .output()
+        .context("Failed to execute downloaded binary for verification")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Downloaded binary failed verification (--version check failed). \
+             This could indicate a corrupted download or wrong architecture."
+        );
+    }
+
+    // Verify output contains expected version format
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("Freenet") && !stdout.contains("freenet") {
+        anyhow::bail!(
+            "Downloaded binary doesn't appear to be Freenet. \
+             Got: {}",
+            stdout.trim()
+        );
+    }
+
+    Ok(())
 }
 
 fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
     // On Unix, we can't directly replace a running binary, but we can rename it
     let backup_path = current_exe.with_extension("old");
+    let parent_dir = current_exe
+        .parent()
+        .context("Current executable has no parent directory")?;
 
     // Remove old backup if it exists
-    let _ = fs::remove_file(&backup_path);
-
-    // Rename current to backup
-    fs::rename(current_exe, &backup_path)
-        .context("Failed to backup current binary. You may need to run with sudo.")?;
-
-    // Copy new binary to location
-    if let Err(e) = fs::copy(new_binary, current_exe) {
-        // Try to restore backup
-        let _ = fs::rename(&backup_path, current_exe);
-        return Err(e).context("Failed to install new binary");
+    if backup_path.exists() {
+        fs::remove_file(&backup_path).context("Failed to remove old backup")?;
     }
 
-    // Set executable permissions
+    // First, copy new binary to a temp location in the same directory
+    // This ensures the rename will be atomic (same filesystem)
+    let temp_new = parent_dir.join(".freenet.new.tmp");
+    fs::copy(new_binary, &temp_new).context("Failed to copy new binary to target directory")?;
+
+    // Set executable permissions on temp file
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(current_exe)?.permissions();
+        let mut perms = fs::metadata(&temp_new)?.permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(current_exe, perms)?;
+        fs::set_permissions(&temp_new, perms)?;
     }
 
-    // Remove backup
-    let _ = fs::remove_file(&backup_path);
+    // Rename current to backup (atomic on Unix)
+    fs::rename(current_exe, &backup_path)
+        .context("Failed to backup current binary. You may need to run with sudo.")?;
+
+    // Rename temp to current (atomic on Unix)
+    if let Err(e) = fs::rename(&temp_new, current_exe) {
+        // Try to restore backup
+        if let Err(restore_err) = fs::rename(&backup_path, current_exe) {
+            // Critical: rollback failed, system may be in broken state
+            eprintln!(
+                "CRITICAL: Failed to restore backup after update failure. \
+                 Original binary may be at: {}",
+                backup_path.display()
+            );
+            eprintln!("Restore error: {}", restore_err);
+        }
+        // Clean up temp file
+        let _ = fs::remove_file(&temp_new);
+        return Err(e).context("Failed to install new binary");
+    }
+
+    // Remove backup on success
+    if let Err(e) = fs::remove_file(&backup_path) {
+        // Non-fatal: warn but don't fail
+        eprintln!(
+            "Warning: Failed to remove backup file {}: {}",
+            backup_path.display(),
+            e
+        );
+    }
 
     Ok(())
 }

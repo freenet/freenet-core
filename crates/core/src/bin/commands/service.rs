@@ -96,12 +96,21 @@ Wants=network-online.target
 Type=simple
 ExecStart={} network
 Restart=on-failure
+# Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
 
 # Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=freenet
+
+# Resource limits to prevent runaway resource consumption
+# File descriptors needed for network connections
+LimitNOFILE=65536
+# Memory limit (2GB soft limit for user service)
+MemoryMax=2G
+# CPU quota (200% = 2 cores max)
+CPUQuota=200%
 
 [Install]
 WantedBy=default.target
@@ -207,13 +216,16 @@ fn install_service() -> Result<()> {
     use std::fs;
 
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
-    let launch_agents_dir = dirs::home_dir()
-        .context("Failed to get home directory")?
-        .join("Library/LaunchAgents");
+    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
 
+    let launch_agents_dir = home_dir.join("Library/LaunchAgents");
     fs::create_dir_all(&launch_agents_dir).context("Failed to create LaunchAgents directory")?;
 
-    let plist_content = generate_plist(&exe_path);
+    // Create log directory in proper macOS location
+    let log_dir = home_dir.join("Library/Logs/freenet");
+    fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+
+    let plist_content = generate_plist(&exe_path, &log_dir);
     let plist_path = launch_agents_dir.join("org.freenet.node.plist");
 
     fs::write(&plist_path, plist_content).context("Failed to write plist file")?;
@@ -224,12 +236,13 @@ fn install_service() -> Result<()> {
     println!("  freenet service start");
     println!();
     println!("The service will start automatically on login.");
+    println!("Logs will be written to: {}", log_dir.display());
 
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn generate_plist(binary_path: &Path) -> String {
+fn generate_plist(binary_path: &Path, log_dir: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -239,7 +252,7 @@ fn generate_plist(binary_path: &Path) -> String {
     <string>org.freenet.node</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{}</string>
+        <string>{binary}</string>
         <string>network</string>
     </array>
     <key>RunAtLoad</key>
@@ -250,13 +263,24 @@ fn generate_plist(binary_path: &Path) -> String {
         <false/>
     </dict>
     <key>StandardOutPath</key>
-    <string>/tmp/freenet.log</string>
+    <string>{log_dir}/freenet.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/freenet.error.log</string>
+    <string>{log_dir}/freenet.error.log</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
 </dict>
 </plist>
 "#,
-        binary_path.display()
+        binary = binary_path.display(),
+        log_dir = log_dir.display()
     )
 }
 
@@ -268,10 +292,17 @@ fn uninstall_service() -> Result<()> {
         .context("Failed to get home directory")?
         .join("Library/LaunchAgents/org.freenet.node.plist");
 
-    // Unload the service if loaded
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", plist_path.to_str().unwrap_or_default()])
+    let plist_path_str = plist_path
+        .to_str()
+        .context("Plist path contains invalid UTF-8")?;
+
+    // Unload the service if loaded (ignore errors as it may not be loaded)
+    let unload_status = std::process::Command::new("launchctl")
+        .args(["unload", plist_path_str])
         .status();
+    if let Err(e) = unload_status {
+        eprintln!("Warning: Failed to unload service: {}", e);
+    }
 
     // Remove the plist file
     if plist_path.exists() {
@@ -313,8 +344,12 @@ fn start_service() -> Result<()> {
         anyhow::bail!("Service not installed. Run 'freenet service install' first.");
     }
 
+    let plist_path_str = plist_path
+        .to_str()
+        .context("Plist path contains invalid UTF-8")?;
+
     let status = std::process::Command::new("launchctl")
-        .args(["load", plist_path.to_str().unwrap_or_default()])
+        .args(["load", plist_path_str])
         .status()
         .context("Failed to start service")?;
 
@@ -333,8 +368,12 @@ fn stop_service() -> Result<()> {
         .context("Failed to get home directory")?
         .join("Library/LaunchAgents/org.freenet.node.plist");
 
+    let plist_path_str = plist_path
+        .to_str()
+        .context("Plist path contains invalid UTF-8")?;
+
     let status = std::process::Command::new("launchctl")
-        .args(["unload", plist_path.to_str().unwrap_or_default()])
+        .args(["unload", plist_path_str])
         .status()
         .context("Failed to stop service")?;
 
