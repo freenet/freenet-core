@@ -37,7 +37,9 @@ ctrlc = { features = ["termination"], workspace = true }
 dashmap = { workspace = true }
 delegate = "0.13"
 directories = "6"
+dirs = "6"
 either = { features = ["serde"], workspace = true }
+flate2 = "1"
 flatbuffers = "25.9"
 futures = "0.3"
 semver = { version = "1",  features = ["serde"] }
@@ -58,6 +60,7 @@ serde_with = { workspace = true }
 sqlx = { features = ["runtime-tokio-rustls", "sqlite"], optional = true, version = "0.8" }
 stretto = { features = ["async", "sync"], version = "0.8" }
 tar = { version = "0.4" }
+tempfile = "3"
 thiserror = "2"
 tokio = { features = ["fs", "macros", "rt-multi-thread", "sync", "process", "tracing"], version = "1" }
 tokio-tungstenite = "0.27.0"
@@ -67,7 +70,7 @@ wasmer = { features = ["sys"], workspace = true }
 wasmer-middlewares = "6.1.0"
 wasmer-compiler-singlepass = { workspace = true }
 xz2 = { version = "0.1" }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 rsa = { version = "0.9", features = ["serde", "pem"] }
 pkcs8 = { version = "0.10", features = ["std", "pem"] }
 sha2 = "0.10"
@@ -97,6 +100,7 @@ libc = "0.2"  # For sendmmsg syscall batching on Linux
 winapi = { version = "0.3", features = ["sysinfoapi"] }
 wmi = "0.18.0"
 serde = { version = "1.0", features = ["derive"] }
+zip = "7"
 
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }

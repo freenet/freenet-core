@@ -1,5 +1,5 @@
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use freenet::{
     config::{Config, ConfigArgs},
     local_node::{Executor, NodeConfig, OperationMode},
@@ -8,6 +8,40 @@ use freenet::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
+
+mod commands;
+use commands::{service::ServiceCommand, update::UpdateCommand};
+
+/// Freenet - A distributed, decentralized, and censorship-resistant platform
+#[derive(Parser, Debug)]
+#[command(name = "freenet")]
+#[command(about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    config: ConfigArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the node in network mode (default if no subcommand specified)
+    Network {
+        #[command(flatten)]
+        config: ConfigArgs,
+    },
+    /// Run the node in local mode
+    Local {
+        #[command(flatten)]
+        config: ConfigArgs,
+    },
+    /// Manage the Freenet system service
+    #[command(subcommand)]
+    Service(ServiceCommand),
+    /// Update Freenet to the latest version
+    Update(UpdateCommand),
+}
 
 /// Thread info for diagnostics
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -18,6 +52,7 @@ struct ThreadInfo {
 
 /// Get all tokio runtime threads with their TIDs and names
 /// Looks for both "freenet-main" (our main runtime) and "tokio-runtime" (rogue runtimes)
+#[cfg(target_os = "linux")]
 fn get_tokio_threads() -> Vec<ThreadInfo> {
     let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
         return Vec::new();
@@ -36,6 +71,11 @@ fn get_tokio_threads() -> Vec<ThreadInfo> {
             }
         })
         .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_tokio_threads() -> Vec<ThreadInfo> {
+    Vec::new()
 }
 
 /// Build metadata embedded at compile time
@@ -197,14 +237,17 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     run_network_node(node).await
 }
 
-fn main() -> anyhow::Result<()> {
+fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     freenet::config::set_logger(None, None);
 
-    // Parse args first to get max_blocking_threads for runtime configuration
-    let config_args = ConfigArgs::parse();
-
     if config_args.version {
-        println!("Freenet version: {}", config_args.current_version());
+        println!(
+            "Freenet version: {} ({}{})",
+            config_args.current_version(),
+            build_info::GIT_COMMIT,
+            build_info::GIT_DIRTY
+        );
+        println!("Build timestamp: {}", build_info::BUILD_TIMESTAMP);
         return Ok(());
     }
 
@@ -239,4 +282,25 @@ fn main() -> anyhow::Result<()> {
         run(config).await
     })?;
     Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Service(cmd)) => cmd.run(),
+        Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
+        Some(Command::Network { mut config }) => {
+            config.mode = Some(OperationMode::Network);
+            run_node(config)
+        }
+        Some(Command::Local { mut config }) => {
+            config.mode = Some(OperationMode::Local);
+            run_node(config)
+        }
+        None => {
+            // Default behavior: run with the config from top-level args
+            run_node(cli.config)
+        }
+    }
 }
