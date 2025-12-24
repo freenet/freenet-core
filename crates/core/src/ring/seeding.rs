@@ -247,17 +247,39 @@ impl SeedingManager {
             .unwrap_or(false)
     }
 
-    /// Get all contracts that we're seeding but don't have an upstream subscription for.
+    /// Get all contracts that we're seeding but don't have an upstream subscription for,
+    /// AND where we have active interest (local client subscriptions or downstream peers).
+    ///
     /// These are contracts where we may be "isolated" from the subscription tree and
     /// should attempt to establish an upstream connection when possible.
+    ///
+    /// IMPORTANT: We only want to re-subscribe if we have active interest. If a client
+    /// disconnects and pruning occurs, we should NOT try to re-subscribe just because
+    /// the contract is still in our cache.
     pub fn contracts_without_upstream(&self) -> Vec<ContractKey> {
         // Get all contracts we're seeding from the cache
         let seeded_contracts: Vec<ContractKey> = self.seeding_cache.read().iter().collect();
 
-        // Filter to only those without upstream
+        // Filter to contracts that:
+        // 1. Don't have an upstream subscription
+        // 2. Have active interest (local clients OR downstream peers)
         seeded_contracts
             .into_iter()
-            .filter(|key| !self.has_upstream(key))
+            .filter(|key| {
+                if self.has_upstream(key) {
+                    return false; // Already has upstream
+                }
+
+                // Check for active interest
+                let has_clients = self.has_client_subscriptions(key.id());
+                let has_downstream = self
+                    .subscriptions
+                    .get(key)
+                    .map(|subs| subs.iter().any(|e| e.role == SubscriberType::Downstream))
+                    .unwrap_or(false);
+
+                has_clients || has_downstream
+            })
             .collect()
     }
 
