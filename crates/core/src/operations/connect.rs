@@ -105,7 +105,7 @@ use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::{ConnectionError, IsOperationCompleted, NetworkBridge, OpManager};
 use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
-use crate::ring::{PeerAddr, PeerKeyLocation};
+use crate::ring::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use crate::transport::TransportKeypair;
 use crate::util::{Backoff, Contains, IterExt};
@@ -237,7 +237,10 @@ pub(crate) trait RelayContext {
     fn self_location(&self) -> &PeerKeyLocation;
 
     /// Determine whether we should accept the joiner immediately.
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool;
+    ///
+    /// Takes a `KnownPeerKeyLocation` to enforce at compile time that the joiner's
+    /// address must be known before acceptance decisions can be made.
+    fn should_accept(&self, joiner: &KnownPeerKeyLocation) -> bool;
 
     /// Choose the next hop for the request, avoiding peers already visited.
     fn select_next_hop(
@@ -432,10 +435,14 @@ impl RelayState {
         // we're committed to that path and should not also accept. This prevents
         // the "double-accept" bug where a retry call could trigger acceptance
         // after we've already forwarded the request elsewhere.
+        //
+        // The joiner must have a known address by this point (filled in by first relay).
+        // If conversion fails, we cannot accept - the joiner's address is still unknown.
+        let joiner_known = KnownPeerKeyLocation::try_from(&self.request.joiner).ok();
         if is_terminus
             && !self.accepted_locally
             && self.forwarded_to.is_none()
-            && ctx.should_accept(&self.request.joiner)
+            && joiner_known.as_ref().is_some_and(|j| ctx.should_accept(j))
         {
             self.accepted_locally = true;
             // Use unknown address for the acceptor - the acceptor doesn't know their own
@@ -497,13 +504,9 @@ impl RelayContext for RelayEnv<'_> {
         &self.self_location
     }
 
-    fn should_accept(&self, joiner: &PeerKeyLocation) -> bool {
-        let addr = joiner
-            .socket_addr()
-            .expect("joiner must have address to determine should_accept");
-        let location = joiner
-            .location()
-            .unwrap_or_else(|| Location::from_address(&addr));
+    fn should_accept(&self, joiner: &KnownPeerKeyLocation) -> bool {
+        let addr = joiner.socket_addr();
+        let location = joiner.location();
         self.op_manager
             .ring
             .connection_manager
@@ -1604,7 +1607,7 @@ mod tests {
             &self.self_loc
         }
 
-        fn should_accept(&self, _joiner: &PeerKeyLocation) -> bool {
+        fn should_accept(&self, _joiner: &KnownPeerKeyLocation) -> bool {
             self.accept
         }
 

@@ -7,7 +7,7 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
 use crate::node::IsOperationCompleted;
-use crate::ring::{Location, PeerKeyLocation, RingError};
+use crate::ring::{KnownPeerKeyLocation, Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager},
@@ -255,9 +255,10 @@ impl Operation for UpdateOp {
                                 return_msg = None;
                             } else {
                                 // Get broadcast targets for propagating UPDATE to subscribers
-                                let sender_addr = request_sender.socket_addr().expect(
-                                    "request_sender must have socket address for broadcast",
-                                );
+                                // Convert to KnownPeerKeyLocation for compile-time address guarantee
+                                let sender_known = KnownPeerKeyLocation::try_from(&request_sender)
+                                    .map_err(|_| OpError::invalid_transition(*id))?;
+                                let sender_addr = sender_known.socket_addr();
                                 let broadcast_to =
                                     op_manager.get_broadcast_targets_update(key, &sender_addr);
 
