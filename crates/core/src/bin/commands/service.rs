@@ -1,8 +1,8 @@
-//! System service management for Freenet.
+//! User service management for Freenet.
 //!
 //! Supports:
-//! - Linux: systemd user service
-//! - macOS: launchd user agent
+//! - Linux: systemd user service (~/.config/systemd/user/)
+//! - macOS: launchd user agent (~/Library/LaunchAgents/)
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -10,9 +10,9 @@ use std::path::Path;
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum ServiceCommand {
-    /// Install Freenet as a system service
+    /// Install Freenet as a user service (auto-starts on login)
     Install,
-    /// Uninstall the Freenet system service
+    /// Uninstall the Freenet user service
     Uninstall,
     /// Check the status of the Freenet service
     Status,
