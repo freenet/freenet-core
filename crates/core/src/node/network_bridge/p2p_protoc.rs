@@ -2320,6 +2320,64 @@ impl P2pConnManager {
                     .ring
                     .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
                     .await;
+
+                // Check if new peer is closer to any contracts we're seeding without upstream.
+                // If so, attempt to subscribe through them to join the subscription tree.
+                let our_loc = connection_manager.own_location();
+                if let Some(our_location) = our_loc.location() {
+                    let ring = &self.bridge.op_manager.ring;
+                    let contracts_without_upstream = ring.contracts_without_upstream();
+
+                    for contract in contracts_without_upstream {
+                        let contract_location = Location::from(&contract);
+                        let our_distance = our_location.distance(contract_location);
+                        let peer_distance = loc.distance(contract_location);
+
+                        // New peer is closer to contract - they might be upstream
+                        if peer_distance < our_distance {
+                            // Check spam prevention
+                            if ring.can_request_subscription(&contract) {
+                                tracing::info!(
+                                    %contract,
+                                    %peer_addr,
+                                    peer_distance = %peer_distance,
+                                    our_distance = %our_distance,
+                                    "New peer closer to contract, attempting subscription"
+                                );
+
+                                // Mark as pending and spawn subscription request
+                                if ring.mark_subscription_pending(contract) {
+                                    let op_manager = self.bridge.op_manager.clone();
+                                    let contract_key = contract;
+                                    tokio::spawn(async move {
+                                        let instance_id = *contract_key.id();
+                                        let sub_op =
+                                            crate::operations::subscribe::start_op(instance_id);
+                                        let result =
+                                            crate::operations::subscribe::request_subscribe(
+                                                &op_manager,
+                                                sub_op,
+                                            )
+                                            .await;
+
+                                        let success = result.is_ok();
+                                        if let Err(ref e) = result {
+                                            tracing::warn!(
+                                                %contract_key,
+                                                error = %e,
+                                                "Failed to re-establish subscription on peer connect"
+                                            );
+                                        }
+                                        op_manager
+                                            .ring
+                                            .complete_subscription_request(&contract_key, success);
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if is_transient {
                     connection_manager.drop_transient(peer_addr);
                 }

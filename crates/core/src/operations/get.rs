@@ -25,6 +25,11 @@ const MAX_RETRIES: usize = 10;
 /// Maximum number of peer attempts at each hop level
 const DEFAULT_MAX_BREADTH: usize = 3;
 
+/// Minimum number of peers that must return NotFound before we consider
+/// re-seeding the network with our local cache. This prevents spurious
+/// re-seeding from transient routing issues.
+const MIN_PEERS_FOR_RESEED: usize = 2;
+
 pub(crate) fn start_op(
     instance_id: ContractInstanceId,
     fetch_contract: bool,
@@ -50,6 +55,7 @@ pub(crate) fn start_op(
             first_response_time: None,
         })),
         upstream_addr: None, // Local operation, no upstream peer
+        local_fallback: None,
     }
 }
 
@@ -79,6 +85,7 @@ pub(crate) fn start_op_with_id(
             first_response_time: None,
         })),
         upstream_addr: None, // Local operation, no upstream peer
+        local_fallback: None,
     }
 }
 
@@ -88,23 +95,23 @@ pub(crate) async fn request_get(
     get_op: GetOp,
     skip_list: HashSet<std::net::SocketAddr>,
 ) -> Result<(), OpError> {
-    let (mut candidates, id, instance_id_val, _fetch_contract) = if let Some(
+    let (mut candidates, id, instance_id_val, _fetch_contract, local_fallback) = if let Some(
         GetState::PrepareRequest {
             instance_id,
             id,
             fetch_contract,
             ..
         },
-    ) = &get_op.state
+    ) =
+        &get_op.state
     {
-        // CRITICAL: Always check local storage FIRST before querying peers.
-        // This ensures that if a contract was just PUT to this node, a subsequent
-        // GET from the same node will find it immediately rather than forwarding
-        // to peers who don't have it yet.
+        // Check local storage to have a fallback, but prefer network for freshness.
+        // This implements "network first, local fallback" to ensure we get the latest
+        // version of contracts rather than serving potentially stale cached data.
         tracing::debug!(
             tx = %id,
             %instance_id,
-            "GET: Checking local storage first before peer lookup"
+            "GET: Checking local storage for fallback before network query"
         );
 
         let get_result = op_manager
@@ -137,32 +144,7 @@ pub(crate) async fn request_get(
             _ => None,
         };
 
-        if let Some((key, state, contract)) = local_value {
-            // Contract found locally - complete the operation immediately
-            tracing::info!(
-                tx = %id,
-                contract = %key,
-                phase = "complete",
-                "GET: contract found locally, returning immediately"
-            );
-
-            let completed_op = GetOp {
-                id: *id,
-                state: Some(GetState::Finished { key }),
-                result: Some(GetResult {
-                    key,
-                    state,
-                    contract,
-                }),
-                stats: get_op.stats,
-                upstream_addr: get_op.upstream_addr,
-            };
-
-            op_manager.push(*id, OpEnum::Get(completed_op)).await?;
-            return Ok(());
-        }
-
-        // Contract not found locally - find peers to query
+        // Find peers to query - we prefer network over local cache for freshness
         let candidates = op_manager.ring.k_closest_potentially_caching(
             instance_id,
             &skip_list,
@@ -170,7 +152,33 @@ pub(crate) async fn request_get(
         );
 
         if candidates.is_empty() {
-            // No peers available and contract not found locally
+            // No peers available - use local cache if we have it
+            if let Some((key, state, contract)) = local_value {
+                tracing::info!(
+                    tx = %id,
+                    contract = %key,
+                    phase = "complete",
+                    "GET: No peers available, returning local cache"
+                );
+
+                let completed_op = GetOp {
+                    id: *id,
+                    state: Some(GetState::Finished { key }),
+                    result: Some(GetResult {
+                        key,
+                        state,
+                        contract,
+                    }),
+                    stats: get_op.stats,
+                    upstream_addr: get_op.upstream_addr,
+                    local_fallback: None,
+                };
+
+                op_manager.push(*id, OpEnum::Get(completed_op)).await?;
+                return Ok(());
+            }
+
+            // No peers AND no local cache - error
             tracing::warn!(
                 tx = %id,
                 contract = %instance_id,
@@ -180,15 +188,26 @@ pub(crate) async fn request_get(
             return Err(RingError::EmptyRing.into());
         }
 
-        tracing::debug!(
-            tx = %id,
-            %instance_id,
-            peer_count = candidates.len(),
-            "GET: Contract not found locally, will query {} peer(s)",
-            candidates.len()
-        );
+        // Peers available - query network, keep local as fallback
+        if local_value.is_some() {
+            tracing::debug!(
+                tx = %id,
+                %instance_id,
+                peer_count = candidates.len(),
+                "GET: Have local cache, querying {} peer(s) for fresh version",
+                candidates.len()
+            );
+        } else {
+            tracing::debug!(
+                tx = %id,
+                %instance_id,
+                peer_count = candidates.len(),
+                "GET: No local cache, querying {} peer(s)",
+                candidates.len()
+            );
+        }
 
-        (candidates, *id, *instance_id, *fetch_contract)
+        (candidates, *id, *instance_id, *fetch_contract, local_value)
     } else {
         return Err(OpError::UnexpectedOpState);
     };
@@ -244,6 +263,7 @@ pub(crate) async fn request_get(
                     s
                 }),
                 upstream_addr: get_op.upstream_addr,
+                local_fallback, // Store local cache for fallback if network returns NotFound
             };
 
             op_manager
@@ -362,6 +382,10 @@ pub(crate) struct GetOp {
     /// The address we received this operation's message from.
     /// Used for connection-based routing: responses are sent back to this address.
     upstream_addr: Option<std::net::SocketAddr>,
+    /// Local cached state to fall back to if network query fails or returns NotFound.
+    /// This enables "network first, local fallback" behavior to ensure we get fresh data
+    /// while still being able to serve cached content when the network is unavailable.
+    local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
 }
 
 impl GetOp {
@@ -460,6 +484,7 @@ impl GetOp {
                     result: None,
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
+                    local_fallback: self.local_fallback,
                 };
 
                 op_manager
@@ -522,6 +547,7 @@ impl GetOp {
                         result: None,
                         stats: self.stats,
                         upstream_addr: self.upstream_addr,
+                        local_fallback: self.local_fallback,
                     };
 
                     op_manager
@@ -531,7 +557,34 @@ impl GetOp {
                 }
             }
 
-            // No alternatives and no new candidates - give up
+            // No alternatives and no new candidates - check for local fallback
+            // If we have a local cache, use it instead of failing entirely
+            if let Some((key, state, contract)) = self.local_fallback {
+                tracing::info!(
+                    tx = %self.id,
+                    contract = %key,
+                    phase = "complete",
+                    "GET: Connection aborted, no peers available - returning local cache"
+                );
+
+                let completed_op = GetOp {
+                    id: self.id,
+                    state: Some(GetState::Finished { key }),
+                    result: Some(GetResult {
+                        key,
+                        state,
+                        contract,
+                    }),
+                    stats: self.stats,
+                    upstream_addr: self.upstream_addr,
+                    local_fallback: None,
+                };
+
+                op_manager.push(self.id, OpEnum::Get(completed_op)).await?;
+                return Ok(());
+            }
+
+            // No local fallback either - give up
             // If we have an upstream requester, they will timeout and retry
             // If this is the original requester, the operation will be marked as failed
             tracing::warn!(
@@ -547,6 +600,7 @@ impl GetOp {
                 result: None,
                 stats: self.stats,
                 upstream_addr: self.upstream_addr,
+                local_fallback: None,
             };
             op_manager.push(self.id, OpEnum::Get(failed_op)).await?;
             return Ok(());
@@ -631,6 +685,7 @@ impl Operation for GetOp {
                         result: None,
                         stats: None, // don't care about stats in target peers
                         upstream_addr: source_addr, // Connection-based routing: store who sent us this request
+                        local_fallback: None,       // Remote requests don't have local fallback
                     },
                     source_addr,
                 })
@@ -651,6 +706,8 @@ impl Operation for GetOp {
         source_addr: Option<std::net::SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
+            // Take local_fallback early since self will be partially moved
+            let mut local_fallback = self.local_fallback;
             #[allow(unused_assignments)]
             let mut return_msg = None;
             #[allow(unused_assignments)]
@@ -1090,20 +1147,86 @@ impl Operation for GetOp {
                                         result: GetMsgResult::NotFound,
                                     });
                                 } else {
-                                    // Original requester, operation failed - contract not found
-                                    tracing::error!(
-                                        tx = %id,
-                                        %instance_id,
-                                        tried = ?tried_peers,
-                                        skip = ?skip_list,
-                                        phase = "not_found",
-                                        "Failed getting contract, not found after max retries"
-                                    );
-                                    // Set result to None - to_host_result will return an error
-                                    // This is appropriate because the contract was not found
-                                    return_msg = None;
-                                    new_state = None;
-                                    // Don't set result - let it remain None to indicate failure
+                                    // Original requester - check for local fallback before failing
+                                    if let Some((key, state, contract)) = local_fallback.take() {
+                                        tracing::info!(
+                                            tx = %id,
+                                            contract = %key,
+                                            phase = "complete",
+                                            "GET: Network returned NotFound, returning local cache and re-seeding network"
+                                        );
+
+                                        // Complete with local cached version
+                                        new_state = Some(GetState::Finished { key });
+                                        return_msg = None;
+                                        result = Some(GetResult {
+                                            key,
+                                            state: state.clone(),
+                                            contract: contract.clone(),
+                                        });
+
+                                        // Re-seed the network with our local copy, but only if we've
+                                        // tried enough peers to be confident the contract is truly missing.
+                                        // This prevents spurious re-seeding from transient routing issues.
+                                        let peers_tried = tried_peers.len();
+                                        if peers_tried >= MIN_PEERS_FOR_RESEED {
+                                            if let Some(contract_code) = contract {
+                                                tracing::info!(
+                                                    tx = %id,
+                                                    %key,
+                                                    peers_tried,
+                                                    "Re-seeding network after {} peers returned NotFound",
+                                                    peers_tried
+                                                );
+                                                let put_result = op_manager
+                                                    .notify_contract_handler(
+                                                        ContractHandlerEvent::PutQuery {
+                                                            key,
+                                                            state,
+                                                            related_contracts:
+                                                                RelatedContracts::default(),
+                                                            contract: Some(contract_code),
+                                                        },
+                                                    )
+                                                    .await;
+                                                match put_result {
+                                                    Ok(ContractHandlerEvent::PutResponse {
+                                                        new_value: Ok(_),
+                                                    }) => {
+                                                        tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
+                                                        super::announce_contract_cached(
+                                                            op_manager, &key,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    _ => {
+                                                        tracing::warn!(tx = %id, %key, "Failed to re-seed contract");
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            tracing::debug!(
+                                                tx = %id,
+                                                %key,
+                                                peers_tried,
+                                                min_required = MIN_PEERS_FOR_RESEED,
+                                                "Skipping re-seed: insufficient peer confirmations"
+                                            );
+                                        }
+                                    } else {
+                                        // No local fallback - operation failed
+                                        tracing::error!(
+                                            tx = %id,
+                                            %instance_id,
+                                            tried = ?tried_peers,
+                                            skip = ?skip_list,
+                                            phase = "not_found",
+                                            "Failed getting contract, not found after max retries"
+                                        );
+                                        // Set result to None - to_host_result will return an error
+                                        return_msg = None;
+                                        new_state = None;
+                                    }
                                 }
                             } else {
                                 // Max retries reached
@@ -1133,16 +1256,82 @@ impl Operation for GetOp {
                                     });
                                     new_state = None;
                                 } else {
-                                    // Original requester, operation failed - contract not found
-                                    tracing::error!(
-                                        tx = %id,
-                                        %instance_id,
-                                        phase = "not_found",
-                                        "Failed getting contract, reached max retries"
-                                    );
-                                    return_msg = None;
-                                    new_state = None;
-                                    // Don't set result - let it remain None to indicate failure
+                                    // Original requester - check for local fallback before failing
+                                    if let Some((key, state, contract)) = local_fallback.take() {
+                                        tracing::info!(
+                                            tx = %id,
+                                            contract = %key,
+                                            phase = "complete",
+                                            "GET: Max retries reached, returning local cache and re-seeding network"
+                                        );
+
+                                        // Complete with local cached version
+                                        new_state = Some(GetState::Finished { key });
+                                        return_msg = None;
+                                        result = Some(GetResult {
+                                            key,
+                                            state: state.clone(),
+                                            contract: contract.clone(),
+                                        });
+
+                                        // Re-seed the network with our local copy, but only if we've
+                                        // tried enough peers to be confident the contract is truly missing.
+                                        let peers_tried = tried_peers.len();
+                                        if peers_tried >= MIN_PEERS_FOR_RESEED {
+                                            if let Some(contract_code) = contract {
+                                                tracing::info!(
+                                                    tx = %id,
+                                                    %key,
+                                                    peers_tried,
+                                                    "Re-seeding network after {} peers returned NotFound (max retries)",
+                                                    peers_tried
+                                                );
+                                                let put_result = op_manager
+                                                    .notify_contract_handler(
+                                                        ContractHandlerEvent::PutQuery {
+                                                            key,
+                                                            state,
+                                                            related_contracts:
+                                                                RelatedContracts::default(),
+                                                            contract: Some(contract_code),
+                                                        },
+                                                    )
+                                                    .await;
+                                                match put_result {
+                                                    Ok(ContractHandlerEvent::PutResponse {
+                                                        new_value: Ok(_),
+                                                    }) => {
+                                                        tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
+                                                        super::announce_contract_cached(
+                                                            op_manager, &key,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    _ => {
+                                                        tracing::warn!(tx = %id, %key, "Failed to re-seed contract");
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            tracing::debug!(
+                                                tx = %id,
+                                                %key,
+                                                peers_tried,
+                                                min_required = MIN_PEERS_FOR_RESEED,
+                                                "Skipping re-seed: insufficient peer confirmations (max retries)"
+                                            );
+                                        }
+                                    } else {
+                                        // No local fallback - operation failed
+                                        tracing::error!(
+                                            tx = %id,
+                                            %instance_id,
+                                            phase = "not_found",
+                                            "Failed getting contract, reached max retries"
+                                        );
+                                        return_msg = None;
+                                        new_state = None;
+                                    }
                                 }
                             }
                         }
@@ -1223,6 +1412,7 @@ impl Operation for GetOp {
                             );
 
                             // Forward NotFound to requester (contract was required but not provided)
+                            // local_fallback is only for original requester, not for forwarding
                             op_manager
                                 .notify_op_change(
                                     NetMessage::from(GetMsg::Response {
@@ -1236,6 +1426,7 @@ impl Operation for GetOp {
                                         result: None,
                                         stats,
                                         upstream_addr: self.upstream_addr,
+                                        local_fallback: None,
                                     }),
                                 )
                                 .await?;
@@ -1532,6 +1723,7 @@ fn build_op_result(
         result,
         stats,
         upstream_addr,
+        local_fallback: None, // Forwarding operations don't have local fallback
     });
     Ok(OperationResult {
         return_msg: msg.map(NetMessage::from),
@@ -1762,6 +1954,7 @@ mod tests {
             result,
             stats: None,
             upstream_addr: None,
+            local_fallback: None,
         }
     }
 

@@ -404,6 +404,33 @@ impl Ring {
         self.seeding_manager.seeding_contracts_count()
     }
 
+    // ==================== Subscription Retry Spam Prevention ====================
+
+    /// Get contracts we're seeding but have no upstream subscription for.
+    /// These are candidates for re-establishing network subscription when peers become available.
+    pub fn contracts_without_upstream(&self) -> Vec<ContractKey> {
+        self.seeding_manager.contracts_without_upstream()
+    }
+
+    /// Check if a subscription request can be made for a contract.
+    /// Returns false if request is already pending or in backoff period.
+    pub fn can_request_subscription(&self, contract: &ContractKey) -> bool {
+        self.seeding_manager.can_request_subscription(contract)
+    }
+
+    /// Mark a subscription request as in-flight.
+    /// Returns false if already pending.
+    pub fn mark_subscription_pending(&self, contract: ContractKey) -> bool {
+        self.seeding_manager.mark_subscription_pending(contract)
+    }
+
+    /// Mark a subscription request as completed.
+    /// If success is false, applies exponential backoff.
+    pub fn complete_subscription_request(&self, contract: &ContractKey, success: bool) {
+        self.seeding_manager
+            .complete_subscription_request(contract, success)
+    }
+
     // ==================== Connection Pruning ====================
 
     /// Prune a peer connection and return notifications needed for subscription tree pruning.
