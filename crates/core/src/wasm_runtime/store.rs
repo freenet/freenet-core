@@ -22,9 +22,13 @@ pub(super) struct SafeWriter<S> {
 impl<S: StoreFsManagement> SafeWriter<S> {
     pub fn new(path: &Path, compact: bool) -> Result<Self, io::Error> {
         let file = if compact {
+            // CRITICAL: Must truncate the temp file to avoid leaving stale data
+            // from a previous failed compaction. If truncate(false) is used and
+            // the new compacted data is smaller than the existing file, the old
+            // trailing bytes remain and are misinterpreted as corrupt records.
             OpenOptions::new()
                 .create(true)
-                .truncate(false)
+                .truncate(true)
                 .write(true)
                 .open(path)?
         } else {
@@ -668,5 +672,62 @@ mod tests {
             let key_offset = shared_data.remove(&key).unwrap().1 .0;
             TestStore1::remove(test_path, key_offset).expect("Failed to remove key");
         }
+    }
+
+    /// Regression test for issue where compaction didn't truncate the temp file,
+    /// leaving stale data that was misinterpreted as corrupt records.
+    /// See: KEY_DATA corruption bug - zeros parsed as Contract records in SecretsStore
+    #[test]
+    fn test_compaction_truncates_stale_data() {
+        let temp_dir = get_temp_dir();
+        let key_file_path = temp_dir.path().join("data.dat");
+        let tmp_file_path = key_file_path.with_extension("tmp");
+
+        // Step 1: Create original KEY_DATA with one record
+        {
+            let mut file = SafeWriter::<TestStore1>::new(&key_file_path, false).expect("failed");
+            let key = ContractInstanceId::new([1; 32]);
+            let value = CodeHash::new([2; 32]);
+            TestStore1::insert(&mut file, key, &value).expect("Failed to insert");
+        }
+
+        // Step 2: Simulate a failed previous compaction that left a large .tmp file
+        // with garbage data (zeros that would parse as Contract records with zero keys)
+        {
+            let mut tmp_file = std::fs::File::create(&tmp_file_path).expect("Failed to create tmp");
+            // Write 1000 bytes of zeros - this simulates stale data from a failed compaction
+            tmp_file
+                .write_all(&[0u8; 1000])
+                .expect("Failed to write garbage");
+        }
+
+        // Step 3: Run compaction - this should truncate the .tmp file before writing
+        super::compact_index_file::<TestStore1>(&key_file_path).expect("Compaction failed");
+
+        // Step 4: Verify the compacted file has exactly one record (not garbage)
+        let mut container = <TestStore1 as StoreFsManagement>::MemContainer::default();
+        TestStore1::load_from_file(&key_file_path, &mut container).expect("Failed to load");
+
+        assert_eq!(
+            container.len(),
+            1,
+            "Should have exactly 1 record, but found {}",
+            container.len()
+        );
+        assert!(
+            container.contains_key(&ContractInstanceId::new([1; 32])),
+            "Original record should be present"
+        );
+
+        // Also verify the file size is reasonable (not bloated with stale data)
+        let file_size = std::fs::metadata(&key_file_path)
+            .expect("Failed to get metadata")
+            .len();
+        // A single Contract record is: 1 (tombstone) + 1 (key_type) + 32 (key) + 4 (len) + 32 (value) = 70 bytes
+        assert!(
+            file_size < 100,
+            "File should be small (~70 bytes), but was {} bytes",
+            file_size
+        );
     }
 }
