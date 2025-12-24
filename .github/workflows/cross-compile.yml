@@ -75,36 +75,6 @@ jobs:
           name: binaries-arm64-linux-fdev
           path: target/release/fdev
 
-  build-x86_64-macos:
-    name: Build for x86_64-apple-darwin
-    runs-on: macos-13  # Intel Mac runner
-    timeout-minutes: 60
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Compile for x86_64-apple-darwin
-        run: cargo build --release
-
-      - name: Upload freenet binary
-        uses: actions/upload-artifact@v6
-        with:
-          name: binaries-x86_64-macos-freenet
-          path: target/release/freenet
-
-      - name: Upload fdev binary
-        uses: actions/upload-artifact@v6
-        with:
-          name: binaries-x86_64-macos-fdev
-          path: target/release/fdev
-
   build-arm64-macos:
     name: Build for aarch64-apple-darwin
     runs-on: macos-latest  # Apple Silicon runner
@@ -169,7 +139,7 @@ jobs:
     name: Attach binaries to GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [build-x86_64-linux, build-arm64-linux, build-x86_64-macos, build-arm64-macos, build-x86_64-windows]
+    needs: [build-x86_64-linux, build-arm64-linux, build-arm64-macos, build-x86_64-windows]
     if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
@@ -201,19 +171,6 @@ jobs:
         with:
           name: binaries-arm64-linux-fdev
           path: artifacts/arm64-linux-fdev
-
-      # macOS x86_64
-      - name: Download x86_64 macOS freenet binary
-        uses: actions/download-artifact@v7
-        with:
-          name: binaries-x86_64-macos-freenet
-          path: artifacts/x86_64-macos-freenet
-
-      - name: Download x86_64 macOS fdev binary
-        uses: actions/download-artifact@v7
-        with:
-          name: binaries-x86_64-macos-fdev
-          path: artifacts/x86_64-macos-fdev
 
       # macOS ARM64
       - name: Download ARM64 macOS freenet binary
@@ -252,10 +209,6 @@ jobs:
           cd artifacts/arm64-linux-freenet && tar -czvf ../../freenet-aarch64-unknown-linux-gnu.tar.gz freenet && cd ../..
           cd artifacts/arm64-linux-fdev && tar -czvf ../../fdev-aarch64-unknown-linux-gnu.tar.gz fdev && cd ../..
 
-          # macOS x86_64
-          cd artifacts/x86_64-macos-freenet && tar -czvf ../../freenet-x86_64-apple-darwin.tar.gz freenet && cd ../..
-          cd artifacts/x86_64-macos-fdev && tar -czvf ../../fdev-x86_64-apple-darwin.tar.gz fdev && cd ../..
-
           # macOS ARM64
           cd artifacts/arm64-macos-freenet && tar -czvf ../../freenet-aarch64-apple-darwin.tar.gz freenet && cd ../..
           cd artifacts/arm64-macos-fdev && tar -czvf ../../fdev-aarch64-apple-darwin.tar.gz fdev && cd ../..
@@ -289,8 +242,6 @@ jobs:
             fdev-x86_64-unknown-linux-gnu.tar.gz \
             freenet-aarch64-unknown-linux-gnu.tar.gz \
             fdev-aarch64-unknown-linux-gnu.tar.gz \
-            freenet-x86_64-apple-darwin.tar.gz \
-            fdev-x86_64-apple-darwin.tar.gz \
             freenet-aarch64-apple-darwin.tar.gz \
             fdev-aarch64-apple-darwin.tar.gz \
             freenet-x86_64-pc-windows-msvc.zip \

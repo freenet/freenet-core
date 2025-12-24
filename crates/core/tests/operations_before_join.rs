@@ -189,7 +189,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
     let (start_gateway_tx, start_gateway_rx) = tokio::sync::oneshot::channel::<()>();
 
     let peer_cfg = peer_config.build().await?;
-    let peer_ws_server = serve_gateway(peer_cfg.ws_api.clone()).await?;
+    let peer_ws_server = serve_gateway(peer_cfg.ws_api).await?;
     let peer_node = NodeConfig::new(peer_cfg.clone())
         .await?
         .build(peer_ws_server)
@@ -217,7 +217,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
         info!("Connected to peer (gateway NOT started yet)");
 
         let contract = load_contract("test-contract-integration", vec![].into())?;
-        let key = contract.key().clone();
+        let key = contract.key();
         let state = WrappedState::from(freenet::test_utils::create_empty_todo_list());
 
         info!("Testing operations before join...");
@@ -225,10 +225,10 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
         make_put(&mut client, state.clone(), contract.clone(), false).await?;
         expect_peer_not_joined(&mut client, "PUT").await?;
 
-        make_get(&mut client, key.clone(), false, false).await?;
+        make_get(&mut client, key, false, false).await?;
         expect_peer_not_joined(&mut client, "GET").await?;
 
-        make_subscribe(&mut client, key.clone()).await?;
+        make_subscribe(&mut client, key).await?;
         expect_peer_not_joined(&mut client, "SUBSCRIBE").await?;
 
         info!("All operations correctly rejected before join");
