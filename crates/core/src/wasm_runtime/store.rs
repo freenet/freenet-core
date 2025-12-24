@@ -22,9 +22,13 @@ pub(super) struct SafeWriter<S> {
 impl<S: StoreFsManagement> SafeWriter<S> {
     pub fn new(path: &Path, compact: bool) -> Result<Self, io::Error> {
         let file = if compact {
+            // CRITICAL: Must truncate the temp file to avoid leaving stale data
+            // from a previous failed compaction. If truncate(false) is used and
+            // the new compacted data is smaller than the existing file, the old
+            // trailing bytes remain and are misinterpreted as corrupt records.
             OpenOptions::new()
                 .create(true)
-                .truncate(false)
+                .truncate(true)
                 .write(true)
                 .open(path)?
         } else {
@@ -330,12 +334,24 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
     // Create a new temporary file to write compacted data
     let temp_file_path = key_file_path.with_extension("tmp");
 
+    // Helper to clean up temp and lock files on error/early-exit
+    let cleanup_files = |temp_path: &Path, lock_path: &Path| {
+        // Clean up temp file (may not exist if we're cleaning up early)
+        if let Err(e) = fs::remove_file(temp_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                error!("{}:{}: Failed to remove temp file: {e}", file!(), line!());
+            }
+        }
+        // Clean up lock file
+        if let Err(e) = fs::remove_file(lock_path) {
+            error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
+        }
+    };
+
     // Read the original file and compact data into the temp file
     let mut original_reader = BufReader::new(original_file);
     let mut temp_writer = SafeWriter::<S>::new(&temp_file_path, true).inspect_err(|_| {
-        if let Err(e) = fs::remove_file(&lock_file_path) {
-            error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
-        }
+        cleanup_files(&temp_file_path, &lock_file_path);
     })?;
 
     let mut any_deleted = false; // Track if any deleted records were found
@@ -348,9 +364,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
                     Either::Right(v) => v.as_slice(),
                 };
                 if let Err(err) = temp_writer.insert_record(store_key, value) {
-                    if let Err(e) = fs::remove_file(&lock_file_path) {
-                        error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
-                    }
+                    cleanup_files(&temp_file_path, &lock_file_path);
                     return Err(err);
                 }
             }
@@ -364,9 +378,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
             }
             Err(other) => {
                 // Handle other errors gracefully
-                if let Err(e) = fs::remove_file(&lock_file_path) {
-                    error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
-                }
+                cleanup_files(&temp_file_path, &lock_file_path);
                 return Err(other);
             }
         }
@@ -374,9 +386,7 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
 
     // Check if any deleted records were found; if not, skip compaction
     if !any_deleted {
-        if let Err(e) = fs::remove_file(&lock_file_path) {
-            error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
-        }
+        cleanup_files(&temp_file_path, &lock_file_path);
         return Ok(());
     }
 
@@ -385,17 +395,13 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
     // This is critical: if we only flush and the system crashes after rename
     // but before the OS writes the buffer to disk, we could lose index data.
     if let Err(e) = temp_writer.sync() {
-        if let Err(e) = fs::remove_file(&lock_file_path) {
-            error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
-        }
+        cleanup_files(&temp_file_path, &lock_file_path);
         return Err(e);
     }
 
     // Replace the original file with the temporary file
     if let Err(e) = fs::rename(&temp_file_path, key_file_path) {
-        if let Err(e) = fs::remove_file(&lock_file_path) {
-            error!("{}:{}: Failed to remove lock file: {e}", file!(), line!());
-        }
+        cleanup_files(&temp_file_path, &lock_file_path);
         return Err(e);
     }
 
@@ -668,5 +674,96 @@ mod tests {
             let key_offset = shared_data.remove(&key).unwrap().1 .0;
             TestStore1::remove(test_path, key_offset).expect("Failed to remove key");
         }
+    }
+
+    /// Regression test for issue where compaction didn't truncate the temp file,
+    /// leaving stale data that was misinterpreted as corrupt records.
+    /// See: KEY_DATA corruption bug - zeros parsed as Contract records in SecretsStore
+    #[test]
+    fn test_compaction_truncates_stale_data() {
+        let temp_dir = get_temp_dir();
+        let key_file_path = temp_dir.path().join("data.dat");
+        let tmp_file_path = key_file_path.with_extension("tmp");
+
+        // Step 1: Create original KEY_DATA with one record
+        {
+            let mut file = SafeWriter::<TestStore1>::new(&key_file_path, false).expect("failed");
+            let key = ContractInstanceId::new([1; 32]);
+            let value = CodeHash::new([2; 32]);
+            TestStore1::insert(&mut file, key, &value).expect("Failed to insert");
+        }
+
+        // Step 2: Simulate a failed previous compaction that left a large .tmp file
+        // with garbage data (zeros that would parse as Contract records with zero keys)
+        {
+            let mut tmp_file = std::fs::File::create(&tmp_file_path).expect("Failed to create tmp");
+            // Write 1000 bytes of zeros - this simulates stale data from a failed compaction
+            tmp_file
+                .write_all(&[0u8; 1000])
+                .expect("Failed to write garbage");
+        }
+
+        // Step 3: Run compaction - this should truncate the .tmp file before writing
+        super::compact_index_file::<TestStore1>(&key_file_path).expect("Compaction failed");
+
+        // Step 4: Verify the compacted file has exactly one record (not garbage)
+        let mut container = <TestStore1 as StoreFsManagement>::MemContainer::default();
+        TestStore1::load_from_file(&key_file_path, &mut container).expect("Failed to load");
+
+        assert_eq!(
+            container.len(),
+            1,
+            "Should have exactly 1 record, but found {}",
+            container.len()
+        );
+        assert!(
+            container.contains_key(&ContractInstanceId::new([1; 32])),
+            "Original record should be present"
+        );
+
+        // Also verify the file size is reasonable (not bloated with stale data)
+        let file_size = std::fs::metadata(&key_file_path)
+            .expect("Failed to get metadata")
+            .len();
+        // A single Contract record is: 1 (tombstone) + 1 (key_type) + 32 (key) + 4 (len) + 32 (value) = 70 bytes
+        assert!(
+            file_size < 100,
+            "File should be small (~70 bytes), but was {} bytes",
+            file_size
+        );
+    }
+
+    /// Test that compaction cleans up temp file when no records are deleted.
+    /// Previously, compaction would create a temp file, write all records,
+    /// then abandon the temp file on early exit.
+    #[test]
+    fn test_compaction_cleans_up_temp_file_on_no_delete() {
+        let temp_dir = get_temp_dir();
+        let key_file_path = temp_dir.path().join("data.dat");
+        let tmp_file_path = key_file_path.with_extension("tmp");
+
+        // Create a file with records but no deletions
+        {
+            let mut file = SafeWriter::<TestStore1>::new(&key_file_path, false).expect("failed");
+            for i in 0..5 {
+                let key = ContractInstanceId::new([i; 32]);
+                let value = CodeHash::new([i + 10; 32]);
+                TestStore1::insert(&mut file, key, &value).expect("Failed to insert");
+            }
+        }
+
+        // Run compaction - should find no deleted records and clean up
+        super::compact_index_file::<TestStore1>(&key_file_path).expect("Compaction failed");
+
+        // Verify temp file was cleaned up
+        assert!(
+            !tmp_file_path.exists(),
+            "Temp file should be cleaned up when no records are deleted"
+        );
+
+        // Verify original data is intact
+        let mut container = <TestStore1 as StoreFsManagement>::MemContainer::default();
+        TestStore1::load_from_file(&key_file_path, &mut container).expect("Failed to load");
+        assert_eq!(container.len(), 5, "All 5 records should still exist");
     }
 }
