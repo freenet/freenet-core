@@ -9,7 +9,7 @@ use crate::{
     client_events::HostResult,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
-    ring::{Location, RingError},
+    ring::{KnownPeerKeyLocation, Location, RingError},
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, ErrorKind, HostResponse},
@@ -125,6 +125,15 @@ pub(crate) fn start_op_with_id(instance_id: ContractInstanceId, id: Transaction)
 }
 
 /// Request to subscribe to value changes from a contract.
+///
+/// # Errors
+///
+/// Returns `RingError::PeerNotJoined` if the peer hasn't established its ring location
+/// (i.e., hasn't completed joining the network) AND the contract is not available locally.
+/// This allows callers to retry after the peer has completed joining.
+///
+/// If the contract exists locally and no network is needed, the subscription completes
+/// locally even without a ring location (standalone node case).
 pub(crate) async fn request_subscribe(
     op_manager: &OpManager,
     sub_op: SubscribeOp,
@@ -133,16 +142,30 @@ pub(crate) async fn request_subscribe(
         return Err(OpError::UnexpectedOpState);
     };
 
-    let own_loc = op_manager.ring.connection_manager.own_location();
-    let own_addr = own_loc
-        .socket_addr()
-        .expect("own location must have socket address");
-
     tracing::debug!(tx = %id, contract = %instance_id, "subscribe: request_subscribe invoked");
 
-    // Note: We don't check for local contract existence here because:
-    // 1. Even if we have it, we still need to register with network for updates
-    // 2. The lookup can happen later when processing the response
+    let own_addr = match op_manager.ring.connection_manager.peer_addr() {
+        Ok(addr) => addr,
+        Err(_) => {
+            // Peer hasn't joined the network yet - check if contract is available locally
+            if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
+                tracing::info!(
+                    tx = %id,
+                    contract = %key,
+                    phase = "local_complete",
+                    "Peer not joined, but contract available locally - completing subscription locally"
+                );
+                return complete_local_subscription(op_manager, *id, key).await;
+            }
+            tracing::warn!(
+                tx = %id,
+                contract = %instance_id,
+                phase = "peer_not_joined",
+                "Cannot subscribe: peer has not joined network yet and contract not available locally"
+            );
+            return Err(RingError::PeerNotJoined.into());
+        }
+    };
 
     // IMPORTANT: Even if we have the contract locally (e.g., from PUT forwarding),
     // we MUST send a Subscribe::Request to the network to register ourselves as a
@@ -451,12 +474,7 @@ impl Operation for SubscribeOp {
                     }
 
                     // Find next hop
-                    let own_addr = op_manager
-                        .ring
-                        .connection_manager
-                        .own_location()
-                        .socket_addr()
-                        .expect("own address");
+                    let own_addr = op_manager.ring.connection_manager.peer_addr()?;
                     let mut new_skip_list = skip_list.clone();
                     new_skip_list.insert(own_addr);
                     if let Some(requester) = self.requester_addr {
@@ -474,7 +492,17 @@ impl Operation for SubscribeOp {
                         return Err(RingError::NoCachingPeers(*instance_id).into());
                     };
 
-                    let next_addr = next_hop.socket_addr().expect("next hop address");
+                    // Convert to KnownPeerKeyLocation for compile-time address guarantee
+                    let next_hop_known = KnownPeerKeyLocation::try_from(next_hop)
+                        .map_err(|e| {
+                            tracing::error!(
+                                tx = %id,
+                                pub_key = %e.pub_key,
+                                "INTERNAL ERROR: next_hop has unknown address - routing selected peer without address"
+                            );
+                            RingError::NoCachingPeers(*instance_id)
+                        })?;
+                    let next_addr = next_hop_known.socket_addr();
                     new_skip_list.insert(next_addr);
 
                     tracing::debug!(tx = %id, %instance_id, next = %next_addr, "Forwarding subscribe request");

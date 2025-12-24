@@ -345,6 +345,11 @@ impl ConnectionManager {
         *self.own_addr.lock()
     }
 
+    /// Returns our own socket address, or `RingError::PeerNotJoined` if not yet established.
+    pub fn peer_addr(&self) -> Result<SocketAddr, super::RingError> {
+        self.get_own_addr().ok_or(super::RingError::PeerNotJoined)
+    }
+
     /// Returns the stored ring location, if set.
     /// This is the location that was set by update_location(), typically from
     /// the externally observed address received via ObservedAddress message.
@@ -1492,5 +1497,38 @@ mod tests {
         // Should keep original location
         let locations = cm.location_for_peer.read();
         assert_eq!(locations.get(&addr), Some(&loc1));
+    }
+
+    #[test]
+    fn test_peer_addr_returns_address_when_joined() {
+        let addr = make_addr(8000);
+        let cm = make_connection_manager(Some(addr), 5, 20, false);
+
+        let result = cm.peer_addr();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), addr);
+    }
+
+    #[test]
+    fn test_peer_addr_returns_error_when_not_joined() {
+        let cm = make_connection_manager(None, 5, 20, false);
+
+        let result = cm.peer_addr();
+        assert!(result.is_err());
+        assert!(matches!(result, Err(super::RingError::PeerNotJoined)));
+    }
+
+    #[test]
+    fn test_peer_addr_is_consistent_with_get_own_addr() {
+        // When get_own_addr returns Some, peer_addr should return Ok with same value
+        let addr = make_addr(9000);
+        let cm = make_connection_manager(Some(addr), 5, 20, false);
+        assert_eq!(cm.get_own_addr(), Some(addr));
+        assert_eq!(cm.peer_addr().unwrap(), addr);
+
+        // When get_own_addr returns None, peer_addr should return Err
+        let cm_no_addr = make_connection_manager(None, 5, 20, false);
+        assert_eq!(cm_no_addr.get_own_addr(), None);
+        assert!(cm_no_addr.peer_addr().is_err());
     }
 }

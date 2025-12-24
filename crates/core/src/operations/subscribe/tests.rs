@@ -478,3 +478,215 @@ async fn test_subscription_validates_k_closest_usage() {
         ));
     }
 }
+
+/// Test that `start_op` creates the correct initial state for local subscription path.
+///
+/// This validates the entry point for local subscriptions (standalone mode).
+#[test]
+fn test_start_op_creates_prepare_request_state() {
+    let instance_id = ContractInstanceId::new([42u8; 32]);
+
+    let sub_op = start_op(instance_id);
+
+    // Verify the operation is initialized correctly
+    assert!(
+        matches!(
+            sub_op.state,
+            Some(SubscribeState::PrepareRequest { id, instance_id: iid })
+            if iid == instance_id && id == sub_op.id
+        ),
+        "start_op should create PrepareRequest state with correct instance_id"
+    );
+
+    // Verify it's a local operation (no requester)
+    assert_eq!(
+        sub_op.requester_addr, None,
+        "Local subscription should have no requester address"
+    );
+
+    // Verify the transaction ID was generated
+    let tx_id = sub_op.id;
+    assert_ne!(
+        format!("{}", tx_id),
+        "",
+        "Transaction ID should be generated"
+    );
+}
+
+/// Test that `start_op_with_id` creates correct state with a specific transaction ID.
+///
+/// This is used for operation deduplication in the subscription path.
+#[test]
+fn test_start_op_with_id_uses_provided_transaction() {
+    let instance_id = ContractInstanceId::new([99u8; 32]);
+    let custom_tx = Transaction::new::<SubscribeMsg>();
+
+    let sub_op = start_op_with_id(instance_id, custom_tx);
+
+    // Verify the operation uses the provided transaction ID
+    assert_eq!(
+        sub_op.id, custom_tx,
+        "start_op_with_id should use provided transaction ID"
+    );
+
+    // Verify state is correct
+    assert!(
+        matches!(
+            sub_op.state,
+            Some(SubscribeState::PrepareRequest { id, instance_id: iid })
+            if iid == instance_id && id == custom_tx
+        ),
+        "PrepareRequest state should have provided transaction ID"
+    );
+
+    // Verify it's a local operation
+    assert_eq!(
+        sub_op.requester_addr, None,
+        "Local subscription should have no requester address"
+    );
+}
+
+/// Test that the SubscribeOp state machine transitions are correctly validated.
+///
+/// This test ensures the operation state follows the expected lifecycle:
+/// PrepareRequest → AwaitingResponse → Completed
+#[test]
+fn test_subscribe_op_state_lifecycle() {
+    let instance_id = ContractInstanceId::new([7u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([8u8; 32]));
+    let tx_id = Transaction::new::<SubscribeMsg>();
+    let peer_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+    // 1. Initial state: PrepareRequest (created by start_op)
+    let op_initial = SubscribeOp {
+        id: tx_id,
+        state: Some(SubscribeState::PrepareRequest {
+            id: tx_id,
+            instance_id,
+        }),
+        requester_addr: None,
+    };
+
+    assert!(
+        !op_initial.finalized(),
+        "PrepareRequest should not be finalized"
+    );
+    assert!(
+        !op_initial.is_completed(),
+        "PrepareRequest should not be completed"
+    );
+
+    // 2. Awaiting response state (after sending Subscribe::Request)
+    let op_awaiting = SubscribeOp {
+        id: tx_id,
+        state: Some(SubscribeState::AwaitingResponse {
+            next_hop: Some(peer_addr),
+        }),
+        requester_addr: None,
+    };
+
+    assert!(
+        !op_awaiting.finalized(),
+        "AwaitingResponse should not be finalized"
+    );
+    assert!(
+        !op_awaiting.is_completed(),
+        "AwaitingResponse should not be completed"
+    );
+    assert_eq!(
+        op_awaiting.get_next_hop_addr(),
+        Some(peer_addr),
+        "Should return next hop address for routing"
+    );
+
+    // 3. Completed state (after receiving Subscribe::Response)
+    let op_completed = SubscribeOp {
+        id: tx_id,
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None,
+    };
+
+    assert!(
+        op_completed.finalized(),
+        "Completed state should be finalized"
+    );
+    assert!(
+        op_completed.is_completed(),
+        "Completed state should be completed"
+    );
+
+    // Verify to_host_result returns success for completed operation
+    let result = op_completed.to_host_result();
+    assert!(
+        result.is_ok(),
+        "Completed operation should return Ok result"
+    );
+}
+
+/// Test that failed subscription (state = None) returns error to client.
+///
+/// This validates error handling in the subscription path.
+#[test]
+fn test_subscribe_op_failed_state_returns_error() {
+    let tx_id = Transaction::new::<SubscribeMsg>();
+
+    // Create operation with no state (indicates failure)
+    let op_failed = SubscribeOp {
+        id: tx_id,
+        state: None,
+        requester_addr: None,
+    };
+
+    // Verify to_host_result returns error
+    let result = op_failed.to_host_result();
+    assert!(result.is_err(), "Failed subscription should return error");
+
+    // Verify error message is appropriate
+    if let Err(err) = result {
+        let error_msg = format!("{:?}", err);
+        assert!(
+            error_msg.contains("subscribe didn't finish successfully"),
+            "Error should indicate subscription failure"
+        );
+    }
+}
+
+/// Test the local subscription completion path (standalone mode).
+///
+/// This test verifies the logic that would be exercised by `complete_local_subscription`.
+/// In standalone mode (no peers), subscriptions complete locally via NodeEvent.
+#[test]
+fn test_local_subscription_completion_state() {
+    let instance_id = ContractInstanceId::new([15u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([16u8; 32]));
+    let tx_id = Transaction::new::<SubscribeMsg>();
+
+    // Simulate the state after complete_local_subscription would be called
+    // In reality, this sends a LocalSubscribeComplete event and marks operation complete
+    let op = SubscribeOp {
+        id: tx_id,
+        state: Some(SubscribeState::Completed { key: contract_key }),
+        requester_addr: None, // Local subscription, no network requester
+    };
+
+    // Verify operation is in completed state
+    assert!(op.finalized(), "Local subscription should be finalized");
+    assert!(op.is_completed(), "Local subscription should be completed");
+
+    // Verify to_host_result returns successful subscription response
+    let result = op.to_host_result();
+    assert!(result.is_ok(), "Local subscription should succeed");
+
+    if let Ok(host_response) = result {
+        // Verify the response indicates successful subscription
+        let response_str = format!("{:?}", host_response);
+        assert!(
+            response_str.contains("SubscribeResponse"),
+            "Should return SubscribeResponse"
+        );
+        assert!(
+            response_str.contains("subscribed: true"),
+            "Should indicate successful subscription"
+        );
+    }
+}

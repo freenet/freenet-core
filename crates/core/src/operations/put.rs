@@ -19,7 +19,7 @@ use crate::{
     contract::ContractHandlerEvent,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
-    ring::Location,
+    ring::{KnownPeerKeyLocation, Location},
 };
 
 pub(crate) struct PutOp {
@@ -262,10 +262,12 @@ impl Operation for PutOp {
                         None
                     };
 
-                    if let Some(next_peer) = next_hop {
+                    // Convert to KnownPeerKeyLocation for compile-time address guarantee
+                    let next_peer_known =
+                        next_hop.and_then(|p| KnownPeerKeyLocation::try_from(p).ok());
+                    if let Some(next_peer) = next_peer_known {
                         // Forward to next hop
-                        let next_addr =
-                            next_peer.socket_addr().expect("next hop must have address");
+                        let next_addr = next_peer.socket_addr();
 
                         tracing::debug!(
                             tx = %id,

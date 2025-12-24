@@ -24,6 +24,7 @@ use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
 use crate::operations::{get, put, update, OpError};
+use crate::ring::KnownPeerKeyLocation;
 use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 // pub(crate) mod admin_endpoints; // TODO: Add axum dependencies
@@ -322,6 +323,15 @@ where
                             tracing::debug!(client_id = %cli_id, "Client disconnected");
                             (cli_id, Err(ClientError::from(ErrorKind::Disconnect)))
                         }
+                        Err(Error::PeerNotJoined) => {
+                            tracing::warn!(
+                                client_id = %cli_id,
+                                "Operation rejected: peer has not joined network yet - client should retry after join"
+                            );
+                            (cli_id, Err(ErrorKind::OperationError {
+                                cause: "PEER_NOT_JOINED: peer has not joined the network yet - retry after node joins".into()
+                            }.into()))
+                        }
                         Err(err) => {
                             tracing::error!(
                                 client_id = %cli_id,
@@ -361,8 +371,13 @@ where
                     (cli_id, Ok(Some(res))) => {
                         let res = match res {
                             QueryResult::Connections(conns) => {
+                                // Connected peers must have known addresses - use type-safe conversion
                                 Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
-                                    peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.socket_addr().expect("connected peer should have socket address"))).collect() }
+                                    peers: conns.into_iter().filter_map(|p| {
+                                        KnownPeerKeyLocation::try_from(&p).ok().map(|known| {
+                                            (p.pub_key.to_string(), known.socket_addr())
+                                        })
+                                    }).collect() }
                                 ))
                             }
                             QueryResult::GetResult { key, state, contract } => {
@@ -384,8 +399,11 @@ where
                                     }
                                 }).collect();
 
-                                let connected_peers = debug_info.connected_peers.into_iter().map(|peer| {
-                                    (peer.to_string(), peer.socket_addr().expect("connected peer should have socket address"))
+                                // Connected peers must have known addresses - use type-safe conversion
+                                let connected_peers = debug_info.connected_peers.into_iter().filter_map(|peer| {
+                                    KnownPeerKeyLocation::try_from(&peer).ok().map(|known| {
+                                        (peer.to_string(), known.socket_addr())
+                                    })
                                 }).collect();
 
                                 Ok(HostResponse::QueryResponse(QueryResponse::NetworkDebug(
@@ -436,6 +454,8 @@ where
 enum Error {
     #[error("Node not connected to network")]
     Disconnected,
+    #[error("Peer has not joined the network yet (no ring location established)")]
+    PeerNotJoined,
     #[error("Node error: {0}")]
     Node(String),
     #[error(transparent)]
@@ -446,6 +466,29 @@ enum Error {
     Executor(#[from] crate::contract::ExecutorError),
     #[error(transparent)]
     Panic(#[from] tokio::task::JoinError),
+}
+
+impl From<crate::ring::RingError> for Error {
+    fn from(err: crate::ring::RingError) -> Self {
+        match err {
+            crate::ring::RingError::PeerNotJoined => Error::PeerNotJoined,
+            other => Error::Node(other.to_string()),
+        }
+    }
+}
+
+/// Check that the peer has completed network join before allowing operations.
+/// For gateways: always ready (their address is set from config).
+/// For regular peers: must wait for handshake to complete (peer_ready flag).
+fn ensure_peer_ready(op_manager: &OpManager) -> Result<std::net::SocketAddr, Error> {
+    if !op_manager.is_gateway
+        && !op_manager
+            .peer_ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(Error::PeerNotJoined);
+    }
+    Ok(op_manager.ring.connection_manager.peer_addr()?)
 }
 
 #[inline]
@@ -482,32 +525,7 @@ async fn process_open_request(
                         related_contracts,
                         subscribe,
                     } => {
-                        // For non-gateway peers: check if peer is ready (peer_id has been set via handshake)
-                        // For gateways: always ready (peer_id set from config)
-                        if !op_manager.is_gateway
-                            && !op_manager
-                                .peer_ready
-                                .load(std::sync::atomic::Ordering::SeqCst)
-                        {
-                            tracing::warn!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "peer_not_ready",
-                                "Client attempted PUT operation before peer initialization complete"
-                            );
-                            return Err(Error::Disconnected);
-                        }
-
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
-                        else {
-                            tracing::error!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "no_peer_address",
-                                "Peer address not found for PUT operation"
-                            );
-                            return Err(Error::Disconnected);
-                        };
+                        let peer_id = ensure_peer_ready(&op_manager)?;
 
                         tracing::debug!(
                             client_id = %client_id,
@@ -790,16 +808,7 @@ async fn process_open_request(
                         }
                     }
                     ContractRequest::Update { key, data } => {
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
-                        else {
-                            tracing::error!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "no_peer_address",
-                                "Peer address not found for UPDATE operation"
-                            );
-                            return Err(Error::Disconnected);
-                        };
+                        let peer_id = ensure_peer_ready(&op_manager)?;
 
                         tracing::debug!(
                             client_id = %client_id,
@@ -1044,16 +1053,7 @@ async fn process_open_request(
                         return_contract_code,
                         subscribe,
                     } => {
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
-                        else {
-                            tracing::error!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "no_peer_address",
-                                "Peer address not found for GET operation"
-                            );
-                            return Err(Error::Disconnected);
-                        };
+                        let peer_id = ensure_peer_ready(&op_manager)?;
 
                         // Query local store by instance_id (key from request is ContractInstanceId)
                         let (full_key, state, contract) = match op_manager
@@ -1354,16 +1354,7 @@ async fn process_open_request(
                         }
                     }
                     ContractRequest::Subscribe { key, summary } => {
-                        let Some(peer_id) = op_manager.ring.connection_manager.get_own_addr()
-                        else {
-                            tracing::error!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                phase = "no_peer_address",
-                                "Peer address not found for SUBSCRIBE operation"
-                            );
-                            return Err(Error::Disconnected);
-                        };
+                        let peer_id = ensure_peer_ready(&op_manager)?;
 
                         tracing::debug!(
                             client_id = %client_id,
