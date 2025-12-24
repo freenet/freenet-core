@@ -722,32 +722,104 @@ async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext)
     // connection is established, the identity IS visible (within a reasonable timeout).
     const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
     const RETRY_DELAY: Duration = Duration::from_secs(2);
+    // Increased query timeout for CI environments under heavy load
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
     let deadline = tokio::time::Instant::now() + CONNECTION_TIMEOUT;
 
     let mut gw_peers = Vec::new();
     let mut peer_peers = Vec::new();
+    let mut attempt = 0;
 
     while tokio::time::Instant::now() < deadline {
-        // Query gateway for connections
-        client_gw
+        attempt += 1;
+        let remaining_secs = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_secs();
+
+        tracing::info!(
+            attempt,
+            remaining_secs,
+            "Querying nodes for connected peers..."
+        );
+
+        // Query gateway for connections - handle errors gracefully within retry loop
+        if let Err(e) = client_gw
             .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await?;
-        let gw_resp = tokio::time::timeout(Duration::from_secs(5), client_gw.recv()).await?;
-        gw_peers = match gw_resp {
-            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
-            Ok(other) => bail!("Unexpected response from gateway: {:?}", other),
-            Err(e) => bail!("Error receiving gateway response: {}", e),
+            .await
+        {
+            tracing::warn!(attempt, error = %e, "Failed to send query to gateway, retrying...");
+            tokio::time::sleep(RETRY_DELAY).await;
+            continue;
+        }
+
+        gw_peers = match tokio::time::timeout(QUERY_TIMEOUT, client_gw.recv()).await {
+            Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }))) => peers,
+            Ok(Ok(other)) => {
+                // Unexpected response - log and retry (could be out-of-order notification)
+                tracing::warn!(
+                    attempt,
+                    ?other,
+                    "Unexpected response from gateway, retrying..."
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+            Ok(Err(e)) => {
+                // WebSocket error - log and retry
+                tracing::warn!(attempt, error = %e, "Error receiving gateway response, retrying...");
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+            Err(_elapsed) => {
+                // Timeout - log and retry (CI environments can be slow)
+                tracing::warn!(
+                    attempt,
+                    timeout_secs = QUERY_TIMEOUT.as_secs(),
+                    "Timeout waiting for gateway response, retrying..."
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
         };
 
-        // Query peer for connections
-        client_peer
+        // Query peer for connections - handle errors gracefully within retry loop
+        if let Err(e) = client_peer
             .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await?;
-        let peer_resp = tokio::time::timeout(Duration::from_secs(5), client_peer.recv()).await?;
-        peer_peers = match peer_resp {
-            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
-            Ok(other) => bail!("Unexpected response from peer: {:?}", other),
-            Err(e) => bail!("Error receiving peer response: {}", e),
+            .await
+        {
+            tracing::warn!(attempt, error = %e, "Failed to send query to peer, retrying...");
+            tokio::time::sleep(RETRY_DELAY).await;
+            continue;
+        }
+
+        peer_peers = match tokio::time::timeout(QUERY_TIMEOUT, client_peer.recv()).await {
+            Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }))) => peers,
+            Ok(Ok(other)) => {
+                // Unexpected response - log and retry
+                tracing::warn!(
+                    attempt,
+                    ?other,
+                    "Unexpected response from peer, retrying..."
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+            Ok(Err(e)) => {
+                // WebSocket error - log and retry
+                tracing::warn!(attempt, error = %e, "Error receiving peer response, retrying...");
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+            Err(_elapsed) => {
+                // Timeout - log and retry
+                tracing::warn!(
+                    attempt,
+                    timeout_secs = QUERY_TIMEOUT.as_secs(),
+                    "Timeout waiting for peer response, retrying..."
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
         };
 
         tracing::info!(
@@ -769,18 +841,20 @@ async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext)
     // because the peer identity was never propagated to the transport layer.
     if gw_peers.is_empty() {
         bail!(
-            "REGRESSION: Gateway's QueryConnections returned empty after {}s! \
+            "REGRESSION: Gateway's QueryConnections returned empty after {} attempts ({}s timeout)! \
              This indicates the peer's identity was not propagated to the \
              transport layer when the transient connection was promoted. \
              See PR #2211 for the original bug fix.",
+            attempt,
             CONNECTION_TIMEOUT.as_secs()
         );
     }
 
     if peer_peers.is_empty() {
         bail!(
-            "REGRESSION: Peer's QueryConnections returned empty after {}s! \
+            "REGRESSION: Peer's QueryConnections returned empty after {} attempts ({}s timeout)! \
              This indicates the connection wasn't properly established.",
+            attempt,
             CONNECTION_TIMEOUT.as_secs()
         );
     }
