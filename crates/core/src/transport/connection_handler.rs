@@ -977,6 +977,31 @@ impl<S: Socket> UdpPacketsListener<S> {
             ));
 
             let (inbound_packet_tx, inbound_packet_rx) = fast_channel::bounded(1000);
+
+            // Issue #2395: Drain any packets that arrived during the handshake.
+            // The peer may send application-level messages (like ConnectRequest) immediately
+            // after its side of the handshake completes, but before our handshake finishes.
+            // These packets are buffered in `next_inbound` but only the ACK packet is read above.
+            // Forward any remaining packets to the new connection channel so they're not lost.
+            let mut forwarded_count = 0;
+            while let Ok(packet) = next_inbound.try_recv() {
+                if inbound_packet_tx.try_send(packet).is_err() {
+                    tracing::warn!(
+                        peer_addr = %remote_addr,
+                        "Failed to forward handshake-buffered packet to connection channel (channel full)"
+                    );
+                    break;
+                }
+                forwarded_count += 1;
+            }
+            if forwarded_count > 0 {
+                tracing::debug!(
+                    peer_addr = %remote_addr,
+                    forwarded_count,
+                    "Forwarded packets buffered during handshake to connection channel"
+                );
+            }
+
             let remote_conn = RemoteConnection {
                 outbound_symmetric_key: outbound_key,
                 remote_addr,
