@@ -4,11 +4,74 @@ use freenet::test_utils::{
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractResponse, HostResponse, NodeQuery, QueryResponse, WebApi},
     prelude::*,
 };
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 use tokio_tungstenite::connect_async;
+
+/// Query a node for its connected peers with resilient error handling.
+///
+/// Returns `Some(peers)` if the query succeeded, `None` if it failed (timeout, error, etc.).
+/// All failures are logged with the attempt number for diagnostics.
+///
+/// This helper is designed for use in retry loops where transient failures should not
+/// immediately fail the test.
+async fn query_connected_peers(
+    client: &mut WebApi,
+    node_name: &str,
+    timeout: Duration,
+    attempt: u32,
+) -> Option<Vec<(String, SocketAddr)>> {
+    // Send the query
+    if let Err(e) = client
+        .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+        .await
+    {
+        tracing::warn!(
+            attempt,
+            node = node_name,
+            error = %e,
+            "Failed to send query, will retry..."
+        );
+        return None;
+    }
+
+    // Wait for response with timeout
+    match tokio::time::timeout(timeout, client.recv()).await {
+        Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }))) => Some(peers),
+        Ok(Ok(other)) => {
+            // Unexpected response - could be out-of-order notification
+            tracing::warn!(
+                attempt,
+                node = node_name,
+                ?other,
+                "Unexpected response, will retry..."
+            );
+            None
+        }
+        Ok(Err(e)) => {
+            // WebSocket error
+            tracing::warn!(
+                attempt,
+                node = node_name,
+                error = %e,
+                "WebSocket error, will retry..."
+            );
+            None
+        }
+        Err(_elapsed) => {
+            // Timeout
+            tracing::warn!(
+                attempt,
+                node = node_name,
+                timeout_secs = timeout.as_secs(),
+                "Query timed out, will retry..."
+            );
+            None
+        }
+    }
+}
 
 /// Test gateway reconnection:
 /// 1. Start a gateway and a peer connected to it
@@ -265,8 +328,6 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
     tokio_worker_threads = 4
 )]
 async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResult {
-    use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
-
     // Load test contract
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
@@ -327,11 +388,12 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     //   - GET: ~30s
     //   - Safety margin: ~30s for CI variability
     const MESH_FORMATION_TIMEOUT: Duration = Duration::from_secs(90);
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
     const RETRY_DELAY: Duration = Duration::from_secs(2);
     let mesh_deadline = tokio::time::Instant::now() + MESH_FORMATION_TIMEOUT;
     let mut mesh_established = false;
     let mut last_snapshot = (String::new(), String::new(), String::new());
-    let mut attempt = 0;
+    let mut attempt: u32 = 0;
 
     while tokio::time::Instant::now() < mesh_deadline {
         attempt += 1;
@@ -346,40 +408,31 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
             );
         }
         tracing::info!(
-            "Attempt {} ({}s remaining): Querying all nodes for connected peers...",
             attempt,
-            remaining_secs
+            remaining_secs,
+            "Querying all nodes for connected peers..."
         );
 
-        // Query each node for connections
-        client_gw
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await?;
-        let gw_resp = tokio::time::timeout(Duration::from_secs(10), client_gw.recv()).await?;
-        let gw_peers = match gw_resp {
-            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
-            Ok(other) => bail!("Unexpected response from gateway: {:?}", other),
-            Err(e) => bail!("Error receiving gateway response: {}", e),
+        // Query each node for connections using resilient helper
+        let Some(gw_peers) =
+            query_connected_peers(&mut client_gw, "gateway", QUERY_TIMEOUT, attempt).await
+        else {
+            tokio::time::sleep(RETRY_DELAY).await;
+            continue;
         };
 
-        client1
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await?;
-        let peer1_resp = tokio::time::timeout(Duration::from_secs(10), client1.recv()).await?;
-        let peer1_peers = match peer1_resp {
-            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
-            Ok(other) => bail!("Unexpected response from peer1: {:?}", other),
-            Err(e) => bail!("Error receiving peer1 response: {}", e),
+        let Some(peer1_peers) =
+            query_connected_peers(&mut client1, "peer1", QUERY_TIMEOUT, attempt).await
+        else {
+            tokio::time::sleep(RETRY_DELAY).await;
+            continue;
         };
 
-        client2
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await?;
-        let peer2_resp = tokio::time::timeout(Duration::from_secs(10), client2.recv()).await?;
-        let peer2_peers = match peer2_resp {
-            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => peers,
-            Ok(other) => bail!("Unexpected response from peer2: {:?}", other),
-            Err(e) => bail!("Error receiving peer2 response: {}", e),
+        let Some(peer2_peers) =
+            query_connected_peers(&mut client2, "peer2", QUERY_TIMEOUT, attempt).await
+        else {
+            tokio::time::sleep(RETRY_DELAY).await;
+            continue;
         };
 
         // Use println! for first 5 attempts to ensure visibility in CI stdout
@@ -391,9 +444,12 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
                 peer2_peers.len()
             );
         }
-        tracing::info!("  - Gateway has {} connections", gw_peers.len());
-        tracing::info!("  - Peer1 has {} connections", peer1_peers.len());
-        tracing::info!("  - Peer2 has {} connections", peer2_peers.len());
+        tracing::info!(
+            gateway_connections = gw_peers.len(),
+            peer1_connections = peer1_peers.len(),
+            peer2_connections = peer2_peers.len(),
+            "Connection counts"
+        );
         tracing::debug!("Gateway peers: {:?}", gw_peers);
         tracing::debug!("Peer1 peers: {:?}", peer1_peers);
         tracing::debug!("Peer2 peers: {:?}", peer2_peers);
@@ -425,10 +481,10 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
             let is_full_mesh =
                 gw_peers.len() >= 2 && peer1_peers.len() >= 2 && peer2_peers.len() >= 2;
             if is_full_mesh {
-                tracing::info!("✅ Full mesh connectivity established!");
+                tracing::info!("Full mesh connectivity established!");
             } else {
                 tracing::info!(
-                    "✅ Minimum connectivity achieved (all nodes connected, network is reachable)"
+                    "Minimum connectivity achieved (all nodes connected, network is reachable)"
                 );
             }
             mesh_established = true;
@@ -696,8 +752,6 @@ async fn perform_put_with_retries(
     tokio_worker_threads = 4
 )]
 async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext) -> TestResult {
-    use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
-
     let gateway = ctx.node("gateway")?;
     let peer = ctx.node("peer")?;
 
@@ -721,14 +775,13 @@ async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext)
     // even after the connection was established. This test verifies that once the
     // connection is established, the identity IS visible (within a reasonable timeout).
     const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
-    const RETRY_DELAY: Duration = Duration::from_secs(2);
-    // Increased query timeout for CI environments under heavy load
     const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+    const RETRY_DELAY: Duration = Duration::from_secs(2);
     let deadline = tokio::time::Instant::now() + CONNECTION_TIMEOUT;
 
     let mut gw_peers = Vec::new();
     let mut peer_peers = Vec::new();
-    let mut attempt = 0;
+    let mut attempt: u32 = 0;
 
     while tokio::time::Instant::now() < deadline {
         attempt += 1;
@@ -742,85 +795,23 @@ async fn test_gateway_reports_peer_identity_after_connect(ctx: &mut TestContext)
             "Querying nodes for connected peers..."
         );
 
-        // Query gateway for connections - handle errors gracefully within retry loop
-        if let Err(e) = client_gw
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await
-        {
-            tracing::warn!(attempt, error = %e, "Failed to send query to gateway, retrying...");
+        // Query both nodes using resilient helper
+        let Some(gw_result) =
+            query_connected_peers(&mut client_gw, "gateway", QUERY_TIMEOUT, attempt).await
+        else {
             tokio::time::sleep(RETRY_DELAY).await;
             continue;
-        }
-
-        gw_peers = match tokio::time::timeout(QUERY_TIMEOUT, client_gw.recv()).await {
-            Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }))) => peers,
-            Ok(Ok(other)) => {
-                // Unexpected response - log and retry (could be out-of-order notification)
-                tracing::warn!(
-                    attempt,
-                    ?other,
-                    "Unexpected response from gateway, retrying..."
-                );
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
-            Ok(Err(e)) => {
-                // WebSocket error - log and retry
-                tracing::warn!(attempt, error = %e, "Error receiving gateway response, retrying...");
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
-            Err(_elapsed) => {
-                // Timeout - log and retry (CI environments can be slow)
-                tracing::warn!(
-                    attempt,
-                    timeout_secs = QUERY_TIMEOUT.as_secs(),
-                    "Timeout waiting for gateway response, retrying..."
-                );
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
         };
 
-        // Query peer for connections - handle errors gracefully within retry loop
-        if let Err(e) = client_peer
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await
-        {
-            tracing::warn!(attempt, error = %e, "Failed to send query to peer, retrying...");
+        let Some(peer_result) =
+            query_connected_peers(&mut client_peer, "peer", QUERY_TIMEOUT, attempt).await
+        else {
             tokio::time::sleep(RETRY_DELAY).await;
             continue;
-        }
-
-        peer_peers = match tokio::time::timeout(QUERY_TIMEOUT, client_peer.recv()).await {
-            Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }))) => peers,
-            Ok(Ok(other)) => {
-                // Unexpected response - log and retry
-                tracing::warn!(
-                    attempt,
-                    ?other,
-                    "Unexpected response from peer, retrying..."
-                );
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
-            Ok(Err(e)) => {
-                // WebSocket error - log and retry
-                tracing::warn!(attempt, error = %e, "Error receiving peer response, retrying...");
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
-            Err(_elapsed) => {
-                // Timeout - log and retry
-                tracing::warn!(
-                    attempt,
-                    timeout_secs = QUERY_TIMEOUT.as_secs(),
-                    "Timeout waiting for peer response, retrying..."
-                );
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
         };
+
+        gw_peers = gw_result;
+        peer_peers = peer_result;
 
         tracing::info!(
             gateway_connections = gw_peers.len(),
