@@ -476,7 +476,14 @@ impl Operation for SubscribeOp {
 
                     // Convert to KnownPeerKeyLocation for compile-time address guarantee
                     let next_hop_known = KnownPeerKeyLocation::try_from(next_hop)
-                        .map_err(|_| RingError::NoCachingPeers(*instance_id))?;
+                        .map_err(|e| {
+                            tracing::error!(
+                                tx = %id,
+                                pub_key = %e.pub_key,
+                                "INTERNAL ERROR: next_hop has unknown address - routing selected peer without address"
+                            );
+                            RingError::NoCachingPeers(*instance_id)
+                        })?;
                     let next_addr = next_hop_known.socket_addr();
                     new_skip_list.insert(next_addr);
 

@@ -1985,9 +1985,20 @@ impl P2pConnManager {
                 transient,
             } => {
                 // Outbound peers must have known addresses - use type-safe conversion
-                let peer_addr = KnownPeerKeyLocation::try_from(&peer)
-                    .map(|k| k.socket_addr())
-                    .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+                // If conversion fails, log error but continue since connection is established
+                let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
+                    Ok(k) => k.socket_addr(),
+                    Err(e) => {
+                        tracing::error!(
+                            transaction = %transaction,
+                            pub_key = %e.pub_key,
+                            "INTERNAL ERROR: outbound connection established but peer has unknown address"
+                        );
+                        // Use peer's pub_key in log, but we need an address for downstream logging
+                        // This should never happen, so use unspecified as last resort
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                    }
+                };
                 tracing::info!(
                     remote = %peer_addr,
                     transient,
@@ -2007,10 +2018,13 @@ impl P2pConnManager {
                 // Outbound peers must have known addresses - extract once for reuse
                 let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
                     Ok(k) => k.socket_addr(),
-                    Err(_) => {
-                        tracing::warn!(
+                    Err(e) => {
+                        // This is an internal consistency error - we initiated this connection,
+                        // so we should always know the target address
+                        tracing::error!(
                             transaction = %transaction,
-                            "Outbound connection failed but peer has unknown address"
+                            pub_key = %e.pub_key,
+                            "INTERNAL ERROR: outbound connection failed but peer has unknown address"
                         );
                         return Ok(());
                     }

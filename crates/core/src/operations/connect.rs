@@ -438,7 +438,20 @@ impl RelayState {
         //
         // The joiner must have a known address by this point (filled in by first relay).
         // If conversion fails, we cannot accept - the joiner's address is still unknown.
-        let joiner_known = KnownPeerKeyLocation::try_from(&self.request.joiner).ok();
+        let joiner_known = match KnownPeerKeyLocation::try_from(&self.request.joiner) {
+            Ok(known) => Some(known),
+            Err(e) => {
+                // This is an internal consistency error - by this point in the connect flow,
+                // the joiner's address should have been filled in by the first relay.
+                // Log as error to aid debugging of NAT traversal or protocol issues.
+                tracing::error!(
+                    joiner_pub_key = %e.pub_key,
+                    upstream_addr = %self.upstream_addr,
+                    "INTERNAL ERROR: joiner has unknown address at acceptance check - first relay should have filled this in"
+                );
+                None
+            }
+        };
         if is_terminus
             && !self.accepted_locally
             && self.forwarded_to.is_none()

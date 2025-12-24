@@ -257,7 +257,14 @@ impl Operation for UpdateOp {
                                 // Get broadcast targets for propagating UPDATE to subscribers
                                 // Convert to KnownPeerKeyLocation for compile-time address guarantee
                                 let sender_known = KnownPeerKeyLocation::try_from(&request_sender)
-                                    .map_err(|_| OpError::invalid_transition(*id))?;
+                                    .map_err(|e| {
+                                        tracing::error!(
+                                            tx = %id,
+                                            pub_key = %e.pub_key,
+                                            "INTERNAL ERROR: request_sender has unknown address - sender should always have known address"
+                                        );
+                                        OpError::invalid_transition(*id)
+                                    })?;
                                 let sender_addr = sender_known.socket_addr();
                                 let broadcast_to =
                                     op_manager.get_broadcast_targets_update(key, &sender_addr);
