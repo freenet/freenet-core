@@ -15,7 +15,7 @@ use commands::{service::ServiceCommand, update::UpdateCommand};
 /// Freenet - A distributed, decentralized, and censorship-resistant platform
 #[derive(Parser, Debug)]
 #[command(name = "freenet")]
-#[command(version, about, long_about = None)]
+#[command(about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
