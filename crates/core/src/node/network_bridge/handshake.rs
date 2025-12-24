@@ -271,8 +271,11 @@ fn spawn_outbound(
                 Err(_) => Err(ConnectionError::Timeout),
             };
 
-        if let Some(flag) = &peer_ready {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Only mark peer as ready after a successful connection
+        if result.is_ok() {
+            if let Some(flag) = &peer_ready {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
 
         let event = match result {

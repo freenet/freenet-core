@@ -832,4 +832,6 @@ pub(crate) enum RingError {
     EmptyRing,
     #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
     NoCachingPeers(ContractInstanceId),
+    #[error("Peer has not joined the network yet (no ring location established)")]
+    PeerNotJoined,
 }
