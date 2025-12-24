@@ -48,7 +48,7 @@ pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
 pub use location::{Distance, Location};
 #[allow(unused_imports)] // PeerAddr will be used as refactoring progresses
-pub use peer_key_location::{PeerAddr, PeerKeyLocation};
+pub use peer_key_location::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation, UnknownAddressError};
 
 /// Thread safe and friendly data structure to keep track of the local knowledge
 /// of the state of the ring.
