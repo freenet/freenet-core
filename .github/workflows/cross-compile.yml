@@ -8,7 +8,7 @@ on:
     tags: ['v*']
 
 jobs:
-  build-x86_64:
+  build-x86_64-linux:
     name: Build for x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -34,16 +34,16 @@ jobs:
       - name: Upload freenet binary
         uses: actions/upload-artifact@v6
         with:
-          name: binaries-x86_64-freenet
+          name: binaries-x86_64-linux-freenet
           path: target/release/freenet
 
       - name: Upload fdev binary
         uses: actions/upload-artifact@v6
         with:
-          name: binaries-x86_64-fdev
+          name: binaries-x86_64-linux-fdev
           path: target/release/fdev
 
-  build-arm64:
+  build-arm64-linux:
     name: Build for aarch64-unknown-linux-gnu
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
@@ -66,57 +66,156 @@ jobs:
       - name: Upload freenet binary
         uses: actions/upload-artifact@v6
         with:
-          name: binaries-arm64-freenet
+          name: binaries-arm64-linux-freenet
           path: target/release/freenet
 
       - name: Upload fdev binary
         uses: actions/upload-artifact@v6
         with:
-          name: binaries-arm64-fdev
+          name: binaries-arm64-linux-fdev
+          path: target/release/fdev
+
+  build-x86_64-macos:
+    name: Build for x86_64-apple-darwin
+    runs-on: macos-13  # Intel Mac runner
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compile for x86_64-apple-darwin
+        run: cargo build --release
+
+      - name: Upload freenet binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: binaries-x86_64-macos-freenet
+          path: target/release/freenet
+
+      - name: Upload fdev binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: binaries-x86_64-macos-fdev
+          path: target/release/fdev
+
+  build-arm64-macos:
+    name: Build for aarch64-apple-darwin
+    runs-on: macos-latest  # Apple Silicon runner
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compile for aarch64-apple-darwin
+        run: cargo build --release
+
+      - name: Upload freenet binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: binaries-arm64-macos-freenet
+          path: target/release/freenet
+
+      - name: Upload fdev binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: binaries-arm64-macos-fdev
           path: target/release/fdev
 
   attach-to-release:
     name: Attach binaries to GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [build-x86_64, build-arm64]
+    needs: [build-x86_64-linux, build-arm64-linux, build-x86_64-macos, build-arm64-macos]
     if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
       contents: write
 
     steps:
-      - name: Download x86_64 freenet binary
+      # Linux x86_64
+      - name: Download x86_64 Linux freenet binary
         uses: actions/download-artifact@v7
         with:
-          name: binaries-x86_64-freenet
-          path: artifacts/x86_64-freenet
+          name: binaries-x86_64-linux-freenet
+          path: artifacts/x86_64-linux-freenet
 
-      - name: Download x86_64 fdev binary
+      - name: Download x86_64 Linux fdev binary
         uses: actions/download-artifact@v7
         with:
-          name: binaries-x86_64-fdev
-          path: artifacts/x86_64-fdev
+          name: binaries-x86_64-linux-fdev
+          path: artifacts/x86_64-linux-fdev
 
-      - name: Download ARM64 freenet binary
+      # Linux ARM64
+      - name: Download ARM64 Linux freenet binary
         uses: actions/download-artifact@v7
         with:
-          name: binaries-arm64-freenet
-          path: artifacts/arm64-freenet
+          name: binaries-arm64-linux-freenet
+          path: artifacts/arm64-linux-freenet
 
-      - name: Download ARM64 fdev binary
+      - name: Download ARM64 Linux fdev binary
         uses: actions/download-artifact@v7
         with:
-          name: binaries-arm64-fdev
-          path: artifacts/arm64-fdev
+          name: binaries-arm64-linux-fdev
+          path: artifacts/arm64-linux-fdev
+
+      # macOS x86_64
+      - name: Download x86_64 macOS freenet binary
+        uses: actions/download-artifact@v7
+        with:
+          name: binaries-x86_64-macos-freenet
+          path: artifacts/x86_64-macos-freenet
+
+      - name: Download x86_64 macOS fdev binary
+        uses: actions/download-artifact@v7
+        with:
+          name: binaries-x86_64-macos-fdev
+          path: artifacts/x86_64-macos-fdev
+
+      # macOS ARM64
+      - name: Download ARM64 macOS freenet binary
+        uses: actions/download-artifact@v7
+        with:
+          name: binaries-arm64-macos-freenet
+          path: artifacts/arm64-macos-freenet
+
+      - name: Download ARM64 macOS fdev binary
+        uses: actions/download-artifact@v7
+        with:
+          name: binaries-arm64-macos-fdev
+          path: artifacts/arm64-macos-fdev
 
       - name: Prepare release assets
         run: |
           # Create tar.gz files for each binary with binstall-compatible naming
-          cd artifacts/x86_64-freenet && tar -czvf ../../freenet-x86_64-unknown-linux-gnu.tar.gz freenet && cd ../..
-          cd artifacts/x86_64-fdev && tar -czvf ../../fdev-x86_64-unknown-linux-gnu.tar.gz fdev && cd ../..
-          cd artifacts/arm64-freenet && tar -czvf ../../freenet-aarch64-unknown-linux-gnu.tar.gz freenet && cd ../..
-          cd artifacts/arm64-fdev && tar -czvf ../../fdev-aarch64-unknown-linux-gnu.tar.gz fdev && cd ../..
+          # Linux x86_64
+          cd artifacts/x86_64-linux-freenet && tar -czvf ../../freenet-x86_64-unknown-linux-gnu.tar.gz freenet && cd ../..
+          cd artifacts/x86_64-linux-fdev && tar -czvf ../../fdev-x86_64-unknown-linux-gnu.tar.gz fdev && cd ../..
+
+          # Linux ARM64
+          cd artifacts/arm64-linux-freenet && tar -czvf ../../freenet-aarch64-unknown-linux-gnu.tar.gz freenet && cd ../..
+          cd artifacts/arm64-linux-fdev && tar -czvf ../../fdev-aarch64-unknown-linux-gnu.tar.gz fdev && cd ../..
+
+          # macOS x86_64
+          cd artifacts/x86_64-macos-freenet && tar -czvf ../../freenet-x86_64-apple-darwin.tar.gz freenet && cd ../..
+          cd artifacts/x86_64-macos-fdev && tar -czvf ../../fdev-x86_64-apple-darwin.tar.gz fdev && cd ../..
+
+          # macOS ARM64
+          cd artifacts/arm64-macos-freenet && tar -czvf ../../freenet-aarch64-apple-darwin.tar.gz freenet && cd ../..
+          cd artifacts/arm64-macos-fdev && tar -czvf ../../fdev-aarch64-apple-darwin.tar.gz fdev && cd ../..
 
           # Display the created files
           ls -lh *.tar.gz
@@ -134,5 +233,9 @@ jobs:
             fdev-x86_64-unknown-linux-gnu.tar.gz \
             freenet-aarch64-unknown-linux-gnu.tar.gz \
             fdev-aarch64-unknown-linux-gnu.tar.gz \
+            freenet-x86_64-apple-darwin.tar.gz \
+            fdev-x86_64-apple-darwin.tar.gz \
+            freenet-aarch64-apple-darwin.tar.gz \
+            fdev-aarch64-apple-darwin.tar.gz \
             --repo ${{ github.repository }} \
             --clobber
