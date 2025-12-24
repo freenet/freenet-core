@@ -100,6 +100,7 @@ libc = "0.2"  # For sendmmsg syscall batching on Linux
 winapi = { version = "0.3", features = ["sysinfoapi"] }
 wmi = "0.18.0"
 serde = { version = "1.0", features = ["derive"] }
+zip = "7"
 
 [dev-dependencies]
 arbitrary = { features = ["derive"], version = "1" }

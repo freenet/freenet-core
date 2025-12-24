@@ -392,33 +392,222 @@ fn restart_service() -> Result<()> {
     start_service()
 }
 
+// Windows implementation
+// Note: Windows service management requires either:
+// 1. Running as a Windows Service (requires service registration)
+// 2. Using Task Scheduler for user-level autostart
+// For now, we provide Task Scheduler-based autostart
+
+#[cfg(target_os = "windows")]
+fn install_service() -> Result<()> {
+    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
+    let exe_path_str = exe_path
+        .to_str()
+        .context("Executable path contains invalid UTF-8")?;
+
+    // Use Task Scheduler to run at login
+    // schtasks /create /tn "Freenet" /tr "path\to\freenet.exe network" /sc onlogon /rl highest
+    let status = std::process::Command::new("schtasks")
+        .args([
+            "/create",
+            "/tn",
+            "Freenet",
+            "/tr",
+            &format!("\"{}\" network", exe_path_str),
+            "/sc",
+            "onlogon",
+            "/rl",
+            "highest",
+            "/f", // Force overwrite if exists
+        ])
+        .status()
+        .context("Failed to create scheduled task")?;
+
+    if !status.success() {
+        anyhow::bail!("Failed to create scheduled task. You may need to run as Administrator.");
+    }
+
+    println!("Freenet scheduled task installed successfully.");
+    println!();
+    println!("To start Freenet now:");
+    println!("  freenet service start");
+    println!();
+    println!("Freenet will start automatically when you log in.");
+    println!();
+    println!("Note: For production use, consider running Freenet as a Windows Service.");
+    println!("See: https://freenet.org/docs/windows-service");
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_service() -> Result<()> {
+    // Stop if running
+    let _ = std::process::Command::new("schtasks")
+        .args(["/end", "/tn", "Freenet"])
+        .status();
+
+    // Delete the task
+    let status = std::process::Command::new("schtasks")
+        .args(["/delete", "/tn", "Freenet", "/f"])
+        .status()
+        .context("Failed to delete scheduled task")?;
+
+    if !status.success() {
+        anyhow::bail!("Failed to delete scheduled task. It may not exist or you may need Administrator privileges.");
+    }
+
+    println!("Freenet scheduled task uninstalled.");
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn service_status() -> Result<()> {
+    let output = std::process::Command::new("schtasks")
+        .args(["/query", "/tn", "Freenet", "/v", "/fo", "list"])
+        .output()
+        .context("Failed to query scheduled task")?;
+
+    if output.status.success() {
+        println!("Freenet scheduled task is installed.");
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    } else {
+        println!("Freenet scheduled task is not installed.");
+        std::process::exit(3);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn start_service() -> Result<()> {
+    let status = std::process::Command::new("schtasks")
+        .args(["/run", "/tn", "Freenet"])
+        .status()
+        .context("Failed to start scheduled task")?;
+
+    if status.success() {
+        println!("Freenet started.");
+    } else {
+        anyhow::bail!("Failed to start Freenet. Make sure the scheduled task is installed.");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn stop_service() -> Result<()> {
+    let status = std::process::Command::new("schtasks")
+        .args(["/end", "/tn", "Freenet"])
+        .status()
+        .context("Failed to stop scheduled task")?;
+
+    if status.success() {
+        println!("Freenet stopped.");
+    } else {
+        anyhow::bail!("Failed to stop Freenet. It may not be running.");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn restart_service() -> Result<()> {
+    let _ = stop_service();
+    // Give it a moment to stop
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    start_service()
+}
+
 // Fallback for unsupported platforms
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn install_service() -> Result<()> {
     anyhow::bail!("Service installation is not supported on this platform")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn uninstall_service() -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn service_status() -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn start_service() -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn stop_service() -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn restart_service() -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_systemd_service_file_generation() {
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let service_content = generate_service_file(&binary_path);
+
+        // Verify the service file contains expected sections
+        assert!(service_content.contains("[Unit]"));
+        assert!(service_content.contains("[Service]"));
+        assert!(service_content.contains("[Install]"));
+
+        // Verify it references the correct binary
+        assert!(service_content.contains("/usr/local/bin/freenet network"));
+
+        // Verify resource limits are set
+        assert!(service_content.contains("LimitNOFILE=65536"));
+        assert!(service_content.contains("MemoryMax=2G"));
+        assert!(service_content.contains("CPUQuota=200%"));
+
+        // Verify restart configuration
+        assert!(service_content.contains("Restart=on-failure"));
+        assert!(service_content.contains("RestartSec=10"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_launchd_plist_generation() {
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let log_dir = PathBuf::from("/Users/test/Library/Logs/freenet");
+        let plist_content = generate_plist(&binary_path, &log_dir);
+
+        // Verify it's valid plist structure
+        assert!(plist_content.contains("<?xml version=\"1.0\""));
+        assert!(plist_content.contains("<plist version=\"1.0\">"));
+        assert!(plist_content.contains("</plist>"));
+
+        // Verify the label is set
+        assert!(plist_content.contains("<string>org.freenet.node</string>"));
+
+        // Verify it references the correct binary
+        assert!(plist_content.contains("/usr/local/bin/freenet"));
+
+        // Verify log paths are set correctly
+        assert!(plist_content.contains("/Users/test/Library/Logs/freenet/freenet.log"));
+        assert!(plist_content.contains("/Users/test/Library/Logs/freenet/freenet.error.log"));
+
+        // Verify resource limits are set
+        assert!(plist_content.contains("<key>NumberOfFiles</key>"));
+        assert!(plist_content.contains("<integer>65536</integer>"));
+
+        // Verify RunAtLoad is set
+        assert!(plist_content.contains("<key>RunAtLoad</key>"));
+        assert!(plist_content.contains("<true/>"));
+    }
 }

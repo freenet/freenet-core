@@ -63,7 +63,8 @@ impl UpdateCommand {
 
     async fn download_and_install(&self, release: &Release) -> Result<()> {
         let target = get_target_triple();
-        let asset_name = format!("freenet-{}.tar.gz", target);
+        let extension = get_archive_extension();
+        let asset_name = format!("freenet-{}.{}", target, extension);
 
         let asset = release
             .assets
@@ -82,11 +83,41 @@ impl UpdateCommand {
                 )
             })?;
 
+        // Try to get checksums
+        let checksums = if let Some(checksums_asset) =
+            release.assets.iter().find(|a| a.name == "SHA256SUMS.txt")
+        {
+            println!("Downloading checksums...");
+            match download_checksums(&checksums_asset.browser_download_url).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("Warning: Failed to download checksums: {}. Continuing without verification.", e);
+                    None
+                }
+            }
+        } else {
+            eprintln!("Warning: SHA256SUMS.txt not found in release. Continuing without checksum verification.");
+            None
+        };
+
         // Download to temp file
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
         let archive_path = temp_dir.path().join(&asset_name);
 
         download_file(&asset.browser_download_url, &archive_path).await?;
+
+        // Verify checksum if available
+        if let Some(ref checksums) = checksums {
+            if let Some(expected_hash) = checksums.get(&asset_name) {
+                println!("Verifying checksum...");
+                verify_checksum(&archive_path, expected_hash)?;
+            } else {
+                eprintln!(
+                    "Warning: Checksum not found for {}. Continuing without verification.",
+                    asset_name
+                );
+            }
+        }
 
         // Extract archive
         let extracted_binary = extract_binary(&archive_path, temp_dir.path())?;
@@ -135,6 +166,31 @@ struct Asset {
     browser_download_url: String,
 }
 
+/// SHA256 checksums parsed from SHA256SUMS.txt
+struct Checksums {
+    entries: std::collections::HashMap<String, String>,
+}
+
+impl Checksums {
+    fn parse(content: &str) -> Self {
+        let mut entries = std::collections::HashMap::new();
+        for line in content.lines() {
+            // Format: "hash  filename" or "hash filename"
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let hash = parts[0].to_string();
+                let filename = parts[1].to_string();
+                entries.insert(filename, hash);
+            }
+        }
+        Self { entries }
+    }
+
+    fn get(&self, filename: &str) -> Option<&str> {
+        self.entries.get(filename).map(|s| s.as_str())
+    }
+}
+
 async fn get_latest_release() -> Result<Release> {
     let client = reqwest::Client::builder()
         .user_agent("freenet-updater")
@@ -160,6 +216,46 @@ async fn get_latest_release() -> Result<Release> {
         .context("Failed to parse release info")
 }
 
+async fn download_checksums(url: &str) -> Result<Checksums> {
+    let client = reqwest::Client::builder()
+        .user_agent("freenet-updater")
+        .build()?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("Failed to download checksums")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Failed to download checksums: {}", response.status());
+    }
+
+    let content = response.text().await.context("Failed to read checksums")?;
+    Ok(Checksums::parse(&content))
+}
+
+fn verify_checksum(file_path: &Path, expected_hash: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = File::open(file_path).context("Failed to open file for checksum")?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).context("Failed to read file for checksum")?;
+    let result = hasher.finalize();
+    let actual_hash = format!("{:x}", result);
+
+    if actual_hash != expected_hash {
+        anyhow::bail!(
+            "Checksum verification failed!\nExpected: {}\nGot:      {}\n\
+             The download may be corrupted or tampered with.",
+            expected_hash,
+            actual_hash
+        );
+    }
+
+    Ok(())
+}
+
 fn get_target_triple() -> &'static str {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
@@ -177,14 +273,31 @@ fn get_target_triple() -> &'static str {
     {
         "aarch64-apple-darwin"
     }
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        "x86_64-pc-windows-msvc"
+    }
     #[cfg(not(any(
         all(target_arch = "x86_64", target_os = "linux"),
         all(target_arch = "aarch64", target_os = "linux"),
         all(target_arch = "x86_64", target_os = "macos"),
         all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "windows"),
     )))]
     {
         "unknown"
+    }
+}
+
+/// Get the archive extension for the current platform
+fn get_archive_extension() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "zip"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "tar.gz"
     }
 }
 
@@ -228,51 +341,30 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
 }
 
 fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
-    let file = File::open(archive_path).context("Failed to open archive")?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-
     // Extract with path traversal protection
     let dest_dir_canonical = dest_dir
         .canonicalize()
         .context("Failed to canonicalize dest dir")?;
 
-    for entry in archive
-        .entries()
-        .context("Failed to read archive entries")?
-    {
-        let mut entry = entry.context("Failed to read archive entry")?;
-        let path = entry.path().context("Failed to get entry path")?;
+    // Determine archive type from extension
+    let is_zip = archive_path
+        .extension()
+        .map(|ext| ext == "zip")
+        .unwrap_or(false);
 
-        // Security: Prevent path traversal attacks by ensuring extracted path is within dest_dir
-        let entry_dest = dest_dir.join(&path);
-        let entry_canonical = entry_dest
-            .canonicalize()
-            .unwrap_or_else(|_| entry_dest.clone());
-
-        // For new files, check parent directory is within dest_dir
-        let check_path = if entry_canonical.exists() {
-            entry_canonical.clone()
-        } else {
-            entry_dest
-                .parent()
-                .and_then(|p| p.canonicalize().ok())
-                .unwrap_or_else(|| dest_dir_canonical.clone())
-        };
-
-        if !check_path.starts_with(&dest_dir_canonical) {
-            anyhow::bail!(
-                "Security error: archive contains path traversal attempt: {}",
-                path.display()
-            );
-        }
-
-        entry
-            .unpack_in(dest_dir)
-            .context("Failed to extract entry")?;
+    if is_zip {
+        extract_zip(archive_path, dest_dir, &dest_dir_canonical)?;
+    } else {
+        extract_tar_gz(archive_path, dest_dir, &dest_dir_canonical)?;
     }
 
-    let binary_path = dest_dir.join("freenet");
+    // Binary name differs on Windows
+    #[cfg(target_os = "windows")]
+    let binary_name = "freenet.exe";
+    #[cfg(not(target_os = "windows"))]
+    let binary_name = "freenet";
+
+    let binary_path = dest_dir.join(binary_name);
     if !binary_path.exists() {
         anyhow::bail!("Binary not found in archive");
     }
@@ -281,6 +373,94 @@ fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
     verify_binary(&binary_path)?;
 
     Ok(binary_path)
+}
+
+fn extract_tar_gz(archive_path: &Path, dest_dir: &Path, dest_dir_canonical: &Path) -> Result<()> {
+    let file = File::open(archive_path).context("Failed to open archive")?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+
+    for entry in archive
+        .entries()
+        .context("Failed to read archive entries")?
+    {
+        let mut entry = entry.context("Failed to read archive entry")?;
+        let path = entry.path().context("Failed to get entry path")?;
+
+        // Security: Prevent path traversal attacks
+        validate_extract_path(dest_dir, dest_dir_canonical, &path)?;
+
+        entry
+            .unpack_in(dest_dir)
+            .context("Failed to extract entry")?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn extract_zip(archive_path: &Path, dest_dir: &Path, dest_dir_canonical: &Path) -> Result<()> {
+    use std::io::Read;
+
+    let file = File::open(archive_path).context("Failed to open archive")?;
+    let mut archive = zip::ZipArchive::new(file).context("Failed to read zip archive")?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).context("Failed to read zip entry")?;
+        let outpath = match file.enclosed_name() {
+            Some(path) => dest_dir.join(path),
+            None => continue,
+        };
+
+        // Security: Prevent path traversal attacks
+        let outpath_str = outpath.to_string_lossy();
+        validate_extract_path(dest_dir, dest_dir_canonical, Path::new(&*outpath_str))?;
+
+        if file.name().ends_with('/') {
+            fs::create_dir_all(&outpath)?;
+        } else {
+            if let Some(p) = outpath.parent() {
+                if !p.exists() {
+                    fs::create_dir_all(p)?;
+                }
+            }
+            let mut outfile = File::create(&outpath)?;
+            std::io::copy(&mut file, &mut outfile)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn extract_zip(_archive_path: &Path, _dest_dir: &Path, _dest_dir_canonical: &Path) -> Result<()> {
+    anyhow::bail!("Zip extraction is only supported on Windows")
+}
+
+fn validate_extract_path(dest_dir: &Path, dest_dir_canonical: &Path, path: &Path) -> Result<()> {
+    let entry_dest = dest_dir.join(path);
+    let entry_canonical = entry_dest
+        .canonicalize()
+        .unwrap_or_else(|_| entry_dest.clone());
+
+    // For new files, check parent directory is within dest_dir
+    let check_path = if entry_canonical.exists() {
+        entry_canonical
+    } else {
+        entry_dest
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .unwrap_or_else(|| dest_dir_canonical.to_path_buf())
+    };
+
+    if !check_path.starts_with(dest_dir_canonical) {
+        anyhow::bail!(
+            "Security error: archive contains path traversal attempt: {}",
+            path.display()
+        );
+    }
+
+    Ok(())
 }
 
 fn verify_binary(binary_path: &Path) -> Result<()> {
