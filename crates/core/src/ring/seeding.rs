@@ -618,21 +618,24 @@ impl SeedingManager {
             info!(%contract, "subscription succeeded, cleared backoff");
         } else {
             // Apply exponential backoff on failure
-            let new_backoff = if let Some(mut entry) = self.subscription_backoff.get_mut(contract) {
-                let (_last_attempt, ref mut backoff) = *entry;
-                let new_duration = (*backoff * 2).min(MAX_SUBSCRIPTION_BACKOFF);
-                *backoff = new_duration;
-                new_duration
-            } else {
-                INITIAL_SUBSCRIPTION_BACKOFF
-            };
-
-            self.subscription_backoff
-                .insert(*contract, (Instant::now(), new_backoff));
+            let backoff_duration =
+                if let Some(mut entry) = self.subscription_backoff.get_mut(contract) {
+                    // Update existing entry in place
+                    let (ref mut last_attempt, ref mut backoff) = *entry;
+                    *last_attempt = Instant::now();
+                    let new_duration = (*backoff * 2).min(MAX_SUBSCRIPTION_BACKOFF);
+                    *backoff = new_duration;
+                    new_duration
+                } else {
+                    // Insert new entry with initial backoff
+                    self.subscription_backoff
+                        .insert(*contract, (Instant::now(), INITIAL_SUBSCRIPTION_BACKOFF));
+                    INITIAL_SUBSCRIPTION_BACKOFF
+                };
 
             info!(
                 %contract,
-                backoff_secs = new_backoff.as_secs(),
+                backoff_secs = backoff_duration.as_secs(),
                 "subscription failed, applied backoff"
             );
         }
