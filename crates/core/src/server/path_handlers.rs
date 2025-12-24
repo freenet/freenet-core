@@ -264,11 +264,18 @@ async fn get_web_body(path: &Path) -> Result<impl IntoResponse, WebSocketApiErro
     Ok(Html(body))
 }
 
-fn contract_web_path(instance_id: &ContractInstanceId) -> PathBuf {
-    std::env::temp_dir()
-        .join("freenet")
+/// Returns the base directory for webapp cache.
+/// Uses XDG cache directory (~/.cache/freenet on Linux) to avoid permission
+/// conflicts when multiple users run freenet on the same machine.
+fn webapp_cache_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "The Freenet Project Inc", "freenet")
+        .map(|dirs| dirs.cache_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("freenet"))
         .join("webapp_cache")
-        .join(instance_id.encode())
+}
+
+fn contract_web_path(instance_id: &ContractInstanceId) -> PathBuf {
+    webapp_cache_dir().join(instance_id.encode())
 }
 
 fn hash_state(state: &[u8]) -> u64 {
@@ -279,8 +286,5 @@ fn hash_state(state: &[u8]) -> u64 {
 }
 
 fn state_hash_path(instance_id: &ContractInstanceId) -> PathBuf {
-    std::env::temp_dir()
-        .join("freenet")
-        .join("webapp_cache")
-        .join(format!("{}.hash", instance_id.encode()))
+    webapp_cache_dir().join(format!("{}.hash", instance_id.encode()))
 }
