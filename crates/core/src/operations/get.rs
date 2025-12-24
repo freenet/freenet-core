@@ -25,6 +25,11 @@ const MAX_RETRIES: usize = 10;
 /// Maximum number of peer attempts at each hop level
 const DEFAULT_MAX_BREADTH: usize = 3;
 
+/// Minimum number of peers that must return NotFound before we consider
+/// re-seeding the network with our local cache. This prevents spurious
+/// re-seeding from transient routing issues.
+const MIN_PEERS_FOR_RESEED: usize = 2;
+
 pub(crate) fn start_op(
     instance_id: ContractInstanceId,
     fetch_contract: bool,
@@ -1160,34 +1165,53 @@ impl Operation for GetOp {
                                             contract: contract.clone(),
                                         });
 
-                                        // Re-seed the network with our local copy
-                                        // This ensures the contract stays available
-                                        if let Some(contract_code) = contract {
-                                            let put_result = op_manager
-                                                .notify_contract_handler(
-                                                    ContractHandlerEvent::PutQuery {
-                                                        key,
-                                                        state,
-                                                        related_contracts:
-                                                            RelatedContracts::default(),
-                                                        contract: Some(contract_code),
-                                                    },
-                                                )
-                                                .await;
-                                            match put_result {
-                                                Ok(ContractHandlerEvent::PutResponse {
-                                                    new_value: Ok(_),
-                                                }) => {
-                                                    tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
-                                                    super::announce_contract_cached(
-                                                        op_manager, &key,
+                                        // Re-seed the network with our local copy, but only if we've
+                                        // tried enough peers to be confident the contract is truly missing.
+                                        // This prevents spurious re-seeding from transient routing issues.
+                                        let peers_tried = tried_peers.len();
+                                        if peers_tried >= MIN_PEERS_FOR_RESEED {
+                                            if let Some(contract_code) = contract {
+                                                tracing::info!(
+                                                    tx = %id,
+                                                    %key,
+                                                    peers_tried,
+                                                    "Re-seeding network after {} peers returned NotFound",
+                                                    peers_tried
+                                                );
+                                                let put_result = op_manager
+                                                    .notify_contract_handler(
+                                                        ContractHandlerEvent::PutQuery {
+                                                            key,
+                                                            state,
+                                                            related_contracts:
+                                                                RelatedContracts::default(),
+                                                            contract: Some(contract_code),
+                                                        },
                                                     )
                                                     .await;
-                                                }
-                                                _ => {
-                                                    tracing::warn!(tx = %id, %key, "Failed to re-seed contract");
+                                                match put_result {
+                                                    Ok(ContractHandlerEvent::PutResponse {
+                                                        new_value: Ok(_),
+                                                    }) => {
+                                                        tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
+                                                        super::announce_contract_cached(
+                                                            op_manager, &key,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    _ => {
+                                                        tracing::warn!(tx = %id, %key, "Failed to re-seed contract");
+                                                    }
                                                 }
                                             }
+                                        } else {
+                                            tracing::debug!(
+                                                tx = %id,
+                                                %key,
+                                                peers_tried,
+                                                min_required = MIN_PEERS_FOR_RESEED,
+                                                "Skipping re-seed: insufficient peer confirmations"
+                                            );
                                         }
                                     } else {
                                         // No local fallback - operation failed
@@ -1250,33 +1274,52 @@ impl Operation for GetOp {
                                             contract: contract.clone(),
                                         });
 
-                                        // Re-seed the network with our local copy
-                                        if let Some(contract_code) = contract {
-                                            let put_result = op_manager
-                                                .notify_contract_handler(
-                                                    ContractHandlerEvent::PutQuery {
-                                                        key,
-                                                        state,
-                                                        related_contracts:
-                                                            RelatedContracts::default(),
-                                                        contract: Some(contract_code),
-                                                    },
-                                                )
-                                                .await;
-                                            match put_result {
-                                                Ok(ContractHandlerEvent::PutResponse {
-                                                    new_value: Ok(_),
-                                                }) => {
-                                                    tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
-                                                    super::announce_contract_cached(
-                                                        op_manager, &key,
+                                        // Re-seed the network with our local copy, but only if we've
+                                        // tried enough peers to be confident the contract is truly missing.
+                                        let peers_tried = tried_peers.len();
+                                        if peers_tried >= MIN_PEERS_FOR_RESEED {
+                                            if let Some(contract_code) = contract {
+                                                tracing::info!(
+                                                    tx = %id,
+                                                    %key,
+                                                    peers_tried,
+                                                    "Re-seeding network after {} peers returned NotFound (max retries)",
+                                                    peers_tried
+                                                );
+                                                let put_result = op_manager
+                                                    .notify_contract_handler(
+                                                        ContractHandlerEvent::PutQuery {
+                                                            key,
+                                                            state,
+                                                            related_contracts:
+                                                                RelatedContracts::default(),
+                                                            contract: Some(contract_code),
+                                                        },
                                                     )
                                                     .await;
-                                                }
-                                                _ => {
-                                                    tracing::warn!(tx = %id, %key, "Failed to re-seed contract");
+                                                match put_result {
+                                                    Ok(ContractHandlerEvent::PutResponse {
+                                                        new_value: Ok(_),
+                                                    }) => {
+                                                        tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
+                                                        super::announce_contract_cached(
+                                                            op_manager, &key,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    _ => {
+                                                        tracing::warn!(tx = %id, %key, "Failed to re-seed contract");
+                                                    }
                                                 }
                                             }
+                                        } else {
+                                            tracing::debug!(
+                                                tx = %id,
+                                                %key,
+                                                peers_tried,
+                                                min_required = MIN_PEERS_FOR_RESEED,
+                                                "Skipping re-seed: insufficient peer confirmations (max retries)"
+                                            );
                                         }
                                     } else {
                                         // No local fallback - operation failed

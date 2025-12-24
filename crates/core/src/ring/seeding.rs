@@ -256,6 +256,11 @@ impl SeedingManager {
     /// IMPORTANT: We only want to re-subscribe if we have active interest. If a client
     /// disconnects and pruning occurs, we should NOT try to re-subscribe just because
     /// the contract is still in our cache.
+    ///
+    /// PERFORMANCE NOTE: This method iterates all seeded contracts. Callers should use
+    /// `can_request_subscription()` to filter results before spawning subscription
+    /// requests, which provides rate-limiting via exponential backoff. For very large
+    /// caches (10,000+ contracts), consider adding result caching with a short TTL.
     pub fn contracts_without_upstream(&self) -> Vec<ContractKey> {
         // Get all contracts we're seeding from the cache
         let seeded_contracts: Vec<ContractKey> = self.seeding_cache.read().iter().collect();
@@ -1137,5 +1142,208 @@ mod tests {
         // Re-accessing a contract doesn't increase count
         seeding_manager.record_contract_access(key1, 1000, AccessType::Get);
         assert_eq!(seeding_manager.seeding_contracts_count(), 3);
+    }
+
+    // ========== Tests for subscription backoff mechanism ==========
+
+    #[test]
+    fn test_subscription_backoff_initial_allowed() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+
+        // First request should be allowed (no backoff)
+        assert!(manager.can_request_subscription(&contract));
+    }
+
+    #[test]
+    fn test_subscription_backoff_pending_blocks() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+
+        // Mark as pending
+        assert!(manager.mark_subscription_pending(contract));
+
+        // While pending, further requests should be blocked
+        assert!(!manager.can_request_subscription(&contract));
+
+        // And marking pending again should fail
+        assert!(!manager.mark_subscription_pending(contract));
+    }
+
+    #[test]
+    fn test_subscription_backoff_success_clears() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+
+        // Mark pending and complete with success
+        assert!(manager.mark_subscription_pending(contract));
+        manager.complete_subscription_request(&contract, true);
+
+        // Should be allowed again (success clears backoff)
+        assert!(manager.can_request_subscription(&contract));
+    }
+
+    #[test]
+    fn test_subscription_backoff_failure_blocks_temporarily() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+
+        // Mark pending and complete with failure
+        assert!(manager.mark_subscription_pending(contract));
+        manager.complete_subscription_request(&contract, false);
+
+        // Should be blocked due to backoff
+        assert!(
+            !manager.can_request_subscription(&contract),
+            "Should be blocked due to backoff after failure"
+        );
+
+        // Verify backoff was recorded
+        assert!(
+            manager.subscription_backoff.contains_key(&contract),
+            "Backoff entry should exist after failure"
+        );
+    }
+
+    #[test]
+    fn test_subscription_backoff_exponential_growth() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+
+        // First failure: should set initial backoff (5 seconds)
+        assert!(manager.mark_subscription_pending(contract));
+        manager.complete_subscription_request(&contract, false);
+
+        let backoff1 = manager
+            .subscription_backoff
+            .get(&contract)
+            .map(|e| e.1)
+            .unwrap();
+        assert_eq!(backoff1, INITIAL_SUBSCRIPTION_BACKOFF);
+
+        // Simulate time passing past the backoff
+        manager
+            .subscription_backoff
+            .alter(&contract, |_, (_, dur)| {
+                (Instant::now() - dur - Duration::from_secs(1), dur)
+            });
+
+        // Second failure: should double the backoff
+        assert!(manager.mark_subscription_pending(contract));
+        manager.complete_subscription_request(&contract, false);
+
+        let backoff2 = manager
+            .subscription_backoff
+            .get(&contract)
+            .map(|e| e.1)
+            .unwrap();
+        assert_eq!(backoff2, INITIAL_SUBSCRIPTION_BACKOFF * 2);
+    }
+
+    #[test]
+    fn test_subscription_backoff_caps_at_maximum() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+
+        // Set backoff just below max
+        manager.subscription_backoff.insert(
+            contract,
+            (
+                Instant::now() - MAX_SUBSCRIPTION_BACKOFF,
+                MAX_SUBSCRIPTION_BACKOFF / 2,
+            ),
+        );
+
+        // Complete with failure - should cap at MAX
+        assert!(manager.mark_subscription_pending(contract));
+        manager.complete_subscription_request(&contract, false);
+
+        let backoff = manager
+            .subscription_backoff
+            .get(&contract)
+            .map(|e| e.1)
+            .unwrap();
+        assert_eq!(backoff, MAX_SUBSCRIPTION_BACKOFF);
+    }
+
+    // ========== Tests for contracts_without_upstream filtering ==========
+
+    #[test]
+    fn test_contracts_without_upstream_requires_active_interest() {
+        use super::super::seeding_cache::AccessType;
+
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+
+        // Add contract to cache (seeding it)
+        manager.record_contract_access(contract, 1000, AccessType::Put);
+
+        // Contract is cached but has no active interest (no clients, no downstream)
+        let contracts = manager.contracts_without_upstream();
+        assert!(
+            contracts.is_empty(),
+            "Should not include contracts without active interest"
+        );
+
+        // Add a client subscription - now it has active interest
+        let client_id = crate::client_events::ClientId::next();
+        manager.add_client_subscription(contract.id(), client_id);
+
+        let contracts = manager.contracts_without_upstream();
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0], contract);
+    }
+
+    #[test]
+    fn test_contracts_without_upstream_excludes_with_upstream() {
+        use super::super::seeding_cache::AccessType;
+
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+
+        // Add contract to cache
+        manager.record_contract_access(contract, 1000, AccessType::Put);
+
+        // Add client subscription (active interest)
+        let client_id = crate::client_events::ClientId::next();
+        manager.add_client_subscription(contract.id(), client_id);
+
+        // Before adding upstream, should be in list
+        let contracts = manager.contracts_without_upstream();
+        assert_eq!(contracts.len(), 1);
+
+        // Add upstream subscription
+        manager.set_upstream(&contract, upstream);
+
+        // After adding upstream, should NOT be in list
+        let contracts = manager.contracts_without_upstream();
+        assert!(
+            contracts.is_empty(),
+            "Contracts with upstream should not be returned"
+        );
+    }
+
+    #[test]
+    fn test_contracts_without_upstream_with_downstream_only() {
+        use super::super::seeding_cache::AccessType;
+
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let downstream = test_peer_loc(1);
+
+        // Add contract to cache
+        manager.record_contract_access(contract, 1000, AccessType::Put);
+
+        // Add downstream subscriber (no client subscription, but downstream = active interest)
+        manager.add_downstream(&contract, downstream, None).unwrap();
+
+        let contracts = manager.contracts_without_upstream();
+        assert_eq!(
+            contracts.len(),
+            1,
+            "Should include contracts with downstream subscribers"
+        );
+        assert_eq!(contracts[0], contract);
     }
 }
