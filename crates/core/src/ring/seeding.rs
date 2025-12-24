@@ -3,15 +3,22 @@ use super::{Location, PeerKeyLocation};
 use crate::node::PeerId;
 use crate::transport::ObservedAddr;
 use crate::util::time_source::InstantTimeSrc;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Default seeding cache budget: 100MB
 /// This can be made configurable via node configuration in the future.
 const DEFAULT_SEEDING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Initial backoff duration for subscription retries.
+const INITIAL_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Maximum backoff duration for subscription retries.
+const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(300); // 5 minutes
 
 /// Role of a peer in a subscription relationship for a specific contract.
 ///
@@ -100,6 +107,14 @@ pub(crate) struct SeedingManager {
 
     /// LRU cache of contracts this peer is seeding, with byte-budget awareness.
     seeding_cache: RwLock<SeedingCache<InstantTimeSrc>>,
+
+    /// Contracts with subscription requests currently in-flight.
+    /// Prevents duplicate requests for the same contract.
+    pending_subscription_requests: DashSet<ContractKey>,
+
+    /// Exponential backoff state for subscription retries.
+    /// Maps contract to (last_attempt_time, current_backoff_duration).
+    subscription_backoff: DashMap<ContractKey, (Instant, Duration)>,
 }
 
 impl SeedingManager {
@@ -114,6 +129,8 @@ impl SeedingManager {
                 DEFAULT_SEEDING_BUDGET_BYTES,
                 InstantTimeSrc::new(),
             )),
+            pending_subscription_requests: DashSet::new(),
+            subscription_backoff: DashMap::new(),
         }
     }
 
@@ -213,13 +230,35 @@ impl SeedingManager {
     }
 
     /// Get the upstream peer for a contract (if any).
-    #[cfg(test)]
+    #[allow(dead_code)] // Public API for debugging/future use
     pub fn get_upstream(&self, contract: &ContractKey) -> Option<PeerKeyLocation> {
         self.subscriptions.get(contract).and_then(|subs| {
             subs.iter()
                 .find(|e| e.role == SubscriberType::Upstream)
                 .map(|e| e.peer.clone())
         })
+    }
+
+    /// Check if a contract has an upstream subscription.
+    pub fn has_upstream(&self, contract: &ContractKey) -> bool {
+        self.subscriptions
+            .get(contract)
+            .map(|subs| subs.iter().any(|e| e.role == SubscriberType::Upstream))
+            .unwrap_or(false)
+    }
+
+    /// Get all contracts that we're seeding but don't have an upstream subscription for.
+    /// These are contracts where we may be "isolated" from the subscription tree and
+    /// should attempt to establish an upstream connection when possible.
+    pub fn contracts_without_upstream(&self) -> Vec<ContractKey> {
+        // Get all contracts we're seeding from the cache
+        let seeded_contracts: Vec<ContractKey> = self.seeding_cache.read().iter().collect();
+
+        // Filter to only those without upstream
+        seeded_contracts
+            .into_iter()
+            .filter(|key| !self.has_upstream(key))
+            .collect()
     }
 
     /// Get all downstream subscribers for a contract (for broadcast targeting).
@@ -529,6 +568,74 @@ impl SeedingManager {
     /// This is the actual count of contracts this node is caching/seeding.
     pub fn seeding_contracts_count(&self) -> usize {
         self.seeding_cache.read().len()
+    }
+
+    // --- Subscription retry spam prevention ---
+
+    /// Check if a subscription request can be made for a contract.
+    ///
+    /// Returns false if:
+    /// - A subscription request is already in-flight for this contract
+    /// - The contract is in backoff period (recent failed attempt)
+    pub fn can_request_subscription(&self, contract: &ContractKey) -> bool {
+        // Check if request is already in-flight
+        if self.pending_subscription_requests.contains(contract) {
+            debug!(%contract, "subscription request already pending");
+            return false;
+        }
+
+        // Check backoff
+        if let Some(entry) = self.subscription_backoff.get(contract) {
+            let (last_attempt, backoff_duration) = *entry;
+            if last_attempt.elapsed() < backoff_duration {
+                debug!(
+                    %contract,
+                    elapsed_secs = last_attempt.elapsed().as_secs(),
+                    backoff_secs = backoff_duration.as_secs(),
+                    "subscription request in backoff period"
+                );
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Mark a subscription request as in-flight.
+    /// Returns false if already pending (should not proceed with request).
+    pub fn mark_subscription_pending(&self, contract: ContractKey) -> bool {
+        self.pending_subscription_requests.insert(contract)
+    }
+
+    /// Mark a subscription request as completed (success or failure).
+    /// If success is false, applies exponential backoff.
+    pub fn complete_subscription_request(&self, contract: &ContractKey, success: bool) {
+        self.pending_subscription_requests.remove(contract);
+
+        if success {
+            // Clear any backoff on success
+            self.subscription_backoff.remove(contract);
+            info!(%contract, "subscription succeeded, cleared backoff");
+        } else {
+            // Apply exponential backoff on failure
+            let new_backoff = if let Some(mut entry) = self.subscription_backoff.get_mut(contract) {
+                let (_last_attempt, ref mut backoff) = *entry;
+                let new_duration = (*backoff * 2).min(MAX_SUBSCRIPTION_BACKOFF);
+                *backoff = new_duration;
+                new_duration
+            } else {
+                INITIAL_SUBSCRIPTION_BACKOFF
+            };
+
+            self.subscription_backoff
+                .insert(*contract, (Instant::now(), new_backoff));
+
+            info!(
+                %contract,
+                backoff_secs = new_backoff.as_secs(),
+                "subscription failed, applied backoff"
+            );
+        }
     }
 }
 

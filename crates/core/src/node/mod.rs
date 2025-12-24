@@ -1165,6 +1165,90 @@ where
                     from = %source,
                     "Processing ProximityCache message (pure network)"
                 );
+
+                // Check if announced contracts could establish upstream subscriptions.
+                // This runs before handle_message to capture the added contracts.
+                if let crate::message::ProximityCacheMessage::CacheAnnounce { ref added, .. } =
+                    message
+                {
+                    // Check if sender is closer to any contracts we're seeding without upstream
+                    let our_loc = op_manager.ring.connection_manager.own_location();
+                    if let Some(our_location) = our_loc.location() {
+                        // Get sender's location from ring
+                        if let Some(sender_loc) = op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_location_by_addr(source)
+                            .and_then(|p| p.location())
+                        {
+                            let contracts_without_upstream =
+                                op_manager.ring.contracts_without_upstream();
+
+                            for announced_id in added {
+                                // Check if this matches any of our contracts without upstream
+                                for contract in &contracts_without_upstream {
+                                    if contract.id() == announced_id {
+                                        let contract_location =
+                                            crate::ring::Location::from(contract);
+                                        let our_distance = our_location.distance(contract_location);
+                                        let sender_distance =
+                                            sender_loc.distance(contract_location);
+
+                                        // Sender is closer - they might be upstream
+                                        if sender_distance < our_distance
+                                            && op_manager.ring.can_request_subscription(contract)
+                                        {
+                                            tracing::info!(
+                                                %contract,
+                                                %source,
+                                                sender_distance = %sender_distance,
+                                                our_distance = %our_distance,
+                                                "Neighbor with cached contract is closer, attempting subscription"
+                                            );
+
+                                            let contract_key = *contract;
+                                            if op_manager
+                                                .ring
+                                                .mark_subscription_pending(contract_key)
+                                            {
+                                                let op_manager_clone = op_manager.clone();
+                                                tokio::spawn(async move {
+                                                    let instance_id = *contract_key.id();
+                                                    let sub_op =
+                                                        crate::operations::subscribe::start_op(
+                                                            instance_id,
+                                                        );
+                                                    let result =
+                                                        crate::operations::subscribe::request_subscribe(
+                                                            &op_manager_clone,
+                                                            sub_op,
+                                                        )
+                                                        .await;
+
+                                                    let success = result.is_ok();
+                                                    if let Err(ref e) = result {
+                                                        tracing::warn!(
+                                                            %contract_key,
+                                                            error = %e,
+                                                            "Failed to re-establish subscription on cache announce"
+                                                        );
+                                                    }
+                                                    op_manager_clone
+                                                        .ring
+                                                        .complete_subscription_request(
+                                                            &contract_key,
+                                                            success,
+                                                        );
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(response) = op_manager
                     .proximity_cache
                     .handle_message(source, message.clone())

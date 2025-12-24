@@ -189,6 +189,11 @@ impl<T: TimeSource> SeedingCache<T> {
     pub fn keys_lru_order(&self) -> Vec<ContractKey> {
         self.lru_order.iter().cloned().collect()
     }
+
+    /// Iterate over all cached contract keys.
+    pub fn iter(&self) -> impl Iterator<Item = ContractKey> + '_ {
+        self.contracts.keys().cloned()
+    }
 }
 
 #[cfg(test)]
