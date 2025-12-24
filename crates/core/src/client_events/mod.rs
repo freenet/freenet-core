@@ -24,6 +24,7 @@ use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
 use crate::operations::{get, put, update, OpError};
+use crate::ring::KnownPeerKeyLocation;
 use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 // pub(crate) mod admin_endpoints; // TODO: Add axum dependencies
@@ -370,8 +371,13 @@ where
                     (cli_id, Ok(Some(res))) => {
                         let res = match res {
                             QueryResult::Connections(conns) => {
+                                // Connected peers must have known addresses - use type-safe conversion
                                 Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
-                                    peers: conns.into_iter().map(|p| (p.pub_key.to_string(), p.socket_addr().expect("connected peer should have socket address"))).collect() }
+                                    peers: conns.into_iter().filter_map(|p| {
+                                        KnownPeerKeyLocation::try_from(&p).ok().map(|known| {
+                                            (p.pub_key.to_string(), known.socket_addr())
+                                        })
+                                    }).collect() }
                                 ))
                             }
                             QueryResult::GetResult { key, state, contract } => {
@@ -393,8 +399,11 @@ where
                                     }
                                 }).collect();
 
-                                let connected_peers = debug_info.connected_peers.into_iter().map(|peer| {
-                                    (peer.to_string(), peer.socket_addr().expect("connected peer should have socket address"))
+                                // Connected peers must have known addresses - use type-safe conversion
+                                let connected_peers = debug_info.connected_peers.into_iter().filter_map(|peer| {
+                                    KnownPeerKeyLocation::try_from(&peer).ok().map(|known| {
+                                        (peer.to_string(), known.socket_addr())
+                                    })
                                 }).collect();
 
                                 Ok(HostResponse::QueryResponse(QueryResponse::NetworkDebug(

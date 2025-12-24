@@ -44,7 +44,7 @@ use crate::{
         handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager,
         PeerId,
     },
-    ring::PeerKeyLocation,
+    ring::{KnownPeerKeyLocation, PeerKeyLocation},
     tracing::NetEventLog,
 };
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
@@ -132,15 +132,15 @@ impl NetworkBridge for P2pBridge {
                 .connection_manager
                 .get_peer_by_addr(peer_addr)
             {
-                self.log_register
-                    .register_events(Either::Left(NetEventLog::disconnected(
-                        &self.op_manager.ring,
-                        &PeerId::new(
-                            peer_loc.socket_addr().expect("peer should have address"),
-                            peer_loc.pub_key().clone(),
-                        ),
-                    )))
-                    .await;
+                // Peer from connection manager should have known address
+                if let Ok(known_loc) = KnownPeerKeyLocation::try_from(&peer_loc) {
+                    self.log_register
+                        .register_events(Either::Left(NetEventLog::disconnected(
+                            &self.op_manager.ring,
+                            &PeerId::new(known_loc.socket_addr(), peer_loc.pub_key().clone()),
+                        )))
+                        .await;
+                }
             }
         }
         Ok(())
@@ -1984,8 +1984,23 @@ impl P2pConnManager {
                 connection,
                 transient,
             } => {
+                // Outbound peers must have known addresses - use type-safe conversion
+                // If conversion fails, log error but continue since connection is established
+                let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
+                    Ok(k) => k.socket_addr(),
+                    Err(e) => {
+                        tracing::error!(
+                            transaction = %transaction,
+                            pub_key = %e.pub_key,
+                            "INTERNAL ERROR: outbound connection established but peer has unknown address"
+                        );
+                        // Use peer's pub_key in log, but we need an address for downstream logging
+                        // This should never happen, so use unspecified as last resort
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                    }
+                };
                 tracing::info!(
-                    remote = %peer.socket_addr().expect("peer should have address"),
+                    remote = %peer_addr,
                     transient,
                     transaction = %transaction,
                     "Outbound connection established"
@@ -2000,8 +2015,23 @@ impl P2pConnManager {
                 error,
                 transient,
             } => {
+                // Outbound peers must have known addresses - extract once for reuse
+                let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
+                    Ok(k) => k.socket_addr(),
+                    Err(e) => {
+                        // This is an internal consistency error - we initiated this connection,
+                        // so we should always know the target address
+                        tracing::error!(
+                            transaction = %transaction,
+                            pub_key = %e.pub_key,
+                            "INTERNAL ERROR: outbound connection failed but peer has unknown address"
+                        );
+                        return Ok(());
+                    }
+                };
+
                 tracing::info!(
-                    remote = %peer.socket_addr().expect("peer should have address"),
+                    remote = %peer_addr,
                     transient,
                     transaction = %transaction,
                     ?error,
@@ -2012,21 +2042,16 @@ impl P2pConnManager {
                     .op_manager
                     .ring
                     .connection_manager
-                    .prune_in_transit_connection(
-                        peer.socket_addr().expect("peer should have address"),
-                    );
+                    .prune_in_transit_connection(peer_addr);
 
                 let pending_txs = state
                     .awaiting_connection_txs
-                    .remove(&peer.socket_addr().expect("peer should have address"))
+                    .remove(&peer_addr)
                     .unwrap_or_default();
 
-                if let Some(callbacks) = state
-                    .awaiting_connection
-                    .remove(&peer.socket_addr().expect("peer should have address"))
-                {
+                if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
                     tracing::debug!(
-                        remote = %peer.socket_addr().expect("peer should have address"),
+                        remote = %peer_addr,
                         callbacks = callbacks.len(),
                         pending_txs = ?pending_txs,
                         transient,
@@ -2039,7 +2064,7 @@ impl P2pConnManager {
                             .await
                             .inspect_err(|err| {
                                 tracing::debug!(
-                                    remote = %peer.socket_addr().expect("peer should have address"),
+                                    remote = %peer_addr,
                                     ?err,
                                     "Failed to deliver outbound failure notification"
                                 );
@@ -2051,7 +2076,7 @@ impl P2pConnManager {
                             .await
                             .inspect_err(|err| {
                                 tracing::debug!(
-                                    remote = %peer.socket_addr().expect("peer should have address"),
+                                    remote = %peer_addr,
                                     ?err,
                                     "Failed to deliver secondary outbound failure notification"
                                 );
@@ -2349,17 +2374,15 @@ impl P2pConnManager {
 
                 if let Some(remote_addr) = inbound.remote_addr {
                     if let Some(sender_peer) = extract_sender_from_message(&inbound.msg) {
-                        if sender_peer
-                            .socket_addr()
-                            .map(|a| a == remote_addr)
-                            .unwrap_or(false)
-                            || sender_peer
-                                .socket_addr()
-                                .map(|a| a.ip().is_unspecified())
-                                .unwrap_or(true)
+                        // Try to get known address, fall back to remote_addr if unknown
+                        let sender_addr = KnownPeerKeyLocation::try_from(&sender_peer)
+                            .ok()
+                            .map(|k| k.socket_addr());
+                        if sender_addr.map(|a| a == remote_addr).unwrap_or(false)
+                            || sender_addr.map(|a| a.ip().is_unspecified()).unwrap_or(true)
                         {
                             let mut new_peer_id = PeerId::new(
-                                sender_peer.socket_addr().unwrap_or(remote_addr),
+                                sender_addr.unwrap_or(remote_addr),
                                 sender_peer.pub_key().clone(),
                             );
                             if new_peer_id.addr.ip().is_unspecified() {

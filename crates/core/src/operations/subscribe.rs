@@ -9,7 +9,7 @@ use crate::{
     client_events::HostResult,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
-    ring::{Location, RingError},
+    ring::{KnownPeerKeyLocation, Location, RingError},
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, ErrorKind, HostResponse},
@@ -492,7 +492,17 @@ impl Operation for SubscribeOp {
                         return Err(RingError::NoCachingPeers(*instance_id).into());
                     };
 
-                    let next_addr = next_hop.socket_addr().expect("next hop address");
+                    // Convert to KnownPeerKeyLocation for compile-time address guarantee
+                    let next_hop_known = KnownPeerKeyLocation::try_from(next_hop)
+                        .map_err(|e| {
+                            tracing::error!(
+                                tx = %id,
+                                pub_key = %e.pub_key,
+                                "INTERNAL ERROR: next_hop has unknown address - routing selected peer without address"
+                            );
+                            RingError::NoCachingPeers(*instance_id)
+                        })?;
+                    let next_addr = next_hop_known.socket_addr();
                     new_skip_list.insert(next_addr);
 
                     tracing::debug!(tx = %id, %instance_id, next = %next_addr, "Forwarding subscribe request");

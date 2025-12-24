@@ -188,6 +188,193 @@ impl Display for PeerKeyLocation {
     }
 }
 
+/// Error type for when a `PeerKeyLocation` with unknown address is converted
+/// to `KnownPeerKeyLocation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownAddressError {
+    /// The public key of the peer with unknown address.
+    pub pub_key: TransportPublicKey,
+}
+
+impl std::fmt::Display for UnknownAddressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot convert PeerKeyLocation with unknown address to KnownPeerKeyLocation (pub_key: {:?})",
+            self.pub_key
+        )
+    }
+}
+
+impl std::error::Error for UnknownAddressError {}
+
+/// A peer location where the address is guaranteed to be known.
+///
+/// This type provides compile-time enforcement that the network address is always
+/// available, unlike `PeerKeyLocation` which may have an unknown address during
+/// NAT traversal scenarios.
+///
+/// # Use Cases
+///
+/// Use `KnownPeerKeyLocation` in code that:
+/// - Requires a known address to operate (e.g., `should_accept`, routing decisions)
+/// - Processes messages after relay address filling has occurred
+/// - Needs infallible access to `socket_addr()` and `location()`
+///
+/// Use `PeerKeyLocation` for:
+/// - Wire protocol messages (where unknown addresses are legitimate for NAT traversal)
+/// - Initial message construction before addresses are discovered
+///
+/// # Conversion
+///
+/// - `TryFrom<PeerKeyLocation>` - Converts if address is known, fails otherwise
+/// - `From<KnownPeerKeyLocation> for PeerKeyLocation` - Always succeeds
+///
+/// # Example
+///
+/// ```ignore
+/// // Function that requires known address
+/// fn process_peer(peer: &KnownPeerKeyLocation) {
+///     let addr = peer.socket_addr(); // Infallible, returns SocketAddr
+///     let loc = peer.location();     // Infallible, returns Location
+/// }
+///
+/// // At call site, conversion enforces the invariant
+/// let peer: PeerKeyLocation = receive_from_network();
+/// let known = KnownPeerKeyLocation::try_from(peer)?; // Explicit check
+/// process_peer(&known);
+/// ```
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+pub struct KnownPeerKeyLocation {
+    /// The peer's cryptographic identity (public key).
+    pub_key: TransportPublicKey,
+    /// The peer's network address (guaranteed known).
+    addr: SocketAddr,
+}
+
+impl KnownPeerKeyLocation {
+    /// Creates a new `KnownPeerKeyLocation` with the given public key and address.
+    pub fn new(pub_key: TransportPublicKey, addr: SocketAddr) -> Self {
+        KnownPeerKeyLocation { pub_key, addr }
+    }
+
+    /// Returns a reference to the peer's public key (identity).
+    #[inline]
+    pub fn pub_key(&self) -> &TransportPublicKey {
+        &self.pub_key
+    }
+
+    /// Returns the peer's socket address.
+    ///
+    /// Unlike `PeerKeyLocation::socket_addr()`, this is infallible since the
+    /// address is guaranteed to be known.
+    #[inline]
+    pub fn socket_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Computes the ring location from the address.
+    ///
+    /// Unlike `PeerKeyLocation::location()`, this is infallible since the
+    /// address is guaranteed to be known.
+    #[inline]
+    pub fn location(&self) -> Location {
+        Location::from_address(&self.addr)
+    }
+
+    /// Converts this `KnownPeerKeyLocation` to a `PeerKeyLocation`.
+    ///
+    /// This is a convenience method equivalent to `PeerKeyLocation::from(self)`.
+    #[inline]
+    pub fn into_peer_key_location(self) -> PeerKeyLocation {
+        PeerKeyLocation::from(self)
+    }
+
+    /// Returns a `PeerKeyLocation` view of this known location.
+    #[inline]
+    pub fn as_peer_key_location(&self) -> PeerKeyLocation {
+        PeerKeyLocation {
+            pub_key: self.pub_key.clone(),
+            peer_addr: PeerAddr::Known(self.addr),
+        }
+    }
+}
+
+impl TryFrom<PeerKeyLocation> for KnownPeerKeyLocation {
+    type Error = UnknownAddressError;
+
+    fn try_from(pkl: PeerKeyLocation) -> Result<Self, Self::Error> {
+        match pkl.peer_addr {
+            PeerAddr::Known(addr) => Ok(KnownPeerKeyLocation {
+                pub_key: pkl.pub_key,
+                addr,
+            }),
+            PeerAddr::Unknown => Err(UnknownAddressError {
+                pub_key: pkl.pub_key,
+            }),
+        }
+    }
+}
+
+impl TryFrom<&PeerKeyLocation> for KnownPeerKeyLocation {
+    type Error = UnknownAddressError;
+
+    fn try_from(pkl: &PeerKeyLocation) -> Result<Self, Self::Error> {
+        match &pkl.peer_addr {
+            PeerAddr::Known(addr) => Ok(KnownPeerKeyLocation {
+                pub_key: pkl.pub_key.clone(),
+                addr: *addr,
+            }),
+            PeerAddr::Unknown => Err(UnknownAddressError {
+                pub_key: pkl.pub_key.clone(),
+            }),
+        }
+    }
+}
+
+impl From<KnownPeerKeyLocation> for PeerKeyLocation {
+    fn from(known: KnownPeerKeyLocation) -> Self {
+        PeerKeyLocation {
+            pub_key: known.pub_key,
+            peer_addr: PeerAddr::Known(known.addr),
+        }
+    }
+}
+
+impl From<&KnownPeerKeyLocation> for PeerKeyLocation {
+    fn from(known: &KnownPeerKeyLocation) -> Self {
+        PeerKeyLocation {
+            pub_key: known.pub_key.clone(),
+            peer_addr: PeerAddr::Known(known.addr),
+        }
+    }
+}
+
+impl Ord for KnownPeerKeyLocation {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.addr.cmp(&other.addr)
+    }
+}
+
+impl PartialOrd for KnownPeerKeyLocation {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Debug for KnownPeerKeyLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as Display>::fmt(self, f)
+    }
+}
+
+impl Display for KnownPeerKeyLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let loc = self.location();
+        write!(f, "{:?}@{} (@ {loc})", self.pub_key, self.addr)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static CACHED_PUB_KEY: std::cell::RefCell<Option<crate::transport::TransportPublicKey>> = const { std::cell::RefCell::new(None) };
@@ -465,5 +652,198 @@ mod tests {
 
         assert_eq!(pkl.socket_addr(), Some(addr));
         assert!(pkl.location().is_some());
+    }
+
+    // ============ KnownPeerKeyLocation tests ============
+
+    #[test]
+    fn test_known_peer_key_location_new() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 8000);
+        let kpkl = KnownPeerKeyLocation::new(pub_key.clone(), addr);
+
+        assert_eq!(kpkl.pub_key(), &pub_key);
+        assert_eq!(kpkl.socket_addr(), addr); // Infallible, returns SocketAddr directly
+        assert_eq!(kpkl.location(), Location::from_address(&addr));
+    }
+
+    #[test]
+    fn test_known_peer_key_location_try_from_known() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let pkl = PeerKeyLocation::new(pub_key.clone(), addr);
+
+        let kpkl = KnownPeerKeyLocation::try_from(pkl).expect("should succeed for known address");
+        assert_eq!(kpkl.pub_key(), &pub_key);
+        assert_eq!(kpkl.socket_addr(), addr);
+    }
+
+    #[test]
+    fn test_known_peer_key_location_try_from_unknown_fails() {
+        let pub_key = make_pub_key();
+        let pkl = PeerKeyLocation::with_unknown_addr(pub_key.clone());
+
+        let result = KnownPeerKeyLocation::try_from(pkl);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.pub_key, pub_key);
+    }
+
+    #[test]
+    fn test_known_peer_key_location_try_from_ref() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 6000);
+        let pkl = PeerKeyLocation::new(pub_key.clone(), addr);
+
+        // Try from reference - doesn't consume the original
+        let kpkl = KnownPeerKeyLocation::try_from(&pkl).expect("should succeed for known address");
+        assert_eq!(kpkl.pub_key(), &pub_key);
+        assert_eq!(kpkl.socket_addr(), addr);
+
+        // Original still usable
+        assert_eq!(pkl.socket_addr(), Some(addr));
+    }
+
+    #[test]
+    fn test_known_peer_key_location_into_peer_key_location() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 12345);
+        let kpkl = KnownPeerKeyLocation::new(pub_key.clone(), addr);
+
+        let pkl: PeerKeyLocation = kpkl.into_peer_key_location();
+        assert_eq!(pkl.pub_key(), &pub_key);
+        assert_eq!(pkl.socket_addr(), Some(addr));
+        assert!(pkl.peer_addr.is_known());
+    }
+
+    #[test]
+    fn test_known_peer_key_location_as_peer_key_location() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)), 7777);
+        let kpkl = KnownPeerKeyLocation::new(pub_key.clone(), addr);
+
+        // as_peer_key_location doesn't consume, clones instead
+        let pkl = kpkl.as_peer_key_location();
+        assert_eq!(pkl.pub_key(), &pub_key);
+        assert_eq!(pkl.socket_addr(), Some(addr));
+
+        // Original still usable
+        assert_eq!(kpkl.socket_addr(), addr);
+    }
+
+    #[test]
+    fn test_known_peer_key_location_from_impl() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)), 8888);
+        let kpkl = KnownPeerKeyLocation::new(pub_key.clone(), addr);
+
+        // Test From<KnownPeerKeyLocation> for PeerKeyLocation
+        let pkl = PeerKeyLocation::from(kpkl);
+        assert_eq!(pkl.pub_key(), &pub_key);
+        assert_eq!(pkl.socket_addr(), Some(addr));
+    }
+
+    #[test]
+    fn test_known_peer_key_location_from_ref_impl() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)), 9999);
+        let kpkl = KnownPeerKeyLocation::new(pub_key.clone(), addr);
+
+        // Test From<&KnownPeerKeyLocation> for PeerKeyLocation
+        let pkl = PeerKeyLocation::from(&kpkl);
+        assert_eq!(pkl.pub_key(), &pub_key);
+        assert_eq!(pkl.socket_addr(), Some(addr));
+
+        // Original still usable
+        assert_eq!(kpkl.socket_addr(), addr);
+    }
+
+    #[test]
+    fn test_known_peer_key_location_ordering() {
+        let pub_key = make_pub_key();
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5000);
+
+        let kpkl1 = KnownPeerKeyLocation::new(pub_key.clone(), addr1);
+        let kpkl2 = KnownPeerKeyLocation::new(pub_key.clone(), addr2);
+
+        assert!(kpkl1 < kpkl2);
+        assert!(kpkl2 > kpkl1);
+    }
+
+    #[test]
+    fn test_known_peer_key_location_equality() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+
+        let kpkl1 = KnownPeerKeyLocation::new(pub_key.clone(), addr);
+        let kpkl2 = KnownPeerKeyLocation::new(pub_key.clone(), addr);
+
+        assert_eq!(kpkl1, kpkl2);
+    }
+
+    #[test]
+    fn test_known_peer_key_location_display() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9000);
+        let kpkl = KnownPeerKeyLocation::new(pub_key, addr);
+
+        let display = format!("{}", kpkl);
+        assert!(display.contains("127.0.0.1:9000"));
+        assert!(display.contains("@")); // location marker
+    }
+
+    #[test]
+    fn test_known_peer_key_location_clone() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)), 5555);
+        let kpkl = KnownPeerKeyLocation::new(pub_key, addr);
+        let cloned = kpkl.clone();
+
+        assert_eq!(kpkl, cloned);
+        assert_eq!(kpkl.socket_addr(), cloned.socket_addr());
+    }
+
+    #[test]
+    fn test_unknown_address_error_display() {
+        let pub_key = make_pub_key();
+        let err = UnknownAddressError {
+            pub_key: pub_key.clone(),
+        };
+
+        let display = format!("{}", err);
+        assert!(display.contains("cannot convert PeerKeyLocation with unknown address"));
+    }
+
+    #[test]
+    fn test_roundtrip_known_to_peer_to_known() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 100, 1)), 12000);
+        let kpkl_original = KnownPeerKeyLocation::new(pub_key.clone(), addr);
+
+        // Convert to PeerKeyLocation
+        let pkl = PeerKeyLocation::from(&kpkl_original);
+
+        // Convert back to KnownPeerKeyLocation
+        let kpkl_roundtrip =
+            KnownPeerKeyLocation::try_from(pkl).expect("roundtrip should preserve known state");
+
+        assert_eq!(kpkl_original.pub_key(), kpkl_roundtrip.pub_key());
+        assert_eq!(kpkl_original.socket_addr(), kpkl_roundtrip.socket_addr());
+    }
+
+    #[test]
+    fn test_known_peer_key_location_with_ipv6() {
+        let pub_key = make_pub_key();
+        let addr = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            8080,
+        );
+        let kpkl = KnownPeerKeyLocation::new(pub_key, addr);
+
+        assert_eq!(kpkl.socket_addr(), addr);
+        let loc = kpkl.location();
+        // Just verify we get a location (value depends on implementation)
+        assert!(loc.as_f64() >= 0.0 && loc.as_f64() <= 1.0);
     }
 }
