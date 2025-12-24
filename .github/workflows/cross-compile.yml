@@ -77,7 +77,7 @@ jobs:
 
   build-x86_64-macos:
     name: Build for x86_64-apple-darwin
-    runs-on: macos-13  # Intel Mac runner
+    runs-on: macos-latest  # Cross-compile from ARM to x86_64
     timeout-minutes: 60
 
     steps:
@@ -87,23 +87,24 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          targets: x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Compile for x86_64-apple-darwin
-        run: cargo build --release
+        run: cargo build --release --target x86_64-apple-darwin
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v6
         with:
           name: binaries-x86_64-macos-freenet
-          path: target/release/freenet
+          path: target/x86_64-apple-darwin/release/freenet
 
       - name: Upload fdev binary
         uses: actions/upload-artifact@v6
         with:
           name: binaries-x86_64-macos-fdev
-          path: target/release/fdev
+          path: target/x86_64-apple-darwin/release/fdev
 
   build-arm64-macos:
     name: Build for aarch64-apple-darwin
