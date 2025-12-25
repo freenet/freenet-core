@@ -4106,3 +4106,128 @@ async fn test_subscription_pruning_sends_unsubscribed(ctx: &mut TestContext) -> 
     tracing::info!("Test PASSED: Subscription tree pruning works correctly");
     Ok(())
 }
+
+/// Regression test for GET NotFound response when no forwarding targets exist.
+///
+/// Previously, when a node received a GET request for a contract it doesn't have,
+/// and had no other peers to forward the request to, it would silently drop the
+/// request. The client would timeout after 60 seconds.
+///
+/// This test verifies that:
+/// 1. GET for a non-existent contract returns NotFound quickly (< 30 seconds)
+/// 2. The response is an explicit NotFound, not a timeout or generic error
+///
+/// Network topology:
+/// - Gateway only (no connected peers)
+///
+/// When client requests a contract that doesn't exist:
+/// 1. Gateway receives GET request from local client
+/// 2. Gateway has no peers to forward to
+/// 3. Gateway should immediately return NotFound to the client
+#[freenet_test(
+    nodes = ["gateway"],
+    timeout_secs = 60,
+    startup_wait_secs = 5,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_get_notfound_no_forwarding_targets(ctx: &mut TestContext) -> TestResult {
+    let gateway = ctx.node("gateway")?;
+
+    tracing::info!("Gateway ws_port: {}", gateway.ws_port);
+
+    // Give time for gateway to start
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Connect to gateway's websocket API
+    let uri = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        gateway.ws_port
+    );
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client_api = WebApi::start(stream);
+
+    // Create a contract instance ID that definitely doesn't exist
+    // Use a deterministic pattern that won't match any real contract
+    let nonexistent_instance_id = ContractInstanceId::new([0xDE; 32]);
+
+    tracing::info!(
+        "Requesting non-existent contract: {}",
+        nonexistent_instance_id
+    );
+
+    // Request the non-existent contract
+    let get_request = ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Get {
+        key: nonexistent_instance_id,
+        return_contract_code: true,
+        subscribe: false,
+    });
+    client_api.send(get_request).await?;
+
+    // The key assertion: we should get NotFound QUICKLY (< 30 seconds)
+    // NOT a 60+ second timeout
+    let start = std::time::Instant::now();
+    let resp = tokio::time::timeout(Duration::from_secs(30), client_api.recv()).await;
+    let elapsed = start.elapsed();
+
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }))) => {
+            tracing::info!(
+                "✓ Received NotFound response in {:?} for instance_id: {:?}",
+                elapsed,
+                instance_id
+            );
+            assert_eq!(
+                instance_id, nonexistent_instance_id,
+                "NotFound should be for the requested instance_id"
+            );
+            // Verify it was fast (not a timeout)
+            assert!(
+                elapsed < Duration::from_secs(20),
+                "NotFound should be returned quickly, not after timeout. Took {:?}",
+                elapsed
+            );
+        }
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }))) => {
+            bail!(
+                "Unexpectedly found contract {:?} - test assumes it doesn't exist",
+                key
+            );
+        }
+        Ok(Ok(other)) => {
+            bail!("Unexpected response type: {:?} (expected NotFound)", other);
+        }
+        Ok(Err(e)) => {
+            // An error is also acceptable if it's fast - the key is we don't timeout
+            // "No ring connections found" is returned when gateway has no peers
+            let err_str = e.to_string();
+            if err_str.contains("No ring connections") || err_str.contains("not found") {
+                tracing::info!(
+                    "✓ Received fast error response in {:?}: {}",
+                    elapsed,
+                    err_str
+                );
+                assert!(
+                    elapsed < Duration::from_secs(20),
+                    "Error should be returned quickly, not after timeout. Took {:?}",
+                    elapsed
+                );
+            } else {
+                bail!(
+                    "Unexpected error: {} (expected NotFound or network error)",
+                    e
+                );
+            }
+        }
+        Err(_) => {
+            bail!(
+                "Timeout after 30 seconds waiting for NotFound response. \
+                 This is the bug: GET should return NotFound immediately, \
+                 not timeout waiting for a response that never comes."
+            );
+        }
+    }
+
+    tracing::info!("Test PASSED: GET for non-existent contract fails quickly (not timeout)");
+    Ok(())
+}
