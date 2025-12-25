@@ -68,6 +68,20 @@ impl UpdateOp {
             .into())
         }
     }
+
+    /// Handle aborted connections by failing the operation immediately.
+    ///
+    /// UPDATE operations don't have alternative routes to try. When the connection
+    /// drops, we mark the operation as completed (failed) so the client can retry.
+    pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
+        tracing::warn!(
+            tx = %self.id,
+            "Update operation aborted due to connection failure"
+        );
+        // Mark the operation as completed so it's removed from tracking
+        op_manager.completed(self.id);
+        Ok(())
+    }
 }
 
 struct UpdateStats {

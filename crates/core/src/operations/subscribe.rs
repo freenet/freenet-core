@@ -308,6 +308,22 @@ impl SubscribeOp {
             _ => None,
         }
     }
+
+    /// Handle aborted connections by failing the operation immediately.
+    ///
+    /// Unlike Get operations, Subscribe doesn't have alternative routes to try.
+    /// The subscription follows the contract's location in the ring, so when
+    /// the connection drops, we mark the operation as completed (failed) so
+    /// the client can retry.
+    pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
+        tracing::warn!(
+            tx = %self.id,
+            "Subscribe operation aborted due to connection failure"
+        );
+        // Mark the operation as completed so it's removed from tracking
+        op_manager.completed(self.id);
+        Ok(())
+    }
 }
 
 impl Operation for SubscribeOp {

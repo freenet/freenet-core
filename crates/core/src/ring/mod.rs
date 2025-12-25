@@ -435,19 +435,31 @@ impl Ring {
 
     /// Prune a peer connection and return notifications needed for subscription tree pruning.
     ///
-    /// Returns a list of (contract, upstream) pairs where Unsubscribed messages should be sent.
+    /// Returns:
+    /// - A list of (contract, upstream) pairs where Unsubscribed messages should be sent.
+    /// - A list of orphaned transactions that need to be retried or failed.
     pub async fn prune_connection(&self, peer: PeerId) -> PruneSubscriptionsResult {
         tracing::debug!(%peer, "Removing connection");
-        self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
+        let orphaned_transactions = self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
+
+        if !orphaned_transactions.is_empty() {
+            tracing::debug!(
+                %peer,
+                orphaned_count = orphaned_transactions.len(),
+                "Connection pruned with orphaned transactions"
+            );
+        }
 
         // This case would be when a connection is being open, so peer location hasn't been recorded yet
         let Some(loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
             return PruneSubscriptionsResult {
                 notifications: Vec::new(),
+                orphaned_transactions,
             };
         };
 
-        let prune_result = self.seeding_manager.prune_subscriptions_for_peer(loc);
+        let mut prune_result = self.seeding_manager.prune_subscriptions_for_peer(loc);
+        prune_result.orphaned_transactions = orphaned_transactions;
 
         self.event_register
             .register_events(Either::Left(NetEventLog::disconnected(self, &peer)))

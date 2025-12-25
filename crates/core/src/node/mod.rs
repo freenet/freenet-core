@@ -1407,7 +1407,45 @@ async fn handle_aborted_op(
             }
             _ => {}
         },
-        _ => {}
+        TransactionType::Subscribe => match op_manager.pop(&tx) {
+            Ok(Some(OpEnum::Subscribe(op))) => {
+                if let Err(err) = op.handle_abort(op_manager).await {
+                    if !matches!(err, OpError::StatePushed) {
+                        return Err(err);
+                    }
+                }
+            }
+            Ok(Some(other)) => {
+                op_manager.push(tx, other).await?;
+            }
+            _ => {}
+        },
+        TransactionType::Put => match op_manager.pop(&tx) {
+            Ok(Some(OpEnum::Put(op))) => {
+                if let Err(err) = op.handle_abort(op_manager).await {
+                    if !matches!(err, OpError::StatePushed) {
+                        return Err(err);
+                    }
+                }
+            }
+            Ok(Some(other)) => {
+                op_manager.push(tx, other).await?;
+            }
+            _ => {}
+        },
+        TransactionType::Update => match op_manager.pop(&tx) {
+            Ok(Some(OpEnum::Update(op))) => {
+                if let Err(err) = op.handle_abort(op_manager).await {
+                    if !matches!(err, OpError::StatePushed) {
+                        return Err(err);
+                    }
+                }
+            }
+            Ok(Some(other)) => {
+                op_manager.push(tx, other).await?;
+            }
+            _ => {}
+        },
     }
     Ok(())
 }
