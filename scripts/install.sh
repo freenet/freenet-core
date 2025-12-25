@@ -92,7 +92,8 @@ get_target_triple() {
 
     case "$os" in
         linux)
-            echo "${arch}-unknown-linux-gnu"
+            # Use musl for static linking - works on all Linux distros regardless of glibc version
+            echo "${arch}-unknown-linux-musl"
             ;;
         macos)
             echo "${arch}-apple-darwin"
