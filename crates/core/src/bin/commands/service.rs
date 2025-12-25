@@ -246,7 +246,8 @@ fn service_logs(error_only: bool) -> Result<()> {
     println!("Press Ctrl+C to stop.\n");
 
     let status = std::process::Command::new("tail")
-        .args(["-f", log_file.to_str().unwrap()])
+        .arg("-f")
+        .arg(&log_file)
         .status()
         .context("Failed to tail log file")?;
 
@@ -458,7 +459,8 @@ fn service_logs(error_only: bool) -> Result<()> {
     println!("Press Ctrl+C to stop.\n");
 
     let status = std::process::Command::new("tail")
-        .args(["-f", log_file.to_str().unwrap()])
+        .arg("-f")
+        .arg(&log_file)
         .status()
         .context("Failed to tail log file")?;
 
