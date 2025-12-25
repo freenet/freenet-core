@@ -34,6 +34,34 @@ use crate::{
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 use crate::server::http_gateway::AttestedContractMap;
 
+/// Checks if an error represents a client-side disconnect rather than a server error.
+///
+/// Client disconnects are expected behavior when clients timeout, crash, or close
+/// connections without proper WebSocket close handshake. These should be logged
+/// as warnings rather than errors since they don't indicate server problems.
+fn is_client_disconnect_error(error: &anyhow::Error) -> bool {
+    let error_msg = error.to_string().to_lowercase();
+
+    // WebSocket protocol errors from tungstenite
+    if error_msg.contains("connection reset without closing handshake")
+        || error_msg.contains("connection closed without")
+    {
+        return true;
+    }
+
+    // IO errors indicating client-side disconnects
+    if error_msg.contains("connection reset")
+        || error_msg.contains("connection aborted")
+        || error_msg.contains("broken pipe")
+        || error_msg.contains("connection refused")
+        || error_msg.contains("not connected")
+    {
+        return true;
+    }
+
+    false
+}
+
 #[derive(Clone)]
 struct WebSocketRequest(mpsc::Sender<ClientConnection>);
 
@@ -332,11 +360,7 @@ async fn websocket_commands(
             // Client-side disconnects (e.g., closing without handshake) are expected
             // and should not be logged as errors. These occur when clients timeout,
             // crash, or close connections abruptly.
-            let error_msg = error.to_string();
-            if error_msg.contains("Connection reset without closing handshake")
-                || error_msg.contains("connection was aborted")
-                || error_msg.contains("connection reset by peer")
-            {
+            if is_client_disconnect_error(&error) {
                 tracing::warn!("WebSocket client disconnect: {error}");
             } else {
                 tracing::error!("WebSocket protocol error: {error}");
@@ -855,5 +879,55 @@ impl ClientEventsProxy for WebSocketProxy {
             Ok(())
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_client_disconnect_error() {
+        // WebSocket protocol errors
+        assert!(is_client_disconnect_error(&anyhow::anyhow!(
+            "Connection reset without closing handshake"
+        )));
+        assert!(is_client_disconnect_error(&anyhow::anyhow!(
+            "WebSocket protocol error: Connection reset without closing handshake"
+        )));
+        assert!(is_client_disconnect_error(&anyhow::anyhow!(
+            "Connection closed without performing the closing handshake"
+        )));
+
+        // IO errors
+        assert!(is_client_disconnect_error(&anyhow::anyhow!(
+            "IO error: connection reset by peer"
+        )));
+        assert!(is_client_disconnect_error(&anyhow::anyhow!(
+            "IO error: connection aborted"
+        )));
+        assert!(is_client_disconnect_error(&anyhow::anyhow!("broken pipe")));
+        assert!(is_client_disconnect_error(&anyhow::anyhow!(
+            "connection refused"
+        )));
+        assert!(is_client_disconnect_error(&anyhow::anyhow!(
+            "not connected"
+        )));
+
+        // Case insensitivity
+        assert!(is_client_disconnect_error(&anyhow::anyhow!(
+            "CONNECTION RESET BY PEER"
+        )));
+
+        // Non-disconnect errors should return false
+        assert!(!is_client_disconnect_error(&anyhow::anyhow!(
+            "invalid WebSocket handshake"
+        )));
+        assert!(!is_client_disconnect_error(&anyhow::anyhow!(
+            "failed to parse message"
+        )));
+        assert!(!is_client_disconnect_error(&anyhow::anyhow!(
+            "permission denied"
+        )));
     }
 }
