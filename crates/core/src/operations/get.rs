@@ -585,25 +585,56 @@ impl GetOp {
             }
 
             // No local fallback either - give up
-            // If we have an upstream requester, they will timeout and retry
-            // If this is the original requester, the operation will be marked as failed
-            tracing::warn!(
-                tx = %self.id,
-                %instance_id,
-                "GET: Connection aborted, no peers available to retry"
-            );
+            if let Some(upstream) = self.upstream_addr {
+                // Send NotFound response back to upstream requester instead of letting them timeout
+                tracing::warn!(
+                    tx = %self.id,
+                    %instance_id,
+                    %upstream,
+                    phase = "not_found",
+                    "GET: Connection aborted, no peers available - sending NotFound to upstream"
+                );
 
-            // Put the op back in failed state so the caller knows it failed
-            let failed_op = GetOp {
-                id: self.id,
-                state: None,
-                result: None,
-                stats: self.stats,
-                upstream_addr: self.upstream_addr,
-                local_fallback: None,
-            };
-            op_manager.push(self.id, OpEnum::Get(failed_op)).await?;
-            return Ok(());
+                let response_op = GetOp {
+                    id: self.id,
+                    state: None,
+                    result: None,
+                    stats: self.stats,
+                    upstream_addr: self.upstream_addr,
+                    local_fallback: None,
+                };
+
+                op_manager
+                    .notify_op_change(
+                        NetMessage::from(GetMsg::Response {
+                            id: self.id,
+                            instance_id,
+                            result: GetMsgResult::NotFound,
+                        }),
+                        OpEnum::Get(response_op),
+                    )
+                    .await?;
+                return Err(OpError::StatePushed);
+            } else {
+                // Original requester - operation fails locally
+                tracing::warn!(
+                    tx = %self.id,
+                    %instance_id,
+                    phase = "not_found",
+                    "GET: Connection aborted, no peers available - local operation fails"
+                );
+
+                let failed_op = GetOp {
+                    id: self.id,
+                    state: None,
+                    result: None,
+                    stats: self.stats,
+                    upstream_addr: self.upstream_addr,
+                    local_fallback: None,
+                };
+                op_manager.push(self.id, OpEnum::Get(failed_op)).await?;
+                return Ok(());
+            }
         }
 
         // If we weren't awaiting a response, just put the op back.
