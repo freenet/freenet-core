@@ -41,7 +41,8 @@ pub struct VisitedPeers {
     #[serde_as(as = "[_; BLOOM_BYTES]")]
     bits: [u8; BLOOM_BYTES],
     /// Hash keys derived from transaction ID for privacy.
-    /// Using two u64 keys for AHash's RandomState.
+    /// Skipped during serialization - receiver reconstructs from transaction ID.
+    #[serde(skip)]
     hash_keys: (u64, u64),
 }
 
@@ -62,10 +63,26 @@ impl VisitedPeers {
     /// - The same peer address produces different hashes in different transactions
     /// - An observer cannot correlate visited sets across transactions
     pub fn new(tx: &Transaction) -> Self {
-        // Extract bytes from transaction ID for use as hash keys
         let tx_bytes = tx.id_bytes();
+        Self {
+            bits: [0u8; BLOOM_BYTES],
+            hash_keys: Self::derive_hash_keys(&tx_bytes),
+        }
+    }
 
-        // Use first 8 bytes as key0, next 8 bytes as key1
+    /// Sets the hash keys from a transaction after deserialization.
+    ///
+    /// When a VisitedPeers is deserialized, hash_keys are zeroed. This method
+    /// must be called to restore them from the transaction ID before using
+    /// `mark_visited` or `probably_visited`.
+    pub fn with_transaction(mut self, tx: &Transaction) -> Self {
+        let tx_bytes = tx.id_bytes();
+        self.hash_keys = Self::derive_hash_keys(&tx_bytes);
+        self
+    }
+
+    /// Derives hash keys from transaction bytes.
+    fn derive_hash_keys(tx_bytes: &[u8; 16]) -> (u64, u64) {
         let key0 = u64::from_le_bytes([
             tx_bytes[0],
             tx_bytes[1],
@@ -86,11 +103,7 @@ impl VisitedPeers {
             tx_bytes[14],
             tx_bytes[15],
         ]);
-
-        Self {
-            bits: [0u8; BLOOM_BYTES],
-            hash_keys: (key0, key1),
-        }
+        (key0, key1)
     }
 
     /// Marks a peer address as visited.
@@ -261,6 +274,9 @@ mod tests {
         let deserialized: VisitedPeers =
             bincode::deserialize(&bytes).expect("deserialization failed");
 
+        // Restore hash keys from transaction (required after deserialization)
+        let deserialized = deserialized.with_transaction(&tx);
+
         // All marked addresses should still be visited
         for addr in &addrs {
             assert!(
@@ -356,16 +372,12 @@ mod tests {
         // Serialize with bincode
         let bytes = bincode::serialize(&visited).expect("serialization failed");
 
-        // Expected size: 64 bytes (bits) + 16 bytes (hash_keys) = 80 bytes
-        // bincode may add small overhead for length prefixes
-        assert!(
-            bytes.len() <= 100,
-            "Serialized size too large: {} bytes (expected ~80 bytes)",
-            bytes.len()
-        );
-        assert!(
-            bytes.len() >= 80,
-            "Serialized size too small: {} bytes (expected ~80 bytes)",
+        // Expected size: 64 bytes (bits only, hash_keys are skipped)
+        // bincode adds a small length prefix for the array
+        assert_eq!(
+            bytes.len(),
+            64,
+            "Serialized size should be exactly 64 bytes, got {}",
             bytes.len()
         );
 

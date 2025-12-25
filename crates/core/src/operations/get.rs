@@ -832,7 +832,8 @@ impl Operation for GetOp {
                         }
 
                         // Update skip list with current peer address
-                        let mut new_visited = visited.clone();
+                        // Restore hash keys after deserialization (they're derived from tx)
+                        let mut new_visited = visited.clone().with_transaction(&id);
                         if let Some(addr) = this_peer.socket_addr() {
                             new_visited.mark_visited(addr);
                         }

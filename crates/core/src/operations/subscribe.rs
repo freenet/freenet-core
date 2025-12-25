@@ -475,7 +475,8 @@ impl Operation for SubscribeOp {
 
                     // Find next hop
                     let own_addr = op_manager.ring.connection_manager.peer_addr()?;
-                    let mut new_visited = visited.clone();
+                    // Restore hash keys after deserialization (they're derived from tx)
+                    let mut new_visited = visited.clone().with_transaction(id);
                     new_visited.mark_visited(own_addr);
                     if let Some(requester) = self.requester_addr {
                         new_visited.mark_visited(requester);
