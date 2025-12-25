@@ -135,15 +135,23 @@ impl P2pBridge {
             "Handling orphaned transactions from pruned connection"
         );
 
-        for tx in transactions {
-            tracing::debug!(
-                %tx,
-                tx_type = ?tx.transaction_type(),
-                "Attempting retry for orphaned transaction"
-            );
+        // Process all orphaned transactions concurrently for better performance
+        let results = futures::future::join_all(transactions.into_iter().map(|tx| {
+            let op_manager = &self.op_manager;
+            async move {
+                tracing::debug!(
+                    %tx,
+                    tx_type = ?tx.transaction_type(),
+                    "Attempting retry for orphaned transaction"
+                );
+                (tx, handle_aborted_op(tx, op_manager, gateways).await)
+            }
+        }))
+        .await;
 
-            // Use the existing handle_aborted_op mechanism to retry or fail operations
-            if let Err(err) = handle_aborted_op(tx, &self.op_manager, gateways).await {
+        // Log any failures
+        for (tx, result) in results {
+            if let Err(err) = result {
                 tracing::warn!(
                     %tx,
                     error = %err,
