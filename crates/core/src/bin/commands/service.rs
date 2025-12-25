@@ -1,8 +1,8 @@
-//! User service management for Freenet.
+//! System service management for Freenet.
 //!
 //! Supports:
-//! - Linux: systemd user service (~/.config/systemd/user/)
-//! - macOS: launchd user agent (~/Library/LaunchAgents/)
+//! - Linux: systemd user service
+//! - macOS: launchd user agent
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -10,9 +10,9 @@ use std::path::Path;
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum ServiceCommand {
-    /// Install Freenet as a user service (auto-starts on login)
+    /// Install Freenet as a system service
     Install,
-    /// Uninstall the Freenet user service
+    /// Uninstall the Freenet system service
     Uninstall,
     /// Check the status of the Freenet service
     Status,
@@ -22,6 +22,12 @@ pub enum ServiceCommand {
     Stop,
     /// Restart the Freenet service
     Restart,
+    /// View service logs (follows new output)
+    Logs {
+        /// Show only error logs
+        #[arg(long)]
+        err: bool,
+    },
 }
 
 impl ServiceCommand {
@@ -33,6 +39,7 @@ impl ServiceCommand {
             ServiceCommand::Start => start_service(),
             ServiceCommand::Stop => stop_service(),
             ServiceCommand::Restart => restart_service(),
+            ServiceCommand::Logs { err } => service_logs(*err),
         }
     }
 }
@@ -42,13 +49,16 @@ fn install_service() -> Result<()> {
     use std::fs;
 
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
-    let service_dir = dirs::home_dir()
-        .context("Failed to get home directory")?
-        .join(".config/systemd/user");
+    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
 
+    let service_dir = home_dir.join(".config/systemd/user");
     fs::create_dir_all(&service_dir).context("Failed to create systemd user directory")?;
 
-    let service_content = generate_service_file(&exe_path);
+    // Create log directory - use ~/.local/state/freenet for XDG compliance
+    let log_dir = home_dir.join(".local/state/freenet");
+    fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+
+    let service_content = generate_service_file(&exe_path, &log_dir);
     let service_path = service_dir.join("freenet.service");
 
     fs::write(&service_path, service_content).context("Failed to write service file")?;
@@ -79,12 +89,13 @@ fn install_service() -> Result<()> {
     println!("  freenet service start");
     println!();
     println!("The service will start automatically on login.");
+    println!("Logs will be written to: {}", log_dir.display());
 
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn generate_service_file(binary_path: &Path) -> String {
+fn generate_service_file(binary_path: &Path, log_dir: &Path) -> String {
     format!(
         r#"[Unit]
 Description=Freenet Node
@@ -94,14 +105,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={} network
+ExecStart={binary} network
 Restart=on-failure
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
 
-# Logging
-StandardOutput=journal
-StandardError=journal
+# Logging - write to files for systems without active user journald
+# (headless servers, systems without lingering enabled, etc.)
+StandardOutput=append:{log_dir}/freenet.log
+StandardError=append:{log_dir}/freenet.error.log
 SyslogIdentifier=freenet
 
 # Resource limits to prevent runaway resource consumption
@@ -115,7 +127,8 @@ CPUQuota=200%
 [Install]
 WantedBy=default.target
 "#,
-        binary_path.display()
+        binary = binary_path.display(),
+        log_dir = log_dir.display()
     )
 }
 
@@ -208,6 +221,37 @@ fn restart_service() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn service_logs(error_only: bool) -> Result<()> {
+    let log_dir = dirs::home_dir()
+        .context("Failed to get home directory")?
+        .join(".local/state/freenet");
+
+    let log_file = if error_only {
+        log_dir.join("freenet.error.log")
+    } else {
+        log_dir.join("freenet.log")
+    };
+
+    if !log_file.exists() {
+        anyhow::bail!(
+            "Log file not found: {}\nMake sure the service has been installed and started.",
+            log_file.display()
+        );
+    }
+
+    println!("Following logs from: {}", log_file.display());
+    println!("Press Ctrl+C to stop.\n");
+
+    let status = std::process::Command::new("tail")
+        .arg("-f")
+        .arg(&log_file)
+        .status()
+        .context("Failed to tail log file")?;
+
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 // macOS implementation using launchd
@@ -392,6 +436,37 @@ fn restart_service() -> Result<()> {
     start_service()
 }
 
+#[cfg(target_os = "macos")]
+fn service_logs(error_only: bool) -> Result<()> {
+    let log_dir = dirs::home_dir()
+        .context("Failed to get home directory")?
+        .join("Library/Logs/freenet");
+
+    let log_file = if error_only {
+        log_dir.join("freenet.error.log")
+    } else {
+        log_dir.join("freenet.log")
+    };
+
+    if !log_file.exists() {
+        anyhow::bail!(
+            "Log file not found: {}\nMake sure the service has been installed and started.",
+            log_file.display()
+        );
+    }
+
+    println!("Following logs from: {}", log_file.display());
+    println!("Press Ctrl+C to stop.\n");
+
+    let status = std::process::Command::new("tail")
+        .arg("-f")
+        .arg(&log_file)
+        .status()
+        .context("Failed to tail log file")?;
+
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 // Windows implementation
 // Note: Windows service management requires either:
 // 1. Running as a Windows Service (requires service registration)
@@ -520,6 +595,17 @@ fn restart_service() -> Result<()> {
     start_service()
 }
 
+#[cfg(target_os = "windows")]
+fn service_logs(_error_only: bool) -> Result<()> {
+    // Windows Task Scheduler doesn't capture stdout/stderr to files by default.
+    // Users can check Event Viewer or run Freenet manually to see output.
+    anyhow::bail!(
+        "Log viewing is not yet supported on Windows.\n\
+         To view logs, run 'freenet network' manually in a terminal,\n\
+         or check Windows Event Viewer for application errors."
+    )
+}
+
 // Fallback for unsupported platforms
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn install_service() -> Result<()> {
@@ -551,6 +637,11 @@ fn restart_service() -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn service_logs(_error_only: bool) -> Result<()> {
+    anyhow::bail!("Service management is not supported on this platform")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,7 +651,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_systemd_service_file_generation() {
         let binary_path = PathBuf::from("/usr/local/bin/freenet");
-        let service_content = generate_service_file(&binary_path);
+        let log_dir = PathBuf::from("/home/test/.local/state/freenet");
+        let service_content = generate_service_file(&binary_path, &log_dir);
 
         // Verify the service file contains expected sections
         assert!(service_content.contains("[Unit]"));
@@ -569,6 +661,10 @@ mod tests {
 
         // Verify it references the correct binary
         assert!(service_content.contains("/usr/local/bin/freenet network"));
+
+        // Verify log paths are set correctly (file-based logging for headless systems)
+        assert!(service_content.contains("/home/test/.local/state/freenet/freenet.log"));
+        assert!(service_content.contains("/home/test/.local/state/freenet/freenet.error.log"));
 
         // Verify resource limits are set
         assert!(service_content.contains("LimitNOFILE=65536"));
