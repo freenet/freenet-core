@@ -145,15 +145,6 @@ type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 /// sending different types of messages.
 ///
 /// The `packet_sending` function is a helper function used to send packets to the remote peer.
-/// Maximum number of unanswered pings before considering the connection dead.
-/// With 5-second ping interval, 2 unanswered pings means 10 seconds of no response.
-/// This is intentionally shorter than KILL_CONNECTION_AFTER (120s) because:
-/// 1. We're actively probing, so we can detect failures faster
-/// 2. Operations have their own timeouts, but routing to a dead peer wastes time
-/// 3. 10 seconds is long enough to tolerate brief network hiccups
-/// 4. Bandwidth is negligible (~20 bytes/sec per connection)
-const MAX_UNANSWERED_PINGS: usize = 2;
-
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub struct PeerConnection<S = super::UdpSocket> {
     remote_conn: RemoteConnection<S>,
@@ -193,6 +184,16 @@ impl<S> Drop for PeerConnection<S> {
         }
     }
 }
+
+/// Maximum number of unanswered pings before considering the connection dead.
+///
+/// With 5-second ping interval, 2 unanswered pings means 10 seconds of no response.
+/// This is intentionally shorter than KILL_CONNECTION_AFTER (120s) because:
+/// 1. We're actively probing, so we can detect failures faster
+/// 2. Operations have their own timeouts, but routing to a dead peer wastes time
+/// 3. 10 seconds is long enough to tolerate brief network hiccups
+/// 4. Bandwidth is negligible (~20 bytes/sec per connection)
+const MAX_UNANSWERED_PINGS: usize = 2;
 
 #[allow(private_bounds)]
 impl<S: super::Socket> PeerConnection<S> {
@@ -683,7 +684,6 @@ impl<S: super::Socket> PeerConnection<S> {
                 }
                 _ = timeout_check.tick() => {
                     let elapsed = last_received.elapsed();
-                    let pending_ping_count = self.pending_pings.read().len();
 
                     // Check for traditional timeout (no packets received)
                     if elapsed > KILL_CONNECTION_AFTER {
@@ -715,6 +715,17 @@ impl<S: super::Socket> PeerConnection<S> {
 
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
+
+                    // Clean up stale pings older than KILL_CONNECTION_AFTER to prevent unbounded growth.
+                    // This handles edge cases where pong responses are lost but connection stays alive.
+                    {
+                        let mut pending = self.pending_pings.write();
+                        let stale_threshold = Instant::now() - KILL_CONNECTION_AFTER;
+                        pending.retain(|_, sent_at| *sent_at > stale_threshold);
+                    }
+
+                    // Re-read count after cleanup
+                    let pending_ping_count = self.pending_pings.read().len();
 
                     // Check for bidirectional liveness failure (too many unanswered pings).
                     // This catches asymmetric failures where we receive packets from remote
@@ -967,7 +978,7 @@ impl<S: super::Socket> PeerConnection<S> {
         let packet_id = self
             .remote_conn
             .last_packet_id
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let pong_packet = SymmetricMessage::serialize_msg_to_packet_data(
             packet_id,

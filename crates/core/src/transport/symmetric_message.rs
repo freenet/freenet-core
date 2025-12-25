@@ -375,6 +375,8 @@ mod test {
                 ),
             },
             SymmetricMessagePayload::NoOp,
+            SymmetricMessagePayload::Ping { sequence: 12345 },
+            SymmetricMessagePayload::Pong { sequence: 12345 },
         ];
         let key = gen_key();
 
