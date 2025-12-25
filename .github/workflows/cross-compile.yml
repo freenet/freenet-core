@@ -9,71 +9,74 @@ on:
 
 jobs:
   build-x86_64-linux:
-    name: Build for x86_64-unknown-linux-gnu
+    name: Build for x86_64-unknown-linux-musl
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v6
-        # with:
-        #   submodules: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cross
-        run: cargo install cross
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
 
-      - name: Compile for x86_64-unknown-linux-gnu
-        run: cargo build --release
+      - name: Compile for x86_64-unknown-linux-musl
+        run: cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v6
         with:
           name: binaries-x86_64-linux-freenet
-          path: target/release/freenet
+          path: target/x86_64-unknown-linux-musl/release/freenet
 
       - name: Upload fdev binary
         uses: actions/upload-artifact@v6
         with:
           name: binaries-x86_64-linux-fdev
-          path: target/release/fdev
+          path: target/x86_64-unknown-linux-musl/release/fdev
 
   build-arm64-linux:
-    name: Build for aarch64-unknown-linux-gnu
+    name: Build for aarch64-unknown-linux-musl
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v6
-        # with:
-        #   submodules: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          targets: aarch64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Compile for aarch64-unknown-linux-gnu
-        run: cargo build --release
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
+
+      - name: Compile for aarch64-unknown-linux-musl
+        run: cargo build --release --target aarch64-unknown-linux-musl
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v6
         with:
           name: binaries-arm64-linux-freenet
-          path: target/release/freenet
+          path: target/aarch64-unknown-linux-musl/release/freenet
 
       - name: Upload fdev binary
         uses: actions/upload-artifact@v6
         with:
           name: binaries-arm64-linux-fdev
-          path: target/release/fdev
+          path: target/aarch64-unknown-linux-musl/release/fdev
 
   build-arm64-macos:
     name: Build for aarch64-apple-darwin
@@ -201,13 +204,13 @@ jobs:
       - name: Prepare release assets
         run: |
           # Create tar.gz files for each binary with binstall-compatible naming
-          # Linux x86_64
-          cd artifacts/x86_64-linux-freenet && tar -czvf ../../freenet-x86_64-unknown-linux-gnu.tar.gz freenet && cd ../..
-          cd artifacts/x86_64-linux-fdev && tar -czvf ../../fdev-x86_64-unknown-linux-gnu.tar.gz fdev && cd ../..
+          # Linux x86_64 (musl for maximum compatibility)
+          cd artifacts/x86_64-linux-freenet && tar -czvf ../../freenet-x86_64-unknown-linux-musl.tar.gz freenet && cd ../..
+          cd artifacts/x86_64-linux-fdev && tar -czvf ../../fdev-x86_64-unknown-linux-musl.tar.gz fdev && cd ../..
 
-          # Linux ARM64
-          cd artifacts/arm64-linux-freenet && tar -czvf ../../freenet-aarch64-unknown-linux-gnu.tar.gz freenet && cd ../..
-          cd artifacts/arm64-linux-fdev && tar -czvf ../../fdev-aarch64-unknown-linux-gnu.tar.gz fdev && cd ../..
+          # Linux ARM64 (musl for maximum compatibility)
+          cd artifacts/arm64-linux-freenet && tar -czvf ../../freenet-aarch64-unknown-linux-musl.tar.gz freenet && cd ../..
+          cd artifacts/arm64-linux-fdev && tar -czvf ../../fdev-aarch64-unknown-linux-musl.tar.gz fdev && cd ../..
 
           # macOS ARM64
           cd artifacts/arm64-macos-freenet && tar -czvf ../../freenet-aarch64-apple-darwin.tar.gz freenet && cd ../..
@@ -238,10 +241,10 @@ jobs:
 
           # Upload all archives and checksums to the release
           gh release upload "$TAG_NAME" \
-            freenet-x86_64-unknown-linux-gnu.tar.gz \
-            fdev-x86_64-unknown-linux-gnu.tar.gz \
-            freenet-aarch64-unknown-linux-gnu.tar.gz \
-            fdev-aarch64-unknown-linux-gnu.tar.gz \
+            freenet-x86_64-unknown-linux-musl.tar.gz \
+            fdev-x86_64-unknown-linux-musl.tar.gz \
+            freenet-aarch64-unknown-linux-musl.tar.gz \
+            fdev-aarch64-unknown-linux-musl.tar.gz \
             freenet-aarch64-apple-darwin.tar.gz \
             fdev-aarch64-apple-darwin.tar.gz \
             freenet-x86_64-pc-windows-msvc.zip \
