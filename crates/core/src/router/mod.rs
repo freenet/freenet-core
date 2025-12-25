@@ -16,7 +16,6 @@ pub(crate) struct Router {
     transfer_rate_estimator: IsotonicEstimator,
     failure_estimator: IsotonicEstimator,
     mean_transfer_size: Mean,
-    consider_n_closest_peers: usize,
 }
 
 impl Router {
@@ -107,14 +106,7 @@ impl Router {
                 EstimatorType::Negative,
             ),
             mean_transfer_size,
-            consider_n_closest_peers: 2,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn considering_n_closest_peers(mut self, n: u32) -> Self {
-        self.consider_n_closest_peers = n as usize;
-        self
     }
 
     pub fn add_event(&mut self, event: RouteEvent) {
@@ -153,7 +145,13 @@ impl Router {
         }
     }
 
-    fn select_closest_peers<'a>(
+    /// Returns all peers sorted by distance from the target location (closest first).
+    ///
+    /// This enables "uphill" routing: when closer peers don't have the contract,
+    /// the caller can fall back to further peers that might have it. Previously
+    /// this function truncated to a small number of closest peers, which caused
+    /// GET/SUBSCRIBE operations to fail even when further peers had the contract.
+    fn select_peers_by_distance<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
@@ -171,10 +169,12 @@ impl Router {
             })
             .collect();
 
+        // Shuffle first to randomize ordering among peers at equal distances
         let rng = &mut rand::rng();
         peer_distances.shuffle(rng);
+        // Sort by distance - closest peers first
         peer_distances.sort_by_key(|&(_, distance)| distance);
-        peer_distances.truncate(self.consider_n_closest_peers);
+        // Return ALL peers, not just the closest N
         peer_distances.into_iter().map(|(peer, _)| peer).collect()
     }
 
@@ -219,9 +219,11 @@ impl Router {
             peer_distances.truncate(k);
             peer_distances.into_iter().map(|(peer, _)| peer).collect()
         } else {
-            // Get closest peers and rank by predicted routing outcome time
+            // Get ALL peers sorted by distance, then rank by predicted routing outcome time.
+            // This enables "uphill" routing: we consider all peers, not just the closest N,
+            // so when closer peers don't have the contract, further peers can be tried.
             let mut candidates: Vec<_> = self
-                .select_closest_peers(peers, &target_location)
+                .select_peers_by_distance(peers, &target_location)
                 .into_iter()
                 .filter_map(|peer| {
                     self.predict_routing_outcome(peer, target_location)
@@ -477,44 +479,53 @@ mod tests {
         }
     }
 
+    /// Test that select_peers_by_distance returns ALL peers, sorted by distance.
+    /// This is the key change for uphill routing - we no longer truncate to closest N.
     #[test]
-    fn test_select_closest_peers_size() {
+    fn test_select_peers_by_distance_returns_all() {
         const NUM_PEERS: u32 = 45;
-        const CAP: u32 = 30;
 
+        let router = Router::new(&[]);
+        let peers = create_peers(NUM_PEERS);
+        let target = Location::random();
+
+        let result = router.select_peers_by_distance(&peers, &target);
+
+        // Should return ALL peers, not just a subset
         assert_eq!(
-            CAP as usize,
-            Router::new(&[])
-                .considering_n_closest_peers(CAP)
-                .select_closest_peers(&create_peers(NUM_PEERS), &Location::random())
-                .len()
+            result.len(),
+            NUM_PEERS as usize,
+            "select_peers_by_distance should return all peers"
         );
     }
 
+    /// Test that select_peers_by_distance returns peers sorted by distance (closest first).
     #[test]
-    fn test_select_closest_peers_equality() {
+    fn test_select_peers_by_distance_ordering() {
         const NUM_PEERS: u32 = 100;
-        const CLOSEST_CAP: u32 = 10;
         let peers: Vec<PeerKeyLocation> = create_peers(NUM_PEERS);
         let contract_location = Location::random();
 
-        let expected_closest = select_closest_peers_vec(CLOSEST_CAP, &peers, &contract_location);
+        let router = Router::new(&[]);
+        let sorted_peers = router.select_peers_by_distance(&peers, &contract_location);
 
-        // Create a router with no historical data
-        let router = Router::new(&[]).considering_n_closest_peers(CLOSEST_CAP);
-        let asserted_closest: Vec<&PeerKeyLocation> =
-            router.select_closest_peers(&peers, &contract_location);
-
-        let mut expected_iter = expected_closest.iter();
-        let mut asserted_iter = asserted_closest.iter();
-
-        while let (Some(expected_location), Some(asserted_location)) =
-            (expected_iter.next(), asserted_iter.next())
-        {
-            assert_eq!(**expected_location, **asserted_location);
+        // Verify ordering: each peer should be no further than the next
+        for window in sorted_peers.windows(2) {
+            let dist1 = window[0]
+                .location()
+                .map(|loc| contract_location.distance(loc))
+                .unwrap_or_else(|| Distance::new(0.5));
+            let dist2 = window[1]
+                .location()
+                .map(|loc| contract_location.distance(loc))
+                .unwrap_or_else(|| Distance::new(0.5));
+            assert!(
+                dist1 <= dist2,
+                "Peers should be sorted by distance: {:?} > {:?}",
+                dist1,
+                dist2
+            );
         }
-
-        assert_eq!(expected_iter.next(), asserted_iter.next());
     }
 
     fn simulate_prediction(
@@ -536,26 +547,6 @@ mod tests {
             time_to_response_start,
             expected_total_time: time_to_response_start + transfer_time,
         }
-    }
-
-    fn select_closest_peers_vec<'a>(
-        closest_peers_capacity: u32,
-        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
-        target_location: &Location,
-    ) -> Vec<&'a PeerKeyLocation>
-    where
-        PeerKeyLocation: Clone,
-    {
-        let mut closest: Vec<&'a PeerKeyLocation> = peers.into_iter().collect();
-        closest.sort_by_key(|&peer| {
-            if let Some(location) = peer.location() {
-                target_location.distance(location)
-            } else {
-                Distance::new(f64::MAX)
-            }
-        });
-
-        closest[..closest_peers_capacity as usize].to_vec()
     }
 
     fn create_peers(num_peers: u32) -> Vec<PeerKeyLocation> {
@@ -601,7 +592,7 @@ mod tests {
         );
     }
 
-    /// Test that select_closest_peers handles empty candidate list
+    /// Test that select_peers_by_distance handles empty candidate list
     ///
     /// **Scenario this supports:**
     /// Internal method used by select_k_best_peers. Must handle edge cases
@@ -611,15 +602,15 @@ mod tests {
     /// Small networks with aggressive filtering can easily end up with zero
     /// routing candidates. This must not cause crashes.
     #[test]
-    fn test_select_k_best_empty_candidates() {
-        let router = Router::new(&[]).considering_n_closest_peers(5);
+    fn test_select_peers_by_distance_empty_candidates() {
+        let router = Router::new(&[]);
         let empty_peers: Vec<PeerKeyLocation> = vec![];
         let target = Location::random();
 
-        let result = router.select_closest_peers(&empty_peers, &target);
+        let result = router.select_peers_by_distance(&empty_peers, &target);
         assert!(
             result.is_empty(),
-            "select_closest_peers should return empty vec for empty candidates"
+            "select_peers_by_distance should return empty vec for empty candidates"
         );
     }
 
@@ -647,6 +638,118 @@ mod tests {
             *result.unwrap(),
             single_peer,
             "Should return the single candidate"
+        );
+    }
+
+    // ============ Uphill routing tests ============
+    //
+    // These tests verify the uphill routing feature: when closer peers don't
+    // have a contract, further peers can be tried. Previously, only the 2
+    // closest peers were considered, causing operations to fail even when
+    // further peers had the contract.
+    //
+    // Related issue: #2401
+
+    /// Test that select_k_best_peers can return peers beyond the closest ones.
+    ///
+    /// **Scenario this tests:**
+    /// With 10 peers and k=5, all 5 returned peers should be from the pool of
+    /// all 10 peers, not limited to just the 2 closest. This is the key
+    /// behavioral change enabling uphill routing.
+    #[test]
+    fn test_select_k_best_considers_all_peers() {
+        const NUM_PEERS: u32 = 10;
+        const K: usize = 5;
+
+        let router = Router::new(&[]);
+        let peers = create_peers(NUM_PEERS);
+        let target = Location::random();
+
+        let result = router.select_k_best_peers(&peers, target, K);
+
+        // Should return exactly k peers (or all if fewer than k available)
+        assert_eq!(
+            result.len(),
+            K,
+            "select_k_best_peers should return k peers when k <= num_peers"
+        );
+    }
+
+    /// Test that uphill routing works: further peers are included in results
+    /// when requesting more than the default closest peer count.
+    ///
+    /// **Scenario this tests:**
+    /// Create peers at known locations. Request more peers than would have
+    /// been returned with the old truncation behavior. Verify that further
+    /// peers are included.
+    #[test]
+    fn test_uphill_routing_includes_further_peers() {
+        const NUM_PEERS: u32 = 20;
+        const K: usize = 10;
+
+        let router = Router::new(&[]);
+        let peers = create_peers(NUM_PEERS);
+        let target = Location::random();
+
+        // Get all peers sorted by distance for reference
+        let all_sorted = router.select_peers_by_distance(&peers, &target);
+
+        // Get k best peers
+        let k_best = router.select_k_best_peers(&peers, target, K);
+
+        // All k_best peers should be from the sorted list
+        for best_peer in &k_best {
+            assert!(
+                all_sorted.contains(best_peer),
+                "k_best peer should be in the sorted peer list"
+            );
+        }
+
+        // The old implementation would have only returned 2 peers at most,
+        // but now we should get all k requested (when available)
+        assert_eq!(
+            k_best.len(),
+            K,
+            "Should return all requested peers, not truncate to closest N"
+        );
+    }
+
+    /// Test that the router correctly handles the case where there are more
+    /// peers than requested in select_k_best_peers.
+    #[test]
+    fn test_select_k_best_truncates_to_k() {
+        const NUM_PEERS: u32 = 50;
+        const K: usize = 5;
+
+        let router = Router::new(&[]);
+        let peers = create_peers(NUM_PEERS);
+        let target = Location::random();
+
+        let result = router.select_k_best_peers(&peers, target, K);
+
+        assert_eq!(
+            result.len(),
+            K,
+            "select_k_best_peers should return exactly k peers when more than k are available"
+        );
+    }
+
+    /// Test that when fewer peers are available than k, all are returned.
+    #[test]
+    fn test_select_k_best_returns_all_when_fewer_than_k() {
+        const NUM_PEERS: u32 = 3;
+        const K: usize = 10;
+
+        let router = Router::new(&[]);
+        let peers = create_peers(NUM_PEERS);
+        let target = Location::random();
+
+        let result = router.select_k_best_peers(&peers, target, K);
+
+        assert_eq!(
+            result.len(),
+            NUM_PEERS as usize,
+            "select_k_best_peers should return all peers when fewer than k are available"
         );
     }
 }
