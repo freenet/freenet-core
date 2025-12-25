@@ -394,4 +394,100 @@ mod tests {
             "Serialized size should be fixed regardless of marked peers"
         );
     }
+
+    /// Test documenting the correct behavior for request forwarding.
+    ///
+    /// When a node receives a forwarded GET/SUBSCRIBE request, it MUST mark BOTH:
+    /// 1. Its own address (this_peer) - so requests won't be routed back to it
+    /// 2. The sender's address (source_addr) - so requests won't cycle back to the sender
+    ///
+    /// This is critical for preventing request cycles, especially in scenarios where
+    /// a node has limited connections (e.g., only connected to a gateway).
+    ///
+    /// Bug reproduction scenario (before fix):
+    /// 1. Node A (originator, single connection to gateway) sends GET request
+    /// 2. Gateway marks itself in visited, forwards to other peers
+    /// 3. Other peers mark themselves, but NOT the sender
+    /// 4. Eventually, some peer routes back to Node A (not in visited filter)
+    /// 5. Node A receives its own request, can't forward (only peer is gateway, already in filter)
+    /// 6. Request fails with "no upstream" error
+    #[test]
+    fn test_forwarding_must_mark_both_this_peer_and_sender() {
+        let tx = test_transaction();
+        let mut visited = VisitedPeers::new(&tx);
+
+        // Simulate the forwarding scenario
+        let this_peer: SocketAddr = "10.0.0.1:8000".parse().unwrap();
+        let sender: SocketAddr = "10.0.0.2:8000".parse().unwrap();
+        let originator: SocketAddr = "10.0.0.3:8000".parse().unwrap();
+
+        // When processing a forwarded request, mark BOTH this_peer AND sender
+        visited.mark_visited(this_peer);
+        visited.mark_visited(sender);
+
+        // Both should be marked to prevent routing back to them
+        assert!(
+            visited.probably_visited(this_peer),
+            "this_peer must be marked to prevent routing back to processing node"
+        );
+        assert!(
+            visited.probably_visited(sender),
+            "sender must be marked to prevent routing back to request source"
+        );
+
+        // The originator is still valid for routing (until they receive and mark themselves)
+        // This documents that the originator should also be marked at the START of the operation
+        assert!(
+            !visited.probably_visited(originator),
+            "originator not marked yet - they should mark themselves when initiating"
+        );
+    }
+
+    /// Test that simulates the full routing cycle prevention.
+    ///
+    /// This tests the complete chain of marking that should prevent request cycles:
+    /// Originator -> Gateway -> Peer1 -> Peer2 -> ... -> back to originator (should be blocked)
+    #[test]
+    fn test_request_cycle_prevention() {
+        let tx = test_transaction();
+        let mut visited = VisitedPeers::new(&tx);
+
+        // Simulate the routing chain:
+        // Originator (A) -> Gateway (G) -> Peer1 (P1) -> Peer2 (P2)
+        let originator: SocketAddr = "10.0.0.1:8000".parse().unwrap();
+        let gateway: SocketAddr = "10.0.0.2:8000".parse().unwrap();
+        let peer1: SocketAddr = "10.0.0.3:8000".parse().unwrap();
+        let peer2: SocketAddr = "10.0.0.4:8000".parse().unwrap();
+
+        // Step 1: Originator should mark themselves BEFORE sending (not tested here, but expected)
+        // For now, originator is NOT in visited - this is the gap that caused the bug
+
+        // Step 2: Gateway receives from originator, marks gateway AND originator
+        visited.mark_visited(gateway);
+        visited.mark_visited(originator); // KEY: Mark sender too!
+
+        // Step 3: Peer1 receives from gateway, marks peer1 AND gateway
+        visited.mark_visited(peer1);
+        // gateway already marked, but would be marked again in real code
+
+        // Step 4: Peer2 receives from peer1, marks peer2 AND peer1
+        visited.mark_visited(peer2);
+        // peer1 already marked
+
+        // Now, all nodes in the chain should be marked
+        assert!(
+            visited.probably_visited(originator),
+            "originator must be blocked"
+        );
+        assert!(visited.probably_visited(gateway), "gateway must be blocked");
+        assert!(visited.probably_visited(peer1), "peer1 must be blocked");
+        assert!(visited.probably_visited(peer2), "peer2 must be blocked");
+
+        // A new peer (peer3) can still be routed to
+        let peer3: SocketAddr = "10.0.0.5:8000".parse().unwrap();
+        assert!(
+            !visited.probably_visited(peer3),
+            "unvisited peer should still be valid for routing"
+        );
+    }
 }
