@@ -1826,13 +1826,34 @@ async fn try_forward_or_return(
             stats,
             upstream_addr,
         )
-    } else {
-        // No targets found and we don't have the contract - can't send proper failure Response
-        // The upstream will timeout and retry through their own mechanisms
-        tracing::debug!(
+    } else if upstream_addr.is_some() {
+        // No targets found and we don't have the contract - send NotFound back to requester
+        tracing::warn!(
             tx = %id,
             %instance_id,
-            "Cannot find any other peers to forward the get request to, upstream will timeout"
+            phase = "not_found",
+            "No peers to forward get request to, returning NotFound to upstream"
+        );
+
+        build_op_result(
+            id,
+            None,
+            Some(GetMsg::Response {
+                id,
+                instance_id,
+                result: GetMsgResult::NotFound,
+            }),
+            None,
+            stats,
+            upstream_addr,
+        )
+    } else {
+        // Original requester with no forwarding targets - operation fails locally
+        tracing::warn!(
+            tx = %id,
+            %instance_id,
+            phase = "not_found",
+            "No peers to forward get request to and no upstream - local operation fails"
         );
 
         build_op_result(id, None, None, None, stats, upstream_addr)
