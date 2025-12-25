@@ -313,13 +313,33 @@ impl SubscribeOp {
     ///
     /// Unlike Get operations, Subscribe doesn't have alternative routes to try.
     /// The subscription follows the contract's location in the ring, so when
-    /// the connection drops, we mark the operation as completed (failed) so
-    /// the client can retry.
+    /// the connection drops, we notify the client of the failure so they can retry.
     pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
         tracing::warn!(
             tx = %self.id,
             "Subscribe operation aborted due to connection failure"
         );
+
+        // Create an error result to notify the client
+        let error_result: crate::client_events::HostResult =
+            Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: "Subscribe operation failed: peer connection dropped".into(),
+            }
+            .into());
+
+        // Send the error to the client via the result router
+        if let Err(err) = op_manager
+            .result_router_tx
+            .send((self.id, error_result))
+            .await
+        {
+            tracing::error!(
+                tx = %self.id,
+                error = %err,
+                "Failed to send abort notification to client"
+            );
+        }
+
         // Mark the operation as completed so it's removed from tracking
         op_manager.completed(self.id);
         Ok(())
