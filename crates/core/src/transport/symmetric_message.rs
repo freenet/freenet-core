@@ -275,6 +275,18 @@ pub(crate) enum SymmetricMessagePayload {
         payload: MessagePayload,
     },
     NoOp,
+    /// Bidirectional liveness probe - sender expects a Pong response.
+    /// Used to detect asymmetric connection failures where packets flow
+    /// in only one direction.
+    Ping {
+        /// Sequence number to correlate with Pong response
+        sequence: u64,
+    },
+    /// Response to a Ping, confirms bidirectional connectivity.
+    Pong {
+        /// Sequence number from the corresponding Ping
+        sequence: u64,
+    },
 }
 
 #[cfg(test)]
@@ -300,6 +312,8 @@ impl std::fmt::Display for SymmetricMessagePayload {
                 "StreamFragment: (stream id: {stream_id:?}, fragment no: {fragment_number:?}) "
             ),
             SymmetricMessagePayload::NoOp => write!(f, "NoOp"),
+            SymmetricMessagePayload::Ping { sequence } => write!(f, "Ping({sequence})"),
+            SymmetricMessagePayload::Pong { sequence } => write!(f, "Pong({sequence})"),
         }
     }
 }

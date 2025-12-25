@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, time::Instant};
+
+use parking_lot::RwLock;
 
 use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
 use crate::transport::crypto::TransportSecretKey;
@@ -142,6 +145,11 @@ type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 /// sending different types of messages.
 ///
 /// The `packet_sending` function is a helper function used to send packets to the remote peer.
+/// Maximum number of unanswered pings before considering the connection dead.
+/// With 10-second ping interval, 12 unanswered pings means 120 seconds of no response,
+/// matching KILL_CONNECTION_AFTER timeout.
+const MAX_UNANSWERED_PINGS: usize = 12;
+
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub struct PeerConnection<S = super::UdpSocket> {
     remote_conn: RemoteConnection<S>,
@@ -156,6 +164,10 @@ pub struct PeerConnection<S = super::UdpSocket> {
     /// Last time we updated the TokenBucket rate from LEDBAT
     /// Used to implement RTT-adaptive rate updates (update approximately once per RTT)
     last_rate_update: Option<std::time::Instant>,
+    /// Tracks pending ping probes awaiting pong responses.
+    /// Maps ping sequence number -> send timestamp.
+    /// Used for bidirectional liveness detection.
+    pending_pings: Arc<RwLock<BTreeMap<u64, Instant>>>,
 }
 
 impl<S> std::fmt::Debug for PeerConnection<S> {
@@ -189,6 +201,11 @@ impl<S: super::Socket> PeerConnection<S> {
         let outbound_key = remote_conn.outbound_symmetric_key.clone();
         let last_packet_id = remote_conn.last_packet_id.clone();
 
+        // Shared state for bidirectional liveness detection
+        let pending_pings: Arc<RwLock<BTreeMap<u64, Instant>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
+        let pending_pings_for_task = pending_pings.clone();
+
         let keep_alive_handle = tokio::spawn(async move {
             tracing::info!(
                 target: "freenet_core::transport::keepalive_lifecycle",
@@ -203,6 +220,7 @@ impl<S: super::Socket> PeerConnection<S> {
             interval.tick().await;
 
             let mut tick_count = 0u64;
+            let mut ping_seq = 0u64;
             let task_start = std::time::Instant::now();
 
             loop {
@@ -213,45 +231,60 @@ impl<S: super::Socket> PeerConnection<S> {
                 let elapsed_since_start = task_start.elapsed();
                 let elapsed_since_last_tick = tick_start.elapsed();
 
+                // Use local ping sequence counter
+                let current_ping_seq = ping_seq;
+                ping_seq += 1;
+
                 tracing::debug!(
                     target: "freenet_core::transport::keepalive_lifecycle",
                     remote = ?remote_addr,
                     tick_count,
+                    ping_sequence = current_ping_seq,
                     elapsed_since_start_secs = elapsed_since_start.as_secs_f64(),
                     tick_interval_ms = elapsed_since_last_tick.as_millis(),
-                    "Keep-alive tick - attempting to send NoOp"
+                    "Keep-alive tick - sending Ping"
                 );
 
-                // Create a NoOp packet
+                // Create a Ping packet for bidirectional liveness detection
                 let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let noop_packet = match SymmetricMessage::serialize_msg_to_packet_data(
+                let ping_packet = match SymmetricMessage::serialize_msg_to_packet_data(
                     packet_id,
-                    SymmetricMessagePayload::NoOp,
+                    SymmetricMessagePayload::Ping {
+                        sequence: current_ping_seq,
+                    },
                     &outbound_key,
                     vec![], // No receipts for keep-alive
                 ) {
                     Ok(packet) => packet.prepared_send(),
                     Err(e) => {
-                        tracing::error!(?e, "Failed to create keep-alive packet");
+                        tracing::error!(?e, "Failed to create keep-alive Ping packet");
                         break;
                     }
                 };
 
-                // Send the keep-alive packet directly to socket
+                // Record the pending ping before sending
+                {
+                    let mut pending = pending_pings_for_task.write();
+                    pending.insert(current_ping_seq, Instant::now());
+                }
+
+                // Send the keep-alive Ping packet directly to socket
                 tracing::debug!(
                     target: "freenet_core::transport::keepalive_lifecycle",
                     remote = ?remote_addr,
                     packet_id,
-                    "Sending keep-alive NoOp packet"
+                    ping_sequence = current_ping_seq,
+                    "Sending keep-alive Ping packet"
                 );
 
-                match socket.send_to(&noop_packet, remote_addr).await {
+                match socket.send_to(&ping_packet, remote_addr).await {
                     Ok(_) => {
                         tracing::debug!(
                             target: "freenet_core::transport::keepalive_lifecycle",
                             remote = ?remote_addr,
                             packet_id,
-                            "Keep-alive NoOp packet sent successfully"
+                            ping_sequence = current_ping_seq,
+                            "Keep-alive Ping packet sent successfully"
                         );
                     }
                     Err(e) => {
@@ -293,6 +326,7 @@ impl<S: super::Socket> PeerConnection<S> {
             last_packet_report_time: Instant::now(),
             keep_alive_handle: Some(keep_alive_handle),
             last_rate_update: None,
+            pending_pings,
         }
     }
 
@@ -477,25 +511,67 @@ impl<S: super::Socket> PeerConnection<S> {
                         payload,
                     } = msg;
 
-                    // Log keep-alive packets specifically
-                    if matches!(payload, SymmetricMessagePayload::NoOp) {
-                        if confirm_receipt.is_empty() {
-                            tracing::debug!(
-                                target: "freenet_core::transport::keepalive_received",
-                                remote = ?self.remote_conn.remote_addr,
-                                packet_id,
-                                time_since_last_received_ms = last_received.elapsed().as_millis(),
-                                "Received NoOp keep-alive packet (no receipts)"
-                            );
-                        } else {
-                            tracing::debug!(
-                                target: "freenet_core::transport::keepalive_received",
-                                remote = ?self.remote_conn.remote_addr,
-                                packet_id,
-                                receipt_count = confirm_receipt.len(),
-                                "Received NoOp receipt packet"
-                            );
+                    // Log and handle keep-alive packets specifically
+                    match &payload {
+                        SymmetricMessagePayload::NoOp => {
+                            if confirm_receipt.is_empty() {
+                                tracing::debug!(
+                                    target: "freenet_core::transport::keepalive_received",
+                                    remote = ?self.remote_conn.remote_addr,
+                                    packet_id,
+                                    time_since_last_received_ms = last_received.elapsed().as_millis(),
+                                    "Received NoOp keep-alive packet (no receipts)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    target: "freenet_core::transport::keepalive_received",
+                                    remote = ?self.remote_conn.remote_addr,
+                                    packet_id,
+                                    receipt_count = confirm_receipt.len(),
+                                    "Received NoOp receipt packet"
+                                );
+                            }
                         }
+                        SymmetricMessagePayload::Ping { sequence } => {
+                            tracing::debug!(
+                                target: "freenet_core::transport::keepalive_received",
+                                remote = ?self.remote_conn.remote_addr,
+                                packet_id,
+                                ping_sequence = sequence,
+                                "Received Ping, sending Pong response"
+                            );
+                            // Immediately respond with Pong
+                            if let Err(e) = self.send_pong(*sequence).await {
+                                tracing::warn!(
+                                    target: "freenet_core::transport::keepalive_received",
+                                    remote = ?self.remote_conn.remote_addr,
+                                    ping_sequence = sequence,
+                                    error = ?e,
+                                    "Failed to send Pong response"
+                                );
+                            }
+                        }
+                        SymmetricMessagePayload::Pong { sequence } => {
+                            tracing::debug!(
+                                target: "freenet_core::transport::keepalive_received",
+                                remote = ?self.remote_conn.remote_addr,
+                                packet_id,
+                                pong_sequence = sequence,
+                                "Received Pong, confirming bidirectional liveness"
+                            );
+                            // Remove the corresponding ping from pending set
+                            let mut pending = self.pending_pings.write();
+                            if pending.remove(sequence).is_some() {
+                                tracing::trace!(
+                                    target: "freenet_core::transport::keepalive_received",
+                                    remote = ?self.remote_conn.remote_addr,
+                                    pong_sequence = sequence,
+                                    remaining_pending = pending.len(),
+                                    "Removed acknowledged ping from pending set"
+                                );
+                            }
+                        }
+                        _ => {}
                     }
 
                     {
@@ -603,6 +679,9 @@ impl<S: super::Socket> PeerConnection<S> {
                 }
                 _ = timeout_check.tick() => {
                     let elapsed = last_received.elapsed();
+                    let pending_ping_count = self.pending_pings.read().len();
+
+                    // Check for traditional timeout (no packets received)
                     if elapsed > KILL_CONNECTION_AFTER {
                         tracing::warn!(
                             target: "freenet_core::transport::keepalive_timeout",
@@ -631,15 +710,35 @@ impl<S: super::Socket> PeerConnection<S> {
                         }
 
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
-                    } else {
-                        tracing::trace!(
-                            target: "freenet_core::transport::keepalive_health",
-                            remote = ?self.remote_conn.remote_addr,
-                            elapsed_seconds = elapsed.as_secs_f64(),
-                            remaining_seconds = (KILL_CONNECTION_AFTER - elapsed).as_secs_f64(),
-                            "Connection health check - still alive"
-                        );
                     }
+
+                    // Check for bidirectional liveness failure (too many unanswered pings).
+                    // This catches asymmetric failures where we receive packets from remote
+                    // (so last_received is updated) but our packets don't reach the remote
+                    // (so our pings never get ponged back).
+                    if pending_ping_count > MAX_UNANSWERED_PINGS {
+                        tracing::warn!(
+                            target: "freenet_core::transport::keepalive_timeout",
+                            remote = ?self.remote_conn.remote_addr,
+                            pending_pings = pending_ping_count,
+                            max_unanswered = MAX_UNANSWERED_PINGS,
+                            time_since_last_received_secs = elapsed.as_secs_f64(),
+                            "BIDIRECTIONAL LIVENESS FAILURE - {} pings unanswered (max {}), \
+                             connection appears asymmetric",
+                            pending_ping_count,
+                            MAX_UNANSWERED_PINGS
+                        );
+                        return Err(TransportError::ConnectionClosed(self.remote_addr()));
+                    }
+
+                    tracing::trace!(
+                        target: "freenet_core::transport::keepalive_health",
+                        remote = ?self.remote_conn.remote_addr,
+                        elapsed_seconds = elapsed.as_secs_f64(),
+                        remaining_seconds = (KILL_CONNECTION_AFTER - elapsed).as_secs_f64(),
+                        pending_pings = pending_ping_count,
+                        "Connection health check - still alive"
+                    );
                 }
                 _ = resend_check.take().unwrap_or(tokio::time::sleep(Duration::from_millis(10))) => {
                     loop {
@@ -837,6 +936,8 @@ impl<S: super::Socket> PeerConnection<S> {
                 Ok(None)
             }
             NoOp => Ok(None),
+            // Ping and Pong are handled earlier in recv() before process_inbound is called
+            Ping { .. } | Pong { .. } => Ok(None),
         }
     }
 
@@ -854,6 +955,38 @@ impl<S: super::Socket> PeerConnection<S> {
             &self.remote_conn.sent_tracker,
         )
         .await
+    }
+
+    /// Send a Pong response to a received Ping.
+    /// This confirms bidirectional liveness to the remote peer.
+    async fn send_pong(&mut self, sequence: u64) -> Result<()> {
+        let packet_id = self
+            .remote_conn
+            .last_packet_id
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        let pong_packet = SymmetricMessage::serialize_msg_to_packet_data(
+            packet_id,
+            SymmetricMessagePayload::Pong { sequence },
+            &self.remote_conn.outbound_symmetric_key,
+            vec![], // No receipts for pong
+        )?
+        .prepared_send();
+
+        self.remote_conn
+            .socket
+            .send_to(&pong_packet, self.remote_conn.remote_addr)
+            .await
+            .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
+
+        tracing::trace!(
+            peer_addr = %self.remote_conn.remote_addr,
+            packet_id,
+            pong_sequence = sequence,
+            "Pong packet sent"
+        );
+
+        Ok(())
     }
 
     #[inline]
