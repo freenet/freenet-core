@@ -120,8 +120,11 @@ impl VisitedPeers {
 
     /// Generates bloom filter indices using double-hashing.
     ///
-    /// Double-hashing: compute h1 and h2, then generate k hashes as h1 + i*h2.
-    /// This is more efficient than computing k independent hashes.
+    /// Uses the technique from "Less Hashing, Same Performance: Building a Better
+    /// Bloom Filter" (Kirsch & Mitzenmacher, 2006). Double-hashing computes h1 and h2,
+    /// then generates k hashes as h1 + i*h2 for i in 0..k.
+    /// This is more efficient than computing k independent hashes and provides
+    /// equivalent probabilistic guarantees.
     fn hash_indices(&self, addr: &SocketAddr) -> [usize; NUM_HASHES] {
         let state = RandomState::with_seeds(
             self.hash_keys.0,
@@ -221,23 +224,21 @@ mod tests {
     fn test_transaction_isolation() {
         let tx1 = test_transaction();
         let tx2 = test_transaction();
-        let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
-        let mut v1 = VisitedPeers::new(&tx1);
+        let v1 = VisitedPeers::new(&tx1);
         let v2 = VisitedPeers::new(&tx2);
 
-        v1.mark_visited(addr);
+        // Different transactions MUST use different hash keys (deterministic property)
+        assert_ne!(
+            v1.hash_keys, v2.hash_keys,
+            "Different transactions must produce different hash keys"
+        );
 
-        // v1 should show visited
-        assert!(v1.probably_visited(addr));
-
-        // v2 should NOT show visited (different transaction key)
-        // Note: Due to bloom filter nature, there's a small chance of false positive
-        // but with different hash keys it should be extremely unlikely
-        // We accept this test may very rarely fail due to hash collision
-        assert!(
-            !v2.probably_visited(addr),
-            "Different transactions should have independent bloom filters"
+        // Same transaction should produce identical hash keys (deterministic)
+        let v1_again = VisitedPeers::new(&tx1);
+        assert_eq!(
+            v1.hash_keys, v1_again.hash_keys,
+            "Same transaction must produce identical hash keys"
         );
     }
 
