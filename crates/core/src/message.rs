@@ -98,6 +98,12 @@ impl Transaction {
         self.id.0.to_le_bytes()
     }
 
+    /// Returns the transaction ID as raw bytes.
+    /// Used for deriving hash keys in bloom filters.
+    pub fn id_bytes(&self) -> [u8; 16] {
+        self.id.0.to_le_bytes()
+    }
+
     /// Returns the elapsed time since this transaction was created.
     pub fn elapsed(&self) -> Duration {
         let current_unix_epoch_ts = SystemTime::now()

@@ -10,7 +10,6 @@ use freenet_stdlib::{
 };
 use futures::stream::FuturesUnordered;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
-use std::collections::HashSet;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -23,7 +22,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
-use crate::operations::{get, put, update, OpError};
+use crate::operations::{get, put, update, OpError, VisitedPeers};
 use crate::ring::KnownPeerKeyLocation;
 use crate::{config::GlobalExecutor, contract::StoreResponse};
 
@@ -1210,8 +1209,12 @@ async fn process_open_request(
                                     transaction_id,
                                 );
 
-                                if let Err(err) =
-                                    get::request_get(&op_manager, op, HashSet::new()).await
+                                if let Err(err) = get::request_get(
+                                    &op_manager,
+                                    op,
+                                    VisitedPeers::new(&transaction_id),
+                                )
+                                .await
                                 {
                                     tracing::error!(
                                         client_id = %client_id,
@@ -1301,7 +1304,7 @@ async fn process_open_request(
                                 })?;
 
                             if let Err(err) =
-                                get::request_get(&op_manager, op, HashSet::new()).await
+                                get::request_get(&op_manager, op, VisitedPeers::new(&op_id)).await
                             {
                                 tracing::error!(
                                     client_id = %client_id,
