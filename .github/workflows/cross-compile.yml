@@ -28,7 +28,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
 
       - name: Compile for x86_64-unknown-linux-musl
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        # Only build freenet and fdev - cdylib crates (contracts) don't support musl
+        run: cargo build --release --target x86_64-unknown-linux-musl -p freenet -p fdev
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v6
@@ -64,7 +65,8 @@ jobs:
           sudo apt-get install -y musl-tools musl-dev
 
       - name: Compile for aarch64-unknown-linux-musl
-        run: cargo build --release --target aarch64-unknown-linux-musl
+        # Only build freenet and fdev - cdylib crates (contracts) don't support musl
+        run: cargo build --release --target aarch64-unknown-linux-musl -p freenet -p fdev
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v6
