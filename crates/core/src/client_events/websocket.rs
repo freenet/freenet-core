@@ -329,7 +329,18 @@ async fn websocket_commands(
         if let Err(error) =
             websocket_interface(rs.clone(), auth_and_instance, encoding_protoc, ws).await
         {
-            tracing::error!("{error}");
+            // Client-side disconnects (e.g., closing without handshake) are expected
+            // and should not be logged as errors. These occur when clients timeout,
+            // crash, or close connections abruptly.
+            let error_msg = error.to_string();
+            if error_msg.contains("Connection reset without closing handshake")
+                || error_msg.contains("connection was aborted")
+                || error_msg.contains("connection reset by peer")
+            {
+                tracing::warn!("WebSocket client disconnect: {error}");
+            } else {
+                tracing::error!("WebSocket protocol error: {error}");
+            }
         }
     };
 
