@@ -8,7 +8,6 @@
 //! - Privacy protection via transaction-specific hashing
 //! - Efficient serialization for network transmission
 
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::SocketAddr;
 
 use ahash::RandomState;
@@ -126,25 +125,25 @@ impl VisitedPeers {
     /// This is more efficient than computing k independent hashes and provides
     /// equivalent probabilistic guarantees.
     fn hash_indices(&self, addr: &SocketAddr) -> [usize; NUM_HASHES] {
-        let state = RandomState::with_seeds(
-            self.hash_keys.0,
-            self.hash_keys.1,
-            self.hash_keys.0.wrapping_mul(0x517cc1b727220a95),
-            self.hash_keys.1.wrapping_mul(0x9e3779b97f4a7c15),
+        // Use two independent hash functions with different seeds.
+        // The constants are derived from the golden ratio (phi) and are commonly
+        // used in hash function mixing to ensure good bit distribution.
+        // 0x9e3779b97f4a7c15 = 2^64 / phi (golden ratio constant)
+        // 0x517cc1b727220a95 = another well-distributed odd constant
+        let state1 = RandomState::with_seeds(self.hash_keys.0, self.hash_keys.1, 0, 0);
+
+        let state2 = RandomState::with_seeds(
+            self.hash_keys.0.wrapping_add(0x9e3779b97f4a7c15),
+            self.hash_keys.1.wrapping_add(0x517cc1b727220a95),
+            0,
+            0,
         );
 
-        // Compute two base hashes
-        let h1 = state.hash_one(addr);
+        // Compute two independent base hashes
+        let h1 = state1.hash_one(addr);
+        let h2 = state2.hash_one(addr);
 
-        let h2 = {
-            let mut hasher = state.build_hasher();
-            addr.hash(&mut hasher);
-            // Add a distinguisher to get a different hash
-            0xDEADBEEFu32.hash(&mut hasher);
-            hasher.finish()
-        };
-
-        // Generate NUM_HASHES indices using double-hashing
+        // Generate NUM_HASHES indices using double-hashing: h1 + i*h2
         [
             (h1 as usize) % BLOOM_BITS,
             (h1.wrapping_add(h2) as usize) % BLOOM_BITS,
@@ -304,9 +303,10 @@ mod tests {
             visited.mark_visited(*addr);
         }
 
-        // Check 1000 random addresses that were NOT inserted
+        // Check 10,000 random addresses that were NOT inserted
+        // Using more samples for statistical significance
         let mut false_positives = 0;
-        for port in 10000..11000 {
+        for port in 10000..20000 {
             let addr: SocketAddr = format!("10.0.0.1:{}", port).parse().unwrap();
             if visited.probably_visited(addr) {
                 false_positives += 1;
@@ -314,12 +314,13 @@ mod tests {
         }
 
         // With 20 elements in 512-bit filter with k=4, expected FP rate is ~0.04%
-        // Allow up to 1% for test stability (10 out of 1000)
+        // Allow up to 0.5% (50 out of 10,000) for test stability - still 12x expected rate
+        let fp_rate = false_positives as f64 / 10000.0 * 100.0;
         assert!(
-            false_positives <= 10,
-            "False positive rate too high: {}/1000 = {}%",
+            false_positives <= 50,
+            "False positive rate too high: {}/10000 = {:.3}% (expected ~0.04%)",
             false_positives,
-            false_positives as f64 / 10.0
+            fp_rate
         );
     }
 
@@ -345,5 +346,40 @@ mod tests {
                 addr
             );
         }
+    }
+
+    #[test]
+    fn test_serialized_size() {
+        let tx = test_transaction();
+        let visited = VisitedPeers::new(&tx);
+
+        // Serialize with bincode
+        let bytes = bincode::serialize(&visited).expect("serialization failed");
+
+        // Expected size: 64 bytes (bits) + 16 bytes (hash_keys) = 80 bytes
+        // bincode may add small overhead for length prefixes
+        assert!(
+            bytes.len() <= 100,
+            "Serialized size too large: {} bytes (expected ~80 bytes)",
+            bytes.len()
+        );
+        assert!(
+            bytes.len() >= 80,
+            "Serialized size too small: {} bytes (expected ~80 bytes)",
+            bytes.len()
+        );
+
+        // Verify the size is fixed regardless of content
+        let mut visited_full = VisitedPeers::new(&tx);
+        for port in 8000..8100 {
+            let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+            visited_full.mark_visited(addr);
+        }
+        let bytes_full = bincode::serialize(&visited_full).expect("serialization failed");
+        assert_eq!(
+            bytes.len(),
+            bytes_full.len(),
+            "Serialized size should be fixed regardless of marked peers"
+        );
     }
 }
