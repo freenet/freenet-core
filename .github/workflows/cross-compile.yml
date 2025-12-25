@@ -24,8 +24,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install musl-tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
 
       - name: Compile for x86_64-unknown-linux-musl
         run: cargo build --release --target x86_64-unknown-linux-musl
@@ -58,10 +58,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install musl cross-compilation tools
+      - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y musl-tools musl-dev
 
       - name: Compile for aarch64-unknown-linux-musl
         run: cargo build --release --target aarch64-unknown-linux-musl

@@ -85,7 +85,7 @@ detect_arch() {
     esac
 }
 
-# Build the target triple for downloading
+# Build the target triple for downloading (primary choice)
 get_target_triple() {
     os=$1
     arch=$2
@@ -97,6 +97,22 @@ get_target_triple() {
             ;;
         macos)
             echo "${arch}-apple-darwin"
+            ;;
+    esac
+}
+
+# Get fallback target triple for older releases that don't have musl binaries
+get_fallback_target_triple() {
+    os=$1
+    arch=$2
+
+    case "$os" in
+        linux)
+            echo "${arch}-unknown-linux-gnu"
+            ;;
+        *)
+            # No fallback needed for non-Linux
+            echo ""
             ;;
     esac
 }
@@ -117,6 +133,20 @@ download() {
         wget -q "$url" -O "$dest"
     else
         error "Neither curl nor wget found. Please install one of them."
+    fi
+}
+
+# Try to download, return 0 on success, 1 on failure (without exiting)
+try_download() {
+    url=$1
+    dest=$2
+
+    if has_cmd curl; then
+        curl -fsSL "$url" -o "$dest" 2>/dev/null
+    elif has_cmd wget; then
+        wget -q "$url" -O "$dest" 2>/dev/null
+    else
+        return 1
     fi
 }
 
@@ -227,6 +257,8 @@ main() {
     os=$(detect_os)
     arch=$(detect_arch)
     target=$(get_target_triple "$os" "$arch")
+    fallback_target=$(get_fallback_target_triple "$os" "$arch")
+    using_fallback=false
 
     info "Detected platform: $os ($arch)"
 
@@ -263,11 +295,25 @@ main() {
         checksums_available=true
     fi
 
-    # Download freenet
+    # Download freenet (try musl first, fall back to gnu for older releases)
     info "Downloading freenet..."
     freenet_archive="freenet-${target}.tar.gz"
     freenet_url="https://github.com/freenet/freenet-core/releases/download/v${version}/${freenet_archive}"
-    download "$freenet_url" "$tmp_dir/freenet.tar.gz"
+
+    if ! try_download "$freenet_url" "$tmp_dir/freenet.tar.gz"; then
+        # Try fallback target (gnu) for older releases
+        if [ -n "$fallback_target" ]; then
+            warn "Musl binary not available, trying glibc version..."
+            freenet_archive="freenet-${fallback_target}.tar.gz"
+            freenet_url="https://github.com/freenet/freenet-core/releases/download/v${version}/${freenet_archive}"
+            if ! try_download "$freenet_url" "$tmp_dir/freenet.tar.gz"; then
+                error "Failed to download freenet binary for version $version"
+            fi
+            using_fallback=true
+        else
+            error "Failed to download freenet binary for version $version"
+        fi
+    fi
 
     # Verify freenet checksum
     if [ "$checksums_available" = true ]; then
@@ -280,11 +326,18 @@ main() {
         fi
     fi
 
-    # Download fdev
+    # Download fdev (use same target as freenet)
     info "Downloading fdev..."
-    fdev_archive="fdev-${target}.tar.gz"
+    if [ "$using_fallback" = true ]; then
+        fdev_archive="fdev-${fallback_target}.tar.gz"
+    else
+        fdev_archive="fdev-${target}.tar.gz"
+    fi
     fdev_url="https://github.com/freenet/freenet-core/releases/download/v${version}/${fdev_archive}"
-    download "$fdev_url" "$tmp_dir/fdev.tar.gz"
+
+    if ! try_download "$fdev_url" "$tmp_dir/fdev.tar.gz"; then
+        error "Failed to download fdev binary for version $version"
+    fi
 
     # Verify fdev checksum
     if [ "$checksums_available" = true ]; then
@@ -295,6 +348,12 @@ main() {
         else
             warn "Checksum not found for $fdev_archive"
         fi
+    fi
+
+    # Warn about glibc compatibility if using fallback
+    if [ "$using_fallback" = true ]; then
+        warn "Using glibc-linked binary. If you see 'GLIBC_X.XX not found' errors,"
+        warn "please upgrade to a newer Freenet version or build from source."
     fi
 
     # Extract binaries
