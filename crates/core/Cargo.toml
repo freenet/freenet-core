@@ -91,7 +91,7 @@ opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"]
 freenet-stdlib = { features = ["net"], workspace = true }
 console-subscriber = { version = "0.5.0", optional = true }
 tokio-stream = "0.1.17"
-freenet-test-network = { version = "0.1.17", optional = true }
+freenet-test-network = { version = "0.1.18", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"  # For sendmmsg syscall batching on Linux
