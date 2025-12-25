@@ -6,7 +6,6 @@ use freenet::{
     run_local_node, run_network_node,
     server::serve_gateway,
 };
-use std::collections::HashSet;
 use std::sync::Arc;
 
 mod commands;
@@ -41,41 +40,6 @@ enum Command {
     Service(ServiceCommand),
     /// Update Freenet to the latest version
     Update(UpdateCommand),
-}
-
-/// Thread info for diagnostics
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ThreadInfo {
-    tid: u64,
-    name: String,
-}
-
-/// Get all tokio runtime threads with their TIDs and names
-/// Looks for both "freenet-main" (our main runtime) and "tokio-runtime" (rogue runtimes)
-#[cfg(target_os = "linux")]
-fn get_tokio_threads() -> Vec<ThreadInfo> {
-    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .filter_map(|entry| {
-            let tid: u64 = entry.file_name().to_str()?.parse().ok()?;
-            let comm_path = entry.path().join("comm");
-            let name = std::fs::read_to_string(comm_path).ok()?.trim().to_string();
-            // Match our main runtime threads OR any rogue tokio runtime threads
-            if name.contains("freenet-main") || name.contains("tokio-runtime") {
-                Some(ThreadInfo { tid, name })
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn get_tokio_threads() -> Vec<ThreadInfo> {
-    Vec::new()
 }
 
 /// Build metadata embedded at compile time
@@ -116,109 +80,6 @@ async fn run_local(config: Config) -> anyhow::Result<()> {
 
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
-
-    // Thread monitor for diagnosing thread explosion issue
-    // Enhanced to track individual thread TIDs and detect exactly when new threads appear
-    tokio::spawn(async {
-        let expected = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
-
-        // Track known thread TIDs
-        let initial_threads = get_tokio_threads();
-        let mut known_tids: HashSet<u64> = initial_threads.iter().map(|t| t.tid).collect();
-        let baseline = initial_threads.len();
-
-        // Log initial thread TIDs for reference
-        let initial_tid_range = if !initial_threads.is_empty() {
-            let min_tid = initial_threads.iter().map(|t| t.tid).min().unwrap();
-            let max_tid = initial_threads.iter().map(|t| t.tid).max().unwrap();
-            format!("{}-{}", min_tid, max_tid)
-        } else {
-            "none".to_string()
-        };
-
-        tracing::info!(
-            target: "freenet::diagnostics::thread_explosion",
-            initial = baseline,
-            expected,
-            tid_range = %initial_tid_range,
-            "Thread monitor started (checking every 10s)"
-        );
-
-        // Check every 10 seconds for faster detection
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-
-        loop {
-            interval.tick().await;
-
-            let current_threads = get_tokio_threads();
-            let current_count = current_threads.len();
-            let current_tids: HashSet<u64> = current_threads.iter().map(|t| t.tid).collect();
-
-            // Find newly created threads
-            let new_tids: Vec<u64> = current_tids.difference(&known_tids).copied().collect();
-
-            if !new_tids.is_empty() {
-                // New threads detected! Log detailed info
-                let new_threads: Vec<_> = current_threads
-                    .iter()
-                    .filter(|t| new_tids.contains(&t.tid))
-                    .collect();
-
-                // Check if this looks like a new runtime (batch of consecutive TIDs)
-                let mut sorted_new_tids = new_tids.clone();
-                sorted_new_tids.sort();
-                let is_batch = sorted_new_tids.len() > 1 && {
-                    let first = sorted_new_tids[0];
-                    let last = sorted_new_tids[sorted_new_tids.len() - 1];
-                    // Consecutive or near-consecutive TIDs suggest batch creation
-                    (last - first) < (sorted_new_tids.len() as u64 * 2)
-                };
-
-                let new_tid_range = if !sorted_new_tids.is_empty() {
-                    format!(
-                        "{}-{}",
-                        sorted_new_tids[0],
-                        sorted_new_tids[sorted_new_tids.len() - 1]
-                    )
-                } else {
-                    "none".to_string()
-                };
-
-                // Get thread names (should all be tokio-runtime-w or similar)
-                let thread_names: Vec<_> = new_threads.iter().map(|t| t.name.as_str()).collect();
-                let unique_names: HashSet<_> = thread_names.iter().copied().collect();
-
-                if current_count > baseline + 10 {
-                    tracing::error!(
-                        target: "freenet::diagnostics::thread_explosion",
-                        current = current_count,
-                        baseline,
-                        new_thread_count = new_tids.len(),
-                        new_tid_range = %new_tid_range,
-                        is_batch_creation = is_batch,
-                        thread_names = ?unique_names,
-                        "THREAD EXPLOSION - new runtime likely created"
-                    );
-                } else {
-                    tracing::warn!(
-                        target: "freenet::diagnostics::thread_explosion",
-                        current = current_count,
-                        baseline,
-                        new_thread_count = new_tids.len(),
-                        new_tid_range = %new_tid_range,
-                        is_batch_creation = is_batch,
-                        thread_names = ?unique_names,
-                        "New tokio threads detected"
-                    );
-                }
-
-                // Update known TIDs
-                known_tids.extend(new_tids);
-            }
-        }
-    });
 
     let clients = serve_gateway(config.ws_api)
         .await
