@@ -146,9 +146,13 @@ type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 ///
 /// The `packet_sending` function is a helper function used to send packets to the remote peer.
 /// Maximum number of unanswered pings before considering the connection dead.
-/// With 10-second ping interval, 12 unanswered pings means 120 seconds of no response,
-/// matching KILL_CONNECTION_AFTER timeout.
-const MAX_UNANSWERED_PINGS: usize = 12;
+/// With 5-second ping interval, 2 unanswered pings means 10 seconds of no response.
+/// This is intentionally shorter than KILL_CONNECTION_AFTER (120s) because:
+/// 1. We're actively probing, so we can detect failures faster
+/// 2. Operations have their own timeouts, but routing to a dead peer wastes time
+/// 3. 10 seconds is long enough to tolerate brief network hiccups
+/// 4. Bandwidth is negligible (~20 bytes/sec per connection)
+const MAX_UNANSWERED_PINGS: usize = 2;
 
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub struct PeerConnection<S = super::UdpSocket> {
@@ -193,7 +197,7 @@ impl<S> Drop for PeerConnection<S> {
 #[allow(private_bounds)]
 impl<S: super::Socket> PeerConnection<S> {
     pub(super) fn new(remote_conn: RemoteConnection<S>) -> Self {
-        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+        const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
         // Start the keep-alive task before creating Self
         let remote_addr = remote_conn.remote_addr;
