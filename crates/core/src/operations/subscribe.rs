@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -69,7 +68,8 @@ async fn fetch_contract_if_missing(
 
     // Start a GET operation to fetch the contract
     let get_op = get::start_op(instance_id, true, false);
-    get::request_get(op_manager, get_op, HashSet::new()).await?;
+    let visited = super::VisitedPeers::new(&get_op.id);
+    get::request_get(op_manager, get_op, visited).await?;
 
     // Wait for contract to arrive
     wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
@@ -177,12 +177,12 @@ pub(crate) async fn request_subscribe(
     // This ensures proper subscription tree management for update propagation.
 
     // Find a peer to forward the request to (needed even if we have contract locally)
-    let mut skip_list: HashSet<std::net::SocketAddr> = HashSet::new();
-    skip_list.insert(own_addr);
+    let mut visited = super::VisitedPeers::new(id);
+    visited.mark_visited(own_addr);
 
     let candidates = op_manager
         .ring
-        .k_closest_potentially_caching(instance_id, &skip_list, 3);
+        .k_closest_potentially_caching(instance_id, &visited, 3);
 
     let Some(target) = candidates.first() else {
         // No remote peers available - if we have contract locally, complete subscription locally.
@@ -198,7 +198,7 @@ pub(crate) async fn request_subscribe(
     let target_addr = target
         .socket_addr()
         .expect("target must have socket address");
-    skip_list.insert(target_addr);
+    visited.mark_visited(target_addr);
 
     tracing::debug!(
         tx = %id,
@@ -211,7 +211,7 @@ pub(crate) async fn request_subscribe(
         id: *id,
         instance_id: *instance_id,
         htl: op_manager.ring.max_hops_to_live,
-        skip_list,
+        visited,
     };
 
     let op = SubscribeOp {
@@ -369,7 +369,7 @@ impl Operation for SubscribeOp {
                     id,
                     instance_id,
                     htl,
-                    skip_list,
+                    visited,
                 } => {
                     tracing::debug!(
                         tx = %id,
@@ -475,17 +475,16 @@ impl Operation for SubscribeOp {
 
                     // Find next hop
                     let own_addr = op_manager.ring.connection_manager.peer_addr()?;
-                    let mut new_skip_list = skip_list.clone();
-                    new_skip_list.insert(own_addr);
+                    let mut new_visited = visited.clone();
+                    new_visited.mark_visited(own_addr);
                     if let Some(requester) = self.requester_addr {
-                        new_skip_list.insert(requester);
+                        new_visited.mark_visited(requester);
                     }
 
-                    let candidates = op_manager.ring.k_closest_potentially_caching(
-                        instance_id,
-                        &new_skip_list,
-                        3,
-                    );
+                    let candidates =
+                        op_manager
+                            .ring
+                            .k_closest_potentially_caching(instance_id, &new_visited, 3);
 
                     let Some(next_hop) = candidates.first() else {
                         // No forward target
@@ -503,7 +502,7 @@ impl Operation for SubscribeOp {
                             RingError::NoCachingPeers(*instance_id)
                         })?;
                     let next_addr = next_hop_known.socket_addr();
-                    new_skip_list.insert(next_addr);
+                    new_visited.mark_visited(next_addr);
 
                     tracing::debug!(tx = %id, %instance_id, next = %next_addr, "Forwarding subscribe request");
 
@@ -512,7 +511,7 @@ impl Operation for SubscribeOp {
                             id: *id,
                             instance_id: *instance_id,
                             htl: htl.saturating_sub(1),
-                            skip_list: new_skip_list,
+                            visited: new_visited,
                         })),
                         next_hop: Some(next_addr),
                         state: Some(OpEnum::Subscribe(SubscribeOp {
@@ -693,8 +692,8 @@ mod messages {
             instance_id: ContractInstanceId,
             /// Hops to live - decremented at each hop
             htl: usize,
-            /// Addresses to skip when selecting next hop (prevents loops)
-            skip_list: HashSet<std::net::SocketAddr>,
+            /// Bloom filter tracking visited peers to prevent loops
+            visited: super::super::VisitedPeers,
         },
         /// Response for a SUBSCRIBE operation. Routed hop-by-hop back to originator.
         /// Uses instance_id for routing (always available from the request).

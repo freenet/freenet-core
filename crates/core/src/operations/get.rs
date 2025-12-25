@@ -93,7 +93,7 @@ pub(crate) fn start_op_with_id(
 pub(crate) async fn request_get(
     op_manager: &OpManager,
     get_op: GetOp,
-    skip_list: HashSet<std::net::SocketAddr>,
+    visited: super::VisitedPeers,
 ) -> Result<(), OpError> {
     let (mut candidates, id, instance_id_val, _fetch_contract, local_fallback) = if let Some(
         GetState::PrepareRequest {
@@ -147,7 +147,7 @@ pub(crate) async fn request_get(
         // Find peers to query - we prefer network over local cache for freshness
         let candidates = op_manager.ring.k_closest_potentially_caching(
             instance_id,
-            &skip_list,
+            &visited,
             DEFAULT_MAX_BREADTH,
         );
 
@@ -243,7 +243,7 @@ pub(crate) async fn request_get(
                 tried_peers,
                 alternatives: candidates,
                 attempts_at_hop: 1,
-                skip_list: skip_list.clone(),
+                visited: visited.clone(),
             });
 
             let msg = GetMsg::Request {
@@ -251,7 +251,7 @@ pub(crate) async fn request_get(
                 instance_id: instance_id_val,
                 fetch_contract,
                 htl: op_manager.ring.max_hops_to_live,
-                skip_list,
+                visited,
             };
 
             let op = GetOp {
@@ -309,8 +309,8 @@ enum GetState {
         alternatives: Vec<PeerKeyLocation>,
         /// How many peers we've tried at this hop
         attempts_at_hop: usize,
-        /// Skip list used for the current hop
-        skip_list: HashSet<std::net::SocketAddr>,
+        /// Bloom filter tracking visited peers across all hops
+        visited: super::VisitedPeers,
     },
     /// Operation completed successfully
     Finished { key: ContractKey },
@@ -433,7 +433,7 @@ impl GetOp {
             mut tried_peers,
             mut alternatives,
             attempts_at_hop,
-            skip_list,
+            visited,
         }) = self.state.take()
         {
             // Mark the failed peer as tried
@@ -467,7 +467,7 @@ impl GetOp {
                     tried_peers,
                     alternatives,
                     attempts_at_hop: attempts_at_hop + 1,
-                    skip_list: skip_list.clone(),
+                    visited: visited.clone(),
                 });
 
                 let msg = GetMsg::Request {
@@ -475,7 +475,7 @@ impl GetOp {
                     instance_id,
                     fetch_contract,
                     htl: current_hop,
-                    skip_list,
+                    visited,
                 };
 
                 let op = GetOp {
@@ -495,12 +495,14 @@ impl GetOp {
 
             // No alternatives - look for new candidates
             if retries < MAX_RETRIES {
-                let mut new_skip_list = skip_list.clone();
-                new_skip_list.extend(tried_peers.clone());
+                let mut new_visited = visited.clone();
+                for addr in &tried_peers {
+                    new_visited.mark_visited(*addr);
+                }
 
                 let mut new_candidates = op_manager.ring.k_closest_potentially_caching(
                     &instance_id,
-                    &new_skip_list,
+                    &new_visited,
                     DEFAULT_MAX_BREADTH,
                 );
 
@@ -530,7 +532,7 @@ impl GetOp {
                         tried_peers: new_tried_peers,
                         alternatives: new_candidates,
                         attempts_at_hop: 1,
-                        skip_list: new_skip_list.clone(),
+                        visited: new_visited.clone(),
                     });
 
                     let msg = GetMsg::Request {
@@ -538,7 +540,7 @@ impl GetOp {
                         instance_id,
                         fetch_contract,
                         htl: current_hop,
-                        skip_list: new_skip_list,
+                        visited: new_visited,
                     };
 
                     let op = GetOp {
@@ -730,7 +732,7 @@ impl Operation for GetOp {
                     id,
                     fetch_contract,
                     htl,
-                    skip_list,
+                    visited,
                 } => {
                     // Handle GET request - either initial or forwarded
                     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
@@ -754,7 +756,7 @@ impl Operation for GetOp {
                         peer_addr = %sender_display,
                         fetch_contract,
                         htl,
-                        skip = ?skip_list,
+                        skip = ?visited,
                         phase = "request",
                         "GET Request received"
                     );
@@ -830,9 +832,9 @@ impl Operation for GetOp {
                         }
 
                         // Update skip list with current peer address
-                        let mut new_skip_list = skip_list.clone();
+                        let mut new_visited = visited.clone();
                         if let Some(addr) = this_peer.socket_addr() {
-                            new_skip_list.insert(addr);
+                            new_visited.mark_visited(addr);
                         }
 
                         // First check if we have the contract locally before forwarding
@@ -960,7 +962,7 @@ impl Operation for GetOp {
                                 instance_id,
                                 (htl, fetch_contract),
                                 (this_peer, sender.clone()),
-                                new_skip_list,
+                                new_visited,
                                 op_manager,
                                 stats,
                                 self.upstream_addr,
@@ -1016,7 +1018,7 @@ impl Operation for GetOp {
                             mut alternatives,
                             attempts_at_hop,
                             next_hop: _,
-                            skip_list,
+                            visited,
                             instance_id: state_instance_id,
                             ..
                         }) => {
@@ -1051,7 +1053,7 @@ impl Operation for GetOp {
                                     instance_id,
                                     fetch_contract,
                                     htl: current_hop,
-                                    skip_list: tried_peers.clone(),
+                                    visited: visited.clone(),
                                 });
 
                                 // Update state with the new alternative being tried
@@ -1070,21 +1072,23 @@ impl Operation for GetOp {
                                     attempts_at_hop: attempts_at_hop + 1,
                                     instance_id,
                                     next_hop: next_target,
-                                    // Preserve the accumulated skip_list so future candidate
+                                    // Preserve the accumulated visited so future candidate
                                     // selection still avoids already-specified peers; tried_peers
                                     // tracks attempts at this hop.
-                                    skip_list: skip_list.clone(),
+                                    visited: visited.clone(),
                                 });
                             } else if retries < MAX_RETRIES {
                                 // No more alternatives at this hop, try finding new peers
-                                let mut new_skip_list = skip_list.clone();
-                                new_skip_list.extend(tried_peers.clone());
+                                let mut new_visited = visited.clone();
+                                for addr in &tried_peers {
+                                    new_visited.mark_visited(*addr);
+                                }
 
                                 // Get new candidates excluding all tried peers
                                 let mut new_candidates =
                                     op_manager.ring.k_closest_potentially_caching(
                                         &instance_id,
-                                        &new_skip_list,
+                                        &new_visited,
                                         DEFAULT_MAX_BREADTH,
                                     );
 
@@ -1092,7 +1096,7 @@ impl Operation for GetOp {
                                     tx = %id,
                                     %instance_id,
                                     new_candidates = ?new_candidates,
-                                    skip = ?new_skip_list,
+                                    skip = ?new_visited,
                                     htl = current_hop,
                                     retries = retries + 1,
                                     phase = "retry",
@@ -1107,7 +1111,7 @@ impl Operation for GetOp {
                                         instance_id,
                                         fetch_contract,
                                         htl: current_hop,
-                                        skip_list: new_skip_list.clone(),
+                                        visited: new_visited.clone(),
                                     });
 
                                     // Reset for new round of attempts
@@ -1127,7 +1131,7 @@ impl Operation for GetOp {
                                         attempts_at_hop: 1,
                                         instance_id,
                                         next_hop: target,
-                                        skip_list: new_skip_list.clone(),
+                                        visited: new_visited.clone(),
                                     });
                                 } else if let Some(requester_peer) = requester.clone() {
                                     // No more peers to try, return NotFound to requester
@@ -1137,7 +1141,7 @@ impl Operation for GetOp {
                                         peer_addr = %this_peer,
                                         target = %requester_peer,
                                         tried = ?tried_peers,
-                                        skip = ?new_skip_list,
+                                        skip = ?new_visited,
                                         phase = "not_found",
                                         "No other peers found while trying to get the contract, returning NotFound to requester"
                                     );
@@ -1219,7 +1223,7 @@ impl Operation for GetOp {
                                             tx = %id,
                                             %instance_id,
                                             tried = ?tried_peers,
-                                            skip = ?skip_list,
+                                            skip = ?visited,
                                             phase = "not_found",
                                             "Failed getting contract, not found after max retries"
                                         );
@@ -1245,7 +1249,7 @@ impl Operation for GetOp {
                                         peer_addr = %this_peer,
                                         target = %requester_peer,
                                         tried = ?tried_peers,
-                                        skip = ?skip_list,
+                                        skip = ?visited,
                                         phase = "not_found",
                                         "No other peers found, returning NotFound to requester"
                                     );
@@ -1738,7 +1742,7 @@ async fn try_forward_or_return(
     instance_id: ContractInstanceId,
     (htl, fetch_contract): (usize, bool),
     (this_peer, sender): (PeerKeyLocation, PeerKeyLocation),
-    skip_list: HashSet<std::net::SocketAddr>,
+    visited: super::VisitedPeers,
     op_manager: &OpManager,
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
@@ -1751,9 +1755,9 @@ async fn try_forward_or_return(
         "Contract not found while processing a get request"
     );
 
-    let mut new_skip_list = skip_list.clone();
+    let mut new_visited = visited.clone();
     if let Some(addr) = this_peer.socket_addr() {
-        new_skip_list.insert(addr);
+        new_visited.mark_visited(addr);
     }
 
     let new_htl = htl.saturating_sub(1);
@@ -1770,7 +1774,7 @@ async fn try_forward_or_return(
     } else {
         let mut candidates = op_manager.ring.k_closest_potentially_caching(
             &instance_id,
-            &new_skip_list,
+            &new_visited,
             DEFAULT_MAX_BREADTH,
         );
 
@@ -1813,14 +1817,14 @@ async fn try_forward_or_return(
                 tried_peers,
                 alternatives,
                 attempts_at_hop: 1,
-                skip_list: new_skip_list.clone(),
+                visited: new_visited.clone(),
             }),
             Some(GetMsg::Request {
                 id,
                 instance_id,
                 fetch_contract,
                 htl: new_htl,
-                skip_list: new_skip_list,
+                visited: new_visited,
             }),
             None,
             stats,
@@ -1881,7 +1885,8 @@ mod messages {
             fetch_contract: bool,
             /// Hops to live - decremented at each hop. When 0, stop forwarding.
             htl: usize,
-            skip_list: HashSet<std::net::SocketAddr>,
+            /// Bloom filter tracking visited peers to prevent loops.
+            visited: super::super::VisitedPeers,
         },
         /// Response for a GET operation. Routed hop-by-hop back to originator.
         /// Uses instance_id for routing (always available from the request).
@@ -1945,7 +1950,7 @@ mod tests {
     use super::*;
     use crate::message::Transaction;
     use crate::operations::test_utils::make_contract_key;
-    use std::collections::HashSet;
+    use crate::operations::VisitedPeers;
 
     fn make_get_op(state: Option<GetState>, result: Option<GetResult>) -> GetOp {
         GetOp {
@@ -2069,7 +2074,7 @@ mod tests {
             instance_id: *make_contract_key(1).id(),
             fetch_contract: false,
             htl: 5,
-            skip_list: HashSet::new(),
+            visited: VisitedPeers::new(&tx),
         };
         assert_eq!(*msg.id(), tx, "id() should return the transaction ID");
     }
@@ -2082,7 +2087,7 @@ mod tests {
             instance_id: *make_contract_key(1).id(),
             fetch_contract: false,
             htl: 5,
-            skip_list: HashSet::new(),
+            visited: VisitedPeers::new(&tx),
         };
         let display = format!("{}", msg);
         assert!(

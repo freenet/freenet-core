@@ -23,6 +23,9 @@ pub(crate) mod subscribe;
 #[cfg(test)]
 pub(crate) mod test_utils;
 pub(crate) mod update;
+pub(crate) mod visited_peers;
+
+pub(crate) use visited_peers::VisitedPeers;
 
 pub(crate) trait Operation
 where

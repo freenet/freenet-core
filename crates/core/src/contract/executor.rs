@@ -2,7 +2,7 @@
 //! Communicates with the `ContractHandler` and potentially the `OpManager` (via `ExecutorToEventLoopChannel`).
 //! See `architecture.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::path::PathBuf;
@@ -617,7 +617,8 @@ impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
     }
 
     async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
-        operations::get::request_get(op_manager, op, HashSet::new()).await
+        let visited = operations::VisitedPeers::new(&op.id);
+        operations::get::request_get(op_manager, op, visited).await
     }
 }
 
