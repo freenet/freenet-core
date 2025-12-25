@@ -932,7 +932,20 @@ where
                                 ),
                             ))
                             .await;
-                        op_manager.ring.prune_connection(peer_id).await;
+                        let prune_result = op_manager.ring.prune_connection(peer_id).await;
+
+                        // Handle orphaned transactions immediately (retry via alternate routes)
+                        for tx in prune_result.orphaned_transactions {
+                            if let Err(err) =
+                                super::handle_aborted_op(tx, &op_manager, &gateways).await
+                            {
+                                tracing::warn!(
+                                    %tx,
+                                    error = %err,
+                                    "Failed to handle orphaned transaction"
+                                );
+                            }
+                        }
                     }
                     continue;
                 }

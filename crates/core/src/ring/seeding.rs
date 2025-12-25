@@ -88,11 +88,13 @@ pub struct RemoveSubscriberResult {
     pub notify_upstream: Option<PeerKeyLocation>,
 }
 
-/// Result of pruning subscriptions for a disconnected peer.
+/// Result of pruning a peer connection.
 #[derive(Debug)]
 pub struct PruneSubscriptionsResult {
     /// List of (contract, upstream) pairs where upstream notification is needed.
     pub notifications: Vec<(ContractKey, PeerKeyLocation)>,
+    /// Transactions that were pending on the pruned peer and need to be retried or failed.
+    pub orphaned_transactions: Vec<crate::message::Transaction>,
 }
 
 pub(crate) struct SeedingManager {
@@ -543,7 +545,10 @@ impl SeedingManager {
             );
         }
 
-        PruneSubscriptionsResult { notifications }
+        PruneSubscriptionsResult {
+            notifications,
+            orphaned_transactions: Vec::new(),
+        }
     }
 
     /// Record an access to a contract in the seeding cache.

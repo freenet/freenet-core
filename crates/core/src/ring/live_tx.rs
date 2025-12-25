@@ -45,12 +45,19 @@ impl LiveTransactionTracker {
         }
     }
 
-    pub(crate) fn prune_transactions_from_peer(&self, peer_addr: SocketAddr) {
+    /// Prune all transactions associated with a peer and return them.
+    ///
+    /// Returns the list of transactions that were associated with this peer,
+    /// allowing callers to handle them appropriately (e.g., retry via alternate routes).
+    pub(crate) fn prune_transactions_from_peer(&self, peer_addr: SocketAddr) -> Vec<Transaction> {
         // Remove all transactions for this peer from the reverse index
         if let Some((_, txs)) = self.tx_per_peer.remove(&peer_addr) {
-            for tx in txs {
-                self.peer_for_tx.remove(&tx);
+            for tx in &txs {
+                self.peer_for_tx.remove(tx);
             }
+            txs
+        } else {
+            Vec::new()
         }
     }
 
@@ -211,5 +218,36 @@ mod tests {
         // peer2's transaction should still exist
         assert!(tracker.has_live_connection(addr2));
         assert!(!tracker.has_live_connection(addr1));
+    }
+
+    #[test]
+    fn prune_transactions_from_peer_returns_transactions() {
+        let tracker = LiveTransactionTracker::new();
+        let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        let tx1 = Transaction::new::<ConnectMsg>();
+        let tx2 = Transaction::new::<GetMsg>();
+        let tx3 = Transaction::new::<PutMsg>();
+
+        // Add transactions for two peers
+        tracker.add_transaction(addr1, tx1);
+        tracker.add_transaction(addr1, tx2);
+        tracker.add_transaction(addr2, tx3);
+
+        // Prune peer1 and check returned transactions
+        let pruned = tracker.prune_transactions_from_peer(addr1);
+        assert_eq!(pruned.len(), 2);
+        assert!(pruned.contains(&tx1));
+        assert!(pruned.contains(&tx2));
+
+        // Prune peer2 and check returned transaction
+        let pruned = tracker.prune_transactions_from_peer(addr2);
+        assert_eq!(pruned.len(), 1);
+        assert!(pruned.contains(&tx3));
+
+        // Prune nonexistent peer returns empty
+        let pruned = tracker.prune_transactions_from_peer(addr1);
+        assert!(pruned.is_empty());
     }
 }

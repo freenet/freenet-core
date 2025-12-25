@@ -85,6 +85,41 @@ impl PutOp {
             _ => None,
         }
     }
+
+    /// Handle aborted connections by failing the operation immediately.
+    ///
+    /// PUT operations don't have alternative routes to try. When the connection
+    /// drops, we notify the client of the failure so they can retry.
+    pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
+        tracing::warn!(
+            tx = %self.id,
+            "Put operation aborted due to connection failure"
+        );
+
+        // Create an error result to notify the client
+        let error_result: crate::client_events::HostResult =
+            Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: "Put operation failed: peer connection dropped".into(),
+            }
+            .into());
+
+        // Send the error to the client via the result router
+        if let Err(err) = op_manager
+            .result_router_tx
+            .send((self.id, error_result))
+            .await
+        {
+            tracing::error!(
+                tx = %self.id,
+                error = %err,
+                "Failed to send abort notification to client"
+            );
+        }
+
+        // Mark the operation as completed so it's removed from tracking
+        op_manager.completed(self.id);
+        Ok(())
+    }
 }
 
 impl IsOperationCompleted for PutOp {

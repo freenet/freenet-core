@@ -116,6 +116,50 @@ impl P2pBridge {
 
         futures::future::join_all(futures).await;
     }
+
+    /// Handle orphaned transactions after a peer connection is pruned.
+    ///
+    /// This triggers retry logic for operations that were pending on the disconnected peer,
+    /// allowing them to be routed through alternate peers instead of waiting for timeout.
+    pub(crate) async fn handle_orphaned_transactions(
+        &self,
+        transactions: Vec<Transaction>,
+        gateways: &[PeerKeyLocation],
+    ) {
+        if transactions.is_empty() {
+            return;
+        }
+
+        tracing::debug!(
+            count = transactions.len(),
+            "Handling orphaned transactions from pruned connection"
+        );
+
+        // Process all orphaned transactions concurrently for better performance
+        let results = futures::future::join_all(transactions.into_iter().map(|tx| {
+            let op_manager = &self.op_manager;
+            async move {
+                tracing::debug!(
+                    %tx,
+                    tx_type = ?tx.transaction_type(),
+                    "Attempting retry for orphaned transaction"
+                );
+                (tx, handle_aborted_op(tx, op_manager, gateways).await)
+            }
+        }))
+        .await;
+
+        // Log any failures
+        for (tx, result) in results {
+            if let Err(err) = result {
+                tracing::warn!(
+                    %tx,
+                    error = %err,
+                    "Failed to handle orphaned transaction"
+                );
+            }
+        }
+    }
 }
 
 impl NetworkBridge for P2pBridge {
@@ -743,6 +787,14 @@ impl P2pConnManager {
                                             .send_prune_notifications(prune_result.notifications)
                                             .await;
 
+                                        // Handle orphaned transactions immediately (retry via alternate routes)
+                                        ctx.bridge
+                                            .handle_orphaned_transactions(
+                                                prune_result.orphaned_transactions,
+                                                &ctx.gateways,
+                                            )
+                                            .await;
+
                                         // Remove from connection map
                                         tracing::trace!(
                                             peer_addr = %peer_addr,
@@ -855,6 +907,14 @@ impl P2pConnManager {
 
                                     ctx.bridge
                                         .send_prune_notifications(prune_result.notifications)
+                                        .await;
+
+                                    // Handle orphaned transactions immediately (retry via alternate routes)
+                                    ctx.bridge
+                                        .handle_orphaned_transactions(
+                                            prune_result.orphaned_transactions,
+                                            &ctx.gateways,
+                                        )
                                         .await;
 
                                     // Clean up proximity cache for disconnected peer
@@ -2542,6 +2602,14 @@ impl P2pConnManager {
 
                     self.bridge
                         .send_prune_notifications(prune_result.notifications)
+                        .await;
+
+                    // Handle orphaned transactions immediately (retry via alternate routes)
+                    self.bridge
+                        .handle_orphaned_transactions(
+                            prune_result.orphaned_transactions,
+                            &self.gateways,
+                        )
                         .await;
 
                     if let Err(error) = handshake_commands
