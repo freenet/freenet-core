@@ -1192,6 +1192,29 @@ async fn process_open_request(
                                         "network GET",
                                     )
                                     .await?;
+
+                                    // CRITICAL: Also start a network SUBSCRIBE operation to establish
+                                    // the subscription tree. The local listener registration only allows
+                                    // receiving updates locally - we need the network operation to
+                                    // register this peer in the upstream subscription tree so updates
+                                    // are actually forwarded to us.
+                                    let _subscribe_result = crate::node::subscribe_with_id(
+                                        op_manager.clone(),
+                                        key,
+                                        None, // No legacy client registration (already done above)
+                                        None, // Let it generate its own transaction ID
+                                    )
+                                    .await
+                                    .inspect_err(|err| {
+                                        tracing::warn!(
+                                            client_id = %client_id,
+                                            contract = %key,
+                                            error = %err,
+                                            "Failed to establish subscription tree for GET with subscribe=true"
+                                        );
+                                    });
+                                    // Note: We don't fail the GET if subscribe fails - the GET can still
+                                    // return data, just won't receive future updates
                                 } else {
                                     tracing::warn!(
                                         client_id = %client_id,
