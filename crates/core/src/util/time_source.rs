@@ -124,6 +124,72 @@ impl TimeSource for MockTimeSource {
     }
 }
 
+/// A shared mock time source for testing components that need external time control.
+///
+/// Unlike `MockTimeSource`, this variant uses `Arc<Mutex<Instant>>` internally,
+/// allowing multiple clones to share the same underlying time. This enables tests
+/// to advance time after creating a component that holds a clone of the time source.
+///
+/// # Example
+/// ```ignore
+/// let time_source = SharedMockTimeSource::new();
+/// let component = Component::new(time_source.clone());
+///
+/// // Advance time after component creation
+/// time_source.advance_time(Duration::from_secs(60));
+///
+/// // Component now sees the advanced time
+/// component.do_something_time_dependent();
+/// ```
+#[cfg(test)]
+#[derive(Clone)]
+pub struct SharedMockTimeSource {
+    current_instant: Arc<std::sync::Mutex<Instant>>,
+}
+
+#[cfg(test)]
+impl SharedMockTimeSource {
+    /// Create a new shared mock time source starting at the current instant.
+    pub fn new() -> Self {
+        Self::with_instant(Instant::now())
+    }
+
+    /// Create a new shared mock time source starting at the given instant.
+    pub fn with_instant(start: Instant) -> Self {
+        SharedMockTimeSource {
+            current_instant: Arc::new(std::sync::Mutex::new(start)),
+        }
+    }
+
+    /// Advance the shared time by the given duration.
+    ///
+    /// All clones of this time source will see the advanced time.
+    pub fn advance_time(&self, duration: Duration) {
+        let mut guard = self.current_instant.lock().unwrap();
+        *guard += duration;
+    }
+
+    /// Get the current time value (for assertions).
+    #[allow(dead_code)] // Utility for future test expansion
+    pub fn current_time(&self) -> Instant {
+        *self.current_instant.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+impl Default for SharedMockTimeSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl TimeSource for SharedMockTimeSource {
+    fn now(&self) -> Instant {
+        *self.current_instant.lock().unwrap()
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;

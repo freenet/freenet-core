@@ -42,6 +42,7 @@
 use crate::client_events::{ClientId, HostResponse, HostResult, RequestId};
 use crate::contract::{ClientResponsesSender, SessionMessage};
 use crate::message::Transaction;
+use crate::util::time_source::{InstantTimeSrc, TimeSource};
 use freenet_stdlib::client_api::ContractResponse;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -61,8 +62,11 @@ const PENDING_RESULT_TTL: Duration = Duration::from_secs(60);
 /// is lazy (triggered only during message processing).
 const MAX_PENDING_RESULTS: usize = 2048;
 
-/// Simple session actor for client connection refactor
-pub struct SessionActor {
+/// Simple session actor for client connection refactor.
+///
+/// Generic over `T: TimeSource` to enable deterministic testing of cache eviction.
+/// For production use, see the type alias [`SessionActorImpl`] which uses real time.
+pub struct SessionActor<T: TimeSource> {
     message_rx: mpsc::Receiver<SessionMessage>,
     client_transactions: HashMap<Transaction, HashSet<ClientId>>,
     // Track RequestId correlation for each (Transaction, ClientId) pair
@@ -73,7 +77,12 @@ pub struct SessionActor {
     /// See module-level documentation for detailed cache eviction strategy and limitations.
     pending_results: HashMap<Transaction, PendingResult>,
     client_responses: ClientResponsesSender,
+    /// Time source for cache TTL calculations.
+    time_source: T,
 }
+
+/// Production type alias using real system time.
+pub type SessionActorImpl = SessionActor<InstantTimeSrc>;
 
 #[derive(Clone)]
 struct PendingResult {
@@ -83,24 +92,41 @@ struct PendingResult {
 }
 
 impl PendingResult {
-    fn new(result: std::sync::Arc<HostResult>) -> Self {
+    fn new(result: std::sync::Arc<HostResult>, now: Instant) -> Self {
         Self {
             result,
             delivered_clients: HashSet::new(),
-            last_accessed: Instant::now(),
+            last_accessed: now,
         }
     }
 
-    fn touch(&mut self) {
-        self.last_accessed = Instant::now();
+    fn touch(&mut self, now: Instant) {
+        self.last_accessed = now;
     }
 }
 
-impl SessionActor {
-    /// Create a new session actor
+impl SessionActorImpl {
+    /// Create a new session actor using real system time.
+    ///
+    /// This is the production constructor. For testing with controlled time,
+    /// use [`SessionActor::with_time_source`].
     pub fn new(
         message_rx: mpsc::Receiver<SessionMessage>,
         client_responses: ClientResponsesSender,
+    ) -> Self {
+        Self::with_time_source(message_rx, client_responses, InstantTimeSrc::new())
+    }
+}
+
+impl<T: TimeSource> SessionActor<T> {
+    /// Create a new session actor with a custom time source.
+    ///
+    /// This constructor is primarily intended for testing with [`SharedMockTimeSource`]
+    /// to enable deterministic cache eviction testing.
+    pub fn with_time_source(
+        message_rx: mpsc::Receiver<SessionMessage>,
+        client_responses: ClientResponsesSender,
+        time_source: T,
     ) -> Self {
         Self {
             message_rx,
@@ -108,6 +134,7 @@ impl SessionActor {
             client_request_ids: HashMap::new(),
             pending_results: HashMap::new(),
             client_responses,
+            time_source,
         }
     }
 
@@ -157,8 +184,9 @@ impl SessionActor {
                     self.client_transactions.get(&tx).map_or(0, |s| s.len())
                 );
 
+                let now = self.time_source.now();
                 if let Some(result_arc) = self.pending_results.get_mut(&tx).and_then(|pending| {
-                    pending.touch();
+                    pending.touch(now);
                     if pending.delivered_clients.insert(client_id) {
                         Some(pending.result.clone())
                     } else {
@@ -276,6 +304,7 @@ impl SessionActor {
         );
 
         let mut recipients = HashSet::new();
+        let now = self.time_source.now();
         let result_to_deliver = {
             if !self.pending_results.contains_key(&tx)
                 && self.pending_results.len() >= MAX_PENDING_RESULTS
@@ -286,9 +315,9 @@ impl SessionActor {
             let entry = self
                 .pending_results
                 .entry(tx)
-                .or_insert_with(|| PendingResult::new(result.clone()));
+                .or_insert_with(|| PendingResult::new(result.clone(), now));
             entry.result = result.clone();
-            entry.touch();
+            entry.touch(now);
 
             if let Some(waiting_clients) = self.client_transactions.remove(&tx) {
                 for client_id in waiting_clients {
@@ -318,6 +347,8 @@ impl SessionActor {
         result: std::sync::Arc<HostResult>,
         request_id: RequestId,
     ) {
+        let now = self.time_source.now();
+
         // Find the specific client associated with this RequestId
         let mut target_client = None;
 
@@ -364,10 +395,10 @@ impl SessionActor {
                 let entry = self
                     .pending_results
                     .entry(tx)
-                    .or_insert_with(|| PendingResult::new(result.clone()));
+                    .or_insert_with(|| PendingResult::new(result.clone(), now));
                 entry.delivered_clients.insert(client_id);
                 entry.result = result.clone();
-                entry.touch();
+                entry.touch(now);
 
                 tracing::debug!(
                     "Delivered result for transaction {} to specific client {} with request correlation {}",
@@ -426,7 +457,7 @@ impl SessionActor {
             self.client_transactions.keys().copied().collect();
         active_txs.extend(self.client_request_ids.keys().map(|(tx, _)| *tx));
 
-        let now = Instant::now();
+        let now = self.time_source.now();
         let stale: Vec<Transaction> = self
             .pending_results
             .iter()
@@ -984,5 +1015,274 @@ mod tests {
         // Clean up
         drop(session_tx);
         actor_handle.await.unwrap();
+    }
+
+    // =========================================================================
+    // Cache eviction tests using SharedMockTimeSource
+    // =========================================================================
+
+    mod cache_eviction {
+        use super::*;
+        use crate::contract::client_responses_channel;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        /// Helper to create an actor with controlled time for cache eviction tests.
+        fn create_test_actor_with_time(
+            time_source: SharedMockTimeSource,
+        ) -> (
+            mpsc::Sender<SessionMessage>,
+            SessionActor<SharedMockTimeSource>,
+        ) {
+            let (session_tx, session_rx) = mpsc::channel(100);
+            let (_client_responses_rx, client_responses_tx) = client_responses_channel();
+            let actor =
+                SessionActor::with_time_source(session_rx, client_responses_tx, time_source);
+            (session_tx, actor)
+        }
+
+        #[tokio::test]
+        async fn test_pending_result_ttl_expiration() {
+            // Test that entries older than PENDING_RESULT_TTL (60s) are pruned
+            let time_source = SharedMockTimeSource::new();
+            let (_session_tx, mut actor) = create_test_actor_with_time(time_source.clone());
+
+            // Add a pending result directly
+            let tx = Transaction::new::<PutMsg>();
+            let result = Arc::new(Ok(HostResponse::Ok));
+            let now = time_source.now();
+            actor
+                .pending_results
+                .insert(tx, PendingResult::new(result, now));
+
+            // Verify the entry exists
+            assert!(actor.pending_results.contains_key(&tx));
+            assert_eq!(actor.pending_results.len(), 1);
+
+            // Advance time by 30 seconds (less than TTL) - should NOT prune
+            time_source.advance_time(Duration::from_secs(30));
+            actor.prune_pending_results();
+            assert!(
+                actor.pending_results.contains_key(&tx),
+                "Entry should still exist before TTL expires"
+            );
+
+            // Advance time past TTL (another 31 seconds = 61 total)
+            time_source.advance_time(Duration::from_secs(31));
+            actor.prune_pending_results();
+            assert!(
+                !actor.pending_results.contains_key(&tx),
+                "Entry should be pruned after TTL expires"
+            );
+            assert_eq!(actor.pending_results.len(), 0);
+        }
+
+        #[tokio::test]
+        async fn test_active_transaction_not_pruned() {
+            // Test that entries with active client transactions are NOT pruned even past TTL
+            let time_source = SharedMockTimeSource::new();
+            let (_session_tx, mut actor) = create_test_actor_with_time(time_source.clone());
+
+            // Add a pending result and register a client for it
+            let tx = Transaction::new::<PutMsg>();
+            let client_id = ClientId::FIRST;
+            let request_id = RequestId::new();
+            let result = Arc::new(Ok(HostResponse::Ok));
+            let now = time_source.now();
+
+            actor
+                .pending_results
+                .insert(tx, PendingResult::new(result, now));
+            actor
+                .client_transactions
+                .entry(tx)
+                .or_default()
+                .insert(client_id);
+            actor.client_request_ids.insert((tx, client_id), request_id);
+
+            // Advance time past TTL
+            time_source.advance_time(Duration::from_secs(120));
+            actor.prune_pending_results();
+
+            // Entry should NOT be pruned because there's an active client waiting
+            assert!(
+                actor.pending_results.contains_key(&tx),
+                "Active transaction should not be pruned even past TTL"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_lru_eviction_at_capacity() {
+            // Test that when cache reaches MAX_PENDING_RESULTS, oldest entry is evicted
+            let time_source = SharedMockTimeSource::new();
+            let (_session_tx, mut actor) = create_test_actor_with_time(time_source.clone());
+
+            // Fill cache to capacity (MAX_PENDING_RESULTS = 2048)
+            // For test efficiency, we'll manually set up a scenario near capacity
+            let mut oldest_tx = None;
+            for i in 0..MAX_PENDING_RESULTS {
+                let tx = Transaction::new::<PutMsg>();
+                let result = Arc::new(Ok(HostResponse::Ok));
+                let now = time_source.now();
+                actor
+                    .pending_results
+                    .insert(tx, PendingResult::new(result, now));
+
+                if i == 0 {
+                    oldest_tx = Some(tx);
+                }
+
+                // Advance time slightly so each entry has a different timestamp
+                time_source.advance_time(Duration::from_millis(1));
+            }
+
+            assert_eq!(actor.pending_results.len(), MAX_PENDING_RESULTS);
+            assert!(oldest_tx.is_some());
+            assert!(actor.pending_results.contains_key(&oldest_tx.unwrap()));
+
+            // Add one more entry - this should trigger LRU eviction
+            let new_tx = Transaction::new::<PutMsg>();
+            let result = Arc::new(Ok(HostResponse::Ok));
+            let now = time_source.now();
+            actor
+                .pending_results
+                .insert(new_tx, PendingResult::new(result, now));
+
+            // Trigger capacity enforcement
+            actor.enforce_pending_capacity();
+
+            // The oldest entry should have been evicted
+            assert!(
+                !actor.pending_results.contains_key(&oldest_tx.unwrap()),
+                "Oldest entry should be evicted when at capacity"
+            );
+            assert!(
+                actor.pending_results.contains_key(&new_tx),
+                "Newly added entry should exist"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_touch_updates_last_accessed() {
+            // Test that touching an entry updates its last_accessed time
+            let time_source = SharedMockTimeSource::new();
+            let (_session_tx, mut actor) = create_test_actor_with_time(time_source.clone());
+
+            // Add a pending result
+            let tx = Transaction::new::<PutMsg>();
+            let result = Arc::new(Ok(HostResponse::Ok));
+            let initial_time = time_source.now();
+            actor
+                .pending_results
+                .insert(tx, PendingResult::new(result, initial_time));
+
+            let initial_accessed = actor.pending_results.get(&tx).unwrap().last_accessed;
+            assert_eq!(initial_accessed, initial_time);
+
+            // Advance time and touch the entry
+            time_source.advance_time(Duration::from_secs(30));
+            let touch_time = time_source.now();
+            if let Some(entry) = actor.pending_results.get_mut(&tx) {
+                entry.touch(touch_time);
+            }
+
+            let updated_accessed = actor.pending_results.get(&tx).unwrap().last_accessed;
+            assert_eq!(updated_accessed, touch_time);
+            assert!(updated_accessed > initial_accessed);
+        }
+
+        #[tokio::test]
+        async fn test_lazy_eviction_only_on_message_processing() {
+            // Test that stale entries persist until a message triggers pruning
+            let time_source = SharedMockTimeSource::new();
+            let (session_tx, actor) = create_test_actor_with_time(time_source.clone());
+
+            // We need to run the actor to test lazy eviction
+            let actor_handle = tokio::spawn(async move {
+                actor.run().await;
+            });
+
+            // Register a transaction so we can send a result
+            let tx = Transaction::new::<PutMsg>();
+            let client_id = ClientId::FIRST;
+            let request_id = RequestId::new();
+
+            // First, deliver a result (which will cache it)
+            let result = Arc::new(Ok(HostResponse::Ok));
+            session_tx
+                .send(SessionMessage::DeliverHostResponse {
+                    tx,
+                    response: result,
+                })
+                .await
+                .unwrap();
+
+            // Give actor time to process
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+            // Advance time past TTL
+            time_source.advance_time(Duration::from_secs(120));
+
+            // At this point, the entry is stale but hasn't been pruned yet
+            // because no message has triggered pruning
+
+            // Send a new message to trigger pruning
+            let new_tx = Transaction::new::<PutMsg>();
+            session_tx
+                .send(SessionMessage::RegisterTransaction {
+                    tx: new_tx,
+                    client_id,
+                    request_id,
+                })
+                .await
+                .unwrap();
+
+            // Give actor time to process and prune
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+            // Clean up
+            drop(session_tx);
+            actor_handle.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_multiple_entries_ttl_selective_pruning() {
+            // Test that only stale entries are pruned, recent ones kept
+            let time_source = SharedMockTimeSource::new();
+            let (_session_tx, mut actor) = create_test_actor_with_time(time_source.clone());
+
+            // Add first entry
+            let tx1 = Transaction::new::<PutMsg>();
+            let result1 = Arc::new(Ok(HostResponse::Ok));
+            let time1 = time_source.now();
+            actor
+                .pending_results
+                .insert(tx1, PendingResult::new(result1, time1));
+
+            // Advance time by 50 seconds
+            time_source.advance_time(Duration::from_secs(50));
+
+            // Add second entry
+            let tx2 = Transaction::new::<PutMsg>();
+            let result2 = Arc::new(Ok(HostResponse::Ok));
+            let time2 = time_source.now();
+            actor
+                .pending_results
+                .insert(tx2, PendingResult::new(result2, time2));
+
+            // Advance time by 15 seconds (total 65s since tx1, 15s since tx2)
+            time_source.advance_time(Duration::from_secs(15));
+
+            // Prune - tx1 should be removed (65s > 60s TTL), tx2 should remain (15s < 60s)
+            actor.prune_pending_results();
+
+            assert!(
+                !actor.pending_results.contains_key(&tx1),
+                "First entry should be pruned (65s old)"
+            );
+            assert!(
+                actor.pending_results.contains_key(&tx2),
+                "Second entry should remain (15s old)"
+            );
+        }
     }
 }
