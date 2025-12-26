@@ -459,20 +459,24 @@ mod tests {
         let peer1: SocketAddr = "10.0.0.3:8000".parse().unwrap();
         let peer2: SocketAddr = "10.0.0.4:8000".parse().unwrap();
 
-        // Step 1: Originator should mark themselves BEFORE sending (not tested here, but expected)
-        // For now, originator is NOT in visited - this is the gap that caused the bug
+        // BUG CONTEXT: In the original bug, only this_peer was marked at each hop,
+        // NOT the sender. This meant requests could cycle back to earlier nodes.
+        // The fix ensures each node marks BOTH itself AND its sender.
 
-        // Step 2: Gateway receives from originator, marks gateway AND originator
+        // Step 1: Gateway receives from originator
+        // Gateway marks: itself (gateway) AND sender (originator)
         visited.mark_visited(gateway);
-        visited.mark_visited(originator); // KEY: Mark sender too!
+        visited.mark_visited(originator);
 
-        // Step 3: Peer1 receives from gateway, marks peer1 AND gateway
+        // Step 2: Peer1 receives from gateway
+        // Peer1 marks: itself (peer1) AND sender (gateway)
         visited.mark_visited(peer1);
-        // gateway already marked, but would be marked again in real code
+        visited.mark_visited(gateway); // Already marked, but this is what the code does
 
-        // Step 4: Peer2 receives from peer1, marks peer2 AND peer1
+        // Step 3: Peer2 receives from peer1
+        // Peer2 marks: itself (peer2) AND sender (peer1)
         visited.mark_visited(peer2);
-        // peer1 already marked
+        visited.mark_visited(peer1); // Already marked, but this is what the code does
 
         // Now, all nodes in the chain should be marked
         assert!(
