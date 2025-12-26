@@ -401,7 +401,33 @@ check_prerequisites() {
         fi
     fi
     echo "  ✓ Up to date with origin"
-    
+
+    # Check if main branch CI is green (required before skipping tests on release PR)
+    if [[ "$DRY_RUN" == "false" ]]; then
+        echo -n "  Checking main branch CI status... "
+        local ci_status
+        ci_status=$(gh api repos/freenet/freenet-core/commits/main/status --jq '.state' 2>/dev/null || echo "unknown")
+
+        if [[ "$ci_status" == "success" ]]; then
+            echo "✓ (green)"
+        elif [[ "$ci_status" == "pending" ]]; then
+            echo "⚠️  (pending)"
+            echo "  ⚠️  Main branch CI is still running"
+            echo "     Release PRs skip slow tests, so main must be green first"
+            echo "     Wait for CI to complete or run with tests enabled"
+            exit 1
+        elif [[ "$ci_status" == "failure" ]] || [[ "$ci_status" == "error" ]]; then
+            echo "✗ ($ci_status)"
+            echo "  ✗ Main branch CI is failing - cannot release"
+            echo "     Fix CI issues on main before releasing"
+            exit 1
+        else
+            echo "⚠️  (unknown: $ci_status)"
+            echo "  ⚠️  Could not determine main branch CI status"
+            echo "     Proceeding anyway - verify CI manually if needed"
+        fi
+    fi
+
     # Check required tools
     for tool in cargo gh; do
         if ! command -v "$tool" &> /dev/null; then

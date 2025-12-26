@@ -99,7 +99,10 @@ jobs:
     needs: fmt_check
     # Skip on merge_group - PR already passed full tests, merge queue only needs
     # to verify compilation with concurrent changes (handled by clippy job)
-    if: github.event_name != 'merge_group'
+    # Skip on release PRs - they only bump versions, main already passed CI
+    if: |
+      github.event_name != 'merge_group' &&
+      !startsWith(github.head_ref, 'release/v')
 
     env:
       FREENET_LOG: error
@@ -142,7 +145,10 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 30
     # Skip on merge_group - PR already passed full tests
-    if: github.event_name != 'merge_group'
+    # Skip on release PRs - they only bump versions, main already passed CI
+    if: |
+      github.event_name != 'merge_group' &&
+      !startsWith(github.head_ref, 'release/v')
 
     env:
       FREENET_LOG: error
