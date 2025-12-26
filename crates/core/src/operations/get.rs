@@ -862,10 +862,16 @@ impl Operation for GetOp {
                             s.next_peer = Some(this_peer.clone());
                         }
 
-                        // Update skip list with current peer address
+                        // Update skip list with current peer address and sender address
                         // Restore hash keys after deserialization (they're derived from tx)
                         let mut new_visited = visited.clone().with_transaction(&id);
                         if let Some(addr) = this_peer.socket_addr() {
+                            new_visited.mark_visited(addr);
+                        }
+                        // Also mark the sender to prevent routing back to them
+                        // This is critical for preventing request cycles, especially when
+                        // a node has limited connections (e.g., only connected to gateway)
+                        if let Some(addr) = source_addr {
                             new_visited.mark_visited(addr);
                         }
 
