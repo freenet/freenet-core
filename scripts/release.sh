@@ -977,6 +977,74 @@ deploy_gateways() {
     fi
 }
 
+wait_for_binaries() {
+    echo "Waiting for cross-compile workflow to complete:"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  [DRY RUN] Would wait for cross-compile workflow"
+        return 0
+    fi
+
+    # Check if binaries are already available
+    local asset_count
+    asset_count=$(gh release view "v$VERSION" --repo freenet/freenet-core --json assets --jq '.assets | length' 2>/dev/null || echo "0")
+    if [[ "$asset_count" -ge 8 ]]; then
+        echo "  ✓ Binaries already available ($asset_count assets)"
+        return 0
+    fi
+
+    echo "  ⏳ Cross-compile workflow in progress..."
+    echo "     Monitor at: https://github.com/freenet/freenet-core/actions/workflows/cross-compile.yml"
+
+    # Find the workflow run for this tag
+    local run_id
+    run_id=$(gh run list --workflow=cross-compile.yml --repo freenet/freenet-core --json databaseId,headBranch --jq ".[] | select(.headBranch == \"v$VERSION\") | .databaseId" 2>/dev/null | head -1)
+
+    if [[ -z "$run_id" ]]; then
+        echo "  ⚠️  Could not find cross-compile workflow run for v$VERSION"
+        echo "     Continuing without waiting (binaries may not be ready)"
+        return 0
+    fi
+
+    echo "  Workflow run ID: $run_id"
+
+    # Wait up to 15 minutes for workflow to complete
+    local max_wait=900
+    local elapsed=0
+    local interval=30
+
+    while [[ $elapsed -lt $max_wait ]]; do
+        local status conclusion
+        status=$(gh run view "$run_id" --repo freenet/freenet-core --json status --jq '.status' 2>/dev/null)
+
+        if [[ "$status" == "completed" ]]; then
+            conclusion=$(gh run view "$run_id" --repo freenet/freenet-core --json conclusion --jq '.conclusion' 2>/dev/null)
+            if [[ "$conclusion" == "success" ]]; then
+                echo "  ✓ Cross-compile workflow completed successfully"
+
+                # Verify assets are uploaded
+                sleep 5  # Brief delay for asset upload
+                asset_count=$(gh release view "v$VERSION" --repo freenet/freenet-core --json assets --jq '.assets | length' 2>/dev/null || echo "0")
+                echo "  ✓ Release has $asset_count assets attached"
+                return 0
+            else
+                echo "  ⚠️  Cross-compile workflow failed (conclusion: $conclusion)"
+                echo "     Binaries may not be available for download"
+                return 1
+            fi
+        fi
+
+        printf "  Waiting... (%ds elapsed, status: %s)\r" "$elapsed" "$status"
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+
+    echo
+    echo "  ⚠️  Timeout waiting for cross-compile workflow"
+    echo "     Continuing anyway - users may encounter 404s until binaries are ready"
+    return 0
+}
+
 announce_to_matrix() {
     echo "Announcing release to Matrix:"
 
@@ -1049,6 +1117,7 @@ create_release_pr
 publish_crates
 create_github_release
 deploy_gateways
+wait_for_binaries
 announce_to_matrix
 
 echo
@@ -1058,9 +1127,8 @@ echo "Summary:"
 echo "- freenet $VERSION published to crates.io"
 echo "- fdev $FDEV_VERSION published to crates.io"
 echo "- GitHub release created: https://github.com/freenet/freenet-core/releases/tag/v$VERSION"
+echo "- Cross-compiled binaries attached to release"
 echo "- Announcement sent to Matrix (#freenet-locutus)"
-echo "- Cross-compilation workflow triggered automatically by tag push"
-echo "- Binaries will be attached to release when workflow completes"
 
 # Show deployment status
 if [[ "$DEPLOY_LOCAL" == "true" ]]; then
@@ -1072,7 +1140,6 @@ fi
 
 echo
 echo "Next steps:"
-echo "- Monitor cross-compile workflow: https://github.com/freenet/freenet-core/actions/workflows/cross-compile.yml"
 
 # Suggest deployment options if not used
 if [[ "$DEPLOY_LOCAL" == "false" ]] && [[ "$DEPLOY_REMOTE" == "false" ]]; then
