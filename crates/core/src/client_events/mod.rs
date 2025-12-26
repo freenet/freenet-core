@@ -1047,10 +1047,17 @@ async fn process_open_request(
                     } => {
                         let peer_id = ensure_peer_ready(&op_manager)?;
 
-                        // Query local store to check for errors, but don't return cached state directly.
-                        // The network GET operation implements "network first, local fallback"
+                        // Query local store to check for errors before routing to network.
+                        // We don't use the cached state directly - instead we route through
+                        // the network GET operation which implements "network first, local fallback"
                         // to ensure we get fresh data rather than serving stale cached state.
-                        // See PR #2388 for details on why local-first was problematic.
+                        //
+                        // This query is kept for error handling: if local storage has issues
+                        // (executor error, contract error), we fail fast rather than silently
+                        // proceeding to network. The network layer's error handling is more
+                        // lenient (treats errors as "not found locally").
+                        //
+                        // See PR #2388 for why local-first was problematic.
                         let (_full_key, _state, _contract) = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
                                 instance_id: key,
