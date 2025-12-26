@@ -250,6 +250,16 @@ pub(crate) trait RelayContext {
         recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation>;
+
+    /// Choose an uphill hop for the request when at terminus but cannot accept.
+    /// "Uphill" means routing AWAY from the target (farther from desired_location),
+    /// which gives peers farther from the target a chance to accept.
+    fn select_uphill_hop(
+        &self,
+        desired_location: Location,
+        visited: &[SocketAddr],
+        recency: &HashMap<PeerKeyLocation, Instant>,
+    ) -> Option<PeerKeyLocation>;
 }
 
 /// Result of processing a request at a relay.
@@ -479,12 +489,60 @@ impl RelayState {
                 "connect: acceptance issued at terminus (acceptor addr will be filled by relay)"
             );
         } else if is_terminus && !self.accepted_locally && self.forwarded_to.is_none() {
-            tracing::info!(
-                target = %self.request.desired_location,
-                ttl = self.request.ttl,
-                visited = ?self.request.visited,
-                "connect: at terminus but should_accept() returned false"
-            );
+            // At terminus but should_accept() returned false (e.g., at capacity).
+            // Route uphill (away from target) to give other peers a chance to accept.
+            // This prevents requests from being silently dropped when the closest peer can't accept.
+            if self.request.ttl > 0 {
+                let uphill_hop = ctx.select_uphill_hop(
+                    self.request.desired_location,
+                    &self.request.visited,
+                    recency,
+                );
+
+                if let Some(uphill_peer) = uphill_hop {
+                    let dist =
+                        ring_distance(uphill_peer.location(), Some(self.request.desired_location));
+                    tracing::info!(
+                        target = %self.request.desired_location,
+                        ttl = self.request.ttl,
+                        uphill_peer = %uphill_peer.pub_key(),
+                        uphill_loc = ?uphill_peer.location(),
+                        ring_distance_to_target = ?dist,
+                        "connect: at terminus but cannot accept, routing uphill"
+                    );
+                    let mut forward_req = self.request.clone();
+                    forward_req.ttl = forward_req.ttl.saturating_sub(1);
+                    if let Some(self_addr) = ctx.self_location().socket_addr() {
+                        push_unique_addr(&mut forward_req.visited, self_addr);
+                    }
+                    let forward_snapshot = forward_req.clone();
+                    self.forwarded_to = Some(uphill_peer.clone());
+                    self.request = forward_req;
+                    forward_attempts.insert(
+                        uphill_peer.clone(),
+                        ForwardAttempt {
+                            peer: uphill_peer.clone(),
+                            desired: self.request.desired_location,
+                            sent_at: Instant::now(),
+                        },
+                    );
+                    actions.forward = Some((uphill_peer, forward_snapshot));
+                } else {
+                    tracing::info!(
+                        target = %self.request.desired_location,
+                        ttl = self.request.ttl,
+                        visited = ?self.request.visited,
+                        "connect: at terminus, cannot accept, no uphill peers available"
+                    );
+                }
+            } else {
+                tracing::info!(
+                    target = %self.request.desired_location,
+                    ttl = self.request.ttl,
+                    visited = ?self.request.visited,
+                    "connect: at terminus, cannot accept, TTL exhausted"
+                );
+            }
         } else if is_terminus && self.forwarded_to.is_some() {
             tracing::debug!(
                 target = %self.request.desired_location,
@@ -612,6 +670,58 @@ impl RelayContext for RelayEnv<'_> {
         if eligible.is_empty() {
             None
         } else {
+            router
+                .select_peer(eligible.iter(), desired_location)
+                .cloned()
+        }
+    }
+
+    fn select_uphill_hop(
+        &self,
+        desired_location: Location,
+        visited: &[SocketAddr],
+        recency: &HashMap<PeerKeyLocation, Instant>,
+    ) -> Option<PeerKeyLocation> {
+        // UPHILL ROUTING: When at terminus but can't accept, try any available peer.
+        //
+        // This method is only called when select_next_hop returned None (terminus).
+        // That means no peer passed the "closer to target than us" filter.
+        // Therefore, ALL remaining candidates are by definition "uphill" (farther from target).
+        // We don't need to re-check distances - just find any available peer.
+        let skip = SkipListWithSelf {
+            visited,
+            self_addr: self.self_location.socket_addr(),
+        };
+        let router = self.op_manager.ring.router.read();
+
+        let candidates = self.op_manager.ring.connection_manager.routing_candidates(
+            desired_location,
+            None,
+            skip,
+        );
+
+        let now = Instant::now();
+        let eligible: Vec<PeerKeyLocation> = candidates
+            .into_iter()
+            .filter(|cand| {
+                // Skip peers we recently forwarded to
+                if let Some(ts) = recency.get(cand) {
+                    if now.duration_since(*ts) < RECENCY_COOLDOWN {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        if eligible.is_empty() {
+            tracing::debug!(
+                target = %desired_location,
+                "connect: no uphill candidates available"
+            );
+            None
+        } else {
+            // Use the router to select among available peers
             router
                 .select_peer(eligible.iter(), desired_location)
                 .cloned()
@@ -1593,6 +1703,7 @@ mod tests {
         self_loc: PeerKeyLocation,
         accept: bool,
         next_hop: Option<PeerKeyLocation>,
+        uphill_hop: Option<PeerKeyLocation>,
     }
 
     impl TestRelayContext {
@@ -1601,6 +1712,7 @@ mod tests {
                 self_loc,
                 accept: true,
                 next_hop: None,
+                uphill_hop: None,
             }
         }
 
@@ -1611,6 +1723,11 @@ mod tests {
 
         fn next_hop(mut self, hop: Option<PeerKeyLocation>) -> Self {
             self.next_hop = hop;
+            self
+        }
+
+        fn uphill_hop(mut self, hop: Option<PeerKeyLocation>) -> Self {
+            self.uphill_hop = hop;
             self
         }
     }
@@ -1632,6 +1749,15 @@ mod tests {
             _estimator: &ConnectForwardEstimator,
         ) -> Option<PeerKeyLocation> {
             self.next_hop.clone()
+        }
+
+        fn select_uphill_hop(
+            &self,
+            _desired_location: Location,
+            _visited: &[SocketAddr],
+            _recency: &HashMap<PeerKeyLocation, Instant>,
+        ) -> Option<PeerKeyLocation> {
+            self.uphill_hop.clone()
         }
     }
 
@@ -2357,6 +2483,161 @@ mod tests {
         assert!(
             actions.accept_response.is_some(),
             "should accept at terminus (TTL exhausted)"
+        );
+    }
+
+    /// Regression test for issue #2420: When at terminus but should_accept() returns false,
+    /// the request should route uphill (away from target) instead of being silently dropped.
+    ///
+    /// Bug scenario this prevents:
+    /// 1. Peer 20 sends ConnectRequest targeting location 0.226
+    /// 2. Gateway is at terminus (closest to target)
+    /// 3. Gateway at capacity, should_accept() returns false
+    /// 4. BUG: Request dropped silently, Peer 20 remains isolated for ~10 minutes
+    ///
+    /// Correct behavior:
+    /// 1-3. Same as above
+    /// 4. Gateway routes uphill (farther from target) to give other peers a chance to accept
+    #[test]
+    fn uphill_routing_when_at_terminus_but_cannot_accept() {
+        let self_loc = make_peer(4500);
+        let joiner = make_peer(5500);
+        let uphill_peer = make_peer(6500);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // At terminus (no next_hop), cannot accept, but uphill_hop available
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false) // Cannot accept (at capacity)
+            .next_hop(None) // At terminus - no closer peer
+            .uphill_hop(Some(uphill_peer.clone())); // But there's an uphill peer
+
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        // Should NOT accept (should_accept returned false)
+        assert!(
+            actions.accept_response.is_none(),
+            "should not accept when should_accept() returns false"
+        );
+
+        // CRITICAL: Should forward uphill instead of dropping
+        let (forward_to, request) = actions
+            .forward
+            .expect("should route uphill when at terminus but cannot accept");
+        assert_eq!(forward_to.pub_key(), uphill_peer.pub_key());
+        assert_eq!(
+            request.ttl, 2,
+            "TTL should be decremented for uphill forward"
+        );
+
+        // forwarded_to should be set
+        assert!(
+            state.forwarded_to.is_some(),
+            "forwarded_to should be set after uphill routing"
+        );
+    }
+
+    /// Test that no forwarding happens when at terminus, cannot accept, and no uphill peers available.
+    #[test]
+    fn no_forward_when_at_terminus_cannot_accept_and_no_uphill_peers() {
+        let self_loc = make_peer(4600);
+        let joiner = make_peer(5600);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // At terminus, cannot accept, no uphill peers
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false) // Cannot accept
+            .next_hop(None) // At terminus
+            .uphill_hop(None); // No uphill peers either
+
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        // Should NOT accept
+        assert!(
+            actions.accept_response.is_none(),
+            "should not accept when should_accept() returns false"
+        );
+
+        // Should NOT forward (no uphill peers available)
+        assert!(
+            actions.forward.is_none(),
+            "should not forward when no uphill peers available"
+        );
+    }
+
+    /// Test that uphill routing doesn't happen when TTL is exhausted.
+    #[test]
+    fn no_uphill_routing_when_ttl_exhausted() {
+        let self_loc = make_peer(4700);
+        let joiner = make_peer(5700);
+        let uphill_peer = make_peer(6700);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 0, // TTL exhausted
+                visited: vec![],
+            },
+            forwarded_to: None,
+            observed_sent: false,
+            accepted_locally: false,
+        };
+
+        // At terminus, cannot accept, uphill peer exists but TTL is 0
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false) // Cannot accept
+            .next_hop(None) // At terminus
+            .uphill_hop(Some(uphill_peer)); // Uphill peer exists
+
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions = state.handle_request(&ctx, &recency, &mut forward_attempts, &estimator);
+
+        // Should NOT accept
+        assert!(
+            actions.accept_response.is_none(),
+            "should not accept when should_accept() returns false"
+        );
+
+        // Should NOT forward (TTL exhausted)
+        assert!(
+            actions.forward.is_none(),
+            "should not forward uphill when TTL is exhausted"
         );
     }
 }
