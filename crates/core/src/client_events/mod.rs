@@ -379,13 +379,6 @@ where
                                     }).collect() }
                                 ))
                             }
-                            QueryResult::GetResult { key, state, contract } => {
-                                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                                    key,
-                                    state,
-                                    contract,
-                                }))
-                            }
                             QueryResult::DelegateResult { response, .. } => {
                                 response
                             }
@@ -1054,8 +1047,11 @@ async fn process_open_request(
                     } => {
                         let peer_id = ensure_peer_ready(&op_manager)?;
 
-                        // Query local store by instance_id (key from request is ContractInstanceId)
-                        let (full_key, state, contract) = match op_manager
+                        // Query local store to check for errors, but don't return cached state directly.
+                        // The network GET operation implements "network first, local fallback"
+                        // to ensure we get fresh data rather than serving stale cached state.
+                        // See PR #2388 for details on why local-first was problematic.
+                        let (_full_key, _state, _contract) = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
                                 instance_id: key,
                                 return_contract_code,
@@ -1110,55 +1106,15 @@ async fn process_open_request(
                             }
                         };
 
-                        // Check if we found the contract locally with state (and code if requested)
-                        if let (Some(full_key), Some(state)) = (full_key, state) {
-                            if !return_contract_code || contract.is_some() {
-                                tracing::debug!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    peer = %peer_id,
-                                    contract = %full_key,
-                                    phase = "local_found",
-                                    "Contract found locally, returning GET result"
-                                );
-
-                                // Handle subscription for locally found contracts
-                                if subscribe {
-                                    if let Some(subscription_listener) = subscription_listener {
-                                        register_subscription_listener(
-                                            &op_manager,
-                                            *full_key.id(),
-                                            client_id,
-                                            subscription_listener,
-                                            "local GET",
-                                        )
-                                        .await?;
-                                    } else {
-                                        tracing::warn!(
-                                            client_id = %client_id,
-                                            contract = %full_key,
-                                            "GET with subscribe=true but no subscription_listener"
-                                        );
-                                    }
-                                }
-
-                                return Ok(Some(Either::Left(QueryResult::GetResult {
-                                    key: full_key,
-                                    state,
-                                    contract,
-                                })));
-                            }
-                        }
-
-                        // Contract not found locally or missing code, route through network
+                        // Always route through network for fresh data (network first, local fallback)
                         if let Some(router) = &request_router {
                             tracing::debug!(
                                 client_id = %client_id,
                                 request_id = %request_id,
                                 peer = %peer_id,
                                 contract = %key,
-                                phase = "not_found_routing",
-                                "Contract not found locally, routing GET request through deduplication layer"
+                                phase = "network_routing",
+                                "Routing GET request through network for fresh data"
                             );
 
                             let request = crate::node::DeduplicatedRequest::Get {
@@ -1282,7 +1238,7 @@ async fn process_open_request(
                                 peer = %peer_id,
                                 contract = %key,
                                 phase = "legacy",
-                                "Contract not found locally, starting direct GET operation (legacy mode)"
+                                "Starting direct GET operation for fresh data (legacy mode)"
                             );
 
                             // Legacy mode: direct operation without deduplication
