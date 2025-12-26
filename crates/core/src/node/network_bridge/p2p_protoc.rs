@@ -2340,8 +2340,10 @@ impl P2pConnManager {
 
         if newly_inserted {
             tracing::info!(peer_id = ?peer_id, %peer_addr, is_transient, "handle_successful_connection: inserted new connection entry");
-            let pending_loc = connection_manager.prune_in_transit_connection(peer_addr);
             if promote_to_ring {
+                // Only prune reservation when promoting to ring - transient connections
+                // don't go through should_accept() so they have no reservation to prune
+                let pending_loc = connection_manager.prune_in_transit_connection(peer_addr);
                 // Safe to unwrap: promote_to_ring is only true when peer_id.is_some()
                 let peer = peer_id
                     .as_ref()
@@ -2443,13 +2445,13 @@ impl P2pConnManager {
                 }
             } else {
                 // Not promoting to ring - either unknown identity or transient on non-gateway.
-                // Keep the connection as transient; budget was reserved before any work.
-                let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_addr));
+                // These connections don't go through should_accept() so there's no pending
+                // reservation. Compute location from address directly.
+                let loc = Location::from_address(&peer_addr);
                 connection_manager.try_register_transient(peer_addr, Some(loc));
                 tracing::info!(
                     peer_id = ?peer_id,
                     %peer_addr,
-                    pending_loc_known = pending_loc.is_some(),
                     "Registered transient connection (not added to ring topology)"
                 );
                 let ttl = connection_manager.transient_ttl();
