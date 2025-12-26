@@ -45,6 +45,7 @@ futures = "0.3"
 semver = { version = "1",  features = ["serde"] }
 headers = "0.4"
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
+hostname = "0.4"
 itertools = "0.14"
 notify = "8"
 pav_regression = "0.6.1"
