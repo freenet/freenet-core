@@ -16,7 +16,9 @@ use crate::{
     },
     ring::{Location, PeerKeyLocation},
 };
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey};
+use freenet_stdlib::prelude::{
+    ContractContainer, ContractInstanceId, ContractKey, DelegateKey, WrappedState,
+};
 pub(crate) use sealed_msg_type::{TransactionType, TransactionTypeId};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -484,6 +486,11 @@ pub struct NetworkDebugInfo {
 #[derive(Debug)]
 pub(crate) enum QueryResult {
     Connections(Vec<PeerKeyLocation>),
+    GetResult {
+        key: ContractKey,
+        state: WrappedState,
+        contract: Option<ContractContainer>,
+    },
     DelegateResult {
         #[allow(dead_code)]
         key: DelegateKey,

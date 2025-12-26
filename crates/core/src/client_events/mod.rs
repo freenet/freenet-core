@@ -408,6 +408,13 @@ where
                             QueryResult::NodeDiagnostics(response) => {
                                 Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))
                             }
+                            QueryResult::GetResult { key, state, contract } => {
+                                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                                    contract,
+                                    state,
+                                    key,
+                                }))
+                            }
                         };
                         if let Ok(result) = &res {
                             tracing::debug!(
@@ -1047,18 +1054,14 @@ async fn process_open_request(
                     } => {
                         let peer_id = ensure_peer_ready(&op_manager)?;
 
-                        // Query local store to check for errors before routing to network.
-                        // We don't use the cached state directly - instead we route through
-                        // the network GET operation which implements "network first, local fallback"
-                        // to ensure we get fresh data rather than serving stale cached state.
+                        // Query local store first. We use the result in two cases:
+                        // 1. Error handling: if local storage has issues, fail fast
+                        // 2. No connections: if isolated (no peers), return local cache immediately
                         //
-                        // This query is kept for error handling: if local storage has issues
-                        // (executor error, contract error), we fail fast rather than silently
-                        // proceeding to network. The network layer's error handling is more
-                        // lenient (treats errors as "not found locally").
-                        //
-                        // See PR #2388 for why local-first was problematic.
-                        let (_full_key, _state, _contract) = match op_manager
+                        // For connected nodes, we route through network GET operation which
+                        // implements "network first, local fallback" to ensure fresh data.
+                        // See PR #2388 for why always-local-first was problematic.
+                        let (full_key, state, contract) = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
                                 instance_id: key,
                                 return_contract_code,
@@ -1113,7 +1116,52 @@ async fn process_open_request(
                             }
                         };
 
-                        // Always route through network for fresh data (network first, local fallback)
+                        // If we have local state and no network connections, return local cache immediately.
+                        // This handles isolated nodes (single gateway, tests) where network queries would timeout.
+                        // For connected nodes, we route through network for fresh data.
+                        let has_connections = op_manager.ring.open_connections() > 0;
+                        if !has_connections {
+                            if let (Some(full_key), Some(state)) = (full_key, state) {
+                                if !return_contract_code || contract.is_some() {
+                                    tracing::debug!(
+                                        client_id = %client_id,
+                                        request_id = %request_id,
+                                        peer = %peer_id,
+                                        contract = %full_key,
+                                        phase = "local_isolated",
+                                        "No network connections, returning local cache"
+                                    );
+
+                                    // Handle subscription for locally found contracts
+                                    if subscribe {
+                                        if let Some(subscription_listener) = subscription_listener {
+                                            register_subscription_listener(
+                                                &op_manager,
+                                                *full_key.id(),
+                                                client_id,
+                                                subscription_listener,
+                                                "local GET (isolated)",
+                                            )
+                                            .await?;
+                                        } else {
+                                            tracing::warn!(
+                                                client_id = %client_id,
+                                                contract = %full_key,
+                                                "GET with subscribe=true but no subscription_listener"
+                                            );
+                                        }
+                                    }
+
+                                    return Ok(Some(Either::Left(QueryResult::GetResult {
+                                        key: full_key,
+                                        state,
+                                        contract,
+                                    })));
+                                }
+                            }
+                        }
+
+                        // Route through network for fresh data (network first, local fallback)
                         if let Some(router) = &request_router {
                             tracing::debug!(
                                 client_id = %client_id,
