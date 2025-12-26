@@ -149,7 +149,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Service(cmd)) => cmd.run(),
+        Some(Command::Service(cmd)) => cmd.run(
+            build_info::VERSION,
+            build_info::GIT_COMMIT,
+            build_info::GIT_DIRTY,
+            build_info::BUILD_TIMESTAMP,
+        ),
         Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
         Some(Command::Network { mut config }) => {
             config.mode = Some(OperationMode::Network);

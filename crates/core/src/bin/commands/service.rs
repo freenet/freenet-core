@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::path::Path;
 
+use super::report::ReportCommand;
+
 #[derive(Subcommand, Debug, Clone)]
 pub enum ServiceCommand {
     /// Install Freenet as a system service
@@ -28,10 +30,18 @@ pub enum ServiceCommand {
         #[arg(long)]
         err: bool,
     },
+    /// Generate and upload a diagnostic report for debugging
+    Report(ReportCommand),
 }
 
 impl ServiceCommand {
-    pub fn run(&self) -> Result<()> {
+    pub fn run(
+        &self,
+        version: &str,
+        git_commit: &str,
+        git_dirty: &str,
+        build_timestamp: &str,
+    ) -> Result<()> {
         match self {
             ServiceCommand::Install => install_service(),
             ServiceCommand::Uninstall => uninstall_service(),
@@ -40,6 +50,7 @@ impl ServiceCommand {
             ServiceCommand::Stop => stop_service(),
             ServiceCommand::Restart => restart_service(),
             ServiceCommand::Logs { err } => service_logs(*err),
+            ServiceCommand::Report(cmd) => cmd.run(version, git_commit, git_dirty, build_timestamp),
         }
     }
 }
