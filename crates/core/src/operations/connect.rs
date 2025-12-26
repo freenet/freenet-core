@@ -339,15 +339,14 @@ impl RelayState {
     /// Returns the forward action to add to RelayActions.
     fn forward_to_peer<C: RelayContext>(
         &mut self,
-        ctx: &C,
+        _ctx: &C,
         peer: PeerKeyLocation,
         forward_attempts: &mut HashMap<PeerKeyLocation, ForwardAttempt>,
     ) -> (PeerKeyLocation, ConnectRequest) {
         let mut forward_req = self.request.clone();
         forward_req.ttl = forward_req.ttl.saturating_sub(1);
-        if let Some(self_addr) = ctx.self_location().socket_addr() {
-            forward_req.visited.mark_visited(self_addr);
-        }
+        // Note: self_addr is already marked as visited in handle_request() before
+        // forward_to_peer is called, so no need to mark it again here.
         let forward_snapshot = forward_req.clone();
         self.forwarded_to = Some(peer.clone());
         self.request = forward_req;
