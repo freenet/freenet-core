@@ -3751,6 +3751,7 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
     };
 
     // Step 4: Verify gateway has peer-a in subscribers
+    // Use a retry loop since subscription propagation may take time in CI
     let gw_diag_config = NodeDiagnosticsConfig {
         include_node_info: false,
         include_network_info: false,
@@ -3760,32 +3761,48 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
         include_detailed_peer_info: false,
         include_subscriber_peer_ids: true,
     };
-    make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
 
-    let gateway_subscribers_initial = loop {
-        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
-        match resp {
-            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
-                let contract_state = diag.contract_states.get(&contract_key);
-                let subscribers = contract_state
-                    .map(|cs| cs.subscriber_peer_ids.clone())
-                    .unwrap_or_default();
-                tracing::info!(
-                    "Gateway subscribers (both clients connected): {:?}",
-                    subscribers
-                );
+    let _gateway_subscribers_initial = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
+
+            let subscribers = loop {
+                let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+                match resp {
+                    HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                        let contract_state = diag.contract_states.get(&contract_key);
+                        let subs = contract_state
+                            .map(|cs| cs.subscriber_peer_ids.clone())
+                            .unwrap_or_default();
+                        tracing::info!("Gateway subscribers (both clients connected): {:?}", subs);
+                        break subs;
+                    }
+                    other => {
+                        tracing::warn!("Gateway: unexpected response: {:?}", other);
+                    }
+                }
+            };
+
+            if subscribers.contains(&peer_a_peer_id) {
                 break subscribers;
             }
-            other => {
-                tracing::warn!("Gateway: unexpected response: {:?}", other);
+
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "Timeout waiting for peer-a to appear in gateway's subscriber list. \
+                     Current subscribers: {:?}, expected peer_id: {}",
+                    subscribers, peer_a_peer_id
+                );
             }
+
+            tracing::info!(
+                "Peer-a not yet in gateway subscribers, retrying in 1s... (current: {:?})",
+                subscribers
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     };
-
-    assert!(
-        gateway_subscribers_initial.contains(&peer_a_peer_id),
-        "Peer-a should be in gateway's subscriber list initially"
-    );
 
     // Step 5: Disconnect first client - peer-a should STILL be in subscribers
     tracing::info!("Step 5: Disconnecting first client (pruning should NOT occur)");

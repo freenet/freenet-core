@@ -331,6 +331,33 @@ impl ConnectForwardEstimator {
     }
 }
 impl RelayState {
+    /// Helper to prepare and execute forwarding to a peer.
+    /// Returns the forward action to add to RelayActions.
+    fn forward_to_peer<C: RelayContext>(
+        &mut self,
+        ctx: &C,
+        peer: PeerKeyLocation,
+        forward_attempts: &mut HashMap<PeerKeyLocation, ForwardAttempt>,
+    ) -> (PeerKeyLocation, ConnectRequest) {
+        let mut forward_req = self.request.clone();
+        forward_req.ttl = forward_req.ttl.saturating_sub(1);
+        if let Some(self_addr) = ctx.self_location().socket_addr() {
+            push_unique_addr(&mut forward_req.visited, self_addr);
+        }
+        let forward_snapshot = forward_req.clone();
+        self.forwarded_to = Some(peer.clone());
+        self.request = forward_req;
+        forward_attempts.insert(
+            peer.clone(),
+            ForwardAttempt {
+                peer: peer.clone(),
+                desired: self.request.desired_location,
+                sent_at: Instant::now(),
+            },
+        );
+        (peer, forward_snapshot)
+    }
+
     pub(crate) fn handle_request<C: RelayContext>(
         &mut self,
         ctx: &C,
@@ -421,23 +448,7 @@ impl RelayState {
                 ring_distance_to_target = ?dist,
                 "connect: forwarding join request to next hop (not accepting - not at terminus)"
             );
-            let mut forward_req = self.request.clone();
-            forward_req.ttl = forward_req.ttl.saturating_sub(1);
-            if let Some(self_addr) = ctx.self_location().socket_addr() {
-                push_unique_addr(&mut forward_req.visited, self_addr);
-            }
-            let forward_snapshot = forward_req.clone();
-            self.forwarded_to = Some(next.clone());
-            self.request = forward_req;
-            forward_attempts.insert(
-                next.clone(),
-                ForwardAttempt {
-                    peer: next.clone(),
-                    desired: self.request.desired_location,
-                    sent_at: Instant::now(),
-                },
-            );
-            actions.forward = Some((next, forward_snapshot));
+            actions.forward = Some(self.forward_to_peer(ctx, next, forward_attempts));
         }
 
         // Only accept at terminus (can't forward to a closer peer)
@@ -510,23 +521,8 @@ impl RelayState {
                         ring_distance_to_target = ?dist,
                         "connect: at terminus but cannot accept, routing uphill"
                     );
-                    let mut forward_req = self.request.clone();
-                    forward_req.ttl = forward_req.ttl.saturating_sub(1);
-                    if let Some(self_addr) = ctx.self_location().socket_addr() {
-                        push_unique_addr(&mut forward_req.visited, self_addr);
-                    }
-                    let forward_snapshot = forward_req.clone();
-                    self.forwarded_to = Some(uphill_peer.clone());
-                    self.request = forward_req;
-                    forward_attempts.insert(
-                        uphill_peer.clone(),
-                        ForwardAttempt {
-                            peer: uphill_peer.clone(),
-                            desired: self.request.desired_location,
-                            sent_at: Instant::now(),
-                        },
-                    );
-                    actions.forward = Some((uphill_peer, forward_snapshot));
+                    actions.forward =
+                        Some(self.forward_to_peer(ctx, uphill_peer, forward_attempts));
                 } else {
                     tracing::info!(
                         target = %self.request.desired_location,
@@ -2640,4 +2636,16 @@ mod tests {
             "should not forward uphill when TTL is exhausted"
         );
     }
+
+    // NOTE: A test for joiner_known = None was considered, but this edge case cannot
+    // actually occur in normal operation. The handle_request function automatically fills
+    // in the joiner's address from upstream_addr if it's unknown (lines 385-390):
+    //
+    //   if self.request.joiner.peer_addr.is_unknown() {
+    //       self.request.joiner.set_addr(self.upstream_addr);
+    //   }
+    //
+    // The joiner_known = None check (line 462-475) is purely defensive - it handles the
+    // theoretical case where the address somehow doesn't get filled in, but this cannot
+    // be triggered in practice since the first relay always fills it in.
 }
