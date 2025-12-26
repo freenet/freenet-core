@@ -648,7 +648,19 @@ struct UpdateContract {
 #[derive(Debug)]
 pub(crate) enum UpsertResult {
     NoChange,
-    Updated(WrappedState),
+    Updated {
+        /// The new state after the update.
+        state: WrappedState,
+        /// Delta from the previous state to the new state, if computed.
+        ///
+        /// This is Some when:
+        /// 1. A previous state existed
+        /// 2. Delta computation succeeded
+        /// 3. The delta is smaller than the full state
+        ///
+        /// The caller can use this to optimize network broadcasts.
+        delta: Option<StateDelta<'static>>,
+    },
 }
 
 impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {

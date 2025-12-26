@@ -416,6 +416,41 @@ enum ComputedStateUpdate {
     MissingRelated(Vec<RelatedContract>),
 }
 
+/// Helper methods for Executor<Runtime> that are not part of the ContractExecutor trait.
+impl Executor<Runtime> {
+    /// Computes a delta for broadcasting an update to network subscribers.
+    ///
+    /// This generates a delta from `old_state` to `new_state` that subscribers
+    /// can apply to their cached state. The delta is only returned if it's
+    /// smaller than the full state (otherwise broadcasting full state is more efficient).
+    fn compute_broadcast_delta(
+        &mut self,
+        key: &ContractKey,
+        params: &Parameters<'_>,
+        old_state: &WrappedState,
+        new_state: &WrappedState,
+    ) -> Result<Option<StateDelta<'static>>, ExecutorError> {
+        // Generate a summary of the old state
+        let old_summary = self
+            .runtime
+            .summarize_state(key, params, old_state)
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        // Compute the delta from new_state using old_summary
+        let delta = self
+            .runtime
+            .get_state_delta(key, params, new_state, &old_summary)
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        // Only use delta if it's actually smaller than the full state
+        if delta.size() < new_state.size() {
+            Ok(Some(delta))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 impl ContractExecutor for Executor<Runtime> {
     fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {
         let code_hash = self.runtime.contract_store.code_hash_from_id(instance_id)?;
@@ -689,7 +724,10 @@ impl ContractExecutor for Executor<Runtime> {
                                 // Now that initialization is complete, they will succeed
                             }
 
-                            return Ok(UpsertResult::Updated(incoming_state));
+                            return Ok(UpsertResult::Updated {
+                                state: incoming_state,
+                                delta: None,
+                            });
                         }
                     }
                     ValidateResult::Invalid => {
@@ -784,12 +822,39 @@ impl ContractExecutor for Executor<Runtime> {
                         .await
                         .map_err(ExecutorError::other)?;
 
-                    // todo: forward delta like we are doing with puts
-                    tracing::warn!(
-                        contract = %key,
-                        "Delta updates are not yet supported"
-                    );
-                    Ok(UpsertResult::Updated(updated_state))
+                    // Compute delta for broadcast if it would be smaller than full state
+                    let broadcast_delta = match self.compute_broadcast_delta(
+                        &key,
+                        &params,
+                        &current_state,
+                        &updated_state,
+                    ) {
+                        Ok(delta) => {
+                            if let Some(ref d) = delta {
+                                tracing::debug!(
+                                    contract = %key,
+                                    delta_size = d.size(),
+                                    state_size = updated_state.size(),
+                                    "Using delta for broadcast (smaller than full state)"
+                                );
+                            }
+                            delta
+                        }
+                        Err(err) => {
+                            // Delta computation failed, fall back to full state broadcast
+                            tracing::warn!(
+                                contract = %key,
+                                error = %err,
+                                "Failed to compute broadcast delta, falling back to full state"
+                            );
+                            None
+                        }
+                    };
+
+                    Ok(UpsertResult::Updated {
+                        state: updated_state,
+                        delta: broadcast_delta,
+                    })
                 }
             }
             ValidateResult::Invalid => Err(ExecutorError::request(

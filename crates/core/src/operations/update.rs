@@ -2,7 +2,7 @@ use either::Either;
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
-pub(crate) use self::messages::UpdateMsg;
+pub(crate) use self::messages::{BroadcastUpdate, UpdateMsg};
 use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
@@ -113,6 +113,7 @@ struct UpdateExecution {
     value: WrappedState,
     summary: StateSummary<'static>,
     changed: bool,
+    broadcast_update: BroadcastUpdate,
 }
 
 pub(crate) struct UpdateResult {}
@@ -260,9 +261,10 @@ impl Operation for UpdateOp {
 
                             // Update contract locally
                             let UpdateExecution {
-                                value: updated_value,
+                                value: _updated_value,
                                 summary,
                                 changed,
+                                broadcast_update,
                             } = update_contract(
                                 op_manager,
                                 *key,
@@ -330,7 +332,7 @@ impl Operation for UpdateOp {
                                         self.state,
                                         (broadcast_to, request_sender.clone()),
                                         *key,
-                                        updated_value.clone(),
+                                        broadcast_update,
                                         false,
                                     )
                                     .await
@@ -414,24 +416,31 @@ impl Operation for UpdateOp {
                         }
                     }
                 }
-                UpdateMsg::BroadcastTo { id, key, new_value } => {
+                UpdateMsg::BroadcastTo { id, key, update } => {
                     // Get sender from connection-based routing
                     let sender = sender_from_addr
                         .clone()
                         .expect("BroadcastTo requires source_addr");
                     let self_location = op_manager.ring.connection_manager.own_location();
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
+
+                    // Convert BroadcastUpdate to UpdateData for processing
+                    let update_data = match update {
+                        BroadcastUpdate::FullState(state) => {
+                            UpdateData::State(State::from(state.clone()))
+                        }
+                        BroadcastUpdate::Delta(delta_bytes) => {
+                            UpdateData::Delta(StateDelta::from(delta_bytes.clone()))
+                        }
+                    };
+
                     let UpdateExecution {
-                        value: updated_value,
+                        value: _updated_value,
                         summary: _summary,
                         changed,
-                    } = update_contract(
-                        op_manager,
-                        *key,
-                        UpdateData::State(State::from(new_value.clone())),
-                        RelatedContracts::default(),
-                    )
-                    .await?;
+                        broadcast_update,
+                    } = update_contract(op_manager, *key, update_data, RelatedContracts::default())
+                        .await?;
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
                     if !changed {
@@ -462,7 +471,7 @@ impl Operation for UpdateOp {
                             self.state,
                             (broadcast_to, sender.clone()),
                             *key,
-                            updated_value.clone(),
+                            broadcast_update,
                             true,
                         )
                         .await
@@ -480,7 +489,7 @@ impl Operation for UpdateOp {
                     broadcast_to,
                     broadcasted_to,
                     key,
-                    new_value,
+                    update,
                     ..
                 } => {
                     let mut broadcasted_to = *broadcasted_to;
@@ -491,7 +500,7 @@ impl Operation for UpdateOp {
                         let msg = UpdateMsg::BroadcastTo {
                             id: *id,
                             key: *key,
-                            new_value: new_value.clone(),
+                            update: update.clone(),
                         };
                         let peer_addr = peer
                             .socket_addr()
@@ -560,7 +569,7 @@ async fn try_to_broadcast(
     state: Option<UpdateState>,
     (broadcast_to, _upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
     key: ContractKey,
-    new_value: WrappedState,
+    broadcast_update: BroadcastUpdate,
     is_from_a_broadcasted_to_peer: bool,
 ) -> Result<(Option<UpdateState>, Option<UpdateMsg>), OpError> {
     let new_state;
@@ -589,7 +598,7 @@ async fn try_to_broadcast(
 
                 return_msg = Some(UpdateMsg::Broadcasting {
                     id,
-                    new_value,
+                    update: broadcast_update,
                     broadcasted_to: 0,
                     broadcast_to,
                     key,
@@ -800,6 +809,7 @@ async fn update_contract(
     {
         Ok(ContractHandlerEvent::UpdateResponse {
             new_value: Ok(new_val),
+            broadcast_delta,
         }) => {
             let new_bytes = State::from(new_val.clone()).into_bytes();
             let summary = StateSummary::from(new_bytes.clone());
@@ -815,14 +825,22 @@ async fn update_contract(
             // produce semantically identical states with different encodings must normalize their
             // serialization (e.g., sort map keys) to avoid redundant broadcasts.
 
+            // Use delta if available (smaller than full state), otherwise use full state
+            let broadcast_update = match broadcast_delta {
+                Some(delta) => BroadcastUpdate::from_delta(delta),
+                None => BroadcastUpdate::FullState(new_val.clone()),
+            };
+
             Ok(UpdateExecution {
                 value: new_val,
                 summary,
                 changed,
+                broadcast_update,
             })
         }
         Ok(ContractHandlerEvent::UpdateResponse {
             new_value: Err(err),
+            ..
         }) => {
             tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
             Err(OpError::UnexpectedOpState)
@@ -901,10 +919,13 @@ async fn update_contract(
 
             let bytes = State::from(resolved_state.clone()).into_bytes();
             let summary = StateSummary::from(bytes);
+            // No change means no broadcasting needed, but we still need a valid broadcast_update
+            let broadcast_update = BroadcastUpdate::FullState(resolved_state.clone());
             Ok(UpdateExecution {
                 value: resolved_state,
                 summary,
                 changed: false,
+                broadcast_update,
             })
         }
         Err(err) => Err(err.into()),
@@ -1091,9 +1112,10 @@ pub(crate) async fn request_update(
             // Note: This handles both truly isolated nodes and nodes where subscribers exist
             // but no suitable remote caching peer was found.
             let UpdateExecution {
-                value: updated_value,
+                value: _updated_value,
                 summary,
                 changed,
+                broadcast_update,
             } = update_contract(op_manager, key, update_data, related_contracts).await?;
 
             tracing::debug!(
@@ -1143,7 +1165,7 @@ pub(crate) async fn request_update(
                     broadcast_state,
                     (broadcast_to, sender.clone()),
                     key,
-                    updated_value,
+                    broadcast_update,
                     false,
                 )
                 .await?;
@@ -1190,6 +1212,7 @@ pub(crate) async fn request_update(
         value: updated_value,
         summary,
         changed: _changed,
+        broadcast_update: _broadcast_update,
     } = update_contract(
         op_manager,
         key,
@@ -1333,13 +1356,41 @@ impl IsOperationCompleted for UpdateOp {
 mod messages {
     use std::fmt::Display;
 
-    use freenet_stdlib::prelude::{ContractKey, RelatedContracts, WrappedState};
+    use freenet_stdlib::prelude::{ContractKey, RelatedContracts, StateDelta, WrappedState};
     use serde::{Deserialize, Serialize};
 
     use crate::{
         message::{InnerMessage, Transaction},
         ring::{Location, PeerKeyLocation},
     };
+
+    /// The update payload for broadcasting to subscribers.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub(crate) enum BroadcastUpdate {
+        FullState(WrappedState),
+        Delta(Vec<u8>),
+    }
+
+    impl BroadcastUpdate {
+        pub fn from_delta(delta: StateDelta<'static>) -> Self {
+            BroadcastUpdate::Delta(delta.into_bytes().to_vec())
+        }
+
+        /// Returns the size of the update payload in bytes.
+        #[allow(dead_code)]
+        pub fn size(&self) -> usize {
+            match self {
+                BroadcastUpdate::FullState(state) => state.size(),
+                BroadcastUpdate::Delta(delta) => delta.len(),
+            }
+        }
+
+        /// Returns true if this is a delta update (not full state).
+        #[allow(dead_code)]
+        pub fn is_delta(&self) -> bool {
+            matches!(self, BroadcastUpdate::Delta(_))
+        }
+    }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     /// Update operation messages.
@@ -1361,13 +1412,13 @@ mod messages {
             broadcasted_to: usize,
             broadcast_to: Vec<PeerKeyLocation>,
             key: ContractKey,
-            new_value: WrappedState,
+            update: BroadcastUpdate,
         },
         /// Broadcasting a change to a specific subscriber.
         BroadcastTo {
             id: Transaction,
             key: ContractKey,
-            new_value: WrappedState,
+            update: BroadcastUpdate,
         },
     }
 

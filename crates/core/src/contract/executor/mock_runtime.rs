@@ -104,7 +104,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .store(key, incoming_state.clone(), contract.params().into_owned())
                     .await
                     .map_err(ExecutorError::other)?;
-                Ok(UpsertResult::Updated(incoming_state))
+                Ok(UpsertResult::Updated { state: incoming_state, delta: None })
             }
             (Either::Left(incoming_state), None) => {
                 // update case
@@ -112,7 +112,7 @@ impl ContractExecutor for Executor<MockRuntime> {
                     .update(&key, incoming_state.clone())
                     .await
                     .map_err(ExecutorError::other)?;
-                Ok(UpsertResult::Updated(incoming_state))
+                Ok(UpsertResult::Updated { state: incoming_state, delta: None })
             }
             (update, contract) => unreachable!("Invalid combination of state/delta and contract presence: {update:?}, {contract:?}"),
         }

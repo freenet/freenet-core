@@ -305,12 +305,21 @@ impl<'a> NetEventLog<'a> {
                 })
             }
             NetMessageV1::Update(UpdateMsg::Broadcasting {
-                new_value,
+                update,
                 broadcast_to,
                 broadcasted_to,
                 key,
                 id,
             }) => {
+                // Convert BroadcastUpdate to WrappedState for event logging
+                let value = match update {
+                    crate::operations::update::BroadcastUpdate::FullState(state) => state.clone(),
+                    crate::operations::update::BroadcastUpdate::Delta(delta) => {
+                        // For delta updates, we use an empty state as placeholder
+                        // The actual delta is embedded in the bytes
+                        WrappedState::from(delta.clone())
+                    }
+                };
                 let this_peer = op_manager.ring.connection_manager.own_location();
                 EventKind::Update(UpdateEvent::BroadcastEmitted {
                     id: *id,
@@ -318,18 +327,26 @@ impl<'a> NetEventLog<'a> {
                     broadcast_to: broadcast_to.clone(),
                     broadcasted_to: *broadcasted_to,
                     key: *key,
-                    value: new_value.clone(),
+                    value,
                     sender: this_peer, // We are the sender
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Update(UpdateMsg::BroadcastTo { new_value, key, id }) => {
+            NetMessageV1::Update(UpdateMsg::BroadcastTo { update, key, id }) => {
+                // Convert BroadcastUpdate to WrappedState for event logging
+                let value = match update {
+                    crate::operations::update::BroadcastUpdate::FullState(state) => state.clone(),
+                    crate::operations::update::BroadcastUpdate::Delta(delta) => {
+                        // For delta updates, we use the delta bytes as the value
+                        WrappedState::from(delta.clone())
+                    }
+                };
                 let this_peer = op_manager.ring.connection_manager.own_location();
                 EventKind::Update(UpdateEvent::BroadcastReceived {
                     id: *id,
                     requester: this_peer.clone(),
                     key: *key,
-                    value: new_value.clone(),
+                    value,
                     target: this_peer, // We are the target
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })

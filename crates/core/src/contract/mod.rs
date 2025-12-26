@@ -190,7 +190,7 @@ where
                     Ok(UpsertResult::NoChange) => ContractHandlerEvent::PutResponse {
                         new_value: Ok(state),
                     },
-                    Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::PutResponse {
+                    Ok(UpsertResult::Updated { state, .. }) => ContractHandlerEvent::PutResponse {
                         new_value: Ok(state),
                     },
                     Err(err) => {
@@ -260,6 +260,7 @@ where
                                 );
                                 ContractHandlerEvent::UpdateResponse {
                                     new_value: Ok(current_state),
+                                    broadcast_delta: None,
                                 }
                             }
                             Ok((None, _)) => {
@@ -283,9 +284,12 @@ where
                             }
                         }
                     }
-                    Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::UpdateResponse {
-                        new_value: Ok(state),
-                    },
+                    Ok(UpsertResult::Updated { state, delta }) => {
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(state),
+                            broadcast_delta: delta,
+                        }
+                    }
                     Err(err) => {
                         if err.is_fatal() {
                             tracing::error!(
@@ -298,6 +302,7 @@ where
                         }
                         ContractHandlerEvent::UpdateResponse {
                             new_value: Err(err),
+                            broadcast_delta: None,
                         }
                     }
                 };
