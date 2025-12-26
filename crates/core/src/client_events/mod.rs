@@ -1172,6 +1172,27 @@ async fn process_open_request(
                                 "Routing GET request through network for fresh data"
                             );
 
+                            // Register subscription listener BEFORE routing through network
+                            // so updates are received once the GET completes
+                            if subscribe {
+                                if let Some(subscription_listener) = subscription_listener {
+                                    register_subscription_listener(
+                                        &op_manager,
+                                        key,
+                                        client_id,
+                                        subscription_listener,
+                                        "network GET",
+                                    )
+                                    .await?;
+                                } else {
+                                    tracing::warn!(
+                                        client_id = %client_id,
+                                        contract = %key,
+                                        "GET with subscribe=true but no subscription_listener"
+                                    );
+                                }
+                            }
+
                             let request = crate::node::DeduplicatedRequest::Get {
                                 key,
                                 return_contract_code,
@@ -1265,26 +1286,6 @@ async fn process_open_request(
                                     phase = "reuse",
                                     "Reusing existing GET operation - client registered for result"
                                 );
-                            }
-
-                            // Register subscription listener if subscribe=true
-                            if subscribe {
-                                if let Some(subscription_listener) = subscription_listener {
-                                    register_subscription_listener(
-                                        &op_manager,
-                                        key,
-                                        client_id,
-                                        subscription_listener,
-                                        "network GET",
-                                    )
-                                    .await?;
-                                } else {
-                                    tracing::warn!(
-                                        client_id = %client_id,
-                                        contract = %key,
-                                        "GET with subscribe=true but no subscription_listener"
-                                    );
-                                }
                             }
                         } else {
                             tracing::debug!(
