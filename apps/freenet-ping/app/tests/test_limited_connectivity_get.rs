@@ -22,6 +22,17 @@
 //! Creates a minimal network (gateway + 1 peer) and requests a non-existent contract.
 //! The request should terminate gracefully (timeout or NotFound) rather than failing
 //! with a cycle-related error.
+//!
+//! ## Why This Topology Works
+//!
+//! With only 2 nodes (gateway + peer), the cycle forms as follows:
+//! 1. Peer sends GET to gateway (htl=10)
+//! 2. Gateway has only one connection (peer), so it forwards back to peer (htl=9)
+//! 3. Without the fix: peer wasn't marked as visited, so gateway sends back to it
+//! 4. With the fix: peer is marked as visited, so gateway has no one to forward to
+//!    and returns NotFound more quickly
+//!
+//! The test validates that the request terminates gracefully in either case.
 
 mod common;
 
@@ -70,7 +81,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> TestResult {
     let path = preset_cfg_gw.temp_dir.path().to_path_buf();
     let config_info = gw_config_from_path(public_port, &path)?;
     let serialized_gateway = serde_json::to_string(&config_info)?;
-    let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
+    let _ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure peer - only knows about the gateway (limited connectivity)
     let (config_peer, preset_cfg_peer) = base_node_test_config(
@@ -134,13 +145,7 @@ async fn test_limited_connectivity_get_nonexistent_contract() -> TestResult {
             connect_async_with_config(&uri_peer, Some(ws_config()), false).await?;
         let mut client_peer = WebApi::start(stream_peer);
 
-        // Also connect to gateway to verify it's working
-        let uri_gw =
-            format!("ws://127.0.0.1:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
-        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
-        let _client_gw = WebApi::start(stream_gw);
-
-        println!("✓ Connected to both nodes");
+        println!("✓ Connected to peer node");
 
         // Generate a random contract ID that definitely doesn't exist
         // Use a random hash to ensure it doesn't match any existing contract
