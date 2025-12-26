@@ -166,6 +166,18 @@ impl VisitedPeers {
     }
 }
 
+/// Default implementation creates an empty bloom filter with zero hash keys.
+/// The bloom filter won't work correctly until hash keys are set via `with_transaction()`.
+/// This is useful for tests or when the bloom filter will be restored after deserialization.
+impl Default for VisitedPeers {
+    fn default() -> Self {
+        Self {
+            bits: [0u8; BLOOM_BYTES],
+            hash_keys: (0, 0),
+        }
+    }
+}
+
 /// Implement Contains trait for use with k_closest_potentially_caching.
 impl crate::util::Contains<SocketAddr> for VisitedPeers {
     fn has_element(&self, target: SocketAddr) -> bool {

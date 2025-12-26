@@ -111,6 +111,8 @@ use crate::transport::TransportKeypair;
 use crate::util::{Backoff, Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
 
+use super::VisitedPeers;
+
 const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 const RECENCY_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -175,7 +177,7 @@ impl fmt::Display for ConnectMsg {
 }
 
 /// Two-message request payload.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ConnectRequest {
     /// Joiner's advertised location (fallbacks to the joiner's socket address).
     pub desired_location: Location,
@@ -186,8 +188,10 @@ pub(crate) struct ConnectRequest {
     pub joiner: PeerKeyLocation,
     /// Remaining hops before the request stops travelling.
     pub ttl: u8,
-    /// Simple visited set to avoid trivial loops (addresses of peers that have seen this request).
-    pub visited: Vec<SocketAddr>,
+    /// Bloom filter tracking visited peers to prevent routing loops.
+    /// Uses transaction-specific hashing for privacy (same peer hashes differently
+    /// in different transactions, preventing topology inference).
+    pub visited: VisitedPeers,
 }
 
 /// Acceptance payload returned by candidates.
@@ -246,7 +250,7 @@ pub(crate) trait RelayContext {
     fn select_next_hop(
         &self,
         desired_location: Location,
-        visited: &[SocketAddr],
+        visited: &VisitedPeers,
         recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation>;
@@ -257,7 +261,7 @@ pub(crate) trait RelayContext {
     fn select_uphill_hop(
         &self,
         desired_location: Location,
-        visited: &[SocketAddr],
+        visited: &VisitedPeers,
         recency: &HashMap<PeerKeyLocation, Instant>,
     ) -> Option<PeerKeyLocation>;
 }
@@ -342,7 +346,7 @@ impl RelayState {
         let mut forward_req = self.request.clone();
         forward_req.ttl = forward_req.ttl.saturating_sub(1);
         if let Some(self_addr) = ctx.self_location().socket_addr() {
-            push_unique_addr(&mut forward_req.visited, self_addr);
+            forward_req.visited.mark_visited(self_addr);
         }
         let forward_snapshot = forward_req.clone();
         self.forwarded_to = Some(peer.clone());
@@ -372,11 +376,12 @@ impl RelayState {
             observed_sent = self.observed_sent,
             "RelayState::step() start"
         );
-        // Add upstream's address (determined from transport layer) to visited list
-        push_unique_addr(&mut self.request.visited, self.upstream_addr);
+        // Add upstream's address (determined from transport layer) to visited list.
+        // Mark upstream first since their observation of our address is more reliable for NAT.
+        self.request.visited.mark_visited(self.upstream_addr);
         // Add our own address to visited list
         if let Some(self_addr) = ctx.self_location().socket_addr() {
-            push_unique_addr(&mut self.request.visited, self_addr);
+            self.request.visited.mark_visited(self_addr);
         }
 
         // Fill in joiner's external address from transport layer if unknown.
@@ -583,7 +588,7 @@ impl RelayContext for RelayEnv<'_> {
     fn select_next_hop(
         &self,
         desired_location: Location,
-        visited: &[SocketAddr],
+        visited: &VisitedPeers,
         recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation> {
@@ -675,7 +680,7 @@ impl RelayContext for RelayEnv<'_> {
     fn select_uphill_hop(
         &self,
         desired_location: Location,
-        visited: &[SocketAddr],
+        visited: &VisitedPeers,
         recency: &HashMap<PeerKeyLocation, Instant>,
     ) -> Option<PeerKeyLocation> {
         // UPHILL ROUTING: When at terminus but can't accept, try any available peer.
@@ -835,9 +840,13 @@ impl ConnectOp {
     pub(crate) fn new_relay(
         id: Transaction,
         upstream_addr: SocketAddr,
-        request: ConnectRequest,
+        mut request: ConnectRequest,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
     ) -> Self {
+        // Restore bloom filter hash keys from transaction ID after deserialization.
+        // The bloom filter uses transaction-specific hash keys for privacy, and these
+        // must be restored since hash keys aren't serialized.
+        request.visited = request.visited.with_transaction(&id);
         let state = ConnectState::Relaying(Box::new(RelayState {
             upstream_addr,
             request,
@@ -905,13 +914,16 @@ impl ConnectOp {
         target_connections: usize,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
     ) -> (Transaction, Self, ConnectMsg) {
-        // Initialize visited list with addresses of ourself and the target gateway
-        let mut visited = Vec::new();
+        let tx = Transaction::new::<ConnectMsg>();
+
+        // Initialize bloom filter with transaction-specific hash keys.
+        // Mark ourself and the target gateway as visited.
+        let mut visited = VisitedPeers::new(&tx);
         if let Some(own_addr) = own.socket_addr() {
-            visited.push(own_addr);
+            visited.mark_visited(own_addr);
         }
         if let Some(target_addr) = target.socket_addr() {
-            push_unique_addr(&mut visited, target_addr);
+            visited.mark_visited(target_addr);
         }
 
         // Create joiner with PeerAddr::Unknown - the joiner doesn't know their own
@@ -925,7 +937,6 @@ impl ConnectOp {
             visited,
         };
 
-        let tx = Transaction::new::<ConnectMsg>();
         let op = ConnectOp::new_joiner(
             tx,
             desired_location,
@@ -1428,7 +1439,7 @@ impl Operation for ConnectOp {
 /// This ensures we never select ourselves as a forwarding target, even if
 /// self wasn't properly added to the visited list by upstream callers.
 struct SkipListWithSelf<'a> {
-    visited: &'a [SocketAddr],
+    visited: &'a VisitedPeers,
     self_addr: Option<SocketAddr>,
 }
 
@@ -1440,20 +1451,14 @@ impl Contains<SocketAddr> for SkipListWithSelf<'_> {
                 return true;
             }
         }
-        // Check if target is in the visited list
-        self.visited.contains(&target)
+        // Check if target is in the visited list (bloom filter)
+        self.visited.probably_visited(target)
     }
 }
 
 impl Contains<&SocketAddr> for SkipListWithSelf<'_> {
     fn has_element(&self, target: &SocketAddr) -> bool {
         self.has_element(*target)
-    }
-}
-
-fn push_unique_addr(list: &mut Vec<SocketAddr>, addr: SocketAddr) {
-    if !list.contains(&addr) {
-        list.push(addr);
     }
 }
 
@@ -1740,7 +1745,7 @@ mod tests {
         fn select_next_hop(
             &self,
             _desired_location: Location,
-            _visited: &[SocketAddr],
+            _visited: &VisitedPeers,
             _recency: &HashMap<PeerKeyLocation, Instant>,
             _estimator: &ConnectForwardEstimator,
         ) -> Option<PeerKeyLocation> {
@@ -1750,7 +1755,7 @@ mod tests {
         fn select_uphill_hop(
             &self,
             _desired_location: Location,
-            _visited: &[SocketAddr],
+            _visited: &VisitedPeers,
             _recency: &HashMap<PeerKeyLocation, Instant>,
         ) -> Option<PeerKeyLocation> {
             self.uphill_hop.clone()
@@ -1805,7 +1810,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1848,7 +1853,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1888,7 +1893,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 2,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1907,10 +1912,10 @@ mod tests {
         let (forward_to, request) = actions.forward.expect("expected forward");
         assert_eq!(forward_to.pub_key(), next_hop.pub_key());
         assert_eq!(request.ttl, 1);
-        // visited now contains SocketAddr
+        // visited now contains SocketAddr (bloom filter check)
         assert!(request
             .visited
-            .contains(&joiner.socket_addr().expect("test peer must have address")));
+            .probably_visited(joiner.socket_addr().expect("test peer must have address")));
     }
 
     /// Test the terminus-only acceptance behavior: relays should NOT accept when they can
@@ -1926,7 +1931,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -1986,7 +1991,7 @@ mod tests {
                 // Joiner has Unknown address in the request
                 joiner: joiner_with_unknown_addr.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -2048,7 +2053,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner_with_known_addr.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -2094,7 +2099,7 @@ mod tests {
         let desired = Location::random();
         let ttl = 5;
         let own = make_peer(7300);
-        let (_tx, op, msg) = ConnectOp::initiate_join_request(
+        let (tx, op, msg) = ConnectOp::initiate_join_request(
             own.clone(),
             target.clone(),
             desired,
@@ -2107,12 +2112,14 @@ mod tests {
             ConnectMsg::Request { payload, .. } => {
                 assert_eq!(payload.desired_location, desired);
                 assert_eq!(payload.ttl, ttl);
-                // visited now contains SocketAddr, not PeerKeyLocation
+                // visited is now a bloom filter, not PeerKeyLocation
+                // Restore hash keys to check (simulating what relay does)
+                let visited = payload.visited.with_transaction(&tx);
                 if let Some(own_addr) = own.socket_addr() {
-                    assert!(payload.visited.contains(&own_addr));
+                    assert!(visited.probably_visited(own_addr));
                 }
                 if let Some(target_addr) = target.socket_addr() {
-                    assert!(payload.visited.contains(&target_addr));
+                    assert!(visited.probably_visited(target_addr));
                 }
             }
             other => panic!("unexpected message: {other:?}"),
@@ -2131,14 +2138,19 @@ mod tests {
         let relay_b = make_peer(8300);
 
         let joiner_addr = joiner.socket_addr().expect("test peer must have address");
+        let tx = Transaction::new::<ConnectMsg>();
+
+        // Create bloom filter with joiner's address marked
+        let mut visited = VisitedPeers::new(&tx);
+        visited.mark_visited(joiner_addr);
+
         let request = ConnectRequest {
             desired_location: Location::random(),
             joiner: joiner.clone(),
             ttl: 3,
-            visited: vec![joiner_addr],
+            visited,
         };
 
-        let tx = Transaction::new::<ConnectMsg>();
         let mut relay_op = ConnectOp::new_relay(
             tx,
             joiner_addr,
@@ -2158,7 +2170,7 @@ mod tests {
         assert_eq!(forward_request.ttl, 2);
         let relay_a_addr = relay_a.socket_addr().expect("test peer must have address");
         assert!(
-            forward_request.visited.contains(&relay_a_addr),
+            forward_request.visited.probably_visited(relay_a_addr),
             "forwarded request should record intermediate relay's address"
         );
 
@@ -2209,7 +2221,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner_with_observed_addr.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -2279,14 +2291,19 @@ mod tests {
         let acceptor_peer = make_peer(9200);
 
         let joiner_addr = joiner.socket_addr().expect("test peer must have address");
+        let tx = Transaction::new::<ConnectMsg>();
+
+        // Create bloom filter with joiner's address marked
+        let mut visited = VisitedPeers::new(&tx);
+        visited.mark_visited(joiner_addr);
+
         let request = ConnectRequest {
             desired_location: Location::random(),
             joiner: joiner.clone(),
             ttl: 3,
-            visited: vec![joiner_addr],
+            visited,
         };
 
-        let tx = Transaction::new::<ConnectMsg>();
         let mut relay_op = ConnectOp::new_relay(
             tx,
             joiner_addr,
@@ -2343,7 +2360,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -2411,7 +2428,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -2451,7 +2468,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 0, // TTL exhausted
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -2506,7 +2523,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -2560,7 +2577,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 3,
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -2605,7 +2622,7 @@ mod tests {
                 desired_location: Location::random(),
                 joiner: joiner.clone(),
                 ttl: 0, // TTL exhausted
-                visited: vec![],
+                visited: VisitedPeers::default(),
             },
             forwarded_to: None,
             observed_sent: false,
@@ -2648,4 +2665,139 @@ mod tests {
     // The joiner_known = None check (line 462-475) is purely defensive - it handles the
     // theoretical case where the address somehow doesn't get filled in, but this cannot
     // be triggered in practice since the first relay always fills it in.
+
+    // =============================================================================
+    // Bloom Filter (VisitedPeers) Regression Tests
+    // These tests ensure the bloom filter implementation correctly tracks visited
+    // peers during the connect operation, preventing routing loops.
+    // =============================================================================
+
+    /// Test that VisitedPeers correctly tracks visited addresses.
+    /// Regression test for issue #2421: Connect operation should use bloom filter.
+    #[test]
+    fn test_visited_peers_tracks_addresses() {
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut visited = VisitedPeers::new(&tx);
+
+        let addr1: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+        let addr3: SocketAddr = "127.0.0.1:8003".parse().unwrap();
+
+        // Initially no addresses are visited
+        assert!(!visited.probably_visited(addr1));
+        assert!(!visited.probably_visited(addr2));
+        assert!(!visited.probably_visited(addr3));
+
+        // Mark addresses as visited
+        visited.mark_visited(addr1);
+        visited.mark_visited(addr2);
+
+        // Visited addresses should be detected
+        assert!(visited.probably_visited(addr1));
+        assert!(visited.probably_visited(addr2));
+        // Unvisited address should not be detected (with high probability)
+        assert!(!visited.probably_visited(addr3));
+    }
+
+    /// Test that VisitedPeers hash keys are correctly restored after deserialization.
+    /// Regression test for issue #2421: Hash keys must be restored using with_transaction().
+    #[test]
+    fn test_visited_peers_hash_key_restoration() {
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut original = VisitedPeers::new(&tx);
+
+        let addr: SocketAddr = "192.168.1.1:9000".parse().unwrap();
+        original.mark_visited(addr);
+
+        // Simulate serialization/deserialization using bincode (same as network)
+        let serialized = bincode::serialize(&original).unwrap();
+        let mut restored: VisitedPeers = bincode::deserialize(&serialized).unwrap();
+
+        // Before restoring hash keys, the check may fail due to zeroed hash keys
+        // (This is implementation-specific - hash_keys are skipped during serialization)
+
+        // After restoration with transaction, the address should be detected
+        restored = restored.with_transaction(&tx);
+        assert!(
+            restored.probably_visited(addr),
+            "visited address should be detected after hash key restoration"
+        );
+    }
+
+    /// Test that bloom filter is properly initialized in initiate_join_request.
+    /// Regression test for issue #2421: Joiner should initialize bloom filter with tx.
+    #[test]
+    fn test_initiate_join_request_uses_bloom_filter() {
+        let own = make_peer(8001);
+        let target = make_peer(8002);
+        let desired_location = Location::try_from(0.5).unwrap();
+        let estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
+
+        let (tx, _op, msg) = ConnectOp::initiate_join_request(
+            own.clone(),
+            target.clone(),
+            desired_location,
+            10,
+            3,
+            estimator,
+        );
+
+        // Extract the request from the message
+        let request = match msg {
+            ConnectMsg::Request { payload, .. } => payload,
+            _ => panic!("Expected ConnectMsg::Request"),
+        };
+
+        // Restore hash keys to check (simulating what relay does)
+        let visited = request.visited.with_transaction(&tx);
+
+        // Own address and target address should be marked as visited
+        if let Some(own_addr) = own.socket_addr() {
+            assert!(
+                visited.probably_visited(own_addr),
+                "own address should be marked visited in initial request"
+            );
+        }
+        if let Some(target_addr) = target.socket_addr() {
+            assert!(
+                visited.probably_visited(target_addr),
+                "target address should be marked visited in initial request"
+            );
+        }
+    }
+
+    /// Test that SkipListWithSelf correctly uses bloom filter for visited detection.
+    /// Regression test for issue #2421: Skip list should use probably_visited.
+    #[test]
+    fn test_skip_list_with_bloom_filter() {
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut visited = VisitedPeers::new(&tx);
+
+        let visited_addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let self_addr: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let other_addr: SocketAddr = "10.0.0.3:5000".parse().unwrap();
+
+        visited.mark_visited(visited_addr);
+
+        let skip = SkipListWithSelf {
+            visited: &visited,
+            self_addr: Some(self_addr),
+        };
+
+        // Should skip visited addresses
+        assert!(
+            skip.has_element(visited_addr),
+            "visited address should be in skip list"
+        );
+        // Should skip self address
+        assert!(
+            skip.has_element(self_addr),
+            "self address should be in skip list"
+        );
+        // Should not skip other addresses
+        assert!(
+            !skip.has_element(other_addr),
+            "unvisited address should not be in skip list"
+        );
+    }
 }
