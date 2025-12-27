@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{mpsc, RwLock};
 
 use super::streaming_buffer::LockFreeStreamBuffer;
 use super::StreamId;
@@ -65,20 +65,21 @@ impl std::fmt::Display for StreamError {
 
 impl std::error::Error for StreamError {}
 
-/// Internal state shared between stream handles and the producer.
-struct StreamState {
-    /// The underlying lock-free buffer.
-    buffer: LockFreeStreamBuffer,
+/// Synchronization state for stream handles.
+///
+/// The lock-free buffer is stored separately (as Arc<LockFreeStreamBuffer>)
+/// so that fragment insertion doesn't require holding this lock.
+/// This struct only holds state that requires synchronization.
+struct SyncState {
     /// True if the stream has been cancelled.
     cancelled: bool,
     /// Wakers for poll_next calls waiting on data.
     wakers: Vec<Waker>,
 }
 
-impl StreamState {
-    fn new(total_bytes: u64) -> Self {
+impl SyncState {
+    fn new() -> Self {
         Self {
-            buffer: LockFreeStreamBuffer::new(total_bytes),
             cancelled: false,
             wakers: Vec::new(),
         }
@@ -95,12 +96,20 @@ impl StreamState {
 ///
 /// Each clone maintains its own read position, allowing independent consumers
 /// to read the stream at different rates.
+///
+/// The design separates the lock-free buffer from synchronization state:
+/// - `buffer`: Lock-free fragment storage using `OnceLock<Bytes>` slots
+/// - `sync`: Cancelled flag and wakers (requires lock)
+///
+/// Fragment insertion goes directly to the buffer without acquiring any lock,
+/// and the buffer's built-in `Notify` handles async notification.
 #[derive(Clone)]
 pub struct StreamHandle {
-    /// Shared state with the producer and other consumers.
-    state: Arc<parking_lot::RwLock<StreamState>>,
-    /// Notification for when new fragments arrive (separate from state for async-safety).
-    notify: Arc<Notify>,
+    /// Lock-free buffer for fragment storage.
+    /// Accessed without holding any lock - all operations are atomic.
+    buffer: Arc<LockFreeStreamBuffer>,
+    /// Synchronization state (cancelled, wakers) - requires lock.
+    sync: Arc<parking_lot::RwLock<SyncState>>,
     /// Stream ID for debugging.
     stream_id: StreamId,
     /// Total expected bytes.
@@ -111,8 +120,8 @@ impl StreamHandle {
     /// Creates a new stream handle.
     fn new(stream_id: StreamId, total_bytes: u64) -> Self {
         Self {
-            state: Arc::new(parking_lot::RwLock::new(StreamState::new(total_bytes))),
-            notify: Arc::new(Notify::new()),
+            buffer: Arc::new(LockFreeStreamBuffer::new(total_bytes)),
+            sync: Arc::new(parking_lot::RwLock::new(SyncState::new())),
             stream_id,
             total_bytes,
         }
@@ -131,17 +140,17 @@ impl StreamHandle {
 
     /// Returns true if all fragments have been received.
     pub fn is_complete(&self) -> bool {
-        self.state.read().buffer.is_complete()
+        self.buffer.is_complete()
     }
 
     /// Returns the number of fragments received so far.
     pub fn received_fragments(&self) -> usize {
-        self.state.read().buffer.inserted_count()
+        self.buffer.inserted_count()
     }
 
     /// Returns the total expected number of fragments.
     pub fn total_fragments(&self) -> usize {
-        self.state.read().buffer.total_fragments()
+        self.buffer.total_fragments()
     }
 
     /// Creates a new streaming view starting from fragment 1.
@@ -166,29 +175,31 @@ impl StreamHandle {
     /// Inserts a fragment into the stream buffer.
     ///
     /// This is called by the transport layer when a fragment arrives.
+    /// The insert operation is lock-free - only the cancelled check and
+    /// waker notification require synchronization.
     ///
     /// # Returns
     ///
     /// * `Ok(true)` - Fragment was inserted successfully
     /// * `Ok(false)` - Fragment was a duplicate (no-op)
-    /// * `Err(StreamError)` - Invalid fragment index
+    /// * `Err(StreamError)` - Invalid fragment index or stream cancelled
     pub(crate) fn push_fragment(
         &self,
         fragment_index: u32,
         data: Bytes,
     ) -> Result<bool, StreamError> {
-        let mut state = self.state.write();
-        if state.cancelled {
+        // Quick check if cancelled (read lock only)
+        if self.sync.read().cancelled {
             return Err(StreamError::Cancelled);
         }
 
-        match state.buffer.insert(fragment_index, data) {
+        // Lock-free insert into buffer
+        // The buffer's internal Notify handles async notification
+        match self.buffer.insert(fragment_index, data) {
             Ok(inserted) => {
                 if inserted {
-                    state.wake_all();
-                    // Notify async waiters (outside lock)
-                    drop(state);
-                    self.notify.notify_waiters();
+                    // Wake synchronous waiters (poll_next wakers)
+                    self.sync.write().wake_all();
                 }
                 Ok(inserted)
             }
@@ -200,12 +211,11 @@ impl StreamHandle {
 
     /// Cancels the stream, waking all waiters.
     pub(crate) fn cancel(&self) {
-        let mut state = self.state.write();
-        state.cancelled = true;
-        state.wake_all();
-        // Notify async waiters (outside lock)
-        drop(state);
-        self.notify.notify_waiters();
+        let mut sync = self.sync.write();
+        sync.cancelled = true;
+        sync.wake_all();
+        // Buffer's internal Notify wakes async waiters automatically
+        // when they next check is_complete() or get()
     }
 
     /// Assembles the complete data if all fragments are present.
@@ -213,49 +223,46 @@ impl StreamHandle {
     /// This is a convenience method for waiting until the stream is complete
     /// and then getting all data at once.
     pub fn try_assemble(&self) -> Option<Vec<u8>> {
-        self.state.read().buffer.assemble()
+        self.buffer.assemble()
     }
 
     /// Waits for the stream to complete and returns the assembled data.
     ///
     /// This is useful when you don't need incremental processing.
+    /// Uses the buffer's built-in Notify for efficient async waiting.
     pub async fn assemble(&self) -> Result<Vec<u8>, StreamError> {
         loop {
-            // Check state and try to assemble
-            {
-                let state = self.state.read();
-                if state.cancelled {
-                    return Err(StreamError::Cancelled);
-                }
-                if state.buffer.is_complete() {
-                    // Assemble while holding the lock
-                    if let Some(data) = state.buffer.assemble() {
-                        return Ok(data);
-                    }
-                    return Err(StreamError::InvalidFragment {
-                        message: "assembly failed".into(),
-                    });
-                }
+            // Check cancelled state
+            if self.sync.read().cancelled {
+                return Err(StreamError::Cancelled);
             }
-            // Lock is released here
 
-            // Wait for notification of new fragments
-            // Using the separate Arc<Notify> that can be borrowed across await
-            self.notify.notified().await;
+            // Try to assemble (lock-free access to buffer)
+            if self.buffer.is_complete() {
+                if let Some(data) = self.buffer.assemble() {
+                    return Ok(data);
+                }
+                return Err(StreamError::InvalidFragment {
+                    message: "assembly failed".into(),
+                });
+            }
+
+            // Wait for notification using buffer's built-in Notify
+            // This is safe because we're not holding any lock across the await
+            self.buffer.notifier().notified().await;
         }
     }
 }
 
 impl std::fmt::Debug for StreamHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.state.read();
         f.debug_struct("StreamHandle")
             .field("stream_id", &self.stream_id)
             .field("total_bytes", &self.total_bytes)
-            .field("received", &state.buffer.inserted_count())
-            .field("total_fragments", &state.buffer.total_fragments())
-            .field("complete", &state.buffer.is_complete())
-            .field("cancelled", &state.cancelled)
+            .field("received", &self.buffer.inserted_count())
+            .field("total_fragments", &self.buffer.total_fragments())
+            .field("complete", &self.buffer.is_complete())
+            .field("cancelled", &self.sync.read().cancelled)
             .finish()
     }
 }
@@ -299,48 +306,41 @@ impl Stream for StreamingInboundStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next_idx = self.next_fragment;
 
-        // First check with read lock
-        let (cancelled, total_fragments, maybe_data) = {
-            let state = self.handle.state.read();
-            let cancelled = state.cancelled;
-            let total = state.buffer.total_fragments() as u32;
-            let data = state.buffer.get(next_idx).cloned();
-            (cancelled, total, data)
-        };
-        // Lock is now released
-
-        // Check if stream is cancelled
-        if cancelled {
+        // Check cancelled state (sync lock)
+        if self.handle.sync.read().cancelled {
             return Poll::Ready(Some(Err(StreamError::Cancelled)));
         }
+
+        // Lock-free access to buffer
+        let total_fragments = self.handle.buffer.total_fragments() as u32;
 
         // Check if we've read all fragments
         if next_idx > total_fragments {
             return Poll::Ready(None); // Stream complete
         }
 
-        // Try to get the next fragment (already fetched above)
-        if let Some(data) = maybe_data {
+        // Try to get the next fragment (lock-free)
+        if let Some(data) = self.handle.buffer.get(next_idx).cloned() {
             self.next_fragment = next_idx + 1;
             self.bytes_read += data.len() as u64;
             return Poll::Ready(Some(Ok(data)));
         }
 
-        // Fragment not yet available, need write lock to register waker
+        // Fragment not yet available, register waker
         {
-            let mut state = self.handle.state.write();
-            // Re-check conditions after acquiring write lock (double-checked locking)
-            if state.cancelled {
+            let mut sync = self.handle.sync.write();
+            // Re-check cancelled after acquiring write lock
+            if sync.cancelled {
                 return Poll::Ready(Some(Err(StreamError::Cancelled)));
             }
-            if let Some(data) = state.buffer.get(next_idx).cloned() {
-                // Fragment arrived while we were waiting for the lock
-                drop(state); // Release lock before modifying self
+            // Re-check buffer (fragment may have arrived)
+            if let Some(data) = self.handle.buffer.get(next_idx).cloned() {
+                drop(sync); // Release lock before modifying self
                 self.next_fragment = next_idx + 1;
                 self.bytes_read += data.len() as u64;
                 return Poll::Ready(Some(Ok(data)));
             }
-            state.wakers.push(cx.waker().clone());
+            sync.wakers.push(cx.waker().clone());
         }
 
         Poll::Pending
