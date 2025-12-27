@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use freenet_stdlib::client_api::{HostResponse, NodeQuery, QueryResponse};
 use prettytable::{Cell, Row, Table};
 
@@ -6,19 +8,41 @@ use crate::{
     config::BaseConfig,
 };
 
+/// Timeout for waiting for query responses.
+/// Queries should be fast, but we use a generous timeout to handle slow networks.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn query(base_cfg: BaseConfig) -> anyhow::Result<()> {
     let mut client = start_api_client(base_cfg).await?;
 
+    let result = query_inner(&mut client).await;
+
+    // Always gracefully close the WebSocket connection, even on timeout/error
+    close_api_client(&mut client).await;
+
+    result
+}
+
+async fn query_inner(client: &mut freenet_stdlib::client_api::WebApi) -> anyhow::Result<()> {
     // Query for connected peers
     tracing::info!("Querying for connected peers");
     execute_command(
         freenet_stdlib::client_api::ClientRequest::NodeQueries(NodeQuery::ConnectedPeers),
-        &mut client,
+        client,
     )
     .await?;
-    let HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }) =
-        client.recv().await?
-    else {
+
+    let response = tokio::time::timeout(QUERY_TIMEOUT, client.recv())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timeout waiting for query response after {} seconds",
+                QUERY_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
+
+    let HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }) = response else {
         anyhow::bail!("Unexpected response from the host");
     };
 
@@ -43,12 +67,21 @@ pub async fn query(base_cfg: BaseConfig) -> anyhow::Result<()> {
     tracing::info!("Querying for subscription info");
     execute_command(
         freenet_stdlib::client_api::ClientRequest::NodeQueries(NodeQuery::SubscriptionInfo),
-        &mut client,
+        client,
     )
     .await?;
 
-    let HostResponse::QueryResponse(QueryResponse::NetworkDebug(info)) = client.recv().await?
-    else {
+    let response = tokio::time::timeout(QUERY_TIMEOUT, client.recv())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timeout waiting for query response after {} seconds",
+                QUERY_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
+
+    let HostResponse::QueryResponse(QueryResponse::NetworkDebug(info)) = response else {
         anyhow::bail!("Unexpected response from the host");
     };
 
@@ -71,9 +104,6 @@ pub async fn query(base_cfg: BaseConfig) -> anyhow::Result<()> {
     } else {
         println!("No application subscriptions");
     }
-
-    // Gracefully close the WebSocket connection
-    close_api_client(&mut client).await;
 
     Ok(())
 }
