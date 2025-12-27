@@ -115,12 +115,40 @@ impl From<DelegateKey> for StoreKey {
     }
 }
 
-impl From<StoreKey> for DelegateKey {
-    fn from(value: StoreKey) -> Self {
-        let StoreKey::DelegateKey { key, code_hash } = value else {
-            unreachable!("StoreKey should be DelegateKey variant")
-        };
-        DelegateKey::new(key, CodeHash::new(code_hash))
+/// Error returned when a StoreKey cannot be converted to the expected type.
+/// This can happen when loading corrupted index files that contain records
+/// of the wrong key type (e.g., Contract records in a Delegate/Secrets store).
+#[derive(Debug)]
+pub struct StoreKeyMismatch {
+    expected: &'static str,
+    actual: &'static str,
+}
+
+impl std::fmt::Display for StoreKeyMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "StoreKey type mismatch: expected {}, got {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for StoreKeyMismatch {}
+
+impl TryFrom<StoreKey> for DelegateKey {
+    type Error = StoreKeyMismatch;
+
+    fn try_from(value: StoreKey) -> Result<Self, Self::Error> {
+        match value {
+            StoreKey::DelegateKey { key, code_hash } => {
+                Ok(DelegateKey::new(key, CodeHash::new(code_hash)))
+            }
+            StoreKey::ContractKey(_) => Err(StoreKeyMismatch {
+                expected: "DelegateKey",
+                actual: "ContractKey",
+            }),
+        }
     }
 }
 
@@ -130,12 +158,17 @@ impl From<ContractInstanceId> for StoreKey {
     }
 }
 
-impl From<StoreKey> for ContractInstanceId {
-    fn from(value: StoreKey) -> Self {
-        let StoreKey::ContractKey(value) = value else {
-            unreachable!("StoreKey should be ContractKey variant")
-        };
-        ContractInstanceId::new(value)
+impl TryFrom<StoreKey> for ContractInstanceId {
+    type Error = StoreKeyMismatch;
+
+    fn try_from(value: StoreKey) -> Result<Self, Self::Error> {
+        match value {
+            StoreKey::ContractKey(key) => Ok(ContractInstanceId::new(key)),
+            StoreKey::DelegateKey { .. } => Err(StoreKeyMismatch {
+                expected: "ContractKey",
+                actual: "DelegateKey",
+            }),
+        }
     }
 }
 
@@ -147,7 +180,7 @@ enum KeyType {
 
 pub(super) trait StoreFsManagement: Sized {
     type MemContainer: Send + Sync + 'static;
-    type Key: Clone + From<StoreKey>;
+    type Key: Clone + TryFrom<StoreKey, Error = StoreKeyMismatch>;
     type Value: AsRef<[u8]> + for<'x> TryFrom<&'x [u8], Error = std::io::Error>;
 
     fn insert_in_container(
@@ -226,7 +259,25 @@ pub(super) trait StoreFsManagement: Sized {
         let mut key_cursor = 0;
         while let Ok(rec) = process_record(&mut file) {
             if let Some((store_key, value)) = rec {
-                let store_key = store_key.into();
+                // Try to convert the store key to the expected type.
+                // If this fails, it means we encountered a record of the wrong type
+                // (e.g., a Contract record in a Delegate/Secrets store), which indicates
+                // file corruption. Skip the corrupt record and continue loading.
+                // See issue: trailing zeros from failed compaction were being parsed
+                // as Contract records (KeyType = 0) in Delegate/Secrets stores.
+                let store_key = match store_key.try_into() {
+                    Ok(key) => key,
+                    Err(mismatch) => {
+                        tracing::warn!(
+                            path = ?key_file_path,
+                            offset = key_cursor,
+                            error = %mismatch,
+                            "Skipping corrupt record in index file (key type mismatch)"
+                        );
+                        key_cursor = file.stream_position()?;
+                        continue;
+                    }
+                };
                 let value = match value {
                     Either::Left(v) => Self::Value::try_from(&v),
                     Either::Right(v) => Self::Value::try_from(&v),
@@ -765,5 +816,65 @@ mod tests {
         let mut container = <TestStore1 as StoreFsManagement>::MemContainer::default();
         TestStore1::load_from_file(&key_file_path, &mut container).expect("Failed to load");
         assert_eq!(container.len(), 5, "All 5 records should still exist");
+    }
+
+    /// Regression test: Loading a DelegateStore index file that contains Contract records
+    /// (wrong key type) should skip the invalid records instead of panicking.
+    ///
+    /// This scenario occurs when:
+    /// 1. A failed compaction leaves trailing zeros in the file
+    /// 2. Zeros are parsed as Contract records (KeyType = 0)
+    /// 3. DelegateStore/SecretsStore tries to load them as DelegateKey
+    ///
+    /// Before the fix, this caused a panic: "StoreKey should be DelegateKey variant"
+    #[test]
+    fn test_key_type_mismatch_skips_corrupt_records() {
+        let temp_dir = get_temp_dir();
+        let key_file_path = temp_dir.path().join("delegate_keys");
+
+        // Step 1: Create a valid DelegateKey record
+        let delegate_key = DelegateKey::new([3; 32], CodeHash::new([4; 32]));
+        let expected_value = CodeHash::new([5; 32]);
+        {
+            let mut file = SafeWriter::<TestStore2>::new(&key_file_path, false).expect("failed");
+            TestStore2::insert(&mut file, delegate_key.clone(), &expected_value)
+                .expect("Failed to insert");
+        }
+
+        // Step 2: Append corrupt data that looks like a Contract record (zeros)
+        // This simulates the corruption scenario from failed compaction
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&key_file_path)
+                .expect("Failed to open");
+            // Write: tombstone=0 (not deleted), key_type=0 (Contract), then garbage
+            // This will be parsed as a Contract record and should be skipped
+            let corrupt_record = [0u8; 70]; // tombstone + key_type + 32-byte key + 4-byte len + 32-byte value
+            file.write_all(&corrupt_record)
+                .expect("Failed to write corrupt data");
+        }
+
+        // Step 3: Load the file - this should NOT panic, but skip the corrupt record
+        let mut container = <TestStore2 as StoreFsManagement>::MemContainer::default();
+        TestStore2::load_from_file(&key_file_path, &mut container)
+            .expect("load_from_file should handle corrupt records gracefully");
+
+        // Step 4: Verify only the valid DelegateKey record was loaded
+        assert_eq!(
+            container.len(),
+            1,
+            "Should have exactly 1 valid record (corrupt Contract record should be skipped)"
+        );
+        assert!(
+            container.contains_key(&delegate_key),
+            "Valid DelegateKey record should be present"
+        );
+        assert_eq!(
+            container.get(&delegate_key).unwrap().value().1,
+            expected_value,
+            "Value should match"
+        );
     }
 }
