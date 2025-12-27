@@ -7,7 +7,7 @@ use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationRe
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
 use crate::node::IsOperationCompleted;
-use crate::ring::{KnownPeerKeyLocation, Location, PeerKeyLocation, RingError};
+use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager},
@@ -182,15 +182,6 @@ impl Operation for UpdateOp {
         Box<dyn futures::Future<Output = Result<super::OperationResult, OpError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            // Look up sender's PeerKeyLocation from source address for logging/routing
-            // This replaces the sender field that was previously embedded in messages
-            let sender_from_addr = source_addr.and_then(|addr| {
-                op_manager
-                    .ring
-                    .connection_manager
-                    .get_peer_location_by_addr(addr)
-            });
-
             let return_msg;
             let new_state;
             let stats = self.stats;
@@ -204,10 +195,8 @@ impl Operation for UpdateOp {
                     related_contracts,
                     value,
                 } => {
-                    // Get sender from connection-based routing
-                    let request_sender = sender_from_addr
-                        .clone()
-                        .expect("RequestUpdate requires source_addr");
+                    // Use upstream_addr for routing decisions (not PeerKeyLocation lookup)
+                    // because get_peer_location_by_addr() can fail for transient connections
                     let self_location = op_manager.ring.connection_manager.own_location();
                     let executing_addr = self_location.socket_addr();
 
@@ -215,19 +204,10 @@ impl Operation for UpdateOp {
                         tx = %id,
                         %key,
                         executing_peer = ?executing_addr,
-                        request_sender = ?request_sender.socket_addr(),
+                        request_sender = ?source_addr,
                         "UPDATE RequestUpdate: processing request"
                     );
 
-                    // With hop-by-hop routing, if we receive the message, we process it.
-                    // Determine if this is a local request (from our own client) or remote request
-                    let is_local_request =
-                        matches!(&self.state, Some(UpdateState::PrepareRequest { .. }));
-                    let upstream = if is_local_request {
-                        None // No upstream - we are the initiator
-                    } else {
-                        Some(request_sender.clone()) // Upstream is the peer that sent us this request
-                    };
                     {
                         // First check if we have the contract locally
                         let has_contract = match op_manager
@@ -278,7 +258,8 @@ impl Operation for UpdateOp {
                                     "UPDATE yielded no state change, skipping broadcast"
                                 );
 
-                                if upstream.is_none() {
+                                // Use upstream_addr to determine if we're the originator
+                                if self.upstream_addr.is_none() {
                                     new_state = Some(UpdateState::Finished {
                                         key: *key,
                                         summary: summary.clone(),
@@ -290,17 +271,10 @@ impl Operation for UpdateOp {
                                 return_msg = None;
                             } else {
                                 // Get broadcast targets for propagating UPDATE to subscribers
-                                // Convert to KnownPeerKeyLocation for compile-time address guarantee
-                                let sender_known = KnownPeerKeyLocation::try_from(&request_sender)
-                                    .map_err(|e| {
-                                        tracing::error!(
-                                            tx = %id,
-                                            pub_key = %e.pub_key,
-                                            "INTERNAL ERROR: request_sender has unknown address - sender should always have known address"
-                                        );
-                                        OpError::invalid_transition(*id)
-                                    })?;
-                                let sender_addr = sender_known.socket_addr();
+                                // Use source_addr directly instead of PeerKeyLocation lookup
+                                let sender_addr = source_addr.expect(
+                                    "remote UpdateMsg::RequestUpdate must have source_addr",
+                                );
                                 let broadcast_to =
                                     op_manager.get_broadcast_targets_update(key, &sender_addr);
 
@@ -311,7 +285,8 @@ impl Operation for UpdateOp {
                                         "No broadcast targets, completing UPDATE locally"
                                     );
 
-                                    if upstream.is_none() {
+                                    // Use upstream_addr to determine if we're the originator
+                                    if self.upstream_addr.is_none() {
                                         new_state = Some(UpdateState::Finished {
                                             key: *key,
                                             summary: summary.clone(),
@@ -328,7 +303,7 @@ impl Operation for UpdateOp {
                                         true, // last_hop - we're handling locally
                                         op_manager,
                                         self.state,
-                                        (broadcast_to, request_sender.clone()),
+                                        broadcast_to,
                                         *key,
                                         updated_value.clone(),
                                         false,
@@ -346,9 +321,9 @@ impl Operation for UpdateOp {
                         } else {
                             // Contract not found locally - forward to another peer
                             let self_addr = op_manager.ring.connection_manager.peer_addr()?;
-                            let sender_addr = request_sender
-                                .socket_addr()
-                                .expect("request sender must have socket address");
+                            // Use source_addr directly instead of PeerKeyLocation lookup
+                            let sender_addr = source_addr
+                                .expect("remote UpdateMsg::RequestUpdate must have source_addr");
                             let skip_list = vec![self_addr, sender_addr];
 
                             let next_target = op_manager
@@ -415,10 +390,8 @@ impl Operation for UpdateOp {
                     }
                 }
                 UpdateMsg::BroadcastTo { id, key, new_value } => {
-                    // Get sender from connection-based routing
-                    let sender = sender_from_addr
-                        .clone()
-                        .expect("BroadcastTo requires source_addr");
+                    // Use source_addr directly instead of PeerKeyLocation lookup
+                    let sender_addr = source_addr.expect("BroadcastTo requires source_addr");
                     let self_location = op_manager.ring.connection_manager.own_location();
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let UpdateExecution {
@@ -443,9 +416,6 @@ impl Operation for UpdateOp {
                         new_state = None;
                         return_msg = None;
                     } else {
-                        let sender_addr = sender
-                            .socket_addr()
-                            .expect("sender must have socket address for broadcast");
                         let broadcast_to =
                             op_manager.get_broadcast_targets_update(key, &sender_addr);
 
@@ -460,7 +430,7 @@ impl Operation for UpdateOp {
                             false,
                             op_manager,
                             self.state,
-                            (broadcast_to, sender.clone()),
+                            broadcast_to,
                             *key,
                             updated_value.clone(),
                             true,
@@ -558,7 +528,7 @@ async fn try_to_broadcast(
     last_hop: bool,
     _op_manager: &OpManager,
     state: Option<UpdateState>,
-    (broadcast_to, _upstream): (Vec<PeerKeyLocation>, PeerKeyLocation),
+    broadcast_to: Vec<PeerKeyLocation>,
     key: ContractKey,
     new_value: WrappedState,
     is_from_a_broadcasted_to_peer: bool,
@@ -1141,7 +1111,7 @@ pub(crate) async fn request_update(
                     false,
                     op_manager,
                     broadcast_state,
-                    (broadcast_to, sender.clone()),
+                    broadcast_to,
                     key,
                     updated_value,
                     false,

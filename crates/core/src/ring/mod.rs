@@ -204,6 +204,19 @@ impl Ring {
         self.seeding_manager.is_seeding_contract(key)
     }
 
+    /// Whether we're part of the subscription tree for this contract.
+    ///
+    /// Returns true if we have upstream/downstream network subscriptions OR
+    /// local client subscriptions for this contract, indicating our cache
+    /// is being kept fresh via subscription updates.
+    ///
+    /// This is a better indicator of cache freshness than `is_seeding_contract`,
+    /// which only checks if the contract is in our LRU cache.
+    #[inline]
+    pub fn is_in_subscription_tree(&self, key: &ContractKey) -> bool {
+        self.seeding_manager.is_in_subscription_tree(key)
+    }
+
     pub fn record_request(
         &self,
         recipient: PeerKeyLocation,

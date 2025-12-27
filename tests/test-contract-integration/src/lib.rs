@@ -92,10 +92,15 @@ impl ContractInterface for Contract {
             Err(e) => return Err(ContractError::Deser(e.to_string())),
         };
 
+        // Track whether we received a delta (which requires version increment)
+        // vs a full state replacement (which already has the correct version)
+        let mut received_delta = false;
+
         // Process each update operation
         for update in data {
             match update {
                 UpdateData::Delta(delta) => {
+                    received_delta = true;
                     let operation: TodoOperation = match serde_json::from_slice(delta.as_ref()) {
                         Ok(op) => op,
                         Err(e) => return Err(ContractError::Deser(e.to_string())),
@@ -139,15 +144,15 @@ impl ContractInterface for Contract {
                     }
                 }
                 UpdateData::State(new_state_data) => {
-                    // Replace the entire state with the new state
-                    todo_list = match serde_json::from_slice(new_state_data.as_ref()) {
+                    // Full state replacement.
+                    let incoming: TodoList = match serde_json::from_slice(new_state_data.as_ref()) {
                         Ok(list) => list,
                         Err(e) => return Err(ContractError::Deser(e.to_string())),
                     };
 
                     // Validate the new state
                     let mut ids = std::collections::HashSet::new();
-                    for task in &todo_list.tasks {
+                    for task in &incoming.tasks {
                         if !ids.insert(task.id) {
                             return Err(ContractError::InvalidUpdate);
                         }
@@ -157,26 +162,53 @@ impl ContractInterface for Contract {
                             return Err(ContractError::InvalidUpdate);
                         }
                     }
+
+                    // Determine if this is a client update or a network broadcast:
+                    // - If incoming version > current version: network broadcast, use as-is
+                    // - If incoming version == current version: client update, may need version bump
+                    // - If incoming version < current version: reject or use current (shouldn't happen)
+                    if incoming.version > todo_list.version {
+                        // Network broadcast with newer version - use it directly
+                        todo_list = incoming;
+                    } else if incoming.version == todo_list.version {
+                        // Same version but potentially different content (client update)
+                        // Will increment version below if content changed
+                        todo_list = incoming;
+                        received_delta = true; // Treat as a delta for version increment logic
+                    } else {
+                        // Incoming has older version - this is a conflict, but we'll accept
+                        // and treat as a modification for version increment
+                        todo_list = incoming;
+                        received_delta = true;
+                    }
                 }
                 _ => return Err(ContractError::InvalidUpdate),
             }
         }
 
-        // Check if the state actually changed by comparing serialized forms
-        let new_state_bytes =
-            serde_json::to_vec(&todo_list).map_err(|e| ContractError::Other(e.to_string()))?;
-        let state_changed = original_state_bytes != new_state_bytes.as_slice();
-
-        // Only increment version if the state actually changed
-        // This prevents double-incrementing when the same state is merged at multiple peers
-        if state_changed {
-            todo_list.version += 1;
-            // Re-serialize with incremented version
-            let new_state =
+        // Only increment version for delta updates (not full state replacements).
+        // Delta updates apply operations locally, so we need to track the version change.
+        // Full state replacements already include the correct version from the source peer.
+        if received_delta {
+            // Check if the state actually changed by comparing serialized forms
+            let new_state_bytes =
                 serde_json::to_vec(&todo_list).map_err(|e| ContractError::Other(e.to_string()))?;
-            Ok(UpdateModification::valid(State::from(new_state)))
+            let state_changed = original_state_bytes != new_state_bytes.as_slice();
+
+            if state_changed {
+                todo_list.version += 1;
+                // Re-serialize with incremented version
+                let new_state = serde_json::to_vec(&todo_list)
+                    .map_err(|e| ContractError::Other(e.to_string()))?;
+                Ok(UpdateModification::valid(State::from(new_state)))
+            } else {
+                // Reuse already serialized bytes since state didn't change
+                Ok(UpdateModification::valid(State::from(new_state_bytes)))
+            }
         } else {
-            // Reuse already serialized bytes since state didn't change
+            // Full state replacement - return the state as-is (version already correct)
+            let new_state_bytes =
+                serde_json::to_vec(&todo_list).map_err(|e| ContractError::Other(e.to_string()))?;
             Ok(UpdateModification::valid(State::from(new_state_bytes)))
         }
     }

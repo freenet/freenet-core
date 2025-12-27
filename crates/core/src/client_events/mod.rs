@@ -1054,7 +1054,13 @@ async fn process_open_request(
                     } => {
                         let peer_id = ensure_peer_ready(&op_manager)?;
 
-                        // Query local store by instance_id (key from request is ContractInstanceId)
+                        // Query local store first. We use the result in two cases:
+                        // 1. Error handling: if local storage has issues, fail fast
+                        // 2. No connections: if isolated (no peers), return local cache immediately
+                        //
+                        // For connected nodes, we use smart cache routing: return local cache
+                        // if subscribed (cache is fresh), otherwise fetch from network.
+                        // See PR #2388 for why always-local-first was problematic.
                         let (full_key, state, contract) = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
                                 instance_id: key,
@@ -1110,55 +1116,86 @@ async fn process_open_request(
                             }
                         };
 
-                        // Check if we found the contract locally with state (and code if requested)
-                        if let (Some(full_key), Some(state)) = (full_key, state) {
-                            if !return_contract_code || contract.is_some() {
-                                tracing::debug!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    peer = %peer_id,
-                                    contract = %full_key,
-                                    phase = "local_found",
-                                    "Contract found locally, returning GET result"
-                                );
+                        // Determine whether to route through network or return local cache.
+                        //
+                        // The key insight: if we're actively subscribed to a contract (is_seeding_contract),
+                        // our local cache is kept fresh via subscription updates. So we can return it.
+                        // If we're NOT subscribed, our cache may be stale and we should fetch from network.
+                        //
+                        // This fixes the stale cache bug (PR #2388) while avoiding the performance
+                        // regression of routing ALL GETs through network.
+                        let connection_count = op_manager.ring.open_connections();
+                        let has_local_state = full_key.is_some() && state.is_some();
+                        let local_satisfies_request =
+                            has_local_state && (!return_contract_code || contract.is_some());
 
-                                // Handle subscription for locally found contracts
-                                if subscribe {
-                                    if let Some(subscription_listener) = subscription_listener {
-                                        register_subscription_listener(
-                                            &op_manager,
-                                            *full_key.id(),
-                                            client_id,
-                                            subscription_listener,
-                                            "local GET",
-                                        )
-                                        .await?;
-                                    } else {
-                                        tracing::warn!(
-                                            client_id = %client_id,
-                                            contract = %full_key,
-                                            "GET with subscribe=true but no subscription_listener"
-                                        );
-                                    }
+                        // Check if we're part of the subscription tree for this contract.
+                        // This includes upstream/downstream network subscriptions AND local clients.
+                        // If we're in the tree, our cache is kept fresh via subscription updates.
+                        let is_subscribed = full_key
+                            .as_ref()
+                            .map(|k| op_manager.ring.is_in_subscription_tree(k))
+                            .unwrap_or(false);
+
+                        // Return local cache if we have valid state AND EITHER:
+                        // 1. No connections (isolated node - can only use local cache), OR
+                        // 2. Actively subscribed (cache is fresh via subscription updates)
+                        if local_satisfies_request && (connection_count == 0 || is_subscribed) {
+                            let full_key = full_key.unwrap();
+                            let state = state.unwrap();
+
+                            tracing::debug!(
+                                client_id = %client_id,
+                                request_id = %request_id,
+                                peer = %peer_id,
+                                contract = %full_key,
+                                is_subscribed,
+                                connection_count,
+                                phase = "local_cache",
+                                "Returning locally cached contract state (subscribed or isolated)"
+                            );
+
+                            // Handle subscription for locally found contracts
+                            if subscribe {
+                                if let Some(subscription_listener) = subscription_listener {
+                                    register_subscription_listener(
+                                        &op_manager,
+                                        *full_key.id(),
+                                        client_id,
+                                        subscription_listener,
+                                        "local GET",
+                                    )
+                                    .await?;
+                                } else {
+                                    tracing::warn!(
+                                        client_id = %client_id,
+                                        contract = %full_key,
+                                        "GET with subscribe=true but no subscription_listener"
+                                    );
                                 }
-
-                                return Ok(Some(Either::Left(QueryResult::GetResult {
-                                    key: full_key,
-                                    state,
-                                    contract,
-                                })));
                             }
+
+                            return Ok(Some(Either::Left(QueryResult::GetResult {
+                                key: full_key,
+                                state,
+                                contract,
+                            })));
                         }
 
-                        // Contract not found locally or missing code, route through network
+                        // Route through network when:
+                        // 1. We don't have local cache, OR
+                        // 2. We have local cache but are NOT subscribed (cache may be stale)
                         if let Some(router) = &request_router {
                             tracing::debug!(
                                 client_id = %client_id,
                                 request_id = %request_id,
                                 peer = %peer_id,
                                 contract = %key,
-                                phase = "not_found_routing",
-                                "Contract not found locally, routing GET request through deduplication layer"
+                                has_local = has_local_state,
+                                is_subscribed,
+                                connection_count,
+                                phase = "network_routing",
+                                "Routing GET request through network (not subscribed or no local cache)"
                             );
 
                             let request = crate::node::DeduplicatedRequest::Get {

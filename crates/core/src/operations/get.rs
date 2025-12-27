@@ -279,8 +279,8 @@ pub(crate) async fn request_get(
 #[allow(clippy::large_enum_variant)]
 enum GetState {
     /// A new petition for a get op received from another peer.
-    /// The requester field stores who sent us this request, so we can send the result back.
-    ReceivedRequest { requester: Option<PeerKeyLocation> },
+    /// Note: We use GetOp::upstream_addr for response routing (not PeerKeyLocation).
+    ReceivedRequest,
     /// Preparing request for get op.
     PrepareRequest {
         instance_id: ContractInstanceId,
@@ -319,7 +319,7 @@ enum GetState {
 impl Display for GetState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GetState::ReceivedRequest { .. } => write!(f, "ReceivedRequest"),
+            GetState::ReceivedRequest => write!(f, "ReceivedRequest"),
             GetState::PrepareRequest {
                 instance_id,
                 id,
@@ -703,17 +703,9 @@ impl Operation for GetOp {
             }
             Ok(None) => {
                 // new request to get a value for a contract, initialize the machine
-                // Look up the requester's PeerKeyLocation from the source address
-                // This replaces the sender field that was previously embedded in messages
-                let requester = source_addr.and_then(|addr| {
-                    op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_location_by_addr(addr)
-                });
                 Ok(OpInitialization {
                     op: Self {
-                        state: Some(GetState::ReceivedRequest { requester }),
+                        state: Some(GetState::ReceivedRequest),
                         id: tx,
                         result: None,
                         stats: None, // don't care about stats in target peers
@@ -838,7 +830,7 @@ impl Operation for GetOp {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
                         debug_assert!(matches!(
                             self.state,
-                            Some(GetState::ReceivedRequest { .. })
+                            Some(GetState::ReceivedRequest)
                                 | Some(GetState::AwaitingResponse { .. })
                         ));
                         tracing::debug!(
@@ -919,10 +911,10 @@ impl Operation for GetOp {
                             );
 
                             // Check if this is a forwarded request or a local request
+                            // Use upstream_addr (the actual socket address) not requester (PeerKeyLocation lookup)
+                            // because get_peer_location_by_addr() can fail for transient connections
                             match &self.state {
-                                Some(GetState::ReceivedRequest { requester })
-                                    if requester.is_some() =>
-                                {
+                                Some(GetState::ReceivedRequest) if self.upstream_addr.is_some() => {
                                     // This is a forwarded request - send result back to upstream
                                     tracing::debug!(tx = %id, "Returning contract {} to upstream", key);
                                     new_state = None;
@@ -938,8 +930,8 @@ impl Operation for GetOp {
                                         },
                                     });
                                 }
-                                Some(GetState::AwaitingResponse { requester, .. })
-                                    if requester.is_some() =>
+                                Some(GetState::AwaitingResponse { .. })
+                                    if self.upstream_addr.is_some() =>
                                 {
                                     // Forward contract to upstream
                                     new_state = None;
@@ -1377,7 +1369,7 @@ impl Operation for GetOp {
                                 }
                             }
                         }
-                        Some(GetState::ReceivedRequest { .. }) => {
+                        Some(GetState::ReceivedRequest) => {
                             // Return NotFound to sender
                             tracing::debug!(tx = %id, %instance_id, "Returning NotFound to {}", sender);
                             new_state = None;
@@ -1476,14 +1468,8 @@ impl Operation for GetOp {
                         }
                     }
 
-                    // Check if this is the original requester
-                    let is_original_requester = matches!(
-                        self.state,
-                        Some(GetState::AwaitingResponse {
-                            requester: None,
-                            ..
-                        })
-                    );
+                    // Check if this is the original requester (no upstream to forward to)
+                    let is_original_requester = self.upstream_addr.is_none();
 
                     // Check if subscription was requested
                     let subscribe_requested =
@@ -1605,70 +1591,55 @@ impl Operation for GetOp {
                         }
                     }
 
-                    // Process based on current state
-                    match self.state {
-                        Some(GetState::AwaitingResponse {
-                            requester: None, ..
-                        }) => {
-                            // Original requester, operation completed successfully
-                            tracing::info!(tx = %id, contract = %key, phase = "complete", "Get response received for contract at original requester");
-                            new_state = Some(GetState::Finished { key });
-                            return_msg = None;
-                            result = Some(GetResult {
-                                key,
-                                state: value.clone(),
-                                contract: contract.clone(),
-                            });
-                        }
-                        Some(GetState::AwaitingResponse {
-                            requester: Some(requester),
-                            ..
-                        }) => {
-                            // Forward response to requester
-                            tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
-                            new_state = None;
-                            return_msg = Some(GetMsg::Response {
-                                id,
-                                instance_id: *key.id(),
-                                result: GetMsgResult::Found {
-                                    key,
-                                    value: StoreResponse {
-                                        state: Some(value.clone()),
-                                        contract: contract.clone(),
-                                    },
-                                },
-                            });
-                            tracing::debug!(tx = %id, %key, target = %requester, "Returning contract to requester");
-                            result = Some(GetResult {
-                                key,
-                                state: value.clone(),
-                                contract: contract.clone(),
-                            });
-                        }
-                        Some(GetState::ReceivedRequest { .. }) => {
-                            // Return response to sender
-                            tracing::info!(tx = %id, contract = %key, peer_addr = %sender, phase = "response", "Returning contract to sender");
-                            new_state = None;
-                            return_msg = Some(GetMsg::Response {
-                                id,
-                                instance_id: *key.id(),
-                                result: GetMsgResult::Found {
-                                    key,
-                                    value: StoreResponse {
-                                        state: Some(value.clone()),
-                                        contract: contract.clone(),
-                                    },
-                                },
-                            });
-                        }
+                    // Process based on whether we're originator or forwarding
+                    // Use upstream_addr for routing decision (not requester which can fail for transient connections)
+                    // First validate we're in an expected state
+                    match &self.state {
+                        Some(GetState::AwaitingResponse { .. })
+                        | Some(GetState::ReceivedRequest) => {}
                         Some(other) => {
+                            // Can't take ownership, so format the state for error reporting
                             return Err(OpError::invalid_transition_with_state(
                                 self.id,
-                                Box::new(other),
-                            ))
+                                Box::new(format!("{}", other)),
+                            ));
                         }
                         None => return Err(OpError::invalid_transition(self.id)),
-                    };
+                    }
+
+                    // Now handle based on upstream_addr
+                    if self.upstream_addr.is_none() {
+                        // Original requester, operation completed successfully
+                        tracing::info!(tx = %id, contract = %key, phase = "complete", "Get response received for contract at original requester");
+                        new_state = Some(GetState::Finished { key });
+                        return_msg = None;
+                        result = Some(GetResult {
+                            key,
+                            state: value.clone(),
+                            contract: contract.clone(),
+                        });
+                    } else {
+                        // Forward response to upstream
+                        tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
+                        new_state = None;
+                        return_msg = Some(GetMsg::Response {
+                            id,
+                            instance_id: *key.id(),
+                            result: GetMsgResult::Found {
+                                key,
+                                value: StoreResponse {
+                                    state: Some(value.clone()),
+                                    contract: contract.clone(),
+                                },
+                            },
+                        });
+                        tracing::debug!(tx = %id, %key, upstream = ?self.upstream_addr, "Returning contract to upstream");
+                        result = Some(GetResult {
+                            key,
+                            state: value.clone(),
+                            contract: contract.clone(),
+                        });
+                    }
                 }
                 // DEFENSIVE HANDLING: Found response with empty state
                 //
@@ -2050,7 +2021,7 @@ mod tests {
 
     #[test]
     fn get_op_not_finalized_when_received_request() {
-        let op = make_get_op(Some(GetState::ReceivedRequest { requester: None }), None);
+        let op = make_get_op(Some(GetState::ReceivedRequest), None);
         assert!(
             !op.finalized(),
             "GetOp should not be finalized in ReceivedRequest state"
@@ -2101,7 +2072,7 @@ mod tests {
 
     #[test]
     fn get_op_to_host_result_error_when_no_result() {
-        let op = make_get_op(Some(GetState::ReceivedRequest { requester: None }), None);
+        let op = make_get_op(Some(GetState::ReceivedRequest), None);
         let result = op.to_host_result();
         assert!(
             result.is_err(),
@@ -2158,7 +2129,7 @@ mod tests {
     // Tests for GetState Display
     #[test]
     fn get_state_display_received_request() {
-        let state = GetState::ReceivedRequest { requester: None };
+        let state = GetState::ReceivedRequest;
         let display = format!("{}", state);
         assert!(
             display.contains("ReceivedRequest"),
