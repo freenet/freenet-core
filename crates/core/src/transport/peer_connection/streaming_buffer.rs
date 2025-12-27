@@ -13,13 +13,15 @@
 //!
 //! # Performance
 //!
-//! Based on spike validation (issue #1452):
+//! Based on spike validation (issue #1452, PR iduartgomez/freenet-core#204):
 //! - Insert throughput: 2,235 MB/s (vs 23 MB/s with RwLock)
 //! - First-fragment latency: 25μs (vs 103μs with RwLock)
+//! - 96× speedup over RwLock-based approach
 
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
+use tokio::sync::Notify;
 
 use crate::transport::packet_data;
 
@@ -32,18 +34,22 @@ pub(crate) const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 /// Uses `OnceLock<Bytes>` slots to enable concurrent, lock-free insertion.
 /// Each fragment can only be written once (write-once semantics), and
 /// concurrent writes to different slots never block each other.
+///
+/// Based on spike implementation from iduartgomez/freenet-core#204.
 pub struct LockFreeStreamBuffer {
     /// Pre-allocated slots for each fragment. Each slot can be written exactly once.
-    slots: Box<[OnceLock<Bytes>]>,
+    /// Fragment indices are 1-indexed, so fragment N is stored at slots[N-1].
+    fragments: Box<[OnceLock<Bytes>]>,
     /// Total expected bytes for the complete stream.
-    total_bytes: u64,
-    /// Number of fragments that have been successfully inserted.
-    /// Used to determine when the stream is complete.
-    inserted_count: AtomicUsize,
-    /// Highest contiguous fragment index from the start.
-    /// Fragment indices are 1-indexed (first fragment is index 1).
-    /// This tracks: "all fragments from 1 to this index are present"
-    highest_contiguous: AtomicU32,
+    total_size: u64,
+    /// Total number of fragments expected.
+    total_fragments: u32,
+    /// Highest contiguous fragment index from the start (0 = none received).
+    /// Uses atomic CAS for lock-free frontier advancement.
+    contiguous_fragments: AtomicU32,
+    /// Notification for when new fragments arrive.
+    /// Allows async consumers to wait efficiently.
+    data_available: Notify,
 }
 
 impl LockFreeStreamBuffer {
@@ -51,33 +57,37 @@ impl LockFreeStreamBuffer {
     ///
     /// # Arguments
     ///
-    /// * `total_bytes` - Total expected bytes in the complete stream
+    /// * `total_size` - Total expected bytes in the complete stream
     ///
     /// # Returns
     ///
     /// A new `LockFreeStreamBuffer` with enough slots to hold all fragments.
-    pub fn new(total_bytes: u64) -> Self {
-        let num_fragments = Self::calculate_fragment_count(total_bytes);
-        let slots: Vec<OnceLock<Bytes>> = (0..num_fragments).map(|_| OnceLock::new()).collect();
+    pub fn new(total_size: u64) -> Self {
+        let num_fragments = Self::calculate_fragment_count(total_size);
+        let fragments: Vec<OnceLock<Bytes>> = (0..num_fragments).map(|_| OnceLock::new()).collect();
 
         Self {
-            slots: slots.into_boxed_slice(),
-            total_bytes,
-            inserted_count: AtomicUsize::new(0),
-            highest_contiguous: AtomicU32::new(0),
+            fragments: fragments.into_boxed_slice(),
+            total_size,
+            total_fragments: num_fragments as u32,
+            contiguous_fragments: AtomicU32::new(0),
+            data_available: Notify::new(),
         }
     }
 
     /// Calculates the number of fragments needed for a given byte count.
-    fn calculate_fragment_count(total_bytes: u64) -> usize {
-        if total_bytes == 0 {
+    fn calculate_fragment_count(total_size: u64) -> usize {
+        if total_size == 0 {
             return 0;
         }
         // Round up division
-        (total_bytes as usize).div_ceil(FRAGMENT_PAYLOAD_SIZE)
+        (total_size as usize).div_ceil(FRAGMENT_PAYLOAD_SIZE)
     }
 
     /// Inserts a fragment into the buffer.
+    ///
+    /// This is the core lock-free operation. Uses `OnceLock::set` which is
+    /// a single atomic CAS - duplicates are idempotent no-ops.
     ///
     /// # Arguments
     ///
@@ -90,113 +100,79 @@ impl LockFreeStreamBuffer {
     /// * `Ok(false)` - Fragment was already present (duplicate, no-op)
     /// * `Err(InsertError)` - Fragment index out of bounds
     pub fn insert(&self, fragment_index: u32, data: Bytes) -> Result<bool, InsertError> {
-        if fragment_index == 0 {
+        if fragment_index == 0 || fragment_index > self.total_fragments {
             return Err(InsertError::InvalidIndex {
                 index: fragment_index,
-                max: self.slots.len() as u32,
+                max: self.total_fragments,
             });
         }
 
-        let slot_index = (fragment_index - 1) as usize;
-        if slot_index >= self.slots.len() {
-            return Err(InsertError::InvalidIndex {
-                index: fragment_index,
-                max: self.slots.len() as u32,
-            });
+        let idx = (fragment_index - 1) as usize;
+
+        // OnceLock::set is lock-free CAS - duplicates are idempotent
+        let was_empty = self.fragments[idx].set(data).is_ok();
+
+        if was_empty {
+            // Advance the contiguous frontier if possible
+            self.advance_frontier();
+            // Notify waiters
+            self.data_available.notify_waiters();
         }
 
-        // Try to set the slot. OnceLock ensures only the first write succeeds.
-        let slot = &self.slots[slot_index];
-        match slot.set(data) {
-            Ok(()) => {
-                // Successfully inserted
-                self.inserted_count.fetch_add(1, Ordering::Release);
-                self.update_highest_contiguous(fragment_index);
-                Ok(true)
-            }
-            Err(_) => {
-                // Slot was already filled (duplicate fragment)
-                Ok(false)
-            }
-        }
+        Ok(was_empty)
     }
 
-    /// Updates the highest contiguous fragment index.
+    /// Advances the contiguous fragment frontier using lock-free CAS.
     ///
-    /// This is called after each successful insert to track progress.
-    fn update_highest_contiguous(&self, inserted_index: u32) {
-        // Only update if this fragment extends the contiguous region
+    /// This is called after each successful insert to track how many
+    /// contiguous fragments are available from the start.
+    fn advance_frontier(&self) {
         loop {
-            let current = self.highest_contiguous.load(Ordering::Acquire);
+            let current = self.contiguous_fragments.load(Ordering::Acquire);
+            let next = current + 1;
 
-            // If this fragment is not the next expected one, don't update
-            if inserted_index != current + 1 {
-                // But we might need to re-check if other fragments filled gaps
-                // Try to extend from current position
-                let mut new_highest = current;
-                for idx in (current + 1)..=self.slots.len() as u32 {
-                    let slot_idx = (idx - 1) as usize;
-                    if self.slots[slot_idx].get().is_some() {
-                        new_highest = idx;
-                    } else {
-                        break;
-                    }
-                }
-
-                if new_highest > current {
-                    // Try to update, but it's okay if another thread beat us
-                    let _ = self.highest_contiguous.compare_exchange(
-                        current,
-                        new_highest,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    );
-                }
-                return;
+            // Check if next fragment exists
+            if next > self.total_fragments {
+                return; // All fragments received
             }
 
-            // This fragment extends the contiguous region
-            // Try to update and continue scanning for more contiguous fragments
-            let mut new_highest = inserted_index;
-            for idx in (inserted_index + 1)..=self.slots.len() as u32 {
-                let slot_idx = (idx - 1) as usize;
-                if self.slots[slot_idx].get().is_some() {
-                    new_highest = idx;
-                } else {
-                    break;
-                }
+            let idx = (next - 1) as usize;
+            if self.fragments[idx].get().is_none() {
+                return; // Gap - can't advance further
             }
 
-            match self.highest_contiguous.compare_exchange(
+            // Try to advance frontier with CAS
+            match self.contiguous_fragments.compare_exchange_weak(
                 current,
-                new_highest,
-                Ordering::Release,
+                next,
+                Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return,
-                Err(_) => continue, // Another thread updated, retry
+                Ok(_) => continue, // Successfully advanced, try to advance more
+                Err(_) => continue, // Another thread advanced, retry from new position
             }
         }
     }
 
     /// Returns true if all fragments have been received.
     pub fn is_complete(&self) -> bool {
-        self.inserted_count.load(Ordering::Acquire) == self.slots.len()
+        self.contiguous_fragments.load(Ordering::Acquire) == self.total_fragments
     }
 
     /// Returns the number of fragments that have been inserted.
     pub fn inserted_count(&self) -> usize {
-        self.inserted_count.load(Ordering::Acquire)
+        // Count non-empty slots
+        self.fragments.iter().filter(|s| s.get().is_some()).count()
     }
 
     /// Returns the total number of expected fragments.
     pub fn total_fragments(&self) -> usize {
-        self.slots.len()
+        self.total_fragments as usize
     }
 
     /// Returns the total expected bytes.
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes
+        self.total_size
     }
 
     /// Returns the highest contiguous fragment index (1-indexed).
@@ -204,7 +180,7 @@ impl LockFreeStreamBuffer {
     /// This indicates that all fragments from 1 to this index are present.
     /// Returns 0 if no fragments are present.
     pub fn highest_contiguous(&self) -> u32 {
-        self.highest_contiguous.load(Ordering::Acquire)
+        self.contiguous_fragments.load(Ordering::Acquire)
     }
 
     /// Gets a reference to a fragment if it has been inserted.
@@ -217,11 +193,18 @@ impl LockFreeStreamBuffer {
     ///
     /// `Some(&Bytes)` if the fragment is present, `None` otherwise.
     pub fn get(&self, fragment_index: u32) -> Option<&Bytes> {
-        if fragment_index == 0 {
+        if fragment_index == 0 || fragment_index > self.total_fragments {
             return None;
         }
-        let slot_index = (fragment_index - 1) as usize;
-        self.slots.get(slot_index)?.get()
+        let idx = (fragment_index - 1) as usize;
+        self.fragments.get(idx)?.get()
+    }
+
+    /// Returns a reference to the notification handle.
+    ///
+    /// Use this to wait for new fragments to arrive.
+    pub fn notifier(&self) -> &Notify {
+        &self.data_available
     }
 
     /// Assembles all fragments into a single contiguous buffer.
@@ -235,14 +218,14 @@ impl LockFreeStreamBuffer {
             return None;
         }
 
-        let mut result = Vec::with_capacity(self.total_bytes as usize);
-        for slot in self.slots.iter() {
+        let mut result = Vec::with_capacity(self.total_size as usize);
+        for slot in self.fragments.iter() {
             let data = slot.get()?;
             result.extend_from_slice(data);
         }
 
-        // Truncate to exact size (last fragment may be padded or we calculated extra)
-        result.truncate(self.total_bytes as usize);
+        // Truncate to exact size (last fragment may be smaller)
+        result.truncate(self.total_size as usize);
         Some(result)
     }
 
@@ -250,14 +233,30 @@ impl LockFreeStreamBuffer {
     ///
     /// Yields `None` for missing fragments and `Some(&Bytes)` for present ones.
     pub fn iter(&self) -> impl Iterator<Item = Option<&Bytes>> {
-        self.slots.iter().map(|slot| slot.get())
+        self.fragments.iter().map(|slot| slot.get())
     }
 
     /// Returns an iterator over contiguous fragments starting from index 1.
     ///
-    /// Stops at the first missing fragment.
-    pub fn contiguous_iter(&self) -> impl Iterator<Item = &Bytes> {
-        self.slots.iter().map_while(|slot| slot.get())
+    /// Stops at the first missing fragment. This is the key method for
+    /// streaming consumption - it yields only fragments that can be
+    /// processed in order.
+    pub fn iter_contiguous(&self) -> impl Iterator<Item = &Bytes> {
+        self.fragments.iter().map_while(|slot| slot.get())
+    }
+
+    /// Collects all contiguous fragments into a single buffer.
+    ///
+    /// Returns bytes that can be processed immediately without waiting
+    /// for out-of-order fragments. Pre-allocates based on total_size
+    /// to avoid reallocations.
+    #[allow(dead_code)]
+    pub fn collect_contiguous(&self) -> Vec<u8> {
+        let mut result = Vec::with_capacity(self.total_size as usize);
+        for data in self.iter_contiguous() {
+            result.extend_from_slice(data);
+        }
+        result
     }
 }
 
@@ -441,7 +440,7 @@ mod tests {
             .insert(4, Bytes::from(vec![4u8; FRAGMENT_PAYLOAD_SIZE]))
             .unwrap();
 
-        let contiguous: Vec<_> = buffer.contiguous_iter().collect();
+        let contiguous: Vec<_> = buffer.iter_contiguous().collect();
         assert_eq!(contiguous.len(), 2); // Only first 2 are contiguous
     }
 
