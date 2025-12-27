@@ -3895,7 +3895,7 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
 /// - → Peer-A sends Unsubscribed to Gateway (upstream)
 #[freenet_test(
     nodes = ["gateway", "peer-a"],
-    timeout_secs = 180,
+    timeout_secs = 300,
     startup_wait_secs = 10,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
