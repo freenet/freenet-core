@@ -85,6 +85,7 @@ opentelemetry-jaeger = { features = ["collector_client", "isahc", "rt-tokio"], o
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-opentelemetry = { optional = true, version = "0.32.0" }
 tracing-subscriber = { optional = true, version = "0.3", features = ["json"] }
+tracing-appender = { optional = true, version = "0.2" }
 opentelemetry-otlp = { optional = true, version = "0.31.0" }
 opentelemetry_sdk = { optional = true, version = "0.31", features = ["rt-tokio"] }
 
@@ -151,7 +152,7 @@ chrono = "0.4"
 [features]
 default = ["redb", "trace", "websocket"]
 sqlite = ["sqlx"]
-trace = ["tracing-subscriber"]
+trace = ["tracing-subscriber", "tracing-appender"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]
 websocket = ["axum/ws"]
 testing = ["freenet-stdlib/testing"]
