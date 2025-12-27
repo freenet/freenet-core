@@ -522,6 +522,7 @@ impl Operation for UpdateOp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_to_broadcast(
     id: Transaction,
     last_hop: bool,

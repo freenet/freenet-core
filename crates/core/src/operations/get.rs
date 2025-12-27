@@ -279,8 +279,12 @@ pub(crate) async fn request_get(
 #[allow(clippy::large_enum_variant)]
 enum GetState {
     /// A new petition for a get op received from another peer.
-    /// The requester field stores who sent us this request, so we can send the result back.
-    ReceivedRequest { requester: Option<PeerKeyLocation> },
+    /// Note: requester field is legacy - we now use GetOp::upstream_addr for routing.
+    /// Kept for backwards compatibility with in-flight operations during upgrades.
+    ReceivedRequest {
+        #[allow(dead_code)]
+        requester: Option<PeerKeyLocation>,
+    },
     /// Preparing request for get op.
     PrepareRequest {
         instance_id: ContractInstanceId,
