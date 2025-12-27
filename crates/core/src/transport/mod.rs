@@ -71,6 +71,12 @@ pub use self::{
     peer_connection::PeerConnection,
 };
 
+// Streaming infrastructure (Phase 1)
+pub use self::peer_connection::{
+    streaming::{StreamError, StreamHandle, StreamRegistry, StreamingInboundStream},
+    streaming_buffer::{InsertError, LockFreeStreamBuffer},
+};
+
 #[derive(Debug, thiserror::Error)]
 #[cfg_attr(feature = "bench", allow(dead_code))]
 pub enum TransportError {
