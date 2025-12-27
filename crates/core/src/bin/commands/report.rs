@@ -4,15 +4,18 @@
 //! then uploads to the Freenet report server for debugging.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 const DEFAULT_REPORT_SERVER: &str = "https://nova.locut.us/api/reports";
+/// Only include log entries from the last 30 minutes
+const LOG_RETENTION_MINUTES: i64 = 30;
 
 #[derive(Args, Debug, Clone)]
 pub struct ReportCommand {
@@ -70,8 +73,16 @@ pub struct VersionInfo {
 pub struct LogContents {
     pub main_log: Option<String>,
     pub error_log: Option<String>,
+    /// Size of the filtered log content included in the report
     pub main_log_size_bytes: u64,
+    /// Size of the filtered error log content included in the report
     pub error_log_size_bytes: u64,
+    /// Original size of the main log file on disk
+    #[serde(default)]
+    pub main_log_original_size_bytes: u64,
+    /// Original size of the error log file on disk
+    #[serde(default)]
+    pub error_log_original_size_bytes: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -152,14 +163,20 @@ impl ReportCommand {
         let main_log_path = log_dir.join("freenet.log");
         let error_log_path = log_dir.join("freenet.error.log");
 
-        let (main_log, main_log_size) = read_log_file(&main_log_path);
-        let (error_log, error_log_size) = read_log_file(&error_log_path);
+        let (main_log, main_log_original_size) = read_log_file(&main_log_path);
+        let (error_log, error_log_original_size) = read_log_file(&error_log_path);
+
+        // Calculate filtered content sizes
+        let main_log_size = main_log.as_ref().map(|s| s.len() as u64).unwrap_or(0);
+        let error_log_size = error_log.as_ref().map(|s| s.len() as u64).unwrap_or(0);
 
         Ok(LogContents {
             main_log,
             error_log,
             main_log_size_bytes: main_log_size,
             error_log_size_bytes: error_log_size,
+            main_log_original_size_bytes: main_log_original_size,
+            error_log_original_size_bytes: error_log_original_size,
         })
     }
 
@@ -246,8 +263,19 @@ impl ReportCommand {
             report.system_info.os, report.system_info.arch
         );
 
-        let total_log_size = report.logs.main_log_size_bytes + report.logs.error_log_size_bytes;
-        println!("  - Logs: {}", format_bytes(total_log_size));
+        let filtered_size = report.logs.main_log_size_bytes + report.logs.error_log_size_bytes;
+        let original_size =
+            report.logs.main_log_original_size_bytes + report.logs.error_log_original_size_bytes;
+        if original_size > filtered_size && filtered_size > 0 {
+            println!(
+                "  - Logs: {} (last {} min, {} total on disk)",
+                format_bytes(filtered_size),
+                LOG_RETENTION_MINUTES,
+                format_bytes(original_size)
+            );
+        } else {
+            println!("  - Logs: {}", format_bytes(original_size));
+        }
 
         println!(
             "  - Config: {}",
@@ -354,17 +382,105 @@ fn get_log_dir() -> Result<PathBuf> {
     }
 }
 
+/// Read log file, filtering to entries from the last 30 minutes.
+/// Returns (filtered_content, original_file_size).
 fn read_log_file(path: &PathBuf) -> (Option<String>, u64) {
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            let size = metadata.len();
-            match fs::read_to_string(path) {
-                Ok(content) => (Some(content), size),
-                Err(_) => (None, size),
+    let metadata = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return (None, 0),
+    };
+    let original_size = metadata.len();
+
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (None, original_size),
+    };
+
+    let cutoff = Utc::now() - Duration::minutes(LOG_RETENTION_MINUTES);
+
+    let reader = BufReader::new(file);
+    let mut filtered_lines = Vec::new();
+    let mut include_line = false;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        // Try to extract timestamp from this line
+        // Log format: optional ANSI codes, then ISO 8601 timestamp like 2025-12-26T17:28:28.636476Z
+        if let Some(ts) = extract_timestamp(&line) {
+            if let Ok(parsed) = DateTime::parse_from_rfc3339(&ts)
+                .map(|dt| dt.with_timezone(&Utc))
+                .or_else(|_| ts.parse::<DateTime<Utc>>())
+            {
+                include_line = parsed >= cutoff;
             }
         }
-        Err(_) => (None, 0),
+
+        // Include this line if we're within the time window
+        // (lines without timestamps inherit the state from the previous timestamped line)
+        if include_line {
+            filtered_lines.push(line);
+        }
     }
+
+    if filtered_lines.is_empty() {
+        (None, original_size)
+    } else {
+        (Some(filtered_lines.join("\n")), original_size)
+    }
+}
+
+/// Extract ISO 8601 timestamp from a log line.
+/// Handles ANSI escape codes that may surround the timestamp.
+fn extract_timestamp(line: &str) -> Option<String> {
+    // Skip any leading ANSI escape sequences
+    let mut chars = line.chars().peekable();
+    while chars.peek() == Some(&'\x1b') {
+        // Skip escape sequence: ESC [ ... m
+        chars.next(); // ESC
+        if chars.next() != Some('[') {
+            break;
+        }
+        for c in chars.by_ref() {
+            if c == 'm' {
+                break;
+            }
+        }
+    }
+
+    // Collect remaining string and look for timestamp pattern
+    let remaining: String = chars.collect();
+
+    // Look for YYYY-MM-DDTHH:MM:SS pattern
+    if remaining.len() < 19 {
+        return None;
+    }
+
+    // Check if it starts with a valid timestamp format
+    let potential = &remaining[..std::cmp::min(30, remaining.len())];
+    if potential.len() >= 19
+        && potential.chars().nth(4) == Some('-')
+        && potential.chars().nth(7) == Some('-')
+        && potential.chars().nth(10) == Some('T')
+        && potential.chars().nth(13) == Some(':')
+        && potential.chars().nth(16) == Some(':')
+    {
+        // Find the end of the timestamp (up to Z or space or ANSI escape)
+        let end = potential.find([' ', '\x1b']).unwrap_or(potential.len());
+        let ts = &potential[..end];
+        // Ensure it ends with Z for RFC3339 compatibility
+        if ts.ends_with('Z') {
+            return Some(ts.to_string());
+        } else {
+            // Add Z if missing (some formats omit it)
+            return Some(format!("{}Z", ts));
+        }
+    }
+
+    None
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -425,6 +541,8 @@ mod tests {
                 error_log: None,
                 main_log_size_bytes: 8,
                 error_log_size_bytes: 0,
+                main_log_original_size_bytes: 100,
+                error_log_original_size_bytes: 0,
             },
             config: None,
             network_status: None,
@@ -434,5 +552,41 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("linux"));
         assert!(json.contains("test log"));
+    }
+
+    #[test]
+    fn test_extract_timestamp_plain() {
+        // Plain timestamp without ANSI codes
+        let line = "2025-12-26T17:28:28.636476Z INFO freenet: Starting";
+        assert_eq!(
+            extract_timestamp(line),
+            Some("2025-12-26T17:28:28.636476Z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_timestamp_with_ansi() {
+        // Timestamp surrounded by ANSI escape codes (as in actual logs)
+        let line = "\x1b[2m2025-12-26T17:28:28.636476Z\x1b[0m \x1b[32m INFO\x1b[0m freenet";
+        assert_eq!(
+            extract_timestamp(line),
+            Some("2025-12-26T17:28:28.636476Z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_timestamp_no_timestamp() {
+        // Line without timestamp
+        let line = "    at crates/core/src/bin/freenet.rs:136";
+        assert_eq!(extract_timestamp(line), None);
+    }
+
+    #[test]
+    fn test_extract_timestamp_adds_z_if_missing() {
+        // Timestamp without trailing Z
+        let line = "2025-12-26T17:28:28.636476 INFO";
+        let result = extract_timestamp(line);
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with('Z'));
     }
 }
