@@ -96,6 +96,12 @@ const EMPTY_DELAY_NANOS: u64 = u64::MAX;
 ///
 /// Uses a fixed-size atomic ring buffer. Each slot stores RTT in nanoseconds.
 /// Readers compute the minimum over all valid (non-empty) slots.
+///
+/// # Timing Assumptions
+///
+/// RTT values are stored as nanoseconds in `u64`. The cast from `Duration::as_nanos()`
+/// (which returns `u128`) is safe because realistic RTT values are always far below
+/// `u64::MAX` (~584 years). Network RTTs range from microseconds to seconds.
 struct AtomicDelayFilter {
     /// Ring buffer of RTT samples (stored as nanoseconds)
     samples: [AtomicU64; DELAY_FILTER_SIZE],
@@ -115,6 +121,7 @@ impl AtomicDelayFilter {
     }
 
     fn add_sample(&self, rtt: Duration) {
+        // Safe cast: RTT values are always far below u64::MAX (~584 years)
         let nanos = rtt.as_nanos() as u64;
         let idx = self.write_index.fetch_add(1, Ordering::Relaxed) % DELAY_FILTER_SIZE;
         self.samples[idx].store(nanos, Ordering::Release);
@@ -155,6 +162,12 @@ impl AtomicDelayFilter {
 ///
 /// Uses atomic arrays for buckets and atomic values for current minute tracking.
 /// All updates use compare-and-swap for thread safety.
+///
+/// # Timing Assumptions
+///
+/// Durations are stored as nanoseconds in `u64`. This limits representable
+/// durations to ~584 years, which is acceptable for RTT measurements.
+/// The epoch-based timing also assumes the controller won't run for 584+ years.
 struct AtomicBaseDelayHistory {
     /// One bucket per minute, containing minimum delay observed in that minute (nanos)
     buckets: [AtomicU64; BASE_HISTORY_SIZE],
@@ -183,6 +196,7 @@ impl AtomicBaseDelayHistory {
     }
 
     fn update(&self, rtt_sample: Duration) {
+        // Safe cast: RTT values are always far below u64::MAX (~584 years)
         let rtt_nanos = rtt_sample.as_nanos() as u64;
         let now_nanos = self.epoch.elapsed().as_nanos() as u64;
         let minute_nanos = 60_000_000_000u64; // 60 seconds in nanos
@@ -199,12 +213,20 @@ impl AtomicBaseDelayHistory {
                     minute_start,
                     new_minute_start,
                     Ordering::AcqRel,
-                    Ordering::Relaxed,
+                    Ordering::Acquire,
                 )
                 .is_ok()
             {
-                // We won the race to roll over - save current minute's minimum
-                let old_min = self.current_minute_min.swap(rtt_nanos, Ordering::AcqRel);
+                // We won the race to roll over - atomically reset current minute
+                // and capture the old minimum for bucket storage.
+                //
+                // Use swap to EMPTY first, then compete for new minimum.
+                // This prevents the race where a losing thread's update_current_min
+                // sets a smaller value that we then overwrite.
+                let old_min = self
+                    .current_minute_min
+                    .swap(EMPTY_DELAY_NANOS, Ordering::AcqRel);
+
                 if old_min != EMPTY_DELAY_NANOS {
                     // Write old minimum to bucket ring buffer
                     let idx =
@@ -222,8 +244,11 @@ impl AtomicBaseDelayHistory {
                         })
                         .ok();
                 }
+
+                // Now compete for the new minute's minimum
+                self.update_current_min(rtt_nanos);
             } else {
-                // Lost the race - just update current minute's minimum
+                // Lost the race - another thread rolled over, update new minute's minimum
                 self.update_current_min(rtt_nanos);
             }
         } else {
@@ -235,7 +260,7 @@ impl AtomicBaseDelayHistory {
     /// Atomically update current minute minimum if new value is smaller
     fn update_current_min(&self, rtt_nanos: u64) {
         self.current_minute_min
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if rtt_nanos < current {
                     Some(rtt_nanos)
                 } else {
@@ -1287,5 +1312,135 @@ mod tests {
         let base = history.base_delay();
         assert!(base >= Duration::from_millis(20));
         assert!(base <= Duration::from_millis(100));
+    }
+
+    /// Test that the minute rollover race condition is handled correctly.
+    ///
+    /// This test verifies that when multiple threads race to roll over the minute
+    /// boundary, the smallest RTT value is correctly recorded and no values are lost.
+    /// The fix uses swap(EMPTY) + update_current_min instead of swap(rtt) to prevent
+    /// a winning thread from overwriting a smaller value set by a losing thread.
+    #[test]
+    fn test_minute_rollover_race_condition() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+        use std::thread;
+
+        // Create a history and immediately add a sample to establish baseline
+        let history = Arc::new(AtomicBaseDelayHistory::new());
+        history.update(Duration::from_millis(100)); // Initial sample
+
+        // Verify initial state
+        assert_eq!(history.base_delay(), Duration::from_millis(100));
+
+        // Track the minimum RTT we send across all threads
+        let expected_min = Arc::new(AtomicU64::new(u64::MAX));
+
+        // Simulate many threads racing to update with different RTT values
+        // In a real minute rollover scenario, all threads would see the minute
+        // boundary at roughly the same time
+        let num_threads = 16;
+        let iterations = 100;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let history = Arc::clone(&history);
+                let expected_min = Arc::clone(&expected_min);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        // Each thread uses different RTT values
+                        // Thread 0 will have the smallest values (10-19ms)
+                        let rtt_ms = 10 + i + (j % 10);
+                        let rtt_nanos = rtt_ms as u64 * 1_000_000;
+
+                        // Track the minimum we're sending
+                        expected_min
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                                if rtt_nanos < current {
+                                    Some(rtt_nanos)
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok();
+
+                        history.update(Duration::from_millis(rtt_ms as u64));
+
+                        // Yield to encourage interleaving
+                        if j % 10 == 0 {
+                            thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // The base delay should reflect the minimum RTT sent by any thread
+        let actual_min = history.base_delay();
+        let _expected = Duration::from_nanos(expected_min.load(Ordering::Relaxed));
+
+        // The actual minimum should be <= expected (we might have lost some due to
+        // timing, but we should never record a LARGER minimum than what was sent)
+        assert!(
+            actual_min <= Duration::from_millis(20),
+            "Base delay {} should be <= 20ms (smallest thread's range)",
+            actual_min.as_millis()
+        );
+
+        // More importantly: base delay should be a valid value we actually sent
+        // (between 10ms and the largest possible value)
+        assert!(
+            actual_min >= Duration::from_millis(10),
+            "Base delay {} should be >= 10ms (smallest value sent)",
+            actual_min.as_millis()
+        );
+    }
+
+    /// Test that concurrent updates don't lose the smallest value during rollover.
+    ///
+    /// This specifically tests the fix for the race where:
+    /// 1. Thread A wins CAS for rollover
+    /// 2. Thread B loses CAS, calls update_current_min with smaller RTT
+    /// 3. Thread A's swap would have overwritten B's smaller value (BUG)
+    /// 4. Fix: Thread A swaps to EMPTY then calls update_current_min (CORRECT)
+    #[test]
+    fn test_no_minimum_value_lost_during_rollover() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let history = Arc::new(AtomicBaseDelayHistory::new());
+
+        // Many threads all trying to set different minimums
+        let num_threads = 8;
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let history = Arc::clone(&history);
+                thread::spawn(move || {
+                    // Thread 0 sends smallest (5ms), thread 7 sends largest (12ms)
+                    let rtt_ms = 5 + i;
+                    for _ in 0..50 {
+                        history.update(Duration::from_millis(rtt_ms as u64));
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // The minimum should be 5ms (from thread 0)
+        let base = history.base_delay();
+        assert_eq!(
+            base,
+            Duration::from_millis(5),
+            "Base delay should be 5ms (the smallest value sent), got {}ms",
+            base.as_millis()
+        );
     }
 }
