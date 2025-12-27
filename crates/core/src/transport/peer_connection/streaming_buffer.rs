@@ -498,4 +498,170 @@ mod tests {
         assert_eq!(success_count, 1);
         assert_eq!(buffer.inserted_count(), 1);
     }
+
+    #[test]
+    fn test_single_byte_stream() {
+        let buffer = LockFreeStreamBuffer::new(1);
+        assert_eq!(buffer.total_fragments(), 1);
+        assert_eq!(buffer.total_bytes(), 1);
+
+        buffer.insert(1, Bytes::from_static(b"X")).unwrap();
+        assert!(buffer.is_complete());
+
+        let assembled = buffer.assemble().unwrap();
+        assert_eq!(assembled, b"X");
+    }
+
+    #[test]
+    fn test_exact_fragment_boundary() {
+        // Total size is exactly 2 fragments
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+        assert_eq!(buffer.total_fragments(), 2);
+
+        buffer
+            .insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        buffer
+            .insert(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        let assembled = buffer.assemble().unwrap();
+        assert_eq!(assembled.len(), total as usize);
+    }
+
+    #[test]
+    fn test_iter_returns_all_fragments() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        // Insert all fragments
+        for i in 1..=3 {
+            buffer
+                .insert(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        let fragments: Vec<_> = buffer.iter().collect();
+        assert_eq!(fragments.len(), 3);
+        assert!(fragments.iter().all(|f| f.is_some()));
+    }
+
+    #[test]
+    fn test_iter_with_gaps() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        // Only insert first and third
+        buffer
+            .insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        buffer
+            .insert(3, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        let fragments: Vec<_> = buffer.iter().collect();
+        assert_eq!(fragments.len(), 3);
+        assert!(fragments[0].is_some());
+        assert!(fragments[1].is_none()); // Gap
+        assert!(fragments[2].is_some());
+    }
+
+    #[test]
+    fn test_get_missing_fragment_returns_none() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        // Insert only first fragment
+        buffer
+            .insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        assert!(buffer.get(1).is_some());
+        assert!(buffer.get(2).is_none()); // Valid index but not inserted
+    }
+
+    #[test]
+    fn test_get_out_of_bounds_returns_none() {
+        let buffer = LockFreeStreamBuffer::new(100);
+
+        assert!(buffer.get(0).is_none()); // Invalid
+        assert!(buffer.get(2).is_none()); // Out of bounds
+        assert!(buffer.get(100).is_none()); // Way out of bounds
+    }
+
+    #[test]
+    fn test_highest_contiguous_advances_after_gap_fill() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 4) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        // Insert fragments 1, 3, 4 (gap at 2)
+        buffer
+            .insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        buffer
+            .insert(3, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        buffer
+            .insert(4, Bytes::from(vec![4u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        assert_eq!(buffer.highest_contiguous(), 1); // Only 1 is contiguous
+
+        // Fill the gap
+        buffer
+            .insert(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        // Now all should be contiguous
+        assert_eq!(buffer.highest_contiguous(), 4);
+        assert!(buffer.is_complete());
+    }
+
+    #[test]
+    fn test_collect_contiguous_with_gap() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        buffer
+            .insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        buffer
+            .insert(3, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        // Gap at fragment 2
+
+        let contiguous = buffer.collect_contiguous();
+        assert_eq!(contiguous.len(), FRAGMENT_PAYLOAD_SIZE);
+        assert!(contiguous.iter().all(|&b| b == 1));
+    }
+
+    #[tokio::test]
+    async fn test_notifier_is_called_on_insert() {
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
+        let buffer = Arc::new(LockFreeStreamBuffer::new(100));
+        let buffer_clone = Arc::clone(&buffer);
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = Arc::clone(&barrier);
+
+        // Spawn a task that waits for notification
+        let waiter = tokio::spawn(async move {
+            barrier_clone.wait().await;
+            buffer_clone.notifier().notified().await;
+            true
+        });
+
+        // Sync with waiter
+        barrier.wait().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Insert should trigger notification
+        buffer.insert(1, Bytes::from_static(b"data")).unwrap();
+
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(100), waiter).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().unwrap());
+    }
 }

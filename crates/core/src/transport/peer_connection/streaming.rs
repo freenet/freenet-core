@@ -214,8 +214,10 @@ impl StreamHandle {
         let mut sync = self.sync.write();
         sync.cancelled = true;
         sync.wake_all();
-        // Buffer's internal Notify wakes async waiters automatically
-        // when they next check is_complete() or get()
+        drop(sync); // Release lock before notifying
+
+        // Wake async waiters blocked on buffer.notifier().notified()
+        self.buffer.notifier().notify_waiters();
     }
 
     /// Assembles the complete data if all fragments are present.
@@ -705,5 +707,315 @@ mod tests {
         // Both streams are exhausted
         assert!(stream1.next().await.is_none());
         assert!(stream2.next().await.is_none());
+    }
+
+    #[test]
+    fn test_zero_byte_stream() {
+        let handle = StreamHandle::new(make_stream_id(), 0);
+
+        assert_eq!(handle.total_bytes(), 0);
+        assert_eq!(handle.total_fragments(), 0);
+        assert!(handle.is_complete()); // Empty stream is complete
+        assert_eq!(handle.try_assemble(), Some(vec![]));
+    }
+
+    #[tokio::test]
+    async fn test_zero_byte_stream_streaming() {
+        let handle = StreamHandle::new(make_stream_id(), 0);
+        let mut stream = handle.stream();
+
+        // Should immediately return None (no fragments)
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_assemble_cancelled_stream() {
+        let handle = StreamHandle::new(make_stream_id(), 100);
+        handle.cancel();
+
+        let result = handle.assemble().await;
+        assert!(matches!(result, Err(StreamError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_during_assemble() {
+        let handle = StreamHandle::new(make_stream_id(), 100);
+        let handle_clone = handle.clone();
+
+        // Start assemble in background
+        let assemble_task = tokio::spawn(async move { handle_clone.assemble().await });
+
+        // Give it time to start waiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Cancel the stream
+        handle.cancel();
+
+        // Assemble should return Cancelled
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(100), assemble_task)
+            .await
+            .expect("timeout")
+            .expect("join");
+        assert!(matches!(result, Err(StreamError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_poll_after_stream_exhausted() {
+        let handle = StreamHandle::new(make_stream_id(), 5);
+        handle
+            .push_fragment(1, Bytes::from_static(b"hello"))
+            .unwrap();
+
+        let mut stream = handle.stream();
+
+        // Read the only fragment
+        let chunk = stream.next().await;
+        assert!(chunk.is_some());
+
+        // Multiple polls after exhaustion should all return None
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_out_of_order_fragments_stream_waits() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        // Push fragment 3 first (out of order)
+        handle
+            .push_fragment(3, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        let mut stream = handle.stream();
+
+        // Create a task that tries to read - should block waiting for fragment 1
+        let handle_clone = handle.clone();
+        let read_task = tokio::spawn(async move {
+            let mut s = handle_clone.stream();
+            s.next().await
+        });
+
+        // Give it time to block
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Task should still be pending
+        assert!(!read_task.is_finished());
+
+        // Now push fragment 1
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        // Read task should complete
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(100), read_task)
+            .await
+            .expect("timeout")
+            .expect("join");
+        assert!(result.is_some());
+        assert!(result.unwrap().is_ok());
+
+        // Now we should be able to read from our stream too
+        let chunk = stream.next().await;
+        assert!(chunk.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_while_streaming() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        // Push first fragment
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        let mut stream = handle.stream();
+
+        // Read first fragment successfully
+        let chunk = stream.next().await;
+        assert!(chunk.is_some());
+        assert!(chunk.unwrap().is_ok());
+
+        // Cancel while waiting for second fragment
+        let handle_clone = handle.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            handle_clone.cancel();
+        });
+
+        // Try to read - should eventually return Cancelled
+        let result = stream.next().await;
+        assert!(matches!(result, Some(Err(StreamError::Cancelled))));
+
+        cancel_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bytes_read_tracking() {
+        let handle = StreamHandle::new(make_stream_id(), 15);
+        handle
+            .push_fragment(1, Bytes::from_static(b"hello world!!!"))
+            .unwrap();
+
+        let mut stream = handle.stream();
+        assert_eq!(stream.bytes_read(), 0);
+
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(stream.bytes_read(), chunk.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_registry_cancel_all() {
+        let registry = StreamRegistry::new();
+
+        let id1 = make_stream_id();
+        let id2 = make_stream_id();
+
+        let handle1 = registry.register(id1, 100).await;
+        let handle2 = registry.register(id2, 200).await;
+
+        // Cancel all
+        registry.cancel_all().await;
+
+        // Both should be cancelled
+        let result1 = handle1.push_fragment(1, Bytes::from_static(b"test"));
+        let result2 = handle2.push_fragment(1, Bytes::from_static(b"test"));
+
+        assert!(matches!(result1, Err(StreamError::Cancelled)));
+        assert!(matches!(result2, Err(StreamError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_take_receiver_twice() {
+        let registry = StreamRegistry::new();
+
+        let rx1 = registry.take_new_stream_receiver().await;
+        let rx2 = registry.take_new_stream_receiver().await;
+
+        assert!(rx1.is_some());
+        assert!(rx2.is_none()); // Second call returns None
+    }
+
+    #[tokio::test]
+    async fn test_registry_get_nonexistent() {
+        let registry = StreamRegistry::new();
+        let id = make_stream_id();
+
+        let result = registry.get(id).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_registry_remove_nonexistent() {
+        let registry = StreamRegistry::new();
+        let id = make_stream_id();
+
+        let result = registry.remove(id).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_push_and_stream() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 10) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+        let fragments_received = Arc::new(AtomicUsize::new(0));
+
+        // Spawn producer
+        let handle_producer = handle.clone();
+        let producer = tokio::spawn(async move {
+            for i in 1..=10 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                handle_producer
+                    .push_fragment(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                    .unwrap();
+            }
+        });
+
+        // Spawn multiple consumers
+        let mut consumers = Vec::new();
+        for _ in 0..3 {
+            let h = handle.clone();
+            let counter = Arc::clone(&fragments_received);
+            consumers.push(tokio::spawn(async move {
+                let mut stream = h.stream();
+                let mut local_count = 0;
+                while let Some(result) = stream.next().await {
+                    result.unwrap();
+                    local_count += 1;
+                }
+                counter.fetch_add(local_count, Ordering::SeqCst);
+                local_count
+            }));
+        }
+
+        producer.await.unwrap();
+
+        // Each consumer should read all 10 fragments
+        for consumer in consumers {
+            let count = consumer.await.unwrap();
+            assert_eq!(count, 10);
+        }
+    }
+
+    #[test]
+    fn test_stream_handle_debug() {
+        let handle = StreamHandle::new(make_stream_id(), 100);
+        handle
+            .push_fragment(1, Bytes::from_static(b"test"))
+            .unwrap();
+
+        let debug_str = format!("{:?}", handle);
+        assert!(debug_str.contains("StreamHandle"));
+        assert!(debug_str.contains("total_bytes"));
+        assert!(debug_str.contains("complete"));
+    }
+
+    #[tokio::test]
+    async fn test_try_assemble_before_complete() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        // Push only first fragment
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        // try_assemble should return None (incomplete)
+        assert!(handle.try_assemble().is_none());
+
+        // Push second fragment
+        handle
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        // Now try_assemble should work
+        let assembled = handle.try_assemble();
+        assert!(assembled.is_some());
+        assert_eq!(assembled.unwrap().len(), total as usize);
+    }
+
+    #[test]
+    fn test_stream_error_display() {
+        let cancelled = StreamError::Cancelled;
+        assert_eq!(format!("{}", cancelled), "stream was cancelled");
+
+        let not_found = StreamError::NotFound;
+        assert_eq!(format!("{}", not_found), "stream not found in registry");
+
+        let invalid = StreamError::InvalidFragment {
+            message: "test error".into(),
+        };
+        assert_eq!(format!("{}", invalid), "invalid fragment: test error");
     }
 }
