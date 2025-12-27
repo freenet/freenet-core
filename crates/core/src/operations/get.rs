@@ -279,12 +279,8 @@ pub(crate) async fn request_get(
 #[allow(clippy::large_enum_variant)]
 enum GetState {
     /// A new petition for a get op received from another peer.
-    /// Note: requester field is legacy - we now use GetOp::upstream_addr for routing.
-    /// Kept for backwards compatibility with in-flight operations during upgrades.
-    ReceivedRequest {
-        #[allow(dead_code)]
-        requester: Option<PeerKeyLocation>,
-    },
+    /// Note: We use GetOp::upstream_addr for response routing (not PeerKeyLocation).
+    ReceivedRequest,
     /// Preparing request for get op.
     PrepareRequest {
         instance_id: ContractInstanceId,
@@ -707,17 +703,9 @@ impl Operation for GetOp {
             }
             Ok(None) => {
                 // new request to get a value for a contract, initialize the machine
-                // Look up the requester's PeerKeyLocation from the source address
-                // This replaces the sender field that was previously embedded in messages
-                let requester = source_addr.and_then(|addr| {
-                    op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_location_by_addr(addr)
-                });
                 Ok(OpInitialization {
                     op: Self {
-                        state: Some(GetState::ReceivedRequest { requester }),
+                        state: Some(GetState::ReceivedRequest),
                         id: tx,
                         result: None,
                         stats: None, // don't care about stats in target peers
@@ -2035,7 +2023,7 @@ mod tests {
 
     #[test]
     fn get_op_not_finalized_when_received_request() {
-        let op = make_get_op(Some(GetState::ReceivedRequest { requester: None }), None);
+        let op = make_get_op(Some(GetState::ReceivedRequest), None);
         assert!(
             !op.finalized(),
             "GetOp should not be finalized in ReceivedRequest state"
@@ -2086,7 +2074,7 @@ mod tests {
 
     #[test]
     fn get_op_to_host_result_error_when_no_result() {
-        let op = make_get_op(Some(GetState::ReceivedRequest { requester: None }), None);
+        let op = make_get_op(Some(GetState::ReceivedRequest), None);
         let result = op.to_host_result();
         assert!(
             result.is_err(),
@@ -2143,7 +2131,7 @@ mod tests {
     // Tests for GetState Display
     #[test]
     fn get_state_display_received_request() {
-        let state = GetState::ReceivedRequest { requester: None };
+        let state = GetState::ReceivedRequest;
         let display = format!("{}", state);
         assert!(
             display.contains("ReceivedRequest"),
