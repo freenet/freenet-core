@@ -9,7 +9,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashSet},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, OnceLock},
     time::Duration,
 };
 
@@ -34,7 +34,7 @@ use crate::{
 
 use super::{
     network_bridge::EventLoopNotificationsSender, proximity_cache::ProximityCacheManager,
-    NetEventRegister, NodeConfig,
+    NetEventRegister, NodeConfig, RequestRouter,
 };
 
 #[cfg(debug_assertions)]
@@ -222,10 +222,18 @@ pub(crate) struct OpManager {
         Arc<Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>>,
     /// Proximity cache manager for tracking neighbor contract caches
     pub proximity_cache: Arc<ProximityCacheManager>,
+    /// Request router for client request deduplication.
+    /// Set lazily from client_event_handling to clean up stale entries when operations complete.
+    request_router: OnceLock<Arc<RequestRouter>>,
 }
 
 impl Clone for OpManager {
     fn clone(&self) -> Self {
+        // Clone OnceLock by getting its value if set
+        let request_router = OnceLock::new();
+        if let Some(router) = self.request_router.get() {
+            let _ = request_router.set(router.clone());
+        }
         Self {
             ring: self.ring.clone(),
             ops: self.ops.clone(),
@@ -239,6 +247,7 @@ impl Clone for OpManager {
             sub_op_tracker: self.sub_op_tracker.clone(),
             contract_waiters: self.contract_waiters.clone(),
             proximity_cache: self.proximity_cache.clone(),
+            request_router,
         }
     }
 }
@@ -310,7 +319,19 @@ impl OpManager {
             sub_op_tracker,
             contract_waiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
             proximity_cache,
+            request_router: OnceLock::new(),
         })
+    }
+
+    /// Set the request router for cleaning up stale entries when operations complete.
+    ///
+    /// This is called from client_event_handling after the request_router is created.
+    /// Without this, completed operations leave stale entries in the request router's
+    /// resource_to_transaction map, causing subsequent requests to hang forever.
+    pub fn set_request_router(&self, router: Arc<RequestRouter>) {
+        if self.request_router.set(router).is_err() {
+            tracing::warn!("Request router already set - ignoring duplicate set");
+        }
     }
 
     fn spawn_client_result(&self, tx: Transaction, host_result: HostResult) {
@@ -562,6 +583,11 @@ impl OpManager {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.under_progress.remove(&id);
         self.ops.completed.insert(id);
+
+        // Clean up request router to prevent stale entries from blocking subsequent requests
+        if let Some(router) = self.request_router.get() {
+            router.complete_operation(id);
+        }
 
         if let Some(parent_tx) = self.sub_op_tracker.get_parent(id) {
             self.sub_op_tracker.remove_child_link(parent_tx, id);

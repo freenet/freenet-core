@@ -279,7 +279,11 @@ pub async fn client_event_handling<ClientEv>(
 where
     ClientEv: ClientEventsProxy + Send + 'static,
 {
-    let request_router = Some(std::sync::Arc::new(crate::node::RequestRouter::new()));
+    let request_router = std::sync::Arc::new(crate::node::RequestRouter::new());
+    // Register the router with op_manager so completed operations clean up stale entries.
+    // Without this, subsequent requests for the same resource would hang forever.
+    op_manager.set_request_router(request_router.clone());
+    let request_router = Some(request_router);
     let mut results = FuturesUnordered::new();
     loop {
         tokio::select! {
