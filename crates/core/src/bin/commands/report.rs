@@ -8,14 +8,23 @@ use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use freenet_stdlib::client_api::{
+    ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeQuery, QueryResponse, WebApi,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::time::Duration as StdDuration;
+use tokio_tungstenite::connect_async;
 
 const DEFAULT_REPORT_SERVER: &str = "https://nova.locut.us/api/reports";
 /// Only include log entries from the last 30 minutes
 const LOG_RETENTION_MINUTES: i64 = 30;
+/// Default WebSocket API port
+const DEFAULT_WS_API_PORT: u16 = 7509;
+/// Timeout for WebSocket connection and queries
+const WS_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Args, Debug, Clone)]
 pub struct ReportCommand {
@@ -141,7 +150,7 @@ impl ReportCommand {
 
         let logs = self.collect_logs()?;
         let config = self.collect_config();
-        let network_status = self.collect_network_status();
+        let network_status = self.collect_network_status(&config);
         let user_message = self.get_user_message()?;
 
         let client_timestamp = chrono::Utc::now().to_rfc3339();
@@ -198,13 +207,33 @@ impl ReportCommand {
         None
     }
 
-    fn collect_network_status(&self) -> Option<String> {
+    fn collect_network_status(&self, config_content: &Option<String>) -> Option<String> {
         // Try to query the local node's WebSocket API
         // This is optional - if the node isn't running, we just skip this
-        // For now, we'll leave this as None and implement it when we have
-        // the WebSocket client available
-        // TODO: Query ws://127.0.0.1:50509 for node diagnostics
-        None
+
+        // Parse the WebSocket port from config, or use default
+        let ws_port = config_content
+            .as_ref()
+            .and_then(|c| parse_ws_port_from_config(c))
+            .unwrap_or(DEFAULT_WS_API_PORT);
+
+        // Create a runtime for the async WebSocket query
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(_) => return None,
+        };
+
+        rt.block_on(async {
+            match tokio::time::timeout(
+                StdDuration::from_secs(WS_TIMEOUT_SECS),
+                query_node_diagnostics(ws_port),
+            )
+            .await
+            {
+                Ok(Ok(diagnostics)) => Some(diagnostics),
+                Ok(Err(_)) | Err(_) => None,
+            }
+        })
     }
 
     fn get_user_message(&self) -> Result<Option<String>> {
@@ -483,6 +512,69 @@ fn extract_timestamp(line: &str) -> Option<String> {
     None
 }
 
+/// Parse the WebSocket API port from config TOML content.
+fn parse_ws_port_from_config(config: &str) -> Option<u16> {
+    // Look for [ws_api] section with port
+    // Format: [ws_api]\n...\nws-api-port = 7509
+    // or just: ws-api-port = 7509
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with("ws-api-port") || line.starts_with("ws_api_port") {
+            if let Some(value) = line.split('=').nth(1) {
+                if let Ok(port) = value.trim().parse::<u16>() {
+                    return Some(port);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Query the node for diagnostics via WebSocket API.
+async fn query_node_diagnostics(port: u16) -> Result<String> {
+    let url = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
+
+    let (stream, _) = connect_async(&url)
+        .await
+        .context("Failed to connect to node WebSocket API")?;
+
+    let mut client = WebApi::start(stream);
+
+    // Query for full node diagnostics
+    let config = NodeDiagnosticsConfig {
+        include_node_info: true,
+        include_network_info: true,
+        include_subscriptions: true,
+        contract_keys: vec![],
+        include_system_metrics: true,
+        include_detailed_peer_info: true,
+        include_subscriber_peer_ids: false,
+    };
+
+    client
+        .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+            config,
+        }))
+        .await
+        .context("Failed to send diagnostics query")?;
+
+    let response = client
+        .recv()
+        .await
+        .context("Failed to receive diagnostics response")?;
+
+    // Close connection gracefully
+    let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
+
+    match response {
+        HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+            // Serialize the diagnostics to JSON for the report
+            serde_json::to_string_pretty(&diag).context("Failed to serialize diagnostics")
+        }
+        _ => anyhow::bail!("Unexpected response from node"),
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -588,5 +680,24 @@ mod tests {
         let result = extract_timestamp(line);
         assert!(result.is_some());
         assert!(result.unwrap().ends_with('Z'));
+    }
+
+    #[test]
+    fn test_parse_ws_port_from_config() {
+        // Test with ws-api-port
+        let config = r#"
+mode = "network"
+[ws_api]
+ws-api-port = 8080
+"#;
+        assert_eq!(parse_ws_port_from_config(config), Some(8080));
+
+        // Test with underscore variant
+        let config = "ws_api_port = 9000";
+        assert_eq!(parse_ws_port_from_config(config), Some(9000));
+
+        // Test with no port
+        let config = "mode = \"network\"";
+        assert_eq!(parse_ws_port_from_config(config), None);
     }
 }
