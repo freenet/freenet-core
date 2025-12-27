@@ -16,6 +16,33 @@ use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 
+/// Execute a closure while suppressing stderr output.
+///
+/// This is used to suppress the harmless libunwind warning:
+/// "libunwind: __unw_add_dynamic_fde: bad fde: FDE is really a CIE"
+///
+/// This warning appears because Wasmer's JIT compiler generates unwind information
+/// that libunwind (on some Linux configurations) misinterprets. The warning is purely
+/// cosmetic - the WASM execution works correctly despite the message. We suppress it
+/// to reduce log noise and avoid confusing users.
+///
+/// On non-Unix platforms, stderr suppression is not available via `gag`, so we just
+/// execute the closure directly.
+#[cfg(unix)]
+fn with_suppressed_stderr<T, F: FnOnce() -> T>(f: F) -> T {
+    // Attempt to suppress stderr; if it fails (e.g., stderr already redirected),
+    // just run without suppression
+    match gag::Gag::stderr() {
+        Ok(_gag) => f(),
+        Err(_) => f(),
+    }
+}
+
+#[cfg(not(unix))]
+fn with_suppressed_stderr<T, F: FnOnce() -> T>(f: F) -> T {
+    f()
+}
+
 pub(super) struct RunningInstance {
     pub id: i64,
     pub instance: Instance,
@@ -257,7 +284,9 @@ impl Runtime {
                 })?;
             let module = match contract {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
-                    Module::new(self.wasm_store.as_ref().unwrap(), contract_v1.code().data())?
+                    let store = self.wasm_store.as_ref().unwrap();
+                    let code = contract_v1.code().data();
+                    with_suppressed_stderr(|| Module::new(store, code))?
                 }
                 _ => unimplemented!(),
             };
@@ -283,7 +312,9 @@ impl Runtime {
                 .delegate_store
                 .fetch_delegate(key, params)
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
-            let module = Module::new(self.wasm_store.as_ref().unwrap(), delegate.code().as_ref())?;
+            let store = self.wasm_store.as_ref().unwrap();
+            let code = delegate.code().as_ref();
+            let module = with_suppressed_stderr(|| Module::new(store, code))?;
             self.delegate_modules.insert(key.clone(), module);
             self.delegate_modules.get(key).unwrap()
         }
@@ -320,11 +351,11 @@ impl Runtime {
     }
 
     fn prepare_instance(&mut self, module: &Module) -> RuntimeResult<Instance> {
-        Ok(Instance::new(
-            self.wasm_store.as_mut().unwrap(),
-            module,
-            &self.top_level_imports,
-        )?)
+        let store = self.wasm_store.as_mut().unwrap();
+        let imports = &self.top_level_imports;
+        Ok(with_suppressed_stderr(|| {
+            Instance::new(store, module, imports)
+        })?)
     }
 
     fn instance_store_with_config(config: &RuntimeConfig) -> Store {
