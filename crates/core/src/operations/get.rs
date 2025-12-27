@@ -319,7 +319,7 @@ enum GetState {
 impl Display for GetState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GetState::ReceivedRequest { .. } => write!(f, "ReceivedRequest"),
+            GetState::ReceivedRequest => write!(f, "ReceivedRequest"),
             GetState::PrepareRequest {
                 instance_id,
                 id,
@@ -830,7 +830,7 @@ impl Operation for GetOp {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
                         debug_assert!(matches!(
                             self.state,
-                            Some(GetState::ReceivedRequest { .. })
+                            Some(GetState::ReceivedRequest)
                                 | Some(GetState::AwaitingResponse { .. })
                         ));
                         tracing::debug!(
@@ -914,9 +914,7 @@ impl Operation for GetOp {
                             // Use upstream_addr (the actual socket address) not requester (PeerKeyLocation lookup)
                             // because get_peer_location_by_addr() can fail for transient connections
                             match &self.state {
-                                Some(GetState::ReceivedRequest { .. })
-                                    if self.upstream_addr.is_some() =>
-                                {
+                                Some(GetState::ReceivedRequest) if self.upstream_addr.is_some() => {
                                     // This is a forwarded request - send result back to upstream
                                     tracing::debug!(tx = %id, "Returning contract {} to upstream", key);
                                     new_state = None;
@@ -1371,7 +1369,7 @@ impl Operation for GetOp {
                                 }
                             }
                         }
-                        Some(GetState::ReceivedRequest { .. }) => {
+                        Some(GetState::ReceivedRequest) => {
                             // Return NotFound to sender
                             tracing::debug!(tx = %id, %instance_id, "Returning NotFound to {}", sender);
                             new_state = None;
@@ -1598,7 +1596,7 @@ impl Operation for GetOp {
                     // First validate we're in an expected state
                     match &self.state {
                         Some(GetState::AwaitingResponse { .. })
-                        | Some(GetState::ReceivedRequest { .. }) => {}
+                        | Some(GetState::ReceivedRequest) => {}
                         Some(other) => {
                             // Can't take ownership, so format the state for error reporting
                             return Err(OpError::invalid_transition_with_state(
