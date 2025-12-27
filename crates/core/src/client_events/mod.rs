@@ -1117,16 +1117,28 @@ async fn process_open_request(
                         };
 
                         // Determine whether to route through network or return local cache.
-                        // When connected to peers, prefer network routing to get fresh data.
-                        // When isolated (no peers), return local cache if available.
+                        //
+                        // The key insight: if we're actively subscribed to a contract (is_seeding_contract),
+                        // our local cache is kept fresh via subscription updates. So we can return it.
+                        // If we're NOT subscribed, our cache may be stale and we should fetch from network.
+                        //
+                        // This fixes the stale cache bug (PR #2388) while avoiding the performance
+                        // regression of routing ALL GETs through network.
                         let connection_count = op_manager.ring.open_connections();
                         let has_local_state = full_key.is_some() && state.is_some();
                         let local_satisfies_request =
                             has_local_state && (!return_contract_code || contract.is_some());
 
-                        // Only return local cache when we have no connected peers.
-                        // When connected, route through network to ensure fresh data.
-                        if local_satisfies_request && connection_count == 0 {
+                        // Check if we're actively subscribed to this contract (cache is kept fresh)
+                        let is_subscribed = full_key
+                            .as_ref()
+                            .map(|k| op_manager.ring.is_seeding_contract(k))
+                            .unwrap_or(false);
+
+                        // Return local cache if we have valid state AND EITHER:
+                        // 1. No connections (isolated node - can only use local cache), OR
+                        // 2. Actively subscribed (cache is fresh via subscription updates)
+                        if local_satisfies_request && (connection_count == 0 || is_subscribed) {
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
 
@@ -1135,8 +1147,10 @@ async fn process_open_request(
                                 request_id = %request_id,
                                 peer = %peer_id,
                                 contract = %full_key,
-                                phase = "local_isolated",
-                                "Returning locally cached contract state (no connected peers)"
+                                is_subscribed,
+                                connection_count,
+                                phase = "local_cache",
+                                "Returning locally cached contract state (subscribed or isolated)"
                             );
 
                             // Handle subscription for locally found contracts
@@ -1166,8 +1180,9 @@ async fn process_open_request(
                             })));
                         }
 
-                        // Route through network when connected to peers (even if we have local cache)
-                        // This ensures we get fresh data rather than potentially stale cache.
+                        // Route through network when:
+                        // 1. We don't have local cache, OR
+                        // 2. We have local cache but are NOT subscribed (cache may be stale)
                         if let Some(router) = &request_router {
                             tracing::debug!(
                                 client_id = %client_id,
@@ -1175,9 +1190,10 @@ async fn process_open_request(
                                 peer = %peer_id,
                                 contract = %key,
                                 has_local = has_local_state,
+                                is_subscribed,
                                 connection_count,
                                 phase = "network_routing",
-                                "Routing GET request through network for fresh data"
+                                "Routing GET request through network (not subscribed or no local cache)"
                             );
 
                             let request = crate::node::DeduplicatedRequest::Get {
