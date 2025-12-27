@@ -130,6 +130,25 @@ impl LockFreeStreamBuffer {
     ///
     /// This is called after each successful insert to track how many
     /// contiguous fragments are available from the start.
+    ///
+    /// # CAS Loop Behavior
+    ///
+    /// The loop uses `compare_exchange_weak` for lock-free advancement:
+    /// - On success: the frontier advances and we try to advance more (there may be
+    ///   additional contiguous fragments already inserted out of order)
+    /// - On failure: another thread already advanced, so we reload the new value and retry
+    ///
+    /// ## Contention Analysis
+    ///
+    /// Under high contention (multiple threads inserting fragments that complete gaps),
+    /// multiple threads may compete to advance the frontier. This is bounded:
+    /// - Maximum loop iterations = number of total fragments (each fragment can only be inserted once)
+    /// - Each failed CAS still represents forward progress by some thread
+    /// - The work is split among all threads - no "CAS storms" where threads just spin
+    ///
+    /// This design was chosen over alternatives like `fetch_max` because we need to:
+    /// 1. Check that the next fragment actually exists before advancing
+    /// 2. Advance by exactly 1, not to an arbitrary higher value
     fn advance_frontier(&self) {
         loop {
             let current = self.contiguous_fragments.load(Ordering::Acquire);

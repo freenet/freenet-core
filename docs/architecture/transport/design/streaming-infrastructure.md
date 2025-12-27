@@ -26,7 +26,7 @@ The original `InboundStream` implementation used `RwLock<HashMap>` for fragment 
               ┌─────────────▼─────────────┐
               │     StreamRegistry        │
               │  (stream_id → StreamHandle)│
-              │   [tokio::sync::RwLock]   │
+              │      [DashMap]            │  ← Lock-free concurrent map
               └─────────────┬─────────────┘
                             │
               ┌─────────────▼─────────────┐
@@ -83,7 +83,12 @@ Multiple consumers can create independent streams from the same handle, each mai
 
 #### 4. StreamRegistry
 
-Global registry for transport-to-operations handoff. See `streaming.rs:354-363` for the struct definition.
+Global registry for transport-to-operations handoff. See `streaming.rs:352-368` for the struct definition.
+
+**Key Design Decisions:**
+- Uses `DashMap` for lock-free concurrent access (avoiding global bottleneck)
+- `cancel_all()` also clears the registry to prevent memory leaks
+- `remove()` should be called when streams complete for explicit cleanup
 
 ## Data Flow
 
@@ -153,6 +158,7 @@ The buffer uses `tokio::sync::Notify` for efficient async waiting:
 
 | Component | Synchronization | Access Pattern |
 |-----------|-----------------|----------------|
+| `StreamRegistry.streams` | `DashMap` | Lock-free concurrent access |
 | `fragments` array | `OnceLock` (atomic CAS) | Many writers, many readers |
 | `contiguous_fragments` | `AtomicU32` (CAS loop) | Many writers, many readers |
 | `cancelled` flag | `parking_lot::RwLock` | Rare write, frequent read |

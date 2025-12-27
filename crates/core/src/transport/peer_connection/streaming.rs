@@ -30,12 +30,12 @@
 //! ```
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::Stream;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 
 use super::streaming_buffer::LockFreeStreamBuffer;
 use super::StreamId;
@@ -353,15 +353,19 @@ impl Stream for StreamingInboundStream {
 ///
 /// The registry provides the handoff point between the transport layer
 /// (which receives fragments) and the operations layer (which consumes them).
+///
+/// Uses `DashMap` for lock-free concurrent access, avoiding the global
+/// bottleneck of `tokio::sync::RwLock<HashMap>`.
 pub struct StreamRegistry {
     /// Active streams indexed by stream ID.
-    streams: RwLock<HashMap<StreamId, StreamHandle>>,
+    /// Uses DashMap for lock-free concurrent access.
+    streams: DashMap<StreamId, StreamHandle>,
     /// Channel for notifying about new streams.
     #[allow(dead_code)]
     new_stream_tx: mpsc::Sender<StreamId>,
     /// Receiver for new stream notifications (held by listener).
     #[allow(dead_code)]
-    new_stream_rx: RwLock<Option<mpsc::Receiver<StreamId>>>,
+    new_stream_rx: parking_lot::Mutex<Option<mpsc::Receiver<StreamId>>>,
 }
 
 impl StreamRegistry {
@@ -369,9 +373,9 @@ impl StreamRegistry {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(64);
         Self {
-            streams: RwLock::new(HashMap::new()),
+            streams: DashMap::new(),
             new_stream_tx: tx,
-            new_stream_rx: RwLock::new(Some(rx)),
+            new_stream_rx: parking_lot::Mutex::new(Some(rx)),
         }
     }
 
@@ -381,14 +385,12 @@ impl StreamRegistry {
     ///
     /// If a stream with this ID already exists, returns the existing handle.
     pub(crate) async fn register(&self, stream_id: StreamId, total_bytes: u64) -> StreamHandle {
-        let mut streams = self.streams.write().await;
-
-        if let Some(handle) = streams.get(&stream_id) {
-            return handle.clone();
-        }
-
-        let handle = StreamHandle::new(stream_id, total_bytes);
-        streams.insert(stream_id, handle.clone());
+        // Use entry API to avoid race conditions
+        let handle = self
+            .streams
+            .entry(stream_id)
+            .or_insert_with(|| StreamHandle::new(stream_id, total_bytes))
+            .clone();
 
         // Notify listeners about the new stream (ignore send errors)
         let _ = self.new_stream_tx.send(stream_id).await;
@@ -400,37 +402,42 @@ impl StreamRegistry {
     ///
     /// Returns `None` if the stream doesn't exist.
     #[allow(dead_code)]
-    pub(crate) async fn get(&self, stream_id: StreamId) -> Option<StreamHandle> {
-        self.streams.read().await.get(&stream_id).cloned()
+    pub(crate) fn get(&self, stream_id: StreamId) -> Option<StreamHandle> {
+        self.streams.get(&stream_id).map(|r| r.clone())
     }
 
     /// Removes a stream from the registry.
     ///
-    /// This should be called when a stream is complete or cancelled.
+    /// This should be called when a stream is complete or cancelled
+    /// to prevent memory leaks.
     #[allow(dead_code)]
-    pub(crate) async fn remove(&self, stream_id: StreamId) -> Option<StreamHandle> {
-        self.streams.write().await.remove(&stream_id)
+    pub(crate) fn remove(&self, stream_id: StreamId) -> Option<StreamHandle> {
+        self.streams.remove(&stream_id).map(|(_, h)| h)
     }
 
     /// Takes the new stream receiver for listening to new stream registrations.
     ///
     /// This can only be called once. Subsequent calls return `None`.
     #[allow(dead_code)]
-    pub(crate) async fn take_new_stream_receiver(&self) -> Option<mpsc::Receiver<StreamId>> {
-        self.new_stream_rx.write().await.take()
+    pub(crate) fn take_new_stream_receiver(&self) -> Option<mpsc::Receiver<StreamId>> {
+        self.new_stream_rx.lock().take()
     }
 
     /// Returns the number of active streams.
-    pub async fn stream_count(&self) -> usize {
-        self.streams.read().await.len()
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
     }
 
     /// Cancels all streams and clears the registry.
-    pub async fn cancel_all(&self) {
-        let streams = self.streams.write().await;
-        for handle in streams.values() {
-            handle.cancel();
+    ///
+    /// This prevents memory leaks by removing all entries after cancellation.
+    pub fn cancel_all(&self) {
+        // Cancel all streams first
+        for entry in self.streams.iter() {
+            entry.value().cancel();
         }
+        // Clear the registry to prevent memory leaks
+        self.streams.clear();
     }
 }
 
@@ -583,7 +590,7 @@ mod tests {
         let handle = registry.register(id, 1000).await;
         assert_eq!(handle.stream_id(), id);
 
-        let retrieved = registry.get(id).await;
+        let retrieved = registry.get(id);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().stream_id(), id);
     }
@@ -606,20 +613,20 @@ mod tests {
         let id = make_stream_id();
 
         registry.register(id, 1000).await;
-        assert_eq!(registry.stream_count().await, 1);
+        assert_eq!(registry.stream_count(), 1);
 
-        let removed = registry.remove(id).await;
+        let removed = registry.remove(id);
         assert!(removed.is_some());
-        assert_eq!(registry.stream_count().await, 0);
+        assert_eq!(registry.stream_count(), 0);
 
         // Get should return None after removal
-        assert!(registry.get(id).await.is_none());
+        assert!(registry.get(id).is_none());
     }
 
     #[tokio::test]
     async fn test_stream_registry_new_stream_notifications() {
         let registry = StreamRegistry::new();
-        let mut rx = registry.take_new_stream_receiver().await.unwrap();
+        let mut rx = registry.take_new_stream_receiver().unwrap();
 
         let id1 = make_stream_id();
         let id2 = make_stream_id();
@@ -876,8 +883,8 @@ mod tests {
         let handle1 = registry.register(id1, 100).await;
         let handle2 = registry.register(id2, 200).await;
 
-        // Cancel all
-        registry.cancel_all().await;
+        // Cancel all (now clears the registry too)
+        registry.cancel_all();
 
         // Both should be cancelled
         let result1 = handle1.push_fragment(1, Bytes::from_static(b"test"));
@@ -885,34 +892,37 @@ mod tests {
 
         assert!(matches!(result1, Err(StreamError::Cancelled)));
         assert!(matches!(result2, Err(StreamError::Cancelled)));
+
+        // Registry should be empty (memory leak fix)
+        assert_eq!(registry.stream_count(), 0);
     }
 
-    #[tokio::test]
-    async fn test_take_receiver_twice() {
+    #[test]
+    fn test_take_receiver_twice() {
         let registry = StreamRegistry::new();
 
-        let rx1 = registry.take_new_stream_receiver().await;
-        let rx2 = registry.take_new_stream_receiver().await;
+        let rx1 = registry.take_new_stream_receiver();
+        let rx2 = registry.take_new_stream_receiver();
 
         assert!(rx1.is_some());
         assert!(rx2.is_none()); // Second call returns None
     }
 
-    #[tokio::test]
-    async fn test_registry_get_nonexistent() {
+    #[test]
+    fn test_registry_get_nonexistent() {
         let registry = StreamRegistry::new();
         let id = make_stream_id();
 
-        let result = registry.get(id).await;
+        let result = registry.get(id);
         assert!(result.is_none());
     }
 
-    #[tokio::test]
-    async fn test_registry_remove_nonexistent() {
+    #[test]
+    fn test_registry_remove_nonexistent() {
         let registry = StreamRegistry::new();
         let id = make_stream_id();
 
-        let result = registry.remove(id).await;
+        let result = registry.remove(id);
         assert!(result.is_none());
     }
 
