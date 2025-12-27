@@ -169,11 +169,12 @@ impl ReportCommand {
     fn collect_logs(&self) -> Result<LogContents> {
         let log_dir = get_log_dir()?;
 
-        let main_log_path = log_dir.join("freenet.log");
-        let error_log_path = log_dir.join("freenet.error.log");
+        // Find log files - support both legacy names and rolling log patterns
+        let main_log_files = find_log_files(&log_dir, "freenet");
+        let error_log_files = find_log_files(&log_dir, "freenet.error");
 
-        let (main_log, main_log_original_size) = read_log_file(&main_log_path);
-        let (error_log, error_log_original_size) = read_log_file(&error_log_path);
+        let (main_log, main_log_original_size) = read_and_merge_log_files(&main_log_files);
+        let (error_log, error_log_original_size) = read_and_merge_log_files(&error_log_files);
 
         // Calculate filtered content sizes
         let main_log_size = main_log.as_ref().map(|s| s.len() as u64).unwrap_or(0);
@@ -408,6 +409,74 @@ fn get_log_dir() -> Result<PathBuf> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         anyhow::bail!("Unsupported platform for log collection")
+    }
+}
+
+/// Find log files matching the given prefix.
+/// Supports both legacy format (freenet.log) and rolling format (freenet.YYYY-MM-DD.log).
+/// Returns files sorted by modification time (newest first).
+fn find_log_files(log_dir: &PathBuf, prefix: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    // Check for legacy file first
+    let legacy_path = log_dir.join(format!("{}.log", prefix));
+    if legacy_path.exists() {
+        files.push(legacy_path);
+    }
+
+    // Look for rolling log files (freenet.YYYY-MM-DD.log pattern)
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                // Match pattern: prefix.YYYY-MM-DD.log
+                if name.starts_with(prefix)
+                    && name.ends_with(".log")
+                    && name.len() > prefix.len() + 5
+                {
+                    // Check if it has a date pattern
+                    let middle = &name[prefix.len()..name.len() - 4];
+                    if middle.starts_with('.') && middle.len() == 11 {
+                        // .YYYY-MM-DD
+                        files.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by modification time, newest first
+    files.sort_by(|a, b| {
+        let a_time = fs::metadata(a).and_then(|m| m.modified()).ok();
+        let b_time = fs::metadata(b).and_then(|m| m.modified()).ok();
+        b_time.cmp(&a_time)
+    });
+
+    files
+}
+
+/// Read and merge multiple log files, filtering to the last 30 minutes.
+/// Returns (merged_content, total_original_size).
+fn read_and_merge_log_files(files: &[PathBuf]) -> (Option<String>, u64) {
+    if files.is_empty() {
+        return (None, 0);
+    }
+
+    let mut total_original_size = 0u64;
+    let mut all_lines = Vec::new();
+
+    for file in files {
+        let (content, size) = read_log_file(file);
+        total_original_size += size;
+        if let Some(content) = content {
+            all_lines.push(content);
+        }
+    }
+
+    if all_lines.is_empty() {
+        (None, total_original_size)
+    } else {
+        (Some(all_lines.join("\n")), total_original_size)
     }
 }
 
