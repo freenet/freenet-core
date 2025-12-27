@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use freenet_stdlib::client_api::{HostResponse, NodeDiagnosticsConfig, NodeQuery, QueryResponse};
 use prettytable::{Cell, Row, Table};
 
@@ -6,9 +8,25 @@ use crate::{
     config::BaseConfig,
 };
 
+/// Timeout for waiting for diagnostics responses.
+/// Diagnostics queries may take time if gathering detailed information.
+const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn diagnostics(base_cfg: BaseConfig, contract_keys: Vec<String>) -> anyhow::Result<()> {
     let mut client = start_api_client(base_cfg).await?;
 
+    let result = diagnostics_inner(&mut client, contract_keys).await;
+
+    // Always gracefully close the WebSocket connection, even on timeout/error
+    close_api_client(&mut client).await;
+
+    result
+}
+
+async fn diagnostics_inner(
+    client: &mut freenet_stdlib::client_api::WebApi,
+    contract_keys: Vec<String>,
+) -> anyhow::Result<()> {
     tracing::info!("Querying node diagnostics");
 
     // Parse contract keys
@@ -44,13 +62,21 @@ pub async fn diagnostics(base_cfg: BaseConfig, contract_keys: Vec<String>) -> an
         freenet_stdlib::client_api::ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
             config,
         }),
-        &mut client,
+        client,
     )
     .await?;
 
-    let HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)) =
-        client.recv().await?
-    else {
+    let response = tokio::time::timeout(DIAGNOSTICS_TIMEOUT, client.recv())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timeout waiting for diagnostics response after {} seconds",
+                DIAGNOSTICS_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
+
+    let HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)) = response else {
         anyhow::bail!("Unexpected response from the host");
     };
 
@@ -154,9 +180,6 @@ pub async fn diagnostics(base_cfg: BaseConfig, contract_keys: Vec<String>) -> an
         println!("  Seeding contracts: {}", metrics.seeding_contracts);
         println!();
     }
-
-    // Gracefully close the WebSocket connection
-    close_api_client(&mut client).await;
 
     Ok(())
 }

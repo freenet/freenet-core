@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use freenet::{dev_tool::OperationMode, server::WebApp};
 use freenet_stdlib::prelude::{
@@ -15,6 +15,11 @@ use xz2::read::XzDecoder;
 use crate::config::{BaseConfig, PutConfig, UpdateConfig};
 
 mod v1;
+
+/// Timeout for waiting for server responses.
+/// Contract operations (especially updates with large state) may take time to process
+/// and propagate, so we use a generous timeout.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {
@@ -174,24 +179,27 @@ async fn put_contract(
     tracing::debug!("WebSocket client connected successfully");
     execute_command(request, &mut client).await?;
 
-    // Wait for server response before closing connection
-    let response = client
-        .recv()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
-
-    let result = match response {
-        HostResponse::ContractResponse(ContractResponse::PutResponse { key: response_key }) => {
+    // Wait for server response before closing connection (with timeout)
+    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse {
+            key: response_key,
+        }))) => {
             tracing::info!(%response_key, "Contract published successfully");
             Ok(())
         }
-        HostResponse::ContractResponse(other) => {
+        Ok(Ok(HostResponse::ContractResponse(other))) => {
             Err(anyhow::anyhow!("Unexpected contract response: {:?}", other))
         }
-        other => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+        Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "Timeout waiting for server response after {} seconds. \
+             The operation may have succeeded - check server logs.",
+            RESPONSE_TIMEOUT.as_secs()
+        )),
     };
 
-    // Gracefully close the WebSocket connection
+    // Always gracefully close the WebSocket connection, even on timeout/error
     close_api_client(&mut client).await;
 
     result
@@ -237,21 +245,22 @@ For additional hardening is recommended to use a different cipher and nonce to e
     let mut client = start_api_client(other).await?;
     execute_command(request, &mut client).await?;
 
-    // Wait for server response before closing connection
-    let response = client
-        .recv()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
-
-    let result = match response {
-        HostResponse::DelegateResponse { key, values } => {
+    // Wait for server response before closing connection (with timeout)
+    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+        Ok(Ok(HostResponse::DelegateResponse { key, values })) => {
             tracing::info!(%key, response_count = values.len(), "Delegate registered successfully");
             Ok(())
         }
-        other => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+        Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "Timeout waiting for server response after {} seconds. \
+             The operation may have succeeded - check server logs.",
+            RESPONSE_TIMEOUT.as_secs()
+        )),
     };
 
-    // Gracefully close the WebSocket connection
+    // Always gracefully close the WebSocket connection, even on timeout/error
     close_api_client(&mut client).await;
 
     result
@@ -308,27 +317,28 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     let mut client = start_api_client(other).await?;
     execute_command(request, &mut client).await?;
 
-    // Wait for server response before closing connection
-    let response = client
-        .recv()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to receive response: {e}"))?;
-
-    let result = match response {
-        HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+    // Wait for server response before closing connection (with timeout)
+    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
             key: response_key,
             summary,
-        }) => {
+        }))) => {
             tracing::info!(%response_key, ?summary, "Contract updated successfully");
             Ok(())
         }
-        HostResponse::ContractResponse(other) => {
+        Ok(Ok(HostResponse::ContractResponse(other))) => {
             Err(anyhow::anyhow!("Unexpected contract response: {:?}", other))
         }
-        other => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+        Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "Timeout waiting for server response after {} seconds. \
+             The operation may have succeeded - check server logs.",
+            RESPONSE_TIMEOUT.as_secs()
+        )),
     };
 
-    // Gracefully close the WebSocket connection
+    // Always gracefully close the WebSocket connection, even on timeout/error
     close_api_client(&mut client).await;
 
     result
