@@ -22,6 +22,12 @@ use tracing::{instrument, span, Instrument};
 mod inbound_stream;
 mod outbound_stream;
 pub(crate) mod streaming;
+
+/// Lock-free streaming buffer implementation.
+/// Public when bench feature is enabled for benchmarking.
+#[cfg(feature = "bench")]
+pub mod streaming_buffer;
+#[cfg(not(feature = "bench"))]
 pub(crate) mod streaming_buffer;
 
 use super::{
