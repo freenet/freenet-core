@@ -380,11 +380,7 @@ impl StreamRegistry {
     /// Returns a handle for pushing fragments to the stream.
     ///
     /// If a stream with this ID already exists, returns the existing handle.
-    pub(crate) async fn register(
-        &self,
-        stream_id: StreamId,
-        total_bytes: u64,
-    ) -> StreamHandle {
+    pub(crate) async fn register(&self, stream_id: StreamId, total_bytes: u64) -> StreamHandle {
         let mut streams = self.streams.write().await;
 
         if let Some(handle) = streams.get(&stream_id) {

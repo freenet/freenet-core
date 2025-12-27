@@ -125,8 +125,7 @@ pub fn bench_concurrent_insert(c: &mut Criterion) {
 
                             handles.push(tokio::spawn(async move {
                                 for i in start..end {
-                                    buf.insert((i + 1) as u32, thread_frags[i].clone())
-                                        .unwrap();
+                                    buf.insert((i + 1) as u32, thread_frags[i].clone()).unwrap();
                                 }
                             }));
                         }
@@ -159,7 +158,10 @@ pub fn bench_assemble(c: &mut Criterion) {
         let buffer = LockFreeStreamBuffer::new(size as u64);
         for i in 0..num_fragments {
             buffer
-                .insert((i + 1) as u32, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .insert(
+                    (i + 1) as u32,
+                    Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]),
+                )
                 .unwrap();
         }
 
@@ -188,7 +190,10 @@ pub fn bench_iter_contiguous(c: &mut Criterion) {
         let buffer = LockFreeStreamBuffer::new(size as u64);
         for i in 0..num_fragments {
             buffer
-                .insert((i + 1) as u32, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .insert(
+                    (i + 1) as u32,
+                    Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]),
+                )
                 .unwrap();
         }
 

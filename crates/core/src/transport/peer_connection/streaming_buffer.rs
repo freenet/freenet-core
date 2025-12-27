@@ -152,7 +152,7 @@ impl LockFreeStreamBuffer {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => continue, // Successfully advanced, try to advance more
+                Ok(_) => continue,  // Successfully advanced, try to advance more
                 Err(_) => continue, // Another thread advanced, retry from new position
             }
         }

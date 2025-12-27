@@ -112,4 +112,11 @@ criterion_group!(
 );
 
 // Main entry point - only CI-friendly benchmarks
-criterion_main!(allocation_ci, level0_ci, level1_ci, transport_ci, streaming_buffer_ci, streaming_buffer_concurrent_ci);
+criterion_main!(
+    allocation_ci,
+    level0_ci,
+    level1_ci,
+    transport_ci,
+    streaming_buffer_ci,
+    streaming_buffer_concurrent_ci
+);
