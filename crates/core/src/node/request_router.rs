@@ -340,6 +340,31 @@ impl RequestRouter {
             }
         }
     }
+
+    /// Mark an operation as complete, cleaning up routing state.
+    ///
+    /// This MUST be called when a transaction completes (success or failure) to prevent
+    /// stale entries in `resource_to_transaction` from blocking subsequent requests for
+    /// the same resource.
+    ///
+    /// Without this cleanup, later requests for the same resource would incorrectly
+    /// deduplicate against the completed transaction, causing clients to wait forever
+    /// for a result that will never arrive.
+    pub fn complete_operation(&self, tx: Transaction) {
+        // Find and remove the resource mapping for this transaction
+        // We need to iterate because we don't store the reverse mapping (tx -> resource)
+        self.state
+            .resource_to_transaction
+            .retain(|_resource, stored_tx| *stored_tx != tx);
+
+        // Remove the waiters list for this transaction
+        self.state.transaction_waiters.remove(&tx);
+
+        debug!(
+            transaction = %tx,
+            "Operation completed - cleaned up routing state"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -863,5 +888,101 @@ mod tests {
             related_contracts: related_contracts.clone(),
         };
         assert_ne!(update_1, update_different);
+    }
+
+    /// Regression test: After an operation completes, a new request for the same
+    /// resource should start a fresh operation, not reuse the stale transaction.
+    ///
+    /// This bug caused the River UI to hang indefinitely on technic (2025-12-27):
+    /// 1. First GET for River contract completed successfully at 16:35
+    /// 2. User refreshed the page at 17:00
+    /// 3. Router found stale entry in resource_to_transaction, returned old tx
+    /// 4. Client was registered to wait for already-completed transaction
+    /// 5. Browser hung forever waiting for a result that would never arrive
+    #[tokio::test]
+    async fn test_request_after_completion_starts_new_operation() {
+        let router = RequestRouter::new();
+        let instance_id = create_test_instance_id();
+        let client_id_1 = ClientId::next();
+        let client_id_2 = ClientId::next();
+        let request_id_1 = RequestId::new();
+        let request_id_2 = RequestId::new();
+
+        // First GET request - should create new operation
+        let request_1 = DeduplicatedRequest::Get {
+            key: instance_id,
+            return_contract_code: true,
+            subscribe: false,
+            client_id: client_id_1,
+            request_id: request_id_1,
+        };
+
+        let (tx1, should_start_1) = router.route_request(request_1).await.unwrap();
+        assert!(should_start_1, "First request should start new operation");
+
+        // Simulate operation completing (result delivered to clients)
+        router.complete_operation(tx1);
+
+        // Second GET request for SAME resource after completion
+        // This MUST start a new operation, not reuse the stale transaction
+        let request_2 = DeduplicatedRequest::Get {
+            key: instance_id,
+            return_contract_code: true,
+            subscribe: false,
+            client_id: client_id_2,
+            request_id: request_id_2,
+        };
+
+        let (tx2, should_start_2) = router.route_request(request_2).await.unwrap();
+        assert!(
+            should_start_2,
+            "Request after completion MUST start new operation, not reuse stale tx"
+        );
+        assert_ne!(
+            tx1, tx2,
+            "New operation should have different transaction ID"
+        );
+    }
+
+    /// Test that complete_operation properly cleans up both maps
+    #[tokio::test]
+    async fn test_complete_operation_cleans_up_state() {
+        let router = RequestRouter::new();
+        let instance_id = create_test_instance_id();
+        let client_id = ClientId::next();
+        let request_id = RequestId::new();
+
+        let request = DeduplicatedRequest::Get {
+            key: instance_id,
+            return_contract_code: true,
+            subscribe: false,
+            client_id,
+            request_id,
+        };
+
+        let (tx, _) = router.route_request(request).await.unwrap();
+
+        // Verify state exists before cleanup
+        assert!(
+            !router.state.resource_to_transaction.is_empty(),
+            "resource_to_transaction should have entry"
+        );
+        assert!(
+            !router.state.transaction_waiters.is_empty(),
+            "transaction_waiters should have entry"
+        );
+
+        // Complete the operation
+        router.complete_operation(tx);
+
+        // Verify state is cleaned up
+        assert!(
+            router.state.resource_to_transaction.is_empty(),
+            "resource_to_transaction should be empty after completion"
+        );
+        assert!(
+            router.state.transaction_waiters.is_empty(),
+            "transaction_waiters should be empty after completion"
+        );
     }
 }
