@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use freenet::tracing::tracer::get_log_dir;
 use freenet_stdlib::client_api::{
     ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeQuery, QueryResponse, WebApi,
 };
@@ -167,7 +168,7 @@ impl ReportCommand {
     }
 
     fn collect_logs(&self) -> Result<LogContents> {
-        let log_dir = get_log_dir()?;
+        let log_dir = get_log_dir().context("Unsupported platform for log collection")?;
 
         // Find log files - support both legacy names and rolling log patterns
         let main_log_files = find_log_files(&log_dir, "freenet");
@@ -380,35 +381,6 @@ impl ReportCommand {
         println!("Share this code with the Freenet team on Matrix.");
 
         Ok(())
-    }
-}
-
-fn get_log_dir() -> Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(dirs::home_dir()
-            .context("Failed to get home directory")?
-            .join(".local/state/freenet"))
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        Ok(dirs::home_dir()
-            .context("Failed to get home directory")?
-            .join("Library/Logs/freenet"))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        Ok(dirs::data_local_dir()
-            .context("Failed to get local app data directory")?
-            .join("freenet")
-            .join("logs"))
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        anyhow::bail!("Unsupported platform for log collection")
     }
 }
 

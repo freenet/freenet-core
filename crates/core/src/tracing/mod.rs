@@ -1355,7 +1355,7 @@ enum UpdateEvent {
 }
 
 #[cfg(feature = "trace")]
-pub(crate) mod tracer {
+pub mod tracer {
     use std::io::IsTerminal;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -1370,8 +1370,9 @@ pub(crate) mod tracer {
     /// Guards for non-blocking file appenders - must be kept alive for the lifetime of the program
     static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
 
-    /// Get the log directory for the current platform
-    fn get_log_dir() -> Option<PathBuf> {
+    /// Get the log directory for the current platform.
+    /// Used by both the tracer (for writing logs) and report command (for reading logs).
+    pub fn get_log_dir() -> Option<PathBuf> {
         #[cfg(target_os = "linux")]
         {
             dirs::home_dir().map(|h| h.join(".local/state/freenet"))
@@ -1473,8 +1474,12 @@ pub(crate) mod tracer {
                 let (main_writer, main_guard) = tracing_appender::non_blocking(main_appender);
                 let (error_writer, error_guard) = tracing_appender::non_blocking(error_appender);
 
-                // Store guards to keep writers alive
-                let _ = LOG_GUARDS.set(vec![main_guard, error_guard]);
+                // Store guards to keep writers alive; fail if already initialized
+                if LOG_GUARDS.set(vec![main_guard, error_guard]).is_err() {
+                    return Err(anyhow::anyhow!(
+                        "LOG_GUARDS already initialized; tracer cannot be re-initialized"
+                    ));
+                }
 
                 // Create layers for main and error logs
                 let main_layer = tracing_subscriber::fmt::layer()
