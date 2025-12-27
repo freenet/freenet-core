@@ -203,35 +203,24 @@ impl ReportCommand {
 
         // Interactive prompt
         println!();
-        println!("What issue are you experiencing? (blank line to finish, Enter twice to skip)");
+        println!("What issue are you experiencing? (Enter on empty line to finish, or just Enter to skip)");
         print!("> ");
         io::stdout().flush()?;
 
         let stdin = io::stdin();
         let mut lines = Vec::new();
-        let mut last_was_empty = false;
 
         for line in stdin.lock().lines() {
             let line = line.context("Failed to read input")?;
 
             if line.is_empty() {
-                if last_was_empty || lines.is_empty() {
-                    // Two consecutive empty lines or empty first line = skip
-                    break;
-                }
-                last_was_empty = true;
-                lines.push(line);
-            } else {
-                last_was_empty = false;
-                lines.push(line);
-                print!("> ");
-                io::stdout().flush()?;
+                // Empty line = done
+                break;
             }
-        }
 
-        // Remove trailing empty lines
-        while lines.last().map(|s| s.is_empty()).unwrap_or(false) {
-            lines.pop();
+            lines.push(line);
+            print!("> ");
+            io::stdout().flush()?;
         }
 
         if lines.is_empty() {
