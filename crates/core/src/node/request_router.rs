@@ -255,7 +255,14 @@ struct RequestRoutingState {
     resource_to_transaction: DashMap<RequestResource, Transaction>,
     /// Reverse mapping for O(1) cleanup: transaction -> resource
     transaction_to_resource: DashMap<Transaction, RequestResource>,
-    /// Maps transactions to all clients waiting for the result
+    /// Maps transactions to all clients waiting for the result.
+    ///
+    /// Note: This map is used for tracking which clients are waiting for a transaction,
+    /// but actual result delivery happens through a separate mechanism
+    /// (`waiting_for_transaction_result` in ContractHandlerChannel). This map enables:
+    /// 1. Detecting when a transaction has active waiters (for cleanup decisions)
+    /// 2. Future extensibility for direct result fan-out if needed
+    /// 3. Debugging/monitoring of client request patterns
     transaction_waiters: DashMap<Transaction, Vec<(ClientId, RequestId)>>,
 }
 
@@ -294,11 +301,47 @@ impl RequestRouter {
         use dashmap::mapref::entry::Entry;
 
         match self.state.resource_to_transaction.entry(resource.clone()) {
-            Entry::Occupied(entry) => {
-                // Existing operation found - deduplicate by adding client to waiters
+            Entry::Occupied(mut entry) => {
+                // Existing operation found - deduplicate by adding client to waiters,
+                // but first verify that the transaction is still active.
                 let existing_tx = *entry.get();
 
-                // Add this client to the waiters list.
+                // If the reverse mapping is missing, this transaction has been completed
+                // concurrently. Treat this as if there was no existing operation and
+                // create a new one instead of adding waiters to a completed transaction.
+                if !self
+                    .state
+                    .transaction_to_resource
+                    .contains_key(&existing_tx)
+                {
+                    // The transaction was already completed; start a fresh operation.
+                    let new_tx = self.create_transaction_for_request(&request);
+
+                    // Overwrite the stale resource -> transaction mapping with the new one.
+                    entry.insert(new_tx);
+
+                    // Insert reverse mapping for O(1) cleanup.
+                    self.state
+                        .transaction_to_resource
+                        .insert(new_tx, resource.clone());
+
+                    // Initialize waiters list with this client.
+                    self.state
+                        .transaction_waiters
+                        .insert(new_tx, vec![(client_id, request_id)]);
+
+                    info!(
+                        transaction = %new_tx,
+                        resource = ?resource,
+                        client = %client_id,
+                        request = %request_id,
+                        "Created new operation after detecting completed transaction"
+                    );
+
+                    return Ok((new_tx, true));
+                }
+
+                // Transaction is still active; add this client to the waiters list.
                 // Use entry API here too to handle the race where complete_operation
                 // might have removed this transaction between our check and insert.
                 self.state
@@ -1117,5 +1160,68 @@ mod tests {
         // All 10 clients should be in the waiters list
         let waiters = router.state.transaction_waiters.get(&first_tx).unwrap();
         assert_eq!(waiters.len(), 10, "All 10 clients should be waiting");
+    }
+
+    /// Test the race condition between route_request and complete_operation.
+    ///
+    /// This tests the scenario where:
+    /// 1. A request creates a transaction
+    /// 2. The transaction completes and complete_operation is called
+    /// 3. A new request arrives before resource_to_transaction is fully cleaned up
+    /// 4. The new request should detect the stale entry and create a new operation
+    #[tokio::test]
+    async fn test_route_request_detects_completed_transaction() {
+        let router = RequestRouter::new();
+        let instance_id = create_test_instance_id();
+        let client_id_1 = ClientId::next();
+        let client_id_2 = ClientId::next();
+        let request_id_1 = RequestId::new();
+        let request_id_2 = RequestId::new();
+
+        // First request creates a new operation
+        let request_1 = DeduplicatedRequest::Get {
+            key: instance_id,
+            return_contract_code: true,
+            subscribe: false,
+            client_id: client_id_1,
+            request_id: request_id_1,
+        };
+        let (tx1, should_start_1) = router.route_request(request_1).await.unwrap();
+        assert!(should_start_1);
+
+        // Simulate partial completion: remove only the reverse mapping
+        // This simulates the race where complete_operation started but hasn't
+        // finished cleaning up resource_to_transaction yet
+        router.state.transaction_to_resource.remove(&tx1);
+
+        // Second request should detect that tx1 is no longer valid
+        // and create a new operation instead of waiting for the completed one
+        let request_2 = DeduplicatedRequest::Get {
+            key: instance_id,
+            return_contract_code: true,
+            subscribe: false,
+            client_id: client_id_2,
+            request_id: request_id_2,
+        };
+        let (tx2, should_start_2) = router.route_request(request_2).await.unwrap();
+
+        // Should create a new operation since tx1 was detected as completed
+        assert!(
+            should_start_2,
+            "Should start new operation for completed transaction"
+        );
+        assert_ne!(tx1, tx2, "Should get a different transaction ID");
+
+        // The router should now have the new transaction registered
+        assert!(router.state.transaction_to_resource.contains_key(&tx2));
+        let resource = RequestResource::Get {
+            key: instance_id,
+            return_contract_code: true,
+            subscribe: false,
+        };
+        assert_eq!(
+            *router.state.resource_to_transaction.get(&resource).unwrap(),
+            tx2
+        );
     }
 }

@@ -223,8 +223,17 @@ pub(crate) struct OpManager {
     /// Proximity cache manager for tracking neighbor contract caches
     pub proximity_cache: Arc<ProximityCacheManager>,
     /// Request router for client request deduplication.
-    /// Set lazily from client_event_handling to clean up stale entries when operations complete.
-    /// Wrapped in Arc for sharing with garbage_cleanup_task.
+    ///
+    /// This is initialized lazily from `client_event_handling` because the router is only
+    /// available once the client-side handling layer has been constructed. When set, it is
+    /// used by operations to clean up stale routing entries as they complete or time out.
+    ///
+    /// Operations that start and finish before the router has been initialized will *not*
+    /// clean up any routing state via this router. In practice this is acceptable because
+    /// `client_event_handling` sets the router early in the node startup sequence, before
+    /// regular client operations are expected to run.
+    ///
+    /// Wrapped in Arc for sharing with `garbage_cleanup_task`.
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
 }
 
