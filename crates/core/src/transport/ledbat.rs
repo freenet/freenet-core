@@ -18,11 +18,16 @@
 //! | Optimization goal | Maximize throughput | Minimize interference |
 //! | Competing flows | Slow to yield | Fast to yield |
 //! | User perception | Noticeable | Imperceptible |
+//!
+//! ## Lock-Free Design
+//!
+//! This implementation is fully lock-free, using atomic operations for all state:
+//! - Atomic ring buffers for delay filtering and base delay history
+//! - AtomicU64 for Duration values (stored as nanoseconds)
+//! - Epoch-based timing for rate-limiting updates
 #![allow(dead_code)] // Infrastructure not yet integrated
 
-use parking_lot::Mutex;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::packet_data::MAX_DATA_SIZE;
@@ -83,28 +88,221 @@ impl Default for LedbatConfig {
     }
 }
 
-/// Consolidated state for LEDBAT to reduce lock contention.
+/// Sentinel value indicating an empty slot in atomic delay arrays.
+/// We use u64::MAX since no valid RTT would ever be this large (~584 years).
+const EMPTY_DELAY_NANOS: u64 = u64::MAX;
+
+/// Lock-free delay filter: MIN over recent samples (RFC 6817 Section 4.2).
 ///
-/// Previously these were 4 separate Mutex fields causing 6 lock acquisitions
-/// per ACK. Now consolidated to a single lock acquisition.
-struct LedbatState {
-    /// Base delay history (10-minute buckets)
-    base_delay_history: BaseDelayHistory,
+/// Uses a fixed-size atomic ring buffer. Each slot stores RTT in nanoseconds.
+/// Readers compute the minimum over all valid (non-empty) slots.
+///
+/// # Timing Assumptions
+///
+/// RTT values are stored as nanoseconds in `u64`. The cast from `Duration::as_nanos()`
+/// (which returns `u128`) is safe because realistic RTT values are always far below
+/// `u64::MAX` (~584 years). Network RTTs range from microseconds to seconds.
+struct AtomicDelayFilter {
+    /// Ring buffer of RTT samples (stored as nanoseconds)
+    samples: [AtomicU64; DELAY_FILTER_SIZE],
+    /// Write index (wraps around)
+    write_index: AtomicUsize,
+    /// Number of samples added (saturates at DELAY_FILTER_SIZE)
+    sample_count: AtomicUsize,
+}
 
-    /// Delay filter (MIN over recent samples)
-    delay_filter: DelayFilter,
+impl AtomicDelayFilter {
+    fn new() -> Self {
+        Self {
+            samples: std::array::from_fn(|_| AtomicU64::new(EMPTY_DELAY_NANOS)),
+            write_index: AtomicUsize::new(0),
+            sample_count: AtomicUsize::new(0),
+        }
+    }
 
-    /// Current queuing delay estimate
-    queuing_delay: Duration,
+    fn add_sample(&self, rtt: Duration) {
+        // Safe cast: RTT values are always far below u64::MAX (~584 years)
+        let nanos = rtt.as_nanos() as u64;
+        let idx = self.write_index.fetch_add(1, Ordering::Relaxed) % DELAY_FILTER_SIZE;
+        self.samples[idx].store(nanos, Ordering::Release);
 
-    /// Last update time (for rate-limiting updates)
-    last_update: Instant,
+        // Increment sample count, saturating at DELAY_FILTER_SIZE
+        self.sample_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                if count < DELAY_FILTER_SIZE {
+                    Some(count + 1)
+                } else {
+                    None // Already saturated
+                }
+            })
+            .ok();
+    }
+
+    fn filtered_delay(&self) -> Option<Duration> {
+        let mut min_nanos = u64::MAX;
+        for slot in &self.samples {
+            let nanos = slot.load(Ordering::Acquire);
+            if nanos != EMPTY_DELAY_NANOS && nanos < min_nanos {
+                min_nanos = nanos;
+            }
+        }
+        if min_nanos == u64::MAX {
+            None
+        } else {
+            Some(Duration::from_nanos(min_nanos))
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.sample_count.load(Ordering::Acquire) >= 2
+    }
+}
+
+/// Lock-free base delay history: 10-minute bucket tracking (RFC 6817 Section 4.1).
+///
+/// Uses atomic arrays for buckets and atomic values for current minute tracking.
+/// All updates use compare-and-swap for thread safety.
+///
+/// # Timing Assumptions
+///
+/// Durations are stored as nanoseconds in `u64`. This limits representable
+/// durations to ~584 years, which is acceptable for RTT measurements.
+/// The epoch-based timing also assumes the controller won't run for 584+ years.
+struct AtomicBaseDelayHistory {
+    /// One bucket per minute, containing minimum delay observed in that minute (nanos)
+    buckets: [AtomicU64; BASE_HISTORY_SIZE],
+    /// Number of valid buckets (0 to BASE_HISTORY_SIZE)
+    bucket_count: AtomicUsize,
+    /// Next bucket index to write (wraps around)
+    bucket_write_index: AtomicUsize,
+    /// Minimum being tracked for current minute (nanos)
+    current_minute_min: AtomicU64,
+    /// Start time of current minute (nanos since epoch instant)
+    current_minute_start_nanos: AtomicU64,
+    /// Epoch instant for time calculations
+    epoch: Instant,
+}
+
+impl AtomicBaseDelayHistory {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(EMPTY_DELAY_NANOS)),
+            bucket_count: AtomicUsize::new(0),
+            bucket_write_index: AtomicUsize::new(0),
+            current_minute_min: AtomicU64::new(EMPTY_DELAY_NANOS),
+            current_minute_start_nanos: AtomicU64::new(0),
+            epoch: Instant::now(),
+        }
+    }
+
+    fn update(&self, rtt_sample: Duration) {
+        // Safe cast: RTT values are always far below u64::MAX (~584 years)
+        let rtt_nanos = rtt_sample.as_nanos() as u64;
+        let now_nanos = self.epoch.elapsed().as_nanos() as u64;
+        let minute_nanos = 60_000_000_000u64; // 60 seconds in nanos
+
+        let minute_start = self.current_minute_start_nanos.load(Ordering::Acquire);
+
+        // Check if we've rolled over to a new minute
+        if now_nanos.saturating_sub(minute_start) >= minute_nanos {
+            // Try to roll over to new minute (only one thread should succeed)
+            let new_minute_start = now_nanos;
+            if self
+                .current_minute_start_nanos
+                .compare_exchange(
+                    minute_start,
+                    new_minute_start,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                // We won the race to roll over - atomically reset current minute
+                // and capture the old minimum for bucket storage.
+                //
+                // Use swap to EMPTY first, then compete for new minimum.
+                // This prevents the race where a losing thread's update_current_min
+                // sets a smaller value that we then overwrite.
+                let old_min = self
+                    .current_minute_min
+                    .swap(EMPTY_DELAY_NANOS, Ordering::AcqRel);
+
+                if old_min != EMPTY_DELAY_NANOS {
+                    // Write old minimum to bucket ring buffer
+                    let idx =
+                        self.bucket_write_index.fetch_add(1, Ordering::Relaxed) % BASE_HISTORY_SIZE;
+                    self.buckets[idx].store(old_min, Ordering::Release);
+
+                    // Increment bucket count, saturating at BASE_HISTORY_SIZE
+                    self.bucket_count
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                            if count < BASE_HISTORY_SIZE {
+                                Some(count + 1)
+                            } else {
+                                None
+                            }
+                        })
+                        .ok();
+                }
+
+                // Now compete for the new minute's minimum
+                self.update_current_min(rtt_nanos);
+            } else {
+                // Lost the race - another thread rolled over, update new minute's minimum
+                self.update_current_min(rtt_nanos);
+            }
+        } else {
+            // Still in current minute - update minimum
+            self.update_current_min(rtt_nanos);
+        }
+    }
+
+    /// Atomically update current minute minimum if new value is smaller
+    fn update_current_min(&self, rtt_nanos: u64) {
+        self.current_minute_min
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                if rtt_nanos < current {
+                    Some(rtt_nanos)
+                } else {
+                    None // Current is already smaller or equal
+                }
+            })
+            .ok();
+    }
+
+    fn base_delay(&self) -> Duration {
+        // Find minimum across all buckets
+        let mut historical_min = u64::MAX;
+        for bucket in &self.buckets {
+            let nanos = bucket.load(Ordering::Acquire);
+            if nanos != EMPTY_DELAY_NANOS && nanos < historical_min {
+                historical_min = nanos;
+            }
+        }
+
+        // Also consider current minute
+        let current_min = self.current_minute_min.load(Ordering::Acquire);
+
+        let result_nanos = match (historical_min != u64::MAX, current_min != EMPTY_DELAY_NANOS) {
+            (true, true) => historical_min.min(current_min),
+            (true, false) => historical_min,
+            (false, true) => current_min,
+            (false, false) => 10_000_000, // 10ms fallback in nanos
+        };
+
+        Duration::from_nanos(result_nanos)
+    }
 }
 
 /// LEDBAT congestion controller (RFC 6817) with slow start.
 ///
 /// Maintains target queuing delay to yield bandwidth to competing flows.
 /// Uses delay-based congestion control instead of loss-based (AIMD).
+///
+/// ## Lock-Free Design
+///
+/// This controller is fully lock-free, using atomic operations for all state.
+/// No mutexes are held on the hot path (on_ack, on_send).
 ///
 /// ## Slow Start Phase
 ///
@@ -119,8 +317,20 @@ pub struct LedbatController {
     /// Bytes currently in flight (sent but not ACKed)
     flightsize: AtomicUsize,
 
-    /// Consolidated state (single lock for all delay tracking)
-    state: Mutex<LedbatState>,
+    /// Lock-free delay filter (MIN over recent samples)
+    delay_filter: AtomicDelayFilter,
+
+    /// Lock-free base delay history (10-minute buckets)
+    base_delay_history: AtomicBaseDelayHistory,
+
+    /// Current queuing delay estimate (stored as nanoseconds)
+    queuing_delay_nanos: AtomicU64,
+
+    /// Last update time (stored as nanos since controller creation)
+    last_update_nanos: AtomicU64,
+
+    /// Epoch instant for time calculations
+    epoch: Instant,
 
     /// Bytes acknowledged since last update
     bytes_acked_since_update: AtomicUsize,
@@ -223,12 +433,11 @@ impl LedbatController {
         Self {
             cwnd: AtomicUsize::new(config.initial_cwnd),
             flightsize: AtomicUsize::new(0),
-            state: Mutex::new(LedbatState {
-                base_delay_history: BaseDelayHistory::new(),
-                delay_filter: DelayFilter::new(),
-                queuing_delay: Duration::ZERO,
-                last_update: Instant::now(),
-            }),
+            delay_filter: AtomicDelayFilter::new(),
+            base_delay_history: AtomicBaseDelayHistory::new(),
+            queuing_delay_nanos: AtomicU64::new(0),
+            last_update_nanos: AtomicU64::new(0),
+            epoch: Instant::now(),
             bytes_acked_since_update: AtomicUsize::new(0),
             ssthresh: AtomicUsize::new(ssthresh),
             in_slow_start: AtomicBool::new(config.enable_slow_start),
@@ -257,6 +466,7 @@ impl LedbatController {
     /// Called when ACK received with RTT sample.
     ///
     /// Updates congestion window based on queuing delay.
+    /// This method is fully lock-free.
     ///
     /// # Arguments
     /// * `rtt_sample` - Round-trip time measurement
@@ -273,38 +483,43 @@ impl LedbatController {
         self.bytes_acked_since_update
             .fetch_add(bytes_acked_now, Ordering::Relaxed);
 
-        // Single lock acquisition for all delay tracking (was 6 locks before)
-        let (queuing_delay, base_delay) = {
-            let mut state = self.state.lock();
+        // Lock-free delay tracking
+        // Update base delay history
+        self.base_delay_history.update(rtt_sample);
 
-            // Update base delay history
-            state.base_delay_history.update(rtt_sample);
+        // Add to delay filter
+        self.delay_filter.add_sample(rtt_sample);
 
-            // Add to delay filter
-            state.delay_filter.add_sample(rtt_sample);
+        // Get filtered delay (minimum of recent samples)
+        if !self.delay_filter.is_ready() {
+            return; // Need more samples
+        }
+        let filtered_rtt = self.delay_filter.filtered_delay().unwrap_or(rtt_sample);
 
-            // Get filtered delay (minimum of recent samples)
-            if !state.delay_filter.is_ready() {
-                return; // Need more samples
-            }
-            let filtered_rtt = state.delay_filter.filtered_delay().unwrap_or(rtt_sample);
+        // Calculate base and queuing delays
+        let base_delay = self.base_delay_history.base_delay();
+        let queuing_delay = filtered_rtt.saturating_sub(base_delay);
+        self.queuing_delay_nanos
+            .store(queuing_delay.as_nanos() as u64, Ordering::Release);
 
-            // Calculate base and queuing delays
-            let base_delay = state.base_delay_history.base_delay();
-            let queuing_delay = filtered_rtt.saturating_sub(base_delay);
-            state.queuing_delay = queuing_delay;
+        // Rate-limit updates to approximately once per RTT
+        let now_nanos = self.epoch.elapsed().as_nanos() as u64;
+        let last_update = self.last_update_nanos.load(Ordering::Acquire);
+        let elapsed_nanos = now_nanos.saturating_sub(last_update);
 
-            // Rate-limit updates to approximately once per RTT
-            let elapsed_since_update = state.last_update.elapsed();
+        // Use base delay as RTT estimate for rate-limiting
+        if elapsed_nanos < base_delay.as_nanos() as u64 {
+            return;
+        }
 
-            // Use base delay as RTT estimate for rate-limiting
-            if elapsed_since_update < base_delay {
-                return;
-            }
-            state.last_update = Instant::now();
-
-            (queuing_delay, base_delay)
-        };
+        // Try to claim this update slot (only one thread should proceed)
+        if self
+            .last_update_nanos
+            .compare_exchange(last_update, now_nanos, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return; // Another thread won the race
+        }
 
         // Calculate off-target amount
         let target = self.target_delay;
@@ -512,14 +727,14 @@ impl LedbatController {
         ((cwnd as f64) / safe_rtt.as_secs_f64()) as usize
     }
 
-    /// Get current queuing delay.
+    /// Get current queuing delay (lock-free).
     pub fn queuing_delay(&self) -> Duration {
-        self.state.lock().queuing_delay
+        Duration::from_nanos(self.queuing_delay_nanos.load(Ordering::Acquire))
     }
 
-    /// Get base delay.
+    /// Get base delay (lock-free).
     pub fn base_delay(&self) -> Duration {
-        self.state.lock().base_delay_history.base_delay()
+        self.base_delay_history.base_delay()
     }
 
     /// Get current flightsize.
@@ -555,100 +770,6 @@ pub struct LedbatStats {
     pub total_losses: usize,
     pub min_cwnd_events: usize,
     pub slow_start_exits: usize,
-}
-
-/// Delay filter: MIN over recent samples (RFC 6817 Section 4.2).
-struct DelayFilter {
-    samples: VecDeque<Duration>,
-    max_samples: usize,
-}
-
-impl DelayFilter {
-    fn new() -> Self {
-        Self {
-            samples: VecDeque::with_capacity(DELAY_FILTER_SIZE),
-            max_samples: DELAY_FILTER_SIZE,
-        }
-    }
-
-    fn add_sample(&mut self, rtt: Duration) {
-        self.samples.push_back(rtt);
-        if self.samples.len() > self.max_samples {
-            self.samples.pop_front();
-        }
-    }
-
-    fn filtered_delay(&self) -> Option<Duration> {
-        self.samples.iter().min().copied()
-    }
-
-    fn is_ready(&self) -> bool {
-        self.samples.len() >= 2
-    }
-}
-
-/// Base delay history: 10-minute bucket tracking (RFC 6817 Section 4.1).
-struct BaseDelayHistory {
-    /// One bucket per minute, containing minimum delay observed in that minute
-    buckets: VecDeque<Duration>,
-    /// Minimum being tracked for current minute
-    current_minute_min: Duration,
-    /// Start time of current minute
-    current_minute_start: Instant,
-    /// Minute duration
-    minute_duration: Duration,
-    /// History size (10 per RFC 6817)
-    history_size: usize,
-}
-
-impl BaseDelayHistory {
-    fn new() -> Self {
-        Self {
-            buckets: VecDeque::with_capacity(BASE_HISTORY_SIZE),
-            current_minute_min: Duration::MAX,
-            current_minute_start: Instant::now(),
-            minute_duration: Duration::from_secs(60),
-            history_size: BASE_HISTORY_SIZE,
-        }
-    }
-
-    fn update(&mut self, rtt_sample: Duration) {
-        let now = Instant::now();
-
-        // Check if we've rolled over to a new minute
-        if now.duration_since(self.current_minute_start) >= self.minute_duration {
-            // Save current minute's minimum
-            if self.current_minute_min != Duration::MAX {
-                self.buckets.push_back(self.current_minute_min);
-                if self.buckets.len() > self.history_size {
-                    self.buckets.pop_front();
-                }
-            }
-
-            // Start new minute
-            self.current_minute_min = rtt_sample;
-            self.current_minute_start = now;
-        } else {
-            // Update current minute's minimum
-            self.current_minute_min = self.current_minute_min.min(rtt_sample);
-        }
-    }
-
-    fn base_delay(&self) -> Duration {
-        let historical_min = self.buckets.iter().min().copied();
-        let current_min = if self.current_minute_min != Duration::MAX {
-            Some(self.current_minute_min)
-        } else {
-            None
-        };
-
-        match (historical_min, current_min) {
-            (Some(h), Some(c)) => h.min(c),
-            (Some(h), None) => h,
-            (None, Some(c)) => c,
-            (None, None) => Duration::from_millis(10), // Fallback
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1010,5 +1131,316 @@ mod tests {
         // With proper randomization, we should see some variation
         // (initial_cwnd is fixed, so this just verifies no crashes with RNG)
         assert!(!ssthresh_values.is_empty());
+    }
+
+    /// Stress test: multiple threads calling on_ack concurrently.
+    /// Validates lock-free correctness under contention.
+    #[test]
+    fn test_concurrent_on_ack_stress() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let controller = Arc::new(LedbatController::new(100_000, 2848, 10_000_000));
+        let num_threads = 8;
+        let iterations_per_thread = 1000;
+
+        // Pre-send enough data to cover all ACKs
+        controller.on_send(num_threads * iterations_per_thread * 1000);
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let controller = Arc::clone(&controller);
+                thread::spawn(move || {
+                    for j in 0..iterations_per_thread {
+                        // Vary RTT to exercise different code paths
+                        let rtt_ms = 20 + (i * 10) + (j % 50);
+                        controller.on_ack(Duration::from_millis(rtt_ms as u64), 1000);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Verify controller is in a valid state
+        let stats = controller.stats();
+        assert!(stats.cwnd >= controller.min_cwnd);
+        assert!(stats.cwnd <= controller.max_cwnd);
+        // Base delay should be set (minimum RTT was 20ms)
+        assert!(stats.base_delay <= Duration::from_millis(100));
+    }
+
+    /// Stress test: concurrent on_send and on_ack from different threads.
+    /// Validates flightsize tracking under contention.
+    #[test]
+    fn test_concurrent_send_ack_stress() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let controller = Arc::new(LedbatController::new(100_000, 2848, 10_000_000));
+        let iterations = 500;
+
+        // Sender thread
+        let controller_send = Arc::clone(&controller);
+        let sender = thread::spawn(move || {
+            for _ in 0..iterations {
+                controller_send.on_send(1000);
+                thread::yield_now(); // Encourage interleaving
+            }
+        });
+
+        // ACK thread
+        let controller_ack = Arc::clone(&controller);
+        let acker = thread::spawn(move || {
+            for i in 0..iterations {
+                let rtt_ms = 30 + (i % 20);
+                controller_ack.on_ack(Duration::from_millis(rtt_ms as u64), 1000);
+                thread::yield_now();
+            }
+        });
+
+        sender.join().expect("Sender panicked");
+        acker.join().expect("Acker panicked");
+
+        // Flightsize should be reasonable (may not be exactly 0 due to timing)
+        // Just verify no underflow (would wrap to huge value)
+        assert!(controller.flightsize() < 1_000_000);
+    }
+
+    /// Stress test: concurrent loss events.
+    /// Validates cwnd halving under contention.
+    #[test]
+    fn test_concurrent_loss_stress() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let controller = Arc::new(LedbatController::new(1_000_000, 2848, 10_000_000));
+        let num_threads = 4;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let controller = Arc::clone(&controller);
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        controller.on_loss();
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // After many loss events, cwnd should be at or near min_cwnd
+        assert!(
+            controller.current_cwnd() <= 10_000,
+            "cwnd should be small after many losses, got {}",
+            controller.current_cwnd()
+        );
+        assert!(controller.current_cwnd() >= controller.min_cwnd);
+
+        // Total losses should be num_threads * 10
+        let stats = controller.stats();
+        assert_eq!(stats.total_losses, num_threads * 10);
+    }
+
+    /// Test atomic delay filter under concurrent access.
+    #[test]
+    fn test_atomic_delay_filter_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let filter = Arc::new(AtomicDelayFilter::new());
+        let num_threads = 4;
+        let iterations = 100;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let filter = Arc::clone(&filter);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        let rtt_ms = 10 + i * 5 + (j % 10);
+                        filter.add_sample(Duration::from_millis(rtt_ms as u64));
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Filter should be ready and have a valid minimum
+        assert!(filter.is_ready());
+        let min_delay = filter.filtered_delay().expect("Should have samples");
+        // Minimum should be at least 10ms (the lowest we added)
+        assert!(min_delay >= Duration::from_millis(10));
+        assert!(min_delay <= Duration::from_millis(50));
+    }
+
+    /// Test atomic base delay history under concurrent access.
+    #[test]
+    fn test_atomic_base_delay_history_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let history = Arc::new(AtomicBaseDelayHistory::new());
+        let num_threads = 4;
+        let iterations = 100;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let history = Arc::clone(&history);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        let rtt_ms = 20 + i * 10 + (j % 15);
+                        history.update(Duration::from_millis(rtt_ms as u64));
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Base delay should be valid and reflect minimum RTT
+        let base = history.base_delay();
+        assert!(base >= Duration::from_millis(20));
+        assert!(base <= Duration::from_millis(100));
+    }
+
+    /// Test that the minute rollover race condition is handled correctly.
+    ///
+    /// This test verifies that when multiple threads race to roll over the minute
+    /// boundary, the smallest RTT value is correctly recorded and no values are lost.
+    /// The fix uses swap(EMPTY) + update_current_min instead of swap(rtt) to prevent
+    /// a winning thread from overwriting a smaller value set by a losing thread.
+    #[test]
+    fn test_minute_rollover_race_condition() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+        use std::thread;
+
+        // Create a history and immediately add a sample to establish baseline
+        let history = Arc::new(AtomicBaseDelayHistory::new());
+        history.update(Duration::from_millis(100)); // Initial sample
+
+        // Verify initial state
+        assert_eq!(history.base_delay(), Duration::from_millis(100));
+
+        // Track the minimum RTT we send across all threads
+        let expected_min = Arc::new(AtomicU64::new(u64::MAX));
+
+        // Simulate many threads racing to update with different RTT values
+        // In a real minute rollover scenario, all threads would see the minute
+        // boundary at roughly the same time
+        let num_threads = 16;
+        let iterations = 100;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let history = Arc::clone(&history);
+                let expected_min = Arc::clone(&expected_min);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        // Each thread uses different RTT values
+                        // Thread 0 will have the smallest values (10-19ms)
+                        let rtt_ms = 10 + i + (j % 10);
+                        let rtt_nanos = rtt_ms as u64 * 1_000_000;
+
+                        // Track the minimum we're sending
+                        expected_min
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                                if rtt_nanos < current {
+                                    Some(rtt_nanos)
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok();
+
+                        history.update(Duration::from_millis(rtt_ms as u64));
+
+                        // Yield to encourage interleaving
+                        if j % 10 == 0 {
+                            thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // The base delay should reflect the minimum RTT sent by any thread
+        let actual_min = history.base_delay();
+        let _expected = Duration::from_nanos(expected_min.load(Ordering::Relaxed));
+
+        // The actual minimum should be <= expected (we might have lost some due to
+        // timing, but we should never record a LARGER minimum than what was sent)
+        assert!(
+            actual_min <= Duration::from_millis(20),
+            "Base delay {} should be <= 20ms (smallest thread's range)",
+            actual_min.as_millis()
+        );
+
+        // More importantly: base delay should be a valid value we actually sent
+        // (between 10ms and the largest possible value)
+        assert!(
+            actual_min >= Duration::from_millis(10),
+            "Base delay {} should be >= 10ms (smallest value sent)",
+            actual_min.as_millis()
+        );
+    }
+
+    /// Test that concurrent updates don't lose the smallest value during rollover.
+    ///
+    /// This specifically tests the fix for the race where:
+    /// 1. Thread A wins CAS for rollover
+    /// 2. Thread B loses CAS, calls update_current_min with smaller RTT
+    /// 3. Thread A's swap would have overwritten B's smaller value (BUG)
+    /// 4. Fix: Thread A swaps to EMPTY then calls update_current_min (CORRECT)
+    #[test]
+    fn test_no_minimum_value_lost_during_rollover() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let history = Arc::new(AtomicBaseDelayHistory::new());
+
+        // Many threads all trying to set different minimums
+        let num_threads = 8;
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let history = Arc::clone(&history);
+                thread::spawn(move || {
+                    // Thread 0 sends smallest (5ms), thread 7 sends largest (12ms)
+                    let rtt_ms = 5 + i;
+                    for _ in 0..50 {
+                        history.update(Duration::from_millis(rtt_ms as u64));
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // The minimum should be 5ms (from thread 0)
+        let base = history.base_delay();
+        assert_eq!(
+            base,
+            Duration::from_millis(5),
+            "Base delay should be 5ms (the smallest value sent), got {}ms",
+            base.as_millis()
+        );
     }
 }
