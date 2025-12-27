@@ -97,7 +97,7 @@ impl<S> Drop for SafeWriter<S> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) enum StoreKey {
     ContractKey([u8; INTERNAL_KEY]),
     DelegateKey {
@@ -257,6 +257,7 @@ pub(super) trait StoreFsManagement: Sized {
     ) -> std::io::Result<()> {
         let mut file = BufReader::new(File::open(key_file_path)?);
         let mut key_cursor = 0;
+        let mut corruption_detected = false;
         while let Ok(rec) = process_record(&mut file) {
             if let Some((store_key, value)) = rec {
                 // Try to convert the store key to the expected type.
@@ -274,6 +275,7 @@ pub(super) trait StoreFsManagement: Sized {
                             error = %mismatch,
                             "Skipping corrupt record in index file (key type mismatch)"
                         );
+                        corruption_detected = true;
                         key_cursor = file.stream_position()?;
                         continue;
                     }
@@ -286,6 +288,25 @@ pub(super) trait StoreFsManagement: Sized {
             }
             key_cursor = file.stream_position()?;
         }
+
+        // If corruption was detected, rewrite the file to remove corrupt records.
+        // This ensures the corruption is fixed permanently, not just skipped on each load.
+        if corruption_detected {
+            tracing::info!(
+                path = ?key_file_path,
+                "Rewriting index file to remove corrupt records"
+            );
+            // Drop the file handle before compaction
+            drop(file);
+            if let Err(e) = compact_index_file::<Self>(key_file_path) {
+                tracing::error!(
+                    path = ?key_file_path,
+                    error = %e,
+                    "Failed to rewrite index file after detecting corruption"
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -405,11 +426,22 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
         cleanup_files(&temp_file_path, &lock_file_path);
     })?;
 
-    let mut any_deleted = false; // Track if any deleted records were found
+    let mut any_deleted = false; // Track if any deleted or corrupt records were found
 
     loop {
         match process_record(&mut original_reader) {
             Ok(Some((store_key, value))) => {
+                // Validate the record by attempting to convert to the expected key type.
+                // This filters out corrupt records (e.g., Contract records in Delegate stores).
+                if S::Key::try_from(store_key.clone()).is_err() {
+                    tracing::warn!(
+                        path = ?key_file_path,
+                        "Removing corrupt record during compaction (key type mismatch)"
+                    );
+                    any_deleted = true;
+                    continue;
+                }
+
                 let value = match &value {
                     Either::Left(v) => v.as_slice(),
                     Either::Right(v) => v.as_slice(),
@@ -420,8 +452,8 @@ fn compact_index_file<S: StoreFsManagement>(key_file_path: &Path) -> std::io::Re
                 }
             }
             Ok(None) => {
-                // Skip record
-                any_deleted = true; // A deleted record was found
+                // Skip deleted record
+                any_deleted = true;
             }
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Done
@@ -819,7 +851,8 @@ mod tests {
     }
 
     /// Regression test: Loading a DelegateStore index file that contains Contract records
-    /// (wrong key type) should skip the invalid records instead of panicking.
+    /// (wrong key type) should skip the invalid records instead of panicking,
+    /// AND rewrite the file to permanently remove the corrupt records.
     ///
     /// This scenario occurs when:
     /// 1. A failed compaction leaves trailing zeros in the file
@@ -827,8 +860,10 @@ mod tests {
     /// 3. DelegateStore/SecretsStore tries to load them as DelegateKey
     ///
     /// Before the fix, this caused a panic: "StoreKey should be DelegateKey variant"
+    /// After partial fix (PR #2433), corrupt records were skipped but remained in file.
+    /// This test verifies that corrupt records are permanently removed from the file.
     #[test]
-    fn test_key_type_mismatch_skips_corrupt_records() {
+    fn test_key_type_mismatch_rewrites_file() {
         let temp_dir = get_temp_dir();
         let key_file_path = temp_dir.path().join("delegate_keys");
 
@@ -841,6 +876,11 @@ mod tests {
                 .expect("Failed to insert");
         }
 
+        // Record the file size before corruption
+        let size_before_corruption = std::fs::metadata(&key_file_path)
+            .expect("Failed to get metadata")
+            .len();
+
         // Step 2: Append corrupt data that looks like a Contract record (zeros)
         // This simulates the corruption scenario from failed compaction
         {
@@ -850,13 +890,22 @@ mod tests {
                 .open(&key_file_path)
                 .expect("Failed to open");
             // Write: tombstone=0 (not deleted), key_type=0 (Contract), then garbage
-            // This will be parsed as a Contract record and should be skipped
+            // This will be parsed as a Contract record and should be removed
             let corrupt_record = [0u8; 70]; // tombstone + key_type + 32-byte key + 4-byte len + 32-byte value
             file.write_all(&corrupt_record)
                 .expect("Failed to write corrupt data");
         }
 
-        // Step 3: Load the file - this should NOT panic, but skip the corrupt record
+        // Verify file grew with corrupt data
+        let size_with_corruption = std::fs::metadata(&key_file_path)
+            .expect("Failed to get metadata")
+            .len();
+        assert!(
+            size_with_corruption > size_before_corruption,
+            "File should be larger after adding corrupt data"
+        );
+
+        // Step 3: Load the file - this should skip corrupt record AND rewrite the file
         let mut container = <TestStore2 as StoreFsManagement>::MemContainer::default();
         TestStore2::load_from_file(&key_file_path, &mut container)
             .expect("load_from_file should handle corrupt records gracefully");
@@ -875,6 +924,25 @@ mod tests {
             container.get(&delegate_key).unwrap().value().1,
             expected_value,
             "Value should match"
+        );
+
+        // Step 5: Verify the file was rewritten (corrupt data should be removed)
+        let size_after_rewrite = std::fs::metadata(&key_file_path)
+            .expect("Failed to get metadata")
+            .len();
+        assert_eq!(
+            size_after_rewrite, size_before_corruption,
+            "File should be same size as before corruption (corrupt record should be removed)"
+        );
+
+        // Step 6: Load again to verify no corruption remains
+        let mut container2 = <TestStore2 as StoreFsManagement>::MemContainer::default();
+        TestStore2::load_from_file(&key_file_path, &mut container2)
+            .expect("Second load should succeed");
+        assert_eq!(
+            container2.len(),
+            1,
+            "Second load should still have exactly 1 record"
         );
     }
 }
