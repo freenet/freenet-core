@@ -184,15 +184,57 @@ pub(crate) async fn request_subscribe(
         .ring
         .k_closest_potentially_caching(instance_id, &visited, 3);
 
-    let Some(target) = candidates.first() else {
-        // No remote peers available - if we have contract locally, complete subscription locally.
-        // This handles the case of a standalone node or when we're the only node with the contract.
-        if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
-            tracing::info!(tx = %id, contract = %key, phase = "complete", "Contract available locally and no remote peers, completing subscription locally");
-            return complete_local_subscription(op_manager, *id, key).await;
+    // First try the best candidates from k_closest_potentially_caching.
+    // If that returns empty, fall back to any available connection.
+    // This ensures we join the subscription tree even when the routing algorithm
+    // can't find ideal candidates (e.g., due to timing or location filtering).
+    let target = if let Some(t) = candidates.first() {
+        t.clone()
+    } else {
+        // k_closest_potentially_caching returned empty - try any connected peer as fallback.
+        // The subscription will be forwarded toward the contract location.
+        let connections = op_manager
+            .ring
+            .connection_manager
+            .get_connections_by_location();
+        let fallback_target = connections
+            .values()
+            .flatten()
+            .find(|conn| {
+                conn.location
+                    .socket_addr()
+                    .map(|addr| !visited.probably_visited(addr))
+                    .unwrap_or(false)
+            })
+            .map(|conn| conn.location.clone());
+
+        match fallback_target {
+            Some(target) => {
+                tracing::debug!(
+                    tx = %id,
+                    contract = %instance_id,
+                    target = ?target.socket_addr(),
+                    phase = "fallback_routing",
+                    "Using fallback connection for subscription (k_closest returned empty)"
+                );
+                target
+            }
+            None => {
+                // Truly no connections available - fall back to local completion only if isolated.
+                // This handles the case of a standalone node or when we're the only node with the contract.
+                if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
+                    tracing::info!(
+                        tx = %id,
+                        contract = %key,
+                        phase = "local_complete",
+                        "Contract available locally and no network connections, completing subscription locally"
+                    );
+                    return complete_local_subscription(op_manager, *id, key).await;
+                }
+                tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
+                return Err(RingError::NoCachingPeers(*instance_id).into());
+            }
         }
-        tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
-        return Err(RingError::NoCachingPeers(*instance_id).into());
     };
 
     let target_addr = target

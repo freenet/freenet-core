@@ -919,9 +919,11 @@ impl Operation for GetOp {
                             );
 
                             // Check if this is a forwarded request or a local request
+                            // Use upstream_addr (the actual socket address) not requester (PeerKeyLocation lookup)
+                            // because get_peer_location_by_addr() can fail for transient connections
                             match &self.state {
-                                Some(GetState::ReceivedRequest { requester })
-                                    if requester.is_some() =>
+                                Some(GetState::ReceivedRequest { .. })
+                                    if self.upstream_addr.is_some() =>
                                 {
                                     // This is a forwarded request - send result back to upstream
                                     tracing::debug!(tx = %id, "Returning contract {} to upstream", key);
@@ -938,8 +940,8 @@ impl Operation for GetOp {
                                         },
                                     });
                                 }
-                                Some(GetState::AwaitingResponse { requester, .. })
-                                    if requester.is_some() =>
+                                Some(GetState::AwaitingResponse { .. })
+                                    if self.upstream_addr.is_some() =>
                                 {
                                     // Forward contract to upstream
                                     new_state = None;
@@ -1476,14 +1478,8 @@ impl Operation for GetOp {
                         }
                     }
 
-                    // Check if this is the original requester
-                    let is_original_requester = matches!(
-                        self.state,
-                        Some(GetState::AwaitingResponse {
-                            requester: None,
-                            ..
-                        })
-                    );
+                    // Check if this is the original requester (no upstream to forward to)
+                    let is_original_requester = self.upstream_addr.is_none();
 
                     // Check if subscription was requested
                     let subscribe_requested =
@@ -1605,70 +1601,55 @@ impl Operation for GetOp {
                         }
                     }
 
-                    // Process based on current state
-                    match self.state {
-                        Some(GetState::AwaitingResponse {
-                            requester: None, ..
-                        }) => {
-                            // Original requester, operation completed successfully
-                            tracing::info!(tx = %id, contract = %key, phase = "complete", "Get response received for contract at original requester");
-                            new_state = Some(GetState::Finished { key });
-                            return_msg = None;
-                            result = Some(GetResult {
-                                key,
-                                state: value.clone(),
-                                contract: contract.clone(),
-                            });
-                        }
-                        Some(GetState::AwaitingResponse {
-                            requester: Some(requester),
-                            ..
-                        }) => {
-                            // Forward response to requester
-                            tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
-                            new_state = None;
-                            return_msg = Some(GetMsg::Response {
-                                id,
-                                instance_id: *key.id(),
-                                result: GetMsgResult::Found {
-                                    key,
-                                    value: StoreResponse {
-                                        state: Some(value.clone()),
-                                        contract: contract.clone(),
-                                    },
-                                },
-                            });
-                            tracing::debug!(tx = %id, %key, target = %requester, "Returning contract to requester");
-                            result = Some(GetResult {
-                                key,
-                                state: value.clone(),
-                                contract: contract.clone(),
-                            });
-                        }
-                        Some(GetState::ReceivedRequest { .. }) => {
-                            // Return response to sender
-                            tracing::info!(tx = %id, contract = %key, peer_addr = %sender, phase = "response", "Returning contract to sender");
-                            new_state = None;
-                            return_msg = Some(GetMsg::Response {
-                                id,
-                                instance_id: *key.id(),
-                                result: GetMsgResult::Found {
-                                    key,
-                                    value: StoreResponse {
-                                        state: Some(value.clone()),
-                                        contract: contract.clone(),
-                                    },
-                                },
-                            });
-                        }
+                    // Process based on whether we're originator or forwarding
+                    // Use upstream_addr for routing decision (not requester which can fail for transient connections)
+                    // First validate we're in an expected state
+                    match &self.state {
+                        Some(GetState::AwaitingResponse { .. })
+                        | Some(GetState::ReceivedRequest { .. }) => {}
                         Some(other) => {
+                            // Can't take ownership, so format the state for error reporting
                             return Err(OpError::invalid_transition_with_state(
                                 self.id,
-                                Box::new(other),
-                            ))
+                                Box::new(format!("{}", other)),
+                            ));
                         }
                         None => return Err(OpError::invalid_transition(self.id)),
-                    };
+                    }
+
+                    // Now handle based on upstream_addr
+                    if self.upstream_addr.is_none() {
+                        // Original requester, operation completed successfully
+                        tracing::info!(tx = %id, contract = %key, phase = "complete", "Get response received for contract at original requester");
+                        new_state = Some(GetState::Finished { key });
+                        return_msg = None;
+                        result = Some(GetResult {
+                            key,
+                            state: value.clone(),
+                            contract: contract.clone(),
+                        });
+                    } else {
+                        // Forward response to upstream
+                        tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
+                        new_state = None;
+                        return_msg = Some(GetMsg::Response {
+                            id,
+                            instance_id: *key.id(),
+                            result: GetMsgResult::Found {
+                                key,
+                                value: StoreResponse {
+                                    state: Some(value.clone()),
+                                    contract: contract.clone(),
+                                },
+                            },
+                        });
+                        tracing::debug!(tx = %id, %key, upstream = ?self.upstream_addr, "Returning contract to upstream");
+                        result = Some(GetResult {
+                            key,
+                            state: value.clone(),
+                            contract: contract.clone(),
+                        });
+                    }
                 }
                 // DEFENSIVE HANDLING: Found response with empty state
                 //
