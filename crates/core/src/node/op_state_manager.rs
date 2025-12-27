@@ -9,7 +9,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashSet},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, OnceLock},
     time::Duration,
 };
 
@@ -34,7 +34,7 @@ use crate::{
 
 use super::{
     network_bridge::EventLoopNotificationsSender, proximity_cache::ProximityCacheManager,
-    NetEventRegister, NodeConfig,
+    NetEventRegister, NodeConfig, RequestRouter,
 };
 
 #[cfg(debug_assertions)]
@@ -222,6 +222,19 @@ pub(crate) struct OpManager {
         Arc<Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>>,
     /// Proximity cache manager for tracking neighbor contract caches
     pub proximity_cache: Arc<ProximityCacheManager>,
+    /// Request router for client request deduplication.
+    ///
+    /// This is initialized lazily from `client_event_handling` because the router is only
+    /// available once the client-side handling layer has been constructed. When set, it is
+    /// used by operations to clean up stale routing entries as they complete or time out.
+    ///
+    /// Operations that start and finish before the router has been initialized will *not*
+    /// clean up any routing state via this router. In practice this is acceptable because
+    /// `client_event_handling` sets the router early in the node startup sequence, before
+    /// regular client operations are expected to run.
+    ///
+    /// Wrapped in Arc for sharing with `garbage_cleanup_task`.
+    request_router: Arc<OnceLock<Arc<RequestRouter>>>,
 }
 
 impl Clone for OpManager {
@@ -239,6 +252,7 @@ impl Clone for OpManager {
             sub_op_tracker: self.sub_op_tracker.clone(),
             contract_waiters: self.contract_waiters.clone(),
             proximity_cache: self.proximity_cache.clone(),
+            request_router: self.request_router.clone(),
         }
     }
 }
@@ -270,6 +284,7 @@ impl OpManager {
         };
         let sub_op_tracker = SubOperationTracker::new();
         let connect_forward_estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
+        let request_router = Arc::new(OnceLock::new());
 
         GlobalExecutor::spawn(
             garbage_cleanup_task(
@@ -280,6 +295,7 @@ impl OpManager {
                 event_register,
                 sub_op_tracker.clone(),
                 result_router_tx.clone(),
+                request_router.clone(),
             )
             .instrument(garbage_span),
         );
@@ -310,7 +326,19 @@ impl OpManager {
             sub_op_tracker,
             contract_waiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
             proximity_cache,
+            request_router,
         })
+    }
+
+    /// Set the request router for cleaning up stale entries when operations complete.
+    ///
+    /// This is called from client_event_handling after the request_router is created.
+    /// Without this, completed operations leave stale entries in the request router's
+    /// resource_to_transaction map, causing subsequent requests to hang forever.
+    pub fn set_request_router(&self, router: Arc<RequestRouter>) {
+        if self.request_router.set(router).is_err() {
+            tracing::warn!("Request router already set - ignoring duplicate set");
+        }
     }
 
     fn spawn_client_result(&self, tx: Transaction, host_result: HostResult) {
@@ -563,6 +591,11 @@ impl OpManager {
         self.ops.under_progress.remove(&id);
         self.ops.completed.insert(id);
 
+        // Clean up request router to prevent stale entries from blocking subsequent requests
+        if let Some(router) = self.request_router.get() {
+            router.complete_operation(id);
+        }
+
         if let Some(parent_tx) = self.sub_op_tracker.get_parent(id) {
             self.sub_op_tracker.remove_child_link(parent_tx, id);
             self.sub_op_tracker.mark_sub_op_completed(parent_tx);
@@ -767,6 +800,7 @@ async fn notify_transaction_timeout(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
     ops: Arc<Ops>,
@@ -775,6 +809,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut event_register: ER,
     sub_op_tracker: SubOperationTracker,
     result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
+    request_router: Arc<OnceLock<Arc<RequestRouter>>>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
@@ -838,6 +873,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         notify_transaction_timeout(&event_loop_notifier, tx).await;
                         live_tx_tracker.remove_finished_transaction(tx);
+
+                        // Clean up request router to prevent stale entries from blocking
+                        // subsequent requests for the same resource after timeout
+                        if let Some(router) = request_router.get() {
+                            router.complete_operation(tx);
+                        }
                     }
                 }
 
@@ -889,6 +930,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         notify_transaction_timeout(&event_loop_notifier, tx).await;
                         live_tx_tracker.remove_finished_transaction(tx);
+
+                        // Clean up request router to prevent stale entries from blocking
+                        // subsequent requests for the same resource after timeout
+                        if let Some(router) = request_router.get() {
+                            router.complete_operation(tx);
+                        }
                     }
                 }
             }
