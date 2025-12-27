@@ -1129,10 +1129,12 @@ async fn process_open_request(
                         let local_satisfies_request =
                             has_local_state && (!return_contract_code || contract.is_some());
 
-                        // Check if we're actively subscribed to this contract (cache is kept fresh)
+                        // Check if we're part of the subscription tree for this contract.
+                        // This includes upstream/downstream network subscriptions AND local clients.
+                        // If we're in the tree, our cache is kept fresh via subscription updates.
                         let is_subscribed = full_key
                             .as_ref()
-                            .map(|k| op_manager.ring.is_seeding_contract(k))
+                            .map(|k| op_manager.ring.is_in_subscription_tree(k))
                             .unwrap_or(false);
 
                         // Return local cache if we have valid state AND EITHER:

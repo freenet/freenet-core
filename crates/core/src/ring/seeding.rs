@@ -249,6 +249,29 @@ impl SeedingManager {
             .unwrap_or(false)
     }
 
+    /// Check if we're part of the subscription tree for this contract.
+    ///
+    /// Returns true if we have:
+    /// - An upstream subscription (receiving updates from network), OR
+    /// - Downstream subscribers (forwarding updates to peers), OR
+    /// - Local client subscriptions (forwarding updates to WebSocket clients)
+    ///
+    /// If any of these is true, our cache is being kept fresh via subscription updates.
+    /// If none is true, we may only have a stale cached copy.
+    pub fn is_in_subscription_tree(&self, contract: &ContractKey) -> bool {
+        // Check for any entry in the subscriptions map (upstream or downstream)
+        let has_network_subscription = self
+            .subscriptions
+            .get(contract)
+            .map(|subs| !subs.is_empty())
+            .unwrap_or(false);
+
+        // Check for local client subscriptions
+        let has_client = self.has_client_subscriptions(contract.id());
+
+        has_network_subscription || has_client
+    }
+
     /// Get all contracts that we're seeding but don't have an upstream subscription for,
     /// AND where we have active interest (local client subscriptions or downstream peers).
     ///
