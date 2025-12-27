@@ -1058,8 +1058,8 @@ async fn process_open_request(
                         // 1. Error handling: if local storage has issues, fail fast
                         // 2. No connections: if isolated (no peers), return local cache immediately
                         //
-                        // For connected nodes, we route through network GET operation which
-                        // implements "network first, local fallback" to ensure fresh data.
+                        // For connected nodes, we use smart cache routing: return local cache
+                        // if subscribed (cache is fresh), otherwise fetch from network.
                         // See PR #2388 for why always-local-first was problematic.
                         let (full_key, state, contract) = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
