@@ -300,20 +300,42 @@ verify_service() {
                 echo -n "  Verifying service status ($service_arg)... "
                 sleep 2  # Give service time to start
                 if systemctl is-active --quiet "$service_arg.service"; then
-                    local running_version=$("$INSTALL_PATH" --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "unknown")
+                    # Get the PID of the running service
+                    local pid=$(systemctl show -p MainPID --value "$service_arg.service" 2>/dev/null)
+
+                    if [[ -n "$pid" ]] && [[ "$pid" != "0" ]]; then
+                        # CRITICAL: Verify the RUNNING process is using the correct binary
+                        # This catches the case where binary was updated but service wasn't restarted
+                        local running_binary=$(sudo readlink -f /proc/$pid/exe 2>/dev/null || echo "unknown")
+                        local expected_binary=$(readlink -f "$INSTALL_PATH" 2>/dev/null || echo "$INSTALL_PATH")
+
+                        if [[ "$running_binary" != "unknown" ]] && [[ "$running_binary" != "$expected_binary" ]]; then
+                            echo "✗"
+                            echo "  ⚠️  CRITICAL: Running process using DIFFERENT binary!"
+                            echo "     Running process (PID $pid) uses: $running_binary"
+                            echo "     Expected (installed at):         $expected_binary"
+                            echo "     This means the service wasn't properly restarted."
+                            echo "     Try: sudo systemctl restart $service_arg.service"
+                            return 1
+                        fi
+                    fi
+
+                    # Verify the binary version on disk matches expected
+                    local disk_version=$("$INSTALL_PATH" --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "unknown")
 
                     # Verify version matches
-                    if [[ "$VERIFY_VERSION" == "true" ]] && [[ "$expected_version" != "unknown" ]] && [[ "$running_version" != "$expected_version" ]]; then
+                    if [[ "$VERIFY_VERSION" == "true" ]] && [[ "$expected_version" != "unknown" ]] && [[ "$disk_version" != "$expected_version" ]]; then
                         echo "✗"
                         echo "  ⚠️  Version mismatch!"
                         echo "     Expected: $expected_version"
-                        echo "     Got:      $running_version"
+                        echo "     Got:      $disk_version"
                         return 1
                     fi
 
                     echo "✓"
-                    echo "  ✓ Version: $running_version"
-                    echo "  ✓ Service: Running"
+                    echo "  ✓ Version: $disk_version"
+                    echo "  ✓ Service: Running (PID ${pid:-unknown})"
+                    echo "  ✓ Binary:  $INSTALL_PATH"
                 else
                     echo "✗"
                     echo "  ⚠️  Service failed to start"
@@ -405,6 +427,27 @@ echo "Installed: $INSTALL_PATH (v$BINARY_VERSION)"
 
 if [[ -f "$INSTALL_PATH.backup" ]]; then
     echo "Backup:    $INSTALL_PATH.backup"
+fi
+
+# Check for PATH shadowing - warn if 'freenet' in PATH resolves to a different binary
+if command -v freenet &>/dev/null; then
+    PATH_BINARY=$(command -v freenet)
+    if [[ "$PATH_BINARY" != "$INSTALL_PATH" ]]; then
+        echo
+        echo "⚠️  WARNING: PATH shadowing detected!"
+        echo "   'freenet' command resolves to: $PATH_BINARY"
+        echo "   But we installed to:           $INSTALL_PATH"
+        echo
+        echo "   This can cause confusion when checking versions."
+        echo "   The service uses the correct binary, but 'freenet --version'"
+        echo "   from your shell may show a different (possibly stale) version."
+        echo
+        echo "   To fix: Remove the shadowing binary or update your PATH."
+        PATH_VERSION=$("$PATH_BINARY" --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "unknown")
+        INSTALLED_VERSION=$("$INSTALL_PATH" --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "unknown")
+        echo "   PATH binary version:      $PATH_VERSION"
+        echo "   Installed binary version: $INSTALLED_VERSION"
+    fi
 fi
 
 case "$SERVICE_MANAGER" in
