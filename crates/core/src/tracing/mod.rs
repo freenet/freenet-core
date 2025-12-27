@@ -1355,9 +1355,44 @@ enum UpdateEvent {
 }
 
 #[cfg(feature = "trace")]
-pub(crate) mod tracer {
+pub mod tracer {
+    use std::io::IsTerminal;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
     use tracing::level_filters::LevelFilter;
+    use tracing_appender::non_blocking::WorkerGuard;
+    use tracing_appender::rolling::{RollingFileAppender, Rotation};
     use tracing_subscriber::{Layer, Registry};
+
+    /// Number of days to keep log files
+    const LOG_RETENTION_DAYS: usize = 7;
+
+    /// Guards for non-blocking file appenders - must be kept alive for the lifetime of the program
+    static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
+
+    /// Get the log directory for the current platform.
+    /// Used by both the tracer (for writing logs) and report command (for reading logs).
+    pub fn get_log_dir() -> Option<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            dirs::home_dir().map(|h| h.join(".local/state/freenet"))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            dirs::home_dir().map(|h| h.join("Library/Logs/freenet"))
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            dirs::data_local_dir().map(|d| d.join("freenet").join("logs"))
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            None
+        }
+    }
 
     pub fn init_tracer(
         level: Option<LevelFilter>,
@@ -1382,52 +1417,110 @@ pub(crate) mod tracer {
         };
         let default_filter = level.unwrap_or(default_filter);
 
-        // use opentelemetry_sdk::propagation::TraceContextPropagator;
         use tracing_subscriber::layer::SubscriberExt;
 
         let disabled_logs = std::env::var("FREENET_DISABLE_LOGS").is_ok();
+        if disabled_logs {
+            return Ok(());
+        }
+
         let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
+        let force_file_logs = std::env::var("FREENET_LOG_TO_FILE").is_ok();
         let use_json = std::env::var("FREENET_LOG_FORMAT")
             .map(|v| v.to_lowercase() == "json")
             .unwrap_or(false);
 
-        let layers = {
-            // Create the base layer with either pretty or JSON formatting
-            let fmt_layer = if use_json {
-                tracing_subscriber::fmt::layer()
-                    .with_level(true)
-                    .json()
-                    .boxed()
-            } else {
-                tracing_subscriber::fmt::layer()
-                    .with_level(true)
-                    .pretty()
-                    .boxed()
-            };
+        // Determine if we should write to files:
+        // - If FREENET_LOG_TO_FILE is set, always use file logging
+        // - If stdout is not a terminal (running as service), use file logging
+        // - If FREENET_LOG_TO_STDERR is set, use stderr instead
+        // - Otherwise, use stdout (interactive mode)
+        let use_file_logging = force_file_logs || (!to_stderr && !std::io::stdout().is_terminal());
 
-            // Apply file/line number configuration for test/debug builds
-            let fmt_layer = if cfg!(any(test, debug_assertions)) && !use_json {
-                // For pretty format, we can add file/line info
-                tracing_subscriber::fmt::layer()
-                    .with_level(true)
-                    .pretty()
-                    .with_file(true)
-                    .with_line_number(true)
-                    .boxed()
-            } else if cfg!(any(test, debug_assertions)) && use_json {
-                // For JSON format, file/line are automatically included
-                tracing_subscriber::fmt::layer()
-                    .with_level(true)
-                    .json()
-                    .with_file(true)
-                    .with_line_number(true)
-                    .boxed()
-            } else {
-                fmt_layer
-            };
+        // Build filter
+        let filter_layer = tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(default_filter.into())
+            .from_env_lossy()
+            .add_directive("stretto=off".parse().expect("infallible"))
+            .add_directive("sqlx=error".parse().expect("infallible"));
 
-            // Apply stderr writer configuration
-            let fmt_layer = if to_stderr && use_json {
+        if use_file_logging {
+            if let Some(log_dir) = get_log_dir() {
+                // Create log directory if it doesn't exist
+                if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                    eprintln!("Warning: Failed to create log directory: {e}");
+                    // Fall back to stdout logging
+                    return init_stdout_tracer(default_filter, to_stderr, use_json, filter_layer);
+                }
+
+                // Create rolling file appender for main log
+                let main_appender = RollingFileAppender::builder()
+                    .rotation(Rotation::DAILY)
+                    .max_log_files(LOG_RETENTION_DAYS)
+                    .filename_prefix("freenet")
+                    .filename_suffix("log")
+                    .build(&log_dir)
+                    .map_err(|e| anyhow::anyhow!("Failed to create log appender: {e}"))?;
+
+                // Create rolling file appender for error log
+                let error_appender = RollingFileAppender::builder()
+                    .rotation(Rotation::DAILY)
+                    .max_log_files(LOG_RETENTION_DAYS)
+                    .filename_prefix("freenet.error")
+                    .filename_suffix("log")
+                    .build(&log_dir)
+                    .map_err(|e| anyhow::anyhow!("Failed to create error log appender: {e}"))?;
+
+                let (main_writer, main_guard) = tracing_appender::non_blocking(main_appender);
+                let (error_writer, error_guard) = tracing_appender::non_blocking(error_appender);
+
+                // Store guards to keep writers alive; fail if already initialized
+                if LOG_GUARDS.set(vec![main_guard, error_guard]).is_err() {
+                    return Err(anyhow::anyhow!(
+                        "LOG_GUARDS already initialized; tracer cannot be re-initialized"
+                    ));
+                }
+
+                // Create layers for main and error logs
+                let main_layer = tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .with_ansi(false) // No ANSI colors in log files
+                    .with_writer(main_writer)
+                    .with_filter(filter_layer);
+
+                // Error layer only captures WARN and above
+                let error_filter = tracing_subscriber::EnvFilter::builder()
+                    .with_default_directive(LevelFilter::WARN.into())
+                    .from_env_lossy();
+
+                let error_layer = tracing_subscriber::fmt::layer()
+                    .with_level(true)
+                    .with_ansi(false)
+                    .with_writer(error_writer)
+                    .with_filter(error_filter);
+
+                let subscriber = Registry::default().with(main_layer).with(error_layer);
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("Error setting subscriber");
+
+                return Ok(());
+            }
+        }
+
+        // Fall back to stdout/stderr logging
+        init_stdout_tracer(default_filter, to_stderr, use_json, filter_layer)
+    }
+
+    fn init_stdout_tracer(
+        _default_filter: LevelFilter,
+        to_stderr: bool,
+        use_json: bool,
+        filter_layer: tracing_subscriber::EnvFilter,
+    ) -> anyhow::Result<()> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let layer = if to_stderr {
+            if use_json {
                 tracing_subscriber::fmt::layer()
                     .with_level(true)
                     .json()
@@ -1435,7 +1528,7 @@ pub(crate) mod tracer {
                     .with_line_number(cfg!(any(test, debug_assertions)))
                     .with_writer(std::io::stderr)
                     .boxed()
-            } else if to_stderr && !use_json {
+            } else {
                 let layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
                 let layer = if cfg!(any(test, debug_assertions)) {
                     layer.with_file(true).with_line_number(true)
@@ -1443,59 +1536,24 @@ pub(crate) mod tracer {
                     layer
                 };
                 layer.with_writer(std::io::stderr).boxed()
+            }
+        } else if use_json {
+            tracing_subscriber::fmt::layer()
+                .with_level(true)
+                .json()
+                .with_file(cfg!(any(test, debug_assertions)))
+                .with_line_number(cfg!(any(test, debug_assertions)))
+                .boxed()
+        } else {
+            let layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
+            if cfg!(any(test, debug_assertions)) {
+                layer.with_file(true).with_line_number(true).boxed()
             } else {
-                fmt_layer
-            };
-            #[cfg(not(feature = "trace-ot"))]
-            {
-                // OpenTelemetry endpoint is temporarily unused due to disabled OT tracing
-            }
-
-            #[cfg(feature = "trace-ot")]
-            {
-                let _disabled_ot_traces = std::env::var("FREENET_DISABLE_TRACES").is_ok();
-                let identifier = if let Ok(peer) = std::env::var("FREENET_PEER_ID") {
-                    format!("freenet-core-{peer}")
-                } else {
-                    "freenet-core".to_string()
-                };
-                tracing::info!("setting OT collector with identifier: {identifier}");
-                // TODO: Fix OpenTelemetry version conflicts and API changes
-                // The code below needs to be updated to work with the new OpenTelemetry API
-                // For now, we'll just use the fmt_layer without OpenTelemetry tracing
-                /*
-                let tracing_ot_layer = {
-                    // For now, just use the global tracer until we fix version conflicts
-                    let ot_jaeger_tracer = opentelemetry::global::tracer("freenet");
-                    // Get a tracer which will route OT spans to a Jaeger agent
-                    tracing_opentelemetry::layer().with_tracer(ot_jaeger_tracer)
-                };
-                */
-                // Temporarily disable OpenTelemetry tracing until version conflicts are resolved
-                if !disabled_logs {
-                    fmt_layer.boxed()
-                } else {
-                    return Ok(());
-                }
-            }
-            #[cfg(not(feature = "trace-ot"))]
-            {
-                if disabled_logs {
-                    return Ok(());
-                }
-                fmt_layer.boxed()
+                layer.boxed()
             }
         };
-        // Build filter and set subscriber.
-        // The main optimization is compile-time filtering (release_max_level_info)
-        // which eliminates TRACE/DEBUG spans entirely in release builds.
-        // from_env_lossy() handles both cases: parses RUST_LOG if set, empty filter if not.
-        let filter_layer = tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(default_filter.into())
-            .from_env_lossy()
-            .add_directive("stretto=off".parse().expect("infallible"))
-            .add_directive("sqlx=error".parse().expect("infallible"));
-        let subscriber = Registry::default().with(layers.with_filter(filter_layer));
+
+        let subscriber = Registry::default().with(layer.with_filter(filter_layer));
         tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
         Ok(())
     }

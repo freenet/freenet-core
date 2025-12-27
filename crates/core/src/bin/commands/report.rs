@@ -4,15 +4,28 @@
 //! then uploads to the Freenet report server for debugging.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use freenet::tracing::tracer::get_log_dir;
+use freenet_stdlib::client_api::{
+    ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeQuery, QueryResponse, WebApi,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::time::Duration as StdDuration;
+use tokio_tungstenite::connect_async;
 
 const DEFAULT_REPORT_SERVER: &str = "https://nova.locut.us/api/reports";
+/// Only include log entries from the last 30 minutes
+const LOG_RETENTION_MINUTES: i64 = 30;
+/// Default WebSocket API port
+const DEFAULT_WS_API_PORT: u16 = 7509;
+/// Timeout for WebSocket connection and queries
+const WS_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Args, Debug, Clone)]
 pub struct ReportCommand {
@@ -70,8 +83,16 @@ pub struct VersionInfo {
 pub struct LogContents {
     pub main_log: Option<String>,
     pub error_log: Option<String>,
+    /// Size of the filtered log content included in the report
     pub main_log_size_bytes: u64,
+    /// Size of the filtered error log content included in the report
     pub error_log_size_bytes: u64,
+    /// Original size of the main log file on disk
+    #[serde(default)]
+    pub main_log_original_size_bytes: u64,
+    /// Original size of the error log file on disk
+    #[serde(default)]
+    pub error_log_original_size_bytes: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -130,7 +151,7 @@ impl ReportCommand {
 
         let logs = self.collect_logs()?;
         let config = self.collect_config();
-        let network_status = self.collect_network_status();
+        let network_status = self.collect_network_status(&config);
         let user_message = self.get_user_message()?;
 
         let client_timestamp = chrono::Utc::now().to_rfc3339();
@@ -147,19 +168,26 @@ impl ReportCommand {
     }
 
     fn collect_logs(&self) -> Result<LogContents> {
-        let log_dir = get_log_dir()?;
+        let log_dir = get_log_dir().context("Unsupported platform for log collection")?;
 
-        let main_log_path = log_dir.join("freenet.log");
-        let error_log_path = log_dir.join("freenet.error.log");
+        // Find log files - support both legacy names and rolling log patterns
+        let main_log_files = find_log_files(&log_dir, "freenet");
+        let error_log_files = find_log_files(&log_dir, "freenet.error");
 
-        let (main_log, main_log_size) = read_log_file(&main_log_path);
-        let (error_log, error_log_size) = read_log_file(&error_log_path);
+        let (main_log, main_log_original_size) = read_and_merge_log_files(&main_log_files);
+        let (error_log, error_log_original_size) = read_and_merge_log_files(&error_log_files);
+
+        // Calculate filtered content sizes
+        let main_log_size = main_log.as_ref().map(|s| s.len() as u64).unwrap_or(0);
+        let error_log_size = error_log.as_ref().map(|s| s.len() as u64).unwrap_or(0);
 
         Ok(LogContents {
             main_log,
             error_log,
             main_log_size_bytes: main_log_size,
             error_log_size_bytes: error_log_size,
+            main_log_original_size_bytes: main_log_original_size,
+            error_log_original_size_bytes: error_log_original_size,
         })
     }
 
@@ -181,13 +209,33 @@ impl ReportCommand {
         None
     }
 
-    fn collect_network_status(&self) -> Option<String> {
+    fn collect_network_status(&self, config_content: &Option<String>) -> Option<String> {
         // Try to query the local node's WebSocket API
         // This is optional - if the node isn't running, we just skip this
-        // For now, we'll leave this as None and implement it when we have
-        // the WebSocket client available
-        // TODO: Query ws://127.0.0.1:50509 for node diagnostics
-        None
+
+        // Parse the WebSocket port from config, or use default
+        let ws_port = config_content
+            .as_ref()
+            .and_then(|c| parse_ws_port_from_config(c))
+            .unwrap_or(DEFAULT_WS_API_PORT);
+
+        // Create a runtime for the async WebSocket query
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(_) => return None,
+        };
+
+        rt.block_on(async {
+            match tokio::time::timeout(
+                StdDuration::from_secs(WS_TIMEOUT_SECS),
+                query_node_diagnostics(ws_port),
+            )
+            .await
+            {
+                Ok(Ok(diagnostics)) => Some(diagnostics),
+                Ok(Err(_)) | Err(_) => None,
+            }
+        })
     }
 
     fn get_user_message(&self) -> Result<Option<String>> {
@@ -203,35 +251,24 @@ impl ReportCommand {
 
         // Interactive prompt
         println!();
-        println!("What issue are you experiencing? (blank line to finish, Enter twice to skip)");
+        println!("What issue are you experiencing? (Enter on empty line to finish, or just Enter to skip)");
         print!("> ");
         io::stdout().flush()?;
 
         let stdin = io::stdin();
         let mut lines = Vec::new();
-        let mut last_was_empty = false;
 
         for line in stdin.lock().lines() {
             let line = line.context("Failed to read input")?;
 
             if line.is_empty() {
-                if last_was_empty || lines.is_empty() {
-                    // Two consecutive empty lines or empty first line = skip
-                    break;
-                }
-                last_was_empty = true;
-                lines.push(line);
-            } else {
-                last_was_empty = false;
-                lines.push(line);
-                print!("> ");
-                io::stdout().flush()?;
+                // Empty line = done
+                break;
             }
-        }
 
-        // Remove trailing empty lines
-        while lines.last().map(|s| s.is_empty()).unwrap_or(false) {
-            lines.pop();
+            lines.push(line);
+            print!("> ");
+            io::stdout().flush()?;
         }
 
         if lines.is_empty() {
@@ -257,8 +294,19 @@ impl ReportCommand {
             report.system_info.os, report.system_info.arch
         );
 
-        let total_log_size = report.logs.main_log_size_bytes + report.logs.error_log_size_bytes;
-        println!("  - Logs: {}", format_bytes(total_log_size));
+        let filtered_size = report.logs.main_log_size_bytes + report.logs.error_log_size_bytes;
+        let original_size =
+            report.logs.main_log_original_size_bytes + report.logs.error_log_original_size_bytes;
+        if original_size > filtered_size && filtered_size > 0 {
+            println!(
+                "  - Logs: {} (last {} min, {} total on disk)",
+                format_bytes(filtered_size),
+                LOG_RETENTION_MINUTES,
+                format_bytes(original_size)
+            );
+        } else {
+            println!("  - Logs: {}", format_bytes(original_size));
+        }
 
         println!(
             "  - Config: {}",
@@ -336,45 +384,235 @@ impl ReportCommand {
     }
 }
 
-fn get_log_dir() -> Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(dirs::home_dir()
-            .context("Failed to get home directory")?
-            .join(".local/state/freenet"))
+/// Find log files matching the given prefix.
+/// Supports both legacy format (freenet.log) and rolling format (freenet.YYYY-MM-DD.log).
+/// Returns files sorted by modification time (newest first).
+fn find_log_files(log_dir: &PathBuf, prefix: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    // Check for legacy file first
+    let legacy_path = log_dir.join(format!("{}.log", prefix));
+    if legacy_path.exists() {
+        files.push(legacy_path);
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        Ok(dirs::home_dir()
-            .context("Failed to get home directory")?
-            .join("Library/Logs/freenet"))
+    // Look for rolling log files (freenet.YYYY-MM-DD.log pattern)
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                // Match pattern: prefix.YYYY-MM-DD.log
+                if name.starts_with(prefix)
+                    && name.ends_with(".log")
+                    && name.len() > prefix.len() + 5
+                {
+                    // Check if it has a date pattern
+                    let middle = &name[prefix.len()..name.len() - 4];
+                    if middle.starts_with('.') && middle.len() == 11 {
+                        // .YYYY-MM-DD
+                        files.push(path);
+                    }
+                }
+            }
+        }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        Ok(dirs::data_local_dir()
-            .context("Failed to get local app data directory")?
-            .join("freenet")
-            .join("logs"))
+    // Sort by modification time, newest first
+    files.sort_by(|a, b| {
+        let a_time = fs::metadata(a).and_then(|m| m.modified()).ok();
+        let b_time = fs::metadata(b).and_then(|m| m.modified()).ok();
+        b_time.cmp(&a_time)
+    });
+
+    files
+}
+
+/// Read and merge multiple log files, filtering to the last 30 minutes.
+/// Returns (merged_content, total_original_size).
+fn read_and_merge_log_files(files: &[PathBuf]) -> (Option<String>, u64) {
+    if files.is_empty() {
+        return (None, 0);
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        anyhow::bail!("Unsupported platform for log collection")
+    let mut total_original_size = 0u64;
+    let mut all_lines = Vec::new();
+
+    for file in files {
+        let (content, size) = read_log_file(file);
+        total_original_size += size;
+        if let Some(content) = content {
+            all_lines.push(content);
+        }
+    }
+
+    if all_lines.is_empty() {
+        (None, total_original_size)
+    } else {
+        (Some(all_lines.join("\n")), total_original_size)
     }
 }
 
+/// Read log file, filtering to entries from the last 30 minutes.
+/// Returns (filtered_content, original_file_size).
 fn read_log_file(path: &PathBuf) -> (Option<String>, u64) {
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            let size = metadata.len();
-            match fs::read_to_string(path) {
-                Ok(content) => (Some(content), size),
-                Err(_) => (None, size),
+    let metadata = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return (None, 0),
+    };
+    let original_size = metadata.len();
+
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (None, original_size),
+    };
+
+    let cutoff = Utc::now() - Duration::minutes(LOG_RETENTION_MINUTES);
+
+    let reader = BufReader::new(file);
+    let mut filtered_lines = Vec::new();
+    let mut include_line = false;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        // Try to extract timestamp from this line
+        // Log format: optional ANSI codes, then ISO 8601 timestamp like 2025-12-26T17:28:28.636476Z
+        if let Some(ts) = extract_timestamp(&line) {
+            if let Ok(parsed) = DateTime::parse_from_rfc3339(&ts)
+                .map(|dt| dt.with_timezone(&Utc))
+                .or_else(|_| ts.parse::<DateTime<Utc>>())
+            {
+                include_line = parsed >= cutoff;
             }
         }
-        Err(_) => (None, 0),
+
+        // Include this line if we're within the time window
+        // (lines without timestamps inherit the state from the previous timestamped line)
+        if include_line {
+            filtered_lines.push(line);
+        }
+    }
+
+    if filtered_lines.is_empty() {
+        (None, original_size)
+    } else {
+        (Some(filtered_lines.join("\n")), original_size)
+    }
+}
+
+/// Extract ISO 8601 timestamp from a log line.
+/// Handles ANSI escape codes that may surround the timestamp.
+fn extract_timestamp(line: &str) -> Option<String> {
+    // Skip any leading ANSI escape sequences
+    let mut chars = line.chars().peekable();
+    while chars.peek() == Some(&'\x1b') {
+        // Skip escape sequence: ESC [ ... m
+        chars.next(); // ESC
+        if chars.next() != Some('[') {
+            break;
+        }
+        for c in chars.by_ref() {
+            if c == 'm' {
+                break;
+            }
+        }
+    }
+
+    // Collect remaining string and look for timestamp pattern
+    let remaining: String = chars.collect();
+
+    // Look for YYYY-MM-DDTHH:MM:SS pattern
+    if remaining.len() < 19 {
+        return None;
+    }
+
+    // Check if it starts with a valid timestamp format
+    let potential = &remaining[..std::cmp::min(30, remaining.len())];
+    if potential.len() >= 19
+        && potential.chars().nth(4) == Some('-')
+        && potential.chars().nth(7) == Some('-')
+        && potential.chars().nth(10) == Some('T')
+        && potential.chars().nth(13) == Some(':')
+        && potential.chars().nth(16) == Some(':')
+    {
+        // Find the end of the timestamp (up to Z or space or ANSI escape)
+        let end = potential.find([' ', '\x1b']).unwrap_or(potential.len());
+        let ts = &potential[..end];
+        // Ensure it ends with Z for RFC3339 compatibility
+        if ts.ends_with('Z') {
+            return Some(ts.to_string());
+        } else {
+            // Add Z if missing (some formats omit it)
+            return Some(format!("{}Z", ts));
+        }
+    }
+
+    None
+}
+
+/// Parse the WebSocket API port from config TOML content.
+fn parse_ws_port_from_config(config: &str) -> Option<u16> {
+    // Look for [ws_api] section with port
+    // Format: [ws_api]\n...\nws-api-port = 7509
+    // or just: ws-api-port = 7509
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with("ws-api-port") || line.starts_with("ws_api_port") {
+            if let Some(value) = line.split('=').nth(1) {
+                if let Ok(port) = value.trim().parse::<u16>() {
+                    return Some(port);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Query the node for diagnostics via WebSocket API.
+async fn query_node_diagnostics(port: u16) -> Result<String> {
+    let url = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
+
+    let (stream, _) = connect_async(&url)
+        .await
+        .context("Failed to connect to node WebSocket API")?;
+
+    let mut client = WebApi::start(stream);
+
+    // Query for full node diagnostics
+    let config = NodeDiagnosticsConfig {
+        include_node_info: true,
+        include_network_info: true,
+        include_subscriptions: true,
+        contract_keys: vec![],
+        include_system_metrics: true,
+        include_detailed_peer_info: true,
+        include_subscriber_peer_ids: false,
+    };
+
+    client
+        .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+            config,
+        }))
+        .await
+        .context("Failed to send diagnostics query")?;
+
+    let response = client
+        .recv()
+        .await
+        .context("Failed to receive diagnostics response")?;
+
+    // Close connection gracefully
+    let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
+
+    match response {
+        HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+            // Serialize the diagnostics to JSON for the report
+            serde_json::to_string_pretty(&diag).context("Failed to serialize diagnostics")
+        }
+        _ => anyhow::bail!("Unexpected response from node"),
     }
 }
 
@@ -436,6 +674,8 @@ mod tests {
                 error_log: None,
                 main_log_size_bytes: 8,
                 error_log_size_bytes: 0,
+                main_log_original_size_bytes: 100,
+                error_log_original_size_bytes: 0,
             },
             config: None,
             network_status: None,
@@ -445,5 +685,60 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("linux"));
         assert!(json.contains("test log"));
+    }
+
+    #[test]
+    fn test_extract_timestamp_plain() {
+        // Plain timestamp without ANSI codes
+        let line = "2025-12-26T17:28:28.636476Z INFO freenet: Starting";
+        assert_eq!(
+            extract_timestamp(line),
+            Some("2025-12-26T17:28:28.636476Z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_timestamp_with_ansi() {
+        // Timestamp surrounded by ANSI escape codes (as in actual logs)
+        let line = "\x1b[2m2025-12-26T17:28:28.636476Z\x1b[0m \x1b[32m INFO\x1b[0m freenet";
+        assert_eq!(
+            extract_timestamp(line),
+            Some("2025-12-26T17:28:28.636476Z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_timestamp_no_timestamp() {
+        // Line without timestamp
+        let line = "    at crates/core/src/bin/freenet.rs:136";
+        assert_eq!(extract_timestamp(line), None);
+    }
+
+    #[test]
+    fn test_extract_timestamp_adds_z_if_missing() {
+        // Timestamp without trailing Z
+        let line = "2025-12-26T17:28:28.636476 INFO";
+        let result = extract_timestamp(line);
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with('Z'));
+    }
+
+    #[test]
+    fn test_parse_ws_port_from_config() {
+        // Test with ws-api-port
+        let config = r#"
+mode = "network"
+[ws_api]
+ws-api-port = 8080
+"#;
+        assert_eq!(parse_ws_port_from_config(config), Some(8080));
+
+        // Test with underscore variant
+        let config = "ws_api_port = 9000";
+        assert_eq!(parse_ws_port_from_config(config), Some(9000));
+
+        // Test with no port
+        let config = "mode = \"network\"";
+        assert_eq!(parse_ws_port_from_config(config), None);
     }
 }
