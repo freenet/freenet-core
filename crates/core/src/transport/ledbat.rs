@@ -1107,4 +1107,185 @@ mod tests {
         // (initial_cwnd is fixed, so this just verifies no crashes with RNG)
         assert!(!ssthresh_values.is_empty());
     }
+
+    /// Stress test: multiple threads calling on_ack concurrently.
+    /// Validates lock-free correctness under contention.
+    #[test]
+    fn test_concurrent_on_ack_stress() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let controller = Arc::new(LedbatController::new(100_000, 2848, 10_000_000));
+        let num_threads = 8;
+        let iterations_per_thread = 1000;
+
+        // Pre-send enough data to cover all ACKs
+        controller.on_send(num_threads * iterations_per_thread * 1000);
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let controller = Arc::clone(&controller);
+                thread::spawn(move || {
+                    for j in 0..iterations_per_thread {
+                        // Vary RTT to exercise different code paths
+                        let rtt_ms = 20 + (i * 10) + (j % 50);
+                        controller.on_ack(Duration::from_millis(rtt_ms as u64), 1000);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Verify controller is in a valid state
+        let stats = controller.stats();
+        assert!(stats.cwnd >= controller.min_cwnd);
+        assert!(stats.cwnd <= controller.max_cwnd);
+        // Base delay should be set (minimum RTT was 20ms)
+        assert!(stats.base_delay <= Duration::from_millis(100));
+    }
+
+    /// Stress test: concurrent on_send and on_ack from different threads.
+    /// Validates flightsize tracking under contention.
+    #[test]
+    fn test_concurrent_send_ack_stress() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let controller = Arc::new(LedbatController::new(100_000, 2848, 10_000_000));
+        let iterations = 500;
+
+        // Sender thread
+        let controller_send = Arc::clone(&controller);
+        let sender = thread::spawn(move || {
+            for _ in 0..iterations {
+                controller_send.on_send(1000);
+                thread::yield_now(); // Encourage interleaving
+            }
+        });
+
+        // ACK thread
+        let controller_ack = Arc::clone(&controller);
+        let acker = thread::spawn(move || {
+            for i in 0..iterations {
+                let rtt_ms = 30 + (i % 20);
+                controller_ack.on_ack(Duration::from_millis(rtt_ms as u64), 1000);
+                thread::yield_now();
+            }
+        });
+
+        sender.join().expect("Sender panicked");
+        acker.join().expect("Acker panicked");
+
+        // Flightsize should be reasonable (may not be exactly 0 due to timing)
+        // Just verify no underflow (would wrap to huge value)
+        assert!(controller.flightsize() < 1_000_000);
+    }
+
+    /// Stress test: concurrent loss events.
+    /// Validates cwnd halving under contention.
+    #[test]
+    fn test_concurrent_loss_stress() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let controller = Arc::new(LedbatController::new(1_000_000, 2848, 10_000_000));
+        let num_threads = 4;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let controller = Arc::clone(&controller);
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        controller.on_loss();
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // After many loss events, cwnd should be at or near min_cwnd
+        assert!(
+            controller.current_cwnd() <= 10_000,
+            "cwnd should be small after many losses, got {}",
+            controller.current_cwnd()
+        );
+        assert!(controller.current_cwnd() >= controller.min_cwnd);
+
+        // Total losses should be num_threads * 10
+        let stats = controller.stats();
+        assert_eq!(stats.total_losses, num_threads * 10);
+    }
+
+    /// Test atomic delay filter under concurrent access.
+    #[test]
+    fn test_atomic_delay_filter_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let filter = Arc::new(AtomicDelayFilter::new());
+        let num_threads = 4;
+        let iterations = 100;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let filter = Arc::clone(&filter);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        let rtt_ms = 10 + i * 5 + (j % 10);
+                        filter.add_sample(Duration::from_millis(rtt_ms as u64));
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Filter should be ready and have a valid minimum
+        assert!(filter.is_ready());
+        let min_delay = filter.filtered_delay().expect("Should have samples");
+        // Minimum should be at least 10ms (the lowest we added)
+        assert!(min_delay >= Duration::from_millis(10));
+        assert!(min_delay <= Duration::from_millis(50));
+    }
+
+    /// Test atomic base delay history under concurrent access.
+    #[test]
+    fn test_atomic_base_delay_history_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let history = Arc::new(AtomicBaseDelayHistory::new());
+        let num_threads = 4;
+        let iterations = 100;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let history = Arc::clone(&history);
+                thread::spawn(move || {
+                    for j in 0..iterations {
+                        let rtt_ms = 20 + i * 10 + (j % 15);
+                        history.update(Duration::from_millis(rtt_ms as u64));
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        // Base delay should be valid and reflect minimum RTT
+        let base = history.base_delay();
+        assert!(base >= Duration::from_millis(20));
+        assert!(base <= Duration::from_millis(100));
+    }
 }
