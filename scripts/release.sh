@@ -1091,28 +1091,9 @@ announce_to_matrix() {
         return 0
     fi
 
-    # Count bug fixes, features, and maintenance items from release notes
-    local release_notes=$(generate_release_notes "$VERSION")
-    local fix_count=$(echo "$release_notes" | grep -c "^- \*\*#.*Bug Fixes" || echo "0")
-    local feature_count=$(echo "$release_notes" | grep -c "^- \*\*#.*Features" || echo "0")
-
-    # Extract key highlights (first 3 fixes or features)
-    local highlights=$(echo "$release_notes" | grep "^- \*\*#" | head -3 | sed 's/^- /  - /')
-
-    local announcement="Freenet v$VERSION Released!
-
-Published to crates.io:
-  - freenet v$VERSION
-  - fdev v$FDEV_VERSION
-
-Release: https://github.com/freenet/freenet-core/releases/tag/v$VERSION
-
-Key highlights:
-$highlights
-
-Full changelog available at the release link above.
-
-[AI-assisted release announcement]"
+    # Simple 2-3 line announcement
+    local announcement="Freenet v$VERSION released: https://github.com/freenet/freenet-core/releases/tag/v$VERSION
+Published to crates.io (freenet v$VERSION, fdev v$FDEV_VERSION)"
 
     echo -n "  Sending announcement to Matrix... "
     # Use room ID instead of alias for reliability, add timeout
