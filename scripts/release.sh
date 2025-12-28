@@ -1208,8 +1208,8 @@ update_versions
 create_release_pr
 publish_crates
 create_github_release
-deploy_gateways
 wait_for_binaries
+deploy_gateways
 announce_to_matrix
 
 echo
