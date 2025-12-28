@@ -5,7 +5,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo test --release -p freenet --test concurrent_streams_regression --features bench -- --nocapture
+//! cargo test --release -p freenet --test concurrent_streams_regression --features bench
 //! ```
 
 #![cfg(feature = "bench")]
@@ -17,6 +17,7 @@ use freenet::transport::mock_transport::{
 use freenet::transport::{OutboundConnectionHandler, PeerConnection};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::info;
 
 /// Helper to create a connected peer pair
 async fn create_connected_pair(
@@ -106,27 +107,27 @@ async fn bench_concurrent_streams(
     (total_elapsed, aggregate_mbps)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_concurrent_streams_bottleneck() {
-    println!("\n=== Concurrent Streams Bottleneck Test ===\n");
+    info!("=== Concurrent Streams Bottleneck Test ===");
 
     let message_size = 1024; // 1KB
     let iterations = 25;
 
     // Benchmark single stream
-    println!("Benchmarking single stream...");
+    info!("Benchmarking single stream...");
     let (single_time, single_mbps) = bench_single_stream(message_size, iterations).await;
-    println!(
+    info!(
         "Single stream: {:.2}ms, {:.2} Mbps",
         single_time.as_secs_f64() * 1000.0,
         single_mbps
     );
 
     // Benchmark 4 concurrent streams
-    println!("\nBenchmarking 4 concurrent streams...");
+    info!("Benchmarking 4 concurrent streams...");
     let (concurrent_time, concurrent_mbps) =
         bench_concurrent_streams(4, message_size, iterations).await;
-    println!(
+    info!(
         "4 concurrent streams: {:.2}ms, {:.2} Mbps (aggregate)",
         concurrent_time.as_secs_f64() * 1000.0,
         concurrent_mbps
@@ -134,25 +135,25 @@ async fn test_concurrent_streams_bottleneck() {
 
     // Calculate degradation
     let degradation_ratio = single_mbps / concurrent_mbps;
-    println!(
-        "\nDegradation: {:.2}x (single stream is {:.2}x faster than aggregate of 4 streams)",
+    info!(
+        "Degradation: {:.2}x (single stream is {:.2}x faster than aggregate of 4 streams)",
         degradation_ratio, degradation_ratio
     );
 
     // Ideally, 4 concurrent streams should achieve close to single stream throughput
     // or better (due to parallelism). If we see >2x degradation, we have a bottleneck.
     if degradation_ratio > 2.0 {
-        println!(
-            "\n⚠️  WARNING: Significant bottleneck detected ({:.2}x degradation)",
+        info!(
+            "WARNING: Significant bottleneck detected ({:.2}x degradation)",
             degradation_ratio
         );
-        println!("   Expected: ~1.0x (concurrent ≈ single stream throughput)");
-        println!("   This indicates serialization in the packet processing pipeline.");
+        info!("   Expected: ~1.0x (concurrent ≈ single stream throughput)");
+        info!("   This indicates serialization in the packet processing pipeline.");
     } else {
-        println!("\n✓ No significant bottleneck (degradation < 2x)");
+        info!("No significant bottleneck (degradation < 2x)");
     }
 
-    println!("\n=== Test Complete ===\n");
+    info!("=== Test Complete ===");
 
     // Don't fail the test, just report metrics
     // assert!(degradation_ratio < 2.0, "Concurrent streams show {:.2}x degradation", degradation_ratio);

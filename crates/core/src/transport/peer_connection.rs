@@ -21,6 +21,14 @@ use tracing::{instrument, span, Instrument};
 
 mod inbound_stream;
 mod outbound_stream;
+pub(crate) mod streaming;
+
+/// Lock-free streaming buffer implementation.
+/// Public when bench feature is enabled for benchmarking.
+#[cfg(feature = "bench")]
+pub mod streaming_buffer;
+#[cfg(not(feature = "bench"))]
+pub(crate) mod streaming_buffer;
 
 use super::{
     connection_handler::SerializedMessage,
@@ -163,6 +171,12 @@ pub struct PeerConnection<S = super::UdpSocket> {
     /// Maps ping sequence number -> send timestamp.
     /// Used for bidirectional liveness detection.
     pending_pings: Arc<RwLock<BTreeMap<u64, Instant>>>,
+    /// Registry for streaming inbound streams.
+    /// Maps stream IDs to streaming handles for incremental fragment access.
+    streaming_registry: Arc<streaming::StreamRegistry>,
+    /// Streaming handles for active streams (parallels inbound_streams).
+    /// Used for pushing fragments to streaming consumers.
+    streaming_handles: HashMap<StreamId, streaming::StreamHandle>,
 }
 
 impl<S> std::fmt::Debug for PeerConnection<S> {
@@ -332,6 +346,8 @@ impl<S: super::Socket> PeerConnection<S> {
             keep_alive_handle: Some(keep_alive_handle),
             last_rate_update: None,
             pending_pings,
+            streaming_registry: Arc::new(streaming::StreamRegistry::new()),
+            streaming_handles: HashMap::new(),
         }
     }
 
@@ -676,6 +692,9 @@ impl<S: super::Socket> PeerConnection<S> {
                         continue;
                     };
                     self.inbound_streams.remove(&stream_id);
+                    // Also clean up streaming handle and registry
+                    self.streaming_handles.remove(&stream_id);
+                    self.streaming_registry.remove(stream_id);
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -898,6 +917,49 @@ impl<S: super::Socket> PeerConnection<S> {
         self.remote_conn.remote_addr
     }
 
+    /// Returns a handle for accessing an inbound stream incrementally.
+    ///
+    /// This provides a `futures::Stream` interface for consuming fragments
+    /// as they arrive, without waiting for complete reassembly. Useful for
+    /// large transfers where you want to process data incrementally.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - The ID of the stream to access
+    ///
+    /// # Returns
+    ///
+    /// * `Some(StreamHandle)` - If the stream exists
+    /// * `None` - If no stream with that ID is registered
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if let Some(handle) = peer_conn.recv_stream_handle(stream_id) {
+    ///     let mut stream = handle.stream();
+    ///     while let Some(chunk) = stream.next().await {
+    ///         process_chunk(chunk?);
+    ///     }
+    /// }
+    /// ```
+    #[allow(dead_code)]
+    pub(crate) fn recv_stream_handle(
+        &self,
+        stream_id: StreamId,
+    ) -> Option<streaming::StreamHandle> {
+        self.streaming_handles.get(&stream_id).cloned()
+    }
+
+    /// Returns the streaming registry for this connection.
+    ///
+    /// The registry allows external code to:
+    /// - Look up streams by ID
+    /// - Subscribe to new stream notifications
+    /// - Get handles for incremental stream consumption
+    pub fn streaming_registry(&self) -> Arc<streaming::StreamRegistry> {
+        Arc::clone(&self.streaming_registry)
+    }
+
     async fn process_inbound(
         &mut self,
         payload: SymmetricMessagePayload,
@@ -927,6 +989,39 @@ impl<S: super::Socket> PeerConnection<S> {
                 fragment_number,
                 payload,
             } => {
+                // Push to streaming handle for incremental access (Phase 1 streaming)
+                if let Some(streaming_handle) = self.streaming_handles.get(&stream_id) {
+                    // Existing streaming handle - push fragment
+                    if let Err(e) = streaming_handle.push_fragment(fragment_number, payload.clone())
+                    {
+                        tracing::warn!(
+                            peer_addr = %self.remote_conn.remote_addr,
+                            stream_id = %stream_id,
+                            fragment_number,
+                            error = %e,
+                            "Failed to push fragment to streaming handle"
+                        );
+                    }
+                } else {
+                    // New stream - register with streaming registry
+                    let streaming_handle = self
+                        .streaming_registry
+                        .register(stream_id, total_length_bytes)
+                        .await;
+                    if let Err(e) = streaming_handle.push_fragment(fragment_number, payload.clone())
+                    {
+                        tracing::warn!(
+                            peer_addr = %self.remote_conn.remote_addr,
+                            stream_id = %stream_id,
+                            fragment_number,
+                            error = %e,
+                            "Failed to push first fragment to streaming handle"
+                        );
+                    }
+                    self.streaming_handles.insert(stream_id, streaming_handle);
+                }
+
+                // Legacy path: push to fast_channel for existing recv() behavior
                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
                     sender
                         .send_async((fragment_number, payload))
@@ -950,6 +1045,9 @@ impl<S: super::Socket> PeerConnection<S> {
                     let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
                     if let Some(msg) = stream.push_fragment(fragment_number, payload) {
                         self.inbound_streams.remove(&stream_id);
+                        // Also remove from streaming handles and registry when complete
+                        self.streaming_handles.remove(&stream_id);
+                        self.streaming_registry.remove(stream_id);
                         tracing::trace!(
                             peer_addr = %self.remote_conn.remote_addr,
                             stream_id = %stream_id,

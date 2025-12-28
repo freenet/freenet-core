@@ -37,7 +37,7 @@ impl InboundStream {
             total_length_bytes,
             last_contiguous_fragment_idx: 0,
             non_contiguous_fragments: BTreeMap::new(),
-            payload: vec![],
+            payload: Vec::with_capacity(total_length_bytes as usize),
         }
     }
 

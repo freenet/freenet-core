@@ -173,9 +173,9 @@ impl TestLogger {
             fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
         };
 
-        // Create env filter from level
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.level));
+        // Always use the explicitly configured level for test isolation.
+        // This ensures tests are predictable regardless of RUST_LOG environment variable.
+        let env_filter = EnvFilter::new(&self.level);
 
         // Build the appropriate layer based on format
         // Note: Span fields are automatically included in logs within those spans

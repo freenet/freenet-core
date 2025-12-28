@@ -3,9 +3,10 @@
 
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
 use std::time::Duration;
+use tracing::info;
 
-#[tokio::test]
-#[ignore] // Run manually with: cargo test manual_network_test -- --ignored --nocapture
+#[test_log::test(tokio::test)]
+#[ignore] // Run manually with: cargo test manual_network_test -- --ignored
 async fn manual_network_test() {
     let network = TestNetwork::builder()
         .gateways(1)
@@ -19,15 +20,15 @@ async fn manual_network_test() {
 
     match network {
         Ok(ref net) => {
-            println!("\n=== Network Started ===");
-            println!("Gateway: {}", net.gateway(0).ws_url());
-            println!("Peer: {}", net.peer(0).ws_url());
+            info!("=== Network Started ===");
+            info!("Gateway: {}", net.gateway(0).ws_url());
+            info!("Peer: {}", net.peer(0).ws_url());
 
             // Print all logs
             if let Ok(logs) = net.read_logs() {
-                println!("\n=== Logs ===");
+                info!("=== Logs ===");
                 for entry in logs {
-                    println!(
+                    info!(
                         "[{}] {}: {}",
                         entry.peer_id,
                         entry.level.as_deref().unwrap_or("INFO"),
@@ -37,11 +38,11 @@ async fn manual_network_test() {
             }
 
             // Keep network alive for inspection
-            println!("\nNetwork is running. Press Ctrl+C to exit.");
+            info!("Network is running. Press Ctrl+C to exit.");
             tokio::time::sleep(Duration::from_secs(300)).await;
         }
         Err(e) => {
-            eprintln!("\n✗ Network failed: {:?}", e);
+            tracing::error!("Network failed: {:?}", e);
             // Try to read logs anyway if temp dirs still exist
         }
     }

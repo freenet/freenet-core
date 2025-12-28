@@ -20,3 +20,4 @@ pub mod level3;
 pub mod manual_throughput;
 pub mod slow_start;
 pub mod streaming;
+pub mod streaming_buffer;

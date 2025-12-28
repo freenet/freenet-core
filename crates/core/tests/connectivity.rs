@@ -339,9 +339,11 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
     let gateway = ctx.node("gateway")?;
     let peer1 = ctx.node("peer1")?;
     let peer2 = ctx.node("peer2")?;
-    println!(
+    tracing::info!(
         "Using deterministic node locations: gateway={:.3}, peer1={:.3}, peer2={:.3}",
-        gateway.location, peer1.location, peer2.location
+        gateway.location,
+        peer1.location,
+        peer2.location
     );
 
     let peer1_public_port = peer1.network_port.context(
@@ -400,11 +402,12 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
         let remaining_secs = mesh_deadline
             .saturating_duration_since(tokio::time::Instant::now())
             .as_secs();
-        // Use println! for first 5 attempts to ensure visibility in CI stdout
+        // Log first 5 attempts at info level for visibility
         if attempt <= 5 {
-            println!(
+            tracing::info!(
                 "Attempt {} ({}s remaining): Querying all nodes for connected peers...",
-                attempt, remaining_secs
+                attempt,
+                remaining_secs
             );
         }
         tracing::info!(
@@ -435,9 +438,9 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
             continue;
         };
 
-        // Use println! for first 5 attempts to ensure visibility in CI stdout
+        // Log first 5 attempts at info level for visibility
         if attempt <= 5 {
-            println!(
+            tracing::info!(
                 "  - Gateway has {} connections, Peer1 has {}, Peer2 has {}",
                 gw_peers.len(),
                 peer1_peers.len(),
