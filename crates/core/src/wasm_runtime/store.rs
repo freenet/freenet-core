@@ -189,6 +189,10 @@ pub(super) trait StoreFsManagement: Sized {
         value: Self::Value,
     );
 
+    /// Clear all entries from the in-memory container.
+    /// Used after compaction to remove stale offsets before reloading.
+    fn clear_container(container: &mut Self::MemContainer);
+
     fn watch_changes(
         mut container: Self::MemContainer,
         key_file_path: &Path,
@@ -304,6 +308,34 @@ pub(super) trait StoreFsManagement: Sized {
                     error = %e,
                     "Failed to rewrite index file after detecting corruption"
                 );
+            } else {
+                // Compaction succeeded - the file has been rewritten with new offsets.
+                // Clear the container and reload to get correct offsets.
+                // Without this, the container would have stale offsets from the old file
+                // layout, which could cause data corruption when writing new records
+                // (tombstoning wrong entries) or identity confusion (reading wrong data).
+                tracing::info!(
+                    path = ?key_file_path,
+                    "Reloading index after compaction to fix stale offsets"
+                );
+                Self::clear_container(container);
+
+                // Reload from the newly compacted file
+                let mut file = BufReader::new(File::open(key_file_path)?);
+                let mut key_cursor = 0;
+                while let Ok(rec) = process_record(&mut file) {
+                    if let Some((store_key, value)) = rec {
+                        // After compaction, all records should be valid
+                        if let Ok(store_key) = store_key.try_into() {
+                            let value = match value {
+                                Either::Left(v) => Self::Value::try_from(&v),
+                                Either::Right(v) => Self::Value::try_from(&v),
+                            }?;
+                            Self::insert_in_container(container, (store_key, key_cursor), value);
+                        }
+                    }
+                    key_cursor = file.stream_position()?;
+                }
             }
         }
 
@@ -520,6 +552,10 @@ mod tests {
         ) {
             container.insert(key, (offset, value));
         }
+
+        fn clear_container(container: &mut Self::MemContainer) {
+            container.clear();
+        }
     }
 
     struct TestStore2;
@@ -535,6 +571,10 @@ mod tests {
             value: Self::Value,
         ) {
             container.insert(key, (offset, value));
+        }
+
+        fn clear_container(container: &mut Self::MemContainer) {
+            container.clear();
         }
     }
 
