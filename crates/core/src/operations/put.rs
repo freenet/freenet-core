@@ -171,6 +171,17 @@ impl Operation for PutOp {
                 Err(OpError::OpNotPresent(tx))
             }
             Ok(None) => {
+                // Check if this is a response message - if so, the operation was likely
+                // cleaned up due to timeout and we should not create a new operation
+                if matches!(msg, PutMsg::Response { .. }) {
+                    tracing::debug!(
+                        tx = %tx,
+                        phase = "load_or_init",
+                        "PUT response arrived for non-existent operation (likely timed out)"
+                    );
+                    return Err(OpError::OpNotPresent(tx));
+                }
+
                 // New incoming request - we're a forwarder or final node.
                 // We don't need persistent state, just track upstream_addr for response routing.
                 tracing::debug!(

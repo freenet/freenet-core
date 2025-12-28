@@ -412,6 +412,17 @@ impl Operation for SubscribeOp {
                 Err(OpError::OpNotPresent(id))
             }
             Ok(None) => {
+                // Check if this is a response message - if so, the operation was likely
+                // cleaned up due to timeout and we should not create a new operation
+                if matches!(msg, SubscribeMsg::Response { .. }) {
+                    tracing::debug!(
+                        tx = %id,
+                        phase = "load_or_init",
+                        "SUBSCRIBE response arrived for non-existent operation (likely timed out)"
+                    );
+                    return Err(OpError::OpNotPresent(id));
+                }
+
                 // New request from another peer - we're an intermediate/terminal node
                 Ok(OpInitialization {
                     op: Self {
