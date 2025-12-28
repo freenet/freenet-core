@@ -178,6 +178,12 @@ jobs:
             .
             river-src
 
+      - name: Pull Docker images for NAT simulation
+        run: |
+          # Pre-pull alpine image used by NAT router simulation
+          # Without this, the test fails with "No such image: alpine:latest"
+          docker pull alpine:latest
+
       - name: Run six-peer regression
         working-directory: river-src
         env:
