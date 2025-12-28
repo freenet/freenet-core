@@ -89,12 +89,18 @@ impl ShutdownHandle {
     /// 2. Stop accepting new connections
     /// 3. Exit the event loop
     pub async fn shutdown(&self) {
-        let _ = self
+        if let Err(err) = self
             .tx
             .send(NodeEvent::Disconnect {
                 cause: Some("graceful shutdown".into()),
             })
-            .await;
+            .await
+        {
+            tracing::debug!(
+                error = %err,
+                "failed to send graceful shutdown signal; shutdown channel may already be closed"
+            );
+        }
     }
 }
 
