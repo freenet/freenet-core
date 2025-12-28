@@ -1415,4 +1415,130 @@ mod tests {
         });
         assert_fast_serialize("Large CacheStateResponse", &large_cache);
     }
+
+    /// Test that flightsize is properly accounted for retransmitted packets.
+    ///
+    /// This test verifies the fix for the flightsize leak bug where retransmitted
+    /// packet ACKs didn't decrement flightsize because Karn's algorithm skipped
+    /// RTT calculation and the code also skipped returning packet_size entirely.
+    ///
+    /// The fix ensures that when a retransmitted packet is ACKed:
+    /// 1. The packet size is returned (so flightsize can be decremented)
+    /// 2. But no RTT sample is returned (Karn's algorithm - don't pollute RTT estimates)
+    ///
+    /// Without the fix, flightsize would leak on every retransmission, eventually
+    /// causing flightsize > cwnd, blocking all sends indefinitely.
+    #[test]
+    fn test_flightsize_accounting_for_retransmitted_packets() {
+        use crate::transport::ledbat::LedbatController;
+        use crate::transport::sent_packet_tracker::SentPacketTracker;
+        use std::sync::Arc;
+
+        // Create LEDBAT controller with realistic values
+        // Initial cwnd = ~38KB (IW26), min cwnd = 2KB (1*MSS)
+        let ledbat = Arc::new(LedbatController::new(38_000, 2_000, 10_000_000));
+
+        // Create sent packet tracker
+        let mut tracker = SentPacketTracker::new();
+
+        // Simulate sending 5 packets of 1424 bytes each
+        let packet_size = 1424;
+        for packet_id in 0..5u32 {
+            let payload: Box<[u8]> = vec![0u8; packet_size].into_boxed_slice();
+            tracker.report_sent_packet(packet_id, payload);
+            ledbat.on_send(packet_size);
+        }
+
+        // Verify initial flightsize
+        assert_eq!(
+            ledbat.flightsize(),
+            5 * packet_size,
+            "Initial flightsize should be 5 * packet_size"
+        );
+
+        // Simulate ACK for packets 0, 1, 2 (normal ACKs with RTT samples)
+        let (ack_info, _) = tracker.report_received_receipts(&[0, 1, 2]);
+        assert_eq!(ack_info.len(), 3, "Should have 3 ACK entries");
+
+        // All 3 should have RTT samples (not retransmitted)
+        for (rtt_opt, size) in &ack_info {
+            assert!(
+                rtt_opt.is_some(),
+                "Non-retransmitted packets should have RTT samples"
+            );
+            assert_eq!(*size, packet_size, "Packet size should match");
+        }
+
+        // Apply ACKs to LEDBAT - this should decrement flightsize
+        for (rtt_opt, size) in ack_info {
+            match rtt_opt {
+                Some(rtt) => ledbat.on_ack(rtt, size),
+                None => ledbat.on_ack_without_rtt(size),
+            }
+        }
+
+        assert_eq!(
+            ledbat.flightsize(),
+            2 * packet_size,
+            "Flightsize should be decremented to 2 * packet_size"
+        );
+
+        // Now simulate a timeout and retransmission for packet 3
+        // Mark it as retransmitted
+        tracker.mark_retransmitted(3);
+
+        // Re-register the packet (simulating retransmission)
+        // In real code, this happens in check_resend_receipts
+        let payload: Box<[u8]> = vec![0u8; packet_size].into_boxed_slice();
+        tracker.report_sent_packet(3, payload);
+
+        // Simulate ACK for retransmitted packet 3
+        let (ack_info, _) = tracker.report_received_receipts(&[3]);
+        assert_eq!(
+            ack_info.len(),
+            1,
+            "Should have 1 ACK entry for retransmitted packet"
+        );
+
+        // THIS IS THE KEY TEST: Retransmitted packet should return size but NO RTT
+        let (rtt_opt, size) = &ack_info[0];
+        assert!(
+            rtt_opt.is_none(),
+            "Retransmitted packets should NOT have RTT samples (Karn's algorithm)"
+        );
+        assert_eq!(
+            *size, packet_size,
+            "Retransmitted packet ACK MUST still return packet size for flightsize decrement"
+        );
+
+        // Apply the ACK - should call on_ack_without_rtt, NOT skip the call entirely
+        for (rtt_opt, size) in ack_info {
+            match rtt_opt {
+                Some(rtt) => ledbat.on_ack(rtt, size),
+                None => ledbat.on_ack_without_rtt(size),
+            }
+        }
+
+        // Verify flightsize was properly decremented
+        assert_eq!(
+            ledbat.flightsize(),
+            packet_size,
+            "Flightsize should be decremented even for retransmitted packet ACKs"
+        );
+
+        // Also ACK the last packet (4) to verify normal flow still works
+        let (ack_info, _) = tracker.report_received_receipts(&[4]);
+        for (rtt_opt, size) in ack_info {
+            match rtt_opt {
+                Some(rtt) => ledbat.on_ack(rtt, size),
+                None => ledbat.on_ack_without_rtt(size),
+            }
+        }
+
+        assert_eq!(
+            ledbat.flightsize(),
+            0,
+            "All packets ACKed, flightsize should be 0"
+        );
+    }
 }
