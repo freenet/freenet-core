@@ -31,6 +31,10 @@ impl StoreFsManagement for DelegateStore {
     ) {
         container.insert(key, (offset, value));
     }
+
+    fn clear_container(container: &mut Self::MemContainer) {
+        container.clear();
+    }
 }
 
 impl DelegateStore {

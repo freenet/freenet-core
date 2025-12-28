@@ -95,6 +95,10 @@ impl StoreFsManagement for SecretsStore {
             }
         }
     }
+
+    fn clear_container(container: &mut Self::MemContainer) {
+        container.clear();
+    }
 }
 
 impl SecretsStore {
