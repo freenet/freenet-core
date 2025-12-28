@@ -13,45 +13,48 @@ use super::report::ReportCommand;
 /// Find the latest log file in the given directory.
 /// Handles both static files (e.g., "freenet.log" from systemd) and
 /// rotated files (e.g., "freenet.2025-12-27.log" from tracing-appender).
+/// Returns the most recently modified file.
 fn find_latest_log_file(log_dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
     use std::fs;
 
-    // First, check for the static file (used by systemd StandardOutput)
+    let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+
+    // Check for the static file (used by systemd StandardOutput)
     let static_file = log_dir.join(format!("{base_name}.log"));
     if static_file.exists() {
-        // Check if the file has content or was recently modified
         if let Ok(metadata) = fs::metadata(&static_file) {
             if metadata.len() > 0 {
-                return Some(static_file);
+                if let Ok(modified) = metadata.modified() {
+                    candidates.push((static_file, modified));
+                }
             }
         }
     }
 
     // Look for rotated files (pattern: {base_name}.YYYY-MM-DD.log)
-    let Ok(entries) = fs::read_dir(log_dir) else {
-        return None;
-    };
-
-    let mut log_files: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name();
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
             let name_str = name.to_string_lossy();
             // Match pattern: {base_name}.YYYY-MM-DD.log
-            name_str.starts_with(&format!("{base_name}."))
+            if name_str.starts_with(&format!("{base_name}."))
                 && name_str.ends_with(".log")
                 && name_str.len() > format!("{base_name}..log").len()
-        })
-        .collect();
+            {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        candidates.push((entry.path(), modified));
+                    }
+                }
+            }
+        }
+    }
 
-    // Sort by modification time (most recent first)
-    log_files.sort_by(|a, b| {
-        let time_a = a.metadata().and_then(|m| m.modified()).ok();
-        let time_b = b.metadata().and_then(|m| m.modified()).ok();
-        time_b.cmp(&time_a)
-    });
-
-    log_files.first().map(|e| e.path())
+    // Return the most recently modified file
+    candidates
+        .into_iter()
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(path, _)| path)
 }
 
 #[derive(Subcommand, Debug, Clone)]
