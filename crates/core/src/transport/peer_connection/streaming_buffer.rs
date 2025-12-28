@@ -21,9 +21,9 @@
 //! - 96× speedup over RwLock-based approach
 
 use bytes::Bytes;
+use event_listener::Event;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
-use tokio::sync::Notify;
 
 use crate::transport::packet_data;
 
@@ -49,6 +49,22 @@ pub(crate) const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 /// processed. This is critical for large streams where holding all fragments
 /// until completion would waste memory.
 ///
+/// # Future Improvements
+///
+/// The current design pre-allocates a fixed-size `Box<[AtomicPtr<Bytes>]>` for
+/// all fragments. For very large streams (100MB+), this has ~0.6% overhead
+/// (8 bytes per fragment × ~73K fragments = 600KB for a 100MB stream).
+///
+/// Potential improvements for Phase 2+:
+/// - **Ring buffer with sliding window**: For multi-consumer scenarios, track
+///   per-consumer read positions and only retain fragments in the active window.
+///   This would allow automatic memory reclamation even with multiple consumers,
+///   without requiring explicit `stream_with_reclaim()`.
+/// - **Chunked allocation**: Allocate fragment slots in chunks (e.g., 1MB worth)
+///   and free completed chunks. Reduces upfront allocation for large streams.
+/// - **Consumer reference counting**: Track active consumers to automatically
+///   reclaim fragments when all consumers have passed them.
+///
 /// Based on spike implementation from iduartgomez/freenet-core#204.
 pub struct LockFreeStreamBuffer {
     /// Pre-allocated slots for each fragment. Each slot is a pointer to heap-allocated Bytes.
@@ -65,9 +81,10 @@ pub struct LockFreeStreamBuffer {
     /// Highest fragment index that has been consumed/freed (0 = none consumed).
     /// Fragments up to this index have been cleared from memory.
     consumed_frontier: AtomicU32,
-    /// Notification for when new fragments arrive.
-    /// Allows async consumers to wait efficiently.
-    data_available: Notify,
+    /// Lock-free event notification for when new fragments arrive.
+    /// Uses `event-listener` crate which is more efficient than `tokio::sync::Notify`
+    /// as it avoids mutex contention for the waiter list.
+    data_available: Event,
 }
 
 impl LockFreeStreamBuffer {
@@ -92,7 +109,7 @@ impl LockFreeStreamBuffer {
             total_fragments: num_fragments as u32,
             contiguous_fragments: AtomicU32::new(0),
             consumed_frontier: AtomicU32::new(0),
-            data_available: Notify::new(),
+            data_available: Event::new(),
         }
     }
 
@@ -151,7 +168,8 @@ impl LockFreeStreamBuffer {
             Ok(_) => {
                 // Successfully inserted
                 self.advance_frontier();
-                self.data_available.notify_waiters();
+                // Notify all waiting listeners that new data is available
+                self.data_available.notify(usize::MAX);
                 Ok(true)
             }
             Err(_) => {
@@ -362,10 +380,12 @@ impl LockFreeStreamBuffer {
         freed_count
     }
 
-    /// Returns a reference to the notification handle.
+    /// Returns a reference to the notification event.
     ///
-    /// Use this to wait for new fragments to arrive.
-    pub fn notifier(&self) -> &Notify {
+    /// Use `event.listen().await` to wait for new fragments to arrive.
+    /// This is more efficient than `tokio::sync::Notify` as it uses
+    /// lock-free synchronization for the waiter list.
+    pub fn notifier(&self) -> &Event {
         &self.data_available
     }
 
@@ -860,7 +880,7 @@ mod tests {
         // Spawn a task that waits for notification
         let waiter = tokio::spawn(async move {
             barrier_clone.wait().await;
-            buffer_clone.notifier().notified().await;
+            buffer_clone.notifier().listen().await;
             true
         });
 

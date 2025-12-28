@@ -286,8 +286,8 @@ impl StreamHandle {
         sync.wake_all();
         drop(sync); // Release lock before notifying
 
-        // Wake async waiters blocked on buffer.notifier().notified()
-        self.buffer.notifier().notify_waiters();
+        // Wake async waiters blocked on buffer.notifier().listen()
+        self.buffer.notifier().notify(usize::MAX);
     }
 
     /// Assembles the complete data if all fragments are present.
@@ -319,9 +319,9 @@ impl StreamHandle {
                 });
             }
 
-            // Wait for notification using buffer's built-in Notify
+            // Wait for notification using buffer's lock-free Event
             // This is safe because we're not holding any lock across the await
-            self.buffer.notifier().notified().await;
+            self.buffer.notifier().listen().await;
         }
     }
 }

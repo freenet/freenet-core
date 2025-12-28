@@ -39,6 +39,7 @@ delegate = "0.13"
 directories = "6"
 dirs = "6"
 either = { features = ["serde"], workspace = true }
+event-listener = "5"
 flate2 = "1"
 flatbuffers = "25.9"
 futures = "0.3"
