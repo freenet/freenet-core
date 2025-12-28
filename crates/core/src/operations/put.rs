@@ -249,7 +249,9 @@ impl Operation for PutOp {
                     let was_seeding = op_manager.ring.is_seeding_contract(&key);
 
                     // Step 1: Store contract locally (all nodes cache)
-                    let merged_value = put_contract(
+                    // put_contract returns (merged_value, state_changed) where state_changed
+                    // is true if the stored state actually changed (old != new).
+                    let (merged_value, state_changed) = put_contract(
                         op_manager,
                         key,
                         value.clone(),
@@ -264,9 +266,13 @@ impl Operation for PutOp {
                         super::announce_contract_cached(op_manager, &key).await;
                     }
 
-                    // If we were already subscribed and the merged value differs from input,
-                    // trigger an Update to propagate the change to other subscribers
-                    let state_changed = merged_value.as_ref() != value.as_ref();
+                    // If we were already subscribed and the stored state actually changed,
+                    // trigger an Update to propagate the change to other subscribers.
+                    // NOTE: We use state_changed from the contract handler, NOT comparison
+                    // of merged_value vs input value. This correctly handles the case where
+                    // the contract's summarize function accepts the incoming state as-is
+                    // (merged_value == value) but the STORED state changed from a previous
+                    // version. See River UI propagation bug.
                     if was_seeding && state_changed {
                         tracing::debug!(
                             tx = %id,
@@ -664,13 +670,16 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
     Ok(())
 }
 
+/// Stores the contract state and returns (new_state, state_changed).
+/// `state_changed` is true if the stored state was actually modified
+/// (old state != new state), which is needed to trigger UPDATE propagation.
 async fn put_contract(
     op_manager: &OpManager,
     key: ContractKey,
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
     contract: &ContractContainer,
-) -> Result<WrappedState, OpError> {
+) -> Result<(WrappedState, bool), OpError> {
     // after the contract has been cached, push the update query
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::PutQuery {
@@ -683,13 +692,15 @@ async fn put_contract(
     {
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Ok(new_val),
+            state_changed,
         }) => {
             // Notify any waiters that this contract has been stored
             op_manager.notify_contract_stored(&key);
-            Ok(new_val)
+            Ok((new_val, state_changed))
         }
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Err(err),
+            ..
         }) => {
             tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
             Err(OpError::from(err))

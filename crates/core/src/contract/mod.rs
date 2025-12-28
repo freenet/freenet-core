@@ -189,9 +189,11 @@ where
                 let event_result = match put_result {
                     Ok(UpsertResult::NoChange) => ContractHandlerEvent::PutResponse {
                         new_value: Ok(state),
+                        state_changed: false,
                     },
                     Ok(UpsertResult::Updated(state)) => ContractHandlerEvent::PutResponse {
                         new_value: Ok(state),
+                        state_changed: true,
                     },
                     Err(err) => {
                         if err.is_fatal() {
@@ -205,6 +207,7 @@ where
                         }
                         ContractHandlerEvent::PutResponse {
                             new_value: Err(err),
+                            state_changed: false,
                         }
                     }
                 };
