@@ -4248,3 +4248,284 @@ async fn test_get_notfound_no_forwarding_targets(ctx: &mut TestContext) -> TestR
     tracing::info!("Test PASSED: GET for non-existent contract fails quickly (not timeout)");
     Ok(())
 }
+
+/// Regression test for PUT→UPDATE propagation bug.
+///
+/// When a PUT arrives at a node that's subscribed to the contract, and the
+/// contract's summarize function accepts the incoming state as-is (e.g., "newer
+/// version wins"), the PUT should trigger an UPDATE to notify other subscribers.
+///
+/// Previously, the code compared merged_value with the PUT input value:
+///   `state_changed = merged_value != value`
+/// This failed to detect changes when summarize returns the input unchanged,
+/// because merged_value == value even though the STORED state changed.
+///
+/// The fix compares old stored state with new stored state instead.
+#[freenet_test(
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 300,
+    startup_wait_secs = 15,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_put_triggers_update_for_subscribers(ctx: &mut TestContext) -> TestResult {
+    // Load test contract
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    // Create initial state (version 1)
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_initial_state = WrappedState::from(initial_state.clone());
+
+    let peer_a = ctx.node("peer-a")?;
+    let gateway = ctx.node("gateway")?;
+    let ws_api_port_peer_a = peer_a.ws_port;
+    let ws_api_port_gateway = gateway.ws_port;
+
+    tracing::info!("Peer A data dir: {:?}", peer_a.temp_dir_path);
+    tracing::info!("Gateway data dir: {:?}", gateway.temp_dir_path);
+
+    // Wait for connection to stabilize
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Connect to peer-a's websocket API
+    let uri_peer_a =
+        format!("ws://127.0.0.1:{ws_api_port_peer_a}/v1/contract/command?encodingProtocol=native");
+    let (stream_a, _) = connect_async(&uri_peer_a).await?;
+    let mut client_peer_a = WebApi::start(stream_a);
+
+    // Connect to gateway's websocket API
+    let uri_gateway =
+        format!("ws://127.0.0.1:{ws_api_port_gateway}/v1/contract/command?encodingProtocol=native");
+    let (stream_gw, _) = connect_async(&uri_gateway).await?;
+    let mut client_gateway = WebApi::start(stream_gw);
+
+    // Step 1: Peer-a puts the contract with initial state
+    tracing::info!("Step 1: Peer-a putting contract with initial state (version 1)");
+    make_put(
+        &mut client_peer_a,
+        wrapped_initial_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    // Wait for put response from peer-a
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_peer_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+            tracing::info!("Peer-a: Initial PUT successful for contract {}", key);
+        }
+        Ok(Ok(other)) => {
+            bail!(
+                "Peer-a: unexpected response while waiting for put: {:?}",
+                other
+            );
+        }
+        Ok(Err(e)) => {
+            bail!("Peer-a: Error receiving put response: {}", e);
+        }
+        Err(_) => {
+            bail!("Peer-a: Timeout waiting for put response");
+        }
+    }
+
+    // Step 2: Gateway gets the contract (this caches it on gateway)
+    tracing::info!("Step 2: Gateway getting contract to cache it");
+    make_get(&mut client_gateway, contract_key, true, false).await?;
+
+    // Wait for get response on gateway
+    let resp = tokio::time::timeout(Duration::from_secs(60), client_gateway.recv()).await;
+    let initial_state_on_gateway: WrappedState = match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key,
+            state,
+            ..
+        }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in GET response");
+            tracing::info!("Gateway: GET successful, contract cached");
+            state
+        }
+        Ok(Ok(other)) => {
+            bail!(
+                "Gateway: unexpected response while waiting for get: {:?}",
+                other
+            );
+        }
+        Ok(Err(e)) => {
+            bail!("Gateway: Error receiving get response: {}", e);
+        }
+        Err(_) => {
+            bail!("Gateway: Timeout waiting for get response");
+        }
+    };
+
+    // Step 3: Gateway subscribes to the contract
+    tracing::info!("Step 3: Gateway subscribing to contract");
+    make_subscribe(&mut client_gateway, contract_key).await?;
+
+    // Wait for subscribe response
+    let resp = tokio::time::timeout(Duration::from_secs(30), client_gateway.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key, ..
+        }))) => {
+            assert_eq!(
+                key, contract_key,
+                "Contract key mismatch in SUBSCRIBE response"
+            );
+            tracing::info!("Gateway: SUBSCRIBE successful for contract {}", key);
+        }
+        Ok(Ok(other)) => {
+            bail!(
+                "Gateway: unexpected response while waiting for subscribe: {:?}",
+                other
+            );
+        }
+        Ok(Err(e)) => {
+            bail!("Gateway: Error receiving subscribe response: {}", e);
+        }
+        Err(_) => {
+            bail!("Gateway: Timeout waiting for subscribe response");
+        }
+    }
+
+    // Give subscription time to propagate
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Step 4: Peer-a PUTs an updated version of the contract
+    // This is the key step - PUT (not UPDATE) should trigger UPDATE propagation
+    // to subscribers when the stored state changes.
+    tracing::info!("Step 4: Peer-a putting UPDATED contract state (version 2)");
+
+    // Create updated state (add a todo item to simulate version 2)
+    let mut todo_list: test_utils::TodoList =
+        serde_json::from_slice(initial_state_on_gateway.as_ref())
+            .expect("Failed to deserialize initial state as TodoList");
+    todo_list.tasks.push(test_utils::Task {
+        id: 1,
+        title: "PUT→UPDATE regression test".to_string(),
+        description: "This task should propagate to gateway when PUT triggers UPDATE".to_string(),
+        completed: false,
+        priority: 1,
+    });
+    let updated_bytes = serde_json::to_vec(&todo_list).unwrap();
+    let wrapped_updated_state = WrappedState::from(updated_bytes);
+
+    // PUT the updated state (not UPDATE - that's intentional!)
+    make_put(
+        &mut client_peer_a,
+        wrapped_updated_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    // Wait for put response from peer-a
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_peer_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            assert_eq!(
+                key, contract_key,
+                "Contract key mismatch in second PUT response"
+            );
+            tracing::info!("Peer-a: Second PUT successful for contract {}", key);
+        }
+        Ok(Ok(other)) => {
+            bail!(
+                "Peer-a: unexpected response while waiting for second put: {:?}",
+                other
+            );
+        }
+        Ok(Err(e)) => {
+            bail!("Peer-a: Error receiving second put response: {}", e);
+        }
+        Err(_) => {
+            bail!("Peer-a: Timeout waiting for second put response");
+        }
+    }
+
+    // Step 5: Gateway should receive an UPDATE notification because it's subscribed
+    // and the PUT should have triggered UPDATE propagation.
+    tracing::info!("Step 5: Waiting for UPDATE notification on gateway (subscribed)");
+
+    // Poll for update via GET since subscription notifications can be unreliable
+    const POLL_INTERVAL_SECS: u64 = 2;
+    const POLL_TIMEOUT_SECS: u64 = 30;
+
+    let poll_start = std::time::Instant::now();
+    let poll_timeout = Duration::from_secs(POLL_TIMEOUT_SECS);
+    let mut gateway_received_update = false;
+
+    while poll_start.elapsed() < poll_timeout {
+        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+
+        make_get(&mut client_gateway, contract_key, false, false).await?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), client_gateway.recv()).await;
+        match resp {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key,
+                state,
+                ..
+            }))) => {
+                assert_eq!(key, contract_key);
+
+                // Check if the state has been updated
+                if state.as_ref() != initial_state_on_gateway.as_ref() {
+                    let state_on_gateway: test_utils::TodoList =
+                        serde_json::from_slice(state.as_ref())
+                            .expect("Failed to deserialize gateway state");
+
+                    if !state_on_gateway.tasks.is_empty()
+                        && state_on_gateway.tasks[0].title == "PUT→UPDATE regression test"
+                    {
+                        tracing::info!(
+                            "SUCCESS: Gateway received the UPDATE triggered by PUT! \
+                             State updated with {} task(s)",
+                            state_on_gateway.tasks.len()
+                        );
+                        gateway_received_update = true;
+                        break;
+                    }
+                }
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!("Gateway poll: unexpected response: {:?}", other);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Gateway poll: error: {}", e);
+            }
+            Err(_) => {
+                tracing::warn!("Gateway poll: timeout");
+            }
+        }
+
+        tracing::debug!(
+            "Gateway state not yet updated, polling... (elapsed: {:?})",
+            poll_start.elapsed()
+        );
+    }
+
+    // REGRESSION TEST: If the PUT→UPDATE conversion bug is present, the gateway
+    // won't receive the update because PUT didn't trigger UPDATE propagation.
+    // The bug was that `state_changed = merged_value != value` returned false
+    // when summarize accepts the incoming state as-is, even though the STORED
+    // state actually changed.
+    ensure!(
+        gateway_received_update,
+        "REGRESSION FAILURE (PUT→UPDATE propagation): Gateway did not receive UPDATE \
+         triggered by PUT. This indicates the bug is present: PUT on a subscribed \
+         contract is not triggering UPDATE propagation when the contract's summarize \
+         function accepts the incoming state as-is (merged_value == value)."
+    );
+
+    tracing::info!(
+        "PUT→UPDATE propagation regression test passed: \
+         PUT correctly triggers UPDATE for subscribers"
+    );
+
+    Ok(())
+}

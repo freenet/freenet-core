@@ -470,6 +470,9 @@ pub(crate) enum ContractHandlerEvent {
     /// The response to a push query
     PutResponse {
         new_value: Result<WrappedState, ExecutorError>,
+        /// True if the stored state actually changed (old state != new state).
+        /// Used to determine whether PUT should trigger UPDATE propagation.
+        state_changed: bool,
     },
     /// Fetch a supposedly existing contract value in this node, and optionally the contract itself
     GetQuery {
@@ -541,9 +544,15 @@ impl std::fmt::Display for ContractHandlerEvent {
                     write!(f, "put query {{ {key} }}")
                 }
             }
-            ContractHandlerEvent::PutResponse { new_value } => match new_value {
+            ContractHandlerEvent::PutResponse {
+                new_value,
+                state_changed,
+            } => match new_value {
                 Ok(v) => {
-                    write!(f, "put query response {{ {v} }}",)
+                    write!(
+                        f,
+                        "put query response {{ {v}, state_changed: {state_changed} }}",
+                    )
                 }
                 Err(e) => {
                     write!(f, "put query failed {{ {e} }}",)
@@ -641,15 +650,21 @@ pub mod test {
                 id,
                 ContractHandlerEvent::PutResponse {
                     new_value: Ok(vec![0, 7].into()),
+                    state_changed: true,
                 },
             ),
         )
         .await??;
-        let ContractHandlerEvent::PutResponse { new_value } = h.await?? else {
+        let ContractHandlerEvent::PutResponse {
+            new_value,
+            state_changed,
+        } = h.await??
+        else {
             anyhow::bail!("invalid event!");
         };
         let new_value = new_value.map_err(|e| anyhow::anyhow!(e))?;
         assert_eq!(new_value.as_ref(), &[0, 7]);
+        assert!(state_changed);
 
         Ok(())
     }
@@ -711,6 +726,7 @@ pub mod test {
                 id,
                 ContractHandlerEvent::PutResponse {
                     new_value: Ok(vec![0, 7].into()),
+                    state_changed: true,
                 },
             )
             .await;

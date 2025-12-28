@@ -1226,6 +1226,7 @@ impl Operation for GetOp {
                                                 match put_result {
                                                     Ok(ContractHandlerEvent::PutResponse {
                                                         new_value: Ok(_),
+                                                        ..
                                                     }) => {
                                                         tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
                                                         super::announce_contract_cached(
@@ -1334,6 +1335,7 @@ impl Operation for GetOp {
                                                 match put_result {
                                                     Ok(ContractHandlerEvent::PutResponse {
                                                         new_value: Ok(_),
+                                                        ..
                                                     }) => {
                                                         tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
                                                         super::announce_contract_cached(
@@ -1538,7 +1540,7 @@ impl Operation for GetOp {
                                     .await?;
 
                                 match res {
-                                    ContractHandlerEvent::PutResponse { new_value: Ok(_) } => {
+                                    ContractHandlerEvent::PutResponse { new_value: Ok(_), .. } => {
                                         tracing::debug!(tx = %id, %key, "Contract put at executor");
                                         let is_subscribed_contract =
                                             op_manager.ring.is_seeding_contract(&key);
@@ -1556,6 +1558,7 @@ impl Operation for GetOp {
                                     }
                                     ContractHandlerEvent::PutResponse {
                                         new_value: Err(err),
+                                        ..
                                     } => {
                                         // Local caching failed, but GET operation succeeded
                                         // Log warning and continue - caching is an optimization, not required
