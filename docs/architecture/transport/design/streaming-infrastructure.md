@@ -159,17 +159,54 @@ The buffer uses `tokio::sync::Notify` for efficient async waiting:
 | Component | Synchronization | Access Pattern |
 |-----------|-----------------|----------------|
 | `StreamRegistry.streams` | `DashMap` | Lock-free concurrent access |
-| `fragments` array | `OnceLock` (atomic CAS) | Many writers, many readers |
+| `fragments` array | `AtomicPtr` (CAS) | Many writers, many readers, clearable |
 | `contiguous_fragments` | `AtomicU32` (CAS loop) | Many writers, many readers |
+| `consumed_frontier` | `AtomicU32` (fetch_max) | Single writer, many readers |
 | `cancelled` flag | `parking_lot::RwLock` | Rare write, frequent read |
 | `wakers` | `parking_lot::RwLock` | Write on wait, read on wake |
+
+## Progressive Memory Reclamation
+
+Unlike `OnceLock`, `AtomicPtr` allows clearing slots after consumption. This enables
+progressive memory reclamation for large streams.
+
+### API Options
+
+| Method | Behavior | Use Case |
+|--------|----------|----------|
+| `stream()` | Clone fragments, keep in buffer | Multiple consumers, fork support |
+| `stream_with_reclaim()` | Take fragments, clear slots | Single consumer, memory-efficient |
+| `mark_consumed(up_to)` | Manually clear slots up to index | Fine-grained control |
+| `take(index)` | Take single fragment, clear slot | Custom consumption patterns |
+
+### Memory Behavior Example
+
+```
+10 MB stream (7,000 fragments)
+
+Without reclaim:
+- All 10 MB held until stream dropped
+- Multiple consumers can read
+
+With reclaim (stream_with_reclaim):
+- Fragment 1 read → Fragment 1 freed (9.999 MB)
+- Fragment 2 read → Fragment 2 freed (9.998 MB)
+- ...at completion, 0 bytes held
+```
+
+### Warning
+
+`stream_with_reclaim()` is incompatible with `fork()` - once a fragment is taken,
+no other consumer can read it. Use only for single-consumer scenarios.
 
 ## Performance Characteristics
 
 | Operation | Complexity | Synchronization |
 |-----------|------------|-----------------|
 | `insert()` | O(1) | Lock-free CAS |
-| `get()` | O(1) | None |
+| `get()` | O(1) | Atomic load |
+| `take()` | O(1) | Atomic swap |
+| `mark_consumed(n)` | O(n) | n atomic swaps |
 | `is_complete()` | O(1) | Atomic load |
 | `inserted_count()` | O(n) | None (iteration) |
 | `assemble()` | O(n) | None |

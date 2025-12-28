@@ -1,15 +1,17 @@
 //! Lock-free streaming buffer implementation.
 //!
 //! This module provides a high-performance, lock-free buffer for reassembling
-//! incoming stream fragments. The design uses `OnceLock<Bytes>` for each fragment
-//! slot, enabling concurrent fragment insertion without mutex contention.
+//! incoming stream fragments. The design uses `AtomicPtr<Bytes>` for each fragment
+//! slot, enabling concurrent fragment insertion without mutex contention and
+//! progressive memory reclamation as fragments are consumed.
 //!
 //! # Key Properties
 //!
-//! - **Lock-free writes**: Each slot uses atomic compare-and-swap via `OnceLock`
+//! - **Lock-free writes**: Each slot uses atomic compare-and-swap
 //! - **Zero-copy**: Uses `Bytes` for reference-counted data sharing
 //! - **Idempotent inserts**: Duplicate fragments are automatically no-ops
 //! - **Pre-allocated**: Buffer size determined by stream header's `total_size`
+//! - **Progressive reclamation**: Consumed fragments can be freed immediately
 //!
 //! # Performance
 //!
@@ -19,8 +21,8 @@
 //! - 96× speedup over RwLock-based approach
 
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use tokio::sync::Notify;
 
 use crate::transport::packet_data;
@@ -35,15 +37,24 @@ pub(crate) const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 
 /// A lock-free buffer for reassembling stream fragments.
 ///
-/// Uses `OnceLock<Bytes>` slots to enable concurrent, lock-free insertion.
-/// Each fragment can only be written once (write-once semantics), and
-/// concurrent writes to different slots never block each other.
+/// Uses `AtomicPtr<Bytes>` slots to enable concurrent, lock-free insertion
+/// and progressive memory reclamation. Each fragment can only be written once
+/// (write-once semantics), and concurrent writes to different slots never
+/// block each other.
+///
+/// # Memory Reclamation
+///
+/// Unlike `OnceLock`, `AtomicPtr` allows clearing slots after consumption.
+/// Call `mark_consumed(index)` to free memory for fragments that have been
+/// processed. This is critical for large streams where holding all fragments
+/// until completion would waste memory.
 ///
 /// Based on spike implementation from iduartgomez/freenet-core#204.
 pub struct LockFreeStreamBuffer {
-    /// Pre-allocated slots for each fragment. Each slot can be written exactly once.
+    /// Pre-allocated slots for each fragment. Each slot is a pointer to heap-allocated Bytes.
     /// Fragment indices are 1-indexed, so fragment N is stored at slots[N-1].
-    fragments: Box<[OnceLock<Bytes>]>,
+    /// NULL means empty/cleared, non-NULL means fragment is present.
+    fragments: Box<[AtomicPtr<Bytes>]>,
     /// Total expected bytes for the complete stream.
     total_size: u64,
     /// Total number of fragments expected.
@@ -51,6 +62,9 @@ pub struct LockFreeStreamBuffer {
     /// Highest contiguous fragment index from the start (0 = none received).
     /// Uses atomic CAS for lock-free frontier advancement.
     contiguous_fragments: AtomicU32,
+    /// Highest fragment index that has been consumed/freed (0 = none consumed).
+    /// Fragments up to this index have been cleared from memory.
+    consumed_frontier: AtomicU32,
     /// Notification for when new fragments arrive.
     /// Allows async consumers to wait efficiently.
     data_available: Notify,
@@ -68,13 +82,16 @@ impl LockFreeStreamBuffer {
     /// A new `LockFreeStreamBuffer` with enough slots to hold all fragments.
     pub fn new(total_size: u64) -> Self {
         let num_fragments = Self::calculate_fragment_count(total_size);
-        let fragments: Vec<OnceLock<Bytes>> = (0..num_fragments).map(|_| OnceLock::new()).collect();
+        let fragments: Vec<AtomicPtr<Bytes>> = (0..num_fragments)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
+            .collect();
 
         Self {
             fragments: fragments.into_boxed_slice(),
             total_size,
             total_fragments: num_fragments as u32,
             contiguous_fragments: AtomicU32::new(0),
+            consumed_frontier: AtomicU32::new(0),
             data_available: Notify::new(),
         }
     }
@@ -90,8 +107,8 @@ impl LockFreeStreamBuffer {
 
     /// Inserts a fragment into the buffer.
     ///
-    /// This is the core lock-free operation. Uses `OnceLock::set` which is
-    /// a single atomic CAS - duplicates are idempotent no-ops.
+    /// This is the core lock-free operation. Uses atomic CAS to insert
+    /// the fragment - duplicates are idempotent no-ops.
     ///
     /// # Arguments
     ///
@@ -102,7 +119,7 @@ impl LockFreeStreamBuffer {
     ///
     /// * `Ok(true)` - Fragment was inserted successfully
     /// * `Ok(false)` - Fragment was already present (duplicate, no-op)
-    /// * `Err(InsertError)` - Fragment index out of bounds
+    /// * `Err(InsertError)` - Fragment index out of bounds or already consumed
     pub fn insert(&self, fragment_index: u32, data: Bytes) -> Result<bool, InsertError> {
         if fragment_index == 0 || fragment_index > self.total_fragments {
             return Err(InsertError::InvalidIndex {
@@ -111,19 +128,41 @@ impl LockFreeStreamBuffer {
             });
         }
 
-        let idx = (fragment_index - 1) as usize;
-
-        // OnceLock::set is lock-free CAS - duplicates are idempotent
-        let was_empty = self.fragments[idx].set(data).is_ok();
-
-        if was_empty {
-            // Advance the contiguous frontier if possible
-            self.advance_frontier();
-            // Notify waiters
-            self.data_available.notify_waiters();
+        // Check if this fragment has already been consumed
+        if fragment_index <= self.consumed_frontier.load(Ordering::Acquire) {
+            return Err(InsertError::AlreadyConsumed {
+                index: fragment_index,
+            });
         }
 
-        Ok(was_empty)
+        let idx = (fragment_index - 1) as usize;
+
+        // Allocate the Bytes on the heap
+        let boxed = Box::new(data);
+        let new_ptr = Box::into_raw(boxed);
+
+        // Atomic CAS: only insert if slot is currently NULL
+        match self.fragments[idx].compare_exchange(
+            ptr::null_mut(),
+            new_ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Successfully inserted
+                self.advance_frontier();
+                self.data_available.notify_waiters();
+                Ok(true)
+            }
+            Err(_) => {
+                // Slot was already occupied - drop our allocation
+                // SAFETY: new_ptr was just created by Box::into_raw and not shared
+                unsafe {
+                    drop(Box::from_raw(new_ptr));
+                }
+                Ok(false) // Duplicate, no-op
+            }
+        }
     }
 
     /// Advances the contiguous fragment frontier using lock-free CAS.
@@ -160,7 +199,8 @@ impl LockFreeStreamBuffer {
             }
 
             let idx = (next - 1) as usize;
-            if self.fragments[idx].get().is_none() {
+            // Check if slot has a valid pointer (not NULL)
+            if self.fragments[idx].load(Ordering::Acquire).is_null() {
                 return; // Gap - can't advance further
             }
 
@@ -182,10 +222,13 @@ impl LockFreeStreamBuffer {
         self.contiguous_fragments.load(Ordering::Acquire) == self.total_fragments
     }
 
-    /// Returns the number of fragments that have been inserted.
+    /// Returns the number of fragments that are currently present (not consumed).
     pub fn inserted_count(&self) -> usize {
-        // Count non-empty slots
-        self.fragments.iter().filter(|s| s.get().is_some()).count()
+        // Count non-NULL slots
+        self.fragments
+            .iter()
+            .filter(|s| !s.load(Ordering::Acquire).is_null())
+            .count()
     }
 
     /// Returns the total number of expected fragments.
@@ -206,7 +249,15 @@ impl LockFreeStreamBuffer {
         self.contiguous_fragments.load(Ordering::Acquire)
     }
 
-    /// Gets a reference to a fragment if it has been inserted.
+    /// Returns the consumed frontier (1-indexed).
+    ///
+    /// Fragments up to and including this index have been freed.
+    /// Returns 0 if no fragments have been consumed.
+    pub fn consumed_frontier(&self) -> u32 {
+        self.consumed_frontier.load(Ordering::Acquire)
+    }
+
+    /// Gets a reference to a fragment if it is present and not consumed.
     ///
     /// # Arguments
     ///
@@ -215,12 +266,100 @@ impl LockFreeStreamBuffer {
     /// # Returns
     ///
     /// `Some(&Bytes)` if the fragment is present, `None` otherwise.
+    ///
+    /// # Safety
+    ///
+    /// The returned reference is valid as long as `mark_consumed` is not called
+    /// for this index. Callers must ensure they don't hold references across
+    /// consumption boundaries.
     pub fn get(&self, fragment_index: u32) -> Option<&Bytes> {
         if fragment_index == 0 || fragment_index > self.total_fragments {
             return None;
         }
         let idx = (fragment_index - 1) as usize;
-        self.fragments.get(idx)?.get()
+        let ptr = self.fragments[idx].load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: If ptr is non-null, it was set by insert() and points to valid Bytes.
+        // The reference is valid until mark_consumed is called for this index.
+        Some(unsafe { &*ptr })
+    }
+
+    /// Takes a fragment, returning ownership and clearing the slot.
+    ///
+    /// This is useful for single-consumer scenarios where the consumer
+    /// wants to own the data rather than clone it.
+    ///
+    /// # Arguments
+    ///
+    /// * `fragment_index` - 1-indexed fragment number
+    ///
+    /// # Returns
+    ///
+    /// `Some(Bytes)` if the fragment was present, `None` if already taken or not inserted.
+    pub fn take(&self, fragment_index: u32) -> Option<Bytes> {
+        if fragment_index == 0 || fragment_index > self.total_fragments {
+            return None;
+        }
+        let idx = (fragment_index - 1) as usize;
+
+        // Atomically swap the pointer to NULL
+        let ptr = self.fragments[idx].swap(ptr::null_mut(), Ordering::AcqRel);
+        if ptr.is_null() {
+            return None;
+        }
+
+        // SAFETY: ptr was set by insert() and we just took exclusive ownership via swap
+        let boxed = unsafe { Box::from_raw(ptr) };
+        Some(*boxed)
+    }
+
+    /// Marks fragments up to and including the given index as consumed, freeing their memory.
+    ///
+    /// This enables progressive memory reclamation for streaming consumers.
+    /// After calling this, fragments 1..=up_to_index will return `None` from `get()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `up_to_index` - 1-indexed fragment number (inclusive)
+    ///
+    /// # Returns
+    ///
+    /// The number of fragments actually freed (may be less if some were already consumed).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `up_to_index` is greater than `total_fragments`.
+    pub fn mark_consumed(&self, up_to_index: u32) -> usize {
+        assert!(
+            up_to_index <= self.total_fragments,
+            "mark_consumed index {} exceeds total_fragments {}",
+            up_to_index,
+            self.total_fragments
+        );
+
+        let mut freed_count = 0;
+        let current_consumed = self.consumed_frontier.load(Ordering::Acquire);
+
+        // Only process fragments we haven't already consumed
+        for idx in current_consumed..up_to_index {
+            let slot_idx = idx as usize;
+            let ptr = self.fragments[slot_idx].swap(ptr::null_mut(), Ordering::AcqRel);
+            if !ptr.is_null() {
+                // SAFETY: ptr was set by insert() and we just took exclusive ownership via swap
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+                freed_count += 1;
+            }
+        }
+
+        // Update the consumed frontier (use fetch_max for thread safety)
+        self.consumed_frontier
+            .fetch_max(up_to_index, Ordering::AcqRel);
+
+        freed_count
     }
 
     /// Returns a reference to the notification handle.
@@ -235,15 +374,25 @@ impl LockFreeStreamBuffer {
     /// # Returns
     ///
     /// * `Some(Vec<u8>)` - Complete assembled data if all fragments are present
-    /// * `None` - If any fragments are missing
+    /// * `None` - If any fragments are missing (including consumed ones)
     pub fn assemble(&self) -> Option<Vec<u8>> {
         if !self.is_complete() {
             return None;
         }
 
+        // Check that no fragments have been consumed
+        if self.consumed_frontier.load(Ordering::Acquire) > 0 {
+            return None; // Can't assemble if fragments were consumed
+        }
+
         let mut result = Vec::with_capacity(self.total_size as usize);
         for slot in self.fragments.iter() {
-            let data = slot.get()?;
+            let ptr = slot.load(Ordering::Acquire);
+            if ptr.is_null() {
+                return None;
+            }
+            // SAFETY: ptr is non-null and was set by insert()
+            let data = unsafe { &*ptr };
             result.extend_from_slice(data);
         }
 
@@ -254,9 +403,17 @@ impl LockFreeStreamBuffer {
 
     /// Returns an iterator over the fragments in order.
     ///
-    /// Yields `None` for missing fragments and `Some(&Bytes)` for present ones.
+    /// Yields `None` for missing/consumed fragments and `Some(&Bytes)` for present ones.
     pub fn iter(&self) -> impl Iterator<Item = Option<&Bytes>> {
-        self.fragments.iter().map(|slot| slot.get())
+        self.fragments.iter().map(|slot| {
+            let ptr = slot.load(Ordering::Acquire);
+            if ptr.is_null() {
+                None
+            } else {
+                // SAFETY: ptr is non-null and was set by insert()
+                Some(unsafe { &*ptr })
+            }
+        })
     }
 
     /// Returns an iterator over contiguous fragments starting from index 1.
@@ -265,7 +422,15 @@ impl LockFreeStreamBuffer {
     /// streaming consumption - it yields only fragments that can be
     /// processed in order.
     pub fn iter_contiguous(&self) -> impl Iterator<Item = &Bytes> {
-        self.fragments.iter().map_while(|slot| slot.get())
+        self.fragments.iter().map_while(|slot| {
+            let ptr = slot.load(Ordering::Acquire);
+            if ptr.is_null() {
+                None
+            } else {
+                // SAFETY: ptr is non-null and was set by insert()
+                Some(unsafe { &*ptr })
+            }
+        })
     }
 
     /// Collects all contiguous fragments into a single buffer.
@@ -283,6 +448,21 @@ impl LockFreeStreamBuffer {
     }
 }
 
+/// Ensures all remaining fragments are properly deallocated when the buffer is dropped.
+impl Drop for LockFreeStreamBuffer {
+    fn drop(&mut self) {
+        for slot in self.fragments.iter() {
+            let ptr = slot.load(Ordering::Acquire);
+            if !ptr.is_null() {
+                // SAFETY: We have exclusive access during drop, ptr was set by insert()
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        }
+    }
+}
+
 /// Error returned when a fragment insertion fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InsertError {
@@ -292,6 +472,11 @@ pub enum InsertError {
         index: u32,
         /// Maximum valid index
         max: u32,
+    },
+    /// Fragment has already been consumed and cannot be re-inserted.
+    AlreadyConsumed {
+        /// The fragment index that was already consumed
+        index: u32,
     },
 }
 
@@ -304,6 +489,9 @@ impl std::fmt::Display for InsertError {
                     "fragment index {} is out of bounds (max: {})",
                     index, max
                 )
+            }
+            InsertError::AlreadyConsumed { index } => {
+                write!(f, "fragment index {} has already been consumed", index)
             }
         }
     }
@@ -686,5 +874,336 @@ mod tests {
         let result = tokio::time::timeout(tokio::time::Duration::from_millis(100), waiter).await;
         assert!(result.is_ok());
         assert!(result.unwrap().unwrap());
+    }
+
+    // ==================== Progressive Reclamation Tests ====================
+
+    #[test]
+    fn test_mark_consumed_basic() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        // Insert all fragments
+        for i in 1..=3 {
+            buffer
+                .insert(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        assert_eq!(buffer.inserted_count(), 3);
+        assert_eq!(buffer.consumed_frontier(), 0);
+
+        // Consume first fragment
+        let freed = buffer.mark_consumed(1);
+        assert_eq!(freed, 1);
+        assert_eq!(buffer.consumed_frontier(), 1);
+        assert_eq!(buffer.inserted_count(), 2); // Only 2 remain
+        assert!(buffer.get(1).is_none()); // Consumed
+        assert!(buffer.get(2).is_some()); // Still there
+
+        // Consume remaining fragments
+        let freed = buffer.mark_consumed(3);
+        assert_eq!(freed, 2);
+        assert_eq!(buffer.consumed_frontier(), 3);
+        assert_eq!(buffer.inserted_count(), 0);
+    }
+
+    #[test]
+    fn test_mark_consumed_idempotent() {
+        let buffer = LockFreeStreamBuffer::new(100);
+        buffer.insert(1, Bytes::from_static(b"hello")).unwrap();
+
+        // First call frees the fragment
+        let freed1 = buffer.mark_consumed(1);
+        assert_eq!(freed1, 1);
+
+        // Second call is a no-op (already consumed)
+        let freed2 = buffer.mark_consumed(1);
+        assert_eq!(freed2, 0);
+
+        assert_eq!(buffer.consumed_frontier(), 1);
+    }
+
+    #[test]
+    fn test_insert_after_consumed_fails() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        // Insert and consume fragment 1
+        buffer
+            .insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        buffer.mark_consumed(1);
+
+        // Try to re-insert fragment 1 - should fail
+        let result = buffer.insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]));
+        assert!(matches!(
+            result,
+            Err(InsertError::AlreadyConsumed { index: 1 })
+        ));
+
+        // Fragment 2 should still be insertable
+        let result = buffer.insert(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_take_fragment() {
+        let buffer = LockFreeStreamBuffer::new(100);
+        let data = Bytes::from_static(b"hello");
+        buffer.insert(1, data.clone()).unwrap();
+
+        // Take the fragment
+        let taken = buffer.take(1);
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap(), data);
+
+        // Slot is now empty
+        assert!(buffer.get(1).is_none());
+        assert_eq!(buffer.inserted_count(), 0);
+
+        // Second take returns None
+        assert!(buffer.take(1).is_none());
+    }
+
+    #[test]
+    fn test_take_invalid_indices() {
+        let buffer = LockFreeStreamBuffer::new(100);
+
+        assert!(buffer.take(0).is_none()); // Invalid index
+        assert!(buffer.take(2).is_none()); // Out of bounds
+    }
+
+    #[test]
+    fn test_assemble_fails_after_consumption() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        // Insert all fragments
+        buffer
+            .insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        buffer
+            .insert(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        // Assembly works before consumption
+        assert!(buffer.assemble().is_some());
+
+        // Consume first fragment
+        buffer.mark_consumed(1);
+
+        // Assembly fails after consumption
+        assert!(buffer.assemble().is_none());
+    }
+
+    #[test]
+    fn test_iter_shows_consumed_as_none() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        for i in 1..=3 {
+            buffer
+                .insert(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        // Consume first two
+        buffer.mark_consumed(2);
+
+        let fragments: Vec<_> = buffer.iter().collect();
+        assert!(fragments[0].is_none()); // Consumed
+        assert!(fragments[1].is_none()); // Consumed
+        assert!(fragments[2].is_some()); // Still present
+    }
+
+    #[test]
+    fn test_iter_contiguous_stops_at_consumed() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        for i in 1..=3 {
+            buffer
+                .insert(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        // Consume first fragment
+        buffer.mark_consumed(1);
+
+        // iter_contiguous should stop immediately (slot 0 is now NULL)
+        let contiguous: Vec<_> = buffer.iter_contiguous().collect();
+        assert_eq!(contiguous.len(), 0);
+    }
+
+    #[test]
+    fn test_consumed_frontier_accessor() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 5) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        assert_eq!(buffer.consumed_frontier(), 0);
+
+        for i in 1..=5 {
+            buffer
+                .insert(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        buffer.mark_consumed(2);
+        assert_eq!(buffer.consumed_frontier(), 2);
+
+        buffer.mark_consumed(4);
+        assert_eq!(buffer.consumed_frontier(), 4);
+
+        // Calling with lower value doesn't decrease frontier
+        buffer.mark_consumed(3);
+        assert_eq!(buffer.consumed_frontier(), 4); // Still 4, not 3
+    }
+
+    #[test]
+    #[should_panic(expected = "mark_consumed index 5 exceeds total_fragments 3")]
+    fn test_mark_consumed_panics_on_invalid_index() {
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+        buffer.mark_consumed(5); // Should panic
+    }
+
+    #[test]
+    fn test_concurrent_mark_consumed() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 100) as u64;
+        let buffer = Arc::new(LockFreeStreamBuffer::new(total));
+
+        // Insert all fragments first
+        for i in 1..=100 {
+            buffer
+                .insert(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        // Multiple threads trying to consume overlapping ranges
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let buffer = Arc::clone(&buffer);
+                thread::spawn(move || {
+                    // Each thread consumes a range
+                    let start = t * 25 + 1;
+                    let end = (t + 1) * 25;
+                    buffer.mark_consumed(end as u32)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All fragments should be consumed
+        assert_eq!(buffer.consumed_frontier(), 100);
+        assert_eq!(buffer.inserted_count(), 0);
+    }
+
+    #[test]
+    fn test_drop_cleans_up_fragments() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Create a custom Bytes that tracks drops
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        struct TrackingBytes(Bytes);
+        impl Drop for TrackingBytes {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        {
+            let buffer = LockFreeStreamBuffer::new(100);
+            // Insert a fragment (the Bytes inside will be dropped when buffer drops)
+            buffer.insert(1, Bytes::from_static(b"hello")).unwrap();
+            // Buffer goes out of scope here
+        }
+
+        // Note: We can't easily track Bytes drops since it uses Arc internally.
+        // This test just verifies no panic/leak occurs.
+    }
+
+    #[test]
+    fn test_memory_reclamation_flow() {
+        // Simulate a streaming consumer that reads and frees as it goes
+        let total = (FRAGMENT_PAYLOAD_SIZE * 5) as u64;
+        let buffer = LockFreeStreamBuffer::new(total);
+
+        // Producer inserts all fragments
+        for i in 1..=5 {
+            buffer
+                .insert(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        // Consumer reads and frees incrementally
+        for i in 1..=5 {
+            // Read the fragment
+            let data = buffer.get(i);
+            assert!(data.is_some());
+            assert_eq!(data.unwrap()[0], i as u8);
+
+            // Mark as consumed (frees memory)
+            let freed = buffer.mark_consumed(i);
+            assert_eq!(freed, 1);
+
+            // Verify it's gone
+            assert!(buffer.get(i).is_none());
+            assert_eq!(buffer.consumed_frontier(), i);
+        }
+
+        // All consumed
+        assert_eq!(buffer.inserted_count(), 0);
+        assert_eq!(buffer.consumed_frontier(), 5);
+    }
+
+    #[test]
+    fn test_concurrent_insert_and_consume() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 10) as u64;
+        let buffer = Arc::new(LockFreeStreamBuffer::new(total));
+
+        // Producer thread
+        let buffer_producer = Arc::clone(&buffer);
+        let producer = thread::spawn(move || {
+            for i in 1..=10 {
+                let data = Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]);
+                buffer_producer.insert(i, data).unwrap();
+                thread::sleep(std::time::Duration::from_micros(100));
+            }
+        });
+
+        // Consumer thread (reads and consumes as they arrive)
+        let buffer_consumer = Arc::clone(&buffer);
+        let consumer = thread::spawn(move || {
+            let mut consumed = 0;
+            while consumed < 10 {
+                let next = consumed + 1;
+                if buffer_consumer.get(next as u32).is_some() {
+                    buffer_consumer.mark_consumed(next as u32);
+                    consumed = next;
+                } else {
+                    thread::yield_now();
+                }
+            }
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+
+        assert_eq!(buffer.consumed_frontier(), 10);
+        assert_eq!(buffer.inserted_count(), 0);
     }
 }

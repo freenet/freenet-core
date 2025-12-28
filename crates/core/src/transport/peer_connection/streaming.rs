@@ -156,11 +156,35 @@ impl StreamHandle {
     /// Creates a new streaming view starting from fragment 1.
     ///
     /// Each call creates an independent stream with its own read position.
+    /// Fragments are cloned but remain in the buffer, allowing multiple
+    /// consumers to read the same data via `fork()`.
     pub fn stream(&self) -> StreamingInboundStream {
         StreamingInboundStream {
             handle: self.clone(),
             next_fragment: 1,
             bytes_read: 0,
+            auto_reclaim: false,
+        }
+    }
+
+    /// Creates a streaming view with automatic memory reclamation.
+    ///
+    /// Unlike `stream()`, this version takes ownership of fragments as they
+    /// are read, freeing memory progressively. This is ideal for:
+    /// - Single-consumer scenarios
+    /// - Large streams where memory is a concern
+    /// - Piped forwarding where data is processed and discarded
+    ///
+    /// # Warning
+    ///
+    /// Once a fragment is read by this stream, it cannot be read again.
+    /// Do not use with `fork()` or multiple consumers.
+    pub fn stream_with_reclaim(&self) -> StreamingInboundStream {
+        StreamingInboundStream {
+            handle: self.clone(),
+            next_fragment: 1,
+            bytes_read: 0,
+            auto_reclaim: true,
         }
     }
 
@@ -273,6 +297,15 @@ impl std::fmt::Debug for StreamHandle {
 ///
 /// This stream yields `Bytes` chunks in order, waiting for out-of-order
 /// fragments to arrive before yielding subsequent chunks.
+///
+/// # Memory Behavior
+///
+/// By default (`auto_reclaim = false`), fragments are cloned but remain in the buffer,
+/// allowing multiple consumers to read the same data via `fork()`.
+///
+/// With `auto_reclaim = true`, fragments are taken from the buffer after reading,
+/// freeing memory progressively. This is ideal for single-consumer scenarios with
+/// large streams.
 pub struct StreamingInboundStream {
     /// Handle to the shared stream state.
     handle: StreamHandle,
@@ -280,6 +313,9 @@ pub struct StreamingInboundStream {
     next_fragment: u32,
     /// Total bytes read so far.
     bytes_read: u64,
+    /// If true, fragments are taken (removed) from the buffer after reading.
+    /// This enables progressive memory reclamation for single-consumer scenarios.
+    auto_reclaim: bool,
 }
 
 impl StreamingInboundStream {
@@ -299,6 +335,23 @@ impl StreamingInboundStream {
     #[allow(dead_code)]
     pub(crate) fn stream_id(&self) -> StreamId {
         self.handle.stream_id
+    }
+
+    /// Returns whether auto-reclaim is enabled.
+    #[allow(dead_code)]
+    pub fn is_auto_reclaim(&self) -> bool {
+        self.auto_reclaim
+    }
+
+    /// Tries to get the next fragment, either taking or cloning based on auto_reclaim.
+    fn try_get_fragment(&self, idx: u32) -> Option<Bytes> {
+        if self.auto_reclaim {
+            // Take ownership and clear the slot
+            self.handle.buffer.take(idx)
+        } else {
+            // Clone, leaving the fragment in place for other consumers
+            self.handle.buffer.get(idx).cloned()
+        }
     }
 }
 
@@ -322,7 +375,7 @@ impl Stream for StreamingInboundStream {
         }
 
         // Try to get the next fragment (lock-free)
-        if let Some(data) = self.handle.buffer.get(next_idx).cloned() {
+        if let Some(data) = self.try_get_fragment(next_idx) {
             self.next_fragment = next_idx + 1;
             self.bytes_read += data.len() as u64;
             return Poll::Ready(Some(Ok(data)));
@@ -336,7 +389,7 @@ impl Stream for StreamingInboundStream {
                 return Poll::Ready(Some(Err(StreamError::Cancelled)));
             }
             // Re-check buffer (fragment may have arrived)
-            if let Some(data) = self.handle.buffer.get(next_idx).cloned() {
+            if let Some(data) = self.try_get_fragment(next_idx) {
                 drop(sync); // Release lock before modifying self
                 self.next_fragment = next_idx + 1;
                 self.bytes_read += data.len() as u64;
@@ -1023,5 +1076,170 @@ mod tests {
             message: "test error".into(),
         };
         assert_eq!(format!("{}", invalid), "invalid fragment: test error");
+    }
+
+    // ==================== Auto-Reclaim Tests ====================
+
+    #[tokio::test]
+    async fn test_stream_with_reclaim_basic() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        // Push all fragments
+        for i in 1..=3 {
+            handle
+                .push_fragment(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        assert_eq!(handle.buffer.inserted_count(), 3);
+
+        // Use reclaiming stream
+        let mut stream = handle.stream_with_reclaim();
+        assert!(stream.is_auto_reclaim());
+
+        // Read first fragment - should be removed from buffer
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk[0], 1);
+        assert_eq!(handle.buffer.inserted_count(), 2); // One removed
+
+        // Read remaining fragments
+        let _ = stream.next().await.unwrap().unwrap();
+        let _ = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(handle.buffer.inserted_count(), 0); // All removed
+
+        // Stream is exhausted
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_without_reclaim_preserves_data() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        for i in 1..=2 {
+            handle
+                .push_fragment(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        // Use non-reclaiming stream (default)
+        let mut stream = handle.stream();
+        assert!(!stream.is_auto_reclaim());
+
+        // Read all fragments
+        let _ = stream.next().await.unwrap().unwrap();
+        let _ = stream.next().await.unwrap().unwrap();
+
+        // Fragments still present in buffer
+        assert_eq!(handle.buffer.inserted_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reclaim_incremental_with_delayed_fragments() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+        let mut stream = handle.stream_with_reclaim();
+
+        // Push and consume fragment 1
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk[0], 1);
+        assert_eq!(handle.buffer.inserted_count(), 0);
+
+        // Push fragments 2 and 3
+        handle
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        handle
+            .push_fragment(3, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        assert_eq!(handle.buffer.inserted_count(), 2);
+
+        // Consume remaining
+        let _ = stream.next().await.unwrap().unwrap();
+        assert_eq!(handle.buffer.inserted_count(), 1);
+
+        let _ = stream.next().await.unwrap().unwrap();
+        assert_eq!(handle.buffer.inserted_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_reclaim_vs_fork_conflict() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        for i in 1..=2 {
+            handle
+                .push_fragment(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        // First consumer uses reclaim
+        let mut reclaim_stream = handle.stream_with_reclaim();
+        let _ = reclaim_stream.next().await.unwrap().unwrap(); // Takes fragment 1
+
+        // Second consumer (forked) tries to read - fragment 1 is gone!
+        let forked = handle.fork();
+        let mut forked_stream = forked.stream();
+
+        // Fragment 1 was taken, so forked stream gets None (waits for it)
+        // This demonstrates why auto_reclaim should only be used with single consumers
+        // The forked stream would wait forever for fragment 1 which is gone
+
+        // Fragment 2 is still there though
+        assert!(handle.buffer.get(2).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_stream_memory_efficiency() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        // Simulate a large stream
+        let num_fragments = 20u32;
+        let total = (FRAGMENT_PAYLOAD_SIZE * num_fragments as usize) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+        let handle_clone = handle.clone();
+
+        // Producer pushes all fragments
+        for i in 1..=num_fragments {
+            handle
+                .push_fragment(i, Bytes::from(vec![i as u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+
+        assert_eq!(handle_clone.buffer.inserted_count(), num_fragments as usize);
+
+        // Consumer with reclaim
+        let mut stream = handle_clone.stream_with_reclaim();
+
+        // Read half the fragments
+        for _ in 0..10 {
+            let _ = stream.next().await.unwrap().unwrap();
+        }
+
+        // Memory for first half is freed
+        assert_eq!(handle.buffer.inserted_count(), 10);
+
+        // Read remaining
+        for _ in 0..10 {
+            let _ = stream.next().await.unwrap().unwrap();
+        }
+
+        // All memory freed
+        assert_eq!(handle.buffer.inserted_count(), 0);
     }
 }
