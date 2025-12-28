@@ -81,9 +81,10 @@ pub struct LockFreeStreamBuffer {
     /// Highest fragment index that has been consumed/freed (0 = none consumed).
     /// Fragments up to this index have been cleared from memory.
     consumed_frontier: AtomicU32,
-    /// Lock-free event notification for when new fragments arrive.
-    /// Uses `event-listener` crate which is more efficient than `tokio::sync::Notify`
-    /// as it avoids mutex contention for the waiter list.
+    /// Event notification for when new fragments arrive.
+    /// Note: `event-listener` uses a Mutex internally for its waiter list.
+    /// The core fragment operations (insert/get/take) are still lock-free;
+    /// the mutex is only for coordinating waiters.
     data_available: Event,
 }
 
@@ -383,8 +384,6 @@ impl LockFreeStreamBuffer {
     /// Returns a reference to the notification event.
     ///
     /// Use `event.listen().await` to wait for new fragments to arrive.
-    /// This is more efficient than `tokio::sync::Notify` as it uses
-    /// lock-free synchronization for the waiter list.
     pub fn notifier(&self) -> &Event {
         &self.data_available
     }

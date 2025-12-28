@@ -251,12 +251,91 @@ cargo bench --bench transport_ci -- streaming_buffer
 cargo bench --bench transport_ci -- transport/streaming
 ```
 
-## Future Improvements (Phase 2+)
+## Phase 2: Piped Forwarding
 
-1. **Piped Streams**: Forward fragments before complete receipt
-2. **Flow Control**: Backpressure from slow consumers
-3. **Memory Limits**: Cap total buffered data across streams
-4. **Metrics**: Expose fragment loss, reordering statistics
+Phase 2 enables intermediate nodes to forward fragments without full reassembly.
+
+### Architecture
+
+```
+┌──────────────┐     fragments     ┌──────────────┐     forward      ┌──────────────┐
+│   Source     │  ───────────────▶ │ Intermediate │  ─────────────▶  │ Destination  │
+│    Node      │   (1, 2, 4, 3)    │    Node      │   (1, 2, 3, 4)   │    Node      │
+└──────────────┘                   └──────────────┘                  └──────────────┘
+                                          │
+                                   ┌──────┴──────┐
+                                   │ PipedStream │
+                                   │             │
+                                   │ next_to_fwd: 1
+                                   │ buffered: {4}│ ← out-of-order
+                                   └─────────────┘
+```
+
+### Key Components
+
+#### PipedStream (`piped_stream.rs`)
+
+Buffers out-of-order fragments and forwards in-order fragments immediately:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `next_to_forward` | `AtomicU32` | Next fragment to forward (1-indexed) |
+| `out_of_order` | `Mutex<BTreeMap>` | Buffered out-of-order fragments |
+| `send_semaphores` | `Vec<Arc<Semaphore>>` | Per-target backpressure |
+| `buffered_bytes` | `AtomicU64` | Memory pressure tracking |
+
+#### PipedStreamConfig
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `max_buffered_fragments` | 100 | Prevent unbounded buffering |
+| `max_buffered_bytes` | 1 MB | Memory pressure limit |
+| `max_concurrent_sends` | 10 | Per-target send concurrency |
+
+#### send_fragment() on PeerConnection
+
+Low-level API to send a single fragment with full congestion control:
+- LEDBAT cwnd enforcement
+- Token bucket rate limiting
+- Sent packet tracking
+
+### Memory Efficiency
+
+| Scenario | Memory Usage |
+|----------|--------------|
+| In-order delivery | 0 bytes buffer |
+| Realistic reorder (chunks of 10) | ~12 KB |
+| Worst case (fully reversed) | Full stream |
+
+### Usage
+
+```rust
+// Create piped stream for forwarding
+let piped = PipedStream::new(stream_id, total_bytes, num_targets, config);
+
+// As fragments arrive from source
+for incoming_fragment in source_stream {
+    // Returns fragments ready to forward (may cascade)
+    let to_forward = piped.push_fragment(
+        incoming_fragment.number,
+        incoming_fragment.payload
+    )?;
+
+    // Forward to all targets
+    for fragment in to_forward {
+        for (i, target) in targets.iter_mut().enumerate() {
+            let _permit = piped.acquire_send_permit(i).await?;
+            target.send_fragment(fragment.clone()).await?;
+        }
+    }
+}
+```
+
+## Future Improvements (Phase 3+)
+
+1. **Flow Control**: Backpressure from slow consumers
+2. **Memory Limits**: Cap total buffered data across streams
+3. **Metrics**: Expose fragment loss, reordering statistics
 
 ## Source Code
 
@@ -264,6 +343,7 @@ cargo bench --bench transport_ci -- transport/streaming
 |-----------|----------|
 | Lock-free buffer | `crates/core/src/transport/peer_connection/streaming_buffer.rs` |
 | StreamHandle, Registry | `crates/core/src/transport/peer_connection/streaming.rs` |
+| Piped forwarding | `crates/core/src/transport/peer_connection/piped_stream.rs` |
 | Integration | `crates/core/src/transport/peer_connection.rs` |
 | Benchmarks | `crates/core/benches/transport/streaming_buffer.rs` |
 
