@@ -257,13 +257,16 @@ fn verify_checksum(file_path: &Path, expected_hash: &str) -> Result<()> {
 }
 
 fn get_target_triple() -> &'static str {
+    // Note: We always request musl binaries for Linux because that's what
+    // the release workflow builds. musl binaries work on both musl (Alpine)
+    // and glibc systems, so this is the simplest approach.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
-        "x86_64-unknown-linux-gnu"
+        "x86_64-unknown-linux-musl"
     }
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     {
-        "aarch64-unknown-linux-gnu"
+        "aarch64-unknown-linux-musl"
     }
     #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
     {
