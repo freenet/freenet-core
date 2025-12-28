@@ -4,7 +4,7 @@
 //! This intentionally runs outside CI (ignored) so it can be executed manually when debugging
 //! contract propagation races:
 //! ```text
-//! cargo test -p freenet --test river_smoke -- --ignored --nocapture
+//! cargo test -p freenet --test river_smoke -- --ignored
 //! ```
 
 mod common;
@@ -13,16 +13,17 @@ use anyhow::{bail, Context, Result};
 use common::RiverSession;
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
 use tokio::time::{sleep, Duration};
+use tracing::info;
 
 const ITERATIONS: usize = 5;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore = "manual-only: reproduces riverctl missing contract race"]
 async fn river_missing_contract_smoke() -> Result<()> {
     let riverctl = which::which("riverctl").context("riverctl not found in PATH")?;
 
     for iter in 1..=ITERATIONS {
-        println!("=== iteration {iter}/{ITERATIONS} ===");
+        info!("=== iteration {iter}/{ITERATIONS} ===");
         let network = TestNetwork::builder()
             .gateways(1)
             .peers(1)
@@ -43,13 +44,13 @@ async fn river_missing_contract_smoke() -> Result<()> {
             .await
         {
             Ok(_) => {
-                println!(
+                info!(
                     "iteration {iter} succeeded (run_root={})",
                     network.run_root().display()
                 );
             }
             Err(err) => {
-                println!(
+                info!(
                     "iteration {iter} failed: {err} (run_root={})",
                     network.run_root().display()
                 );

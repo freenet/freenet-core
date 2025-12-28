@@ -11,7 +11,7 @@ use std::time::Duration;
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
 
 /// Gateways should expose at least one non-gateway neighbor in their ring snapshot after peers join.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn gateway_records_real_peer_ids_on_inbound() -> anyhow::Result<()> {
     // Small, fast network: 1 gateway + 2 peers.
     let network = TestNetwork::builder()

@@ -3,8 +3,9 @@
 
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
 use std::time::Duration;
+use tracing::info;
 
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn diagnose_connectivity_failure() {
     // Build network with more relaxed settings
     let result = TestNetwork::builder()
@@ -19,31 +20,31 @@ async fn diagnose_connectivity_failure() {
 
     match result {
         Ok(network) => {
-            println!("\n✓ Network started successfully!");
+            info!("Network started successfully!");
 
             // Print network info
-            println!("\nNetwork topology:");
-            println!("  Gateway: {}", network.gateway(0).ws_url());
+            info!("Network topology:");
+            info!("  Gateway: {}", network.gateway(0).ws_url());
             for i in 0..2 {
-                println!("  Peer {}: {}", i, network.peer(i).ws_url());
+                info!("  Peer {}: {}", i, network.peer(i).ws_url());
             }
 
             // Read and print logs
-            println!("\n=== Network Logs ===");
+            info!("=== Network Logs ===");
             if let Ok(logs) = network.read_logs() {
                 for entry in logs.iter().take(200) {
-                    println!(
+                    info!(
                         "[{}] {}: {}",
                         entry.peer_id,
                         entry.level.as_deref().unwrap_or("INFO"),
                         entry.message
                     );
                 }
-                println!("\n(Showing first 200 log lines, total: {})", logs.len());
+                info!("(Showing first 200 log lines, total: {})", logs.len());
             }
         }
         Err(e) => {
-            eprintln!("\n✗ Network failed to start: {:?}", e);
+            tracing::error!("Network failed to start: {:?}", e);
             panic!("Network startup failed - see logs above");
         }
     }

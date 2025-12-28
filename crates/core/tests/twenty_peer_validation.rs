@@ -12,13 +12,13 @@
 //! ### Phase 1: Connect Protocol Validation (Docker NAT)
 //! ```text
 //! FREENET_TEST_DOCKER_NAT=1 cargo test -p freenet --test twenty_peer_validation \
-//!     twenty_peer_connect_validation -- --ignored --nocapture
+//!     twenty_peer_connect_validation -- --ignored
 //! ```
 //!
 //! ### Phase 2: Operations Validation (Local, faster)
 //! ```text
 //! cargo test -p freenet --test twenty_peer_validation \
-//!     twenty_peer_operations_validation -- --ignored --nocapture
+//!     twenty_peer_operations_validation -- --ignored
 //! ```
 //!
 //! ## Environment Overrides
@@ -48,6 +48,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
+use tracing::info;
 use which::which;
 
 // Defaults tuned for 20-peer network
@@ -118,7 +119,7 @@ impl TestConfig {
 /// - Most peers have connections (low isolation rate)
 /// - Connections are primarily to nearby peers on the ring
 /// - Average ring distance between connected peers is small
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore = "Manual test - requires Docker NAT (FREENET_TEST_DOCKER_NAT=1)"]
 async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
     let config = TestConfig::from_env();
@@ -142,8 +143,8 @@ async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
         "Docker is not available. Install/start Docker or use local backend for operations test."
     );
 
-    println!("=== Twenty-Peer Connect Protocol Validation ===");
-    println!(
+    info!("=== Twenty-Peer Connect Protocol Validation ===");
+    info!(
         "Peers: {}, Connections: {}-{}, Stabilization: {}s",
         config.peer_count,
         config.min_connections,
@@ -166,7 +167,7 @@ async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
         .await
         .context("Failed to start Docker NAT test network")?;
 
-    println!(
+    info!(
         "Network started (run root: {})",
         network.run_root().display()
     );
@@ -175,7 +176,7 @@ async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
     fs::create_dir_all(&snapshots_dir)?;
 
     // Wait for initial topology stabilization
-    println!(
+    info!(
         "Waiting {}s for topology stabilization...",
         config.stabilization_secs
     );
@@ -184,10 +185,7 @@ async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
     // Take periodic snapshots to observe topology evolution
     let mut best_analysis = None;
     for i in 1..=config.snapshot_count {
-        println!(
-            "\n--- Topology Snapshot {}/{} ---",
-            i, config.snapshot_count
-        );
+        info!("--- Topology Snapshot {}/{} ---", i, config.snapshot_count);
 
         let analysis = analyze_small_world_topology(&network).await?;
         print_topology_summary(&analysis);
@@ -196,7 +194,7 @@ async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
         let snapshot_path = snapshots_dir.join(format!("topology-{i:02}.json"));
         let diagnostics = network.collect_diagnostics().await?;
         fs::write(&snapshot_path, to_string_pretty(&diagnostics)?)?;
-        println!("Wrote snapshot to {}", snapshot_path.display());
+        info!("Wrote snapshot to {}", snapshot_path.display());
 
         // Track the best (most connected) topology observed
         if best_analysis
@@ -226,31 +224,31 @@ async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
 
     // Final analysis
     let final_analysis = best_analysis.expect("Should have at least one analysis");
-    println!("\n=== Final Topology Analysis ===");
+    info!("=== Final Topology Analysis ===");
     print_topology_summary(&final_analysis);
     print_topology_details(&final_analysis);
 
     // Validate small-world properties
     if !final_analysis.is_small_world {
-        println!("\nWARNING: Network did not achieve small-world topology.");
-        println!("This may indicate issues with the connect protocol.");
-        println!(
+        info!("WARNING: Network did not achieve small-world topology.");
+        info!("This may indicate issues with the connect protocol.");
+        info!(
             "  - Local connection ratio: {:.1}% (target: >50%)",
             final_analysis.local_connection_ratio * 100.0
         );
-        println!(
+        info!(
             "  - Avg ring distance: {:.3} (target: <0.3)",
             final_analysis.avg_ring_distance
         );
-        println!(
+        info!(
             "  - Isolated peers: {}/{} (target: <10%)",
             final_analysis.isolated_peers, final_analysis.peer_count
         );
         // Don't fail yet - this is informational for now
     }
 
-    println!("\n=== Connect Protocol Validation Complete ===");
-    println!("Snapshots saved to: {}", snapshots_dir.display());
+    info!("=== Connect Protocol Validation Complete ===");
+    info!("Snapshots saved to: {}", snapshots_dir.display());
 
     Ok(())
 }
@@ -261,7 +259,7 @@ async fn twenty_peer_connect_validation() -> anyhow::Result<()> {
 /// - Room creation (put)
 /// - Room retrieval (get)
 /// - Subscription and message delivery (subscribe/update)
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore = "Manual test - requires riverctl in PATH"]
 async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
     let config = TestConfig::from_env();
@@ -269,8 +267,8 @@ async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
     let riverctl = which("riverctl")
         .context("riverctl not found in PATH; install via `cargo install riverctl`")?;
 
-    println!("=== Twenty-Peer Operations Validation ===");
-    println!(
+    info!("=== Twenty-Peer Operations Validation ===");
+    info!(
         "Peers: {}, Connections: {}-{}",
         config.peer_count, config.min_connections, config.max_connections
     );
@@ -290,13 +288,13 @@ async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
         .await
         .context("Failed to start local test network")?;
 
-    println!(
+    info!(
         "Network started (run root: {})",
         network.run_root().display()
     );
 
     // Brief stabilization for local network
-    println!("Waiting 30s for network stabilization...");
+    info!("Waiting 30s for network stabilization...");
     sleep(Duration::from_secs(30)).await;
 
     // Check initial topology
@@ -304,7 +302,7 @@ async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
     print_topology_summary(&analysis);
 
     // Test operations using River
-    println!("\n--- Testing River Operations ---");
+    info!("--- Testing River Operations ---");
 
     // Use gateway and a distant peer (by index) to test cross-network operations
     let alice_peer_idx = 0; // First regular peer
@@ -319,23 +317,23 @@ async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
         network.peer(bob_peer_idx).ws_url()
     );
 
-    println!(
+    info!(
         "Alice on peer {}, Bob on peer {}",
         alice_peer_idx, bob_peer_idx
     );
 
     // Initialize session (creates room = PUT, joins = GET + PUT)
-    println!("Creating room and inviting Bob...");
+    info!("Creating room and inviting Bob...");
     let session = RiverSession::initialize(riverctl.clone(), alice_url, bob_url)
         .await
         .context("Failed to initialize River session")?;
-    println!(
+    info!(
         "Room created successfully (room_key: {})",
         session.room_key()
     );
 
     // Test message sending (UPDATE propagation)
-    println!("\nTesting message propagation...");
+    info!("Testing message propagation...");
     let test_messages = [
         "Hello from Alice - testing update propagation",
         "Reply from Bob - testing bidirectional updates",
@@ -349,12 +347,12 @@ async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
             RiverUser::Bob
         };
         session.send_message(user, msg).await?;
-        println!("  Sent: {} ({:?})", msg, user);
+        info!("  Sent: {} ({:?})", msg, user);
         sleep(Duration::from_millis(500)).await;
     }
 
     // Verify messages are visible
-    println!("\nVerifying message delivery...");
+    info!("Verifying message delivery...");
     let alice_messages = session.list_messages(RiverUser::Alice).await?;
     let bob_messages = session.list_messages(RiverUser::Bob).await?;
 
@@ -366,10 +364,10 @@ async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
         );
         ensure!(bob_messages.contains(msg), "Bob missing message: {}", msg);
     }
-    println!("All messages delivered successfully!");
+    info!("All messages delivered successfully!");
 
     // Final topology check
-    println!("\n--- Final Topology Check ---");
+    info!("--- Final Topology Check ---");
     let final_analysis = analyze_small_world_topology(&network).await?;
     print_topology_summary(&final_analysis);
 
@@ -381,8 +379,8 @@ async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
         to_string_pretty(&diagnostics)?,
     )?;
 
-    println!("\n=== Operations Validation Complete ===");
-    println!("Snapshots saved to: {}", snapshots_dir.display());
+    info!("=== Operations Validation Complete ===");
+    info!("Snapshots saved to: {}", snapshots_dir.display());
 
     Ok(())
 }
@@ -393,7 +391,7 @@ async fn twenty_peer_operations_validation() -> anyhow::Result<()> {
 /// 1. Starts a Docker NAT network
 /// 2. Validates small-world topology formation
 /// 3. Runs River operations to validate put/get/subscribe/update
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore = "Manual test - requires Docker NAT and riverctl"]
 async fn twenty_peer_full_validation() -> anyhow::Result<()> {
     let config = TestConfig::from_env();
@@ -406,8 +404,8 @@ async fn twenty_peer_full_validation() -> anyhow::Result<()> {
     let riverctl = which("riverctl")
         .context("riverctl not found in PATH; install via `cargo install riverctl`")?;
 
-    println!("=== Twenty-Peer Full Validation ===");
-    println!(
+    info!("=== Twenty-Peer Full Validation ===");
+    info!(
         "Peers: {}, Connections: {}-{}",
         config.peer_count, config.min_connections, config.max_connections
     );
@@ -430,14 +428,14 @@ async fn twenty_peer_full_validation() -> anyhow::Result<()> {
     let snapshots_dir = network.run_root().join("full-validation");
     fs::create_dir_all(&snapshots_dir)?;
 
-    println!(
+    info!(
         "Network started (run root: {})",
         network.run_root().display()
     );
 
     // Phase 1: Wait for topology stabilization
-    println!(
-        "\n--- Phase 1: Topology Stabilization ({}s) ---",
+    info!(
+        "--- Phase 1: Topology Stabilization ({}s) ---",
         config.stabilization_secs
     );
     let start = Instant::now();
@@ -446,7 +444,7 @@ async fn twenty_peer_full_validation() -> anyhow::Result<()> {
     while start.elapsed().as_secs() < config.stabilization_secs {
         let elapsed = start.elapsed().as_secs();
         let remaining = config.stabilization_secs - elapsed;
-        println!(
+        info!(
             "  Stabilizing... {}s elapsed, {}s remaining",
             elapsed, remaining
         );
@@ -455,7 +453,7 @@ async fn twenty_peer_full_validation() -> anyhow::Result<()> {
         if elapsed > 0 && elapsed % 60 == 0 {
             snapshot_num += 1;
             let analysis = analyze_small_world_topology(&network).await?;
-            println!(
+            info!(
                 "  Snapshot {}: {} connections avg, {:.1}% local",
                 snapshot_num,
                 analysis.avg_connections,
@@ -467,7 +465,7 @@ async fn twenty_peer_full_validation() -> anyhow::Result<()> {
     }
 
     // Phase 1 validation
-    println!("\n--- Phase 1: Topology Validation ---");
+    info!("--- Phase 1: Topology Validation ---");
     let topology_analysis = analyze_small_world_topology(&network).await?;
     print_topology_summary(&topology_analysis);
 
@@ -478,7 +476,7 @@ async fn twenty_peer_full_validation() -> anyhow::Result<()> {
     )?;
 
     // Phase 2: Operations validation
-    println!("\n--- Phase 2: Operations Validation ---");
+    info!("--- Phase 2: Operations Validation ---");
 
     let alice_url = format!("{}?encodingProtocol=native", network.peer(0).ws_url());
     let bob_url = format!(
@@ -489,7 +487,7 @@ async fn twenty_peer_full_validation() -> anyhow::Result<()> {
     let session = RiverSession::initialize(riverctl, alice_url, bob_url)
         .await
         .context("Failed to initialize River session")?;
-    println!("Room created: {}", session.room_key());
+    info!("Room created: {}", session.room_key());
 
     // Send test messages
     session
@@ -510,7 +508,7 @@ async fn twenty_peer_full_validation() -> anyhow::Result<()> {
         messages.contains("Full validation test from Bob"),
         "Bob's message not found"
     );
-    println!("Messages delivered successfully!");
+    info!("Messages delivered successfully!");
 
     // Final snapshot
     let final_diagnostics = network.collect_diagnostics().await?;
@@ -519,9 +517,9 @@ async fn twenty_peer_full_validation() -> anyhow::Result<()> {
         to_string_pretty(&final_diagnostics)?,
     )?;
 
-    println!("\n=== Full Validation Complete ===");
-    println!("Snapshots saved to: {}", snapshots_dir.display());
-    println!(
+    info!("=== Full Validation Complete ===");
+    info!("Snapshots saved to: {}", snapshots_dir.display());
+    info!(
         "Small-world topology: {}",
         if topology_analysis.is_small_world {
             "ACHIEVED"

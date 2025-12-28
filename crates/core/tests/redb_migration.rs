@@ -16,7 +16,7 @@ use tracing::info;
 ///    - The old database is backed up with a timestamp
 ///    - A new v3 database is created
 ///    - The migration completes without errors
-#[tokio::test]
+#[test_log::test(tokio::test)]
 #[cfg_attr(not(feature = "redb"), ignore)]
 async fn test_automatic_migration_from_v2_to_v3() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "redb")]
@@ -84,7 +84,7 @@ async fn test_automatic_migration_from_v2_to_v3() -> Result<(), Box<dyn std::err
 }
 
 /// Test that verifies the migration logic doesn't interfere with normal operation
-#[tokio::test]
+#[test_log::test(tokio::test)]
 #[cfg_attr(not(feature = "redb"), ignore)]
 async fn test_normal_operation_without_migration() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "redb")]

@@ -7,7 +7,7 @@
 //!
 //! ## Running Manually
 //! ```text
-//! cargo test -p freenet --test large_network -- --ignored --nocapture
+//! cargo test -p freenet --test large_network -- --ignored
 //! ```
 //! Environment overrides:
 //! - `SOAK_PEER_COUNT` – number of non-gateway peers (default: 38).
@@ -33,6 +33,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
+use tracing::info;
 use which::which;
 
 const DEFAULT_PEER_COUNT: usize = 38;
@@ -43,7 +44,7 @@ const DEFAULT_CONNECTIVITY_TARGET: f64 = 0.75;
 const DEFAULT_MIN_CONNECTIONS: usize = 5;
 const DEFAULT_MAX_CONNECTIONS: usize = 7;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[ignore = "Large soak test - run manually (see file header for instructions)"]
 async fn large_network_soak() -> anyhow::Result<()> {
     let peer_count = env::var("SOAK_PEER_COUNT")
@@ -91,13 +92,13 @@ async fn large_network_soak() -> anyhow::Result<()> {
         .await
         .context("failed to start soak test network")?;
 
-    println!(
+    info!(
         "Started soak network with {} gateways and {} peers (run root: {})",
         2,
         peer_count,
         network.run_root().display()
     );
-    println!(
+    info!(
         "Min connections: {}, max connections: {} (override via SOAK_MIN_CONNECTIONS / SOAK_MAX_CONNECTIONS)",
         min_connections, max_connections
     );
@@ -113,7 +114,7 @@ async fn large_network_soak() -> anyhow::Result<()> {
     fs::create_dir_all(&snapshots_dir)?;
 
     // Allow topology maintenance to run before the first snapshot.
-    println!(
+    info!(
         "Waiting {:?} before first snapshot to allow topology maintenance to converge",
         snapshot_warmup
     );
@@ -138,7 +139,7 @@ async fn large_network_soak() -> anyhow::Result<()> {
             .filter(|peer| peer.error.is_none() && !peer.connected_peer_ids.is_empty())
             .count();
         let ratio = healthy as f64 / snapshot.peers.len().max(1) as f64;
-        println!(
+        info!(
             "Snapshot {iteration}/{snapshot_iterations}: {:.1}% peers healthy ({} / {}), wrote {}",
             ratio * 100.0,
             healthy,
@@ -175,7 +176,7 @@ async fn large_network_soak() -> anyhow::Result<()> {
         }
     }
 
-    println!(
+    info!(
         "Large network soak complete; inspect {} for diagnostics snapshots",
         snapshots_dir.display()
     );

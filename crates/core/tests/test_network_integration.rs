@@ -7,6 +7,7 @@ use freenet_stdlib::client_api::WebApi;
 use freenet_test_network::TestNetwork;
 use testresult::TestResult;
 use tokio_tungstenite::connect_async;
+use tracing::info;
 
 // Helper to get or create network
 async fn get_network() -> TestNetwork {
@@ -21,7 +22,7 @@ async fn get_network() -> TestNetwork {
         .expect("Failed to start test network")
 }
 
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_network_connectivity() -> TestResult {
     let network = get_network().await;
 
@@ -34,11 +35,11 @@ async fn test_network_connectivity() -> TestResult {
     let (stream, _) = connect_async(&peer_url).await?;
     let _peer_client = WebApi::start(stream);
 
-    println!("✓ Successfully connected to gateway and peer");
+    info!("Successfully connected to gateway and peer");
     Ok(())
 }
 
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_multiple_connections() -> TestResult {
     let network = get_network().await;
 
@@ -55,7 +56,7 @@ async fn test_multiple_connections() -> TestResult {
     let (stream3, _) = connect_async(&url3).await?;
     let _client3 = WebApi::start(stream3);
 
-    println!("✓ Multiple WebSocket connections work");
+    info!("Multiple WebSocket connections work");
     Ok(())
 }
 
@@ -65,7 +66,7 @@ async fn test_multiple_connections() -> TestResult {
 /// which would leave them without a ring location (loc=N/A).
 ///
 /// See PR #2333 for context on why this validation is important.
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_all_peers_have_ring_locations() -> TestResult {
     use std::time::Duration;
     use tokio::time::sleep;
@@ -96,9 +97,6 @@ async fn test_all_peers_have_ring_locations() -> TestResult {
         missing_locations
     );
 
-    println!(
-        "✓ All {} peers have ring locations",
-        diagnostics.peers.len()
-    );
+    info!("All {} peers have ring locations", diagnostics.peers.len());
     Ok(())
 }
