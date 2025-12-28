@@ -325,14 +325,40 @@ pub(super) trait StoreFsManagement: Sized {
                 let mut key_cursor = 0;
                 while let Ok(rec) = process_record(&mut file) {
                     if let Some((store_key, value)) = rec {
-                        // After compaction, all records should be valid
-                        if let Ok(store_key) = store_key.try_into() {
-                            let value = match value {
-                                Either::Left(v) => Self::Value::try_from(&v),
-                                Either::Right(v) => Self::Value::try_from(&v),
-                            }?;
-                            Self::insert_in_container(container, (store_key, key_cursor), value);
+                        // After compaction, all records should be valid. Any failure to
+                        // convert the key type here indicates a serious bug in the
+                        // compaction logic or unexpected data corruption.
+                        let store_key = match store_key.try_into() {
+                            Ok(key) => key,
+                            Err(mismatch) => {
+                                tracing::error!(
+                                    path = ?key_file_path,
+                                    offset = key_cursor,
+                                    error = %mismatch,
+                                    "Invalid record after compaction (key type mismatch) - \
+                                     container has been cleared but reload failed"
+                                );
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("Invalid record after compaction: {}", mismatch),
+                                ));
+                            }
+                        };
+                        let value = match value {
+                            Either::Left(v) => Self::Value::try_from(&v),
+                            Either::Right(v) => Self::Value::try_from(&v),
                         }
+                        .map_err(|e| {
+                            tracing::error!(
+                                path = ?key_file_path,
+                                offset = key_cursor,
+                                error = %e,
+                                "Failed to convert value while reloading after compaction - \
+                                 container has been cleared but reload failed"
+                            );
+                            e
+                        })?;
+                        Self::insert_in_container(container, (store_key, key_cursor), value);
                     }
                     key_cursor = file.stream_position()?;
                 }
