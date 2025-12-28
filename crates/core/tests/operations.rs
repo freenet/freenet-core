@@ -111,33 +111,63 @@ async fn get_contract(
     key: ContractKey,
     temp_dir: impl AsRef<Path>,
 ) -> anyhow::Result<(ContractContainer, WrappedState)> {
-    make_get(client, key, true, false).await?;
-    // Limit iterations to avoid infinite loop on unexpected responses
-    const MAX_RESPONSES: usize = 20;
-    for _ in 0..MAX_RESPONSES {
-        let resp = tokio::time::timeout(Duration::from_secs(45), client.recv()).await;
-        match resp {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                key,
-                contract: Some(contract),
-                state,
-            }))) => {
-                verify_contract_exists(temp_dir.as_ref(), key).await?;
-                return Ok((contract, state));
-            }
-            Ok(Ok(other)) => {
-                tracing::warn!("unexpected response while waiting for get: {:?}", other);
-                // Continue to next iteration to drain pending messages
-            }
-            Ok(Err(e)) => {
-                bail!("Error receiving get response: {}", e);
-            }
-            Err(_) => {
-                bail!("Timeout waiting for get response");
+    const MAX_ATTEMPTS: usize = 3;
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+    const MAX_RESPONSES_PER_ATTEMPT: usize = 20;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        tracing::info!("GET contract attempt {attempt}/{MAX_ATTEMPTS}");
+        make_get(client, key, true, false).await?;
+
+        // Limit iterations to avoid infinite loop on unexpected responses
+        for _ in 0..MAX_RESPONSES_PER_ATTEMPT {
+            let resp = tokio::time::timeout(ATTEMPT_TIMEOUT, client.recv()).await;
+            match resp {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    contract: Some(contract),
+                    state,
+                }))) => {
+                    verify_contract_exists(temp_dir.as_ref(), key).await?;
+                    tracing::info!("GET contract succeeded on attempt {attempt}");
+                    return Ok((contract, state));
+                }
+                Ok(Ok(other)) => {
+                    tracing::warn!("unexpected response while waiting for get: {:?}", other);
+                    // Continue to next iteration to drain pending messages
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("GET attempt {attempt} error receiving response: {}", e);
+                    break; // Break inner loop to retry
+                }
+                Err(_) => {
+                    tracing::warn!("GET attempt {attempt} timed out waiting for response");
+                    break; // Break inner loop to retry
+                }
             }
         }
+
+        if attempt == MAX_ATTEMPTS {
+            bail!("GET contract failed after {MAX_ATTEMPTS} attempts");
+        }
+
+        // Drain any stray responses/errors before retrying to keep the client state clean
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), client.recv()).await {
+                Ok(Ok(resp)) => {
+                    tracing::warn!("Discarding stray response prior to GET retry: {:?}", resp);
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!("Discarding stray error prior to GET retry: {}", err);
+                }
+                Err(_) => break,
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
-    bail!("Exceeded max responses ({MAX_RESPONSES}) without receiving expected GetResponse");
+
+    unreachable!("get_contract loop should always return or bail");
 }
 
 async fn send_put_with_retry(
