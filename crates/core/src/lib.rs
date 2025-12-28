@@ -19,7 +19,7 @@ mod message;
 
 /// Node configuration, implementations and execution (entry points for the binaries).
 mod node;
-pub use node::{run_local_node, run_network_node};
+pub use node::{run_local_node, run_network_node, Node, ShutdownHandle};
 
 /// Network operation/transaction state machines.
 mod operations;

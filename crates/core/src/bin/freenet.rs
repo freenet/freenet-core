@@ -95,7 +95,63 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
         .await
         .with_context(|| "failed while building the node")?;
 
-    run_network_node(node).await
+    // Get shutdown handle before starting the node
+    let shutdown_handle = node.shutdown_handle();
+
+    // Run node with signal handling for graceful shutdown
+    run_network_node_with_signals(node, shutdown_handle).await
+}
+
+/// Run the network node with signal handling for graceful shutdown.
+///
+/// This function handles SIGTERM and SIGINT (Ctrl+C) to trigger graceful shutdown,
+/// allowing the node to properly close peer connections and clean up resources.
+async fn run_network_node_with_signals(
+    node: freenet::Node,
+    shutdown_handle: freenet::ShutdownHandle,
+) -> anyhow::Result<()> {
+    use tokio::signal;
+
+    // Set up SIGTERM handler for Unix systems
+    #[cfg(unix)]
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler")?;
+
+    // Spawn a task to listen for shutdown signals and trigger graceful shutdown
+    let signal_task = {
+        let shutdown_handle = shutdown_handle.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            let shutdown_reason = tokio::select! {
+                _ = signal::ctrl_c() => "received SIGINT (Ctrl+C)",
+                _ = sigterm.recv() => "received SIGTERM",
+            };
+
+            #[cfg(not(unix))]
+            let shutdown_reason = {
+                let _ = signal::ctrl_c().await;
+                "received SIGINT (Ctrl+C)"
+            };
+
+            tracing::info!(reason = shutdown_reason, "Initiating graceful shutdown");
+            shutdown_handle.shutdown().await;
+        })
+    };
+
+    // Run the node - it will exit when it receives the shutdown signal
+    let result = run_network_node(node).await;
+
+    // Clean up the signal task
+    signal_task.abort();
+
+    // Give a moment for final cleanup logging
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    if result.is_ok() {
+        tracing::info!("Graceful shutdown complete");
+    }
+
+    result
 }
 
 fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {

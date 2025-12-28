@@ -39,7 +39,7 @@ use crate::{
     config::{Address, GatewayConfig, WebsocketApiConfig},
     contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
-    message::{InnerMessage, NetMessage, Transaction, TransactionType},
+    message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
         connect::{self, ConnectOp},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
@@ -75,19 +75,56 @@ pub(crate) mod testing_impl;
 pub use message_processor::MessageProcessor;
 pub use request_router::{DeduplicatedRequest, RequestRouter};
 
-pub struct Node(NodeP2P);
+/// Handle to trigger graceful shutdown of the node.
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    tx: tokio::sync::mpsc::Sender<NodeEvent>,
+}
+
+impl ShutdownHandle {
+    /// Trigger a graceful shutdown of the node.
+    ///
+    /// This will:
+    /// 1. Close all peer connections gracefully
+    /// 2. Stop accepting new connections
+    /// 3. Exit the event loop
+    pub async fn shutdown(&self) {
+        if let Err(err) = self
+            .tx
+            .send(NodeEvent::Disconnect {
+                cause: Some("graceful shutdown".into()),
+            })
+            .await
+        {
+            tracing::debug!(
+                error = %err,
+                "failed to send graceful shutdown signal; shutdown channel may already be closed"
+            );
+        }
+    }
+}
+
+pub struct Node {
+    inner: NodeP2P,
+    shutdown_handle: ShutdownHandle,
+}
 
 impl Node {
     pub fn update_location(&mut self, location: Location) {
-        self.0
+        self.inner
             .op_manager
             .ring
             .connection_manager
             .update_location(Some(location));
     }
 
+    /// Get a handle that can be used to trigger graceful shutdown.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        self.shutdown_handle.clone()
+    }
+
     pub async fn run(self) -> anyhow::Result<Infallible> {
-        self.0.run_node().await
+        self.inner.run_node().await
     }
 }
 
@@ -351,14 +388,21 @@ impl NodeConfig {
             }
         };
         let cfg = self.config.clone();
-        let node = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(
+        let (node_inner, shutdown_tx) = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(
             self,
             clients,
             event_register,
             cfg,
         )
         .await?;
-        Ok((Node(node), flush_handle))
+        let shutdown_handle = ShutdownHandle { tx: shutdown_tx };
+        Ok((
+            Node {
+                inner: node_inner,
+                shutdown_handle,
+            },
+            flush_handle,
+        ))
     }
 
     pub fn get_own_addr(&self) -> Option<SocketAddr> {
@@ -1685,13 +1729,13 @@ pub async fn run_local_node(
 pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
     tracing::info!("Starting node");
 
-    let is_gateway = node.0.is_gateway;
-    let location = if let Some(loc) = node.0.location {
+    let is_gateway = node.inner.is_gateway;
+    let location = if let Some(loc) = node.inner.location {
         Some(loc)
     } else {
         is_gateway
             .then(|| {
-                node.0
+                node.inner
                     .peer_id
                     .as_ref()
                     .map(|id| Location::from_address(&id.addr))
