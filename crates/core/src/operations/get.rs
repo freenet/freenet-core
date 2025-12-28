@@ -707,6 +707,7 @@ impl Operation for GetOp {
                 if matches!(msg, GetMsg::Response { .. }) {
                     tracing::debug!(
                         tx = %tx,
+                        phase = "load_or_init",
                         "GET response arrived for non-existent operation (likely timed out)"
                     );
                     return Err(OpError::OpNotPresent(tx));

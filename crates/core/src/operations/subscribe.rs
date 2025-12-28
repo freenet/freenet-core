@@ -417,6 +417,7 @@ impl Operation for SubscribeOp {
                 if matches!(msg, SubscribeMsg::Response { .. }) {
                     tracing::debug!(
                         tx = %id,
+                        phase = "load_or_init",
                         "SUBSCRIBE response arrived for non-existent operation (likely timed out)"
                     );
                     return Err(OpError::OpNotPresent(id));
