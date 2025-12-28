@@ -702,6 +702,16 @@ impl Operation for GetOp {
                 Err(OpError::OpNotPresent(tx))
             }
             Ok(None) => {
+                // Check if this is a response message - if so, the operation was likely
+                // cleaned up due to timeout and we should not create a new operation
+                if matches!(msg, GetMsg::Response { .. }) {
+                    tracing::debug!(
+                        tx = %tx,
+                        "GET response arrived for non-existent operation (likely timed out)"
+                    );
+                    return Err(OpError::OpNotPresent(tx));
+                }
+
                 // new request to get a value for a contract, initialize the machine
                 Ok(OpInitialization {
                     op: Self {
