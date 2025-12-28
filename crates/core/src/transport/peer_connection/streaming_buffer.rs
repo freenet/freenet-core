@@ -1089,7 +1089,7 @@ mod tests {
                 let buffer = Arc::clone(&buffer);
                 thread::spawn(move || {
                     // Each thread consumes a range
-                    let start = t * 25 + 1;
+                    let _start = t * 25 + 1;
                     let end = (t + 1) * 25;
                     buffer.mark_consumed(end as u32)
                 })
@@ -1103,34 +1103,6 @@ mod tests {
         // All fragments should be consumed
         assert_eq!(buffer.consumed_frontier(), 100);
         assert_eq!(buffer.inserted_count(), 0);
-    }
-
-    #[test]
-    fn test_drop_cleans_up_fragments() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        // Create a custom Bytes that tracks drops
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        struct TrackingBytes(Bytes);
-        impl Drop for TrackingBytes {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::SeqCst);
-
-        {
-            let buffer = LockFreeStreamBuffer::new(100);
-            // Insert a fragment (the Bytes inside will be dropped when buffer drops)
-            buffer.insert(1, Bytes::from_static(b"hello")).unwrap();
-            // Buffer goes out of scope here
-        }
-
-        // Note: We can't easily track Bytes drops since it uses Arc internally.
-        // This test just verifies no panic/leak occurs.
     }
 
     #[test]

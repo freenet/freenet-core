@@ -681,8 +681,9 @@ impl<S: super::Socket> PeerConnection<S> {
                         continue;
                     };
                     self.inbound_streams.remove(&stream_id);
-                    // Also clean up streaming handle
+                    // Also clean up streaming handle and registry
                     self.streaming_handles.remove(&stream_id);
+                    self.streaming_registry.remove(stream_id);
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -1029,8 +1030,9 @@ impl<S: super::Socket> PeerConnection<S> {
                     let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
                     if let Some(msg) = stream.push_fragment(fragment_number, payload) {
                         self.inbound_streams.remove(&stream_id);
-                        // Also remove from streaming handles when complete
+                        // Also remove from streaming handles and registry when complete
                         self.streaming_handles.remove(&stream_id);
+                        self.streaming_registry.remove(stream_id);
                         tracing::trace!(
                             peer_addr = %self.remote_conn.remote_addr,
                             stream_id = %stream_id,

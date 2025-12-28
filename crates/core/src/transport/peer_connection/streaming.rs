@@ -158,6 +158,25 @@ impl StreamHandle {
     /// Each call creates an independent stream with its own read position.
     /// Fragments are cloned but remain in the buffer, allowing multiple
     /// consumers to read the same data via `fork()`.
+    ///
+    /// # Memory Behavior
+    ///
+    /// All fragments remain in the buffer until the stream is dropped or
+    /// explicitly cleared. This means:
+    /// - **Pro**: Multiple consumers can read the same data independently
+    /// - **Pro**: Safe to use with `fork()` for parallel processing
+    /// - **Con**: Memory usage equals full stream size until completion
+    ///
+    /// # When to Use
+    ///
+    /// Use `stream()` when:
+    /// - Multiple consumers need to read the same data
+    /// - You need to fork the stream for parallel processing
+    /// - Memory is not a concern for the stream size
+    /// - You might need to re-read fragments
+    ///
+    /// For single-consumer scenarios with large streams, prefer
+    /// [`stream_with_reclaim()`](Self::stream_with_reclaim) for better memory efficiency.
     pub fn stream(&self) -> StreamingInboundStream {
         StreamingInboundStream {
             handle: self.clone(),
@@ -169,16 +188,43 @@ impl StreamHandle {
 
     /// Creates a streaming view with automatic memory reclamation.
     ///
-    /// Unlike `stream()`, this version takes ownership of fragments as they
-    /// are read, freeing memory progressively. This is ideal for:
-    /// - Single-consumer scenarios
-    /// - Large streams where memory is a concern
-    /// - Piped forwarding where data is processed and discarded
+    /// Unlike [`stream()`](Self::stream), this version takes ownership of
+    /// fragments as they are read, freeing memory progressively.
+    ///
+    /// # Memory Behavior
+    ///
+    /// Each fragment is removed from the buffer immediately after being read:
+    /// - **Pro**: Memory usage stays constant regardless of stream size
+    /// - **Pro**: Ideal for processing large streams (10MB+) without OOM
+    /// - **Con**: Fragments cannot be read again once consumed
+    /// - **Con**: Incompatible with `fork()` or multiple consumers
+    ///
+    /// # When to Use
+    ///
+    /// Use `stream_with_reclaim()` when:
+    /// - Only one consumer will read the stream
+    /// - The stream is large and memory is a concern
+    /// - Data is processed once and discarded (e.g., forwarding, hashing)
+    /// - You don't need `fork()` or parallel consumers
     ///
     /// # Warning
     ///
-    /// Once a fragment is read by this stream, it cannot be read again.
-    /// Do not use with `fork()` or multiple consumers.
+    /// **Do not use with `fork()` or multiple consumers.** Once a fragment is
+    /// read by this stream, it is permanently removed from the buffer. Other
+    /// consumers (including forked handles) will wait forever for fragments
+    /// that have already been consumed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Single consumer processing a large file
+    /// let mut stream = handle.stream_with_reclaim();
+    /// let mut hasher = Sha256::new();
+    /// while let Some(chunk) = stream.next().await {
+    ///     hasher.update(&chunk?);
+    ///     // Memory for this chunk is freed immediately
+    /// }
+    /// ```
     pub fn stream_with_reclaim(&self) -> StreamingInboundStream {
         StreamingInboundStream {
             handle: self.clone(),
@@ -950,6 +996,50 @@ mod tests {
         assert_eq!(registry.stream_count(), 0);
     }
 
+    #[tokio::test]
+    async fn test_registry_cleanup_on_normal_completion() {
+        // This test verifies that streams can be properly removed from the registry
+        // when they complete normally (simulating the cleanup done in peer_connection.rs)
+        let registry = StreamRegistry::new();
+
+        let id1 = make_stream_id();
+        let id2 = make_stream_id();
+        let id3 = make_stream_id();
+
+        // Register multiple streams
+        let handle1 = registry.register(id1, 100).await;
+        let _handle2 = registry.register(id2, 200).await;
+        let _handle3 = registry.register(id3, 300).await;
+
+        assert_eq!(registry.stream_count(), 3);
+
+        // Complete stream 1's data
+        handle1
+            .push_fragment(1, Bytes::from_static(b"complete data here!"))
+            .unwrap();
+        assert!(handle1.is_complete());
+
+        // Simulate normal completion cleanup (as done in peer_connection.rs)
+        let removed = registry.remove(id1);
+        assert!(removed.is_some());
+        assert_eq!(registry.stream_count(), 2);
+
+        // Remove another stream
+        let removed = registry.remove(id2);
+        assert!(removed.is_some());
+        assert_eq!(registry.stream_count(), 1);
+
+        // Remove last stream
+        let removed = registry.remove(id3);
+        assert!(removed.is_some());
+        assert_eq!(registry.stream_count(), 0);
+
+        // Registry should be completely empty - no memory leak
+        assert!(registry.get(id1).is_none());
+        assert!(registry.get(id2).is_none());
+        assert!(registry.get(id3).is_none());
+    }
+
     #[test]
     fn test_take_receiver_twice() {
         let registry = StreamRegistry::new();
@@ -1194,7 +1284,7 @@ mod tests {
 
         // Second consumer (forked) tries to read - fragment 1 is gone!
         let forked = handle.fork();
-        let mut forked_stream = forked.stream();
+        let _forked_stream = forked.stream();
 
         // Fragment 1 was taken, so forked stream gets None (waits for it)
         // This demonstrates why auto_reclaim should only be used with single consumers
