@@ -742,6 +742,31 @@ impl LedbatController {
         self.flightsize.load(Ordering::Relaxed)
     }
 
+    /// Called when ACK received for a retransmitted packet.
+    ///
+    /// This ONLY decrements flightsize without updating RTT estimation,
+    /// following Karn's algorithm which excludes retransmitted packets
+    /// from RTT calculation.
+    ///
+    /// This is critical for preventing flightsize leaks: when a packet
+    /// times out and is retransmitted, on_send was called once for the
+    /// original send. If the retransmitted packet is ACKed, we still need
+    /// to decrement flightsize even though we can't use it for RTT.
+    pub fn on_ack_without_rtt(&self, bytes_acked: usize) {
+        // Decrease flightsize with saturating subtraction to prevent underflow
+        self.flightsize
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes_acked))
+            })
+            .ok();
+
+        tracing::trace!(
+            bytes_acked,
+            new_flightsize = self.flightsize.load(Ordering::Relaxed),
+            "Decremented flightsize for retransmitted packet ACK"
+        );
+    }
+
     /// Get statistics.
     pub fn stats(&self) -> LedbatStats {
         LedbatStats {
@@ -962,6 +987,49 @@ mod tests {
 
         controller.on_ack(Duration::from_millis(50), 3000);
         assert_eq!(controller.flightsize(), 0);
+    }
+
+    #[test]
+    fn test_on_ack_without_rtt_decrements_flightsize() {
+        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+
+        // Send bytes to track
+        controller.on_send(5000);
+        assert_eq!(controller.flightsize(), 5000);
+
+        // on_ack_without_rtt should decrement flightsize without updating RTT state
+        controller.on_ack_without_rtt(2000);
+        assert_eq!(controller.flightsize(), 3000);
+
+        // Should not have updated base_delay (no RTT sample provided)
+        // Base delay should still be at the default fallback value
+        let base_delay = controller.base_delay();
+        assert!(
+            base_delay == Duration::from_millis(10) || base_delay.is_zero(),
+            "base_delay should be fallback value, got {:?}",
+            base_delay
+        );
+
+        // Continue decrementing
+        controller.on_ack_without_rtt(3000);
+        assert_eq!(controller.flightsize(), 0);
+    }
+
+    #[test]
+    fn test_on_ack_without_rtt_saturates_on_underflow() {
+        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+
+        // Send a small amount
+        controller.on_send(1000);
+        assert_eq!(controller.flightsize(), 1000);
+
+        // ACK more than we sent - should saturate to 0, not wrap
+        controller.on_ack_without_rtt(5000);
+        assert_eq!(
+            controller.flightsize(),
+            0,
+            "should saturate to 0, not underflow"
+        );
     }
 
     #[tokio::test]

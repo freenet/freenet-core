@@ -127,13 +127,17 @@ impl<T: TimeSource> SentPacketTracker<T> {
     }
 
     /// Reports that receipts have been received for the given packet IDs.
-    /// Returns: ((RTT sample, packet size) pairs, loss rate)
+    /// Returns: ((RTT sample option, packet size) pairs, loss rate)
+    ///
+    /// RTT sample is Some for non-retransmitted packets (used for RTT estimation),
+    /// None for retransmitted packets (Karn's algorithm - don't use for RTT).
+    /// Packet size is ALWAYS returned so LEDBAT can decrement flightsize for all ACKs.
     pub(super) fn report_received_receipts(
         &mut self,
         packet_ids: &[PacketId],
-    ) -> (Vec<(Duration, usize)>, Option<f64>) {
+    ) -> (Vec<(Option<Duration>, usize)>, Option<f64>) {
         let now = self.time_source.now();
-        let mut rtt_samples = Vec::new();
+        let mut ack_info = Vec::new();
 
         for packet_id in packet_ids {
             // Update loss proportion (ACK received = no loss)
@@ -141,12 +145,19 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 * (1.0 - PACKET_LOSS_DECAY_FACTOR)
                 + (PACKET_LOSS_DECAY_FACTOR * 0.0);
 
-            // Calculate RTT if this packet wasn't retransmitted (Karn's algorithm)
-            if !self.retransmitted_packets.contains(packet_id) {
-                if let Some((payload, sent_time)) = self.pending_receipts.get(packet_id) {
+            // Get packet info before removing
+            let is_retransmitted = self.retransmitted_packets.contains(packet_id);
+
+            if let Some((payload, sent_time)) = self.pending_receipts.get(packet_id) {
+                let packet_size = payload.len();
+
+                if is_retransmitted {
+                    // Retransmitted packet: return size but no RTT (Karn's algorithm)
+                    ack_info.push((None, packet_size));
+                } else {
+                    // Non-retransmitted: calculate RTT and update estimation
                     let rtt_sample = now.duration_since(*sent_time);
-                    let packet_size = payload.len();
-                    rtt_samples.push((rtt_sample, packet_size));
+                    ack_info.push((Some(rtt_sample), packet_size));
                     self.update_rtt(rtt_sample);
 
                     // RFC 6298 Section 5.7: Reset backoff on valid ACK
@@ -166,7 +177,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             None
         };
 
-        (rtt_samples, loss_rate)
+        (ack_info, loss_rate)
     }
 
     /// Updates RTT estimation based on a new sample using RFC 6298 algorithm
@@ -362,11 +373,13 @@ pub(in crate::transport) mod tests {
     fn test_report_received_receipts() {
         let mut tracker = mock_sent_packet_tracker();
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
-        let (rtt_samples, loss_rate) = tracker.report_received_receipts(&[1]);
+        let (ack_info, loss_rate) = tracker.report_received_receipts(&[1]);
         assert_eq!(tracker.pending_receipts.len(), 0);
         assert!(tracker.resend_queue.len() <= 1);
         assert_eq!(tracker.packet_loss_proportion, 0.0);
-        assert_eq!(rtt_samples.len(), 1); // Should have one RTT sample
+        assert_eq!(ack_info.len(), 1); // Should have one ACK entry
+        assert!(ack_info[0].0.is_some()); // Non-retransmitted, so RTT should be Some
+        assert_eq!(ack_info[0].1, 3); // Packet size
         assert!(loss_rate.is_some()); // Should have loss rate
     }
 
@@ -458,11 +471,12 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance_time(Duration::from_millis(50));
 
         // Receive ACK
-        let (rtt_samples, _) = tracker.report_received_receipts(&[1]);
+        let (ack_info, _) = tracker.report_received_receipts(&[1]);
 
         // Verify first sample (RFC 6298 Section 2.2)
-        assert_eq!(rtt_samples.len(), 1);
-        assert_eq!(rtt_samples[0].0, Duration::from_millis(50)); // .0 = RTT, .1 = packet size
+        assert_eq!(ack_info.len(), 1);
+        assert_eq!(ack_info[0].0, Some(Duration::from_millis(50))); // .0 = Some(RTT), .1 = packet size
+        assert_eq!(ack_info[0].1, 3); // packet size
         assert_eq!(tracker.smoothed_rtt(), Some(Duration::from_millis(50)));
         assert_eq!(tracker.rttvar, Duration::from_millis(25)); // R/2
         assert_eq!(tracker.min_rtt(), Duration::from_millis(50));
@@ -480,11 +494,11 @@ pub(in crate::transport) mod tests {
         // Second RTT sample: 200ms
         tracker.report_sent_packet(2, vec![2].into());
         tracker.time_source.advance_time(Duration::from_millis(200));
-        let (rtt_samples, _) = tracker.report_received_receipts(&[2]);
+        let (ack_info, _) = tracker.report_received_receipts(&[2]);
 
         // Verify exponential smoothing (ALPHA = 1/8)
         // SRTT = (7/8 * 100) + (1/8 * 200) = 87.5 + 25 = 112.5ms
-        assert_eq!(rtt_samples[0].0, Duration::from_millis(200)); // .0 = RTT, .1 = packet size
+        assert_eq!(ack_info[0].0, Some(Duration::from_millis(200))); // .0 = Some(RTT), .1 = packet size
         let srtt = tracker.smoothed_rtt().unwrap();
         assert!((srtt.as_millis() as i64 - 112).abs() <= 1); // Allow 1ms tolerance
     }
@@ -501,10 +515,13 @@ pub(in crate::transport) mod tests {
 
         // Advance time and receive ACK
         tracker.time_source.advance_time(Duration::from_millis(50));
-        let (rtt_samples, _) = tracker.report_received_receipts(&[1]);
+        let (ack_info, _) = tracker.report_received_receipts(&[1]);
 
-        // Should NOT include RTT sample (Karn's algorithm)
-        assert_eq!(rtt_samples.len(), 0);
+        // Should have ACK info but with None RTT (Karn's algorithm)
+        // Critically: packet_size is STILL returned so LEDBAT can decrement flightsize
+        assert_eq!(ack_info.len(), 1);
+        assert_eq!(ack_info[0].0, None); // No RTT for retransmitted packet
+        assert_eq!(ack_info[0].1, 1); // But packet size IS returned
         assert_eq!(tracker.smoothed_rtt(), None); // No RTT samples yet
     }
 
