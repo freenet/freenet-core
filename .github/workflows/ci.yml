@@ -76,7 +76,7 @@ jobs:
     needs: fmt_check
 
     env:
-      FREENET_LOG: error
+      RUST_LOG: error
 
     steps:
       - uses: actions/checkout@v6
@@ -105,7 +105,8 @@ jobs:
       !startsWith(github.head_ref, 'release/v')
 
     env:
-      FREENET_LOG: error
+      # RUST_LOG controls tracing output level (used by both test-log and production code)
+      RUST_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
@@ -136,8 +137,8 @@ jobs:
       - name: Test
         # Limit test threads to reduce resource contention on high-core-count runners
         # Without this, 64+ parallel tests cause timing-sensitive network tests to fail
-        # --nocapture shows logs in real-time instead of buffering until test completion
-        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8 --nocapture
+        # Output is captured and only shown for failing tests (default cargo test behavior)
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8
 
   six_peer_regression:
     name: six-peer-regression
@@ -151,7 +152,7 @@ jobs:
       !startsWith(github.head_ref, 'release/v')
 
     env:
-      FREENET_LOG: error
+      RUST_LOG: error
       # Ensure lzma-sys can find liblzma on Arch Linux (self-hosted runner)
       LIBRARY_PATH: /usr/lib
       PKG_CONFIG_PATH: /usr/lib/pkgconfig
@@ -216,7 +217,8 @@ jobs:
     timeout-minutes: 30
 
     env:
-      FREENET_LOG: error
+      # RUST_LOG controls tracing output level
+      RUST_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       UBERTEST_PEER_COUNT: 6  # Fewer peers for faster CI
 

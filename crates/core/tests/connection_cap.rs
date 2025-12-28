@@ -8,7 +8,7 @@
 
 use freenet_test_network::{BuildProfile, FreenetBinary, NetworkBuilder};
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn connection_cap_respected() -> anyhow::Result<()> {
     let max_connections = freenet::config::DEFAULT_MAX_CONNECTIONS;
     let net = NetworkBuilder::new()

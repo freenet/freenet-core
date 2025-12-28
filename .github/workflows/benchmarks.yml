@@ -34,7 +34,7 @@ jobs:
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       # Reduce noise from logging during benchmarks
-      FREENET_LOG: error
+      RUST_LOG: error
 
     steps:
       - uses: actions/checkout@v6

@@ -58,7 +58,7 @@ async fn create_test_config(
 
 /// Test that token configuration values are properly accepted and applied.
 /// This verifies that the cleanup task can be configured with short intervals for testing.
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_token_configuration() -> TestResult {
     let span = span!(Level::INFO, "test_token_configuration");
     async move {
@@ -105,7 +105,7 @@ async fn test_token_configuration() -> TestResult {
 }
 
 /// Test that default token configuration values are used when not specified.
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_default_token_configuration() -> TestResult {
     let span = span!(Level::INFO, "test_default_token_configuration");
     async move {
@@ -174,7 +174,7 @@ async fn test_default_token_configuration() -> TestResult {
 
 /// Test that the cleanup task actually removes expired tokens from the map.
 /// This test exercises the full token expiration lifecycle.
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
     use freenet::{
         config::WebsocketApiConfig,
