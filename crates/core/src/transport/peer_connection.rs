@@ -790,6 +790,10 @@ impl<S: super::Socket> PeerConnection<S> {
                                     .send_to(&packet, self.remote_conn.remote_addr)
                                     .await
                                     .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
+                                // Re-register packet for ACK tracking. Note: on_send() is NOT called here
+                                // because the bytes were already counted in flightsize during the initial send.
+                                // When the retransmitted packet is ACKed, on_ack_without_rtt() will decrement
+                                // flightsize once, maintaining correct accounting.
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                             }
                         }

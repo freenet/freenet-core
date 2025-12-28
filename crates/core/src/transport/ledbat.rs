@@ -989,6 +989,49 @@ mod tests {
         assert_eq!(controller.flightsize(), 0);
     }
 
+    #[test]
+    fn test_on_ack_without_rtt_decrements_flightsize() {
+        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+
+        // Send bytes to track
+        controller.on_send(5000);
+        assert_eq!(controller.flightsize(), 5000);
+
+        // on_ack_without_rtt should decrement flightsize without updating RTT state
+        controller.on_ack_without_rtt(2000);
+        assert_eq!(controller.flightsize(), 3000);
+
+        // Should not have updated base_delay (no RTT sample provided)
+        // Base delay should still be at the default fallback value
+        let base_delay = controller.base_delay();
+        assert!(
+            base_delay == Duration::from_millis(10) || base_delay.is_zero(),
+            "base_delay should be fallback value, got {:?}",
+            base_delay
+        );
+
+        // Continue decrementing
+        controller.on_ack_without_rtt(3000);
+        assert_eq!(controller.flightsize(), 0);
+    }
+
+    #[test]
+    fn test_on_ack_without_rtt_saturates_on_underflow() {
+        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+
+        // Send a small amount
+        controller.on_send(1000);
+        assert_eq!(controller.flightsize(), 1000);
+
+        // ACK more than we sent - should saturate to 0, not wrap
+        controller.on_ack_without_rtt(5000);
+        assert_eq!(
+            controller.flightsize(),
+            0,
+            "should saturate to 0, not underflow"
+        );
+    }
+
     #[tokio::test]
     async fn test_ledbat_cwnd_formula_correctness() {
         // Disable slow start to test pure LEDBAT congestion avoidance formula
