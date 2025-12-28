@@ -742,6 +742,31 @@ impl LedbatController {
         self.flightsize.load(Ordering::Relaxed)
     }
 
+    /// Called when ACK received for a retransmitted packet.
+    ///
+    /// This ONLY decrements flightsize without updating RTT estimation,
+    /// following Karn's algorithm which excludes retransmitted packets
+    /// from RTT calculation.
+    ///
+    /// This is critical for preventing flightsize leaks: when a packet
+    /// times out and is retransmitted, on_send was called once for the
+    /// original send. If the retransmitted packet is ACKed, we still need
+    /// to decrement flightsize even though we can't use it for RTT.
+    pub fn on_ack_without_rtt(&self, bytes_acked: usize) {
+        // Decrease flightsize with saturating subtraction to prevent underflow
+        self.flightsize
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes_acked))
+            })
+            .ok();
+
+        tracing::trace!(
+            bytes_acked,
+            new_flightsize = self.flightsize.load(Ordering::Relaxed),
+            "Decremented flightsize for retransmitted packet ACK"
+        );
+    }
+
     /// Get statistics.
     pub fn stats(&self) -> LedbatStats {
         LedbatStats {

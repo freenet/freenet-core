@@ -603,14 +603,25 @@ impl<S: super::Socket> PeerConnection<S> {
                     };
 
                     // Process ACKs and update LEDBAT congestion controller
-                    let (rtt_samples, _loss_rate) = self.remote_conn
+                    let (ack_info, _loss_rate) = self.remote_conn
                         .sent_tracker
                         .lock()
                         .report_received_receipts(&confirm_receipt);
 
-                    // Feed RTT samples to LEDBAT for congestion window adjustment
-                    for (rtt_sample, packet_size) in rtt_samples {
-                        self.remote_conn.ledbat.on_ack(rtt_sample, packet_size);
+                    // Feed ACK info to LEDBAT for congestion window adjustment
+                    // All ACKs decrement flightsize, but only non-retransmitted packets
+                    // update RTT estimation (Karn's algorithm)
+                    for (rtt_sample_opt, packet_size) in ack_info {
+                        match rtt_sample_opt {
+                            Some(rtt_sample) => {
+                                // Normal packet: full RTT processing + flightsize decrement
+                                self.remote_conn.ledbat.on_ack(rtt_sample, packet_size);
+                            }
+                            None => {
+                                // Retransmitted packet: only decrement flightsize (no RTT update)
+                                self.remote_conn.ledbat.on_ack_without_rtt(packet_size);
+                            }
+                        }
                     }
 
                     let report_result = self.received_tracker.report_received_packet(packet_id);
