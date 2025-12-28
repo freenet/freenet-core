@@ -144,6 +144,71 @@ version_compare() {
     echo "0"
 }
 
+# Download release binary from GitHub releases
+# This ensures we deploy the exact same binary that users download
+# Returns: path to downloaded binary on stdout (status messages go to stderr)
+download_release_binary() {
+    local version="$1"
+    local target_dir="${2:-/tmp}"
+
+    # Detect architecture
+    local arch=$(uname -m)
+    local asset_name=""
+
+    case "$arch" in
+        x86_64)
+            asset_name="freenet-x86_64-unknown-linux-musl.tar.gz"
+            ;;
+        aarch64|arm64)
+            asset_name="freenet-aarch64-unknown-linux-musl.tar.gz"
+            ;;
+        *)
+            echo "  ⚠️  Unsupported architecture: $arch" >&2
+            return 1
+            ;;
+    esac
+
+    local download_url="https://github.com/freenet/freenet-core/releases/download/v${version}/${asset_name}"
+    local tar_file="${target_dir}/${asset_name}"
+    local binary_path="${target_dir}/freenet-release-${version}"
+
+    echo "  Downloading release binary from GitHub..." >&2
+    echo "    URL: $download_url" >&2
+
+    # Download the tarball
+    if ! curl -L -s -o "$tar_file" "$download_url"; then
+        echo "  ⚠️  Failed to download release binary" >&2
+        return 1
+    fi
+
+    # Extract the binary
+    if ! tar -xzf "$tar_file" -C "$target_dir"; then
+        echo "  ⚠️  Failed to extract release binary" >&2
+        rm -f "$tar_file"
+        return 1
+    fi
+
+    # The tarball contains just "freenet" binary
+    if [[ -f "${target_dir}/freenet" ]]; then
+        mv "${target_dir}/freenet" "$binary_path"
+        chmod +x "$binary_path"
+        rm -f "$tar_file"
+        echo "    Binary: $binary_path" >&2
+
+        # Verify the binary
+        local dl_version=$("$binary_path" --version 2>/dev/null | head -1)
+        echo "    Version: $dl_version" >&2
+
+        # Output only the path to stdout for capture
+        echo "$binary_path"
+        return 0
+    else
+        echo "  ⚠️  Binary not found in tarball" >&2
+        rm -f "$tar_file"
+        return 1
+    fi
+}
+
 # Validate requested version against published version
 VERSION_CMP=$(version_compare "$VERSION" "$PUBLISHED_VERSION")
 
@@ -968,16 +1033,28 @@ deploy_gateways() {
         echo "Deploying to local gateway:"
 
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "  [DRY RUN] Would run: $SCRIPT_DIR/deploy-local-gateway.sh"
+            echo "  [DRY RUN] Would download binary from GitHub and run: $SCRIPT_DIR/deploy-local-gateway.sh"
         else
             local deploy_script="$SCRIPT_DIR/deploy-local-gateway.sh"
             if [[ ! -f "$deploy_script" ]]; then
                 echo "  ⚠️  Deployment script not found: $deploy_script"
                 echo "     Skipping local deployment"
             else
-                if "$deploy_script" --binary "$PROJECT_ROOT/target/release/freenet"; then
+                # Download the release binary from GitHub (ensures we deploy exact same binary users get)
+                local release_binary
+                release_binary=$(download_release_binary "$VERSION" "/tmp")
+                if [[ $? -ne 0 ]] || [[ -z "$release_binary" ]] || [[ ! -f "$release_binary" ]]; then
+                    echo "  ⚠️  Failed to download release binary, falling back to local build"
+                    release_binary="$PROJECT_ROOT/target/release/freenet"
+                fi
+
+                if "$deploy_script" --binary "$release_binary"; then
                     echo "  ✓ Local gateway deployed successfully"
                     mark_completed "LOCAL_DEPLOYED"
+                    # Clean up downloaded binary
+                    if [[ "$release_binary" == /tmp/freenet-release-* ]]; then
+                        rm -f "$release_binary"
+                    fi
                 else
                     echo "  ⚠️  Local gateway deployment failed (non-fatal)"
                     echo "     You can deploy manually with: $deploy_script"
