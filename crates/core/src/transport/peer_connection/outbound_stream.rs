@@ -251,7 +251,7 @@ mod tests {
             ledbat,
         ));
 
-        let mut inbound_bytes = Vec::new();
+        let mut inbound_bytes = Vec::with_capacity(message.len());
         while let Ok((_, packet)) = outbound_receiver.recv_async().await {
             let decrypted_packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
                 .try_decrypt_sym(&cipher)

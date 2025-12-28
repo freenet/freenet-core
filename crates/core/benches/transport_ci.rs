@@ -1,7 +1,7 @@
 //! CI-Optimized Transport Benchmarks
 //!
 //! Fast, deterministic benchmarks suitable for CI regression detection.
-//! Total execution time: ~8 minutes
+//! Total execution time: ~10 minutes
 //!
 //! Run with: `cargo bench --bench transport_ci`
 //!
@@ -9,6 +9,7 @@
 //! - level0: Pure logic (crypto, serialization) - deterministic, <2% noise
 //! - level1: Mock I/O (channel throughput) - ~5% noise from async
 //! - transport: Full transport pipeline with mock sockets - ~10% noise
+//! - streaming_buffer: Lock-free buffer operations - deterministic, <2% noise
 //!
 //! Not included (too slow or noisy for CI):
 //! - level2/level3: Real sockets, kernel-dependent
@@ -26,6 +27,7 @@ use transport::allocation_overhead::*;
 use transport::blackbox::*;
 use transport::level0::*;
 use transport::level1::*;
+use transport::streaming_buffer::*;
 
 // =============================================================================
 // CI Benchmark Groups
@@ -82,5 +84,39 @@ criterion_group!(
         bench_message_throughput,
 );
 
+criterion_group!(
+    name = streaming_buffer_ci;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(3))
+        .noise_threshold(0.02)  // 2% - lock-free should be rock stable
+        .significance_level(0.01);
+    targets =
+        bench_sequential_insert,
+        bench_assemble,
+        bench_iter_contiguous,
+        bench_first_fragment_latency,
+        bench_duplicate_insert,
+        bench_buffer_creation,
+);
+
+criterion_group!(
+    name = streaming_buffer_concurrent_ci;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(5))
+        .noise_threshold(0.05)  // 5% - async adds some variance
+        .significance_level(0.01);
+    targets =
+        bench_concurrent_insert,
+);
+
 // Main entry point - only CI-friendly benchmarks
-criterion_main!(allocation_ci, level0_ci, level1_ci, transport_ci);
+criterion_main!(
+    allocation_ci,
+    level0_ci,
+    level1_ci,
+    transport_ci,
+    streaming_buffer_ci,
+    streaming_buffer_concurrent_ci
+);

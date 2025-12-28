@@ -1871,6 +1871,7 @@ dependencies = [
  "directories",
  "dirs",
  "either",
+ "event-listener 5.4.1",
  "flatbuffers 25.12.19",
  "flate2",
  "freenet-macros 0.1.0",

@@ -20,6 +20,7 @@ The Freenet transport layer provides low-level network communication over UDP wi
 | cwnd Enforcement | ✅ Complete | Week 4 |
 | Bandwidth Configuration | ✅ Complete | Week 4 |
 | Global Bandwidth Pool | ✅ Complete | Week 5 |
+| Streaming Infrastructure (Phase 1) | ✅ Complete | Week 6 |
 
 ## Document Map
 
@@ -27,6 +28,7 @@ The Freenet transport layer provides low-level network communication over UDP wi
 How the transport layer is designed and why.
 
 - **[LEDBAT Slow Start Design](design/ledbat-slow-start.md)** - Congestion control algorithm design, slow start mechanics, and integration architecture
+- **[Streaming Infrastructure](design/streaming-infrastructure.md)** - Lock-free fragment reassembly, `futures::Stream` API, and concurrent consumer support
 
 ### Analysis & Results
 Performance analysis and empirical results.
@@ -93,6 +95,8 @@ cargo bench --bench transport_perf -- slow_start
 - **RTT tracking**: `crates/core/src/transport/sent_packet_tracker.rs`
 - **Connection handling**: `crates/core/src/transport/connection_handler.rs`
 - **Stream sending**: `crates/core/src/transport/peer_connection/outbound_stream.rs`
+- **Streaming buffer**: `crates/core/src/transport/peer_connection/streaming_buffer.rs`
+- **Streaming API**: `crates/core/src/transport/peer_connection/streaming.rs`
 
 ## Architecture Diagram
 
@@ -125,7 +129,28 @@ cargo bench --bench transport_perf -- slow_start
       ┌─────────▼──────────┐
       │    UDP Socket      │
       │  (sendto/recvfrom) │
-      └────────────────────┘
+      └─────────┬──────────┘
+                │
+                │ (incoming fragments)
+                ▼
+      ┌─────────────────────────────────────────────────────┐
+      │              StreamRegistry                          │
+      │         (stream_id → StreamHandle)                   │
+      └─────────────────────┬───────────────────────────────┘
+                            │
+      ┌─────────────────────▼───────────────────────────────┐
+      │              LockFreeStreamBuffer                    │
+      │  ┌─────┬─────┬─────┬─────┬─────┐                    │
+      │  │ [1] │ [2] │ [3] │ ... │ [n] │  OnceLock<Bytes>   │
+      │  └─────┴─────┴─────┴─────┴─────┘                    │
+      │  contiguous_fragments: AtomicU32 (frontier tracking)│
+      └─────────────────────┬───────────────────────────────┘
+                            │
+      ┌─────────────────────▼───────────────────────────────┐
+      │           StreamingInboundStream                     │
+      │              (futures::Stream)                       │
+      │         [independent read position]                  │
+      └─────────────────────────────────────────────────────┘
 ```
 
 ## Flow Control
