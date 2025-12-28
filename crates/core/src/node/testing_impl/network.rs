@@ -2,7 +2,7 @@ use crate::client_events::BoxedClient;
 use crate::contract::MemoryContractHandler;
 use crate::dev_tool::TransportPublicKey;
 use crate::node::p2p_impl::NodeP2P;
-use crate::node::Node;
+use crate::node::{Node, ShutdownHandle};
 use crate::tracing::EventRegister;
 use anyhow::Error;
 use futures::SinkExt;
@@ -82,14 +82,18 @@ impl NetworkPeer {
                 EventRegister::new(self.config.config.event_log())
             }
         };
-        let node = NodeP2P::build::<MemoryContractHandler, CLIENTS, _>(
+        let (node_inner, shutdown_tx) = NodeP2P::build::<MemoryContractHandler, CLIENTS, _>(
             self.config.clone(),
             clients,
             event_register,
             identifier,
         )
         .await?;
-        Ok(Node(node))
+        let shutdown_handle = ShutdownHandle { tx: shutdown_tx };
+        Ok(Node {
+            inner: node_inner,
+            shutdown_handle,
+        })
     }
 
     pub async fn send_peer_msg(&self, msg: PeerMessage) {

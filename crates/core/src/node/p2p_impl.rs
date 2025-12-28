@@ -182,12 +182,16 @@ impl NodeP2P {
         result
     }
 
+    /// Build a new node and return it along with a shutdown sender.
+    ///
+    /// The shutdown sender can be used to trigger graceful shutdown by sending
+    /// `NodeEvent::Disconnect`.
     pub(crate) async fn build<CH, const CLIENTS: usize, ER>(
         config: NodeConfig,
         clients: [BoxedClient; CLIENTS],
         event_register: ER,
         ch_builder: CH::Builder,
-    ) -> anyhow::Result<Self>
+    ) -> anyhow::Result<(Self, tokio::sync::mpsc::Sender<NodeEvent>)>
     where
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
@@ -287,7 +291,10 @@ impl NodeP2P {
         })
         .boxed();
         let clients = ClientEventsCombinator::new(clients);
+        // Create node controller channel with capacity for shutdown signal
+        // We clone the sender to return it for external shutdown triggering
         let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
+        let shutdown_tx = node_controller_tx.clone();
         let client_events_task = GlobalExecutor::spawn({
             let op_manager_clone = op_manager.clone();
             let task = async move {
@@ -310,20 +317,23 @@ impl NodeP2P {
         })
         .boxed();
 
-        Ok(NodeP2P {
-            conn_manager,
-            notification_channel,
-            client_wait_for_transaction: wait_for_event,
-            op_manager,
-            executor_listener,
-            node_controller: node_controller_rx,
-            should_try_connect: config.should_connect,
-            peer_id: None, // PeerId removed - using PeerKeyLocation instead
-            is_gateway: config.is_gateway,
-            location: config.location,
-            client_events_task,
-            contract_executor_task,
-            initial_join_task: None,
-        })
+        Ok((
+            NodeP2P {
+                conn_manager,
+                notification_channel,
+                client_wait_for_transaction: wait_for_event,
+                op_manager,
+                executor_listener,
+                node_controller: node_controller_rx,
+                should_try_connect: config.should_connect,
+                peer_id: None, // PeerId removed - using PeerKeyLocation instead
+                is_gateway: config.is_gateway,
+                location: config.location,
+                client_events_task,
+                contract_executor_task,
+                initial_join_task: None,
+            },
+            shutdown_tx,
+        ))
     }
 }

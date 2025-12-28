@@ -164,6 +164,9 @@ ExecStart={binary} network
 Restart=on-failure
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
+# Allow 15 seconds for graceful shutdown before SIGKILL
+# The node handles SIGTERM to properly close peer connections
+TimeoutStopSec=15
 
 # Logging - write to files for systems without active user journald
 # (headless servers, systems without lingering enabled, etc.)
@@ -729,6 +732,9 @@ mod tests {
         // Verify restart configuration
         assert!(service_content.contains("Restart=on-failure"));
         assert!(service_content.contains("RestartSec=10"));
+
+        // Verify graceful shutdown timeout is set
+        assert!(service_content.contains("TimeoutStopSec=15"));
     }
 
     #[test]
