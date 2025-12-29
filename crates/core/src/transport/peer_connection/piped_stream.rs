@@ -47,6 +47,19 @@
 //! piped.push_fragment(3, payload3).await?; // buffers (waiting for 2)
 //! piped.push_fragment(2, payload2).await?; // forwards 2, then 3
 //! ```
+//!
+//! # Error Handling
+//!
+//! | Error | Cause | Recovery Strategy |
+//! |-------|-------|-------------------|
+//! | `BufferFull` | Too many out-of-order fragments | Apply upstream backpressure, wait for gaps to fill |
+//! | `Cancelled` | Stream was cancelled | Stop processing, clean up resources |
+//! | `InvalidFragment` | Fragment number out of range | Log and ignore (likely duplicate or corruption) |
+//! | `SendFailed` | Target connection failed | Retry with exponential backoff, or mark target dead |
+//!
+//! **Phase 3 Integration Note**: Target failure tracking (which targets are dead,
+//! retry logic) will be implemented when wiring `PipedStream` into the forwarding path.
+//! This module provides the primitives; the integration layer handles failure policies.
 
 // Allow dead code - this is Phase 2 infrastructure not yet integrated into forwarding path
 #![allow(dead_code)]
@@ -55,7 +68,7 @@ use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use super::StreamId;
 
@@ -173,7 +186,15 @@ pub struct PipedStream {
     next_to_forward: AtomicU32,
     /// Out-of-order fragments waiting to be forwarded.
     /// Key is fragment_number, value is payload.
-    /// Protected by a lock since we need to atomically check-and-insert.
+    ///
+    /// # Design Choices
+    ///
+    /// - **parking_lot::Mutex**: Smaller, faster than std::sync::Mutex, no poisoning.
+    ///   Poisoning isn't useful here since we don't hold state that could be corrupted.
+    ///
+    /// - **BTreeMap over HashMap**: O(log n) vs O(1) for individual operations, but
+    ///   BTreeMap enables future optimization with `split_off()` to drain contiguous
+    ///   ranges in O(log n + k) instead of O(k log n) individual removes.
     out_of_order: parking_lot::Mutex<BTreeMap<u32, Bytes>>,
     /// Current buffered bytes (for memory pressure tracking).
     buffered_bytes: AtomicU64,
@@ -184,6 +205,8 @@ pub struct PipedStream {
     send_semaphores: Vec<Arc<Semaphore>>,
     /// Whether the stream has been cancelled.
     cancelled: std::sync::atomic::AtomicBool,
+    /// Notification for cancellation - wakes waiters in acquire_send_permit.
+    cancel_notify: Notify,
 }
 
 impl PipedStream {
@@ -224,6 +247,7 @@ impl PipedStream {
             config,
             send_semaphores,
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            cancel_notify: Notify::new(),
         }
     }
 
@@ -262,10 +286,12 @@ impl PipedStream {
         self.next_to_forward.load(Ordering::Acquire)
     }
 
-    /// Cancels the stream.
+    /// Cancels the stream and wakes any waiters.
     pub fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
+        // Wake any tasks waiting for permits
+        self.cancel_notify.notify_waiters();
     }
 
     /// Returns true if the stream has been cancelled.
@@ -364,6 +390,12 @@ impl PipedStream {
     }
 
     /// Forwards a contiguous run of fragments starting from fragment_number.
+    ///
+    /// # Concurrency
+    ///
+    /// The `next_to_forward` frontier is updated while holding the lock to prevent
+    /// a race where another thread sees a stale frontier and incorrectly buffers
+    /// a fragment that should be forwarded immediately.
     fn forward_contiguous(
         &self,
         fragment_number: u32,
@@ -382,25 +414,29 @@ impl PipedStream {
         // Advance next_to_forward
         let mut current = fragment_number + 1;
 
-        // Check for buffered continuations
-        let mut buffer = self.out_of_order.lock();
+        // Check for buffered continuations while holding the lock.
+        // IMPORTANT: We update next_to_forward BEFORE releasing the lock to prevent
+        // a race where another thread sees a stale frontier.
+        {
+            let mut buffer = self.out_of_order.lock();
 
-        while let Some(buffered_payload) = buffer.remove(&current) {
-            let payload_len = buffered_payload.len() as u64;
-            self.buffered_bytes
-                .fetch_sub(payload_len, Ordering::Relaxed);
+            while let Some(buffered_payload) = buffer.remove(&current) {
+                let payload_len = buffered_payload.len() as u64;
+                self.buffered_bytes
+                    .fetch_sub(payload_len, Ordering::Relaxed);
 
-            to_forward.push(ForwardFragment {
-                stream_id: self.stream_id,
-                fragment_number: current,
-                total_bytes: self.total_bytes,
-                payload: buffered_payload,
-            });
-            current += 1;
-        }
+                to_forward.push(ForwardFragment {
+                    stream_id: self.stream_id,
+                    fragment_number: current,
+                    total_bytes: self.total_bytes,
+                    payload: buffered_payload,
+                });
+                current += 1;
+            }
 
-        // Update the frontier
-        self.next_to_forward.store(current, Ordering::Release);
+            // Update the frontier while still holding the lock
+            self.next_to_forward.store(current, Ordering::Release);
+        } // Lock released here, after frontier is updated
 
         Ok(to_forward)
     }
@@ -409,6 +445,11 @@ impl PipedStream {
     ///
     /// This implements backpressure - if too many fragments are in-flight
     /// to this target, the caller will wait until a permit becomes available.
+    ///
+    /// # Cancellation Safety
+    ///
+    /// This method races permit acquisition against stream cancellation.
+    /// If `cancel()` is called while waiting, this returns `Cancelled` immediately.
     ///
     /// # Returns
     ///
@@ -429,13 +470,24 @@ impl PipedStream {
             });
         }
 
-        let permit = self.send_semaphores[target_index]
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| PipedStreamError::Cancelled)?;
+        // Race permit acquisition against cancellation to avoid deadlock
+        // if cancel() is called while we're waiting for a permit.
+        let semaphore = self.send_semaphores[target_index].clone();
+        tokio::select! {
+            biased;  // Check cancellation first for faster response
 
-        Ok(permit)
+            _ = self.cancel_notify.notified() => {
+                Err(PipedStreamError::Cancelled)
+            }
+
+            result = semaphore.acquire_owned() => {
+                // Double-check cancellation after acquiring permit
+                if self.is_cancelled() {
+                    return Err(PipedStreamError::Cancelled);
+                }
+                result.map_err(|_| PipedStreamError::Cancelled)
+            }
+        }
     }
 
     /// Returns the number of available send permits for a target.
@@ -735,5 +787,119 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 3); // 4, 5, 6
         assert!(stream.is_complete());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_push_fragments() {
+        use std::sync::Arc;
+
+        // Create a stream with 20 fragments
+        let stream = Arc::new(PipedStream::new(
+            make_stream_id(),
+            28000, // ~20 fragments
+            1,
+            PipedStreamConfig::default(),
+        ));
+
+        let num_fragments = stream.total_fragments();
+        assert!(num_fragments >= 10); // Sanity check
+
+        // Spawn multiple tasks to push fragments concurrently
+        let mut handles = Vec::new();
+        for frag_num in 1..=num_fragments {
+            let stream = Arc::clone(&stream);
+            handles.push(tokio::spawn(async move {
+                let payload = Bytes::from(format!("fragment {}", frag_num));
+                stream.push_fragment(frag_num, payload)
+            }));
+        }
+
+        // Wait for all to complete
+        let mut total_forwarded = 0;
+        for handle in handles {
+            if let Ok(Ok(fragments)) = handle.await {
+                total_forwarded += fragments.len();
+            }
+        }
+
+        // All fragments should have been forwarded exactly once
+        assert_eq!(total_forwarded, num_fragments as usize);
+        assert!(stream.is_complete());
+        assert_eq!(stream.buffered_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_during_permit_wait() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Create stream with only 1 concurrent send allowed
+        let config = PipedStreamConfig {
+            max_buffered_fragments: 100,
+            max_buffered_bytes: 1024 * 1024,
+            max_concurrent_sends: 1,
+        };
+        let stream = Arc::new(PipedStream::new(make_stream_id(), 4000, 1, config));
+
+        // Acquire the only permit
+        let _permit = stream.acquire_send_permit(0).await.unwrap();
+        assert_eq!(stream.available_permits(0), 0);
+
+        // Spawn a task that tries to acquire a permit (will block)
+        let stream_clone = Arc::clone(&stream);
+        let waiter = tokio::spawn(async move { stream_clone.acquire_send_permit(0).await });
+
+        // Give the waiter time to start waiting
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Cancel the stream - should wake the waiter
+        stream.cancel();
+
+        // The waiter should return Cancelled, not hang
+        let result = tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("waiter should not timeout")
+            .expect("task should not panic");
+
+        assert!(matches!(result, Err(PipedStreamError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_push_and_cancel() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let stream = Arc::new(PipedStream::new(
+            make_stream_id(),
+            14000, // ~10 fragments
+            1,
+            PipedStreamConfig::default(),
+        ));
+
+        // Start pushing fragments
+        let stream_clone = Arc::clone(&stream);
+        let pusher = tokio::spawn(async move {
+            for i in 1..=10 {
+                if stream_clone.is_cancelled() {
+                    break;
+                }
+                let _ = stream_clone.push_fragment(i, Bytes::from(format!("frag {}", i)));
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        // Cancel after a short delay
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stream.cancel();
+
+        // Wait for pusher to finish
+        let _ = pusher.await;
+
+        // Stream should be cancelled
+        assert!(stream.is_cancelled());
+
+        // Further pushes should fail
+        let result = stream.push_fragment(1, Bytes::from_static(b"data"));
+        assert!(matches!(result, Err(PipedStreamError::Cancelled)));
     }
 }

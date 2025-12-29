@@ -82,9 +82,18 @@ pub struct LockFreeStreamBuffer {
     /// Fragments up to this index have been cleared from memory.
     consumed_frontier: AtomicU32,
     /// Event notification for when new fragments arrive.
-    /// Note: `event-listener` uses a Mutex internally for its waiter list.
-    /// The core fragment operations (insert/get/take) are still lock-free;
-    /// the mutex is only for coordinating waiters.
+    ///
+    /// # Lock-Free Considerations
+    ///
+    /// Fragment slot operations (AtomicPtr CAS) are lock-free. However,
+    /// `event-listener::Event` uses a mutex internally for its waiter list.
+    /// This means:
+    /// - **Fast path (no waiters)**: `notify()` is essentially lock-free
+    /// - **Slow path (waiters present)**: `notify()` takes a mutex briefly
+    ///
+    /// Since notification only happens during insert and the mutex is only
+    /// held to wake waiters (not during the actual fragment write), contention
+    /// is minimal in practice.
     data_available: Event,
 }
 
