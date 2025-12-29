@@ -96,7 +96,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Compile for aarch64-apple-darwin
+        env:
+          # Support macOS 11 (Big Sur) and later for broader compatibility
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: cargo build --release
+
+      - name: Ad-hoc sign binaries
+        run: |
+          # Ad-hoc sign binaries so they can run without Gatekeeper blocking
+          codesign -s - --force target/release/freenet
+          codesign -s - --force target/release/fdev
+          # Verify signatures
+          codesign -v target/release/freenet
+          codesign -v target/release/fdev
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v6
