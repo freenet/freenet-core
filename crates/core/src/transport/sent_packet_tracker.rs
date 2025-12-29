@@ -155,12 +155,22 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     // Retransmitted packet: return size but no RTT (Karn's algorithm)
                     ack_info.push((None, packet_size));
 
-                    // Halve backoff on retransmit ACKs to allow recovery from death spiral.
-                    // Rationale: Receiving any ACK indicates network is functioning, even if
-                    // we can't use it for RTT estimation. This is a pragmatic deviation from
-                    // strict Karn's algorithm to prevent permanent throughput collapse.
-                    // Recovery: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1 (6 ACKs to full recovery)
-                    self.rto_backoff = (self.rto_backoff / 2).max(1);
+                    // Full reset of backoff on retransmit ACKs (matching libutp behavior).
+                    //
+                    // Rationale: Receiving any ACK indicates the network is functioning, even
+                    // if we can't use it for RTT estimation per Karn's algorithm. Karn's
+                    // algorithm only addresses RTT measurement ambiguity, not backoff recovery.
+                    //
+                    // Prior art justification:
+                    // - libutp (BitTorrent's canonical LEDBAT): full reset on any ACK
+                    // - Linux TCP: full reset on any ACK
+                    // - picotcp issue #69: identical death spiral bug, fixed with full reset
+                    //
+                    // The previous halving approach was more conservative than necessary.
+                    // libutp has been battle-tested across millions of clients for 10+ years
+                    // with full reset. The protection against congestion collapse comes from
+                    // the timeout doubling itself, not from delayed recovery on ACK.
+                    self.rto_backoff = 1;
                 } else {
                     // Non-retransmitted: calculate RTT and update estimation
                     let rtt_sample = now.duration_since(*sent_time);
@@ -655,7 +665,7 @@ pub(in crate::transport) mod tests {
     }
 
     #[test]
-    fn test_rto_backoff_halves_on_retransmitted_ack() {
+    fn test_rto_backoff_resets_on_retransmitted_ack() {
         let mut tracker = mock_sent_packet_tracker();
 
         // Trigger some timeouts to build up backoff
@@ -671,15 +681,16 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance_time(Duration::from_millis(50));
         tracker.report_received_receipts(&[1]);
 
-        // Backoff should be halved (not fully reset) for retransmitted packets
-        // This allows gradual recovery from death spiral while still being conservative
-        assert_eq!(tracker.rto_backoff(), 2);
+        // Backoff should fully reset on any ACK (matching libutp behavior).
+        // Karn's algorithm only prevents RTT sampling from retransmits, not backoff reset.
+        // Prior art: libutp, Linux TCP, picotcp all reset backoff on any ACK.
+        assert_eq!(tracker.rto_backoff(), 1);
     }
 
     #[test]
     fn test_death_spiral_recovery() {
         // Tests that the system can recover from a high backoff state through
-        // successive retransmit ACKs (the "death spiral" fix)
+        // a single retransmit ACK (matching libutp behavior)
         let mut tracker = mock_sent_packet_tracker();
 
         // Simulate death spiral: many timeouts leading to high backoff
@@ -688,24 +699,14 @@ pub(in crate::transport) mod tests {
         }
         assert_eq!(tracker.rto_backoff(), 64);
 
-        // Recovery through successive retransmit ACKs: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
-        let expected_backoffs = [32, 16, 8, 4, 2, 1];
-        for (i, expected) in expected_backoffs.iter().enumerate() {
-            let packet_id = (i + 1) as u32;
-            tracker.report_sent_packet(packet_id, vec![1, 2, 3].into());
-            tracker.mark_retransmitted(packet_id);
-            tracker.time_source.advance_time(Duration::from_millis(50));
-            tracker.report_received_receipts(&[packet_id]);
-            assert_eq!(
-                tracker.rto_backoff(),
-                *expected,
-                "After {} retransmit ACKs, backoff should be {}",
-                i + 1,
-                expected
-            );
-        }
+        // Single retransmit ACK should fully recover (matching libutp, Linux TCP)
+        // This is the key fix: any ACK proves the network is working
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+        tracker.mark_retransmitted(1);
+        tracker.time_source.advance_time(Duration::from_millis(50));
+        tracker.report_received_receipts(&[1]);
 
-        // Verify we've fully recovered
+        // Immediate full recovery - no gradual halving needed
         assert_eq!(tracker.rto_backoff(), 1);
     }
 
@@ -750,17 +751,15 @@ pub(in crate::transport) mod tests {
         }
         assert_eq!(tracker.rto_backoff(), 16);
 
-        // Phase 2: Recover through retransmit ACKs (16 -> 8 -> 4 -> 2 -> 1)
-        for i in 1..=4 {
-            tracker.report_sent_packet(i, vec![i as u8].into());
-            tracker.mark_retransmitted(i);
-            tracker.time_source.advance_time(Duration::from_millis(50));
-            tracker.report_received_receipts(&[i]);
-        }
+        // Phase 2: Single retransmit ACK immediately recovers (libutp behavior)
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.mark_retransmitted(1);
+        tracker.time_source.advance_time(Duration::from_millis(50));
+        tracker.report_received_receipts(&[1]);
         assert_eq!(
             tracker.rto_backoff(),
             1,
-            "Should have recovered to backoff 1"
+            "Single retransmit ACK should fully recover"
         );
 
         // Phase 3: New timeout should elevate backoff again
