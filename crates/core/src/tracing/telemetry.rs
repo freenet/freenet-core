@@ -9,6 +9,16 @@
 //! - Event batching (send every 10 seconds or when buffer reaches 100 events)
 //! - Rate limiting (max 10 events/second aggregate)
 //! - Priority-based dropping when buffer is full
+//!
+//! ## Design Notes
+//!
+//! ### Why custom backoff instead of `crate::util::Backoff`?
+//! The shared `Backoff` utility is designed for "try N times then give up" scenarios.
+//! Telemetry needs infinite retries with reset-on-success, which is a different pattern.
+//!
+//! ### Why HTTP instead of HTTPS?
+//! TODO(#2456): Enable HTTPS once TLS is configured on the collector server.
+//! Currently the server only accepts HTTP connections.
 
 use std::time::{Duration, Instant};
 
@@ -39,6 +49,21 @@ const INITIAL_BACKOFF_MS: u64 = 1000;
 
 /// Maximum backoff duration
 const MAX_BACKOFF_MS: u64 = 300_000; // 5 minutes
+
+/// Get current timestamp in milliseconds since Unix epoch.
+/// Logs a warning if system time is unavailable (e.g., clock went backwards).
+fn current_timestamp_ms() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as u64,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "System time error while generating telemetry timestamp; using 0 as fallback"
+            );
+            0
+        }
+    }
+}
 
 /// Telemetry reporter that sends events to a central OTLP collector.
 #[derive(Clone)]
@@ -99,10 +124,7 @@ impl NetEventRegister for TelemetryReporter {
         async move {
             for log_msg in NetLogMessage::to_log_message(logs) {
                 let event = TelemetryEvent {
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
+                    timestamp: current_timestamp_ms(),
                     peer_id: log_msg.peer_id.to_string(),
                     transaction_id: log_msg.tx.to_string(),
                     event_type: event_kind_to_string(&log_msg.kind),
@@ -122,10 +144,7 @@ impl NetEventRegister for TelemetryReporter {
         let sender = self.sender.clone();
         async move {
             let event = TelemetryEvent {
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
+                timestamp: current_timestamp_ms(),
                 peer_id: String::new(),
                 transaction_id: tx.to_string(),
                 event_type: "timeout".to_string(),
@@ -291,12 +310,20 @@ impl TelemetryWorker {
         let log_records: Vec<serde_json::Value> = events
             .iter()
             .map(|e| {
+                let body_string = serde_json::to_string(&e.event_data).unwrap_or_else(|err| {
+                    tracing::warn!(
+                        error = %err,
+                        event_type = %e.event_type,
+                        "Failed to serialize telemetry event_data"
+                    );
+                    String::new()
+                });
                 serde_json::json!({
                     "timeUnixNano": e.timestamp * 1_000_000, // Convert ms to ns (OTLP expects numeric)
                     "severityNumber": 9, // INFO
                     "severityText": "INFO",
                     "body": {
-                        "stringValue": serde_json::to_string(&e.event_data).unwrap_or_default()
+                        "stringValue": body_string
                     },
                     "attributes": [
                         {

@@ -292,14 +292,14 @@ impl ConfigArgs {
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
-            // Note: telemetry_enabled defaults to true via clap, so we only override
+            // Note: enabled defaults to true via clap, so we only override
             // if the config file explicitly sets it to false
             if !cfg.telemetry.enabled {
-                self.telemetry.telemetry_enabled = false;
+                self.telemetry.enabled = false;
             }
-            if self.telemetry.telemetry_endpoint.is_none() {
+            if self.telemetry.endpoint.is_none() {
                 self.telemetry
-                    .telemetry_endpoint
+                    .endpoint
                     .get_or_insert(cfg.telemetry.endpoint);
             }
         }
@@ -491,10 +491,10 @@ impl ConfigArgs {
                 .max_blocking_threads
                 .unwrap_or_else(default_max_blocking_threads),
             telemetry: TelemetryConfig {
-                enabled: self.telemetry.telemetry_enabled,
+                enabled: self.telemetry.enabled,
                 endpoint: self
                     .telemetry
-                    .telemetry_endpoint
+                    .endpoint
                     .unwrap_or_else(|| DEFAULT_TELEMETRY_ENDPOINT.to_string()),
             },
         };
@@ -886,21 +886,25 @@ pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
 pub struct TelemetryArgs {
     /// Enable telemetry reporting to help improve Freenet (default: true during alpha).
     /// Telemetry includes operation timing and network topology data, but never contract content.
-    #[arg(long, env = "FREENET_TELEMETRY_ENABLED", default_value = "true")]
+    #[arg(
+        long = "telemetry-enabled",
+        env = "FREENET_TELEMETRY_ENABLED",
+        default_value = "true"
+    )]
     #[serde(rename = "telemetry-enabled", default = "default_telemetry_enabled")]
-    pub telemetry_enabled: bool,
+    pub enabled: bool,
 
     /// Telemetry endpoint URL (OTLP/HTTP format)
-    #[arg(long, env = "FREENET_TELEMETRY_ENDPOINT")]
+    #[arg(long = "telemetry-endpoint", env = "FREENET_TELEMETRY_ENDPOINT")]
     #[serde(rename = "telemetry-endpoint", skip_serializing_if = "Option::is_none")]
-    pub telemetry_endpoint: Option<String>,
+    pub endpoint: Option<String>,
 }
 
 impl Default for TelemetryArgs {
     fn default() -> Self {
         Self {
-            telemetry_enabled: true,
-            telemetry_endpoint: None,
+            enabled: true,
+            endpoint: None,
         }
     }
 }

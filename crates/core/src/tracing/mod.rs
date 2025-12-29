@@ -165,13 +165,17 @@ impl NetEventRegister for DynamicRegister {
 
     fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
         async move {
+            // Aggregate events from all registers up to the requested limit
+            let mut collected = Vec::new();
             for reg in &self.0 {
-                let events = reg.get_router_events(number).await?;
-                if !events.is_empty() {
-                    return Ok(events);
+                if collected.len() >= number {
+                    break;
                 }
+                let remaining = number - collected.len();
+                let events = reg.get_router_events(remaining).await?;
+                collected.extend(events);
             }
-            Ok(vec![])
+            Ok(collected)
         }
         .boxed()
     }
