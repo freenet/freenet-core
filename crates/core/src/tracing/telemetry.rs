@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use either::Either;
 use futures::future::BoxFuture;
 use futures::FutureExt;
+use rand::Rng as _;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
@@ -206,6 +207,15 @@ impl TelemetryWorker {
         }
         self.events_this_second += 1;
 
+        // Drop events if buffer is full and we're in backoff (prevents unbounded memory growth)
+        if self.buffer.len() >= MAX_BUFFER_SIZE && self.backoff_ms > 0 {
+            let elapsed = self.last_send.elapsed();
+            if elapsed < Duration::from_millis(self.backoff_ms) {
+                // Still in backoff and buffer full - drop event
+                return;
+            }
+        }
+
         self.buffer.push(event);
 
         // Send if buffer is full
@@ -240,12 +250,14 @@ impl TelemetryWorker {
             Err(e) => {
                 tracing::debug!(error = %e, "Failed to send telemetry batch");
 
-                // Exponential backoff
-                if self.backoff_ms == 0 {
-                    self.backoff_ms = INITIAL_BACKOFF_MS;
+                // Exponential backoff with jitter (0-25% of base backoff) to prevent thundering herd
+                let base_backoff = if self.backoff_ms == 0 {
+                    INITIAL_BACKOFF_MS
                 } else {
-                    self.backoff_ms = (self.backoff_ms * 2).min(MAX_BACKOFF_MS);
-                }
+                    (self.backoff_ms * 2).min(MAX_BACKOFF_MS)
+                };
+                let jitter = rand::rng().random_range(0..=(base_backoff / 4));
+                self.backoff_ms = base_backoff + jitter;
                 self.last_send = Instant::now();
 
                 // Put events back in buffer (up to limit)
