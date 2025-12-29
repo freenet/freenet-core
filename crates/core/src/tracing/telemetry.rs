@@ -49,7 +49,7 @@ pub struct TelemetryReporter {
 #[allow(dead_code)]
 enum TelemetryCommand {
     Event(TelemetryEvent),
-    Shutdown, // Reserved for future graceful shutdown
+    Shutdown, // TODO(#2456): implement graceful shutdown - send this when node shuts down
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +74,8 @@ impl TelemetryReporter {
         let endpoint = config.endpoint.clone();
         tracing::info!(endpoint = %endpoint, "Telemetry reporting enabled");
 
+        // Channel capacity: 1000 events provides ~100 seconds of buffer at max rate (10 events/sec)
+        // plus headroom for bursts. Events are dropped via try_send if channel is full.
         let (sender, receiver) = mpsc::channel(1000);
 
         // Spawn the background worker
@@ -161,7 +163,7 @@ impl TelemetryWorker {
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .expect("failed to build HTTP client"),
+                .expect("failed to build telemetry HTTP client; check TLS/proxy configuration"),
             backoff_ms: 0,
             last_send: Instant::now(),
             events_this_second: 0,
@@ -248,7 +250,7 @@ impl TelemetryWorker {
                 self.last_send = Instant::now();
             }
             Err(e) => {
-                tracing::debug!(error = %e, "Failed to send telemetry batch");
+                tracing::warn!(error = %e, "Failed to send telemetry batch, will retry with backoff");
 
                 // Exponential backoff with jitter (0-25% of base backoff) to prevent thundering herd
                 let base_backoff = if self.backoff_ms == 0 {
@@ -290,7 +292,7 @@ impl TelemetryWorker {
             .iter()
             .map(|e| {
                 serde_json::json!({
-                    "timeUnixNano": format!("{}", e.timestamp * 1_000_000), // Convert ms to ns
+                    "timeUnixNano": e.timestamp * 1_000_000, // Convert ms to ns (OTLP expects numeric)
                     "severityNumber": 9, // INFO
                     "severityText": "INFO",
                     "body": {

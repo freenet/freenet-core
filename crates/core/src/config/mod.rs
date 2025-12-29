@@ -878,8 +878,9 @@ pub struct WebsocketApiArgs {
     pub token_cleanup_interval_seconds: Option<u64>,
 }
 
-/// Default telemetry endpoint (nova.locut.us OTLP collector)
-pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://5.9.111.215:4318";
+/// Default telemetry endpoint (nova.locut.us OTLP collector).
+/// Using domain name for resilience to IP changes.
+pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
 
 #[derive(clap::Parser, Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryArgs {
