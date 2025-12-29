@@ -10,7 +10,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::{
     config::GlobalExecutor,
-    contract::StoreResponse,
     generated::ContractChange,
     message::{MessageStats, NetMessage, NetMessageV1, Transaction},
     node::PeerId,
@@ -331,22 +330,50 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
+            NetMessageV1::Get(GetMsg::Request {
+                id,
+                instance_id,
+                htl,
+                ..
+            }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Get(GetEvent::Request {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    instance_id: *instance_id,
+                    target: this_peer,
+                    htl: *htl,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
             NetMessageV1::Get(GetMsg::Response {
                 id,
-                result:
-                    GetMsgResult::Found {
-                        key,
-                        value: StoreResponse { state: Some(_), .. },
-                    },
+                result: GetMsgResult::Found { key, value },
                 ..
-            }) => EventKind::Get {
-                id: *id,
-                key: *key,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                // Note: target no longer embedded in message - use connection-based routing
-                requester: op_manager.ring.connection_manager.own_location(),
-                target: op_manager.ring.connection_manager.own_location(),
-            },
+            }) if value.state.is_some() => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Get(GetEvent::GetSuccess {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    target: this_peer,
+                    key: *key,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
+            NetMessageV1::Get(GetMsg::Response {
+                id,
+                instance_id,
+                result: GetMsgResult::NotFound,
+            }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Get(GetEvent::GetNotFound {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    instance_id: *instance_id,
+                    target: this_peer,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
             NetMessageV1::Subscribe(SubscribeMsg::Response {
                 id,
                 result: SubscribeMsgResult::Subscribed { key },
@@ -448,6 +475,8 @@ impl NetLogMessage {
             EventKind::Connect(_) => false,
             EventKind::Put(PutEvent::PutSuccess { .. }) => true,
             EventKind::Put(_) => false,
+            EventKind::Get(GetEvent::GetSuccess { .. } | GetEvent::GetNotFound { .. }) => true,
+            EventKind::Get(_) => false,
             _ => false,
         }
     }
@@ -837,13 +866,13 @@ async fn send_to_metrics_server(
             );
             ws_stream.send(Message::Binary(msg.into())).await
         }
-        EventKind::Get {
+        EventKind::Get(GetEvent::GetSuccess {
             id,
             key,
             timestamp,
             requester,
             target,
-        } => {
+        }) => {
             let contract_location = Location::from_contract_key(key.as_bytes());
             let msg = ContractChange::get_contract_msg(
                 requester.to_string(),
@@ -856,6 +885,8 @@ async fn send_to_metrics_server(
 
             ws_stream.send(Message::Binary(msg.into())).await
         }
+        // GetEvent::Request and GetEvent::GetNotFound fall through to catch-all
+        // TODO: Add FlatBuffer messages for these events when metrics server is enhanced
         EventKind::Subscribed {
             id,
             key,
@@ -1268,14 +1299,7 @@ mod opentelemetry_tracer {
 pub enum EventKind {
     Connect(ConnectEvent),
     Put(PutEvent),
-    // todo: make this a sequence like Put
-    Get {
-        id: Transaction,
-        key: ContractKey,
-        timestamp: u64,
-        requester: PeerKeyLocation,
-        target: PeerKeyLocation,
-    },
+    Get(GetEvent),
     Route(RouteEvent),
     Update(UpdateEvent),
     Subscribed {
@@ -1305,7 +1329,7 @@ impl EventKind {
         match self {
             EventKind::Connect(_) => Self::CONNECT,
             EventKind::Put(_) => Self::PUT,
-            EventKind::Get { .. } => Self::GET,
+            EventKind::Get(_) => Self::GET,
             EventKind::Route(_) => Self::ROUTE,
             EventKind::Subscribed { .. } => Self::SUBSCRIBED,
             EventKind::Ignored => Self::IGNORED,
@@ -1414,6 +1438,48 @@ enum UpdateEvent {
         /// value that was updated
         value: WrappedState,
         /// target peer
+        target: PeerKeyLocation,
+        timestamp: u64,
+    },
+}
+
+/// GET operation events for tracking the lifecycle of contract retrieval.
+///
+/// Similar to `PutEvent`, this enum captures the full sequence of a Get operation:
+/// - Request initiation
+/// - Success when contract is found
+/// - NotFound when contract doesn't exist after search
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+enum GetEvent {
+    /// A Get request was initiated or received.
+    Request {
+        id: Transaction,
+        /// The peer initiating or receiving the request.
+        requester: PeerKeyLocation,
+        /// Contract instance being requested (full key may not be known yet).
+        instance_id: ContractInstanceId,
+        /// Target peer (with hop-by-hop routing, this is the current node).
+        target: PeerKeyLocation,
+        /// Hops remaining before giving up.
+        htl: usize,
+        timestamp: u64,
+    },
+    /// Contract was successfully retrieved.
+    GetSuccess {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        target: PeerKeyLocation,
+        /// Full contract key (only available after successful retrieval).
+        key: ContractKey,
+        timestamp: u64,
+    },
+    /// Contract was not found after exhaustive search.
+    GetNotFound {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        /// Contract instance that was searched for.
+        instance_id: ContractInstanceId,
         target: PeerKeyLocation,
         timestamp: u64,
     },
