@@ -219,14 +219,14 @@ impl<'a> NetEventLog<'a> {
         );
         let connected = PeerKeyLocation::new(peer.pub_key.clone(), peer.addr);
         // Note: location is computed from address, so we don't need to set it separately
-        // elapsed_ms is 0 since we don't have transaction timing for this path
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
             kind: EventKind::Connect(ConnectEvent::Connected {
                 this: ring.connection_manager.own_location(),
                 connected,
-                elapsed_ms: 0,
+                // None since we don't have transaction timing for this path
+                elapsed_ms: None,
             }),
         }
     }
@@ -266,7 +266,7 @@ impl<'a> NetEventLog<'a> {
                 EventKind::Connect(ConnectEvent::Connected {
                     this: this_peer,
                     connected: payload.acceptor.clone(),
-                    elapsed_ms: msg.id().elapsed().as_millis() as u64,
+                    elapsed_ms: Some(msg.id().elapsed().as_millis() as u64),
                 })
             }
             _ => EventKind::Ignored,
@@ -295,7 +295,7 @@ impl<'a> NetEventLog<'a> {
                 };
                 let acceptor_peer_id = PeerId::new(acceptor_addr, acceptor.pub_key().clone());
                 let this_peer_id = PeerId::new(this_addr, this_peer.pub_key().clone());
-                let elapsed_ms = msg.id().elapsed().as_millis() as u64;
+                let elapsed_ms = Some(msg.id().elapsed().as_millis() as u64);
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
@@ -521,22 +521,32 @@ impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
                 this,
                 connected,
                 elapsed_ms,
-            }) => Some(vec![
-                KeyValue::new("phase", "connected"),
-                KeyValue::new("from", format!("{this}")),
-                KeyValue::new("to", format!("{connected}")),
-                KeyValue::new("elapsed_ms", *elapsed_ms as i64),
-            ]),
+            }) => {
+                let mut attrs = vec![
+                    KeyValue::new("phase", "connected"),
+                    KeyValue::new("from", format!("{this}")),
+                    KeyValue::new("to", format!("{connected}")),
+                ];
+                if let Some(ms) = elapsed_ms {
+                    attrs.push(KeyValue::new("elapsed_ms", *ms as i64));
+                }
+                Some(attrs)
+            }
             EventKind::Connect(ConnectEvent::Finished {
                 initiator,
                 location,
                 elapsed_ms,
-            }) => Some(vec![
-                KeyValue::new("phase", "finished"),
-                KeyValue::new("initiator", format!("{initiator}")),
-                KeyValue::new("location", location.as_f64()),
-                KeyValue::new("elapsed_ms", *elapsed_ms as i64),
-            ]),
+            }) => {
+                let mut attrs = vec![
+                    KeyValue::new("phase", "finished"),
+                    KeyValue::new("initiator", format!("{initiator}")),
+                    KeyValue::new("location", location.as_f64()),
+                ];
+                if let Some(ms) = elapsed_ms {
+                    attrs.push(KeyValue::new("elapsed_ms", *ms as i64));
+                }
+                Some(attrs)
+            }
             _ => None,
         };
         map.map(|mut map| {
@@ -923,7 +933,8 @@ async fn send_to_metrics_server(
             ws_stream.send(Message::Binary(msg.into())).await
         }
         // GetEvent::Request and GetEvent::GetNotFound fall through to catch-all
-        // TODO: Add FlatBuffer messages for these events when metrics server is enhanced
+        // TODO(#2456): Add FlatBuffer messages for GetEvent::Request and GetEvent::GetNotFound
+        // when metrics server is enhanced to support these event types.
         EventKind::Subscribed {
             id,
             key,
@@ -1386,25 +1397,37 @@ impl EventKind {
     }
 }
 
+/// Connection lifecycle events.
+///
+/// Note on event format versioning: New variants are added at the end of enums
+/// to maintain backwards compatibility with persisted AOF logs within a session.
+/// AOF logs are session-scoped and cleared on restart, so cross-version
+/// compatibility is not required.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum ConnectEvent {
     StartConnection {
         from: PeerId,
         /// Whether this is a connection to a gateway node.
+        /// TODO(#2456): Populate from connect operation context - currently always false.
         is_gateway: bool,
     },
     Connected {
         this: PeerKeyLocation,
         connected: PeerKeyLocation,
         /// Time elapsed since connection started (milliseconds).
-        elapsed_ms: u64,
+        /// None when timing information is unavailable (e.g., connection events
+        /// without transaction context).
+        elapsed_ms: Option<u64>,
     },
+    /// Connection process finished.
+    /// TODO(#2456): This variant is defined but not currently emitted.
+    /// Implementation requires hooking into connect operation completion.
     Finished {
         initiator: PeerId,
         location: Location,
         /// Time elapsed since connection started (milliseconds).
-        elapsed_ms: u64,
+        elapsed_ms: Option<u64>,
     },
 }
 
@@ -1923,7 +1946,7 @@ pub(super) mod test {
                 kind: EventKind::Connect(ConnectEvent::Connected {
                     this: PeerKeyLocation::new(peer_id.pub_key.clone(), peer_id.addr),
                     connected: PeerKeyLocation::new(other.pub_key.clone(), other.addr),
-                    elapsed_ms: 0,
+                    elapsed_ms: None,
                 }),
             }))
         }));
