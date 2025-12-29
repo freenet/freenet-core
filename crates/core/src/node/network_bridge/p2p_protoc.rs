@@ -182,6 +182,7 @@ impl NetworkBridge for P2pBridge {
                         .register_events(Either::Left(NetEventLog::disconnected(
                             &self.op_manager.ring,
                             &PeerId::new(known_loc.socket_addr(), peer_loc.pub_key().clone()),
+                            Some("connection dropped by bridge".to_string()),
                         )))
                         .await;
                 }

@@ -229,7 +229,7 @@ impl<'a> NetEventLog<'a> {
         }
     }
 
-    pub fn disconnected(ring: &'a Ring, from: &'a PeerId) -> Self {
+    pub fn disconnected(ring: &'a Ring, from: &'a PeerId, reason: Option<String>) -> Self {
         let own_loc = ring.connection_manager.own_location();
         let peer_id = PeerId::new(
             own_loc
@@ -240,7 +240,10 @@ impl<'a> NetEventLog<'a> {
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
-            kind: EventKind::Disconnected { from: from.clone() },
+            kind: EventKind::Disconnected {
+                from: from.clone(),
+                reason,
+            },
         }
     }
 
@@ -708,8 +711,21 @@ impl NetEventRegister for EventRegister {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<'_, ()> {
-        async {}.boxed()
+    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+        let log_msg = NetLogMessage {
+            tx,
+            datetime: Utc::now(),
+            peer_id: PeerId::random(), // Timeout events don't have a specific peer context
+            kind: EventKind::Timeout {
+                id: tx,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            },
+        };
+        let sender = self.log_sender.clone();
+        async move {
+            let _ = sender.send(EventLogCommand::Log(log_msg)).await;
+        }
+        .boxed()
     }
 
     fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
@@ -771,7 +787,7 @@ async fn send_to_metrics_server(
                 Ok(())
             }
         }
-        EventKind::Disconnected { from } => {
+        EventKind::Disconnected { from, .. } => {
             let msg = PeerChange::removed_connection_msg(
                 from.clone().to_string(),
                 send_msg.peer_id.clone().to_string(),
@@ -1312,6 +1328,14 @@ pub enum EventKind {
     Ignored,
     Disconnected {
         from: PeerId,
+        /// Reason for disconnection, if known.
+        reason: Option<String>,
+    },
+    /// A transaction timed out without completing.
+    Timeout {
+        /// The transaction that timed out.
+        id: Transaction,
+        timestamp: u64,
     },
 }
 
@@ -1324,6 +1348,7 @@ impl EventKind {
     const IGNORED: u8 = 5;
     const DISCONNECTED: u8 = 6;
     const UPDATE: u8 = 7;
+    const TIMEOUT: u8 = 8;
 
     const fn varint_id(&self) -> u8 {
         match self {
@@ -1335,6 +1360,7 @@ impl EventKind {
             EventKind::Ignored => Self::IGNORED,
             EventKind::Disconnected { .. } => Self::DISCONNECTED,
             EventKind::Update(_) => Self::UPDATE,
+            EventKind::Timeout { .. } => Self::TIMEOUT,
         }
     }
 }

@@ -1405,11 +1405,12 @@ impl TestContext {
                 let (icon, type_name) = match &event.kind {
                     crate::tracing::EventKind::Connect(..) => ("🔗", "Connect"),
                     crate::tracing::EventKind::Put(..) => ("📤", "Put"),
-                    crate::tracing::EventKind::Get { .. } => ("📥", "Get"),
+                    crate::tracing::EventKind::Get(..) => ("📥", "Get"),
                     crate::tracing::EventKind::Route(..) => ("🔀", "Route"),
                     crate::tracing::EventKind::Update(..) => ("🔄", "Update"),
                     crate::tracing::EventKind::Subscribed { .. } => ("🔔", "Subscribe"),
                     crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
+                    crate::tracing::EventKind::Timeout { .. } => ("⏱️", "Timeout"),
                     crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
                 };
 
@@ -1445,11 +1446,12 @@ impl TestContext {
             let (icon, type_name) = match &event.kind {
                 crate::tracing::EventKind::Connect(..) => ("🔗", "Connect"),
                 crate::tracing::EventKind::Put(..) => ("📤", "Put"),
-                crate::tracing::EventKind::Get { .. } => ("📥", "Get"),
+                crate::tracing::EventKind::Get(..) => ("📥", "Get"),
                 crate::tracing::EventKind::Route(..) => ("🔀", "Route"),
                 crate::tracing::EventKind::Update(..) => ("🔄", "Update"),
                 crate::tracing::EventKind::Subscribed { .. } => ("🔔", "Subscribe"),
                 crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
+                crate::tracing::EventKind::Timeout { .. } => ("⏱️", "Timeout"),
                 crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
             };
 
@@ -1506,11 +1508,12 @@ impl TestContext {
                         let type_name = match &event.kind {
                             crate::tracing::EventKind::Connect(..) => "Connect",
                             crate::tracing::EventKind::Put(..) => "Put",
-                            crate::tracing::EventKind::Get { .. } => "Get",
+                            crate::tracing::EventKind::Get(..) => "Get",
                             crate::tracing::EventKind::Route(..) => "Route",
                             crate::tracing::EventKind::Update(..) => "Update",
                             crate::tracing::EventKind::Subscribed { .. } => "Subscribe",
                             crate::tracing::EventKind::Disconnected { .. } => "Disconnect",
+                            crate::tracing::EventKind::Timeout { .. } => "Timeout",
                             crate::tracing::EventKind::Ignored => "Ignored",
                         };
                         *by_type.entry(type_name.to_string()).or_default() += 1;
@@ -1558,11 +1561,12 @@ impl TestContext {
                         let (icon, _type_name) = match &event.kind {
                             crate::tracing::EventKind::Connect(..) => ("🔗", "Connect"),
                             crate::tracing::EventKind::Put(..) => ("📤", "Put"),
-                            crate::tracing::EventKind::Get { .. } => ("📥", "Get"),
+                            crate::tracing::EventKind::Get(..) => ("📥", "Get"),
                             crate::tracing::EventKind::Route(..) => ("🔀", "Route"),
                             crate::tracing::EventKind::Update(..) => ("🔄", "Update"),
                             crate::tracing::EventKind::Subscribed { .. } => ("🔔", "Subscribe"),
                             crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
+                            crate::tracing::EventKind::Timeout { .. } => ("⏱️", "Timeout"),
                             crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
                         };
 

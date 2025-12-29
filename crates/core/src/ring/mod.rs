@@ -475,7 +475,11 @@ impl Ring {
         prune_result.orphaned_transactions = orphaned_transactions;
 
         self.event_register
-            .register_events(Either::Left(NetEventLog::disconnected(self, &peer)))
+            .register_events(Either::Left(NetEventLog::disconnected(
+                self,
+                &peer,
+                Some("connection pruned".to_string()),
+            )))
             .await;
 
         prune_result
