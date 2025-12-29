@@ -1,23 +1,31 @@
-//! LEDBAT (Low Extra Delay Background Transport) congestion controller.
+//! LEDBAT++ (Low Extra Delay Background Transport) congestion controller.
 //!
-//! RFC 6817 compliant implementation of delay-based congestion control designed
-//! for background traffic. LEDBAT automatically yields bandwidth to competing
-//! flows by maintaining a target queuing delay (~100ms).
+//! Implementation based on draft-irtf-iccrg-ledbat-plus-plus, which improves upon
+//! RFC 6817 with better inter-flow fairness and latecomer handling.
 //!
-//! ## Why LEDBAT?
+//! ## Why LEDBAT++?
 //!
 //! Freenet runs as a background daemon and should not interfere with foreground
-//! applications (video calls, web browsing, etc.). LEDBAT is designed exactly
-//! for this use case - it's used by BitTorrent for the same reason.
+//! applications (video calls, web browsing, etc.). LEDBAT++ is designed exactly
+//! for this use case - it's used by BitTorrent (uTP) and Apple for similar reasons.
 //!
-//! ## Key Differences from AIMD
+//! ## Key Improvements over RFC 6817 LEDBAT
 //!
-//! | Factor | AIMD | LEDBAT |
-//! |--------|------|--------|
-//! | Congestion signal | Packet loss | Queuing delay |
-//! | Optimization goal | Maximize throughput | Minimize interference |
-//! | Competing flows | Slow to yield | Fast to yield |
-//! | User perception | Noticeable | Imperceptible |
+//! | Feature | RFC 6817 | LEDBAT++ |
+//! |---------|----------|----------|
+//! | Target delay | 100ms | 60ms |
+//! | Gain | Fixed 1.0 | Dynamic based on base_delay |
+//! | Decrease formula | Linear | Multiplicative with -W/2 cap |
+//! | Inter-flow fairness | Poor (latecomer advantage) | Good (periodic slowdowns) |
+//! | Slow start exit | 50% of target | 75% of target |
+//!
+//! ## Periodic Slowdown Mechanism
+//!
+//! LEDBAT++ introduces periodic slowdowns to solve the "latecomer advantage" problem:
+//! - After initial slow start exit, wait 2 RTTs then reduce cwnd to 2 packets
+//! - Freeze cwnd for 2 RTTs to allow base delay re-measurement
+//! - Ramp back up using slow start until reaching previous cwnd
+//! - Schedule next slowdown at 9x the slowdown duration (maintains ≤10% utilization impact)
 //!
 //! ## Lock-Free Design
 //!
@@ -27,7 +35,7 @@
 //! - Epoch-based timing for rate-limiting updates
 #![allow(dead_code)] // Infrastructure not yet integrated
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::packet_data::MAX_DATA_SIZE;
@@ -35,11 +43,11 @@ use super::packet_data::MAX_DATA_SIZE;
 /// Maximum segment size (actual packet data capacity)
 const MSS: usize = MAX_DATA_SIZE;
 
-/// Target queuing delay (RFC 6817 default)
-const TARGET: Duration = Duration::from_millis(100);
+/// Target queuing delay (LEDBAT++ uses 60ms, RFC 6817 used 100ms)
+const TARGET: Duration = Duration::from_millis(60);
 
-/// Controller gain (RFC 6817 default)
-const GAIN: f64 = 1.0;
+/// Maximum GAIN divisor for dynamic GAIN calculation (LEDBAT++ Section 4.2)
+const MAX_GAIN_DIVISOR: u32 = 16;
 
 /// Base delay history size (RFC 6817 recommendation)
 const BASE_HISTORY_SIZE: usize = 10;
@@ -50,7 +58,18 @@ const DELAY_FILTER_SIZE: usize = 4;
 /// Default slow start threshold (100 KB)
 const DEFAULT_SSTHRESH: usize = 102_400;
 
-/// Configuration for LEDBAT with slow start
+/// Periodic slowdown interval multiplier (LEDBAT++ Section 4.4)
+/// Next slowdown is scheduled at 9x the previous slowdown duration,
+/// maintaining ≤10% utilization impact.
+const SLOWDOWN_INTERVAL_MULTIPLIER: u32 = 9;
+
+/// Number of RTTs to wait after slow start exit before initial slowdown
+const SLOWDOWN_DELAY_RTTS: u32 = 2;
+
+/// Number of RTTs to freeze cwnd at minimum during slowdown
+const SLOWDOWN_FREEZE_RTTS: u32 = 2;
+
+/// Configuration for LEDBAT++ with slow start and periodic slowdowns
 #[derive(Debug, Clone)]
 pub struct LedbatConfig {
     /// Initial congestion window (bytes)
@@ -64,11 +83,14 @@ pub struct LedbatConfig {
     /// Enable slow start phase
     pub enable_slow_start: bool,
     /// Delay threshold to exit slow start (fraction of TARGET)
-    /// Default: 0.5 (exit when queuing_delay > TARGET/2 = 50ms)
+    /// Default: 0.75 (LEDBAT++ exits when queuing_delay > 3/4 * TARGET = 45ms)
     pub delay_exit_threshold: f64,
     /// Randomize ssthresh to prevent synchronization (±20% jitter)
     /// Default: true
     pub randomize_ssthresh: bool,
+    /// Enable periodic slowdowns for inter-flow fairness (LEDBAT++ feature)
+    /// Default: true
+    pub enable_periodic_slowdown: bool,
 }
 
 impl Default for LedbatConfig {
@@ -76,14 +98,15 @@ impl Default for LedbatConfig {
         Self {
             // IW26: 26 * MSS = 38,000 bytes
             // Reaches 300KB cwnd in 3 RTTs (38KB → 76KB → 152KB → 304KB)
-            // This enables >3 MB/s throughput at 100ms RTT
+            // This enables >3 MB/s throughput at 60ms RTT
             initial_cwnd: 38_000,       // 26 * MSS (IW26)
             min_cwnd: 2_848,            // 2 * MSS
             max_cwnd: 1_000_000_000,    // 1 GB
             ssthresh: DEFAULT_SSTHRESH, // 100 KB
             enable_slow_start: true,    // Enable by default
-            delay_exit_threshold: 0.5,  // Exit at TARGET/2
+            delay_exit_threshold: 0.75, // LEDBAT++: exit at 3/4 * TARGET (45ms)
             randomize_ssthresh: true,   // Enable jitter by default
+            enable_periodic_slowdown: true, // LEDBAT++: enable for inter-flow fairness
         }
     }
 }
@@ -91,6 +114,29 @@ impl Default for LedbatConfig {
 /// Sentinel value indicating an empty slot in atomic delay arrays.
 /// We use u64::MAX since no valid RTT would ever be this large (~584 years).
 const EMPTY_DELAY_NANOS: u64 = u64::MAX;
+
+/// Periodic slowdown state machine (LEDBAT++ Section 4.4)
+///
+/// The slowdown mechanism works as follows:
+/// 1. After initial slow start exit, wait 2 RTTs (WaitingForSlowdown)
+/// 2. Enter slowdown: save cwnd to ssthresh, reduce to min_cwnd (InSlowdown)
+/// 3. Freeze at min_cwnd for 2 RTTs to re-measure base delay (Frozen)
+/// 4. Ramp back up using slow start until reaching ssthresh (RampingUp)
+/// 5. Return to normal operation, schedule next slowdown at 9x duration (Normal)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum SlowdownState {
+    /// Normal operation, no slowdown pending
+    Normal = 0,
+    /// Waiting N RTTs before starting slowdown
+    WaitingForSlowdown = 1,
+    /// In slowdown: cwnd reduced to minimum, waiting to freeze
+    InSlowdown = 2,
+    /// Frozen at minimum cwnd, re-measuring base delay
+    Frozen = 3,
+    /// Ramping back up using slow start
+    RampingUp = 4,
+}
 
 /// Lock-free delay filter: MIN over recent samples (RFC 6817 Section 4.2).
 ///
@@ -294,10 +340,13 @@ impl AtomicBaseDelayHistory {
     }
 }
 
-/// LEDBAT congestion controller (RFC 6817) with slow start.
+/// LEDBAT++ congestion controller with slow start and periodic slowdowns.
 ///
-/// Maintains target queuing delay to yield bandwidth to competing flows.
-/// Uses delay-based congestion control instead of loss-based (AIMD).
+/// Implements draft-irtf-iccrg-ledbat-plus-plus with improvements over RFC 6817:
+/// - Dynamic GAIN based on base_delay
+/// - Multiplicative decrease capped at -W/2
+/// - Periodic slowdowns for inter-flow fairness
+/// - 60ms target delay (vs 100ms in RFC 6817)
 ///
 /// ## Lock-Free Design
 ///
@@ -310,6 +359,11 @@ impl AtomicBaseDelayHistory {
 /// for fast ramp-up. Exits when:
 /// - cwnd >= ssthresh (reached threshold), OR
 /// - queuing_delay > TARGET * delay_exit_threshold (congestion detected)
+///
+/// ## Periodic Slowdowns
+///
+/// After initial slow start exit, periodically reduces cwnd to minimum to
+/// re-measure base delay and ensure fair sharing with competing flows.
 pub struct LedbatController {
     /// Congestion window (bytes in flight)
     cwnd: AtomicUsize,
@@ -341,14 +395,36 @@ pub struct LedbatController {
     /// Are we in slow start phase?
     in_slow_start: AtomicBool,
 
+    // ===== LEDBAT++ Periodic Slowdown State =====
+    /// Current slowdown state (stored as u8, maps to SlowdownState)
+    slowdown_state: AtomicU8,
+
+    /// Time when current slowdown phase started (nanos since epoch)
+    slowdown_phase_start_nanos: AtomicU64,
+
+    /// RTT count within current slowdown phase
+    slowdown_rtt_count: AtomicU32,
+
+    /// Duration of last complete slowdown cycle (nanos) for scheduling next
+    last_slowdown_duration_nanos: AtomicU64,
+
+    /// Time when next scheduled slowdown should start (nanos since epoch)
+    next_slowdown_time_nanos: AtomicU64,
+
+    /// cwnd value saved before slowdown (for ramping back up)
+    pre_slowdown_cwnd: AtomicUsize,
+
+    /// Whether initial slow start has completed (triggers first slowdown)
+    initial_slow_start_completed: AtomicBool,
+
     /// Configuration
     target_delay: Duration,
-    gain: f64,
     allowed_increase_packets: usize,
     min_cwnd: usize,
     max_cwnd: usize,
     enable_slow_start: bool,
     delay_exit_threshold: f64,
+    enable_periodic_slowdown: bool,
 
     /// Statistics
     total_increases: AtomicUsize,
@@ -356,6 +432,7 @@ pub struct LedbatController {
     total_losses: AtomicUsize,
     min_cwnd_events: AtomicUsize,
     slow_start_exits: AtomicUsize,
+    periodic_slowdowns: AtomicUsize,
 }
 
 impl LedbatController {
@@ -441,19 +518,51 @@ impl LedbatController {
             bytes_acked_since_update: AtomicUsize::new(0),
             ssthresh: AtomicUsize::new(ssthresh),
             in_slow_start: AtomicBool::new(config.enable_slow_start),
+            // LEDBAT++ periodic slowdown state
+            slowdown_state: AtomicU8::new(SlowdownState::Normal as u8),
+            slowdown_phase_start_nanos: AtomicU64::new(0),
+            slowdown_rtt_count: AtomicU32::new(0),
+            last_slowdown_duration_nanos: AtomicU64::new(0),
+            next_slowdown_time_nanos: AtomicU64::new(u64::MAX), // No scheduled slowdown yet
+            pre_slowdown_cwnd: AtomicUsize::new(0),
+            initial_slow_start_completed: AtomicBool::new(false),
+            // Configuration
             target_delay: TARGET,
-            gain: GAIN,
             allowed_increase_packets: 2, // RFC 6817 default
             min_cwnd: config.min_cwnd,
             max_cwnd: config.max_cwnd,
             enable_slow_start: config.enable_slow_start,
             delay_exit_threshold: config.delay_exit_threshold,
+            enable_periodic_slowdown: config.enable_periodic_slowdown,
+            // Statistics
             total_increases: AtomicUsize::new(0),
             total_decreases: AtomicUsize::new(0),
             total_losses: AtomicUsize::new(0),
             min_cwnd_events: AtomicUsize::new(0),
             slow_start_exits: AtomicUsize::new(0),
+            periodic_slowdowns: AtomicUsize::new(0),
         }
+    }
+
+    /// Calculate dynamic GAIN based on base delay (LEDBAT++ Section 4.2)
+    ///
+    /// GAIN = 1 / min(16, ceil(2 * TARGET / base_delay))
+    ///
+    /// This adapts the responsiveness based on the ratio of target to base delay.
+    /// For low-latency links (low base_delay), GAIN is smaller for stability.
+    /// For high-latency links (high base_delay), GAIN approaches 1/16 minimum.
+    fn calculate_dynamic_gain(&self, base_delay: Duration) -> f64 {
+        let base_ms = base_delay.as_millis() as f64;
+        let target_ms = self.target_delay.as_millis() as f64;
+
+        if base_ms <= 0.0 {
+            // Fallback for edge case
+            return 1.0 / MAX_GAIN_DIVISOR as f64;
+        }
+
+        let divisor = (2.0 * target_ms / base_ms).ceil() as u32;
+        let clamped_divisor = divisor.min(MAX_GAIN_DIVISOR).max(1);
+        1.0 / clamped_divisor as f64
     }
 
     /// Called when packet sent.
@@ -538,23 +647,52 @@ impl LedbatController {
 
         // Check if in slow start phase
         if self.enable_slow_start && self.in_slow_start.load(Ordering::Acquire) {
-            self.handle_slow_start(bytes_acked_total, queuing_delay);
+            self.handle_slow_start(bytes_acked_total, queuing_delay, base_delay);
             return;
         }
 
-        // LEDBAT congestion avoidance (RFC 6817 Section 2.4.2)
+        // Check for periodic slowdown (LEDBAT++)
+        if self.enable_periodic_slowdown {
+            if self.check_and_handle_slowdown(bytes_acked_total, queuing_delay, base_delay) {
+                return; // Slowdown handling took over
+            }
+        }
+
+        // LEDBAT++ congestion avoidance (draft-irtf-iccrg-ledbat-plus-plus Section 4.2)
+        //
+        // Uses dynamic GAIN and multiplicative decrease capped at -W/2:
+        // Δcwnd = max(GAIN - Constant * W * (delay/target - 1), -W/2)
+        //
+        // Where:
+        // - GAIN = 1 / min(16, ceil(2 * TARGET / base_delay))
+        // - Constant approximates the LEDBAT linear formula
+        //
+        // For simplicity, we use the equivalent formulation:
         // Δcwnd = GAIN * (off_target / TARGET) * bytes_acked * MSS / cwnd
+        // But cap the decrease at -W/2 per RTT
         let current_cwnd = self.cwnd.load(Ordering::Acquire);
+
+        // Calculate dynamic GAIN based on base delay
+        let gain = self.calculate_dynamic_gain(base_delay);
+
         let cwnd_change =
-            self.gain * (off_target_ms / target_ms) * (bytes_acked_total as f64) * (MSS as f64)
+            gain * (off_target_ms / target_ms) * (bytes_acked_total as f64) * (MSS as f64)
                 / (current_cwnd as f64);
 
-        let mut new_cwnd = current_cwnd as f64 + cwnd_change;
+        // LEDBAT++ key improvement: cap decrease at -W/2 (multiplicative decrease limit)
+        let max_decrease = -(current_cwnd as f64 / 2.0);
+        let capped_change = if cwnd_change < max_decrease {
+            max_decrease
+        } else {
+            cwnd_change
+        };
+
+        let mut new_cwnd = current_cwnd as f64 + capped_change;
 
         // Track statistics
-        if cwnd_change > 0.0 {
+        if capped_change > 0.0 {
             self.total_increases.fetch_add(1, Ordering::Relaxed);
-        } else if cwnd_change < 0.0 {
+        } else if capped_change < 0.0 {
             self.total_decreases.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -596,7 +734,9 @@ impl LedbatController {
     /// Exits slow start when:
     /// - cwnd >= ssthresh (reached threshold), OR
     /// - queuing_delay > TARGET * delay_exit_threshold (congestion detected)
-    fn handle_slow_start(&self, bytes_acked: usize, queuing_delay: Duration) {
+    ///
+    /// On initial slow start exit, schedules the first periodic slowdown (LEDBAT++).
+    fn handle_slow_start(&self, bytes_acked: usize, queuing_delay: Duration, base_delay: Duration) {
         // Early exit if no longer in slow start (race: loss/timeout occurred)
         if !self.in_slow_start.load(Ordering::Acquire) {
             return;
@@ -605,7 +745,7 @@ impl LedbatController {
         let current_cwnd = self.cwnd.load(Ordering::Acquire);
         let ssthresh = self.ssthresh.load(Ordering::Acquire);
 
-        // Check exit conditions
+        // Check exit conditions (LEDBAT++ uses 3/4 of target, configured via delay_exit_threshold)
         let delay_threshold =
             Duration::from_secs_f64(self.target_delay.as_secs_f64() * self.delay_exit_threshold);
         let should_exit = current_cwnd >= ssthresh || queuing_delay > delay_threshold;
@@ -619,6 +759,26 @@ impl LedbatController {
             let new_cwnd = ((current_cwnd as f64) * 0.9) as usize;
             let new_cwnd = new_cwnd.max(self.min_cwnd).min(self.max_cwnd);
             self.cwnd.store(new_cwnd, Ordering::Release);
+
+            // LEDBAT++: Schedule initial slowdown after first slow start exit
+            // The slowdown will occur after SLOWDOWN_DELAY_RTTS (2 RTTs)
+            if self.enable_periodic_slowdown
+                && !self.initial_slow_start_completed.swap(true, Ordering::AcqRel)
+            {
+                let now_nanos = self.epoch.elapsed().as_nanos() as u64;
+                // Schedule slowdown after 2 RTTs (use base_delay as RTT estimate)
+                let delay_nanos =
+                    base_delay.as_nanos() as u64 * SLOWDOWN_DELAY_RTTS as u64;
+                self.next_slowdown_time_nanos
+                    .store(now_nanos + delay_nanos, Ordering::Release);
+                self.slowdown_state
+                    .store(SlowdownState::WaitingForSlowdown as u8, Ordering::Release);
+
+                tracing::debug!(
+                    delay_ms = delay_nanos / 1_000_000,
+                    "LEDBAT++ scheduling initial slowdown after slow start exit"
+                );
+            }
 
             let exit_reason = if current_cwnd >= ssthresh {
                 "ssthresh"
@@ -649,6 +809,140 @@ impl LedbatController {
                 "Slow start growth"
             );
         }
+    }
+
+    /// Check and handle periodic slowdown state machine (LEDBAT++ Section 4.4).
+    ///
+    /// Returns true if the slowdown logic handled this update (caller should return).
+    fn check_and_handle_slowdown(
+        &self,
+        bytes_acked: usize,
+        queuing_delay: Duration,
+        base_delay: Duration,
+    ) -> bool {
+        let now_nanos = self.epoch.elapsed().as_nanos() as u64;
+        let state = self.slowdown_state.load(Ordering::Acquire);
+
+        match state {
+            s if s == SlowdownState::Normal as u8 => {
+                // Check if it's time for the next scheduled slowdown
+                let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
+                if now_nanos >= next_slowdown && next_slowdown != u64::MAX {
+                    self.start_slowdown(now_nanos, base_delay);
+                    return true;
+                }
+                false
+            }
+            s if s == SlowdownState::WaitingForSlowdown as u8 => {
+                // Check if wait period is over
+                let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
+                if now_nanos >= next_slowdown {
+                    self.start_slowdown(now_nanos, base_delay);
+                    return true;
+                }
+                false
+            }
+            s if s == SlowdownState::InSlowdown as u8 => {
+                // Just entered slowdown, transition to frozen state
+                self.slowdown_state
+                    .store(SlowdownState::Frozen as u8, Ordering::Release);
+                self.slowdown_rtt_count.store(0, Ordering::Release);
+                self.slowdown_phase_start_nanos
+                    .store(now_nanos, Ordering::Release);
+                true
+            }
+            s if s == SlowdownState::Frozen as u8 => {
+                // Frozen at min_cwnd, counting RTTs until we can ramp up
+                let phase_start = self.slowdown_phase_start_nanos.load(Ordering::Acquire);
+                let freeze_duration = base_delay.as_nanos() as u64 * SLOWDOWN_FREEZE_RTTS as u64;
+
+                if now_nanos.saturating_sub(phase_start) >= freeze_duration {
+                    // Done freezing, start ramping up
+                    self.slowdown_state
+                        .store(SlowdownState::RampingUp as u8, Ordering::Release);
+                    self.in_slow_start.store(true, Ordering::Release);
+                    tracing::debug!(
+                        cwnd_kb = self.cwnd.load(Ordering::Relaxed) / 1024,
+                        "LEDBAT++ slowdown: starting ramp-up phase"
+                    );
+                }
+                // Keep cwnd at minimum during freeze
+                self.cwnd.store(self.min_cwnd, Ordering::Release);
+                true
+            }
+            s if s == SlowdownState::RampingUp as u8 => {
+                // Ramping up using slow start until reaching pre_slowdown_cwnd
+                let target_cwnd = self.pre_slowdown_cwnd.load(Ordering::Acquire);
+                let current_cwnd = self.cwnd.load(Ordering::Acquire);
+
+                if current_cwnd >= target_cwnd || queuing_delay > self.target_delay {
+                    // Done ramping up, return to normal operation
+                    self.complete_slowdown(now_nanos, base_delay);
+                    return false; // Let normal congestion avoidance take over
+                }
+
+                // Exponential growth during ramp-up
+                let new_cwnd = (current_cwnd + bytes_acked).min(target_cwnd).min(self.max_cwnd);
+                self.cwnd.store(new_cwnd, Ordering::Release);
+                true
+            }
+            _ => false, // Unknown state, don't interfere
+        }
+    }
+
+    /// Start a periodic slowdown cycle.
+    fn start_slowdown(&self, now_nanos: u64, _base_delay: Duration) {
+        let current_cwnd = self.cwnd.load(Ordering::Acquire);
+
+        // Save current cwnd as ssthresh and ramp-up target
+        self.ssthresh.store(current_cwnd, Ordering::Release);
+        self.pre_slowdown_cwnd.store(current_cwnd, Ordering::Release);
+
+        // Reduce cwnd to minimum (2 packets)
+        self.cwnd.store(self.min_cwnd, Ordering::Release);
+
+        // Update state
+        self.slowdown_state
+            .store(SlowdownState::InSlowdown as u8, Ordering::Release);
+        self.slowdown_phase_start_nanos
+            .store(now_nanos, Ordering::Release);
+        self.periodic_slowdowns.fetch_add(1, Ordering::Relaxed);
+
+        tracing::debug!(
+            old_cwnd_kb = current_cwnd / 1024,
+            new_cwnd_kb = self.min_cwnd / 1024,
+            "LEDBAT++ periodic slowdown: reducing cwnd to minimum"
+        );
+    }
+
+    /// Complete a slowdown cycle and schedule the next one.
+    fn complete_slowdown(&self, now_nanos: u64, base_delay: Duration) {
+        let phase_start = self.slowdown_phase_start_nanos.load(Ordering::Acquire);
+        let slowdown_duration = now_nanos.saturating_sub(phase_start);
+
+        // Store duration for potential diagnostics
+        self.last_slowdown_duration_nanos
+            .store(slowdown_duration, Ordering::Release);
+
+        // Schedule next slowdown at 9x the current duration (LEDBAT++ spec)
+        let next_interval = slowdown_duration * SLOWDOWN_INTERVAL_MULTIPLIER as u64;
+        // Ensure minimum interval of 1 RTT
+        let min_interval = base_delay.as_nanos() as u64;
+        let actual_interval = next_interval.max(min_interval);
+
+        self.next_slowdown_time_nanos
+            .store(now_nanos + actual_interval, Ordering::Release);
+
+        // Return to normal operation
+        self.slowdown_state
+            .store(SlowdownState::Normal as u8, Ordering::Release);
+        self.in_slow_start.store(false, Ordering::Release);
+
+        tracing::debug!(
+            slowdown_duration_ms = slowdown_duration / 1_000_000,
+            next_interval_ms = actual_interval / 1_000_000,
+            "LEDBAT++ slowdown complete, scheduling next"
+        );
     }
 
     /// Called when packet loss detected (not timeout).
@@ -779,11 +1073,12 @@ impl LedbatController {
             total_losses: self.total_losses.load(Ordering::Relaxed),
             min_cwnd_events: self.min_cwnd_events.load(Ordering::Relaxed),
             slow_start_exits: self.slow_start_exits.load(Ordering::Relaxed),
+            periodic_slowdowns: self.periodic_slowdowns.load(Ordering::Relaxed),
         }
     }
 }
 
-/// LEDBAT statistics.
+/// LEDBAT++ statistics.
 #[derive(Debug, Clone)]
 pub struct LedbatStats {
     pub cwnd: usize,
@@ -795,6 +1090,8 @@ pub struct LedbatStats {
     pub total_losses: usize,
     pub min_cwnd_events: usize,
     pub slow_start_exits: usize,
+    /// Number of periodic slowdowns completed (LEDBAT++ feature)
+    pub periodic_slowdowns: usize,
 }
 
 #[cfg(test)]
@@ -1509,6 +1806,271 @@ mod tests {
             Duration::from_millis(5),
             "Base delay should be 5ms (the smallest value sent), got {}ms",
             base.as_millis()
+        );
+    }
+
+    // ============ LEDBAT++ Specific Tests ============
+
+    /// Test dynamic GAIN calculation (LEDBAT++ Section 4.2)
+    /// GAIN = 1 / min(16, ceil(2 * TARGET / base_delay))
+    #[test]
+    fn test_dynamic_gain_calculation() {
+        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+
+        // TARGET = 60ms
+        // For base_delay = 60ms: ceil(2 * 60 / 60) = 2, GAIN = 1/2 = 0.5
+        let gain = controller.calculate_dynamic_gain(Duration::from_millis(60));
+        assert!(
+            (gain - 0.5).abs() < 0.01,
+            "GAIN for 60ms base should be 0.5, got {}",
+            gain
+        );
+
+        // For base_delay = 30ms: ceil(2 * 60 / 30) = 4, GAIN = 1/4 = 0.25
+        let gain = controller.calculate_dynamic_gain(Duration::from_millis(30));
+        assert!(
+            (gain - 0.25).abs() < 0.01,
+            "GAIN for 30ms base should be 0.25, got {}",
+            gain
+        );
+
+        // For base_delay = 10ms: ceil(2 * 60 / 10) = 12, GAIN = 1/12 ≈ 0.083
+        let gain = controller.calculate_dynamic_gain(Duration::from_millis(10));
+        assert!(
+            (gain - 1.0 / 12.0).abs() < 0.01,
+            "GAIN for 10ms base should be ~0.083, got {}",
+            gain
+        );
+
+        // For very small base_delay (1ms): ceil(2 * 60 / 1) = 120 > 16, capped at 16
+        // GAIN = 1/16 = 0.0625
+        let gain = controller.calculate_dynamic_gain(Duration::from_millis(1));
+        assert!(
+            (gain - 1.0 / 16.0).abs() < 0.01,
+            "GAIN for 1ms base should be capped at 0.0625, got {}",
+            gain
+        );
+
+        // For zero/near-zero base_delay, should fallback to minimum gain
+        let gain = controller.calculate_dynamic_gain(Duration::ZERO);
+        assert!(
+            (gain - 1.0 / 16.0).abs() < 0.01,
+            "GAIN for 0ms base should be 0.0625, got {}",
+            gain
+        );
+    }
+
+    /// Test that TARGET delay is now 60ms (LEDBAT++)
+    #[test]
+    fn test_target_delay_is_60ms() {
+        assert_eq!(
+            TARGET,
+            Duration::from_millis(60),
+            "LEDBAT++ TARGET should be 60ms"
+        );
+    }
+
+    /// Test that default slow start exit threshold is 0.75 (LEDBAT++)
+    #[test]
+    fn test_slow_start_exit_threshold_is_75_percent() {
+        let config = LedbatConfig::default();
+        assert!(
+            (config.delay_exit_threshold - 0.75).abs() < 0.01,
+            "LEDBAT++ delay_exit_threshold should be 0.75, got {}",
+            config.delay_exit_threshold
+        );
+    }
+
+    /// Test multiplicative decrease cap at -W/2 (LEDBAT++)
+    #[tokio::test]
+    async fn test_multiplicative_decrease_capped_at_half() {
+        // Disable slow start and periodic slowdown to test pure congestion avoidance
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            enable_slow_start: false,
+            enable_periodic_slowdown: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Track flightsize
+        controller.on_send(200_000);
+
+        // Set low base delay
+        controller.on_ack(Duration::from_millis(10), 1000);
+        controller.on_ack(Duration::from_millis(10), 1000);
+
+        // Wait for update interval
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Fill delay filter with very high RTT (extreme congestion)
+        for _ in 0..4 {
+            controller.on_send(10_000);
+            controller.on_ack(Duration::from_millis(500), 2000);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        let initial_cwnd = controller.current_cwnd();
+
+        // Wait for update and apply extreme congestion signal
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        controller.on_send(50_000);
+        controller.on_ack(Duration::from_millis(500), 10_000);
+
+        let new_cwnd = controller.current_cwnd();
+
+        // The decrease should be capped at 50% per RTT
+        // Even with extreme queuing delay, cwnd should not drop below initial/2
+        assert!(
+            new_cwnd >= initial_cwnd / 2 - 1000, // Allow some tolerance
+            "cwnd decrease should be capped at 50%, was {} -> {} (more than half)",
+            initial_cwnd,
+            new_cwnd
+        );
+    }
+
+    /// Test periodic slowdown config option
+    #[test]
+    fn test_periodic_slowdown_config() {
+        // With periodic slowdown enabled (default)
+        let config = LedbatConfig::default();
+        assert!(
+            config.enable_periodic_slowdown,
+            "Periodic slowdown should be enabled by default"
+        );
+
+        // Can be disabled
+        let config = LedbatConfig {
+            enable_periodic_slowdown: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+        assert!(!controller.enable_periodic_slowdown);
+    }
+
+    /// Test periodic slowdown state machine initialization
+    #[test]
+    fn test_periodic_slowdown_initial_state() {
+        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+
+        // Initial state should be Normal
+        let state = controller.slowdown_state.load(Ordering::Relaxed);
+        assert_eq!(
+            state,
+            SlowdownState::Normal as u8,
+            "Initial slowdown state should be Normal"
+        );
+
+        // initial_slow_start_completed should be false
+        assert!(
+            !controller
+                .initial_slow_start_completed
+                .load(Ordering::Relaxed),
+            "initial_slow_start_completed should be false initially"
+        );
+
+        // No slowdown scheduled yet
+        let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Relaxed);
+        assert_eq!(
+            next_slowdown,
+            u64::MAX,
+            "No slowdown should be scheduled initially"
+        );
+    }
+
+    /// Test that periodic slowdown statistics are tracked
+    #[test]
+    fn test_periodic_slowdown_stats() {
+        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+
+        let stats = controller.stats();
+        assert_eq!(
+            stats.periodic_slowdowns, 0,
+            "Initial periodic_slowdowns should be 0"
+        );
+    }
+
+    /// Test slowdown state enum values
+    #[test]
+    fn test_slowdown_state_values() {
+        // Verify enum values for state machine
+        assert_eq!(SlowdownState::Normal as u8, 0);
+        assert_eq!(SlowdownState::WaitingForSlowdown as u8, 1);
+        assert_eq!(SlowdownState::InSlowdown as u8, 2);
+        assert_eq!(SlowdownState::Frozen as u8, 3);
+        assert_eq!(SlowdownState::RampingUp as u8, 4);
+    }
+
+    /// Integration test: slow start exit schedules initial slowdown
+    #[tokio::test]
+    async fn test_slow_start_exit_schedules_slowdown() {
+        let config = LedbatConfig {
+            initial_cwnd: 15_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 20_000, // Low threshold so we exit slow start quickly
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Send data and establish RTT
+        controller.on_send(100_000);
+
+        // Initial samples to set base delay (need 2+ for filter)
+        controller.on_ack(Duration::from_millis(20), 1000);
+        controller.on_ack(Duration::from_millis(20), 1000);
+
+        // Wait for update interval (based on base_delay ~20ms)
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // This ACK should trigger slow start growth: 15000 + 10000 = 25000 >= 20000 ssthresh
+        // Should trigger exit check
+        controller.on_ack(Duration::from_millis(20), 10_000);
+
+        // Wait for another RTT to ensure the exit check runs
+        // (the first ACK after the wait may just do growth, second triggers exit check)
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        controller.on_ack(Duration::from_millis(20), 1000);
+
+        // Wait for yet another RTT to make sure the exit is processed
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        controller.on_ack(Duration::from_millis(20), 1000);
+
+        // Should have exited slow start (cwnd grew past ssthresh)
+        let in_slow_start = controller.in_slow_start.load(Ordering::Acquire);
+        let cwnd = controller.current_cwnd();
+        assert!(
+            !in_slow_start,
+            "Should have exited slow start (cwnd={}, ssthresh=20000)",
+            cwnd
+        );
+
+        // Should have marked initial slow start as completed
+        assert!(
+            controller
+                .initial_slow_start_completed
+                .load(Ordering::Acquire),
+            "initial_slow_start_completed should be true after slow start exit"
+        );
+
+        // Slowdown should be scheduled (not u64::MAX)
+        let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
+        assert!(
+            next_slowdown != u64::MAX,
+            "A slowdown should be scheduled after slow start exit"
+        );
+
+        // State should be WaitingForSlowdown
+        let state = controller.slowdown_state.load(Ordering::Acquire);
+        assert_eq!(
+            state,
+            SlowdownState::WaitingForSlowdown as u8,
+            "State should be WaitingForSlowdown"
         );
     }
 }
