@@ -219,12 +219,14 @@ impl<'a> NetEventLog<'a> {
         );
         let connected = PeerKeyLocation::new(peer.pub_key.clone(), peer.addr);
         // Note: location is computed from address, so we don't need to set it separately
+        // elapsed_ms is 0 since we don't have transaction timing for this path
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
             kind: EventKind::Connect(ConnectEvent::Connected {
                 this: ring.connection_manager.own_location(),
                 connected,
+                elapsed_ms: 0,
             }),
         }
     }
@@ -264,6 +266,7 @@ impl<'a> NetEventLog<'a> {
                 EventKind::Connect(ConnectEvent::Connected {
                     this: this_peer,
                     connected: payload.acceptor.clone(),
+                    elapsed_ms: msg.id().elapsed().as_millis() as u64,
                 })
             }
             _ => EventKind::Ignored,
@@ -292,6 +295,7 @@ impl<'a> NetEventLog<'a> {
                 };
                 let acceptor_peer_id = PeerId::new(acceptor_addr, acceptor.pub_key().clone());
                 let this_peer_id = PeerId::new(this_addr, this_peer.pub_key().clone());
+                let elapsed_ms = msg.id().elapsed().as_millis() as u64;
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
@@ -299,6 +303,7 @@ impl<'a> NetEventLog<'a> {
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: acceptor.clone(),
                             connected: this_peer.clone(),
+                            elapsed_ms,
                         }),
                     },
                     NetEventLog {
@@ -307,12 +312,15 @@ impl<'a> NetEventLog<'a> {
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: this_peer,
                             connected: acceptor,
+                            elapsed_ms,
                         }),
                     },
                 ];
                 return Either::Right(events);
             }
-            NetMessageV1::Put(PutMsg::Request { contract, id, .. }) => {
+            NetMessageV1::Put(PutMsg::Request {
+                contract, id, htl, ..
+            }) => {
                 let this_peer = &op_manager.ring.connection_manager.own_location();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
@@ -320,6 +328,7 @@ impl<'a> NetEventLog<'a> {
                     target: this_peer.clone(), // No embedded target - use own location
                     key,
                     id: *id,
+                    htl: *htl,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
@@ -330,6 +339,7 @@ impl<'a> NetEventLog<'a> {
                     requester: this_peer.clone(),
                     target: this_peer.clone(),
                     key: *key,
+                    elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
@@ -360,6 +370,7 @@ impl<'a> NetEventLog<'a> {
                     requester: this_peer.clone(),
                     target: this_peer,
                     key: *key,
+                    elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
@@ -374,6 +385,7 @@ impl<'a> NetEventLog<'a> {
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
+                    elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
@@ -501,22 +513,29 @@ impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
     fn from(msg: &'a NetLogMessage) -> Self {
         use opentelemetry::KeyValue;
         let map: Option<Vec<KeyValue>> = match &msg.kind {
-            EventKind::Connect(ConnectEvent::StartConnection { from }) => Some(vec![
+            EventKind::Connect(ConnectEvent::StartConnection { from, .. }) => Some(vec![
                 KeyValue::new("phase", "start"),
                 KeyValue::new("initiator", format!("{from}")),
             ]),
-            EventKind::Connect(ConnectEvent::Connected { this, connected }) => Some(vec![
+            EventKind::Connect(ConnectEvent::Connected {
+                this,
+                connected,
+                elapsed_ms,
+            }) => Some(vec![
                 KeyValue::new("phase", "connected"),
                 KeyValue::new("from", format!("{this}")),
                 KeyValue::new("to", format!("{connected}")),
+                KeyValue::new("elapsed_ms", *elapsed_ms as i64),
             ]),
             EventKind::Connect(ConnectEvent::Finished {
                 initiator,
                 location,
+                elapsed_ms,
             }) => Some(vec![
                 KeyValue::new("phase", "finished"),
                 KeyValue::new("initiator", format!("{initiator}")),
                 KeyValue::new("location", location.as_f64()),
+                KeyValue::new("elapsed_ms", *elapsed_ms as i64),
             ]),
             _ => None,
         };
@@ -760,6 +779,7 @@ async fn send_to_metrics_server(
         EventKind::Connect(ConnectEvent::Connected {
             this: this_peer,
             connected: connected_peer,
+            ..
         }) => {
             // Both peers must have known locations to send to metrics server
             if let (Some(from_loc), Some(to_loc)) =
@@ -888,6 +908,7 @@ async fn send_to_metrics_server(
             timestamp,
             requester,
             target,
+            ..
         }) => {
             let contract_location = Location::from_contract_key(key.as_bytes());
             let msg = ContractChange::get_contract_msg(
@@ -1370,14 +1391,20 @@ impl EventKind {
 enum ConnectEvent {
     StartConnection {
         from: PeerId,
+        /// Whether this is a connection to a gateway node.
+        is_gateway: bool,
     },
     Connected {
         this: PeerKeyLocation,
         connected: PeerKeyLocation,
+        /// Time elapsed since connection started (milliseconds).
+        elapsed_ms: u64,
     },
     Finished {
         initiator: PeerId,
         location: Location,
+        /// Time elapsed since connection started (milliseconds).
+        elapsed_ms: u64,
     },
 }
 
@@ -1389,6 +1416,8 @@ enum PutEvent {
         requester: PeerKeyLocation,
         key: ContractKey,
         target: PeerKeyLocation,
+        /// Hops to live - remaining hops before request fails.
+        htl: usize,
         timestamp: u64,
     },
     PutSuccess {
@@ -1396,6 +1425,8 @@ enum PutEvent {
         requester: PeerKeyLocation,
         target: PeerKeyLocation,
         key: ContractKey,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
         timestamp: u64,
     },
     BroadcastEmitted {
@@ -1498,6 +1529,8 @@ enum GetEvent {
         target: PeerKeyLocation,
         /// Full contract key (only available after successful retrieval).
         key: ContractKey,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
         timestamp: u64,
     },
     /// Contract was not found after exhaustive search.
@@ -1507,6 +1540,8 @@ enum GetEvent {
         /// Contract instance that was searched for.
         instance_id: ContractInstanceId,
         target: PeerKeyLocation,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
         timestamp: u64,
     },
 }
@@ -1784,7 +1819,9 @@ pub(super) mod test {
             let iter = logs
                 .iter()
                 .filter_map(|l| {
-                    if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = &l.kind
+                    if let EventKind::Connect(ConnectEvent::Connected {
+                        this, connected, ..
+                    }) = &l.kind
                     {
                         let connected_id =
                             PeerId::new(connected.socket_addr()?, connected.pub_key().clone());
@@ -1886,6 +1923,7 @@ pub(super) mod test {
                 kind: EventKind::Connect(ConnectEvent::Connected {
                     this: PeerKeyLocation::new(peer_id.pub_key.clone(), peer_id.addr),
                     connected: PeerKeyLocation::new(other.pub_key.clone(), other.addr),
+                    elapsed_ms: 0,
                 }),
             }))
         }));
