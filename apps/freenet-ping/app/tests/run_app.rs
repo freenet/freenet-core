@@ -11,21 +11,20 @@ use freenet::{local_node::NodeConfig, server::serve_gateway};
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
     client_api::{
-        ClientRequest, ContractRequest, ContractResponse, HostResponse, NodeDiagnosticsConfig,
-        NodeQuery, QueryResponse, WebApi,
+        ClientRequest, ContractRequest, HostResponse, NodeDiagnosticsConfig, NodeQuery,
+        QueryResponse, WebApi,
     },
     prelude::*,
 };
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::FutureExt;
 use rand::SeedableRng;
 use testresult::TestResult;
 use tokio::{select, time::sleep, time::timeout};
 use tracing::{span, Instrument, Level};
 
 use common::{
-    base_node_test_config, base_node_test_config_with_rng, connect_async_with_config,
-    gw_config_from_path, gw_config_from_path_with_rng, ws_config, APP_TAG, PACKAGE_DIR,
-    PATH_TO_CONTRACT,
+    base_node_test_config_with_rng, connect_async_with_config, gw_config_from_path_with_rng,
+    ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 use freenet_ping_app::ping_client::{
     run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
