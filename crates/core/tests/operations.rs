@@ -4083,28 +4083,55 @@ async fn test_subscription_pruning_sends_unsubscribed(ctx: &mut TestContext) -> 
     );
     tracing::info!("✓ Peer-A has local client subscription");
 
-    // Verify Gateway has Peer-A as subscriber
-    make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
+    // Verify Gateway has Peer-A as subscriber (with retry for eventual consistency)
+    // The subscription registration may have a small delay due to async processing
+    let max_retries = 10;
+    let mut gateway_subscribers_after_subscribe = Vec::new();
+    for attempt in 0..max_retries {
+        make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
 
-    let gateway_subscribers_after_subscribe = loop {
-        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
-        match resp {
-            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
-                let subs = diag
-                    .contract_states
-                    .get(&contract_key)
-                    .map(|cs| cs.subscriber_peer_ids.clone())
-                    .unwrap_or_default();
-                tracing::info!("Gateway subscribers after subscribe: {:?}", subs);
-                break subs;
+        let subs = loop {
+            let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+            match resp {
+                HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                    let subs = diag
+                        .contract_states
+                        .get(&contract_key)
+                        .map(|cs| cs.subscriber_peer_ids.clone())
+                        .unwrap_or_default();
+                    break subs;
+                }
+                other => tracing::warn!("Unexpected: {:?}", other),
             }
-            other => tracing::warn!("Unexpected: {:?}", other),
+        };
+
+        tracing::info!(
+            "Gateway subscribers after subscribe (attempt {}): {:?}",
+            attempt + 1,
+            subs
+        );
+
+        if subs.contains(&peer_a_peer_id) {
+            gateway_subscribers_after_subscribe = subs;
+            break;
         }
-    };
+
+        if attempt < max_retries - 1 {
+            tracing::info!(
+                "Subscriber not yet registered, retrying in 1s (attempt {}/{})",
+                attempt + 1,
+                max_retries
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        } else {
+            gateway_subscribers_after_subscribe = subs;
+        }
+    }
 
     assert!(
         gateway_subscribers_after_subscribe.contains(&peer_a_peer_id),
-        "Gateway should have Peer-A as subscriber. peer_id={}, subscribers={:?}",
+        "Gateway should have Peer-A as subscriber after {} retries. peer_id={}, subscribers={:?}",
+        max_retries,
         peer_a_peer_id,
         gateway_subscribers_after_subscribe
     );

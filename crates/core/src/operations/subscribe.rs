@@ -483,6 +483,14 @@ impl Operation for SubscribeOp {
                                     upstream_peer,
                                     Some(requester_addr.into()),
                                 );
+                            } else {
+                                tracing::warn!(
+                                    tx = %id,
+                                    contract = %key,
+                                    requester = %requester_addr,
+                                    "subscribe: failed to lookup peer location for downstream registration, \
+                                     subscriber will NOT receive updates"
+                                );
                             }
 
                             tracing::info!(tx = %id, contract = %key, phase = "response", "Subscription fulfilled, sending Response");
@@ -529,6 +537,14 @@ impl Operation for SubscribeOp {
                                     &key,
                                     upstream_peer,
                                     Some(requester_addr.into()),
+                                );
+                            } else {
+                                tracing::warn!(
+                                    tx = %id,
+                                    contract = %key,
+                                    requester = %requester_addr,
+                                    "subscribe: failed to lookup peer location for downstream registration, \
+                                     subscriber will NOT receive updates"
                                 );
                             }
 
@@ -668,6 +684,14 @@ impl Operation for SubscribeOp {
                                         %key,
                                         downstream = %requester_addr,
                                         "subscribe: registered requester as downstream subscriber"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        tx = %msg_id,
+                                        %key,
+                                        requester = %requester_addr,
+                                        "subscribe: failed to lookup peer location for downstream registration, \
+                                         subscriber will NOT receive updates"
                                     );
                                 }
 
