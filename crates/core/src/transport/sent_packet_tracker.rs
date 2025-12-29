@@ -154,6 +154,13 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 if is_retransmitted {
                     // Retransmitted packet: return size but no RTT (Karn's algorithm)
                     ack_info.push((None, packet_size));
+
+                    // Halve backoff on retransmit ACKs to allow recovery from death spiral.
+                    // Rationale: Receiving any ACK indicates network is functioning, even if
+                    // we can't use it for RTT estimation. This is a pragmatic deviation from
+                    // strict Karn's algorithm to prevent permanent throughput collapse.
+                    // Recovery: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1 (6 ACKs to full recovery)
+                    self.rto_backoff = (self.rto_backoff / 2).max(1);
                 } else {
                     // Non-retransmitted: calculate RTT and update estimation
                     let rtt_sample = now.duration_since(*sent_time);
@@ -648,10 +655,10 @@ pub(in crate::transport) mod tests {
     }
 
     #[test]
-    fn test_rto_backoff_not_reset_on_retransmitted_ack() {
+    fn test_rto_backoff_halves_on_retransmitted_ack() {
         let mut tracker = mock_sent_packet_tracker();
 
-        // Trigger some timeouts
+        // Trigger some timeouts to build up backoff
         tracker.on_timeout();
         tracker.on_timeout();
         assert_eq!(tracker.rto_backoff(), 4);
@@ -664,8 +671,42 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance_time(Duration::from_millis(50));
         tracker.report_received_receipts(&[1]);
 
-        // Backoff should NOT be reset for retransmitted packets (Karn's algorithm)
-        assert_eq!(tracker.rto_backoff(), 4);
+        // Backoff should be halved (not fully reset) for retransmitted packets
+        // This allows gradual recovery from death spiral while still being conservative
+        assert_eq!(tracker.rto_backoff(), 2);
+    }
+
+    #[test]
+    fn test_death_spiral_recovery() {
+        // Tests that the system can recover from a high backoff state through
+        // successive retransmit ACKs (the "death spiral" fix)
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Simulate death spiral: many timeouts leading to high backoff
+        for _ in 0..6 {
+            tracker.on_timeout();
+        }
+        assert_eq!(tracker.rto_backoff(), 64);
+
+        // Recovery through successive retransmit ACKs: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
+        let expected_backoffs = [32, 16, 8, 4, 2, 1];
+        for (i, expected) in expected_backoffs.iter().enumerate() {
+            let packet_id = (i + 1) as u32;
+            tracker.report_sent_packet(packet_id, vec![1, 2, 3].into());
+            tracker.mark_retransmitted(packet_id);
+            tracker.time_source.advance_time(Duration::from_millis(50));
+            tracker.report_received_receipts(&[packet_id]);
+            assert_eq!(
+                tracker.rto_backoff(),
+                *expected,
+                "After {} retransmit ACKs, backoff should be {}",
+                i + 1,
+                expected
+            );
+        }
+
+        // Verify we've fully recovered
+        assert_eq!(tracker.rto_backoff(), 1);
     }
 
     #[test]
