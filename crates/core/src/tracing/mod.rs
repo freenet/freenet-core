@@ -43,6 +43,10 @@ mod aof;
 /// Event aggregation across multiple nodes for debugging and testing.
 pub mod event_aggregator;
 
+/// Telemetry reporting to central collector.
+pub mod telemetry;
+pub use telemetry::TelemetryReporter;
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 struct ListenerLogId(usize);
@@ -119,6 +123,63 @@ impl<const N: usize> Clone for CombinedRegister<N> {
             cloned
         });
         Self(cloned)
+    }
+}
+
+/// A dynamic register that can hold multiple event registers.
+/// Unlike CombinedRegister, this uses a Vec so the number of registers
+/// can be determined at runtime.
+pub(crate) struct DynamicRegister(Vec<Box<dyn NetEventRegister>>);
+
+impl DynamicRegister {
+    pub(crate) fn new(registries: Vec<Box<dyn NetEventRegister>>) -> Self {
+        Self(registries)
+    }
+}
+
+impl NetEventRegister for DynamicRegister {
+    fn register_events<'a>(
+        &'a self,
+        events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
+    ) -> BoxFuture<'a, ()> {
+        async move {
+            for registry in &self.0 {
+                registry.register_events(events.clone()).await;
+            }
+        }
+        .boxed()
+    }
+
+    fn trait_clone(&self) -> Box<dyn NetEventRegister> {
+        Box::new(self.clone())
+    }
+
+    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+        async move {
+            for reg in &mut self.0 {
+                reg.notify_of_time_out(tx).await;
+            }
+        }
+        .boxed()
+    }
+
+    fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
+        async move {
+            for reg in &self.0 {
+                let events = reg.get_router_events(number).await?;
+                if !events.is_empty() {
+                    return Ok(events);
+                }
+            }
+            Ok(vec![])
+        }
+        .boxed()
+    }
+}
+
+impl Clone for DynamicRegister {
+    fn clone(&self) -> Self {
+        Self(self.0.iter().map(|r| r.trait_clone()).collect())
     }
 }
 
