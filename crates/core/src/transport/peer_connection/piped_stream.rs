@@ -63,10 +63,8 @@
 //!
 //! # Naming Convention
 //!
-//! This module uses `fragment_number` (1-indexed) for fragment identifiers.
-//! Note: `streaming_buffer.rs` (Phase 1) uses `fragment_index` for the same concept.
-//! Both are 1-indexed despite the "index" name. A future cleanup could standardize
-//! on `fragment_number` codebase-wide since these are numbers, not 0-based indices.
+//! All streaming modules use `fragment_number` (1-indexed) for fragment identifiers.
+//! This is consistent across `piped_stream.rs`, `streaming_buffer.rs`, and `streaming.rs`.
 
 // Allow dead code - this is Phase 2 infrastructure not yet integrated into forwarding path
 #![allow(dead_code)]

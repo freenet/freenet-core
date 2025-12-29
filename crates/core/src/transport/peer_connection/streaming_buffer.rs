@@ -68,18 +68,18 @@ pub(crate) const FRAGMENT_PAYLOAD_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 /// Based on spike implementation from iduartgomez/freenet-core#204.
 pub struct LockFreeStreamBuffer {
     /// Pre-allocated slots for each fragment. Each slot is a pointer to heap-allocated Bytes.
-    /// Fragment indices are 1-indexed, so fragment N is stored at slots[N-1].
+    /// Fragment numbers are 1-indexed, so fragment N is stored at slots[N-1].
     /// NULL means empty/cleared, non-NULL means fragment is present.
     fragments: Box<[AtomicPtr<Bytes>]>,
     /// Total expected bytes for the complete stream.
     total_size: u64,
     /// Total number of fragments expected.
     total_fragments: u32,
-    /// Highest contiguous fragment index from the start (0 = none received).
+    /// Highest contiguous fragment number from the start (0 = none received).
     /// Uses atomic CAS for lock-free frontier advancement.
     contiguous_fragments: AtomicU32,
-    /// Highest fragment index that has been consumed/freed (0 = none consumed).
-    /// Fragments up to this index have been cleared from memory.
+    /// Highest fragment number that has been consumed/freed (0 = none consumed).
+    /// Fragments up to this number have been cleared from memory.
     consumed_frontier: AtomicU32,
     /// Event notification for when new fragments arrive.
     ///
@@ -139,30 +139,30 @@ impl LockFreeStreamBuffer {
     ///
     /// # Arguments
     ///
-    /// * `fragment_index` - 1-indexed fragment number (first fragment is 1)
+    /// * `fragment_number` - 1-indexed fragment number (first fragment is 1)
     /// * `data` - The fragment payload
     ///
     /// # Returns
     ///
     /// * `Ok(true)` - Fragment was inserted successfully
     /// * `Ok(false)` - Fragment was already present (duplicate, no-op)
-    /// * `Err(InsertError)` - Fragment index out of bounds or already consumed
-    pub fn insert(&self, fragment_index: u32, data: Bytes) -> Result<bool, InsertError> {
-        if fragment_index == 0 || fragment_index > self.total_fragments {
-            return Err(InsertError::InvalidIndex {
-                index: fragment_index,
+    /// * `Err(InsertError)` - Fragment number out of bounds or already consumed
+    pub fn insert(&self, fragment_number: u32, data: Bytes) -> Result<bool, InsertError> {
+        if fragment_number == 0 || fragment_number > self.total_fragments {
+            return Err(InsertError::InvalidNumber {
+                number: fragment_number,
                 max: self.total_fragments,
             });
         }
 
         // Check if this fragment has already been consumed
-        if fragment_index <= self.consumed_frontier.load(Ordering::Acquire) {
+        if fragment_number <= self.consumed_frontier.load(Ordering::Acquire) {
             return Err(InsertError::AlreadyConsumed {
-                index: fragment_index,
+                number: fragment_number,
             });
         }
 
-        let idx = (fragment_index - 1) as usize;
+        let idx = (fragment_number - 1) as usize;
 
         // Allocate the Bytes on the heap
         let boxed = Box::new(data);
@@ -269,9 +269,9 @@ impl LockFreeStreamBuffer {
         self.total_size
     }
 
-    /// Returns the highest contiguous fragment index (1-indexed).
+    /// Returns the highest contiguous fragment number (1-indexed).
     ///
-    /// This indicates that all fragments from 1 to this index are present.
+    /// This indicates that all fragments from 1 to this number are present.
     /// Returns 0 if no fragments are present.
     pub fn highest_contiguous(&self) -> u32 {
         self.contiguous_fragments.load(Ordering::Acquire)
@@ -279,7 +279,7 @@ impl LockFreeStreamBuffer {
 
     /// Returns the consumed frontier (1-indexed).
     ///
-    /// Fragments up to and including this index have been freed.
+    /// Fragments up to and including this number have been freed.
     /// Returns 0 if no fragments have been consumed.
     pub fn consumed_frontier(&self) -> u32 {
         self.consumed_frontier.load(Ordering::Acquire)
@@ -289,7 +289,7 @@ impl LockFreeStreamBuffer {
     ///
     /// # Arguments
     ///
-    /// * `fragment_index` - 1-indexed fragment number
+    /// * `fragment_number` - 1-indexed fragment number
     ///
     /// # Returns
     ///
@@ -298,13 +298,13 @@ impl LockFreeStreamBuffer {
     /// # Safety
     ///
     /// The returned reference is valid as long as `mark_consumed` is not called
-    /// for this index. Callers must ensure they don't hold references across
+    /// for this number. Callers must ensure they don't hold references across
     /// consumption boundaries.
-    pub fn get(&self, fragment_index: u32) -> Option<&Bytes> {
-        if fragment_index == 0 || fragment_index > self.total_fragments {
+    pub fn get(&self, fragment_number: u32) -> Option<&Bytes> {
+        if fragment_number == 0 || fragment_number > self.total_fragments {
             return None;
         }
-        let idx = (fragment_index - 1) as usize;
+        let idx = (fragment_number - 1) as usize;
         let ptr = self.fragments[idx].load(Ordering::Acquire);
         if ptr.is_null() {
             return None;
@@ -321,16 +321,16 @@ impl LockFreeStreamBuffer {
     ///
     /// # Arguments
     ///
-    /// * `fragment_index` - 1-indexed fragment number
+    /// * `fragment_number` - 1-indexed fragment number
     ///
     /// # Returns
     ///
     /// `Some(Bytes)` if the fragment was present, `None` if already taken or not inserted.
-    pub fn take(&self, fragment_index: u32) -> Option<Bytes> {
-        if fragment_index == 0 || fragment_index > self.total_fragments {
+    pub fn take(&self, fragment_number: u32) -> Option<Bytes> {
+        if fragment_number == 0 || fragment_number > self.total_fragments {
             return None;
         }
-        let idx = (fragment_index - 1) as usize;
+        let idx = (fragment_number - 1) as usize;
 
         // Atomically swap the pointer to NULL
         let ptr = self.fragments[idx].swap(ptr::null_mut(), Ordering::AcqRel);
@@ -343,14 +343,14 @@ impl LockFreeStreamBuffer {
         Some(*boxed)
     }
 
-    /// Marks fragments up to and including the given index as consumed, freeing their memory.
+    /// Marks fragments up to and including the given number as consumed, freeing their memory.
     ///
     /// This enables progressive memory reclamation for streaming consumers.
-    /// After calling this, fragments 1..=up_to_index will return `None` from `get()`.
+    /// After calling this, fragments 1..=up_to_number will return `None` from `get()`.
     ///
     /// # Arguments
     ///
-    /// * `up_to_index` - 1-indexed fragment number (inclusive)
+    /// * `up_to_number` - 1-indexed fragment number (inclusive)
     ///
     /// # Returns
     ///
@@ -494,32 +494,32 @@ impl Drop for LockFreeStreamBuffer {
 /// Error returned when a fragment insertion fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InsertError {
-    /// Fragment index is out of bounds.
-    InvalidIndex {
-        /// The provided index (1-indexed)
-        index: u32,
-        /// Maximum valid index
+    /// Fragment number is out of bounds.
+    InvalidNumber {
+        /// The provided fragment number (1-indexed)
+        number: u32,
+        /// Maximum valid fragment number
         max: u32,
     },
     /// Fragment has already been consumed and cannot be re-inserted.
     AlreadyConsumed {
-        /// The fragment index that was already consumed
-        index: u32,
+        /// The fragment number that was already consumed
+        number: u32,
     },
 }
 
 impl std::fmt::Display for InsertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InsertError::InvalidIndex { index, max } => {
+            InsertError::InvalidNumber { number, max } => {
                 write!(
                     f,
-                    "fragment index {} is out of bounds (max: {})",
-                    index, max
+                    "fragment number {} is out of bounds (max: {})",
+                    number, max
                 )
             }
-            InsertError::AlreadyConsumed { index } => {
-                write!(f, "fragment index {} has already been consumed", index)
+            InsertError::AlreadyConsumed { number } => {
+                write!(f, "fragment number {} has already been consumed", number)
             }
         }
     }
@@ -589,21 +589,21 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_invalid_index_zero() {
+    fn test_insert_invalid_number_zero() {
         let buffer = LockFreeStreamBuffer::new(100);
         let data = Bytes::from_static(b"hello");
 
         let result = buffer.insert(0, data);
-        assert!(matches!(result, Err(InsertError::InvalidIndex { .. })));
+        assert!(matches!(result, Err(InsertError::InvalidNumber { .. })));
     }
 
     #[test]
-    fn test_insert_invalid_index_too_large() {
+    fn test_insert_invalid_number_too_large() {
         let buffer = LockFreeStreamBuffer::new(100);
         let data = Bytes::from_static(b"hello");
 
         let result = buffer.insert(2, data); // Only 1 fragment expected
-        assert!(matches!(result, Err(InsertError::InvalidIndex { .. })));
+        assert!(matches!(result, Err(InsertError::InvalidNumber { .. })));
     }
 
     #[test]
@@ -967,7 +967,7 @@ mod tests {
         let result = buffer.insert(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]));
         assert!(matches!(
             result,
-            Err(InsertError::AlreadyConsumed { index: 1 })
+            Err(InsertError::AlreadyConsumed { number: 1 })
         ));
 
         // Fragment 2 should still be insertable
