@@ -710,6 +710,82 @@ pub(in crate::transport) mod tests {
     }
 
     #[test]
+    fn test_mixed_ack_batch_resets_on_fresh_packet() {
+        // When a batch contains both retransmit and non-retransmit ACKs,
+        // the non-retransmit ACK should fully reset backoff to 1
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Build up backoff
+        for _ in 0..4 {
+            tracker.on_timeout();
+        }
+        assert_eq!(tracker.rto_backoff(), 16);
+
+        // Send 3 packets: 1 and 2 will be retransmitted, 3 will be fresh
+        tracker.report_sent_packet(1, vec![1].into());
+        tracker.report_sent_packet(2, vec![2].into());
+        tracker.report_sent_packet(3, vec![3].into());
+
+        // Mark packets 1 and 2 as retransmitted
+        tracker.mark_retransmitted(1);
+        tracker.mark_retransmitted(2);
+
+        tracker.time_source.advance_time(Duration::from_millis(50));
+
+        // ACK all three in one batch - packet 3 is fresh, should reset to 1
+        tracker.report_received_receipts(&[1, 2, 3]);
+
+        // Fresh packet ACK should have reset backoff to 1
+        assert_eq!(tracker.rto_backoff(), 1);
+    }
+
+    #[test]
+    fn test_backoff_re_elevation_after_recovery() {
+        // Verifies the system handles: timeout -> recovery -> timeout correctly
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Phase 1: Build up high backoff
+        for _ in 0..4 {
+            tracker.on_timeout();
+        }
+        assert_eq!(tracker.rto_backoff(), 16);
+
+        // Phase 2: Recover through retransmit ACKs (16 -> 8 -> 4 -> 2 -> 1)
+        for i in 1..=4 {
+            tracker.report_sent_packet(i, vec![i as u8].into());
+            tracker.mark_retransmitted(i);
+            tracker.time_source.advance_time(Duration::from_millis(50));
+            tracker.report_received_receipts(&[i]);
+        }
+        assert_eq!(
+            tracker.rto_backoff(),
+            1,
+            "Should have recovered to backoff 1"
+        );
+
+        // Phase 3: New timeout should elevate backoff again
+        tracker.on_timeout();
+        assert_eq!(
+            tracker.rto_backoff(),
+            2,
+            "Timeout after recovery should work normally"
+        );
+
+        tracker.on_timeout();
+        assert_eq!(
+            tracker.rto_backoff(),
+            4,
+            "Subsequent timeout should continue doubling"
+        );
+
+        // Phase 4: Fresh ACK should reset again
+        tracker.report_sent_packet(10, vec![10].into());
+        tracker.time_source.advance_time(Duration::from_millis(50));
+        tracker.report_received_receipts(&[10]);
+        assert_eq!(tracker.rto_backoff(), 1, "Fresh ACK should reset to 1");
+    }
+
+    #[test]
     fn test_get_resend_triggers_backoff() {
         let mut tracker = mock_sent_packet_tracker();
 
