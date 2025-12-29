@@ -21,6 +21,7 @@ use tracing::{instrument, span, Instrument};
 
 mod inbound_stream;
 mod outbound_stream;
+pub(crate) mod piped_stream;
 pub(crate) mod streaming;
 
 /// Lock-free streaming buffer implementation.
@@ -1154,6 +1155,116 @@ impl<S: super::Socket> PeerConnection<S> {
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
         self.outbound_stream_futures.push(task);
+    }
+
+    /// Sends a single stream fragment to the remote peer.
+    ///
+    /// This is the low-level API for piped forwarding. Unlike `send()` which
+    /// serializes and fragments automatically, this sends a pre-existing fragment
+    /// directly. Used by intermediate nodes to forward fragments immediately.
+    ///
+    /// # Arguments
+    ///
+    /// * `fragment` - The fragment to send (from `PipedStream::push_fragment()`)
+    ///
+    /// # Congestion Control
+    ///
+    /// This method applies both LEDBAT congestion control (cwnd) and token bucket
+    /// rate limiting, ensuring forwarded fragments don't overwhelm the network.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Forward fragments as they become ready
+    /// for fragment in piped_stream.push_fragment(num, payload)? {
+    ///     peer_connection.send_fragment(fragment).await?;
+    /// }
+    /// ```
+    #[allow(dead_code)] // Phase 2 infrastructure - not yet integrated
+    pub(crate) async fn send_fragment(
+        &mut self,
+        fragment: piped_stream::ForwardFragment,
+    ) -> Result<()> {
+        let packet_size = fragment.payload.len();
+
+        // LEDBAT congestion control - wait for cwnd space
+        let mut cwnd_wait_iterations = 0;
+        loop {
+            let flightsize = self.remote_conn.ledbat.flightsize();
+            let cwnd = self.remote_conn.ledbat.current_cwnd();
+
+            if flightsize + packet_size <= cwnd {
+                break;
+            }
+
+            cwnd_wait_iterations += 1;
+            if cwnd_wait_iterations == 1 {
+                tracing::trace!(
+                    stream_id = %fragment.stream_id.0,
+                    fragment_number = fragment.fragment_number,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    "Waiting for cwnd space in send_fragment"
+                );
+            }
+
+            // Exponential backoff
+            if cwnd_wait_iterations <= 10 {
+                tokio::task::yield_now().await;
+            } else if cwnd_wait_iterations <= 100 {
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        // Token bucket rate limiting
+        let wait_time = self.remote_conn.token_bucket.reserve(packet_size);
+        if !wait_time.is_zero() {
+            tracing::trace!(
+                stream_id = %fragment.stream_id.0,
+                fragment_number = fragment.fragment_number,
+                wait_time_ms = wait_time.as_millis(),
+                "Rate limiting fragment send"
+            );
+            tokio::time::sleep(wait_time).await;
+        }
+
+        // Get receipts and packet ID
+        let receipts = self.received_tracker.get_receipts();
+        let packet_id = self
+            .remote_conn
+            .last_packet_id
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        // Send the fragment
+        packet_sending(
+            self.remote_conn.remote_addr,
+            &self.remote_conn.socket,
+            packet_id,
+            &self.remote_conn.outbound_symmetric_key,
+            receipts,
+            symmetric_message::StreamFragment {
+                stream_id: fragment.stream_id,
+                total_length_bytes: fragment.total_bytes,
+                fragment_number: fragment.fragment_number,
+                payload: fragment.payload,
+            },
+            &self.remote_conn.sent_tracker,
+        )
+        .await?;
+
+        // Track for LEDBAT
+        self.remote_conn.ledbat.on_send(packet_size);
+
+        tracing::trace!(
+            stream_id = %fragment.stream_id.0,
+            fragment_number = fragment.fragment_number,
+            packet_id,
+            "Fragment sent"
+        );
+
+        Ok(())
     }
 }
 

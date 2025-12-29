@@ -252,10 +252,10 @@ impl StreamHandle {
     ///
     /// * `Ok(true)` - Fragment was inserted successfully
     /// * `Ok(false)` - Fragment was a duplicate (no-op)
-    /// * `Err(StreamError)` - Invalid fragment index or stream cancelled
+    /// * `Err(StreamError)` - Invalid fragment number or stream cancelled
     pub(crate) fn push_fragment(
         &self,
-        fragment_index: u32,
+        fragment_number: u32,
         data: Bytes,
     ) -> Result<bool, StreamError> {
         // Quick check if cancelled (read lock only)
@@ -265,7 +265,7 @@ impl StreamHandle {
 
         // Lock-free insert into buffer
         // The buffer's internal Notify handles async notification
-        match self.buffer.insert(fragment_index, data) {
+        match self.buffer.insert(fragment_number, data) {
             Ok(inserted) => {
                 if inserted {
                     // Wake synchronous waiters (poll_next wakers)
@@ -365,9 +365,9 @@ pub struct StreamingInboundStream {
 }
 
 impl StreamingInboundStream {
-    /// Returns the next fragment index that will be yielded.
+    /// Returns the next fragment number that will be yielded.
     #[allow(dead_code)]
-    pub fn next_fragment_index(&self) -> u32 {
+    pub fn next_fragment_number(&self) -> u32 {
         self.next_fragment
     }
 
@@ -793,8 +793,8 @@ mod tests {
         assert_eq!(chunk1, chunk2);
 
         // Both are now waiting for fragment 2
-        assert_eq!(stream1.next_fragment_index(), 2);
-        assert_eq!(stream2.next_fragment_index(), 2);
+        assert_eq!(stream1.next_fragment_number(), 2);
+        assert_eq!(stream2.next_fragment_number(), 2);
 
         // Push second fragment
         handle
