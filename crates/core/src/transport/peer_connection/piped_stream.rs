@@ -60,6 +60,13 @@
 //! **Phase 3 Integration Note**: Target failure tracking (which targets are dead,
 //! retry logic) will be implemented when wiring `PipedStream` into the forwarding path.
 //! This module provides the primitives; the integration layer handles failure policies.
+//!
+//! # Naming Convention
+//!
+//! This module uses `fragment_number` (1-indexed) for fragment identifiers.
+//! Note: `streaming_buffer.rs` (Phase 1) uses `fragment_index` for the same concept.
+//! Both are 1-indexed despite the "index" name. A future cleanup could standardize
+//! on `fragment_number` codebase-wide since these are numbers, not 0-based indices.
 
 // Allow dead code - this is Phase 2 infrastructure not yet integrated into forwarding path
 #![allow(dead_code)]
@@ -901,5 +908,84 @@ mod tests {
         // Further pushes should fail
         let result = stream.push_fragment(1, Bytes::from_static(b"data"));
         assert!(matches!(result, Err(PipedStreamError::Cancelled)));
+    }
+
+    #[test]
+    fn test_buffer_full_recovery() {
+        // Test that BufferFull can be recovered from by filling gaps
+        let config = PipedStreamConfig {
+            max_buffered_fragments: 2,
+            max_buffered_bytes: 1024 * 1024,
+            max_concurrent_sends: 10,
+        };
+        let stream = PipedStream::new(make_stream_id(), 10_000, 1, config);
+
+        // Buffer 2 fragments (at limit)
+        stream
+            .push_fragment(3, Bytes::from_static(b"frag 3"))
+            .unwrap();
+        stream
+            .push_fragment(4, Bytes::from_static(b"frag 4"))
+            .unwrap();
+        assert_eq!(stream.buffered_count(), 2);
+
+        // Try to buffer a 3rd - should fail with BufferFull
+        let result = stream.push_fragment(5, Bytes::from_static(b"frag 5"));
+        assert!(matches!(result, Err(PipedStreamError::BufferFull { .. })));
+
+        // Now fill the gap - this should cascade and free buffer space
+        stream
+            .push_fragment(1, Bytes::from_static(b"frag 1"))
+            .unwrap();
+        let result = stream
+            .push_fragment(2, Bytes::from_static(b"frag 2"))
+            .unwrap();
+
+        // Fragments 2, 3, 4 should have been forwarded
+        assert_eq!(result.len(), 3);
+        assert_eq!(stream.buffered_count(), 0);
+
+        // Now we can buffer again
+        stream
+            .push_fragment(6, Bytes::from_static(b"frag 6"))
+            .unwrap();
+        assert_eq!(stream.buffered_count(), 1);
+
+        // And the previously rejected fragment 5 should work
+        let result = stream
+            .push_fragment(5, Bytes::from_static(b"frag 5"))
+            .unwrap();
+        assert_eq!(result.len(), 2); // 5 and 6
+    }
+
+    #[tokio::test]
+    async fn test_all_permits_exhausted_then_released() {
+        use std::sync::Arc;
+
+        let config = PipedStreamConfig {
+            max_buffered_fragments: 100,
+            max_buffered_bytes: 1024 * 1024,
+            max_concurrent_sends: 2,
+        };
+        let stream = Arc::new(PipedStream::new(make_stream_id(), 4000, 1, config));
+
+        // Exhaust all permits
+        let permit1 = stream.acquire_send_permit(0).await.unwrap();
+        let permit2 = stream.acquire_send_permit(0).await.unwrap();
+        assert_eq!(stream.available_permits(0), 0);
+
+        // Spawn a waiter
+        let stream_clone = Arc::clone(&stream);
+        let waiter = tokio::spawn(async move { stream_clone.acquire_send_permit(0).await });
+
+        // Release one permit
+        drop(permit1);
+
+        // Waiter should succeed
+        let result = waiter.await.unwrap();
+        assert!(result.is_ok());
+
+        // Clean up
+        drop(permit2);
     }
 }
