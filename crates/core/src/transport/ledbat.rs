@@ -22,7 +22,7 @@
 //! ## Periodic Slowdown Mechanism
 //!
 //! LEDBAT++ introduces periodic slowdowns to solve the "latecomer advantage" problem:
-//! - After initial slow start exit, wait 2 RTTs then reduce cwnd by 16x (not to minimum)
+//! - After initial slow start exit, wait 2 RTTs then reduce cwnd by 4x (not to minimum)
 //! - This proportional reduction is consistent with our large initial window (IW26)
 //! - Freeze cwnd for 2 RTTs to allow base delay re-measurement
 //! - Ramp back up using slow start until reaching previous cwnd
@@ -565,7 +565,11 @@ impl LedbatController {
         let target_ms = self.target_delay.as_millis() as f64;
 
         if base_ms <= 0.0 {
-            // Fallback for edge case
+            // Edge case: base_delay is zero or unset. This occurs:
+            // 1. At connection start before any RTT measurements
+            // 2. After base_delay history reset (rare)
+            // 3. As a defensive guard against measurement errors
+            // Use most conservative GAIN (1/16) for stability.
             return 1.0 / MAX_GAIN_DIVISOR as f64;
         }
 
@@ -2175,7 +2179,7 @@ mod tests {
         );
     }
 
-    /// Test proportional slowdown reduction (16x, not to minimum)
+    /// Test proportional slowdown reduction (4x, not to minimum)
     #[tokio::test]
     async fn test_proportional_slowdown_reduction() {
         let config = LedbatConfig {
