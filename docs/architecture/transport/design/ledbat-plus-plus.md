@@ -380,6 +380,18 @@ test result: ok. 45 passed; 0 failed
 | BitTorrent uTP | N/A (no slowdown) | 100ms | N/A | RFC 6817 only, no LEDBAT++ |
 | LEDBAT++ spec | "minimal rate" | 60ms | 9x duration | Recommends 2 MSS minimum |
 
+#### Timing Comparison (Spec vs Freenet)
+
+| Parameter | LEDBAT++ Spec | Freenet | Compliant? |
+|-----------|---------------|---------|------------|
+| Initial delay after slow start | 2 RTTs | 2 RTTs | ✅ Yes |
+| Freeze duration | 2 RTTs | 2 RTTs | ✅ Yes |
+| Frozen cwnd level | 2 packets (~2.8KB) | cwnd/4 (~75KB) | ❌ Gentler |
+| Ramp-up mechanism | Slow start to ssthresh | Slow start to pre_slowdown | ✅ Yes |
+| Next slowdown interval | 9x slowdown duration | 9x slowdown duration | ✅ Yes |
+
+**Summary:** Our timing is fully spec-compliant. The only deviation is the frozen cwnd depth (4x reduction vs 16x+), which we chose for smoother user experience.
+
 **Key differences in our implementation:**
 
 1. **Gradual slowdown (4x vs 16x+)**: We use a gentler reduction factor:
