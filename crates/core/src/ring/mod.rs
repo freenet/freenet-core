@@ -164,6 +164,12 @@ impl Ring {
         self.connection_manager.connection_count()
     }
 
+    /// Register events with the event system.
+    /// This is used by operations to emit failure and other events.
+    pub async fn register_events<'a>(&self, events: either::Either<crate::tracing::NetEventLog<'a>, Vec<crate::tracing::NetEventLog<'a>>>) {
+        self.event_register.register_events(events).await;
+    }
+
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;

@@ -371,11 +371,20 @@ fn event_kind_to_string(kind: &EventKind) -> String {
             match put_event {
                 PutEvent::Request { .. } => "put_request".to_string(),
                 PutEvent::PutSuccess { .. } => "put_success".to_string(),
+                PutEvent::PutFailure { .. } => "put_failure".to_string(),
                 PutEvent::BroadcastEmitted { .. } => "put_broadcast_emitted".to_string(),
                 PutEvent::BroadcastReceived { .. } => "put_broadcast_received".to_string(),
             }
         }
-        EventKind::Get(_) => "get".to_string(),
+        EventKind::Get(get_event) => {
+            use super::GetEvent;
+            match get_event {
+                GetEvent::Request { .. } => "get_request".to_string(),
+                GetEvent::GetSuccess { .. } => "get_success".to_string(),
+                GetEvent::GetNotFound { .. } => "get_not_found".to_string(),
+                GetEvent::GetFailure { .. } => "get_failure".to_string(),
+            }
+        }
         EventKind::Subscribe(_) => "subscribe".to_string(),
         EventKind::Update(update_event) => {
             use super::UpdateEvent;
@@ -531,6 +540,26 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "timestamp": timestamp,
                     })
                 }
+                PutEvent::PutFailure {
+                    id,
+                    requester,
+                    target,
+                    key,
+                    reason,
+                    elapsed_ms,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "failure",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "target": target.to_string(),
+                        "key": key.to_string(),
+                        "reason": format!("{:?}", reason),
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
+                    })
+                }
             }
         }
         EventKind::Get(get_event) => {
@@ -586,6 +615,26 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
+                    })
+                }
+                GetEvent::GetFailure {
+                    id,
+                    requester,
+                    instance_id,
+                    target,
+                    reason,
+                    elapsed_ms,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "get_failure",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "target": target.to_string(),
+                        "reason": format!("{:?}", reason),
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })

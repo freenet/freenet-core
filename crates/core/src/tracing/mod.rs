@@ -290,6 +290,64 @@ impl<'a> NetEventLog<'a> {
         )
     }
 
+    /// Create a Put failure event.
+    pub fn put_failure(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        reason: OperationFailure,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id: peer_id.clone(),
+            kind: EventKind::Put(PutEvent::PutFailure {
+                id: *tx,
+                requester: own_loc.clone(),
+                target: own_loc,
+                key,
+                reason,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create a Get failure event.
+    pub fn get_failure(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        reason: OperationFailure,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id: peer_id.clone(),
+            kind: EventKind::Get(GetEvent::GetFailure {
+                id: *tx,
+                requester: own_loc.clone(),
+                instance_id,
+                target: own_loc,
+                reason,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
     pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
         let own_loc = ring.connection_manager.own_location();
         let Some(own_addr) = own_loc.socket_addr() else {
@@ -1622,6 +1680,30 @@ enum ConnectEvent {
     },
 }
 
+/// Reason for operation failure.
+///
+/// Understanding failure reasons helps debug network and contract issues.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum OperationFailure {
+    /// Connection to peer dropped during operation.
+    ConnectionDropped,
+    /// Operation exceeded maximum retries.
+    MaxRetriesExceeded {
+        retries: usize,
+    },
+    /// HTL (hops to live) exhausted before finding result.
+    HtlExhausted,
+    /// No peers available in the ring to route to.
+    NoPeersAvailable,
+    /// Contract handler returned an error.
+    ContractError(String),
+    /// Operation timed out.
+    Timeout,
+    /// Other failure with description.
+    Other(String),
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum PutEvent {
@@ -1639,6 +1721,18 @@ enum PutEvent {
         requester: PeerKeyLocation,
         target: PeerKeyLocation,
         key: ContractKey,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
+    /// Put operation failed.
+    PutFailure {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        target: PeerKeyLocation,
+        key: ContractKey,
+        /// Reason for the failure.
+        reason: OperationFailure,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -1720,6 +1814,7 @@ enum UpdateEvent {
 /// - Request initiation
 /// - Success when contract is found
 /// - NotFound when contract doesn't exist after search
+/// - Failure when operation fails due to network/system errors
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum GetEvent {
@@ -1754,6 +1849,19 @@ enum GetEvent {
         /// Contract instance that was searched for.
         instance_id: ContractInstanceId,
         target: PeerKeyLocation,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
+    /// Get operation failed due to network or system error.
+    GetFailure {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        /// Contract instance that was searched for.
+        instance_id: ContractInstanceId,
+        target: PeerKeyLocation,
+        /// Reason for the failure.
+        reason: OperationFailure,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,

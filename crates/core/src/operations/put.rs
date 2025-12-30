@@ -20,7 +20,9 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
     ring::{KnownPeerKeyLocation, Location},
+    tracing::{NetEventLog, OperationFailure},
 };
+use either::Either;
 
 pub(crate) struct PutOp {
     pub id: Transaction,
@@ -95,6 +97,26 @@ impl PutOp {
             tx = %self.id,
             "Put operation aborted due to connection failure"
         );
+
+        // Extract key from state if available
+        let key = match &self.state {
+            Some(PutState::PrepareRequest { contract, .. }) => Some(contract.key()),
+            Some(PutState::Finished { key }) => Some(*key),
+            _ => None,
+        };
+
+        // Emit failure event if we have the key
+        if let Some(key) = key {
+            op_manager
+                .ring
+                .register_events(Either::Left(NetEventLog::put_failure(
+                    &self.id,
+                    &op_manager.ring,
+                    key,
+                    OperationFailure::ConnectionDropped,
+                )))
+                .await;
+        }
 
         // Create an error result to notify the client
         let error_result: crate::client_events::HostResult =

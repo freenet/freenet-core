@@ -13,7 +13,9 @@ use crate::{
     node::{NetworkBridge, OpManager},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
+    tracing::{NetEventLog, OperationFailure},
 };
+use either::Either;
 
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
@@ -625,6 +627,17 @@ impl GetOp {
                     phase = "not_found",
                     "GET: Connection aborted, no peers available - local operation fails"
                 );
+
+                // Emit failure event
+                op_manager
+                    .ring
+                    .register_events(Either::Left(NetEventLog::get_failure(
+                        &self.id,
+                        &op_manager.ring,
+                        instance_id,
+                        OperationFailure::NoPeersAvailable,
+                    )))
+                    .await;
 
                 let failed_op = GetOp {
                     id: self.id,
