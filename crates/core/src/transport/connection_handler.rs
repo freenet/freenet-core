@@ -792,31 +792,21 @@ impl<S: Socket> UdpPacketsListener<S> {
                     );
                     let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
 
-                    // Check if we already have an active connection
-                    if let Some(existing_conn) = self.remote_connections.get(&remote_addr) {
-                        // Check if the existing connection is still alive
-                        if existing_conn.inbound_packet_sender.is_closed() {
-                            // Connection is dead, remove it
-                            self.remote_connections.remove(&remote_addr);
-                            // Clean up rate-limit tracking
-                            self.last_rsa_attempt.remove(&remote_addr);
-                            tracing::warn!(
-                                peer_addr = %remote_addr,
-                                direction = "outbound",
-                                "Removing closed connection"
-                            );
-                        } else {
-                            // Connection is still alive, reject new connection attempt
-                            tracing::debug!(
-                                peer_addr = %remote_addr,
-                                direction = "outbound",
-                                "Connection already established and healthy, rejecting new attempt"
-                            );
-                            let _ = open_connection.send(Err(TransportError::ConnectionEstablishmentFailure {
-                                cause: "connection already exists".into(),
-                            }));
-                            continue;
-                        }
+                    // Check if we already have an active connection.
+                    // Issue #2470: When a gateway restarts, the peer's existing connection has
+                    // stale symmetric keys that can't communicate with the new gateway session.
+                    // The channel appears "open" (is_closed() returns false) but the connection
+                    // is non-functional. If the higher layer is requesting a new connection,
+                    // it's because the existing one isn't working - trust the caller and replace it.
+                    if let Some(_existing_conn) = self.remote_connections.remove(&remote_addr) {
+                        // Clean up rate-limit tracking
+                        self.last_rsa_attempt.remove(&remote_addr);
+                        tracing::info!(
+                            peer_addr = %remote_addr,
+                            direction = "outbound",
+                            "Clearing existing connection to allow fresh handshake \
+                             (remote may have restarted with new session)"
+                        );
                     }
 
                     // Also check if a connection attempt is already in progress
@@ -2868,6 +2858,167 @@ pub mod mock_transport {
             OutboundConnectionHandler::new_test(addr, socket, peer_keypair, false)
                 .expect("failed to create peer");
         Ok((peer_pub, peer_conn, addr))
+    }
+
+    /// Create a mock gateway at a specific socket address for testing.
+    ///
+    /// This allows testing scenarios where a gateway restarts at the same IP:port with new keys.
+    #[allow(dead_code)]
+    async fn create_mock_gateway_at_addr(
+        packet_drop_policy: PacketDropPolicy,
+        addr: SocketAddr,
+        channels: Channels,
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        (
+            OutboundConnectionHandler<MockSocket>,
+            mpsc::Receiver<PeerConnection<MockSocket>>,
+        ),
+        SocketAddr,
+    )> {
+        let gw_keypair = TransportKeypair::new();
+        let gw_pub = gw_keypair.public.clone();
+        let socket = Arc::new(
+            MockSocket::new(
+                packet_drop_policy,
+                PacketDelayPolicy::NoDelay,
+                addr,
+                channels,
+            )
+            .await,
+        );
+        let (gw_conn, inbound_conn) =
+            OutboundConnectionHandler::new_test(addr, socket, gw_keypair, true)
+                .expect("failed to create gateway");
+        Ok((gw_pub, (gw_conn, inbound_conn), addr))
+    }
+
+    /// Test that a peer reconnecting to a gateway after gateway restart is handled correctly.
+    ///
+    /// This simulates the scenario from issue #2470 where:
+    /// 1. Peer connects to Gateway A (identity X) at gw_addr
+    /// 2. Gateway A restarts (simulated by dropping and recreating)
+    /// 3. Gateway B (identity Y) starts at the SAME gw_addr
+    /// 4. Peer tries to reconnect to gw_addr with Gateway B's public key
+    ///
+    /// The bug was that the peer retained the old session with Gateway A's encryption keys.
+    /// When the peer called connect() again, the old code would return the stale connection
+    /// instead of establishing a fresh handshake with Gateway B's new keys.
+    ///
+    /// The fix clears any existing remote_connections entry when connect() is called,
+    /// ensuring a fresh handshake occurs.
+    #[tokio::test]
+    async fn peer_handles_gateway_restart_same_addr_new_identity() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+
+        // Use a fixed port for the gateway to simulate restart at same address
+        let gw_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 55555).into();
+
+        // Step 1: Create Gateway A with identity X
+        tracing::info!("Step 1: Creating Gateway A (identity X) at {}", gw_addr);
+        let (gw_a_pub, (gw_a_outbound, mut gw_a_conn), _) =
+            create_mock_gateway_at_addr(Default::default(), gw_addr, channels.clone()).await?;
+        tracing::info!("Gateway A public key: {:?}", gw_a_pub);
+
+        // Create the peer at a regular address
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+
+        // Peer connects to Gateway A
+        let gw_task = tokio::spawn(async move {
+            let conn = tokio::time::timeout(Duration::from_secs(10), gw_a_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!(
+                    "Gateway A: no inbound connection from peer"
+                ))?;
+            tracing::info!(
+                "Gateway A received connection from peer at {}",
+                conn.remote_addr()
+            );
+            Ok::<_, anyhow::Error>(conn)
+        });
+
+        let peer_conn_a = tokio::time::timeout(
+            Duration::from_secs(10),
+            peer.connect(gw_a_pub.clone(), gw_addr).await,
+        )
+        .await??;
+        tracing::info!("Peer connected to Gateway A successfully");
+
+        let _gw_a_peer_conn = gw_task.await??;
+
+        // Verify the connection works
+        assert_eq!(peer_conn_a.remote_addr(), gw_addr);
+
+        // Step 2: Simulate gateway restart by dropping Gateway A
+        tracing::info!("Step 2: Simulating Gateway A restart (dropping connection and handler)");
+        drop(peer_conn_a);
+        drop(gw_a_outbound);
+
+        // Give time for cleanup
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Step 3: Create Gateway B with NEW identity (Y) at the SAME address
+        tracing::info!(
+            "Step 3: Creating Gateway B (NEW identity Y) at SAME address {}",
+            gw_addr
+        );
+        let (gw_b_pub, (_gw_b_outbound, mut gw_b_conn), _) =
+            create_mock_gateway_at_addr(Default::default(), gw_addr, channels.clone()).await?;
+        tracing::info!("Gateway B public key: {:?}", gw_b_pub);
+
+        // Verify this test is actually testing new identity
+        assert_ne!(
+            gw_a_pub, gw_b_pub,
+            "Gateway B must have different identity than Gateway A"
+        );
+
+        // Step 4: Peer reconnects to Gateway B (new identity) at same address
+        // This is where the bug manifests:
+        // - Peer still has remote_connections entry for gw_addr with Gateway A's session
+        // - Without the fix: connect() returns stale connection with wrong keys
+        // - With the fix: connect() clears stale entry and does fresh handshake
+        tracing::info!("Step 4: Peer reconnecting to Gateway B (new identity) at same address");
+
+        let gw_task = tokio::spawn(async move {
+            let conn = tokio::time::timeout(Duration::from_secs(5), gw_b_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!(
+                    "Gateway B: no inbound connection from peer (bug #2470 - peer didn't clear stale session)"
+                ))?;
+            tracing::info!(
+                "Gateway B received connection from peer at {}",
+                conn.remote_addr()
+            );
+            Ok::<_, anyhow::Error>(conn)
+        });
+
+        let start = std::time::Instant::now();
+        let peer_conn_b = tokio::time::timeout(
+            Duration::from_secs(5),
+            peer.connect(gw_b_pub.clone(), gw_addr).await,
+        )
+        .await??;
+        let elapsed = start.elapsed();
+
+        tracing::info!("Peer reconnected to Gateway B in {:?}", elapsed);
+
+        let _gw_b_peer_conn = gw_task.await??;
+
+        // Verify the connection works
+        assert_eq!(peer_conn_b.remote_addr(), gw_addr);
+
+        // The connection should complete quickly
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Connection took {:?}, which suggests the peer failed to clear stale session. \
+             This is bug #2470: peer doesn't reset session when gateway restarts with new identity.",
+            elapsed
+        );
+
+        tracing::info!("Test passed: Peer successfully reconnected to restarted gateway");
+
+        Ok(())
     }
 
     /// Test that a peer reconnecting from the SAME IP:port with a NEW identity is handled correctly.
