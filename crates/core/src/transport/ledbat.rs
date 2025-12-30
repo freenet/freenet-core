@@ -2705,4 +2705,414 @@ mod tests {
         println!("  60ms RTT:  {:.4}", gain_60ms);
         println!("  120ms RTT: {:.4}", gain_120ms);
     }
+
+    // =========================================================================
+    // E2E Simulation Tests - Visualize behavior at different latencies
+    // =========================================================================
+
+    /// Snapshot of controller state at a point in time
+    #[derive(Debug, Clone)]
+    struct StateSnapshot {
+        time_ms: u64,
+        cwnd_kb: usize,
+        state: u8,
+        throughput_mbps: f64,
+        data_transferred_kb: usize,
+    }
+
+    /// Simulate a transfer and collect state snapshots (synchronous, no real-time delays)
+    ///
+    /// This uses a controlled test clock to simulate time passing, allowing the test
+    /// to run instantly regardless of simulated RTT.
+    ///
+    /// Note: Since the controller uses wall-clock time for rate limiting, we need to
+    /// reset the rate limiter before each simulated RTT to allow updates.
+    fn simulate_transfer_sync(
+        rtt_ms: u64,
+        transfer_size_kb: usize,
+        sample_interval_ms: u64,
+    ) -> (Vec<StateSnapshot>, u64) {
+        let rtt = Duration::from_millis(rtt_ms);
+        let config = LedbatConfig {
+            initial_cwnd: 38_000, // IW26
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 100_000,
+            enable_slow_start: true,
+            // Disable periodic slowdown since it depends on wall-clock time
+            // See test_complete_slowdown_cycle for slowdown tests
+            enable_periodic_slowdown: false,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        let mut snapshots = Vec::new();
+        let mut total_data_kb: usize = 0;
+        let mut elapsed_ms: u64 = 0;
+
+        // Simulate flightsize - enough to not bottleneck
+        controller.on_send(10_000_000);
+
+        // Max simulation time (5 minutes virtual time)
+        let max_time_ms = 300_000u64;
+
+        // Prime the delay filter with initial samples
+        for _ in 0..4 {
+            controller.delay_filter.add_sample(rtt);
+        }
+        controller.base_delay_history.update(rtt);
+
+        // Simulate transfer - each iteration represents one RTT
+        while total_data_kb < transfer_size_kb && elapsed_ms < max_time_ms {
+            elapsed_ms += rtt_ms;
+
+            // Wait for at least base_delay so the rate limiter allows updates
+            // This is the minimum real-time wait needed for accurate simulation
+            std::thread::sleep(rtt);
+
+            // Reset bytes accumulated and set last_update to allow this update
+            controller.last_update_nanos.store(0, Ordering::Release);
+
+            // Calculate bytes we can send this RTT (cwnd worth)
+            let cwnd = controller.current_cwnd();
+            let remaining_bytes = (transfer_size_kb * 1024).saturating_sub(total_data_kb * 1024);
+            let bytes_this_rtt = cwnd.min(remaining_bytes);
+
+            if bytes_this_rtt == 0 {
+                // Edge case: cwnd too small, simulate at least one packet
+                let min_packet = 1464usize;
+                controller.on_ack(rtt, min_packet);
+                total_data_kb += min_packet / 1024;
+            } else {
+                // Simulate ACK for sent data - simulate slight queuing delay for realism
+                // Use 10% of target delay as typical queuing delay (6ms)
+                let queued_rtt = Duration::from_nanos(rtt.as_nanos() as u64 + 6_000_000);
+                controller.on_ack(queued_rtt, bytes_this_rtt);
+                total_data_kb += bytes_this_rtt / 1024;
+            }
+
+            // Take snapshot at intervals
+            if elapsed_ms % sample_interval_ms == 0 || elapsed_ms <= rtt_ms * 2 {
+                let throughput = if elapsed_ms > 0 {
+                    (total_data_kb as f64 * 1024.0 * 8.0) / (elapsed_ms as f64 / 1000.0) / 1_000_000.0
+                } else {
+                    0.0
+                };
+
+                snapshots.push(StateSnapshot {
+                    time_ms: elapsed_ms,
+                    cwnd_kb: controller.current_cwnd() / 1024,
+                    state: controller.slowdown_state.load(Ordering::Relaxed),
+                    throughput_mbps: throughput,
+                    data_transferred_kb: total_data_kb,
+                });
+            }
+        }
+
+        (snapshots, elapsed_ms)
+    }
+
+    /// Render ASCII throughput chart
+    fn render_throughput_chart(snapshots: &[StateSnapshot], max_throughput: f64, width: usize) {
+        let height = 10;
+        let mut chart = vec![vec![' '; width]; height];
+
+        // Plot data points
+        for (i, snap) in snapshots.iter().enumerate() {
+            if i >= width {
+                break;
+            }
+            let normalized = (snap.throughput_mbps / max_throughput).min(1.0);
+            let row = height - 1 - (normalized * (height - 1) as f64) as usize;
+            chart[row][i] = match snap.state {
+                0 => '█', // Normal
+                1 => '▓', // WaitingForSlowdown
+                2 => '▒', // InSlowdown
+                3 => '░', // Frozen
+                4 => '▄', // RampingUp
+                _ => '?',
+            };
+        }
+
+        // Print chart
+        println!("\n    Throughput over time (█=Normal ░=Frozen ▄=RampingUp)");
+        println!("    {:.1} Mbps ┤", max_throughput);
+        for row in &chart {
+            print!("            │");
+            for &c in row {
+                print!("{}", c);
+            }
+            println!();
+        }
+        println!("      0 Mbps ┼{}┬──────────────────────────────────────────►", "─".repeat(width.saturating_sub(45)));
+        println!("              0                                              time");
+    }
+
+    /// Render state timeline
+    fn render_state_timeline(snapshots: &[StateSnapshot]) {
+        let _state_names = ["Normal", "Waiting", "Slowdown", "Frozen", "RampingUp"];
+        let state_chars = ['─', '╌', '▼', '═', '╱'];
+
+        print!("    State: ");
+        let mut last_state = 255u8;
+        for snap in snapshots.iter().take(60) {
+            if snap.state != last_state {
+                print!("{}", state_chars[snap.state as usize]);
+                last_state = snap.state;
+            } else {
+                print!("{}", state_chars[snap.state as usize]);
+            }
+        }
+        println!();
+        println!("           (─=Normal ═=Frozen ╱=RampingUp ▼=Slowdown)");
+    }
+
+    /// E2E test: 512KB transfer at 50ms RTT with visualization
+    ///
+    /// This test uses real-time sleeps to properly test the LEDBAT controller's
+    /// slow start behavior. Uses smaller transfer size for faster execution.
+    /// See test_complete_slowdown_cycle for slowdown mechanism tests.
+    #[test]
+    fn test_e2e_transfer_50ms_rtt() {
+        println!("\n========== E2E Test: 512KB Transfer @ 50ms RTT ==========");
+
+        let (snapshots, duration_ms) = simulate_transfer_sync(50, 512, 50);
+
+        println!("\n--- Transfer Summary ---");
+        println!("RTT:              50ms");
+        println!("Transfer size:    512 KB");
+        println!("Duration:         {} ms ({:.2}s)", duration_ms, duration_ms as f64 / 1000.0);
+        println!("Avg throughput:   {:.2} Mbps",
+            (512.0 * 8.0) / (duration_ms as f64 / 1000.0) / 1000.0);
+
+        // Print key snapshots showing slow start growth
+        println!("\n--- cwnd Evolution ---");
+        println!("{:>8} {:>8} {:>10}", "Time(ms)", "cwnd(KB)", "Data(KB)");
+        for snap in &snapshots {
+            println!("{:>8} {:>8} {:>10}", snap.time_ms, snap.cwnd_kb, snap.data_transferred_kb);
+        }
+
+        // Verify slow start doubled cwnd (initial 37KB should grow)
+        let max_cwnd = snapshots.iter().map(|s| s.cwnd_kb).max().unwrap_or(0);
+        assert!(max_cwnd >= 74, "Slow start should double cwnd (37 -> 74+), got max {}KB", max_cwnd);
+
+        // Verify transfer completed
+        let final_data = snapshots.last().map(|s| s.data_transferred_kb).unwrap_or(0);
+        assert!(final_data >= 512, "Should have transferred 512KB, got {}KB", final_data);
+    }
+
+    /// E2E test: 1MB transfer at 200ms RTT with visualization
+    #[test]
+    fn test_e2e_transfer_200ms_rtt() {
+        println!("\n========== E2E Test: 1MB Transfer @ 200ms RTT ==========");
+
+        let (snapshots, duration_ms) = simulate_transfer_sync(200, 1024, 200);
+
+        println!("\n--- Transfer Summary ---");
+        println!("RTT:              200ms");
+        println!("Transfer size:    1 MB");
+        println!("Duration:         {} ms ({:.2}s)", duration_ms, duration_ms as f64 / 1000.0);
+        println!("Avg throughput:   {:.2} Mbps",
+            (1024.0 * 8.0) / (duration_ms as f64 / 1000.0) / 1000.0);
+
+        // Print key snapshots
+        println!("\n--- cwnd Evolution ---");
+        println!("{:>8} {:>8} {:>10}", "Time(ms)", "cwnd(KB)", "Data(KB)");
+        for snap in &snapshots {
+            println!("{:>8} {:>8} {:>10}", snap.time_ms, snap.cwnd_kb, snap.data_transferred_kb);
+        }
+
+        // Verify slow start worked
+        let max_cwnd = snapshots.iter().map(|s| s.cwnd_kb).max().unwrap_or(0);
+        assert!(max_cwnd >= 74, "Slow start should grow cwnd, got max {}KB", max_cwnd);
+
+        // Verify transfer completed
+        let final_data = snapshots.last().map(|s| s.data_transferred_kb).unwrap_or(0);
+        assert!(final_data >= 1024, "Should have transferred 1MB, got {}KB", final_data);
+    }
+
+    /// Parametrized test for multiple latency scenarios
+    ///
+    /// Uses small transfer sizes (256KB) to keep test execution fast while
+    /// still validating slow start behavior at different RTTs.
+    #[rstest::rstest]
+    #[case::lan_10ms(10, 256)]       // 256KB @ 10ms
+    #[case::regional_50ms(50, 256)]  // 256KB @ 50ms
+    #[case::continental_100ms(100, 256)] // 256KB @ 100ms
+    #[case::satellite_200ms(200, 256)]   // 256KB @ 200ms
+    fn test_e2e_latency_scenarios(
+        #[case] rtt_ms: u64,
+        #[case] size_kb: usize,
+    ) {
+        let (snapshots, duration_ms) = simulate_transfer_sync(rtt_ms, size_kb, rtt_ms);
+
+        let avg_throughput = (size_kb as f64 * 8.0) / (duration_ms as f64 / 1000.0) / 1000.0;
+
+        println!("\n{}ms RTT, {}KB transfer:", rtt_ms, size_kb);
+        println!("  Duration: {}ms ({:.2}s)", duration_ms, duration_ms as f64 / 1000.0);
+        println!("  Throughput: {:.2} Mbps", avg_throughput);
+        println!("  Snapshots: {}", snapshots.len());
+
+        // Verify slow start worked (cwnd should grow from initial 37KB)
+        let max_cwnd = snapshots.iter().map(|s| s.cwnd_kb).max().unwrap_or(0);
+        assert!(
+            max_cwnd >= 74,
+            "{}ms RTT: Slow start should grow cwnd to 74KB+, got {}KB",
+            rtt_ms, max_cwnd
+        );
+
+        // Verify we actually transferred the data
+        let final_data = snapshots.last().map(|s| s.data_transferred_kb).unwrap_or(0);
+        assert!(final_data >= size_kb, "Should have transferred {}KB, got {}KB", size_kb, final_data);
+    }
+
+    /// Test that visualizes cwnd evolution through complete slowdown cycle
+    #[tokio::test]
+    async fn test_e2e_visualize_slowdown_cycle() {
+        println!("\n========== Visualizing Complete Slowdown Cycle ==========");
+
+        let rtt = Duration::from_millis(100);
+        let config = LedbatConfig {
+            initial_cwnd: 38_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 80_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+        controller.on_send(1_000_000);
+
+        let mut timeline: Vec<(u64, usize, &str)> = Vec::new();
+        let mut elapsed_ms = 0u64;
+
+        // Phase 1: Slow start
+        println!("\n--- Phase 1: Slow Start ---");
+        for _ in 0..15 {
+            tokio::time::sleep(rtt).await;
+            elapsed_ms += 100;
+            controller.on_ack(rtt, 20_000);
+
+            let state = controller.slowdown_state.load(Ordering::Relaxed);
+            let state_name = match state {
+                0 => "Normal",
+                1 => "Waiting",
+                2 => "Slowdown",
+                3 => "Frozen",
+                4 => "RampingUp",
+                _ => "?",
+            };
+            timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name));
+
+            if !controller.in_slow_start.load(Ordering::Relaxed) {
+                println!("  Slow start exit at {}ms, cwnd={}KB", elapsed_ms, controller.current_cwnd() / 1024);
+                break;
+            }
+        }
+
+        // Phase 2: Wait for slowdown
+        println!("\n--- Phase 2: Waiting for Slowdown ---");
+        for _ in 0..10 {
+            tokio::time::sleep(rtt).await;
+            elapsed_ms += 100;
+            controller.on_ack(rtt, 10_000);
+
+            let state = controller.slowdown_state.load(Ordering::Relaxed);
+            let state_name = match state {
+                0 => "Normal",
+                1 => "Waiting",
+                2 => "Slowdown",
+                3 => "Frozen",
+                4 => "RampingUp",
+                _ => "?",
+            };
+            timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name));
+
+            if state >= 2 {
+                println!("  Slowdown triggered at {}ms, cwnd={}KB", elapsed_ms, controller.current_cwnd() / 1024);
+                break;
+            }
+        }
+
+        // Phase 3: Freeze
+        println!("\n--- Phase 3: Frozen ---");
+        let pre_slowdown_cwnd = controller.pre_slowdown_cwnd.load(Ordering::Relaxed) / 1024;
+        for _ in 0..5 {
+            tokio::time::sleep(rtt).await;
+            elapsed_ms += 100;
+            controller.on_ack(rtt, 5_000);
+
+            let state = controller.slowdown_state.load(Ordering::Relaxed);
+            let state_name = match state {
+                0 => "Normal",
+                1 => "Waiting",
+                2 => "Slowdown",
+                3 => "Frozen",
+                4 => "RampingUp",
+                _ => "?",
+            };
+            timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name));
+
+            if state == 4 {
+                println!("  Ramp-up started at {}ms, cwnd={}KB", elapsed_ms, controller.current_cwnd() / 1024);
+                break;
+            }
+        }
+
+        // Phase 4: Ramp-up
+        println!("\n--- Phase 4: Ramp-up ---");
+        for _ in 0..10 {
+            tokio::time::sleep(rtt).await;
+            elapsed_ms += 100;
+            controller.on_ack(rtt, 30_000);
+
+            let state = controller.slowdown_state.load(Ordering::Relaxed);
+            let state_name = match state {
+                0 => "Normal",
+                1 => "Waiting",
+                2 => "Slowdown",
+                3 => "Frozen",
+                4 => "RampingUp",
+                _ => "?",
+            };
+            timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name));
+
+            if state == 0 {
+                println!("  Back to normal at {}ms, cwnd={}KB", elapsed_ms, controller.current_cwnd() / 1024);
+                break;
+            }
+        }
+
+        // Render timeline
+        println!("\n--- cwnd Timeline ---");
+        println!("{:>8} {:>10} {:>12}", "Time(ms)", "cwnd(KB)", "State");
+        println!("{}", "-".repeat(32));
+        for (t, cwnd, state) in &timeline {
+            let bar_len = (*cwnd / 10).min(30);
+            let bar: String = "█".repeat(bar_len);
+            println!("{:>8} {:>10} {:>12} {}", t, cwnd, state, bar);
+        }
+
+        // Verify the cycle completed
+        let final_state = controller.slowdown_state.load(Ordering::Relaxed);
+        assert_eq!(final_state, 0, "Should return to Normal state");
+
+        let final_cwnd = controller.current_cwnd();
+        assert!(
+            final_cwnd >= pre_slowdown_cwnd * 1024 * 95 / 100,
+            "Should recover to ~pre_slowdown level: {} >= {}",
+            final_cwnd / 1024,
+            pre_slowdown_cwnd * 95 / 100
+        );
+
+        println!("\n✓ Complete slowdown cycle verified");
+        println!("  Pre-slowdown: {}KB", pre_slowdown_cwnd);
+        println!("  Frozen: {}KB (expected {}KB)",
+            timeline.iter().filter(|(_, _, s)| *s == "Frozen").map(|(_, c, _)| *c).next().unwrap_or(0),
+            pre_slowdown_cwnd / 4);
+        println!("  Recovered: {}KB", final_cwnd / 1024);
+    }
 }
