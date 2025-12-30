@@ -107,10 +107,14 @@ impl<S> Drop for RemoteConnection<S> {
     }
 }
 
+/// Unique identifier for a streaming transfer.
+///
+/// Used to correlate streaming metadata messages with their data streams.
+/// StreamIds are unique within a node's lifetime and are generated atomically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
 #[serde(transparent)]
-pub(crate) struct StreamId(u32);
+pub struct StreamId(u32);
 
 impl StreamId {
     pub fn next() -> Self {

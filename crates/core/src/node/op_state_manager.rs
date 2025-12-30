@@ -26,8 +26,8 @@ use crate::{
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
-        connect::ConnectForwardEstimator, get::GetOp, put::PutOp, subscribe::SubscribeOp,
-        update::UpdateOp, OpEnum, OpError,
+        connect::ConnectForwardEstimator, get::GetOp, orphan_streams::OrphanStreamRegistry,
+        put::PutOp, subscribe::SubscribeOp, update::UpdateOp, OpEnum, OpError,
     },
     ring::{ConnectionManager, LiveTransactionTracker, PeerKeyLocation, Ring},
 };
@@ -235,6 +235,16 @@ pub(crate) struct OpManager {
     ///
     /// Wrapped in Arc for sharing with `garbage_cleanup_task`.
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
+    /// Registry for handling race conditions between stream fragments and metadata messages.
+    /// Used when streaming is enabled to coordinate transport layer (which receives fragments)
+    /// with operations layer (which receives RequestStreaming/ResponseStreaming messages).
+    orphan_stream_registry: Arc<OrphanStreamRegistry>,
+    /// Whether streaming transport is enabled for large transfers.
+    /// When true, transfers larger than `streaming_threshold` use streaming.
+    pub streaming_enabled: bool,
+    /// Size threshold in bytes above which streaming is used.
+    /// Only applies when `streaming_enabled` is true.
+    pub streaming_threshold: usize,
 }
 
 impl Clone for OpManager {
@@ -253,6 +263,9 @@ impl Clone for OpManager {
             contract_waiters: self.contract_waiters.clone(),
             proximity_cache: self.proximity_cache.clone(),
             request_router: self.request_router.clone(),
+            orphan_stream_registry: self.orphan_stream_registry.clone(),
+            streaming_enabled: self.streaming_enabled,
+            streaming_threshold: self.streaming_threshold,
         }
     }
 }
@@ -313,6 +326,17 @@ impl OpManager {
 
         let proximity_cache = Arc::new(ProximityCacheManager::new());
 
+        // Extract streaming config from NodeConfig
+        let streaming_enabled = config.config.network_api.streaming_enabled;
+        let streaming_threshold = config.config.network_api.streaming_threshold;
+
+        if streaming_enabled {
+            tracing::info!(
+                streaming_threshold_bytes = streaming_threshold,
+                "Streaming transport enabled for large transfers"
+            );
+        }
+
         Ok(Self {
             ring,
             ops,
@@ -327,6 +351,9 @@ impl OpManager {
             contract_waiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
             proximity_cache,
             request_router,
+            orphan_stream_registry: Arc::new(OrphanStreamRegistry::new()),
+            streaming_enabled,
+            streaming_threshold,
         })
     }
 
@@ -787,6 +814,24 @@ impl OpManager {
                 );
             }
         }
+    }
+
+    /// Returns a reference to the orphan stream registry.
+    ///
+    /// Used by operations layer to claim orphan streams when RequestStreaming
+    /// or ResponseStreaming metadata messages arrive.
+    #[allow(dead_code)] // Phase 3 infrastructure - will be used when streaming handlers are implemented
+    pub fn orphan_stream_registry(&self) -> &Arc<OrphanStreamRegistry> {
+        &self.orphan_stream_registry
+    }
+
+    /// Determines if streaming should be used for a payload of the given size.
+    ///
+    /// Returns `true` if streaming is enabled and the payload size exceeds
+    /// the streaming threshold.
+    #[allow(dead_code)] // Phase 3 infrastructure - will be used when streaming handlers are implemented
+    pub fn should_use_streaming(&self, payload_size: usize) -> bool {
+        self.streaming_enabled && payload_size > self.streaming_threshold
     }
 }
 

@@ -114,6 +114,8 @@ impl Default for ConfigArgs {
                 transient_ttl_secs: Some(DEFAULT_TRANSIENT_TTL_SECS),
                 min_connections: None,
                 max_connections: None,
+                streaming_enabled: None,   // Default: disabled
+                streaming_threshold: None, // Default: 64KB (set in NetworkApiConfig)
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -289,6 +291,14 @@ impl ConfigArgs {
             self.network_api
                 .max_connections
                 .get_or_insert(cfg.network_api.max_connections);
+            if cfg.network_api.streaming_enabled {
+                self.network_api.streaming_enabled.get_or_insert(true);
+            }
+            if cfg.network_api.streaming_threshold != default_streaming_threshold() {
+                self.network_api
+                    .streaming_threshold
+                    .get_or_insert(cfg.network_api.streaming_threshold);
+            }
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
@@ -464,6 +474,11 @@ impl ConfigArgs {
                     .network_api
                     .max_connections
                     .unwrap_or(DEFAULT_MAX_CONNECTIONS),
+                streaming_enabled: self.network_api.streaming_enabled.unwrap_or(false),
+                streaming_threshold: self
+                    .network_api
+                    .streaming_threshold
+                    .unwrap_or_else(default_streaming_threshold),
             },
             ws_api: WebsocketApiConfig {
                 // the websocket API is always local
@@ -714,6 +729,23 @@ pub struct NetworkArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_connections: Option<usize>,
+
+    /// Enable streaming transport for large transfers (experimental).
+    /// When enabled, transfers larger than streaming_threshold use streaming
+    /// instead of atomic messages. Default: false
+    #[arg(long, env = "STREAMING_ENABLED")]
+    #[serde(rename = "streaming-enabled", skip_serializing_if = "Option::is_none")]
+    pub streaming_enabled: Option<bool>,
+
+    /// Threshold in bytes above which streaming transport is used.
+    /// Only applies when streaming_enabled is true.
+    /// Default: 65536 (64KB)
+    #[arg(long, env = "STREAMING_THRESHOLD")]
+    #[serde(
+        rename = "streaming-threshold",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub streaming_threshold: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -823,6 +855,21 @@ pub struct NetworkApiConfig {
         rename = "max-number-of-connections"
     )]
     pub max_connections: usize,
+
+    /// Enable streaming transport for large transfers (experimental).
+    /// When enabled, transfers larger than `streaming_threshold` use streaming
+    /// instead of atomic messages. Default: false
+    #[serde(default, rename = "streaming-enabled")]
+    pub streaming_enabled: bool,
+
+    /// Threshold in bytes above which streaming transport is used.
+    /// Only applies when `streaming_enabled` is true.
+    /// Default: 65536 (64KB)
+    #[serde(
+        default = "default_streaming_threshold",
+        rename = "streaming-threshold"
+    )]
+    pub streaming_threshold: usize,
 }
 
 mod port_allocation;
@@ -846,6 +893,12 @@ fn default_min_connections() -> usize {
 
 fn default_max_connections() -> usize {
     DEFAULT_MAX_CONNECTIONS
+}
+
+/// Default streaming threshold: 64KB
+/// Transfers larger than this will use streaming when `streaming_enabled` is true.
+fn default_streaming_threshold() -> usize {
+    64 * 1024
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
@@ -1530,5 +1583,59 @@ mod tests {
             // Don't test for specific port since it's randomly assigned
             assert!(socket.port() > 1024); // Ensure we're using unprivileged ports
         }
+    }
+
+    #[test]
+    fn test_streaming_config_defaults_via_serde() {
+        // Verify streaming is disabled by default when deserializing empty config
+        // This tests the serde defaults which mirror the runtime defaults
+        let minimal_config = r#"
+            network-address = "127.0.0.1"
+            network-port = 8080
+        "#;
+        let network_api: NetworkApiConfig = toml::from_str(minimal_config).unwrap();
+        assert!(
+            !network_api.streaming_enabled,
+            "Streaming should be disabled by default"
+        );
+        assert_eq!(
+            network_api.streaming_threshold,
+            64 * 1024,
+            "Default streaming threshold should be 64KB"
+        );
+    }
+
+    #[test]
+    fn test_streaming_config_serde() {
+        // Test serialization/deserialization of streaming config with explicit values
+        let config_str = r#"
+            network-address = "127.0.0.1"
+            network-port = 8080
+            streaming-enabled = true
+            streaming-threshold = 131072
+        "#;
+
+        let config: NetworkApiConfig = toml::from_str(config_str).unwrap();
+        assert!(config.streaming_enabled);
+        assert_eq!(config.streaming_threshold, 128 * 1024);
+
+        // Round-trip test
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("streaming-enabled = true"));
+        assert!(serialized.contains("streaming-threshold = 131072"));
+    }
+
+    #[test]
+    fn test_network_args_streaming_defaults() {
+        // Verify NetworkArgs streaming fields are None by default (disabled)
+        let args = NetworkArgs::default();
+        assert!(
+            args.streaming_enabled.is_none(),
+            "NetworkArgs.streaming_enabled should be None by default"
+        );
+        assert!(
+            args.streaming_threshold.is_none(),
+            "NetworkArgs.streaming_threshold should be None by default"
+        );
     }
 }

@@ -168,6 +168,8 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             transient_ttl_secs: None,
             total_bandwidth_limit: None,
             min_bandwidth_per_connection: None,
+            streaming_enabled: None,
+            streaming_threshold: None,
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),

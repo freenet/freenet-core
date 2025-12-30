@@ -306,6 +306,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
             transient_ttl_secs: None,
             total_bandwidth_limit: None,
             min_bandwidth_per_connection: None,
+            ..Default::default()
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir_gw.path().to_path_buf()),
@@ -361,6 +362,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
             transient_ttl_secs: None,
             total_bandwidth_limit: None,
             min_bandwidth_per_connection: None,
+            ..Default::default()
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir_peer.path().to_path_buf()),

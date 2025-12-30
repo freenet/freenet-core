@@ -7,6 +7,7 @@ use std::{future::Future, time::Instant};
 
 use crate::client_events::HostResult;
 use crate::node::IsOperationCompleted;
+use crate::transport::peer_connection::StreamId;
 use crate::{
     contract::{ContractHandlerEvent, StoreResponse},
     message::{InnerMessage, NetMessage, Transaction},
@@ -314,6 +315,36 @@ enum GetState {
         /// Bloom filter tracking visited peers across all hops
         visited: super::VisitedPeers,
     },
+    /// Waiting for streaming response data to arrive.
+    /// Used when we're the requester and received ResponseStreaming.
+    #[allow(dead_code)]
+    AwaitingStreamData {
+        /// StreamId we're waiting for
+        stream_id: StreamId,
+        /// Contract key being fetched
+        key: ContractKey,
+        /// Instance ID for routing
+        instance_id: ContractInstanceId,
+        /// Expected total size of the stream
+        total_size: u64,
+        /// Whether the response includes contract code
+        includes_contract: bool,
+        /// Whether to subscribe after receiving
+        subscribe: bool,
+    },
+    /// Sending a streaming response back to the requester.
+    /// Used when we have the contract and it exceeds the streaming threshold.
+    #[allow(dead_code)]
+    SendingStreamResponse {
+        /// StreamId for the outbound stream
+        stream_id: StreamId,
+        /// Contract key being sent
+        key: ContractKey,
+        /// Instance ID for the contract
+        instance_id: ContractInstanceId,
+        /// Address to send the response to
+        target_addr: std::net::SocketAddr,
+    },
     /// Operation completed successfully
     Finished { key: ContractKey },
 }
@@ -342,6 +373,28 @@ impl Display for GetState {
                 ..
             } => {
                 write!(f, "AwaitingResponse(requester: {requester:?}, fetch_contract: {fetch_contract}, retries: {retries}, current_hop: {current_hop}, subscribe: {subscribe})")
+            }
+            GetState::AwaitingStreamData {
+                stream_id,
+                key,
+                total_size,
+                ..
+            } => {
+                write!(
+                    f,
+                    "AwaitingStreamData(stream: {stream_id}, key: {key}, size: {total_size})"
+                )
+            }
+            GetState::SendingStreamResponse {
+                stream_id,
+                key,
+                target_addr,
+                ..
+            } => {
+                write!(
+                    f,
+                    "SendingStreamResponse(stream: {stream_id}, key: {key}, target: {target_addr})"
+                )
             }
             GetState::Finished { key, .. } => write!(f, "Finished(key: {key})"),
         }
@@ -1735,6 +1788,32 @@ impl Operation for GetOp {
                         // result remains None to indicate failure
                     }
                 }
+
+                // Streaming variants - placeholder handlers until full implementation
+                // These will be implemented in Step 4 of Phase 3
+                GetMsg::ResponseStreaming {
+                    id,
+                    instance_id,
+                    key,
+                    ..
+                } => {
+                    tracing::warn!(
+                        tx = %id,
+                        %instance_id,
+                        contract = %key,
+                        "GET ResponseStreaming received but streaming not yet implemented"
+                    );
+                    return Err(OpError::UnexpectedOpState);
+                }
+
+                GetMsg::ResponseStreamingAck { id, stream_id } => {
+                    tracing::warn!(
+                        tx = %id,
+                        %stream_id,
+                        "GET ResponseStreamingAck received but streaming not yet implemented"
+                    );
+                    return Err(OpError::UnexpectedOpState);
+                }
             }
 
             build_op_result(
@@ -1923,6 +2002,7 @@ mod messages {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::transport::peer_connection::StreamId;
 
     /// Result of a GET operation - either the contract was found or it wasn't.
     ///
@@ -1964,19 +2044,51 @@ mod messages {
             instance_id: ContractInstanceId,
             result: GetMsgResult,
         },
+
+        /// Streaming response for large contract data. Used when the response payload
+        /// exceeds streaming_threshold (default 64KB). The actual data is sent via
+        /// a separate stream identified by stream_id.
+        ///
+        /// This variant is only used when streaming is enabled in config.
+        ResponseStreaming {
+            id: Transaction,
+            instance_id: ContractInstanceId,
+            /// Identifies the stream carrying the response data
+            stream_id: StreamId,
+            /// Full contract key (known since we found the contract)
+            key: ContractKey,
+            /// Total size of the streamed payload in bytes
+            total_size: u64,
+            /// Whether the response includes the contract code (not just state)
+            includes_contract: bool,
+        },
+
+        /// Acknowledgment that a streaming response was received.
+        /// Sent back to the responder to confirm stream completion.
+        ResponseStreamingAck {
+            id: Transaction,
+            stream_id: StreamId,
+        },
     }
 
     impl InnerMessage for GetMsg {
         fn id(&self) -> &Transaction {
             match self {
-                Self::Request { id, .. } | Self::Response { id, .. } => id,
+                Self::Request { id, .. }
+                | Self::Response { id, .. }
+                | Self::ResponseStreaming { id, .. }
+                | Self::ResponseStreamingAck { id, .. } => id,
             }
         }
 
         fn requested_location(&self) -> Option<Location> {
             match self {
-                Self::Request { instance_id, .. } | Self::Response { instance_id, .. } => {
-                    Some(Location::from(instance_id))
+                Self::Request { instance_id, .. }
+                | Self::Response { instance_id, .. }
+                | Self::ResponseStreaming { instance_id, .. } => Some(Location::from(instance_id)),
+                Self::ResponseStreamingAck { .. } => {
+                    // Ack doesn't carry location info - routed via stream_id
+                    None
                 }
             }
         }
@@ -2006,6 +2118,24 @@ mod messages {
                     write!(
                         f,
                         "Get::Response(id: {id}, instance_id: {instance_id}, result: {result_str})"
+                    )
+                }
+                Self::ResponseStreaming {
+                    instance_id,
+                    stream_id,
+                    key,
+                    total_size,
+                    ..
+                } => {
+                    write!(
+                        f,
+                        "Get::ResponseStreaming(id: {id}, instance_id: {instance_id}, key: {key}, stream: {stream_id}, size: {total_size})"
+                    )
+                }
+                Self::ResponseStreamingAck { stream_id, .. } => {
+                    write!(
+                        f,
+                        "Get::ResponseStreamingAck(id: {id}, stream: {stream_id})"
                     )
                 }
             }
