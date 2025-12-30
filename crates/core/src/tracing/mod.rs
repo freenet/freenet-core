@@ -463,12 +463,16 @@ impl<'a> NetEventLog<'a> {
             }
             NetMessageV1::Put(PutMsg::Response { id, key }) => {
                 let this_peer = &op_manager.ring.connection_manager.own_location();
+                // Calculate hop_count from operation state: max_htl - current_htl
+                let hop_count = op_manager.get_current_hop(id).map(|current_htl| {
+                    op_manager.ring.max_hops_to_live.saturating_sub(current_htl)
+                });
                 EventKind::Put(PutEvent::PutSuccess {
                     id: *id,
                     requester: this_peer.clone(),
                     target: this_peer.clone(),
                     key: *key,
-                    hop_count: None, // TODO: Track hop count from operation state
+                    hop_count,
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -495,12 +499,16 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) if value.state.is_some() => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                // Calculate hop_count from operation state: max_htl - current_hop
+                let hop_count = op_manager.get_current_hop(id).map(|current_hop| {
+                    op_manager.ring.max_hops_to_live.saturating_sub(current_hop)
+                });
                 EventKind::Get(GetEvent::GetSuccess {
                     id: *id,
                     requester: this_peer.clone(),
                     target: this_peer,
                     key: *key,
-                    hop_count: None, // TODO: Track hop count from operation state
+                    hop_count,
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -511,12 +519,16 @@ impl<'a> NetEventLog<'a> {
                 result: GetMsgResult::NotFound,
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                // Calculate hop_count from operation state: max_htl - current_hop
+                let hop_count = op_manager.get_current_hop(id).map(|current_hop| {
+                    op_manager.ring.max_hops_to_live.saturating_sub(current_hop)
+                });
                 EventKind::Get(GetEvent::GetNotFound {
                     id: *id,
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
-                    hop_count: None, // TODO: Track hop count from operation state
+                    hop_count,
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })

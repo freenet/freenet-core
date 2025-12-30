@@ -88,6 +88,15 @@ impl PutOp {
         }
     }
 
+    /// Get the current HTL (remaining hops) for this operation.
+    /// Returns None if the operation is not in AwaitingResponse state.
+    pub(crate) fn get_current_htl(&self) -> Option<usize> {
+        match &self.state {
+            Some(PutState::AwaitingResponse { current_htl, .. }) => Some(*current_htl),
+            _ => None,
+        }
+    }
+
     /// Handle aborted connections by failing the operation immediately.
     ///
     /// PUT operations don't have alternative routes to try. When the connection
@@ -366,6 +375,7 @@ impl Operation for PutOp {
                         let new_state = Some(PutState::AwaitingResponse {
                             subscribe,
                             next_hop: Some(next_addr),
+                            current_htl: htl,
                         });
 
                         Ok(OperationResult {
@@ -629,6 +639,8 @@ pub enum PutState {
         subscribe: bool,
         /// Next hop address for routing the outbound message
         next_hop: Option<std::net::SocketAddr>,
+        /// Current HTL (remaining hops) for hop_count calculation.
+        current_htl: usize,
     },
     /// Operation completed successfully.
     Finished { key: ContractKey },
@@ -691,6 +703,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
         state: Some(PutState::AwaitingResponse {
             subscribe,
             next_hop: None,
+            current_htl: htl,
         }),
         upstream_addr: None,
     };
@@ -862,6 +875,7 @@ mod tests {
         let op = make_put_op(Some(PutState::AwaitingResponse {
             subscribe: false,
             next_hop: None,
+            current_htl: 10,
         }));
         assert!(
             !op.finalized(),
@@ -895,6 +909,7 @@ mod tests {
         let op = make_put_op(Some(PutState::AwaitingResponse {
             subscribe: false,
             next_hop: None,
+            current_htl: 10,
         }));
         let result = op.to_host_result();
         assert!(
@@ -930,6 +945,7 @@ mod tests {
         let op = make_put_op(Some(PutState::AwaitingResponse {
             subscribe: false,
             next_hop: None,
+            current_htl: 10,
         }));
         assert!(
             !op.is_completed(),

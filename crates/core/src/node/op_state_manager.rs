@@ -549,6 +549,17 @@ impl OpManager {
         }
     }
 
+    /// Get the current hop count (remaining HTL) for an operation.
+    /// Used for calculating hop_count in success/failure events.
+    pub fn get_current_hop(&self, id: &Transaction) -> Option<usize> {
+        match id.transaction_type() {
+            TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_current_hop()),
+            TransactionType::Put => self.ops.put.get(id).and_then(|op| op.get_current_htl()),
+            // TODO: Add support for Subscribe operations when they track HTL
+            _ => None,
+        }
+    }
+
     pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
         if self.ops.completed.contains(id) {
             return Err(OpNotAvailable::Completed);

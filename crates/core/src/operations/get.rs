@@ -690,6 +690,15 @@ impl GetOp {
             _ => None,
         }
     }
+
+    /// Get the current hop count (remaining HTL) for this operation.
+    /// Returns None if the operation is not in AwaitingResponse state.
+    pub(crate) fn get_current_hop(&self) -> Option<usize> {
+        match &self.state {
+            Some(GetState::AwaitingResponse { current_hop, .. }) => Some(*current_hop),
+            _ => None,
+        }
+    }
 }
 
 impl Operation for GetOp {
