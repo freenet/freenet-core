@@ -511,6 +511,10 @@ impl ConfigArgs {
                     .telemetry
                     .endpoint
                     .unwrap_or_else(|| DEFAULT_TELEMETRY_ENDPOINT.to_string()),
+                // Test environments are identified by the --id flag, which is used for
+                // simulated networks and integration tests. We disable telemetry in these
+                // environments to avoid flooding the collector with test data.
+                is_test_environment: self.id.is_some(),
             },
         };
 
@@ -975,6 +979,11 @@ pub struct TelemetryConfig {
     /// Telemetry endpoint URL
     #[serde(default = "default_telemetry_endpoint", rename = "telemetry-endpoint")]
     pub endpoint: String,
+
+    /// Whether this is a test environment (detected via --id flag).
+    /// When true, telemetry is disabled to avoid flooding the collector with test data.
+    #[serde(skip)]
+    pub is_test_environment: bool,
 }
 
 fn default_telemetry_endpoint() -> String {
@@ -986,6 +995,7 @@ impl Default for TelemetryConfig {
         Self {
             enabled: true,
             endpoint: DEFAULT_TELEMETRY_ENDPOINT.to_string(),
+            is_test_environment: false,
         }
     }
 }

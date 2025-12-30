@@ -89,10 +89,17 @@ struct TelemetryEvent {
 impl TelemetryReporter {
     /// Create a new telemetry reporter.
     ///
-    /// Returns None if telemetry is disabled.
+    /// Returns None if telemetry is disabled or in a test environment.
     pub fn new(config: &TelemetryConfig) -> Option<Self> {
         if !config.enabled {
             tracing::info!("Telemetry reporting is disabled");
+            return None;
+        }
+
+        // Disable telemetry in test environments (detected via --id flag) to avoid
+        // flooding the collector with CI/integration test data.
+        if config.is_test_environment {
+            tracing::info!("Telemetry disabled in test environment (--id flag detected)");
             return None;
         }
 
