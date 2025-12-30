@@ -927,7 +927,7 @@ pub struct TelemetryConfig {
     #[serde(default = "default_telemetry_endpoint", rename = "telemetry-endpoint")]
     pub endpoint: String,
 
-    /// Whether this is a test environment (detected via --id flag or test/debug build).
+    /// Whether this is a test environment (detected via --id flag).
     /// When true, telemetry is disabled to avoid flooding the collector with test data.
     #[serde(skip)]
     pub is_test_environment: bool,
