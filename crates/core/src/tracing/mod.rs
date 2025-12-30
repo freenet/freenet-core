@@ -347,6 +347,124 @@ impl<'a> NetEventLog<'a> {
         }
     }
 
+    /// Create a ConnectRequest sent event.
+    ///
+    /// Note: Currently unused because the initial request emission needs to happen
+    /// in node.rs where the connect operation is initiated (has access to Ring).
+    /// The RequestReceived event already captures forwarding via the `forwarded_to` field.
+    #[allow(dead_code)]
+    pub fn connect_request_sent(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        desired_location: Location,
+        joiner: PeerKeyLocation,
+        target: PeerKeyLocation,
+        ttl: u8,
+        is_initial: bool,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::RequestSent {
+                desired_location,
+                joiner,
+                target,
+                ttl,
+                is_initial,
+            }),
+        }
+    }
+
+    /// Create a ConnectRequest received event.
+    ///
+    /// `from_addr` is the socket address of the upstream peer that sent the request.
+    /// We look up the full PeerKeyLocation from the connection manager if available.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_request_received(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        desired_location: Location,
+        joiner: PeerKeyLocation,
+        from_addr: std::net::SocketAddr,
+        forwarded_to: Option<PeerKeyLocation>,
+        accepted: bool,
+        ttl: u8,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        // Look up the full peer info from connection manager if the peer is already connected
+        let from_peer = ring.connection_manager.get_peer_by_addr(from_addr);
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::RequestReceived {
+                desired_location,
+                joiner,
+                from_addr,
+                from_peer,
+                forwarded_to,
+                accepted,
+                ttl,
+            }),
+        }
+    }
+
+    /// Create a ConnectResponse sent event.
+    pub fn connect_response_sent(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        acceptor: PeerKeyLocation,
+        joiner: PeerKeyLocation,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::ResponseSent { acceptor, joiner }),
+        }
+    }
+
+    /// Create a ConnectResponse received event.
+    pub fn connect_response_received(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        acceptor: PeerKeyLocation,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::ResponseReceived {
+                acceptor,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+            }),
+        }
+    }
+
     pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
         let own_loc = ring.connection_manager.own_location();
         let Some(own_addr) = own_loc.socket_addr() else {
@@ -1724,8 +1842,11 @@ enum ConnectEvent {
         desired_location: Location,
         /// The joiner's identity and location.
         joiner: PeerKeyLocation,
-        /// The peer that sent us this request.
-        from_peer: PeerKeyLocation,
+        /// The socket address of the peer that sent us this request.
+        from_addr: std::net::SocketAddr,
+        /// The peer that sent us this request (if we have them in our connection table).
+        /// None when receiving from a new joiner who isn't connected yet.
+        from_peer: Option<PeerKeyLocation>,
         /// Where we're forwarding to (None if we're at terminus).
         forwarded_to: Option<PeerKeyLocation>,
         /// Whether we accepted this connection request.

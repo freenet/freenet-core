@@ -490,6 +490,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 ConnectEvent::RequestReceived {
                     desired_location,
                     joiner,
+                    from_addr,
                     from_peer,
                     forwarded_to,
                     accepted,
@@ -499,7 +500,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "type": "request_received",
                         "desired_location": desired_location.as_f64(),
                         "joiner": joiner.to_string(),
-                        "from_peer": from_peer.to_string(),
+                        "from_addr": from_addr.to_string(),
+                        "from_peer": from_peer.as_ref().map(|p| p.to_string()),
                         "forwarded_to": forwarded_to.as_ref().map(|p| p.to_string()),
                         "accepted": accepted,
                         "ttl": ttl,
