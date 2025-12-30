@@ -2231,58 +2231,12 @@ impl P2pConnManager {
             state.awaiting_connection_txs.remove(&peer_addr);
             return Ok(());
         }
-        let pending_txs = state
-            .awaiting_connection_txs
-            .remove(&peer_addr)
-            .unwrap_or_default();
-        if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
-            // The callback expects the remote peer's address (not our own)
-            let resolved_addr = peer_addr;
-            tracing::debug!(
-                remote = %peer_addr,
-                callbacks = callbacks.len(),
-                "handle_successful_connection: notifying waiting callbacks"
-            );
-            tracing::info!(
-                remote = %peer_addr,
-                callbacks = callbacks.len(),
-                pending_txs = ?pending_txs,
-                remaining_checks = ?remaining_checks,
-                "handle_successful_connection: connection established"
-            );
-            for mut cb in callbacks {
-                match timeout(
-                    Duration::from_secs(60),
-                    cb.send_result(Ok((resolved_addr, remaining_checks))),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(())) => {
-                        tracing::debug!(
-                            remote = %peer_addr,
-                            "Callback dropped before receiving connection result"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            remote = %peer_addr,
-                            ?error,
-                            "Failed to deliver connection result"
-                        );
-                    }
-                }
-            }
-        } else {
-            tracing::warn!(
-                peer_id = ?peer_id,
-                %peer_addr,
-                pending_txs = ?pending_txs,
-                "No callback for connection established"
-            );
-        }
 
-        // Only insert if connection doesn't already exist to avoid dropping existing channel
+        // IMPORTANT: Insert into self.connections BEFORE removing from awaiting_connection.
+        // This prevents a race condition where another connect() call could slip through
+        // during the window when neither structure has the entry, causing the transport
+        // layer to tear down the connection we just established.
+        // See: handle_connect_peer checks self.connections first, then awaiting_connection.
         let mut newly_inserted = false;
         if !self.connections.contains_key(&peer_addr) {
             if is_transient {
@@ -2340,6 +2294,60 @@ impl P2pConnManager {
                 %peer_addr,
                 conn_map_size = self.connections.len(),
                 "[CONN_TRACK] SKIP INSERT: connection already exists in HashMap"
+            );
+        }
+
+        // Now safe to remove from awaiting_connection and notify callbacks.
+        // self.connections already has the entry, so concurrent connect() calls
+        // will see it and reuse the existing connection instead of tearing it down.
+        let pending_txs = state
+            .awaiting_connection_txs
+            .remove(&peer_addr)
+            .unwrap_or_default();
+        if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
+            // The callback expects the remote peer's address (not our own)
+            let resolved_addr = peer_addr;
+            tracing::debug!(
+                remote = %peer_addr,
+                callbacks = callbacks.len(),
+                "handle_successful_connection: notifying waiting callbacks"
+            );
+            tracing::info!(
+                remote = %peer_addr,
+                callbacks = callbacks.len(),
+                pending_txs = ?pending_txs,
+                remaining_checks = ?remaining_checks,
+                "handle_successful_connection: connection established"
+            );
+            for mut cb in callbacks {
+                match timeout(
+                    Duration::from_secs(60),
+                    cb.send_result(Ok((resolved_addr, remaining_checks))),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(())) => {
+                        tracing::debug!(
+                            remote = %peer_addr,
+                            "Callback dropped before receiving connection result"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            remote = %peer_addr,
+                            ?error,
+                            "Failed to deliver connection result"
+                        );
+                    }
+                }
+            }
+        } else {
+            tracing::warn!(
+                peer_id = ?peer_id,
+                %peer_addr,
+                pending_txs = ?pending_txs,
+                "No callback for connection established"
             );
         }
 
