@@ -312,6 +312,7 @@ impl<'a> NetEventLog<'a> {
                 requester: own_loc.clone(),
                 target: own_loc,
                 key,
+                hop_count: None, // Not tracked at abort time
                 reason,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
@@ -341,6 +342,7 @@ impl<'a> NetEventLog<'a> {
                 requester: own_loc.clone(),
                 instance_id,
                 target: own_loc,
+                hop_count: None, // Not tracked at abort time
                 reason,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
@@ -465,6 +467,7 @@ impl<'a> NetEventLog<'a> {
                     requester: this_peer.clone(),
                     target: this_peer.clone(),
                     key: *key,
+                    hop_count: None, // TODO: Track hop count from operation state
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -496,6 +499,7 @@ impl<'a> NetEventLog<'a> {
                     requester: this_peer.clone(),
                     target: this_peer,
                     key: *key,
+                    hop_count: None, // TODO: Track hop count from operation state
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -511,6 +515,7 @@ impl<'a> NetEventLog<'a> {
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
+                    hop_count: None, // TODO: Track hop count from operation state
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -541,6 +546,7 @@ impl<'a> NetEventLog<'a> {
                     id: *id,
                     key: *key,
                     at: this_peer.clone(),
+                    hop_count: None, // TODO: Track hop count from operation state
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     requester: this_peer,
@@ -557,6 +563,7 @@ impl<'a> NetEventLog<'a> {
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
+                    hop_count: None, // TODO: Track hop count from operation state
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -1721,6 +1728,8 @@ enum PutEvent {
         requester: PeerKeyLocation,
         target: PeerKeyLocation,
         key: ContractKey,
+        /// Number of hops the request traversed (initial HTL - remaining HTL).
+        hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -1731,6 +1740,8 @@ enum PutEvent {
         requester: PeerKeyLocation,
         target: PeerKeyLocation,
         key: ContractKey,
+        /// Number of hops the request traversed before failure.
+        hop_count: Option<usize>,
         /// Reason for the failure.
         reason: OperationFailure,
         /// Time elapsed since operation started (milliseconds).
@@ -1838,6 +1849,8 @@ enum GetEvent {
         target: PeerKeyLocation,
         /// Full contract key (only available after successful retrieval).
         key: ContractKey,
+        /// Number of hops the request traversed.
+        hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -1849,6 +1862,8 @@ enum GetEvent {
         /// Contract instance that was searched for.
         instance_id: ContractInstanceId,
         target: PeerKeyLocation,
+        /// Number of hops the request traversed before exhaustion.
+        hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -1860,6 +1875,8 @@ enum GetEvent {
         /// Contract instance that was searched for.
         instance_id: ContractInstanceId,
         target: PeerKeyLocation,
+        /// Number of hops the request traversed before failure.
+        hop_count: Option<usize>,
         /// Reason for the failure.
         reason: OperationFailure,
         /// Time elapsed since operation started (milliseconds).
@@ -1897,6 +1914,8 @@ enum SubscribeEvent {
         key: ContractKey,
         /// Location where subscription was established.
         at: PeerKeyLocation,
+        /// Number of hops the request traversed.
+        hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -1909,6 +1928,8 @@ enum SubscribeEvent {
         /// Contract instance that was searched for.
         instance_id: ContractInstanceId,
         target: PeerKeyLocation,
+        /// Number of hops the request traversed before exhaustion.
+        hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,

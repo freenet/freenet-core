@@ -489,6 +489,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     target,
                     key,
                     id,
+                    hop_count,
                     elapsed_ms,
                     timestamp,
                 } => {
@@ -498,6 +499,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "key": key.to_string(),
                         "id": id.to_string(),
+                        "hop_count": hop_count,
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
@@ -545,6 +547,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     target,
                     key,
+                    hop_count,
                     reason,
                     elapsed_ms,
                     timestamp,
@@ -555,6 +558,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "target": target.to_string(),
                         "key": key.to_string(),
+                        "hop_count": hop_count,
                         "reason": format!("{:?}", reason),
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
@@ -588,6 +592,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     target,
                     key,
+                    hop_count,
                     elapsed_ms,
                     timestamp,
                 } => {
@@ -597,6 +602,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "target": target.to_string(),
                         "key": key.to_string(),
+                        "hop_count": hop_count,
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
@@ -606,6 +612,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     instance_id,
                     target,
+                    hop_count,
                     elapsed_ms,
                     timestamp,
                 } => {
@@ -615,6 +622,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
+                        "hop_count": hop_count,
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
@@ -624,6 +632,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     instance_id,
                     target,
+                    hop_count,
                     reason,
                     elapsed_ms,
                     timestamp,
@@ -634,6 +643,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
+                        "hop_count": hop_count,
                         "reason": format!("{:?}", reason),
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
@@ -666,6 +676,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     id,
                     key,
                     at,
+                    hop_count,
                     elapsed_ms,
                     timestamp,
                     requester,
@@ -675,6 +686,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "id": id.to_string(),
                         "key": key.to_string(),
                         "at": at.to_string(),
+                        "hop_count": hop_count,
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                         "requester": requester.to_string(),
@@ -685,6 +697,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     instance_id,
                     target,
+                    hop_count,
                     elapsed_ms,
                     timestamp,
                 } => {
@@ -694,6 +707,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
+                        "hop_count": hop_count,
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
