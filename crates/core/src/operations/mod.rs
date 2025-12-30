@@ -501,8 +501,13 @@ async fn has_contract(
 ///
 /// # Arguments
 /// * `streaming_enabled` - Whether streaming is enabled in the config
-/// * `streaming_threshold` - Size threshold above which streaming is used
+/// * `streaming_threshold` - Size threshold above which streaming is used (exclusive)
 /// * `payload_size` - Size of the payload in bytes
+///
+/// # Note
+/// The threshold comparison is exclusive (`>`), meaning payloads exactly at the
+/// threshold will NOT use streaming. This is intentional: the threshold represents
+/// "the maximum size for non-streaming transfers", so payloads must exceed it.
 #[allow(dead_code)]
 pub(crate) fn should_use_streaming(
     streaming_enabled: bool,

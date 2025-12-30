@@ -22,6 +22,13 @@
 //! // Operations layer: metadata message arrives
 //! let handle = orphan_registry.claim_or_wait(stream_id, timeout).await?;
 //! ```
+//!
+//! # Phase 4 Dependencies
+//!
+//! This infrastructure is completed in Phase 3 but not yet actively used. Phase 4 will:
+//! - Wire transport layer (`PeerConnection`) to call `register_orphan()` when streams arrive
+//! - Wire operations handlers to call `claim_or_wait()` when metadata arrives
+//! - Add periodic GC task to clean up expired orphans via `gc_expired()`
 
 use std::time::{Duration, Instant};
 
@@ -236,6 +243,12 @@ impl std::error::Error for OrphanStreamError {}
 mod tests {
     use super::*;
 
+    /// Small delay to allow async waiter registration before asserting.
+    const WAITER_REGISTRATION_DELAY: Duration = Duration::from_millis(50);
+
+    /// Age to use when simulating an expired orphan for GC tests.
+    const EXPIRED_ORPHAN_AGE: Duration = Duration::from_secs(60);
+
     // Helper to create a test StreamHandle
     fn make_test_handle(stream_id: StreamId) -> StreamHandle {
         StreamHandle::new(stream_id, 1000)
@@ -280,7 +293,7 @@ mod tests {
         });
 
         // Small delay to ensure waiter is registered
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(WAITER_REGISTRATION_DELAY).await;
         assert_eq!(registry.waiter_count(), 1);
 
         // Register orphan (should deliver to waiter)
@@ -300,7 +313,7 @@ mod tests {
 
         // Try to claim non-existent stream with short timeout
         let result = registry
-            .claim_or_wait(stream_id, Duration::from_millis(50))
+            .claim_or_wait(stream_id, WAITER_REGISTRATION_DELAY)
             .await;
 
         assert!(matches!(result, Err(OrphanStreamError::Timeout)));
@@ -313,10 +326,9 @@ mod tests {
         let handle = make_test_handle(stream_id);
 
         // Insert with fake old timestamp by directly manipulating
-        registry.orphan_streams.insert(
-            stream_id,
-            (handle, Instant::now() - Duration::from_secs(60)),
-        );
+        registry
+            .orphan_streams
+            .insert(stream_id, (handle, Instant::now() - EXPIRED_ORPHAN_AGE));
 
         assert_eq!(registry.orphan_count(), 1);
 
