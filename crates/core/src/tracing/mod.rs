@@ -526,7 +526,9 @@ impl NetLogMessage {
             EventKind::Put(_) => false,
             EventKind::Get(GetEvent::GetSuccess { .. } | GetEvent::GetNotFound { .. }) => true,
             EventKind::Get(_) => false,
-            EventKind::Subscribe(SubscribeEvent::SubscribeSuccess { .. } | SubscribeEvent::SubscribeNotFound { .. }) => true,
+            EventKind::Subscribe(
+                SubscribeEvent::SubscribeSuccess { .. } | SubscribeEvent::SubscribeNotFound { .. },
+            ) => true,
             EventKind::Subscribe(_) => false,
             _ => false,
         }
@@ -999,7 +1001,6 @@ async fn send_to_metrics_server(
         // SubscribeEvent::Request and SubscribeEvent::SubscribeNotFound fall through to catch-all
         // TODO(#2456): Add FlatBuffer messages for SubscribeEvent::Request and SubscribeEvent::SubscribeNotFound
         // when metrics server is enhanced to support these event types.
-
         EventKind::Update(UpdateEvent::Request {
             id,
             requester,
