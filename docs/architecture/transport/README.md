@@ -5,7 +5,7 @@
 The Freenet transport layer provides low-level network communication over UDP with:
 - **Encryption**: AES-128-GCM symmetric encryption after RSA key exchange
 - **Reliability**: Packet acknowledgment and retransmission
-- **Congestion Control**: LEDBAT (Low Extra Delay Background Transport) with slow start
+- **Congestion Control**: LEDBAT++ (Low Extra Delay Background Transport) with slow start and periodic slowdowns
 - **Rate Limiting**: Token bucket for smooth packet pacing
 - **RTT Tracking**: RFC 6298-compliant RTT estimation
 
@@ -21,13 +21,15 @@ The Freenet transport layer provides low-level network communication over UDP wi
 | Bandwidth Configuration | ✅ Complete | Week 4 |
 | Global Bandwidth Pool | ✅ Complete | Week 5 |
 | Streaming Infrastructure (Phase 1) | ✅ Complete | Week 6 |
+| LEDBAT++ (draft-irtf-iccrg-ledbat-plus-plus) | ✅ Complete | Week 7 |
 
 ## Document Map
 
 ### Design Documents
 How the transport layer is designed and why.
 
-- **[LEDBAT Slow Start Design](design/ledbat-slow-start.md)** - Congestion control algorithm design, slow start mechanics, and integration architecture
+- **[LEDBAT++ Implementation](design/ledbat-plus-plus.md)** - LEDBAT++ congestion control with periodic slowdowns, dynamic GAIN, and real-world behavior analysis at different latencies
+- **[LEDBAT Slow Start Design](design/ledbat-slow-start.md)** - Original slow start design rationale and integration architecture
 - **[Streaming Infrastructure](design/streaming-infrastructure.md)** - Lock-free fragment reassembly, `futures::Stream` API, and concurrent consumer support
 
 ### Analysis & Results
@@ -67,6 +69,9 @@ Documentation for completed transport features.
 - **Slow start threshold**: 100 KB
 - **Maximum cwnd**: 1 GB
 - **Token bucket capacity**: 10 KB burst
+- **TARGET delay**: 60ms (LEDBAT++ spec)
+- **Slowdown reduction**: 4x (cwnd drops to 25% during periodic slowdowns)
+- **Slowdown interval**: 9x slowdown duration (~10% overhead)
 
 ### Key Performance Metrics
 - **>3 MB/s goal**: ✅ Achieved (10 MB/s default, 3.3x target)
