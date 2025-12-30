@@ -929,6 +929,7 @@ where
                                 crate::tracing::NetEventLog::disconnected(
                                     &op_manager.ring,
                                     &peer_id,
+                                    Some("connection dropped by node request".to_string()),
                                 ),
                             ))
                             .await;

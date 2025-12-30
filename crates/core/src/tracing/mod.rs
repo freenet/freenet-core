@@ -10,7 +10,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::{
     config::GlobalExecutor,
-    contract::StoreResponse,
     generated::ContractChange,
     message::{MessageStats, NetMessage, NetMessageV1, Transaction},
     node::PeerId,
@@ -226,11 +225,13 @@ impl<'a> NetEventLog<'a> {
             kind: EventKind::Connect(ConnectEvent::Connected {
                 this: ring.connection_manager.own_location(),
                 connected,
+                // None since we don't have transaction timing for this path
+                elapsed_ms: None,
             }),
         }
     }
 
-    pub fn disconnected(ring: &'a Ring, from: &'a PeerId) -> Self {
+    pub fn disconnected(ring: &'a Ring, from: &'a PeerId, reason: Option<String>) -> Self {
         let own_loc = ring.connection_manager.own_location();
         let peer_id = PeerId::new(
             own_loc
@@ -241,7 +242,10 @@ impl<'a> NetEventLog<'a> {
         NetEventLog {
             tx: Transaction::NULL,
             peer_id,
-            kind: EventKind::Disconnected { from: from.clone() },
+            kind: EventKind::Disconnected {
+                from: from.clone(),
+                reason,
+            },
         }
     }
 
@@ -262,6 +266,7 @@ impl<'a> NetEventLog<'a> {
                 EventKind::Connect(ConnectEvent::Connected {
                     this: this_peer,
                     connected: payload.acceptor.clone(),
+                    elapsed_ms: Some(msg.id().elapsed().as_millis() as u64),
                 })
             }
             _ => EventKind::Ignored,
@@ -290,6 +295,7 @@ impl<'a> NetEventLog<'a> {
                 };
                 let acceptor_peer_id = PeerId::new(acceptor_addr, acceptor.pub_key().clone());
                 let this_peer_id = PeerId::new(this_addr, this_peer.pub_key().clone());
+                let elapsed_ms = Some(msg.id().elapsed().as_millis() as u64);
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
@@ -297,6 +303,7 @@ impl<'a> NetEventLog<'a> {
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: acceptor.clone(),
                             connected: this_peer.clone(),
+                            elapsed_ms,
                         }),
                     },
                     NetEventLog {
@@ -305,12 +312,15 @@ impl<'a> NetEventLog<'a> {
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: this_peer,
                             connected: acceptor,
+                            elapsed_ms,
                         }),
                     },
                 ];
                 return Either::Right(events);
             }
-            NetMessageV1::Put(PutMsg::Request { contract, id, .. }) => {
+            NetMessageV1::Put(PutMsg::Request {
+                contract, id, htl, ..
+            }) => {
                 let this_peer = &op_manager.ring.connection_manager.own_location();
                 let key = contract.key();
                 EventKind::Put(PutEvent::Request {
@@ -318,6 +328,7 @@ impl<'a> NetEventLog<'a> {
                     target: this_peer.clone(), // No embedded target - use own location
                     key,
                     id: *id,
+                    htl: *htl,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
@@ -328,37 +339,102 @@ impl<'a> NetEventLog<'a> {
                     requester: this_peer.clone(),
                     target: this_peer.clone(),
                     key: *key,
+                    elapsed_ms: id.elapsed().as_millis() as u64,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
+            NetMessageV1::Get(GetMsg::Request {
+                id,
+                instance_id,
+                htl,
+                ..
+            }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Get(GetEvent::Request {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    instance_id: *instance_id,
+                    target: this_peer,
+                    htl: *htl,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
             NetMessageV1::Get(GetMsg::Response {
                 id,
-                result:
-                    GetMsgResult::Found {
-                        key,
-                        value: StoreResponse { state: Some(_), .. },
-                    },
+                result: GetMsgResult::Found { key, value },
                 ..
-            }) => EventKind::Get {
-                id: *id,
-                key: *key,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                // Note: target no longer embedded in message - use connection-based routing
-                requester: op_manager.ring.connection_manager.own_location(),
-                target: op_manager.ring.connection_manager.own_location(),
-            },
+            }) if value.state.is_some() => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Get(GetEvent::GetSuccess {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    target: this_peer,
+                    key: *key,
+                    elapsed_ms: id.elapsed().as_millis() as u64,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
+            NetMessageV1::Get(GetMsg::Response {
+                id,
+                instance_id,
+                result: GetMsgResult::NotFound,
+            }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Get(GetEvent::GetNotFound {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    instance_id: *instance_id,
+                    target: this_peer,
+                    elapsed_ms: id.elapsed().as_millis() as u64,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
+            NetMessageV1::Subscribe(SubscribeMsg::Request {
+                id,
+                instance_id,
+                htl,
+                ..
+            }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Subscribe(SubscribeEvent::Request {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    instance_id: *instance_id,
+                    target: this_peer,
+                    htl: *htl,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
             NetMessageV1::Subscribe(SubscribeMsg::Response {
                 id,
                 result: SubscribeMsgResult::Subscribed { key },
                 ..
-            }) => EventKind::Subscribed {
-                id: *id,
-                key: *key,
-                // Note: target no longer embedded in message - use connection-based routing
-                at: op_manager.ring.connection_manager.own_location(),
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                requester: op_manager.ring.connection_manager.own_location(),
-            },
+            }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Subscribe(SubscribeEvent::SubscribeSuccess {
+                    id: *id,
+                    key: *key,
+                    at: this_peer.clone(),
+                    elapsed_ms: id.elapsed().as_millis() as u64,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    requester: this_peer,
+                })
+            }
+            NetMessageV1::Subscribe(SubscribeMsg::Response {
+                id,
+                instance_id,
+                result: SubscribeMsgResult::NotFound,
+            }) => {
+                let this_peer = op_manager.ring.connection_manager.own_location();
+                EventKind::Subscribe(SubscribeEvent::SubscribeNotFound {
+                    id: *id,
+                    requester: this_peer.clone(),
+                    instance_id: *instance_id,
+                    target: this_peer,
+                    elapsed_ms: id.elapsed().as_millis() as u64,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                })
+            }
             NetMessageV1::Update(UpdateMsg::RequestUpdate { key, id, .. }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
                 EventKind::Update(UpdateEvent::Request {
@@ -448,6 +524,10 @@ impl NetLogMessage {
             EventKind::Connect(_) => false,
             EventKind::Put(PutEvent::PutSuccess { .. }) => true,
             EventKind::Put(_) => false,
+            EventKind::Get(GetEvent::GetSuccess { .. } | GetEvent::GetNotFound { .. }) => true,
+            EventKind::Get(_) => false,
+            EventKind::Subscribe(SubscribeEvent::SubscribeSuccess { .. } | SubscribeEvent::SubscribeNotFound { .. }) => true,
+            EventKind::Subscribe(_) => false,
             _ => false,
         }
     }
@@ -469,23 +549,40 @@ impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
     fn from(msg: &'a NetLogMessage) -> Self {
         use opentelemetry::KeyValue;
         let map: Option<Vec<KeyValue>> = match &msg.kind {
-            EventKind::Connect(ConnectEvent::StartConnection { from }) => Some(vec![
+            EventKind::Connect(ConnectEvent::StartConnection { from, .. }) => Some(vec![
                 KeyValue::new("phase", "start"),
                 KeyValue::new("initiator", format!("{from}")),
             ]),
-            EventKind::Connect(ConnectEvent::Connected { this, connected }) => Some(vec![
-                KeyValue::new("phase", "connected"),
-                KeyValue::new("from", format!("{this}")),
-                KeyValue::new("to", format!("{connected}")),
-            ]),
+            EventKind::Connect(ConnectEvent::Connected {
+                this,
+                connected,
+                elapsed_ms,
+            }) => {
+                let mut attrs = vec![
+                    KeyValue::new("phase", "connected"),
+                    KeyValue::new("from", format!("{this}")),
+                    KeyValue::new("to", format!("{connected}")),
+                ];
+                if let Some(ms) = elapsed_ms {
+                    attrs.push(KeyValue::new("elapsed_ms", *ms as i64));
+                }
+                Some(attrs)
+            }
             EventKind::Connect(ConnectEvent::Finished {
                 initiator,
                 location,
-            }) => Some(vec![
-                KeyValue::new("phase", "finished"),
-                KeyValue::new("initiator", format!("{initiator}")),
-                KeyValue::new("location", location.as_f64()),
-            ]),
+                elapsed_ms,
+            }) => {
+                let mut attrs = vec![
+                    KeyValue::new("phase", "finished"),
+                    KeyValue::new("initiator", format!("{initiator}")),
+                    KeyValue::new("location", location.as_f64()),
+                ];
+                if let Some(ms) = elapsed_ms {
+                    attrs.push(KeyValue::new("elapsed_ms", *ms as i64));
+                }
+                Some(attrs)
+            }
             _ => None,
         };
         map.map(|mut map| {
@@ -679,8 +776,21 @@ impl NetEventRegister for EventRegister {
         Box::new(self.clone())
     }
 
-    fn notify_of_time_out(&mut self, _: Transaction) -> BoxFuture<'_, ()> {
-        async {}.boxed()
+    fn notify_of_time_out(&mut self, tx: Transaction) -> BoxFuture<'_, ()> {
+        let log_msg = NetLogMessage {
+            tx,
+            datetime: Utc::now(),
+            peer_id: PeerId::random(), // Timeout events don't have a specific peer context
+            kind: EventKind::Timeout {
+                id: tx,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            },
+        };
+        let sender = self.log_sender.clone();
+        async move {
+            let _ = sender.send(EventLogCommand::Log(log_msg)).await;
+        }
+        .boxed()
     }
 
     fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
@@ -715,6 +825,7 @@ async fn send_to_metrics_server(
         EventKind::Connect(ConnectEvent::Connected {
             this: this_peer,
             connected: connected_peer,
+            ..
         }) => {
             // Both peers must have known locations to send to metrics server
             if let (Some(from_loc), Some(to_loc)) =
@@ -742,7 +853,7 @@ async fn send_to_metrics_server(
                 Ok(())
             }
         }
-        EventKind::Disconnected { from } => {
+        EventKind::Disconnected { from, .. } => {
             let msg = PeerChange::removed_connection_msg(
                 from.clone().to_string(),
                 send_msg.peer_id.clone().to_string(),
@@ -837,13 +948,14 @@ async fn send_to_metrics_server(
             );
             ws_stream.send(Message::Binary(msg.into())).await
         }
-        EventKind::Get {
+        EventKind::Get(GetEvent::GetSuccess {
             id,
             key,
             timestamp,
             requester,
             target,
-        } => {
+            ..
+        }) => {
             let contract_location = Location::from_contract_key(key.as_bytes());
             let msg = ContractChange::get_contract_msg(
                 requester.to_string(),
@@ -856,13 +968,17 @@ async fn send_to_metrics_server(
 
             ws_stream.send(Message::Binary(msg.into())).await
         }
-        EventKind::Subscribed {
+        // GetEvent::Request and GetEvent::GetNotFound fall through to catch-all
+        // TODO(#2456): Add FlatBuffer messages for GetEvent::Request and GetEvent::GetNotFound
+        // when metrics server is enhanced to support these event types.
+        EventKind::Subscribe(SubscribeEvent::SubscribeSuccess {
             id,
             key,
             at,
             timestamp,
             requester,
-        } => {
+            ..
+        }) => {
             if let (Some(at_addr), Some(at_loc)) = (at.socket_addr(), at.location()) {
                 let contract_location = Location::from_contract_key(key.as_bytes());
                 let at_id = PeerId::new(at_addr, at.pub_key().clone());
@@ -880,6 +996,9 @@ async fn send_to_metrics_server(
                 Ok(())
             }
         }
+        // SubscribeEvent::Request and SubscribeEvent::SubscribeNotFound fall through to catch-all
+        // TODO(#2456): Add FlatBuffer messages for SubscribeEvent::Request and SubscribeEvent::SubscribeNotFound
+        // when metrics server is enhanced to support these event types.
 
         EventKind::Update(UpdateEvent::Request {
             id,
@@ -1268,26 +1387,21 @@ mod opentelemetry_tracer {
 pub enum EventKind {
     Connect(ConnectEvent),
     Put(PutEvent),
-    // todo: make this a sequence like Put
-    Get {
-        id: Transaction,
-        key: ContractKey,
-        timestamp: u64,
-        requester: PeerKeyLocation,
-        target: PeerKeyLocation,
-    },
+    Get(GetEvent),
+    Subscribe(SubscribeEvent),
     Route(RouteEvent),
     Update(UpdateEvent),
-    Subscribed {
-        id: Transaction,
-        key: ContractKey,
-        at: PeerKeyLocation,
-        timestamp: u64,
-        requester: PeerKeyLocation,
-    },
     Ignored,
     Disconnected {
         from: PeerId,
+        /// Reason for disconnection, if known.
+        reason: Option<String>,
+    },
+    /// A transaction timed out without completing.
+    Timeout {
+        /// The transaction that timed out.
+        id: Transaction,
+        timestamp: u64,
     },
 }
 
@@ -1296,38 +1410,58 @@ impl EventKind {
     const PUT: u8 = 1;
     const GET: u8 = 2;
     const ROUTE: u8 = 3;
-    const SUBSCRIBED: u8 = 4;
+    const SUBSCRIBE: u8 = 4;
     const IGNORED: u8 = 5;
     const DISCONNECTED: u8 = 6;
     const UPDATE: u8 = 7;
+    const TIMEOUT: u8 = 8;
 
     const fn varint_id(&self) -> u8 {
         match self {
             EventKind::Connect(_) => Self::CONNECT,
             EventKind::Put(_) => Self::PUT,
-            EventKind::Get { .. } => Self::GET,
+            EventKind::Get(_) => Self::GET,
             EventKind::Route(_) => Self::ROUTE,
-            EventKind::Subscribed { .. } => Self::SUBSCRIBED,
+            EventKind::Subscribe(_) => Self::SUBSCRIBE,
             EventKind::Ignored => Self::IGNORED,
             EventKind::Disconnected { .. } => Self::DISCONNECTED,
             EventKind::Update(_) => Self::UPDATE,
+            EventKind::Timeout { .. } => Self::TIMEOUT,
         }
     }
 }
 
+/// Connection lifecycle events.
+///
+/// Note on event format versioning: New variants are added at the end of enums
+/// to maintain backwards compatibility with persisted AOF logs within a session.
+/// AOF logs are session-scoped and cleared on restart, so cross-version
+/// compatibility is not required.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum ConnectEvent {
     StartConnection {
         from: PeerId,
+        /// Whether this is a connection to a gateway node.
+        /// TODO(#2456): Populate from connect operation context - currently always false.
+        is_gateway: bool,
     },
     Connected {
         this: PeerKeyLocation,
         connected: PeerKeyLocation,
+        /// Time elapsed since connection started (milliseconds).
+        /// None when timing information is unavailable (e.g., connection events
+        /// without transaction context).
+        elapsed_ms: Option<u64>,
     },
+    /// Connection process finished.
+    /// TODO(#2456): This variant is defined but not currently emitted.
+    /// Implementation requires hooking into connect operation completion.
     Finished {
         initiator: PeerId,
         location: Location,
+        /// Time elapsed since connection started (milliseconds).
+        elapsed_ms: Option<u64>,
     },
 }
 
@@ -1339,6 +1473,8 @@ enum PutEvent {
         requester: PeerKeyLocation,
         key: ContractKey,
         target: PeerKeyLocation,
+        /// Hops to live - remaining hops before request fails.
+        htl: usize,
         timestamp: u64,
     },
     PutSuccess {
@@ -1346,6 +1482,8 @@ enum PutEvent {
         requester: PeerKeyLocation,
         target: PeerKeyLocation,
         key: ContractKey,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
         timestamp: u64,
     },
     BroadcastEmitted {
@@ -1415,6 +1553,99 @@ enum UpdateEvent {
         value: WrappedState,
         /// target peer
         target: PeerKeyLocation,
+        timestamp: u64,
+    },
+}
+
+/// GET operation events for tracking the lifecycle of contract retrieval.
+///
+/// Similar to `PutEvent`, this enum captures the full sequence of a Get operation:
+/// - Request initiation
+/// - Success when contract is found
+/// - NotFound when contract doesn't exist after search
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+enum GetEvent {
+    /// A Get request was initiated or received.
+    Request {
+        id: Transaction,
+        /// The peer initiating or receiving the request.
+        requester: PeerKeyLocation,
+        /// Contract instance being requested (full key may not be known yet).
+        instance_id: ContractInstanceId,
+        /// Target peer (with hop-by-hop routing, this is the current node).
+        target: PeerKeyLocation,
+        /// Hops remaining before giving up.
+        htl: usize,
+        timestamp: u64,
+    },
+    /// Contract was successfully retrieved.
+    GetSuccess {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        target: PeerKeyLocation,
+        /// Full contract key (only available after successful retrieval).
+        key: ContractKey,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
+    /// Contract was not found after exhaustive search.
+    GetNotFound {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        /// Contract instance that was searched for.
+        instance_id: ContractInstanceId,
+        target: PeerKeyLocation,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
+}
+
+/// SUBSCRIBE operation events for tracking the lifecycle of contract subscriptions.
+///
+/// Similar to `GetEvent` and `PutEvent`, this enum captures the full sequence of a Subscribe operation:
+/// - Request initiation
+/// - Success when subscription is established
+/// - NotFound when contract doesn't exist after search
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+enum SubscribeEvent {
+    /// A Subscribe request was initiated or received.
+    Request {
+        id: Transaction,
+        /// The peer initiating or receiving the request.
+        requester: PeerKeyLocation,
+        /// Contract instance being subscribed to (full key may not be known yet).
+        instance_id: ContractInstanceId,
+        /// Target peer (with hop-by-hop routing, this is the current node).
+        target: PeerKeyLocation,
+        /// Hops remaining before giving up.
+        htl: usize,
+        timestamp: u64,
+    },
+    /// Subscription was successfully established.
+    SubscribeSuccess {
+        id: Transaction,
+        /// Full contract key (only available after successful subscription).
+        key: ContractKey,
+        /// Location where subscription was established.
+        at: PeerKeyLocation,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+        requester: PeerKeyLocation,
+    },
+    /// Contract was not found after exhaustive search.
+    SubscribeNotFound {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        /// Contract instance that was searched for.
+        instance_id: ContractInstanceId,
+        target: PeerKeyLocation,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
         timestamp: u64,
     },
 }
@@ -1692,7 +1923,9 @@ pub(super) mod test {
             let iter = logs
                 .iter()
                 .filter_map(|l| {
-                    if let EventKind::Connect(ConnectEvent::Connected { this, connected }) = &l.kind
+                    if let EventKind::Connect(ConnectEvent::Connected {
+                        this, connected, ..
+                    }) = &l.kind
                     {
                         let connected_id =
                             PeerId::new(connected.socket_addr()?, connected.pub_key().clone());
@@ -1794,6 +2027,7 @@ pub(super) mod test {
                 kind: EventKind::Connect(ConnectEvent::Connected {
                     this: PeerKeyLocation::new(peer_id.pub_key.clone(), peer_id.addr),
                     connected: PeerKeyLocation::new(other.pub_key.clone(), other.addr),
+                    elapsed_ms: None,
                 }),
             }))
         }));
