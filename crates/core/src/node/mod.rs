@@ -1849,11 +1849,7 @@ mod tests {
     #[rstest]
     #[case::same_addr_different_keys(8080, 8080, true)]
     #[case::different_addr_same_key(8080, 8081, false)]
-    fn test_peer_id_equality(
-        #[case] port1: u16,
-        #[case] port2: u16,
-        #[case] expected_equal: bool,
-    ) {
+    fn test_peer_id_equality(#[case] port1: u16, #[case] port2: u16, #[case] expected_equal: bool) {
         let keypair1 = TransportKeypair::new();
         let keypair2 = TransportKeypair::new();
         let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port1);
