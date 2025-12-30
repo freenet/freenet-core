@@ -107,12 +107,18 @@ impl PutOp {
             "Put operation aborted due to connection failure"
         );
 
-        // Extract key from state if available
-        let key = match &self.state {
-            Some(PutState::PrepareRequest { contract, .. }) => Some(contract.key()),
-            Some(PutState::Finished { key }) => Some(*key),
-            _ => None,
+        // Extract key and current_htl from state if available
+        let (key, current_htl) = match &self.state {
+            Some(PutState::PrepareRequest { contract, htl, .. }) => {
+                (Some(contract.key()), Some(*htl))
+            }
+            Some(PutState::AwaitingResponse { current_htl, .. }) => (None, Some(*current_htl)),
+            Some(PutState::Finished { key }) => (Some(*key), None),
+            None => (None, None),
         };
+
+        // Calculate hop_count: max_htl - current_htl
+        let hop_count = current_htl.map(|htl| op_manager.ring.max_hops_to_live.saturating_sub(htl));
 
         // Emit failure event if we have the key
         if let Some(key) = key {
@@ -123,6 +129,7 @@ impl PutOp {
                     &op_manager.ring,
                     key,
                     OperationFailure::ConnectionDropped,
+                    hop_count,
                 )))
                 .await;
         }

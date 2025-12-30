@@ -628,7 +628,8 @@ impl GetOp {
                     "GET: Connection aborted, no peers available - local operation fails"
                 );
 
-                // Emit failure event
+                // Emit failure event with hop_count
+                let hop_count = Some(op_manager.ring.max_hops_to_live.saturating_sub(current_hop));
                 op_manager
                     .ring
                     .register_events(Either::Left(NetEventLog::get_failure(
@@ -636,6 +637,7 @@ impl GetOp {
                         &op_manager.ring,
                         instance_id,
                         OperationFailure::NoPeersAvailable,
+                        hop_count,
                     )))
                     .await;
 

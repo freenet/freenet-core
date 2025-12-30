@@ -279,6 +279,7 @@ impl<'a> NetEventLog<'a> {
     }
 
     /// Create a disconnected event with minimal context (backwards compatible).
+    /// Note: Prefer `disconnected_with_context` with explicit `DisconnectReason` variants.
     #[allow(dead_code)] // Kept as simpler API for external callers
     pub fn disconnected(ring: &'a Ring, from: &'a PeerId, reason: Option<String>) -> Self {
         Self::disconnected_with_context(ring, from, reason.into(), None, None, None)
@@ -290,6 +291,7 @@ impl<'a> NetEventLog<'a> {
         ring: &'a Ring,
         key: ContractKey,
         reason: OperationFailure,
+        hop_count: Option<usize>,
     ) -> Self {
         let own_loc = ring.connection_manager.own_location();
         let peer_id = PeerId::new(
@@ -306,7 +308,7 @@ impl<'a> NetEventLog<'a> {
                 requester: own_loc.clone(),
                 target: own_loc,
                 key,
-                hop_count: None, // Not tracked at abort time
+                hop_count,
                 reason,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
@@ -320,6 +322,7 @@ impl<'a> NetEventLog<'a> {
         ring: &'a Ring,
         instance_id: ContractInstanceId,
         reason: OperationFailure,
+        hop_count: Option<usize>,
     ) -> Self {
         let own_loc = ring.connection_manager.own_location();
         let peer_id = PeerId::new(
@@ -336,7 +339,7 @@ impl<'a> NetEventLog<'a> {
                 requester: own_loc.clone(),
                 instance_id,
                 target: own_loc,
-                hop_count: None, // Not tracked at abort time
+                hop_count,
                 reason,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
@@ -1634,6 +1637,11 @@ pub enum DisconnectReason {
     Unknown,
 }
 
+/// **Deprecated**: This conversion uses fragile substring matching which can break
+/// if error message formats change. Use DisconnectReason enum variants directly instead.
+///
+/// This impl exists only for backwards compatibility with the `disconnected()` helper.
+/// New code should construct DisconnectReason variants directly.
 impl From<Option<String>> for DisconnectReason {
     fn from(reason: Option<String>) -> Self {
         match reason {
@@ -1713,6 +1721,48 @@ pub enum OperationFailure {
     Timeout,
     /// Other failure with description.
     Other(String),
+}
+
+impl std::fmt::Display for ConnectionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionType::Direct => write!(f, "direct"),
+            ConnectionType::Relayed => write!(f, "relayed"),
+            ConnectionType::Gateway => write!(f, "gateway"),
+            ConnectionType::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl std::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DisconnectReason::Explicit(reason) => write!(f, "explicit: {}", reason),
+            DisconnectReason::Pruned => write!(f, "pruned"),
+            DisconnectReason::Timeout => write!(f, "timeout"),
+            DisconnectReason::NetworkError(err) => write!(f, "network_error: {}", err),
+            DisconnectReason::Unresponsive => write!(f, "unresponsive"),
+            DisconnectReason::RemoteDropped => write!(f, "remote_dropped"),
+            DisconnectReason::ConnectionLimitReached => write!(f, "connection_limit_reached"),
+            DisconnectReason::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl std::fmt::Display for OperationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperationFailure::ConnectionDropped => write!(f, "connection_dropped"),
+            OperationFailure::MaxRetriesExceeded { retries } => {
+                write!(f, "max_retries_exceeded: {}", retries)
+            }
+            OperationFailure::HtlExhausted => write!(f, "htl_exhausted"),
+            OperationFailure::NoPeersAvailable => write!(f, "no_peers_available"),
+            OperationFailure::ContractError(err) => write!(f, "contract_error: {}", err),
+            OperationFailure::Timeout => write!(f, "timeout"),
+            OperationFailure::Other(reason) => write!(f, "other: {}", reason),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]

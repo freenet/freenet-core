@@ -427,7 +427,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "this_peer": this.to_string(),
                         "connected_peer": connected.to_string(),
                         "elapsed_ms": elapsed_ms,
-                        "connection_type": format!("{:?}", connection_type),
+                        "connection_type": connection_type.to_string(),
                         "latency_ms": latency_ms,
                         "connection_count": this_peer_connection_count,
                         "initiated_by": initiated_by.as_ref().map(|p| p.to_string()),
@@ -457,7 +457,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             serde_json::json!({
                 "type": "disconnected",
                 "from": from.to_string(),
-                "reason": format!("{:?}", reason),
+                "reason": reason.to_string(),
                 "connection_duration_ms": connection_duration_ms,
                 "bytes_sent": bytes_sent,
                 "bytes_received": bytes_received,
@@ -559,7 +559,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "key": key.to_string(),
                         "hop_count": hop_count,
-                        "reason": format!("{:?}", reason),
+                        "reason": reason.to_string(),
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
@@ -644,7 +644,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
                         "hop_count": hop_count,
-                        "reason": format!("{:?}", reason),
+                        "reason": reason.to_string(),
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
