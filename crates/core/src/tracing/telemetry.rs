@@ -424,6 +424,13 @@ fn event_kind_to_string(kind: &EventKind) -> String {
         EventKind::Route(_) => "route".to_string(),
         EventKind::Ignored => "ignored".to_string(),
         EventKind::Timeout { .. } => "timeout".to_string(),
+        EventKind::Lifecycle(lifecycle_event) => {
+            use super::PeerLifecycleEvent;
+            match lifecycle_event {
+                PeerLifecycleEvent::Startup { .. } => "peer_startup".to_string(),
+                PeerLifecycleEvent::Shutdown { .. } => "peer_shutdown".to_string(),
+            }
+        }
     }
 }
 
@@ -956,6 +963,49 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "id": id.to_string(),
                 "timestamp": timestamp,
             })
+        }
+        EventKind::Lifecycle(lifecycle_event) => {
+            use super::PeerLifecycleEvent;
+            match lifecycle_event {
+                PeerLifecycleEvent::Startup {
+                    version,
+                    git_commit,
+                    git_dirty,
+                    arch,
+                    os,
+                    os_version,
+                    is_gateway,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "startup",
+                        "version": version,
+                        "git_commit": git_commit,
+                        "git_dirty": git_dirty,
+                        "arch": arch,
+                        "os": os,
+                        "os_version": os_version,
+                        "is_gateway": is_gateway,
+                        "timestamp": timestamp,
+                    })
+                }
+                PeerLifecycleEvent::Shutdown {
+                    graceful,
+                    reason,
+                    uptime_secs,
+                    total_connections,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "shutdown",
+                        "graceful": graceful,
+                        "reason": reason,
+                        "uptime_secs": uptime_secs,
+                        "total_connections": total_connections,
+                        "timestamp": timestamp,
+                    })
+                }
+            }
         }
     }
 }

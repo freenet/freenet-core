@@ -532,13 +532,13 @@ async fn report_result(
                             payload_transfer_time,
                         },
                     };
-                    event_listener
-                        .register_events(Either::Left(NetEventLog::route_event(
-                            op_res.id(),
-                            &op_manager.ring,
-                            &event,
-                        )))
-                        .await;
+                    if let Some(log_event) =
+                        NetEventLog::route_event(op_res.id(), &op_manager.ring, &event)
+                    {
+                        event_listener
+                            .register_events(Either::Left(log_event))
+                            .await;
+                    }
                     op_manager.ring.routing_finished(event);
                 }
                 // todo: handle failures, need to track timeouts and other potential failures

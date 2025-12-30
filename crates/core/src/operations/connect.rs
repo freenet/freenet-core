@@ -1163,19 +1163,18 @@ impl Operation for ConnectOp {
                         self.handle_request(&env, upstream_addr, payload.clone(), &estimator);
 
                     // Emit telemetry for request received
-                    op_manager
-                        .ring
-                        .register_events(Either::Left(NetEventLog::connect_request_received(
-                            &self.id,
-                            &op_manager.ring,
-                            payload.desired_location,
-                            payload.joiner.clone(),
-                            upstream_addr,
-                            actions.forward.as_ref().map(|(peer, _)| peer.clone()),
-                            actions.accept_response.is_some(),
-                            payload.ttl,
-                        )))
-                        .await;
+                    if let Some(event) = NetEventLog::connect_request_received(
+                        &self.id,
+                        &op_manager.ring,
+                        payload.desired_location,
+                        payload.joiner.clone(),
+                        upstream_addr,
+                        actions.forward.as_ref().map(|(peer, _)| peer.clone()),
+                        actions.accept_response.is_some(),
+                        payload.ttl,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
 
                     if let Some((_target, address)) = actions.observed_address {
                         let msg = ConnectMsg::ObservedAddress {
@@ -1271,15 +1270,14 @@ impl Operation for ConnectOp {
 
                     if let Some(response) = actions.accept_response {
                         // Emit telemetry for response sent
-                        op_manager
-                            .ring
-                            .register_events(Either::Left(NetEventLog::connect_response_sent(
-                                &self.id,
-                                &op_manager.ring,
-                                response.acceptor.clone(),
-                                payload.joiner.clone(),
-                            )))
-                            .await;
+                        if let Some(event) = NetEventLog::connect_response_sent(
+                            &self.id,
+                            &op_manager.ring,
+                            response.acceptor.clone(),
+                            payload.joiner.clone(),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
 
                         let response_msg = ConnectMsg::Response {
                             id: self.id,
@@ -1328,14 +1326,13 @@ impl Operation for ConnectOp {
                     if let Some(ConnectState::WaitingForResponses(_)) = &self.state {
                         // Joiner: process the response and connect to acceptor
                         // Emit telemetry for response received at joiner
-                        op_manager
-                            .ring
-                            .register_events(Either::Left(NetEventLog::connect_response_received(
-                                &self.id,
-                                &op_manager.ring,
-                                payload.acceptor.clone(),
-                            )))
-                            .await;
+                        if let Some(event) = NetEventLog::connect_response_received(
+                            &self.id,
+                            &op_manager.ring,
+                            payload.acceptor.clone(),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
 
                         if let Some(acceptance) = self.handle_response(&payload, Instant::now()) {
                             // Note: Location assignment happens in ObservedAddress handler,
@@ -1596,18 +1593,17 @@ pub(crate) async fn join_ring_request(
     );
 
     // Emit telemetry for initial connect request sent
-    op_manager
-        .ring
-        .register_events(Either::Left(NetEventLog::connect_request_sent(
-            &tx,
-            &op_manager.ring,
-            location,
-            own,
-            gateway.clone(),
-            ttl,
-            true, // is_initial
-        )))
-        .await;
+    if let Some(event) = NetEventLog::connect_request_sent(
+        &tx,
+        &op_manager.ring,
+        location,
+        own,
+        gateway.clone(),
+        ttl,
+        true, // is_initial
+    ) {
+        op_manager.ring.register_events(Either::Left(event)).await;
+    }
 
     op.first_hop = Some(Box::new(gateway.clone()));
     if let Some(backoff) = backoff {

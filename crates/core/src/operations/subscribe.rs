@@ -260,16 +260,15 @@ pub(crate) async fn request_subscribe(
     };
 
     // Emit telemetry for subscribe request initiation
-    op_manager
-        .ring
-        .register_events(Either::Left(NetEventLog::subscribe_request(
-            id,
-            &op_manager.ring,
-            *instance_id,
-            target.clone(),
-            op_manager.ring.max_hops_to_live,
-        )))
-        .await;
+    if let Some(event) = NetEventLog::subscribe_request(
+        id,
+        &op_manager.ring,
+        *instance_id,
+        target.clone(),
+        op_manager.ring.max_hops_to_live,
+    ) {
+        op_manager.ring.register_events(Either::Left(event)).await;
+    }
 
     let op = SubscribeOp {
         id: *id,
@@ -730,16 +729,15 @@ impl Operation for SubscribeOp {
 
                                 // Emit telemetry for successful subscription
                                 let own_loc = op_manager.ring.connection_manager.own_location();
-                                op_manager
-                                    .ring
-                                    .register_events(Either::Left(NetEventLog::subscribe_success(
-                                        msg_id,
-                                        &op_manager.ring,
-                                        *key,
-                                        own_loc,
-                                        None, // hop_count not tracked in subscribe
-                                    )))
-                                    .await;
+                                if let Some(event) = NetEventLog::subscribe_success(
+                                    msg_id,
+                                    &op_manager.ring,
+                                    *key,
+                                    own_loc,
+                                    None, // hop_count not tracked in subscribe
+                                ) {
+                                    op_manager.ring.register_events(Either::Left(event)).await;
+                                }
 
                                 Ok(OperationResult {
                                     return_msg: None,
@@ -779,17 +777,14 @@ impl Operation for SubscribeOp {
                                 tracing::warn!(tx = %msg_id, %instance_id, phase = "not_found", "Subscribe failed - contract not found");
 
                                 // Emit telemetry for subscription not found
-                                op_manager
-                                    .ring
-                                    .register_events(Either::Left(
-                                        NetEventLog::subscribe_not_found(
-                                            msg_id,
-                                            &op_manager.ring,
-                                            *instance_id,
-                                            None, // hop_count not tracked in subscribe
-                                        ),
-                                    ))
-                                    .await;
+                                if let Some(event) = NetEventLog::subscribe_not_found(
+                                    msg_id,
+                                    &op_manager.ring,
+                                    *instance_id,
+                                    None, // hop_count not tracked in subscribe
+                                ) {
+                                    op_manager.ring.register_events(Either::Left(event)).await;
+                                }
 
                                 // Return op with no inner state - to_host_result() will return error
                                 Ok(OperationResult {

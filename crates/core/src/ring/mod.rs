@@ -253,9 +253,11 @@ impl Ring {
         let pub_key = peer.pub_key.clone();
         self.connection_manager
             .add_connection(loc, addr, pub_key, was_reserved);
-        self.event_register
-            .register_events(Either::Left(NetEventLog::connected(self, peer, loc)))
-            .await;
+        if let Some(event) = NetEventLog::connected(self, peer, loc) {
+            self.event_register
+                .register_events(Either::Left(event))
+                .await;
+        }
         self.refresh_density_request_cache()
     }
 
@@ -493,16 +495,18 @@ impl Ring {
         let mut prune_result = self.seeding_manager.prune_subscriptions_for_peer(loc);
         prune_result.orphaned_transactions = orphaned_transactions;
 
-        self.event_register
-            .register_events(Either::Left(NetEventLog::disconnected_with_context(
-                self,
-                &peer,
-                DisconnectReason::Pruned,
-                connection_duration_ms,
-                None, // bytes_sent not tracked yet
-                None, // bytes_received not tracked yet
-            )))
-            .await;
+        if let Some(event) = NetEventLog::disconnected_with_context(
+            self,
+            &peer,
+            DisconnectReason::Pruned,
+            connection_duration_ms,
+            None, // bytes_sent not tracked yet
+            None, // bytes_received not tracked yet
+        ) {
+            self.event_register
+                .register_events(Either::Left(event))
+                .await;
+        }
 
         prune_result
     }
@@ -832,7 +836,7 @@ impl Ring {
         );
 
         // Emit telemetry for initial connect request sent
-        self.register_events(Either::Left(NetEventLog::connect_request_sent(
+        if let Some(event) = NetEventLog::connect_request_sent(
             &tx,
             self,
             ideal_location,
@@ -840,8 +844,9 @@ impl Ring {
             query_target.clone(),
             ttl,
             true, // is_initial
-        )))
-        .await;
+        ) {
+            self.register_events(Either::Left(event)).await;
+        }
 
         if let Some(addr) = query_target.socket_addr() {
             live_tx_tracker.add_transaction(addr, tx);

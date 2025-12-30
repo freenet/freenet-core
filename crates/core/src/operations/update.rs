@@ -262,15 +262,14 @@ impl Operation for UpdateOp {
                                 .connection_manager
                                 .get_peer_by_addr(requester_addr)
                             {
-                                op_manager
-                                    .ring
-                                    .register_events(Either::Left(NetEventLog::update_success(
-                                        id,
-                                        &op_manager.ring,
-                                        *key,
-                                        requester_pkl,
-                                    )))
-                                    .await;
+                                if let Some(event) = NetEventLog::update_success(
+                                    id,
+                                    &op_manager.ring,
+                                    *key,
+                                    requester_pkl,
+                                ) {
+                                    op_manager.ring.register_events(Either::Left(event)).await;
+                                }
                             }
 
                             if !changed {
@@ -422,16 +421,15 @@ impl Operation for UpdateOp {
                         .connection_manager
                         .get_peer_by_addr(sender_addr)
                     {
-                        op_manager
-                            .ring
-                            .register_events(Either::Left(NetEventLog::update_broadcast_received(
-                                id,
-                                &op_manager.ring,
-                                *key,
-                                requester_pkl,
-                                new_value.clone(),
-                            )))
-                            .await;
+                        if let Some(event) = NetEventLog::update_broadcast_received(
+                            id,
+                            &op_manager.ring,
+                            *key,
+                            requester_pkl,
+                            new_value.clone(),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
                     }
 
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
@@ -503,17 +501,16 @@ impl Operation for UpdateOp {
                         .and_then(|addr| op_manager.ring.connection_manager.get_peer_by_addr(addr))
                         .unwrap_or_else(|| op_manager.ring.connection_manager.own_location());
 
-                    op_manager
-                        .ring
-                        .register_events(Either::Left(NetEventLog::update_broadcast_emitted(
-                            id,
-                            &op_manager.ring,
-                            *key,
-                            new_value.clone(),
-                            broadcast_to.clone(),
-                            upstream_pkl,
-                        )))
-                        .await;
+                    if let Some(event) = NetEventLog::update_broadcast_emitted(
+                        id,
+                        &op_manager.ring,
+                        *key,
+                        new_value.clone(),
+                        broadcast_to.clone(),
+                        upstream_pkl,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
 
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
 
@@ -1249,15 +1246,9 @@ pub(crate) async fn request_update(
     }
 
     // Emit telemetry: UPDATE request initiated
-    op_manager
-        .ring
-        .register_events(Either::Left(NetEventLog::update_request(
-            &id,
-            &op_manager.ring,
-            key,
-            target.clone(),
-        )))
-        .await;
+    if let Some(event) = NetEventLog::update_request(&id, &op_manager.ring, key, target.clone()) {
+        op_manager.ring.register_events(Either::Left(event)).await;
+    }
 
     let msg = UpdateMsg::RequestUpdate {
         id,

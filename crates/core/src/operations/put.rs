@@ -127,16 +127,15 @@ impl PutOp {
 
         // Emit failure event if we have the key
         if let Some(key) = key {
-            op_manager
-                .ring
-                .register_events(Either::Left(NetEventLog::put_failure(
-                    &self.id,
-                    &op_manager.ring,
-                    key,
-                    OperationFailure::ConnectionDropped,
-                    hop_count,
-                )))
-                .await;
+            if let Some(event) = NetEventLog::put_failure(
+                &self.id,
+                &op_manager.ring,
+                key,
+                OperationFailure::ConnectionDropped,
+                hop_count,
+            ) {
+                op_manager.ring.register_events(Either::Left(event)).await;
+            }
         }
 
         // Create an error result to notify the client
@@ -382,16 +381,15 @@ impl Operation for PutOp {
                         );
 
                         // Emit put_request telemetry when forwarding
-                        op_manager
-                            .ring
-                            .register_events(Either::Left(NetEventLog::put_request(
-                                &id,
-                                &op_manager.ring,
-                                key,
-                                PeerKeyLocation::from(next_peer.clone()),
-                                htl.saturating_sub(1),
-                            )))
-                            .await;
+                        if let Some(event) = NetEventLog::put_request(
+                            &id,
+                            &op_manager.ring,
+                            key,
+                            PeerKeyLocation::from(next_peer.clone()),
+                            htl.saturating_sub(1),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
 
                         let forward_msg = PutMsg::Request {
                             id,
@@ -433,16 +431,15 @@ impl Operation for PutOp {
                             // Emit put_success telemetry with our own location as target
                             // hop_count is 0 since we stored locally
                             let own_location = op_manager.ring.connection_manager.own_location();
-                            op_manager
-                                .ring
-                                .register_events(Either::Left(NetEventLog::put_success(
-                                    &id,
-                                    &op_manager.ring,
-                                    key,
-                                    own_location,
-                                    Some(0), // Stored locally, 0 hops
-                                )))
-                                .await;
+                            if let Some(event) = NetEventLog::put_success(
+                                &id,
+                                &op_manager.ring,
+                                key,
+                                own_location,
+                                Some(0), // Stored locally, 0 hops
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
 
                             // Start subscription if requested
                             if subscribe {
@@ -505,16 +502,15 @@ impl Operation for PutOp {
                             .map(|htl| op_manager.ring.max_hops_to_live.saturating_sub(htl));
 
                         if let Some(sender) = sender_from_addr.clone() {
-                            op_manager
-                                .ring
-                                .register_events(Either::Left(NetEventLog::put_success(
-                                    &id,
-                                    &op_manager.ring,
-                                    *key,
-                                    sender,
-                                    hop_count,
-                                )))
-                                .await;
+                            if let Some(event) = NetEventLog::put_success(
+                                &id,
+                                &op_manager.ring,
+                                *key,
+                                sender,
+                                hop_count,
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
                         }
 
                         // Start subscription if requested
