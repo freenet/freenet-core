@@ -194,6 +194,7 @@ async fn create_peer_config(
             transient_ttl_secs: None,
             total_bandwidth_limit: None,
             min_bandwidth_per_connection: None,
+            ..Default::default()
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),

@@ -114,6 +114,8 @@ impl Default for ConfigArgs {
                 transient_ttl_secs: Some(DEFAULT_TRANSIENT_TTL_SECS),
                 min_connections: None,
                 max_connections: None,
+                streaming_enabled: None,   // Default: disabled
+                streaming_threshold: None, // Default: 64KB (set in NetworkApiConfig)
             },
             ws_api: WebsocketApiArgs {
                 address: Some(default_listening_address()),
@@ -289,6 +291,14 @@ impl ConfigArgs {
             self.network_api
                 .max_connections
                 .get_or_insert(cfg.network_api.max_connections);
+            if cfg.network_api.streaming_enabled {
+                self.network_api.streaming_enabled.get_or_insert(true);
+            }
+            if cfg.network_api.streaming_threshold != default_streaming_threshold() {
+                self.network_api
+                    .streaming_threshold
+                    .get_or_insert(cfg.network_api.streaming_threshold);
+            }
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
@@ -464,6 +474,11 @@ impl ConfigArgs {
                     .network_api
                     .max_connections
                     .unwrap_or(DEFAULT_MAX_CONNECTIONS),
+                streaming_enabled: self.network_api.streaming_enabled.unwrap_or(false),
+                streaming_threshold: self
+                    .network_api
+                    .streaming_threshold
+                    .unwrap_or_else(default_streaming_threshold),
             },
             ws_api: WebsocketApiConfig {
                 // the websocket API is always local
@@ -714,6 +729,23 @@ pub struct NetworkArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_connections: Option<usize>,
+
+    /// Enable streaming transport for large transfers (experimental).
+    /// When enabled, transfers larger than streaming_threshold use streaming
+    /// instead of atomic messages. Default: false
+    #[arg(long, env = "STREAMING_ENABLED")]
+    #[serde(rename = "streaming-enabled", skip_serializing_if = "Option::is_none")]
+    pub streaming_enabled: Option<bool>,
+
+    /// Threshold in bytes above which streaming transport is used.
+    /// Only applies when streaming_enabled is true.
+    /// Default: 65536 (64KB)
+    #[arg(long, env = "STREAMING_THRESHOLD")]
+    #[serde(
+        rename = "streaming-threshold",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub streaming_threshold: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -823,6 +855,21 @@ pub struct NetworkApiConfig {
         rename = "max-number-of-connections"
     )]
     pub max_connections: usize,
+
+    /// Enable streaming transport for large transfers (experimental).
+    /// When enabled, transfers larger than `streaming_threshold` use streaming
+    /// instead of atomic messages. Default: false
+    #[serde(default, rename = "streaming-enabled")]
+    pub streaming_enabled: bool,
+
+    /// Threshold in bytes above which streaming transport is used.
+    /// Only applies when `streaming_enabled` is true.
+    /// Default: 65536 (64KB)
+    #[serde(
+        default = "default_streaming_threshold",
+        rename = "streaming-threshold"
+    )]
+    pub streaming_threshold: usize,
 }
 
 mod port_allocation;
@@ -846,6 +893,12 @@ fn default_min_connections() -> usize {
 
 fn default_max_connections() -> usize {
     DEFAULT_MAX_CONNECTIONS
+}
+
+/// Default streaming threshold: 64KB
+/// Transfers larger than this will use streaming when `streaming_enabled` is true.
+fn default_streaming_threshold() -> usize {
+    64 * 1024
 }
 
 #[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]

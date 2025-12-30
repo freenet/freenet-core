@@ -18,6 +18,7 @@ use crate::{
 
 pub(crate) mod connect;
 pub(crate) mod get;
+pub(crate) mod orphan_streams;
 pub(crate) mod put;
 pub(crate) mod subscribe;
 #[cfg(test)]
@@ -335,6 +336,14 @@ pub(crate) enum OpError {
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
 
+    // Streaming-related errors
+    #[error("stream timed out waiting for data")]
+    StreamTimeout,
+    #[error("stream was cancelled")]
+    StreamCancelled,
+    #[error("failed to claim orphan stream")]
+    OrphanStreamClaimFailed,
+
     // used for control flow
     /// This is used as an early interrumpt of an op update when an op
     /// was sent throught the fast path back to the storage.
@@ -476,4 +485,26 @@ async fn has_contract(
         } => Ok(key),
         _ => Ok(None),
     }
+}
+
+/// Determines if streaming transport should be used for a payload of the given size.
+///
+/// Returns `true` if:
+/// 1. Streaming is enabled (`streaming_enabled = true`)
+/// 2. The payload size exceeds the streaming threshold (default: 64KB)
+///
+/// When streaming is disabled (the default), this always returns `false`,
+/// ensuring the existing code path is used.
+///
+/// # Arguments
+/// * `streaming_enabled` - Whether streaming is enabled in the config
+/// * `streaming_threshold` - Size threshold above which streaming is used
+/// * `payload_size` - Size of the payload in bytes
+#[allow(dead_code)]
+pub(crate) fn should_use_streaming(
+    streaming_enabled: bool,
+    streaming_threshold: usize,
+    payload_size: usize,
+) -> bool {
+    streaming_enabled && payload_size > streaming_threshold
 }

@@ -118,7 +118,10 @@ pub struct StreamHandle {
 
 impl StreamHandle {
     /// Creates a new stream handle.
-    fn new(stream_id: StreamId, total_bytes: u64) -> Self {
+    ///
+    /// This is public for use by `OrphanStreamRegistry` which needs to create
+    /// handles and for transport layer stream registration.
+    pub fn new(stream_id: StreamId, total_bytes: u64) -> Self {
         Self {
             buffer: Arc::new(LockFreeStreamBuffer::new(total_bytes)),
             sync: Arc::new(parking_lot::RwLock::new(SyncState::new())),

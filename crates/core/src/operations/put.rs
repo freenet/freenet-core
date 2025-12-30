@@ -14,6 +14,7 @@ use freenet_stdlib::{
 
 use super::{put, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::node::IsOperationCompleted;
+use crate::transport::peer_connection::StreamId;
 use crate::{
     client_events::HostResult,
     contract::ContractHandlerEvent,
@@ -114,6 +115,10 @@ impl PutOp {
             }
             Some(PutState::AwaitingResponse { current_htl, .. }) => (None, Some(*current_htl)),
             Some(PutState::Finished { key }) => (Some(*key), None),
+            Some(PutState::AwaitingStreamData {
+                contract_key, htl, ..
+            }) => (Some(*contract_key), Some(*htl)),
+            Some(PutState::ForwardingStream { contract_key, .. }) => (Some(*contract_key), None),
             None => (None, None),
         };
 
@@ -489,6 +494,29 @@ impl Operation for PutOp {
                         })
                     }
                 }
+
+                // Streaming variants - placeholder handlers until full implementation
+                // These will be implemented in Step 4 of Phase 3
+                PutMsg::RequestStreaming {
+                    id, contract_key, ..
+                } => {
+                    tracing::warn!(
+                        tx = %id,
+                        contract = %contract_key,
+                        "PUT RequestStreaming received but streaming not yet implemented"
+                    );
+                    // For now, return an error - streaming will be implemented in later step
+                    Err(OpError::UnexpectedOpState)
+                }
+
+                PutMsg::ResponseStreaming { id, key, .. } => {
+                    tracing::warn!(
+                        tx = %id,
+                        contract = %key,
+                        "PUT ResponseStreaming received but streaming not yet implemented"
+                    );
+                    Err(OpError::UnexpectedOpState)
+                }
             }
         })
     }
@@ -629,6 +657,11 @@ pub(crate) fn start_op_with_id(
 /// - Originator: PrepareRequest → AwaitingResponse → Finished
 /// - Forwarder: (receives Request) → AwaitingResponse → (receives Response) → done
 /// - Final node: (receives Request) → stores contract → sends Response → done
+///
+/// Streaming flow (when enabled and payload > threshold):
+/// - Originator: PrepareRequest → AwaitingStreamData → AwaitingResponse → Finished
+/// - Forwarder: ReceivedRequest → ForwardingStream → AwaitingResponse → Finished
+/// - Final node: ReceivedRequest → AwaitingStreamData → stores → sends Response → done
 #[derive(Debug, Clone)]
 pub enum PutState {
     /// Local originator preparing to send initial request.
@@ -648,6 +681,36 @@ pub enum PutState {
         next_hop: Option<std::net::SocketAddr>,
         /// Current HTL (remaining hops) for hop_count calculation.
         current_htl: usize,
+    },
+    /// Waiting for stream data to arrive after receiving RequestStreaming.
+    /// Used when we're the receiving end of a streaming PUT.
+    #[allow(dead_code)]
+    AwaitingStreamData {
+        /// StreamId we're waiting for
+        stream_id: StreamId,
+        /// Contract key being stored
+        contract_key: ContractKey,
+        /// Expected total size of the stream
+        total_size: u64,
+        /// Whether to subscribe after storing
+        subscribe: bool,
+        /// HTL for potential forwarding
+        htl: usize,
+    },
+    /// Forwarding a stream to the next hop.
+    /// Used when we're an intermediate node in a streaming PUT.
+    #[allow(dead_code)]
+    ForwardingStream {
+        /// Original stream ID from upstream
+        upstream_stream_id: StreamId,
+        /// New stream ID for downstream
+        downstream_stream_id: StreamId,
+        /// Contract key being forwarded
+        contract_key: ContractKey,
+        /// Next hop address
+        next_hop: std::net::SocketAddr,
+        /// Whether to subscribe after storing
+        subscribe: bool,
     },
     /// Operation completed successfully.
     Finished { key: ContractKey },
@@ -772,6 +835,7 @@ mod messages {
 
     use crate::message::{InnerMessage, Transaction};
     use crate::ring::Location;
+    use crate::transport::peer_connection::StreamId;
 
     /// PUT operation messages.
     ///
@@ -803,12 +867,46 @@ mod messages {
         /// Response indicating the PUT completed. Routed hop-by-hop back to originator
         /// using each node's stored upstream_addr.
         Response { id: Transaction, key: ContractKey },
+
+        /// Streaming request to store a large contract. Used when payload exceeds
+        /// streaming_threshold (default 64KB). The actual data is sent via a separate
+        /// stream identified by stream_id.
+        ///
+        /// This variant is only used when streaming is enabled in config.
+        RequestStreaming {
+            id: Transaction,
+            /// Identifies the stream carrying the contract and state data
+            stream_id: StreamId,
+            /// Key of the contract being stored
+            contract_key: ContractKey,
+            /// Total size of the streamed payload in bytes
+            total_size: u64,
+            /// Hops to live - decremented at each hop
+            htl: usize,
+            /// Addresses to skip when selecting next hop
+            skip_list: HashSet<std::net::SocketAddr>,
+            /// Whether to subscribe to updates after storing
+            subscribe: bool,
+        },
+
+        /// Streaming response indicating PUT completed for a streaming request.
+        /// Sent back to the originator after the stream has been fully received
+        /// and the contract stored.
+        ResponseStreaming {
+            id: Transaction,
+            key: ContractKey,
+            /// Whether the receiving node should continue forwarding to other peers
+            continue_forwarding: bool,
+        },
     }
 
     impl InnerMessage for PutMsg {
         fn id(&self) -> &Transaction {
             match self {
-                Self::Request { id, .. } | Self::Response { id, .. } => id,
+                Self::Request { id, .. }
+                | Self::Response { id, .. }
+                | Self::RequestStreaming { id, .. }
+                | Self::ResponseStreaming { id, .. } => id,
             }
         }
 
@@ -816,6 +914,10 @@ mod messages {
             match self {
                 Self::Request { contract, .. } => Some(Location::from(contract.id())),
                 Self::Response { key, .. } => Some(Location::from(key.id())),
+                Self::RequestStreaming { contract_key, .. } => {
+                    Some(Location::from(contract_key.id()))
+                }
+                Self::ResponseStreaming { key, .. } => Some(Location::from(key.id())),
             }
         }
     }
@@ -836,6 +938,31 @@ mod messages {
                 }
                 Self::Response { id, key } => {
                     write!(f, "PutResponse(id: {}, key: {})", id, key)
+                }
+                Self::RequestStreaming {
+                    id,
+                    stream_id,
+                    contract_key,
+                    total_size,
+                    htl,
+                    ..
+                } => {
+                    write!(
+                        f,
+                        "PutRequestStreaming(id: {}, key: {}, stream: {}, size: {}, htl: {})",
+                        id, contract_key, stream_id, total_size, htl
+                    )
+                }
+                Self::ResponseStreaming {
+                    id,
+                    key,
+                    continue_forwarding,
+                } => {
+                    write!(
+                        f,
+                        "PutResponseStreaming(id: {}, key: {}, continue: {})",
+                        id, key, continue_forwarding
+                    )
                 }
             }
         }
