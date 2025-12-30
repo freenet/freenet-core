@@ -110,6 +110,8 @@ jobs:
       # RUST_LOG controls tracing output level (used by both test-log and production code)
       RUST_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Increase rustc stack size to prevent SIGSEGV during compilation
+      RUST_MIN_STACK: 16777216
 
     steps:
       - uses: actions/checkout@v6
@@ -158,6 +160,10 @@ jobs:
       # Ensure lzma-sys can find liblzma on Arch Linux (self-hosted runner)
       LIBRARY_PATH: /usr/lib
       PKG_CONFIG_PATH: /usr/lib/pkgconfig
+      # Increase rustc stack size to prevent SIGSEGV during compilation
+      # The river workspace builds many crates fresh (no cache), which can
+      # exhaust default stack space during parallel compilation
+      RUST_MIN_STACK: 16777216
 
     steps:
       - uses: actions/checkout@v6
@@ -223,6 +229,8 @@ jobs:
       RUST_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       UBERTEST_PEER_COUNT: 6  # Fewer peers for faster CI
+      # Increase rustc stack size to prevent SIGSEGV during compilation
+      RUST_MIN_STACK: 16777216
 
     steps:
       - uses: actions/checkout@v6
