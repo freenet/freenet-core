@@ -281,14 +281,7 @@ impl<'a> NetEventLog<'a> {
     /// Create a disconnected event with minimal context (backwards compatible).
     #[allow(dead_code)] // Kept as simpler API for external callers
     pub fn disconnected(ring: &'a Ring, from: &'a PeerId, reason: Option<String>) -> Self {
-        Self::disconnected_with_context(
-            ring,
-            from,
-            reason.into(),
-            None,
-            None,
-            None,
-        )
+        Self::disconnected_with_context(ring, from, reason.into(), None, None, None)
     }
 
     /// Create a Put failure event.
@@ -1709,9 +1702,7 @@ pub enum OperationFailure {
     /// Connection to peer dropped during operation.
     ConnectionDropped,
     /// Operation exceeded maximum retries.
-    MaxRetriesExceeded {
-        retries: usize,
-    },
+    MaxRetriesExceeded { retries: usize },
     /// HTL (hops to live) exhausted before finding result.
     HtlExhausted,
     /// No peers available in the ring to route to.

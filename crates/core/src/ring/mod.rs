@@ -166,7 +166,13 @@ impl Ring {
 
     /// Register events with the event system.
     /// This is used by operations to emit failure and other events.
-    pub async fn register_events<'a>(&self, events: either::Either<crate::tracing::NetEventLog<'a>, Vec<crate::tracing::NetEventLog<'a>>>) {
+    pub async fn register_events<'a>(
+        &self,
+        events: either::Either<
+            crate::tracing::NetEventLog<'a>,
+            Vec<crate::tracing::NetEventLog<'a>>,
+        >,
+    ) {
         self.event_register.register_events(events).await;
     }
 
