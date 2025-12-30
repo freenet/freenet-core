@@ -131,22 +131,38 @@ impl UpdateCommand {
             release.tag_name.trim_start_matches('v')
         );
 
-        // Check if service is running and offer to restart
+        // Automatically restart service if running
         #[cfg(target_os = "linux")]
         {
             if is_systemd_service_active() {
-                println!();
-                println!("The Freenet service is running. Restart it to use the new version:");
-                println!("  freenet service restart");
+                println!("Restarting Freenet service...");
+                let status = Command::new("systemctl")
+                    .args(["--user", "restart", "freenet"])
+                    .status();
+                match status {
+                    Ok(s) if s.success() => println!("Service restarted successfully."),
+                    Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
+                    Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
+                }
             }
         }
 
         #[cfg(target_os = "macos")]
         {
             if is_launchd_service_active() {
-                println!();
-                println!("The Freenet service is running. Restart it to use the new version:");
-                println!("  freenet service restart");
+                println!("Restarting Freenet service...");
+                // launchctl doesn't have a restart command, so stop + start
+                let _ = Command::new("launchctl")
+                    .args(["stop", "org.freenet.node"])
+                    .status();
+                let status = Command::new("launchctl")
+                    .args(["start", "org.freenet.node"])
+                    .status();
+                match status {
+                    Ok(s) if s.success() => println!("Service restarted successfully."),
+                    Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
+                    Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
+                }
             }
         }
 
