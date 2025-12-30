@@ -348,11 +348,6 @@ impl<'a> NetEventLog<'a> {
     }
 
     /// Create a ConnectRequest sent event.
-    ///
-    /// Note: Currently unused because the initial request emission needs to happen
-    /// in node.rs where the connect operation is initiated (has access to Ring).
-    /// The RequestReceived event already captures forwarding via the `forwarded_to` field.
-    #[allow(dead_code)]
     pub fn connect_request_sent(
         tx: &'a Transaction,
         ring: &'a Ring,

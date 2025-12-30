@@ -823,13 +823,25 @@ impl Ring {
         let target_connections = self.connection_manager.min_connections;
 
         let (tx, op, msg) = ConnectOp::initiate_join_request(
-            joiner,
+            joiner.clone(),
             query_target.clone(),
             ideal_location,
             ttl,
             target_connections,
             op_manager.connect_forward_estimator.clone(),
         );
+
+        // Emit telemetry for initial connect request sent
+        self.register_events(Either::Left(NetEventLog::connect_request_sent(
+            &tx,
+            self,
+            ideal_location,
+            joiner,
+            query_target.clone(),
+            ttl,
+            true, // is_initial
+        )))
+        .await;
 
         if let Some(addr) = query_target.socket_addr() {
             live_tx_tracker.add_transaction(addr, tx);

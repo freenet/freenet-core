@@ -1595,6 +1595,20 @@ pub(crate) async fn join_ring_request(
         op_manager.connect_forward_estimator.clone(),
     );
 
+    // Emit telemetry for initial connect request sent
+    op_manager
+        .ring
+        .register_events(Either::Left(NetEventLog::connect_request_sent(
+            &tx,
+            &op_manager.ring,
+            location,
+            own,
+            gateway.clone(),
+            ttl,
+            true, // is_initial
+        )))
+        .await;
+
     op.first_hop = Some(Box::new(gateway.clone()));
     if let Some(backoff) = backoff {
         op.backoff = Some(backoff);
@@ -1605,7 +1619,7 @@ pub(crate) async fn join_ring_request(
         tx = %tx,
         target_connections,
         ttl,
-        "Attempting network join using connect"
+        "Attempting network connect"
     );
 
     op_manager
