@@ -924,12 +924,22 @@ where
                                 .expect("peer should have socket address"),
                             peer_loc.pub_key().clone(),
                         );
+                        // Capture connection duration before pruning
+                        let connection_duration_ms = op_manager
+                            .ring
+                            .connection_manager
+                            .get_connection_duration_ms(peer_addr);
                         event_register
                             .register_events(Either::Left(
-                                crate::tracing::NetEventLog::disconnected(
+                                crate::tracing::NetEventLog::disconnected_with_context(
                                     &op_manager.ring,
                                     &peer_id,
-                                    Some("connection dropped by node request".to_string()),
+                                    crate::tracing::DisconnectReason::Explicit(
+                                        "connection dropped by node request".to_string(),
+                                    ),
+                                    connection_duration_ms,
+                                    None,
+                                    None,
                                 ),
                             ))
                             .await;

@@ -279,6 +279,7 @@ impl<'a> NetEventLog<'a> {
     }
 
     /// Create a disconnected event with minimal context (backwards compatible).
+    #[allow(dead_code)] // Kept as simpler API for external callers
     pub fn disconnected(ring: &'a Ring, from: &'a PeerId, reason: Option<String>) -> Self {
         Self::disconnected_with_context(
             ring,

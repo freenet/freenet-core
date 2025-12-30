@@ -458,6 +458,8 @@ impl Ring {
     /// - A list of (contract, upstream) pairs where Unsubscribed messages should be sent.
     /// - A list of orphaned transactions that need to be retried or failed.
     pub async fn prune_connection(&self, peer: PeerId) -> PruneSubscriptionsResult {
+        use crate::tracing::DisconnectReason;
+
         tracing::debug!(%peer, "Removing connection");
         let orphaned_transactions = self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
 
@@ -468,6 +470,11 @@ impl Ring {
                 "Connection pruned with orphaned transactions"
             );
         }
+
+        // Capture connection duration before pruning
+        let connection_duration_ms = self
+            .connection_manager
+            .get_connection_duration_ms(peer.addr);
 
         // This case would be when a connection is being open, so peer location hasn't been recorded yet
         let Some(loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
@@ -481,10 +488,13 @@ impl Ring {
         prune_result.orphaned_transactions = orphaned_transactions;
 
         self.event_register
-            .register_events(Either::Left(NetEventLog::disconnected(
+            .register_events(Either::Left(NetEventLog::disconnected_with_context(
                 self,
                 &peer,
-                Some("connection pruned".to_string()),
+                DisconnectReason::Pruned,
+                connection_duration_ms,
+                None, // bytes_sent not tracked yet
+                None, // bytes_received not tracked yet
             )))
             .await;
 
