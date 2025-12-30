@@ -336,11 +336,14 @@ pub(crate) enum OpError {
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
 
-    // Streaming-related errors
+    // Streaming-related errors (Phase 3 infrastructure - will be used by streaming handlers)
+    #[allow(dead_code)]
     #[error("stream timed out waiting for data")]
     StreamTimeout,
+    #[allow(dead_code)]
     #[error("stream was cancelled")]
     StreamCancelled,
+    #[allow(dead_code)]
     #[error("failed to claim orphan stream")]
     OrphanStreamClaimFailed,
 
@@ -507,4 +510,78 @@ pub(crate) fn should_use_streaming(
     payload_size: usize,
 ) -> bool {
     streaming_enabled && payload_size > streaming_threshold
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::should_use_streaming;
+
+    const DEFAULT_THRESHOLD: usize = 64 * 1024; // 64KB
+
+    #[test]
+    fn test_streaming_disabled_always_returns_false() {
+        // When streaming is disabled, should_use_streaming always returns false
+        // regardless of payload size. This is the default behavior.
+        assert!(!should_use_streaming(false, DEFAULT_THRESHOLD, 0));
+        assert!(!should_use_streaming(false, DEFAULT_THRESHOLD, 1000));
+        assert!(!should_use_streaming(
+            false,
+            DEFAULT_THRESHOLD,
+            DEFAULT_THRESHOLD
+        ));
+        assert!(!should_use_streaming(
+            false,
+            DEFAULT_THRESHOLD,
+            DEFAULT_THRESHOLD + 1
+        ));
+        assert!(!should_use_streaming(false, DEFAULT_THRESHOLD, 1024 * 1024)); // 1MB
+        assert!(!should_use_streaming(
+            false,
+            DEFAULT_THRESHOLD,
+            10 * 1024 * 1024
+        )); // 10MB
+    }
+
+    #[test]
+    fn test_streaming_enabled_respects_threshold() {
+        // When streaming is enabled, payloads above threshold use streaming
+        assert!(!should_use_streaming(true, DEFAULT_THRESHOLD, 0));
+        assert!(!should_use_streaming(true, DEFAULT_THRESHOLD, 1000));
+        assert!(!should_use_streaming(
+            true,
+            DEFAULT_THRESHOLD,
+            DEFAULT_THRESHOLD
+        )); // exactly at threshold
+        assert!(should_use_streaming(
+            true,
+            DEFAULT_THRESHOLD,
+            DEFAULT_THRESHOLD + 1
+        )); // just above
+        assert!(should_use_streaming(true, DEFAULT_THRESHOLD, 1024 * 1024)); // 1MB
+    }
+
+    #[test]
+    fn test_streaming_custom_threshold() {
+        // Custom threshold values work correctly
+        let custom_threshold = 128 * 1024; // 128KB
+        assert!(!should_use_streaming(true, custom_threshold, 64 * 1024));
+        assert!(!should_use_streaming(
+            true,
+            custom_threshold,
+            custom_threshold
+        ));
+        assert!(should_use_streaming(
+            true,
+            custom_threshold,
+            custom_threshold + 1
+        ));
+    }
+
+    #[test]
+    fn test_streaming_zero_threshold() {
+        // With threshold of 0, any non-zero payload uses streaming (when enabled)
+        assert!(!should_use_streaming(true, 0, 0));
+        assert!(should_use_streaming(true, 0, 1));
+        assert!(should_use_streaming(true, 0, 100));
+    }
 }

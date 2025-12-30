@@ -1584,4 +1584,58 @@ mod tests {
             assert!(socket.port() > 1024); // Ensure we're using unprivileged ports
         }
     }
+
+    #[test]
+    fn test_streaming_config_defaults_via_serde() {
+        // Verify streaming is disabled by default when deserializing empty config
+        // This tests the serde defaults which mirror the runtime defaults
+        let minimal_config = r#"
+            network-address = "127.0.0.1"
+            network-port = 8080
+        "#;
+        let network_api: NetworkApiConfig = toml::from_str(minimal_config).unwrap();
+        assert!(
+            !network_api.streaming_enabled,
+            "Streaming should be disabled by default"
+        );
+        assert_eq!(
+            network_api.streaming_threshold,
+            64 * 1024,
+            "Default streaming threshold should be 64KB"
+        );
+    }
+
+    #[test]
+    fn test_streaming_config_serde() {
+        // Test serialization/deserialization of streaming config with explicit values
+        let config_str = r#"
+            network-address = "127.0.0.1"
+            network-port = 8080
+            streaming-enabled = true
+            streaming-threshold = 131072
+        "#;
+
+        let config: NetworkApiConfig = toml::from_str(config_str).unwrap();
+        assert!(config.streaming_enabled);
+        assert_eq!(config.streaming_threshold, 128 * 1024);
+
+        // Round-trip test
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("streaming-enabled = true"));
+        assert!(serialized.contains("streaming-threshold = 131072"));
+    }
+
+    #[test]
+    fn test_network_args_streaming_defaults() {
+        // Verify NetworkArgs streaming fields are None by default (disabled)
+        let args = NetworkArgs::default();
+        assert!(
+            args.streaming_enabled.is_none(),
+            "NetworkArgs.streaming_enabled should be None by default"
+        );
+        assert!(
+            args.streaming_threshold.is_none(),
+            "NetworkArgs.streaming_threshold should be None by default"
+        );
+    }
 }

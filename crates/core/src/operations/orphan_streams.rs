@@ -33,9 +33,11 @@ use crate::transport::peer_connection::StreamId;
 
 /// Timeout for unclaimed orphan streams.
 /// Orphan streams not claimed within this duration are garbage collected.
+#[allow(dead_code)] // Phase 3 infrastructure - will be used when gc_expired is called periodically
 pub const ORPHAN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default timeout when waiting for a stream to arrive after metadata.
+#[allow(dead_code)] // Phase 3 infrastructure - will be used by streaming handlers
 pub const STREAM_CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Registry for handling race conditions between stream fragments and metadata messages.
@@ -65,6 +67,7 @@ impl OrphanStreamRegistry {
     ///
     /// If someone is already waiting for this stream, the handle is delivered
     /// immediately. Otherwise, it's stored as an orphan until claimed or timeout.
+    #[allow(dead_code)] // Phase 3 infrastructure - will be used when transport registers orphans
     pub fn register_orphan(&self, stream_id: StreamId, handle: StreamHandle) {
         // Check if someone is already waiting for this stream
         if let Some((_, waiter)) = self.stream_waiters.remove(&stream_id) {
@@ -100,6 +103,7 @@ impl OrphanStreamRegistry {
     ///
     /// Returns `OrphanStreamError::Timeout` if the stream doesn't arrive within
     /// the timeout period.
+    #[allow(dead_code)] // Phase 3 infrastructure - will be used by streaming handlers
     pub async fn claim_or_wait(
         &self,
         stream_id: StreamId,
@@ -159,6 +163,7 @@ impl OrphanStreamRegistry {
     ///
     /// Should be called periodically to clean up orphan streams that were
     /// never claimed. Each expired stream's handle is cancelled.
+    #[allow(dead_code)] // Phase 3 infrastructure - will be called from a periodic cleanup task
     pub fn gc_expired(&self) {
         let now = Instant::now();
         let mut expired_count = 0;
@@ -207,6 +212,7 @@ impl Default for OrphanStreamRegistry {
 }
 
 /// Errors that can occur when claiming a stream.
+#[allow(dead_code)] // Phase 3 infrastructure - will be used by streaming handlers
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrphanStreamError {
     /// Timeout waiting for stream to arrive.

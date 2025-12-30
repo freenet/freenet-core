@@ -1127,6 +1127,7 @@ impl LedbatController {
 /// LEDBAT++ statistics (test-only).
 #[cfg(test)]
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields used for debugging and analysis in tests
 pub struct LedbatStats {
     pub cwnd: usize,
     pub flightsize: usize,
@@ -2767,6 +2768,7 @@ mod tests {
 
     /// Snapshot of controller state at a point in time
     #[derive(Debug, Clone)]
+    #[allow(dead_code)] // Fields used for debugging and analysis in visualization tests
     struct StateSnapshot {
         time_ms: u64,
         cwnd_kb: usize,
@@ -2871,6 +2873,7 @@ mod tests {
     }
 
     /// Render ASCII throughput chart
+    #[allow(dead_code)] // Visualization helper for debugging
     fn render_throughput_chart(snapshots: &[StateSnapshot], max_throughput: f64, width: usize) {
         let height = 10;
         let mut chart = vec![vec![' '; width]; height];
@@ -2910,6 +2913,7 @@ mod tests {
     }
 
     /// Render state timeline
+    #[allow(dead_code)] // Visualization helper for debugging
     fn render_state_timeline(snapshots: &[StateSnapshot]) {
         let _state_names = ["Normal", "Waiting", "Slowdown", "Frozen", "RampingUp"];
         let state_chars = ['─', '╌', '▼', '═', '╱'];
