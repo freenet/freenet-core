@@ -375,8 +375,8 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 PutEvent::BroadcastReceived { .. } => "put_broadcast_received".to_string(),
             }
         }
-        EventKind::Get(..) => "get_success".to_string(),
-        EventKind::Subscribe(..) => "subscribed".to_string(),
+        EventKind::Get(_) => "get".to_string(),
+        EventKind::Subscribe(_) => "subscribe".to_string(),
         EventKind::Update(update_event) => {
             use super::UpdateEvent;
             match update_event {
@@ -397,38 +397,61 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
         EventKind::Connect(connect_event) => {
             use super::ConnectEvent;
             match connect_event {
-                ConnectEvent::StartConnection { from, .. } => {
+                ConnectEvent::StartConnection { from, is_gateway } => {
                     serde_json::json!({
                         "type": "start_connection",
                         "from": from.to_string(),
+                        "is_gateway": is_gateway,
                     })
                 }
                 ConnectEvent::Connected {
-                    this, connected, ..
+                    this,
+                    connected,
+                    elapsed_ms,
+                    connection_type,
+                    latency_ms,
+                    this_peer_connection_count,
+                    initiated_by,
                 } => {
                     serde_json::json!({
                         "type": "connected",
                         "this_peer": this.to_string(),
                         "connected_peer": connected.to_string(),
+                        "elapsed_ms": elapsed_ms,
+                        "connection_type": format!("{:?}", connection_type),
+                        "latency_ms": latency_ms,
+                        "connection_count": this_peer_connection_count,
+                        "initiated_by": initiated_by.as_ref().map(|p| p.to_string()),
                     })
                 }
                 ConnectEvent::Finished {
                     initiator,
                     location,
-                    ..
+                    elapsed_ms,
                 } => {
                     serde_json::json!({
                         "type": "finished",
                         "initiator": initiator.to_string(),
                         "location": location.as_f64(),
+                        "elapsed_ms": elapsed_ms,
                     })
                 }
             }
         }
-        EventKind::Disconnected { from, .. } => {
+        EventKind::Disconnected {
+            from,
+            reason,
+            connection_duration_ms,
+            bytes_sent,
+            bytes_received,
+        } => {
             serde_json::json!({
                 "type": "disconnected",
                 "from": from.to_string(),
+                "reason": format!("{:?}", reason),
+                "connection_duration_ms": connection_duration_ms,
+                "bytes_sent": bytes_sent,
+                "bytes_received": bytes_received,
             })
         }
         EventKind::Put(put_event) => {
@@ -439,8 +462,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     target,
                     key,
                     id,
+                    htl,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "request",
@@ -448,6 +471,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "key": key.to_string(),
                         "id": id.to_string(),
+                        "htl": htl,
                         "timestamp": timestamp,
                     })
                 }
@@ -456,8 +480,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     target,
                     key,
                     id,
+                    elapsed_ms,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "success",
@@ -465,6 +489,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "key": key.to_string(),
                         "id": id.to_string(),
+                        "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
                 }
@@ -516,8 +541,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     instance_id,
                     target,
+                    htl,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "get_request",
@@ -525,6 +550,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
+                        "htl": htl,
                         "timestamp": timestamp,
                     })
                 }
@@ -533,30 +559,34 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     target,
                     key,
+                    elapsed_ms,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "get_success",
                         "id": id.to_string(),
-                        "key": key.to_string(),
-                        "timestamp": timestamp,
                         "requester": requester.to_string(),
                         "target": target.to_string(),
+                        "key": key.to_string(),
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
                     })
                 }
                 GetEvent::GetNotFound {
                     id,
                     requester,
                     instance_id,
+                    target,
+                    elapsed_ms,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "get_not_found",
                         "id": id.to_string(),
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
+                        "target": target.to_string(),
+                        "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
                 }
@@ -570,8 +600,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     instance_id,
                     target,
+                    htl,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "subscribe_request",
@@ -579,6 +609,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
+                        "htl": htl,
                         "timestamp": timestamp,
                     })
                 }
@@ -586,27 +617,35 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     id,
                     key,
                     at,
+                    elapsed_ms,
                     timestamp,
-                    ..
+                    requester,
                 } => {
                     serde_json::json!({
-                        "type": "subscribed",
+                        "type": "subscribe_success",
                         "id": id.to_string(),
                         "key": key.to_string(),
                         "at": at.to_string(),
+                        "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
+                        "requester": requester.to_string(),
                     })
                 }
                 SubscribeEvent::SubscribeNotFound {
                     id,
+                    requester,
                     instance_id,
+                    target,
+                    elapsed_ms,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "subscribe_not_found",
                         "id": id.to_string(),
+                        "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
+                        "target": target.to_string(),
+                        "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
                 }
