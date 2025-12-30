@@ -34,7 +34,6 @@
 //! - Atomic ring buffers for delay filtering and base delay history
 //! - AtomicU64 for Duration values (stored as nanoseconds)
 //! - Epoch-based timing for rate-limiting updates
-#![allow(dead_code)] // Infrastructure not yet integrated
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -461,6 +460,7 @@ impl LedbatController {
     ///     10_000_000 // 10 MB max
     /// );
     /// ```
+    #[cfg(test)]
     pub fn new(initial_cwnd: usize, min_cwnd: usize, max_cwnd: usize) -> Self {
         let config = LedbatConfig {
             initial_cwnd,
@@ -999,6 +999,7 @@ impl LedbatController {
     /// [`on_timeout`] for retransmissions. This method is for future fast-retransmit
     /// support (3 duplicate ACKs). LEDBAT primarily uses delay-based signals anyway,
     /// so loss detection is less critical than in traditional TCP congestion control.
+    #[cfg(test)]
     pub fn on_loss(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
 
@@ -1105,7 +1106,8 @@ impl LedbatController {
         );
     }
 
-    /// Get statistics.
+    /// Get statistics (test-only, for validating controller behavior).
+    #[cfg(test)]
     pub fn stats(&self) -> LedbatStats {
         LedbatStats {
             cwnd: self.current_cwnd(),
@@ -1122,7 +1124,8 @@ impl LedbatController {
     }
 }
 
-/// LEDBAT++ statistics.
+/// LEDBAT++ statistics (test-only).
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct LedbatStats {
     pub cwnd: usize,
