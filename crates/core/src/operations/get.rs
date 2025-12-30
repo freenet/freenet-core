@@ -262,12 +262,23 @@ pub(crate) async fn request_get(
                 state: new_state,
                 result: None,
                 stats: get_op.stats.map(|mut s| {
-                    s.next_peer = Some(target);
+                    s.next_peer = Some(target.clone());
                     s
                 }),
                 upstream_addr: get_op.upstream_addr,
                 local_fallback, // Store local cache for fallback if network returns NotFound
             };
+
+            // Emit get_request telemetry when initiating a GET operation
+            if let Some(event) = NetEventLog::get_request(
+                &id,
+                &op_manager.ring,
+                instance_id_val,
+                target,
+                op_manager.ring.max_hops_to_live,
+            ) {
+                op_manager.ring.register_events(Either::Left(event)).await;
+            }
 
             op_manager
                 .notify_op_change(NetMessage::from(msg), OpEnum::Get(op))
@@ -683,16 +694,15 @@ impl GetOp {
 
                 // Emit failure event with hop_count
                 let hop_count = Some(op_manager.ring.max_hops_to_live.saturating_sub(current_hop));
-                op_manager
-                    .ring
-                    .register_events(Either::Left(NetEventLog::get_failure(
-                        &self.id,
-                        &op_manager.ring,
-                        instance_id,
-                        OperationFailure::NoPeersAvailable,
-                        hop_count,
-                    )))
-                    .await;
+                if let Some(event) = NetEventLog::get_failure(
+                    &self.id,
+                    &op_manager.ring,
+                    instance_id,
+                    OperationFailure::NoPeersAvailable,
+                    hop_count,
+                ) {
+                    op_manager.ring.register_events(Either::Left(event)).await;
+                }
 
                 let failed_op = GetOp {
                     id: self.id,
@@ -1346,6 +1356,26 @@ impl Operation for GetOp {
                                             phase = "not_found",
                                             "Failed getting contract, not found after max retries"
                                         );
+
+                                        // Emit get_not_found telemetry
+                                        let hop_count = Some(
+                                            op_manager
+                                                .ring
+                                                .max_hops_to_live
+                                                .saturating_sub(current_hop),
+                                        );
+                                        if let Some(event) = NetEventLog::get_not_found(
+                                            &id,
+                                            &op_manager.ring,
+                                            instance_id,
+                                            hop_count,
+                                        ) {
+                                            op_manager
+                                                .ring
+                                                .register_events(Either::Left(event))
+                                                .await;
+                                        }
+
                                         // Set result to None - to_host_result will return an error
                                         return_msg = None;
                                         new_state = None;
@@ -1453,6 +1483,26 @@ impl Operation for GetOp {
                                             phase = "not_found",
                                             "Failed getting contract, reached max retries"
                                         );
+
+                                        // Emit get_not_found telemetry
+                                        let hop_count = Some(
+                                            op_manager
+                                                .ring
+                                                .max_hops_to_live
+                                                .saturating_sub(current_hop),
+                                        );
+                                        if let Some(event) = NetEventLog::get_not_found(
+                                            &id,
+                                            &op_manager.ring,
+                                            instance_id,
+                                            hop_count,
+                                        ) {
+                                            op_manager
+                                                .ring
+                                                .register_events(Either::Left(event))
+                                                .await;
+                                        }
+
                                         return_msg = None;
                                         new_state = None;
                                     }
@@ -1509,11 +1559,14 @@ impl Operation for GetOp {
                         })
                     );
 
-                    // Get requester from current state
-                    let requester = if let Some(GetState::AwaitingResponse { requester, .. }) =
-                        self.state.as_ref()
+                    // Get requester and current_hop from current state
+                    let (requester, current_hop) = if let Some(GetState::AwaitingResponse {
+                        requester,
+                        current_hop,
+                        ..
+                    }) = self.state.as_ref()
                     {
-                        requester.clone()
+                        (requester.clone(), Some(*current_hop))
                     } else {
                         return Err(OpError::UnexpectedOpState);
                     };
@@ -1702,6 +1755,20 @@ impl Operation for GetOp {
                     if self.upstream_addr.is_none() {
                         // Original requester, operation completed successfully
                         tracing::info!(tx = %id, contract = %key, phase = "complete", "Get response received for contract at original requester");
+
+                        // Emit get_success telemetry
+                        let hop_count =
+                            current_hop.map(|h| op_manager.ring.max_hops_to_live.saturating_sub(h));
+                        if let Some(event) = NetEventLog::get_success(
+                            &id,
+                            &op_manager.ring,
+                            key,
+                            sender.clone(),
+                            hop_count,
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
+
                         new_state = Some(GetState::Finished { key });
                         return_msg = None;
                         result = Some(GetResult {

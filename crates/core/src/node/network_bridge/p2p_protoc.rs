@@ -185,16 +185,16 @@ impl NetworkBridge for P2pBridge {
                         .ring
                         .connection_manager
                         .get_connection_duration_ms(peer_addr);
-                    self.log_register
-                        .register_events(Either::Left(NetEventLog::disconnected_with_context(
-                            &self.op_manager.ring,
-                            &PeerId::new(known_loc.socket_addr(), peer_loc.pub_key().clone()),
-                            DisconnectReason::RemoteDropped,
-                            connection_duration_ms,
-                            None, // bytes_sent not tracked yet
-                            None, // bytes_received not tracked yet
-                        )))
-                        .await;
+                    if let Some(event) = NetEventLog::disconnected_with_context(
+                        &self.op_manager.ring,
+                        &PeerId::new(known_loc.socket_addr(), peer_loc.pub_key().clone()),
+                        DisconnectReason::RemoteDropped,
+                        connection_duration_ms,
+                        None, // bytes_sent not tracked yet
+                        None, // bytes_received not tracked yet
+                    ) {
+                        self.log_register.register_events(Either::Left(event)).await;
+                    }
                 }
             }
         }

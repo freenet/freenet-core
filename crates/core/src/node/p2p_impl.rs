@@ -119,6 +119,28 @@ impl NodeP2P {
     }
 
     pub(super) async fn run_node(mut self) -> anyhow::Result<Infallible> {
+        // Record the start time for uptime tracking in shutdown event
+        let start_time = std::time::Instant::now();
+
+        // Emit peer startup event
+        if let Some(event) = crate::tracing::NetEventLog::peer_startup(
+            &self.op_manager.ring,
+            crate::config::PCK_VERSION.to_string(),
+            None, // git_commit - not available in library, only in binary
+            None, // git_dirty - not available in library, only in binary
+        ) {
+            use either::Either;
+            self.op_manager
+                .ring
+                .register_events(Either::Left(event))
+                .await;
+            tracing::info!(
+                version = crate::config::PCK_VERSION,
+                is_gateway = self.op_manager.ring.is_gateway(),
+                "Peer startup event emitted"
+            );
+        }
+
         if self.should_try_connect {
             let join_handle = connect::initial_join_procedure(
                 self.op_manager.clone(),
@@ -177,6 +199,30 @@ impl NodeP2P {
         }
         if let Some(handle) = aggressive_conn_task {
             handle.abort();
+        }
+
+        // Emit peer shutdown event
+        let (graceful, reason) = match &result {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        if let Some(event) = crate::tracing::NetEventLog::peer_shutdown(
+            &self.op_manager.ring,
+            graceful,
+            reason.clone(),
+            start_time,
+        ) {
+            use either::Either;
+            self.op_manager
+                .ring
+                .register_events(Either::Left(event))
+                .await;
+            tracing::info!(
+                graceful,
+                reason = reason.as_deref().unwrap_or("clean exit"),
+                uptime_secs = start_time.elapsed().as_secs(),
+                "Peer shutdown event emitted"
+            );
         }
 
         result

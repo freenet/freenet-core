@@ -100,6 +100,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 
+use either::Either;
+
 use crate::client_events::HostResult;
 use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transaction};
@@ -107,6 +109,7 @@ use crate::node::{ConnectionError, IsOperationCompleted, NetworkBridge, OpManage
 use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::ring::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
+use crate::tracing::NetEventLog;
 use crate::transport::TransportKeypair;
 use crate::util::{Backoff, Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
@@ -1159,6 +1162,20 @@ impl Operation for ConnectOp {
                     let actions =
                         self.handle_request(&env, upstream_addr, payload.clone(), &estimator);
 
+                    // Emit telemetry for request received
+                    if let Some(event) = NetEventLog::connect_request_received(
+                        &self.id,
+                        &op_manager.ring,
+                        payload.desired_location,
+                        payload.joiner.clone(),
+                        upstream_addr,
+                        actions.forward.as_ref().map(|(peer, _)| peer.clone()),
+                        actions.accept_response.is_some(),
+                        payload.ttl,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+
                     if let Some((_target, address)) = actions.observed_address {
                         let msg = ConnectMsg::ObservedAddress {
                             id: self.id,
@@ -1252,6 +1269,16 @@ impl Operation for ConnectOp {
                     }
 
                     if let Some(response) = actions.accept_response {
+                        // Emit telemetry for response sent
+                        if let Some(event) = NetEventLog::connect_response_sent(
+                            &self.id,
+                            &op_manager.ring,
+                            response.acceptor.clone(),
+                            payload.joiner.clone(),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
+
                         let response_msg = ConnectMsg::Response {
                             id: self.id,
                             payload: response,
@@ -1298,6 +1325,15 @@ impl Operation for ConnectOp {
 
                     if let Some(ConnectState::WaitingForResponses(_)) = &self.state {
                         // Joiner: process the response and connect to acceptor
+                        // Emit telemetry for response received at joiner
+                        if let Some(event) = NetEventLog::connect_response_received(
+                            &self.id,
+                            &op_manager.ring,
+                            payload.acceptor.clone(),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
+
                         if let Some(acceptance) = self.handle_response(&payload, Instant::now()) {
                             // Note: Location assignment happens in ObservedAddress handler,
                             // not here. The joiner's ring location is derived from their
@@ -1556,6 +1592,19 @@ pub(crate) async fn join_ring_request(
         op_manager.connect_forward_estimator.clone(),
     );
 
+    // Emit telemetry for initial connect request sent
+    if let Some(event) = NetEventLog::connect_request_sent(
+        &tx,
+        &op_manager.ring,
+        location,
+        own,
+        gateway.clone(),
+        ttl,
+        true, // is_initial
+    ) {
+        op_manager.ring.register_events(Either::Left(event)).await;
+    }
+
     op.first_hop = Some(Box::new(gateway.clone()));
     if let Some(backoff) = backoff {
         op.backoff = Some(backoff);
@@ -1566,7 +1615,7 @@ pub(crate) async fn join_ring_request(
         tx = %tx,
         target_connections,
         ttl,
-        "Attempting network join using connect"
+        "Attempting network connect"
     );
 
     op_manager

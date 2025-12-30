@@ -929,20 +929,18 @@ where
                             .ring
                             .connection_manager
                             .get_connection_duration_ms(peer_addr);
-                        event_register
-                            .register_events(Either::Left(
-                                crate::tracing::NetEventLog::disconnected_with_context(
-                                    &op_manager.ring,
-                                    &peer_id,
-                                    crate::tracing::DisconnectReason::Explicit(
-                                        "connection dropped by node request".to_string(),
-                                    ),
-                                    connection_duration_ms,
-                                    None,
-                                    None,
-                                ),
-                            ))
-                            .await;
+                        if let Some(event) = crate::tracing::NetEventLog::disconnected_with_context(
+                            &op_manager.ring,
+                            &peer_id,
+                            crate::tracing::DisconnectReason::Explicit(
+                                "connection dropped by node request".to_string(),
+                            ),
+                            connection_duration_ms,
+                            None,
+                            None,
+                        ) {
+                            event_register.register_events(Either::Left(event)).await;
+                        }
                         let prune_result = op_manager.ring.prune_connection(peer_id).await;
 
                         // Handle orphaned transactions immediately (retry via alternate routes)

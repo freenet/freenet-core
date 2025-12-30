@@ -1,9 +1,12 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use either::Either;
+
 pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
 use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::node::IsOperationCompleted;
+use crate::tracing::NetEventLog;
 use crate::{
     client_events::HostResult,
     message::{InnerMessage, NetMessage, Transaction},
@@ -255,6 +258,17 @@ pub(crate) async fn request_subscribe(
         htl: op_manager.ring.max_hops_to_live,
         visited,
     };
+
+    // Emit telemetry for subscribe request initiation
+    if let Some(event) = NetEventLog::subscribe_request(
+        id,
+        &op_manager.ring,
+        *instance_id,
+        target.clone(),
+        op_manager.ring.max_hops_to_live,
+    ) {
+        op_manager.ring.register_events(Either::Left(event)).await;
+    }
 
     let op = SubscribeOp {
         id: *id,
@@ -712,6 +726,19 @@ impl Operation for SubscribeOp {
                             } else {
                                 // We're the originator - return completed state for handle_op_result
                                 tracing::info!(tx = %msg_id, contract = %key, phase = "complete", "Subscribe completed (originator)");
+
+                                // Emit telemetry for successful subscription
+                                let own_loc = op_manager.ring.connection_manager.own_location();
+                                if let Some(event) = NetEventLog::subscribe_success(
+                                    msg_id,
+                                    &op_manager.ring,
+                                    *key,
+                                    own_loc,
+                                    None, // hop_count not tracked in subscribe
+                                ) {
+                                    op_manager.ring.register_events(Either::Left(event)).await;
+                                }
+
                                 Ok(OperationResult {
                                     return_msg: None,
                                     next_hop: None,
@@ -748,6 +775,17 @@ impl Operation for SubscribeOp {
                             } else {
                                 // We're the originator - subscription failed, contract not found
                                 tracing::warn!(tx = %msg_id, %instance_id, phase = "not_found", "Subscribe failed - contract not found");
+
+                                // Emit telemetry for subscription not found
+                                if let Some(event) = NetEventLog::subscribe_not_found(
+                                    msg_id,
+                                    &op_manager.ring,
+                                    *instance_id,
+                                    None, // hop_count not tracked in subscribe
+                                ) {
+                                    op_manager.ring.register_events(Either::Left(event)).await;
+                                }
+
                                 // Return op with no inner state - to_host_result() will return error
                                 Ok(OperationResult {
                                     return_msg: None,

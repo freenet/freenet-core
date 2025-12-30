@@ -194,34 +194,36 @@ pub(crate) struct NetEventLog<'a> {
 }
 
 impl<'a> NetEventLog<'a> {
-    pub fn route_event(tx: &'a Transaction, ring: &'a Ring, route_event: &RouteEvent) -> Self {
+    /// Safely get the peer_id from the ring's connection manager.
+    /// Returns None if the peer doesn't have a known address (e.g., during startup).
+    /// Telemetry should never panic - we just skip events if we can't identify ourselves.
+    fn get_own_peer_id(ring: &Ring) -> Option<PeerId> {
         let own_loc = ring.connection_manager.own_location();
-        let peer_id = PeerId::new(
-            own_loc
-                .socket_addr()
-                .expect("own location should have address"),
-            own_loc.pub_key,
-        );
-        NetEventLog {
+        own_loc
+            .socket_addr()
+            .map(|addr| PeerId::new(addr, own_loc.pub_key().clone()))
+    }
+
+    pub fn route_event(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        route_event: &RouteEvent,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
             tx,
             peer_id,
             kind: EventKind::Route(route_event.clone()),
-        }
+        })
     }
 
-    pub fn connected(ring: &'a Ring, peer: PeerId, _location: Location) -> Self {
-        let own_loc = ring.connection_manager.own_location();
-        let peer_id = PeerId::new(
-            own_loc
-                .socket_addr()
-                .expect("own location should have address"),
-            own_loc.pub_key().clone(),
-        );
+    pub fn connected(ring: &'a Ring, peer: PeerId, _location: Location) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
         let connected = PeerKeyLocation::new(peer.pub_key.clone(), peer.addr);
         let connection_count = ring.connection_manager.connection_count();
         let is_gateway = ring.connection_manager.is_gateway();
         // Note: location is computed from address, so we don't need to set it separately
-        NetEventLog {
+        Some(NetEventLog {
             tx: Transaction::NULL,
             peer_id,
             kind: EventKind::Connect(ConnectEvent::Connected {
@@ -238,7 +240,7 @@ impl<'a> NetEventLog<'a> {
                 this_peer_connection_count: connection_count,
                 initiated_by: None, // Not available in this context
             }),
-        }
+        })
     }
 
     /// Create a disconnected event with full context.
@@ -257,15 +259,9 @@ impl<'a> NetEventLog<'a> {
         connection_duration_ms: Option<u64>,
         bytes_sent: Option<u64>,
         bytes_received: Option<u64>,
-    ) -> Self {
-        let own_loc = ring.connection_manager.own_location();
-        let peer_id = PeerId::new(
-            own_loc
-                .socket_addr()
-                .expect("own location should have address"),
-            own_loc.pub_key().clone(),
-        );
-        NetEventLog {
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
             tx: Transaction::NULL,
             peer_id,
             kind: EventKind::Disconnected {
@@ -275,13 +271,13 @@ impl<'a> NetEventLog<'a> {
                 bytes_sent,
                 bytes_received,
             },
-        }
+        })
     }
 
     /// Create a disconnected event with minimal context (backwards compatible).
     /// Note: Prefer `disconnected_with_context` with explicit `DisconnectReason` variants.
     #[allow(dead_code)] // Kept as simpler API for external callers
-    pub fn disconnected(ring: &'a Ring, from: &'a PeerId, reason: Option<String>) -> Self {
+    pub fn disconnected(ring: &'a Ring, from: &'a PeerId, reason: Option<String>) -> Option<Self> {
         Self::disconnected_with_context(ring, from, reason.into(), None, None, None)
     }
 
@@ -292,17 +288,12 @@ impl<'a> NetEventLog<'a> {
         key: ContractKey,
         reason: OperationFailure,
         hop_count: Option<usize>,
-    ) -> Self {
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
-        let peer_id = PeerId::new(
-            own_loc
-                .socket_addr()
-                .expect("own location should have address"),
-            own_loc.pub_key().clone(),
-        );
-        NetEventLog {
+        Some(NetEventLog {
             tx,
-            peer_id: peer_id.clone(),
+            peer_id,
             kind: EventKind::Put(PutEvent::PutFailure {
                 id: *tx,
                 requester: own_loc.clone(),
@@ -313,7 +304,7 @@ impl<'a> NetEventLog<'a> {
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
-        }
+        })
     }
 
     /// Create a Get failure event.
@@ -323,17 +314,12 @@ impl<'a> NetEventLog<'a> {
         instance_id: ContractInstanceId,
         reason: OperationFailure,
         hop_count: Option<usize>,
-    ) -> Self {
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
-        let peer_id = PeerId::new(
-            own_loc
-                .socket_addr()
-                .expect("own location should have address"),
-            own_loc.pub_key().clone(),
-        );
-        NetEventLog {
+        Some(NetEventLog {
             tx,
-            peer_id: peer_id.clone(),
+            peer_id,
             kind: EventKind::Get(GetEvent::GetFailure {
                 id: *tx,
                 requester: own_loc.clone(),
@@ -344,6 +330,572 @@ impl<'a> NetEventLog<'a> {
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
+        })
+    }
+
+    /// Create a ConnectRequest sent event.
+    pub fn connect_request_sent(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        desired_location: Location,
+        joiner: PeerKeyLocation,
+        target: PeerKeyLocation,
+        ttl: u8,
+        is_initial: bool,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::RequestSent {
+                desired_location,
+                joiner,
+                target,
+                ttl,
+                is_initial,
+            }),
+        })
+    }
+
+    /// Create a ConnectRequest received event.
+    ///
+    /// `from_addr` is the socket address of the upstream peer that sent the request.
+    /// We look up the full PeerKeyLocation from the connection manager if available.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_request_received(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        desired_location: Location,
+        joiner: PeerKeyLocation,
+        from_addr: std::net::SocketAddr,
+        forwarded_to: Option<PeerKeyLocation>,
+        accepted: bool,
+        ttl: u8,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        // Look up the full peer info from connection manager if the peer is already connected
+        let from_peer = ring.connection_manager.get_peer_by_addr(from_addr);
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::RequestReceived {
+                desired_location,
+                joiner,
+                from_addr,
+                from_peer,
+                forwarded_to,
+                accepted,
+                ttl,
+            }),
+        })
+    }
+
+    /// Create a ConnectResponse sent event.
+    pub fn connect_response_sent(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        acceptor: PeerKeyLocation,
+        joiner: PeerKeyLocation,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::ResponseSent { acceptor, joiner }),
+        })
+    }
+
+    /// Create a ConnectResponse received event.
+    pub fn connect_response_received(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        acceptor: PeerKeyLocation,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::ResponseReceived {
+                acceptor,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+            }),
+        })
+    }
+
+    // ==================== PUT Operation Helpers ====================
+
+    /// Create a Put request event.
+    pub fn put_request(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+        htl: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Put(PutEvent::Request {
+                id: *tx,
+                requester: own_loc,
+                key,
+                target,
+                htl,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a Put success event.
+    pub fn put_success(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+        hop_count: Option<usize>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Put(PutEvent::PutSuccess {
+                id: *tx,
+                requester: own_loc,
+                target,
+                key,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a Put broadcast emitted event.
+    /// Note: PUT operations don't currently use broadcasting (Update handles that),
+    /// but this helper exists for API completeness.
+    #[allow(dead_code)]
+    pub fn put_broadcast_emitted(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        value: WrappedState,
+        broadcast_to: Vec<PeerKeyLocation>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        let broadcasted_to = broadcast_to.len();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Put(PutEvent::BroadcastEmitted {
+                id: *tx,
+                upstream: own_loc.clone(),
+                broadcast_to,
+                broadcasted_to,
+                key,
+                value,
+                sender: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a Put broadcast received event.
+    /// Note: PUT operations don't currently use broadcasting (Update handles that),
+    /// but this helper exists for API completeness.
+    #[allow(dead_code)]
+    pub fn put_broadcast_received(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        requester: PeerKeyLocation,
+        value: WrappedState,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Put(PutEvent::BroadcastReceived {
+                id: *tx,
+                key,
+                requester,
+                value,
+                target: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    // ==================== GET Operation Helpers ====================
+
+    /// Create a Get request event.
+    pub fn get_request(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        target: PeerKeyLocation,
+        htl: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::Request {
+                id: *tx,
+                requester: own_loc,
+                instance_id,
+                target,
+                htl,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a Get success event.
+    pub fn get_success(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+        hop_count: Option<usize>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::GetSuccess {
+                id: *tx,
+                requester: own_loc,
+                target,
+                key,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a Get not found event.
+    pub fn get_not_found(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        hop_count: Option<usize>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::GetNotFound {
+                id: *tx,
+                requester: own_loc.clone(),
+                instance_id,
+                target: own_loc,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    // ==================== SUBSCRIBE Operation Helpers ====================
+
+    /// Create a Subscribe request event.
+    pub fn subscribe_request(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        target: PeerKeyLocation,
+        htl: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Subscribe(SubscribeEvent::Request {
+                id: *tx,
+                requester: own_loc,
+                instance_id,
+                target,
+                htl,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a Subscribe success event.
+    pub fn subscribe_success(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        at: PeerKeyLocation,
+        hop_count: Option<usize>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Subscribe(SubscribeEvent::SubscribeSuccess {
+                id: *tx,
+                key,
+                at,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                requester: own_loc,
+            }),
+        })
+    }
+
+    /// Create a Subscribe not found event.
+    pub fn subscribe_not_found(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        hop_count: Option<usize>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Subscribe(SubscribeEvent::SubscribeNotFound {
+                id: *tx,
+                requester: own_loc.clone(),
+                instance_id,
+                target: own_loc,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    // ==================== UPDATE Operation Helpers ====================
+
+    /// Create an Update request event.
+    pub fn update_request(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::Request {
+                id: *tx,
+                requester: own_loc,
+                key,
+                target,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create an Update success event.
+    pub fn update_success(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::UpdateSuccess {
+                id: *tx,
+                requester: own_loc,
+                target,
+                key,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create an Update broadcast emitted event.
+    pub fn update_broadcast_emitted(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        value: WrappedState,
+        broadcast_to: Vec<PeerKeyLocation>,
+        upstream: PeerKeyLocation,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        let broadcasted_to = broadcast_to.len();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastEmitted {
+                id: *tx,
+                upstream,
+                broadcast_to,
+                broadcasted_to,
+                key,
+                value,
+                sender: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create an Update broadcast received event.
+    pub fn update_broadcast_received(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        requester: PeerKeyLocation,
+        value: WrappedState,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastReceived {
+                id: *tx,
+                key,
+                requester,
+                value,
+                target: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a peer startup event.
+    ///
+    /// This should be called once when the node starts and is ready to participate in the network.
+    /// The event captures version info, platform details, and gateway status.
+    pub fn peer_startup(
+        ring: &'a Ring,
+        version: String,
+        git_commit: Option<String>,
+        git_dirty: Option<bool>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let is_gateway = ring.connection_manager.is_gateway();
+
+        // Get OS version info
+        let os_version = Self::get_os_version();
+
+        Some(NetEventLog {
+            tx: Transaction::NULL,
+            peer_id,
+            kind: EventKind::Lifecycle(PeerLifecycleEvent::Startup {
+                version,
+                git_commit,
+                git_dirty,
+                arch: std::env::consts::ARCH.to_string(),
+                os: std::env::consts::OS.to_string(),
+                os_version,
+                is_gateway,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a peer shutdown event.
+    ///
+    /// This should be called when the node is shutting down, either gracefully or due to an error.
+    pub fn peer_shutdown(
+        ring: &'a Ring,
+        graceful: bool,
+        reason: Option<String>,
+        start_time: std::time::Instant,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let uptime_secs = start_time.elapsed().as_secs();
+        // Get current connection count at shutdown time
+        let total_connections = ring.connection_manager.connection_count() as u64;
+
+        Some(NetEventLog {
+            tx: Transaction::NULL,
+            peer_id,
+            kind: EventKind::Lifecycle(PeerLifecycleEvent::Shutdown {
+                graceful,
+                reason,
+                uptime_secs,
+                total_connections,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Get OS version information.
+    /// Returns None if version detection fails.
+    fn get_os_version() -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            // Try to read /etc/os-release
+            if let Ok(contents) = std::fs::read_to_string("/etc/os-release") {
+                for line in contents.lines() {
+                    if line.starts_with("PRETTY_NAME=") {
+                        return Some(
+                            line.trim_start_matches("PRETTY_NAME=")
+                                .trim_matches('"')
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            None
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // Use sw_vers to get macOS version
+            std::process::Command::new("sw_vers")
+                .arg("-productVersion")
+                .output()
+                .ok()
+                .and_then(|output| {
+                    if output.status.success() {
+                        String::from_utf8(output.stdout)
+                            .ok()
+                            .map(|v| format!("macOS {}", v.trim()))
+                    } else {
+                        None
+                    }
+                })
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // Use ver command or registry
+            std::process::Command::new("cmd")
+                .args(["/C", "ver"])
+                .output()
+                .ok()
+                .and_then(|output| {
+                    if output.status.success() {
+                        String::from_utf8(output.stdout)
+                            .ok()
+                            .map(|v| v.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            None
         }
     }
 
@@ -620,12 +1172,10 @@ impl<'a> NetEventLog<'a> {
             _ => EventKind::Ignored,
         };
         let own_loc = op_manager.ring.connection_manager.own_location();
-        let peer_id = PeerId::new(
-            own_loc
-                .socket_addr()
-                .expect("own location should have address"),
-            own_loc.pub_key().clone(),
-        );
+        let Some(own_addr) = own_loc.socket_addr() else {
+            return Either::Right(vec![]);
+        };
+        let peer_id = PeerId::new(own_addr, own_loc.pub_key().clone());
         Either::Left(NetEventLog {
             tx: msg.id(),
             peer_id,
@@ -1548,6 +2098,8 @@ pub enum EventKind {
     Update(UpdateEvent),
     /// Data transfer events for stream-level transfers.
     Transfer(TransferEvent),
+    /// Peer lifecycle events (startup, shutdown).
+    Lifecycle(PeerLifecycleEvent),
     Ignored,
     Disconnected {
         from: PeerId,
@@ -1582,6 +2134,7 @@ impl EventKind {
     const UPDATE: u8 = 7;
     const TIMEOUT: u8 = 8;
     const TRANSFER: u8 = 9;
+    const LIFECYCLE: u8 = 10;
 
     const fn varint_id(&self) -> u8 {
         match self {
@@ -1595,6 +2148,7 @@ impl EventKind {
             EventKind::Update(_) => Self::UPDATE,
             EventKind::Timeout { .. } => Self::TIMEOUT,
             EventKind::Transfer(_) => Self::TRANSFER,
+            EventKind::Lifecycle(_) => Self::LIFECYCLE,
         }
     }
 }
@@ -1724,8 +2278,11 @@ enum ConnectEvent {
         desired_location: Location,
         /// The joiner's identity and location.
         joiner: PeerKeyLocation,
-        /// The peer that sent us this request.
-        from_peer: PeerKeyLocation,
+        /// The socket address of the peer that sent us this request.
+        from_addr: std::net::SocketAddr,
+        /// The peer that sent us this request (if we have them in our connection table).
+        /// None when receiving from a new joiner who isn't connected yet.
+        from_peer: Option<PeerKeyLocation>,
         /// Where we're forwarding to (None if we're at terminus).
         forwarded_to: Option<PeerKeyLocation>,
         /// Whether we accepted this connection request.
@@ -2116,6 +2673,50 @@ enum TransferEvent {
         elapsed_ms: u64,
         /// Whether we were sending or receiving.
         direction: TransferDirection,
+        timestamp: u64,
+    },
+}
+
+/// Peer lifecycle events for tracking node startup and shutdown.
+///
+/// These events help with:
+/// - Monitoring fleet health (which peers are online/offline)
+/// - Understanding version distribution across the network
+/// - Debugging issues specific to certain OS/architecture combinations
+/// - Tracking graceful vs ungraceful shutdowns
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum PeerLifecycleEvent {
+    /// Peer has started and is ready to participate in the network.
+    Startup {
+        /// Freenet core version (from Cargo.toml).
+        version: String,
+        /// Git commit hash (if available).
+        git_commit: Option<String>,
+        /// Whether the build has uncommitted changes.
+        git_dirty: Option<bool>,
+        /// Target architecture (e.g., "x86_64", "aarch64").
+        arch: String,
+        /// Operating system (e.g., "linux", "macos", "windows").
+        os: String,
+        /// OS version/release (e.g., "Ubuntu 22.04", "macOS 14.0").
+        os_version: Option<String>,
+        /// Whether this peer is configured as a gateway.
+        is_gateway: bool,
+        /// Timestamp when the peer started.
+        timestamp: u64,
+    },
+    /// Peer is shutting down.
+    Shutdown {
+        /// Whether this is a graceful shutdown (true) or unexpected (false).
+        graceful: bool,
+        /// Reason for shutdown if available.
+        reason: Option<String>,
+        /// Total uptime in seconds.
+        uptime_secs: u64,
+        /// Total connections made during uptime.
+        total_connections: u64,
+        /// Timestamp when shutdown was initiated.
         timestamp: u64,
     },
 }
