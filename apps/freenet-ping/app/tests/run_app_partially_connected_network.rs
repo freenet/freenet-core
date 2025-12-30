@@ -14,10 +14,14 @@
 
 mod common;
 
-use std::{net::TcpListener, path::PathBuf, time::Duration};
+use std::{
+    net::{SocketAddr, TcpListener},
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::anyhow;
-use freenet::{local_node::NodeConfig, server::serve_gateway};
+use freenet::{local_node::NodeConfig, server::serve_gateway, test_utils::test_ip_for_node};
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -25,18 +29,17 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::FutureExt;
-use testresult::TestResult;
 use tokio::{select, time::timeout};
 use tracing::{span, Instrument, Level};
 
 use common::{
-    base_node_test_config, connect_async_with_config, gw_config_from_path, ws_config, APP_TAG,
-    PACKAGE_DIR, PATH_TO_CONTRACT,
+    base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
+    ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
+/// Test for subscription propagation in a partially connected network.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore = "Test has never worked - nodes fail on startup with channel closed errors"]
-async fn test_ping_partially_connected_network() -> TestResult {
+async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
      *
@@ -50,48 +53,60 @@ async fn test_ping_partially_connected_network() -> TestResult {
      * - ALL regular nodes connect to ALL gateways (full gateway connectivity)
      * - Regular nodes have partial connectivity to other regular nodes based on CONNECTIVITY_RATIO
      * - Uses a deterministic approach to create partial connectivity between regular nodes
-     *
-     * Test procedure:
-     * 1. Configures and starts all nodes with the specified topology
-     * 2. One node publishes the ping contract
-     * 3. All nodes (gateways and regular nodes) attempt to get the contract initially
-     * 4. Tracks which nodes successfully access the contract in the first attempt
-     * 5. Nodes that don't have the contract make additional get attempts
-     * 6. ALL nodes that successfully obtain the contract (in any attempt) subscribe to it
-     * 7. Sends an update from one subscribed node
-     * 8. Verifies update propagation across all subscribed nodes in the network
-     * 9. Analyzes results to detect potential subscription propagation issues
-     * 10. Validates that a minimum percentage of subscribed nodes receive updates
      */
+
+    std::env::set_var("FREENET_RUNTIME_POOL_SIZE", "2");
 
     // Network configuration parameters
     const NUM_GATEWAYS: usize = 1;
     const NUM_REGULAR_NODES: usize = 7;
-    const CONNECTIVITY_RATIO: f64 = 0.3; // Controls connectivity between regular nodes
+    const CONNECTIVITY_RATIO: f64 = 0.3;
 
     println!(
-        "Starting test with {NUM_GATEWAYS} gateways and {NUM_REGULAR_NODES} regular nodes (connectivity ratio: {CONNECTIVITY_RATIO})"
+        "Starting test with {} gateways and {} regular nodes (connectivity ratio: {})",
+        NUM_GATEWAYS, NUM_REGULAR_NODES, CONNECTIVITY_RATIO
     );
 
-    // Setup network sockets for the gateways
-    let mut gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
+    // Use varied loopback IPs for unique ring locations
+    // This is essential because ring locations are derived from IP addresses.
+    // Gateways use indices 0..NUM_GATEWAYS, nodes use NUM_GATEWAYS..NUM_GATEWAYS+NUM_REGULAR_NODES
+    let gateway_ips: Vec<_> = (0..NUM_GATEWAYS).map(test_ip_for_node).collect();
+    let node_ips: Vec<_> = (0..NUM_REGULAR_NODES)
+        .map(|i| test_ip_for_node(NUM_GATEWAYS + i))
+        .collect();
+
+    // Reserve network ports for gateways on their varied IPs
+    let mut gateway_network_sockets = Vec::with_capacity(NUM_GATEWAYS);
+    let mut gateway_network_ports = Vec::with_capacity(NUM_GATEWAYS);
     let mut ws_api_gateway_sockets = Vec::with_capacity(NUM_GATEWAYS);
 
-    for _ in 0..NUM_GATEWAYS {
-        gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+    for (i, &ip) in gateway_ips.iter().enumerate() {
+        let network_socket = TcpListener::bind(SocketAddr::new(ip.into(), 0))?;
+        let port = network_socket.local_addr()?.port();
+        gateway_network_ports.push(port);
+        gateway_network_sockets.push(network_socket);
+        // WebSocket always uses localhost
         ws_api_gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+        println!("Gateway {} will use {}:{}", i, ip, port);
     }
 
-    // Setup API sockets for regular nodes
+    // Reserve network ports for regular nodes on their varied IPs
+    // Store the actual network addresses for blocking
+    let mut node_network_sockets = Vec::with_capacity(NUM_REGULAR_NODES);
+    let mut node_network_ports = Vec::with_capacity(NUM_REGULAR_NODES);
+    let mut node_network_addrs = Vec::with_capacity(NUM_REGULAR_NODES);
     let mut ws_api_node_sockets = Vec::with_capacity(NUM_REGULAR_NODES);
-    let mut regular_node_addresses = Vec::with_capacity(NUM_REGULAR_NODES);
 
-    // First, bind all sockets to get addresses for later blocking
-    for _ in 0..NUM_REGULAR_NODES {
-        let socket = TcpListener::bind("127.0.0.1:0")?;
-        // Store the address for later use in blocked_addresses
-        regular_node_addresses.push(socket.local_addr()?);
+    for (i, &ip) in node_ips.iter().enumerate() {
+        let network_socket = TcpListener::bind(SocketAddr::new(ip.into(), 0))?;
+        let port = network_socket.local_addr()?.port();
+        let addr = SocketAddr::new(ip.into(), port);
+        node_network_ports.push(port);
+        node_network_addrs.push(addr);
+        node_network_sockets.push(network_socket);
+        // WebSocket always uses localhost
         ws_api_node_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+        println!("Node {} will use {} ({})", i, addr, ip);
     }
 
     // Configure gateway nodes
@@ -102,23 +117,32 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut gateway_configs = Vec::with_capacity(NUM_GATEWAYS);
     let mut gateway_presets = Vec::with_capacity(NUM_GATEWAYS);
 
+    let dir_suffix = "partial";
+
     for i in 0..NUM_GATEWAYS {
-        let (cfg, preset) = base_node_test_config(
+        let gw_ip = gateway_ips[i];
+        let (cfg, preset) = base_node_test_config_with_ip(
             true,
             vec![],
-            Some(gateway_sockets[i].local_addr()?.port()),
+            Some(gateway_network_ports[i]),
             ws_api_gateway_sockets[i].local_addr()?.port(),
-            &format!("gw_partial_{i}"), // data_dir_suffix
-            None,                       // base_tmp_dir
-            None,                       // No blocked addresses for gateways
+            &format!("gw_{}_{i}", dir_suffix),
+            None,
+            None,        // No blocked addresses for gateways
+            Some(gw_ip), // Use varied IP for unique ring location
         )
         .await?;
 
         let public_port = cfg.network_api.public_port.unwrap();
         let path = preset.temp_dir.path().to_path_buf();
-        let config_info = gw_config_from_path(public_port, &path)?;
+        let config_info = gw_config_from_path_with_ip(public_port, &path, gw_ip)?;
 
-        println!("Gateway {} data dir: {:?}", i, preset.temp_dir.path());
+        println!(
+            "Gateway {} data dir: {:?} (IP: {})",
+            i,
+            preset.temp_dir.path(),
+            gw_ip
+        );
         ws_api_ports_gw.push(cfg.ws_api.ws_api_port.unwrap());
         gateway_info.push(config_info);
         gateway_configs.push(cfg);
@@ -139,14 +163,13 @@ async fn test_ping_partially_connected_network() -> TestResult {
     let mut node_configs = Vec::with_capacity(NUM_REGULAR_NODES);
     let mut node_presets = Vec::with_capacity(NUM_REGULAR_NODES);
 
-    for (i, listener) in ws_api_node_sockets
-        .iter()
-        .enumerate()
-        .take(NUM_REGULAR_NODES)
-    {
+    for i in 0..NUM_REGULAR_NODES {
+        let node_ip = node_ips[i];
+
         // Determine which other regular nodes this node should block
+        // Use the ACTUAL network addresses we reserved earlier
         let mut blocked_addresses = Vec::new();
-        for (j, &addr) in regular_node_addresses.iter().enumerate() {
+        for (j, &addr) in node_network_addrs.iter().enumerate() {
             if i == j {
                 continue; // Skip self
             }
@@ -165,21 +188,23 @@ async fn test_ping_partially_connected_network() -> TestResult {
         let effective_connections = (NUM_REGULAR_NODES - 1) - blocked_addresses.len();
         node_connections.push(effective_connections);
 
-        let (cfg, preset) = base_node_test_config(
+        let (cfg, preset) = base_node_test_config_with_ip(
             false,
-            serialized_gateways.clone(), // All nodes connect to all gateways
-            None,                        // Regular nodes pick their own network port or use default
-            listener.local_addr()?.port(),
-            &format!("node_partial_{i}"),    // data_dir_suffix
-            None,                            // base_tmp_dir
-            Some(blocked_addresses.clone()), // Use blocked_addresses for regular nodes
+            serialized_gateways.clone(),
+            Some(node_network_ports[i]), // Use reserved network port
+            ws_api_node_sockets[i].local_addr()?.port(),
+            &format!("node_{}_{i}", dir_suffix),
+            None,
+            Some(blocked_addresses.clone()),
+            Some(node_ip), // Use varied IP for unique ring location
         )
         .await?;
 
         println!(
-            "Node {} data dir: {:?} - Connected to {} other regular nodes (blocked: {})",
+            "Node {} data dir: {:?} (IP: {}) - Connected to {} other nodes (blocked: {})",
             i,
             preset.temp_dir.path(),
+            node_ip,
             effective_connections,
             blocked_addresses.len()
         );
@@ -190,20 +215,20 @@ async fn test_ping_partially_connected_network() -> TestResult {
     }
 
     // Free ports to avoid binding errors
-    std::mem::drop(gateway_sockets);
+    std::mem::drop(gateway_network_sockets);
     std::mem::drop(ws_api_gateway_sockets);
+    std::mem::drop(node_network_sockets);
     std::mem::drop(ws_api_node_sockets);
 
     // Start all gateway nodes
     let mut gateway_futures = Vec::with_capacity(NUM_GATEWAYS);
-    for _ in 0..NUM_GATEWAYS {
+    for _i in 0..NUM_GATEWAYS {
         let config = gateway_configs.remove(0);
-        let gateway_future = async {
+        let gateway_future = async move {
             let config = config.build().await?;
-            let node = NodeConfig::new(config.clone())
-                .await?
-                .build(serve_gateway(config.ws_api).await?)
-                .await?;
+            let node = NodeConfig::new(config.clone()).await?;
+            let gateway_service = serve_gateway(config.ws_api).await?;
+            let node = node.build(gateway_service).await?;
             node.run().await
         }
         .boxed_local();
@@ -214,23 +239,22 @@ async fn test_ping_partially_connected_network() -> TestResult {
 
     // Start all regular nodes
     let mut regular_node_futures = Vec::with_capacity(NUM_REGULAR_NODES);
-    for _ in 0..NUM_REGULAR_NODES {
+    for _i in 0..NUM_REGULAR_NODES {
         let config = node_configs.remove(0);
-        let regular_node_future = async {
+        let regular_node_future = async move {
             let config = config.build().await?;
-            let node = NodeConfig::new(config.clone())
-                .await?
-                .build(serve_gateway(config.ws_api).await?)
-                .await?;
+            let node = NodeConfig::new(config.clone()).await?;
+            let gateway_service = serve_gateway(config.ws_api).await?;
+            let node = node.build(gateway_service).await?;
             node.run().await
         }
         .boxed_local();
         regular_node_futures.push(regular_node_future);
     }
 
-    let test = tokio::time::timeout(Duration::from_secs(240), async {
+    let test = tokio::time::timeout(Duration::from_secs(300), async {
         // Wait for nodes to start up
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(25)).await;
 
         // Connect to all nodes
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
@@ -921,7 +945,7 @@ async fn test_ping_partially_connected_network() -> TestResult {
             (result, _index, remaining) = select_all_futures => {
                 match result {
                     Err(err) => {
-                        return Err(anyhow!("Node failed: {}", err).into());
+                        return Err(anyhow!("Node failed: {}", err));
                     }
                     Ok(_) => {
                         // A node completed successfully, continue with remaining nodes

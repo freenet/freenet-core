@@ -92,13 +92,9 @@ impl RuntimePool {
         let pool_size_usize: usize = pool_size.into();
         let mut runtimes = Vec::with_capacity(pool_size_usize);
 
-        // Create the shared StateStore once - it wraps a ReDb database that uses
-        // exclusive file locking, so we can only have one connection. ReDb is now
-        // Clone (wraps Arc<Database>), so we can share it across executors.
         let (_, _, _, shared_state_store) = Executor::<Runtime>::get_stores(&config).await?;
 
-        // Create all executors sharing the same StateStore
-        for _ in 0..pool_size_usize {
+        for i in 0..pool_size_usize {
             let executor = Executor::from_config_with_shared_store(
                 config.clone(),
                 shared_state_store.clone(),
@@ -107,13 +103,14 @@ impl RuntimePool {
             )
             .await?;
             runtimes.push(Some(executor));
+
+            // Yield to prevent async starvation during CPU-intensive WASM engine creation
+            if i < pool_size_usize - 1 {
+                tokio::task::yield_now().await;
+            }
         }
 
-        tracing::info!(
-            pool_size = pool_size_usize,
-            "Created RuntimePool with {} executors sharing one database connection",
-            pool_size_usize
-        );
+        tracing::info!(pool_size = pool_size_usize, "RuntimePool created");
 
         Ok(Self {
             runtimes,
