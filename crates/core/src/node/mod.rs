@@ -1795,23 +1795,22 @@ mod tests {
 
     use super::*;
     use crate::operations::OpError;
+    use rstest::rstest;
 
+    // Hostname resolution tests
     #[tokio::test]
-    async fn test_hostname_resolution() {
+    async fn test_hostname_resolution_localhost() {
         let addr = Address::Hostname("localhost".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         assert!(
             socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
                 || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
         );
-        // Port should be in valid range
-        assert!(socket_addr.port() > 1024); // Ensure we're using unprivileged ports
+        assert!(socket_addr.port() > 1024);
+    }
 
-        let addr = Address::Hostname("google.com".to_string());
-        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
-        // Port should be in valid range
-        assert!(socket_addr.port() > 1024); // Ensure we're using unprivileged ports
-
+    #[tokio::test]
+    async fn test_hostname_resolution_with_port() {
         let addr = Address::Hostname("google.com:8080".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         assert_eq!(socket_addr.port(), 8080);
@@ -1846,42 +1845,37 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // PeerId tests
-    #[test]
-    fn test_peer_id_equality_based_on_addr() {
+    // PeerId equality tests
+    #[rstest]
+    #[case::same_addr_different_keys(8080, 8080, true)]
+    #[case::different_addr_same_key(8080, 8081, false)]
+    fn test_peer_id_equality(
+        #[case] port1: u16,
+        #[case] port2: u16,
+        #[case] expected_equal: bool,
+    ) {
         let keypair1 = TransportKeypair::new();
         let keypair2 = TransportKeypair::new();
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port1);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port2);
 
-        let peer1 = PeerId::new(addr, keypair1.public().clone());
-        let peer2 = PeerId::new(addr, keypair2.public().clone());
+        let peer1 = PeerId::new(addr1, keypair1.public().clone());
+        let peer2 = PeerId::new(addr2, keypair2.public().clone());
 
-        // PeerId equality is based on address, not public key
-        assert_eq!(peer1, peer2);
+        assert_eq!(peer1 == peer2, expected_equal);
     }
 
-    #[test]
-    fn test_peer_id_inequality_different_addr() {
+    #[rstest]
+    #[case::lower_port_first(8080, 8081)]
+    #[case::high_port_diff(1024, 65535)]
+    fn test_peer_id_ordering(#[case] lower_port: u16, #[case] higher_port: u16) {
         let keypair = TransportKeypair::new();
-        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081);
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), lower_port);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), higher_port);
 
         let peer1 = PeerId::new(addr1, keypair.public().clone());
         let peer2 = PeerId::new(addr2, keypair.public().clone());
 
-        assert_ne!(peer1, peer2);
-    }
-
-    #[test]
-    fn test_peer_id_ordering() {
-        let keypair = TransportKeypair::new();
-        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081);
-
-        let peer1 = PeerId::new(addr1, keypair.public().clone());
-        let peer2 = PeerId::new(addr2, keypair.public().clone());
-
-        // Ordering should be consistent
         assert!(peer1 < peer2);
         assert!(peer2 > peer1);
     }
@@ -1953,23 +1947,15 @@ mod tests {
         assert_eq!(init_peer.location, location);
     }
 
-    // is_operation_completed tests
-    #[test]
-    fn test_is_operation_completed_with_none() {
-        let result: Result<Option<OpEnum>, OpError> = Ok(None);
-        assert!(!is_operation_completed(&result));
-    }
-
-    #[test]
-    fn test_is_operation_completed_with_error() {
-        let result: Result<Option<OpEnum>, OpError> =
-            Err(OpError::OpNotAvailable(super::OpNotAvailable::Running));
-        assert!(!is_operation_completed(&result));
-    }
-
-    #[test]
-    fn test_is_operation_completed_with_state_pushed_error() {
-        let result: Result<Option<OpEnum>, OpError> = Err(OpError::StatePushed);
-        assert!(!is_operation_completed(&result));
+    // is_operation_completed tests - parametrized
+    #[rstest]
+    #[case::with_none(Ok(None), false)]
+    #[case::with_running_error(Err(OpError::OpNotAvailable(super::OpNotAvailable::Running)), false)]
+    #[case::with_state_pushed_error(Err(OpError::StatePushed), false)]
+    fn test_is_operation_completed(
+        #[case] result: Result<Option<OpEnum>, OpError>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_operation_completed(&result), expected);
     }
 }
