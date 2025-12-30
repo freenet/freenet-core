@@ -2709,6 +2709,54 @@ mod tests {
     // =========================================================================
     // E2E Simulation Tests - Visualize behavior at different latencies
     // =========================================================================
+    //
+    // These tests simulate data transfers at various RTT latencies and visualize
+    // the LEDBAT controller's behavior (cwnd evolution, slow start, etc.).
+    //
+    // ## Running Larger Transfers
+    //
+    // The default tests use small transfer sizes (256KB-1MB) to keep execution
+    // fast. To test larger transfers for performance analysis:
+    //
+    // ### Option 1: Modify existing tests temporarily
+    // ```rust
+    // // Change transfer size from 512KB to 10MB:
+    // let (snapshots, duration_ms) = simulate_transfer_sync(50, 10 * 1024, 50);
+    // ```
+    //
+    // ### Option 2: Add custom test cases to the parametrized test
+    // ```rust
+    // #[case::large_transfer_50ms(50, 10 * 1024)]  // 10MB @ 50ms
+    // #[case::huge_transfer_100ms(100, 100 * 1024)] // 100MB @ 100ms
+    // ```
+    //
+    // ### Option 3: Create a dedicated large transfer test (ignored by default)
+    // ```rust
+    // #[test]
+    // #[ignore] // Run with: cargo test --ignored test_large_transfer
+    // fn test_large_transfer() {
+    //     let (snapshots, duration_ms) = simulate_transfer_sync(100, 50 * 1024, 1000);
+    //     // 50MB @ 100ms RTT, snapshot every 1 second
+    // }
+    // ```
+    //
+    // ## Execution Time Estimates (real-time sleeps per RTT)
+    //
+    // | Transfer Size | 10ms RTT | 50ms RTT | 100ms RTT | 200ms RTT |
+    // |---------------|----------|----------|-----------|-----------|
+    // | 256KB         | ~0.1s    | ~0.2s    | ~0.3s     | ~0.6s     |
+    // | 1MB           | ~0.3s    | ~0.5s    | ~0.6s     | ~1.8s     |
+    // | 10MB          | ~1s      | ~2s      | ~4s       | ~10s      |
+    // | 100MB         | ~8s      | ~20s     | ~40s      | ~100s     |
+    //
+    // Note: These are rough estimates. Actual time depends on slow start behavior
+    // and steady-state throughput which varies with RTT.
+    //
+    // ## Enabling Periodic Slowdown in Simulations
+    //
+    // The simulation disables periodic slowdowns by default since they require
+    // wall-clock time. To test with slowdowns, set `enable_periodic_slowdown: true`
+    // in the config and accept the longer test duration (slowdown cycles are ~9x RTT).
 
     /// Snapshot of controller state at a point in time
     #[derive(Debug, Clone)]
