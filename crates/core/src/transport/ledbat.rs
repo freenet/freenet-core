@@ -22,7 +22,8 @@
 //! ## Periodic Slowdown Mechanism
 //!
 //! LEDBAT++ introduces periodic slowdowns to solve the "latecomer advantage" problem:
-//! - After initial slow start exit, wait 2 RTTs then reduce cwnd to 2 packets
+//! - After initial slow start exit, wait 2 RTTs then reduce cwnd by 16x (not to minimum)
+//! - This proportional reduction is consistent with our large initial window (IW26)
 //! - Freeze cwnd for 2 RTTs to allow base delay re-measurement
 //! - Ramp back up using slow start until reaching previous cwnd
 //! - Schedule next slowdown at 9x the slowdown duration (maintains ≤10% utilization impact)
@@ -68,6 +69,12 @@ const SLOWDOWN_DELAY_RTTS: u32 = 2;
 
 /// Number of RTTs to freeze cwnd at minimum during slowdown
 const SLOWDOWN_FREEZE_RTTS: u32 = 2;
+
+/// Slowdown reduction factor: cwnd is divided by this during periodic slowdowns.
+/// We use 16 to be consistent with our large initial window (IW26).
+/// This means a 300KB cwnd drops to ~18KB, not 2.8KB.
+/// Still provides significant reduction for fairness while enabling faster recovery.
+const SLOWDOWN_REDUCTION_FACTOR: usize = 16;
 
 /// Configuration for LEDBAT++ with slow start and periodic slowdowns
 #[derive(Debug, Clone)]
@@ -852,7 +859,7 @@ impl LedbatController {
                 true
             }
             s if s == SlowdownState::Frozen as u8 => {
-                // Frozen at min_cwnd, counting RTTs until we can ramp up
+                // Frozen at reduced cwnd, counting RTTs until we can ramp up
                 let phase_start = self.slowdown_phase_start_nanos.load(Ordering::Acquire);
                 let freeze_duration = base_delay.as_nanos() as u64 * SLOWDOWN_FREEZE_RTTS as u64;
 
@@ -866,8 +873,11 @@ impl LedbatController {
                         "LEDBAT++ slowdown: starting ramp-up phase"
                     );
                 }
-                // Keep cwnd at minimum during freeze
-                self.cwnd.store(self.min_cwnd, Ordering::Release);
+                // Keep cwnd at proportionally reduced level during freeze
+                // (already set in start_slowdown, just maintain it)
+                let pre_slowdown = self.pre_slowdown_cwnd.load(Ordering::Relaxed);
+                let frozen_cwnd = (pre_slowdown / SLOWDOWN_REDUCTION_FACTOR).max(self.min_cwnd);
+                self.cwnd.store(frozen_cwnd, Ordering::Release);
                 true
             }
             s if s == SlowdownState::RampingUp as u8 => {
@@ -898,8 +908,10 @@ impl LedbatController {
         self.ssthresh.store(current_cwnd, Ordering::Release);
         self.pre_slowdown_cwnd.store(current_cwnd, Ordering::Release);
 
-        // Reduce cwnd to minimum (2 packets)
-        self.cwnd.store(self.min_cwnd, Ordering::Release);
+        // Reduce cwnd proportionally (consistent with our large initial window)
+        // Drop to cwnd/16 but never below min_cwnd (2 packets)
+        let slowdown_cwnd = (current_cwnd / SLOWDOWN_REDUCTION_FACTOR).max(self.min_cwnd);
+        self.cwnd.store(slowdown_cwnd, Ordering::Release);
 
         // Update state
         self.slowdown_state
@@ -910,8 +922,9 @@ impl LedbatController {
 
         tracing::debug!(
             old_cwnd_kb = current_cwnd / 1024,
-            new_cwnd_kb = self.min_cwnd / 1024,
-            "LEDBAT++ periodic slowdown: reducing cwnd to minimum"
+            new_cwnd_kb = slowdown_cwnd / 1024,
+            reduction_factor = SLOWDOWN_REDUCTION_FACTOR,
+            "LEDBAT++ periodic slowdown: reducing cwnd proportionally"
         );
     }
 
