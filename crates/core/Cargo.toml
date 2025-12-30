@@ -114,6 +114,7 @@ freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
 httptest = "0.16"
 libc = "0.2"  # For sendmmsg syscall batching benchmarks
+rstest = "0.25"
 statrs = "0.18"
 tempfile = "3"
 test-log = "0.2"

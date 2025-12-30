@@ -375,8 +375,8 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 PutEvent::BroadcastReceived { .. } => "put_broadcast_received".to_string(),
             }
         }
-        EventKind::Get { .. } => "get_success".to_string(),
-        EventKind::Subscribed { .. } => "subscribed".to_string(),
+        EventKind::Get(..) => "get_success".to_string(),
+        EventKind::Subscribe(..) => "subscribed".to_string(),
         EventKind::Update(update_event) => {
             use super::UpdateEvent;
             match update_event {
@@ -388,6 +388,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
         }
         EventKind::Route(_) => "route".to_string(),
         EventKind::Ignored => "ignored".to_string(),
+        EventKind::Timeout { .. } => "timeout".to_string(),
     }
 }
 
@@ -396,13 +397,15 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
         EventKind::Connect(connect_event) => {
             use super::ConnectEvent;
             match connect_event {
-                ConnectEvent::StartConnection { from } => {
+                ConnectEvent::StartConnection { from, .. } => {
                     serde_json::json!({
                         "type": "start_connection",
                         "from": from.to_string(),
                     })
                 }
-                ConnectEvent::Connected { this, connected } => {
+                ConnectEvent::Connected {
+                    this, connected, ..
+                } => {
                     serde_json::json!({
                         "type": "connected",
                         "this_peer": this.to_string(),
@@ -412,6 +415,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 ConnectEvent::Finished {
                     initiator,
                     location,
+                    ..
                 } => {
                     serde_json::json!({
                         "type": "finished",
@@ -421,7 +425,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 }
             }
         }
-        EventKind::Disconnected { from } => {
+        EventKind::Disconnected { from, .. } => {
             serde_json::json!({
                 "type": "disconnected",
                 "from": from.to_string(),
@@ -436,6 +440,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     key,
                     id,
                     timestamp,
+                    ..
                 } => {
                     serde_json::json!({
                         "type": "request",
@@ -452,6 +457,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     key,
                     id,
                     timestamp,
+                    ..
                 } => {
                     serde_json::json!({
                         "type": "success",
@@ -502,37 +508,109 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 }
             }
         }
-        EventKind::Get {
-            id,
-            key,
-            timestamp,
-            requester,
-            target,
-        } => {
-            serde_json::json!({
-                "type": "get_success",
-                "id": id.to_string(),
-                "key": key.to_string(),
-                "timestamp": timestamp,
-                "requester": requester.to_string(),
-                "target": target.to_string(),
-            })
+        EventKind::Get(get_event) => {
+            use super::GetEvent;
+            match get_event {
+                GetEvent::Request {
+                    id,
+                    requester,
+                    instance_id,
+                    target,
+                    timestamp,
+                    ..
+                } => {
+                    serde_json::json!({
+                        "type": "get_request",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "target": target.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                GetEvent::GetSuccess {
+                    id,
+                    requester,
+                    target,
+                    key,
+                    timestamp,
+                    ..
+                } => {
+                    serde_json::json!({
+                        "type": "get_success",
+                        "id": id.to_string(),
+                        "key": key.to_string(),
+                        "timestamp": timestamp,
+                        "requester": requester.to_string(),
+                        "target": target.to_string(),
+                    })
+                }
+                GetEvent::GetNotFound {
+                    id,
+                    requester,
+                    instance_id,
+                    timestamp,
+                    ..
+                } => {
+                    serde_json::json!({
+                        "type": "get_not_found",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+            }
         }
-        EventKind::Subscribed {
-            id,
-            key,
-            at,
-            timestamp,
-            requester,
-        } => {
-            serde_json::json!({
-                "type": "subscribed",
-                "id": id.to_string(),
-                "key": key.to_string(),
-                "at": at.to_string(),
-                "timestamp": timestamp,
-                "requester": requester.to_string(),
-            })
+        EventKind::Subscribe(subscribe_event) => {
+            use super::SubscribeEvent;
+            match subscribe_event {
+                SubscribeEvent::Request {
+                    id,
+                    requester,
+                    instance_id,
+                    target,
+                    timestamp,
+                    ..
+                } => {
+                    serde_json::json!({
+                        "type": "subscribe_request",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "target": target.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::SubscribeSuccess {
+                    id,
+                    key,
+                    at,
+                    timestamp,
+                    ..
+                } => {
+                    serde_json::json!({
+                        "type": "subscribed",
+                        "id": id.to_string(),
+                        "key": key.to_string(),
+                        "at": at.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::SubscribeNotFound {
+                    id,
+                    instance_id,
+                    timestamp,
+                    ..
+                } => {
+                    serde_json::json!({
+                        "type": "subscribe_not_found",
+                        "id": id.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+            }
         }
         EventKind::Update(update_event) => {
             use super::UpdateEvent;
@@ -617,6 +695,13 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
         }
         EventKind::Ignored => {
             serde_json::json!({"type": "ignored"})
+        }
+        EventKind::Timeout { id, timestamp } => {
+            serde_json::json!({
+                "type": "timeout",
+                "id": id.to_string(),
+                "timestamp": timestamp,
+            })
         }
     }
 }
