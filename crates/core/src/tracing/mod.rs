@@ -1546,6 +1546,8 @@ pub enum EventKind {
     Subscribe(SubscribeEvent),
     Route(RouteEvent),
     Update(UpdateEvent),
+    /// Data transfer events for stream-level transfers.
+    Transfer(TransferEvent),
     Ignored,
     Disconnected {
         from: PeerId,
@@ -1579,6 +1581,7 @@ impl EventKind {
     const DISCONNECTED: u8 = 6;
     const UPDATE: u8 = 7;
     const TIMEOUT: u8 = 8;
+    const TRANSFER: u8 = 9;
 
     const fn varint_id(&self) -> u8 {
         match self {
@@ -1591,6 +1594,7 @@ impl EventKind {
             EventKind::Disconnected { .. } => Self::DISCONNECTED,
             EventKind::Update(_) => Self::UPDATE,
             EventKind::Timeout { .. } => Self::TIMEOUT,
+            EventKind::Transfer(_) => Self::TRANSFER,
         }
     }
 }
@@ -1665,10 +1669,10 @@ impl From<Option<String>> for DisconnectReason {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[allow(clippy::large_enum_variant)] // Connected variant needs PeerKeyLocation for observability
 enum ConnectEvent {
+    /// Initial connection start (legacy event - see RequestSent/RequestReceived for detailed tracking).
     StartConnection {
         from: PeerId,
         /// Whether this is a connection to a gateway node.
-        /// TODO(#2456): Populate from connect operation context - currently always false.
         is_gateway: bool,
     },
     Connected {
@@ -1690,14 +1694,58 @@ enum ConnectEvent {
         /// Helps trace connection establishment patterns.
         initiated_by: Option<PeerId>,
     },
-    /// Connection process finished.
-    /// TODO(#2456): This variant is defined but not currently emitted.
-    /// Implementation requires hooking into connect operation completion.
+    /// Connection process finished (legacy event - see RequestSent/RequestReceived/ResponseReceived for detailed tracking).
     Finished {
         initiator: PeerId,
         location: Location,
         /// Time elapsed since connection started (milliseconds).
         elapsed_ms: Option<u64>,
+    },
+
+    // === Protocol Message Events ===
+    // These track the actual ConnectRequest/Response messages flowing through the network,
+    // enabling visualization of message routing paths in the dashboard.
+    /// A ConnectRequest message was sent (by joiner or forwarded by relay).
+    RequestSent {
+        /// The target ring location this request is routing toward.
+        desired_location: Location,
+        /// The joiner's identity and location.
+        joiner: PeerKeyLocation,
+        /// The peer we're sending this request to.
+        target: PeerKeyLocation,
+        /// Remaining hops-to-live.
+        ttl: u8,
+        /// True if this is the initial send from the joiner (not a forward).
+        is_initial: bool,
+    },
+    /// A ConnectRequest message was received.
+    RequestReceived {
+        /// The target ring location this request is routing toward.
+        desired_location: Location,
+        /// The joiner's identity and location.
+        joiner: PeerKeyLocation,
+        /// The peer that sent us this request.
+        from_peer: PeerKeyLocation,
+        /// Where we're forwarding to (None if we're at terminus).
+        forwarded_to: Option<PeerKeyLocation>,
+        /// Whether we accepted this connection request.
+        accepted: bool,
+        /// Remaining hops-to-live when received.
+        ttl: u8,
+    },
+    /// A ConnectResponse message was sent (acceptor sending back to joiner).
+    ResponseSent {
+        /// The acceptor (us) who is accepting the connection.
+        acceptor: PeerKeyLocation,
+        /// The joiner we're accepting.
+        joiner: PeerKeyLocation,
+    },
+    /// A ConnectResponse message was received (joiner receiving from acceptor).
+    ResponseReceived {
+        /// The acceptor who accepted our connection request.
+        acceptor: PeerKeyLocation,
+        /// Time elapsed since we sent the original request (milliseconds).
+        elapsed_ms: u64,
     },
 }
 
@@ -1986,6 +2034,88 @@ enum SubscribeEvent {
         hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
+        timestamp: u64,
+    },
+}
+
+/// Direction of data transfer.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum TransferDirection {
+    /// Sending data to a peer.
+    Send,
+    /// Receiving data from a peer.
+    Receive,
+}
+
+/// Data transfer events for tracking stream-level transfers.
+///
+/// These events track the start and completion of data transfers between peers,
+/// including LEDBAT congestion control metrics. This enables:
+/// - Monitoring transfer throughput and latency
+/// - Debugging LEDBAT behavior (slowdowns, cwnd evolution)
+/// - Identifying bottlenecks in data propagation
+///
+/// Note: Individual packets are NOT reported to avoid flooding the telemetry system.
+/// Only transfer-level events (start/complete/failed) are emitted.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+enum TransferEvent {
+    /// A data stream transfer has started.
+    Started {
+        /// Unique identifier for this stream.
+        stream_id: u64,
+        /// The remote peer we're transferring with.
+        peer: PeerKeyLocation,
+        /// Contract instance this transfer is for (if applicable).
+        contract_instance: Option<ContractInstanceId>,
+        /// Total expected bytes to transfer.
+        expected_bytes: u64,
+        /// Whether we're sending or receiving.
+        direction: TransferDirection,
+        /// Transaction ID associated with this transfer.
+        tx_id: Option<Transaction>,
+        timestamp: u64,
+    },
+    /// A data stream transfer completed successfully.
+    Completed {
+        /// Unique identifier for this stream.
+        stream_id: u64,
+        /// The remote peer we transferred with.
+        peer: PeerKeyLocation,
+        /// Actual bytes transferred.
+        bytes_transferred: u64,
+        /// Time elapsed from start to completion (milliseconds).
+        elapsed_ms: u64,
+        /// Average throughput (bytes per second).
+        avg_throughput_bps: u64,
+        /// Peak congestion window during transfer (bytes).
+        peak_cwnd_bytes: Option<u32>,
+        /// Final congestion window at completion (bytes).
+        final_cwnd_bytes: Option<u32>,
+        /// Number of LEDBAT slowdowns triggered during transfer.
+        /// A high count indicates congestion or competing flows.
+        slowdowns_triggered: Option<u32>,
+        /// Final smoothed RTT at completion (milliseconds).
+        final_srtt_ms: Option<u32>,
+        /// Whether we were sending or receiving.
+        direction: TransferDirection,
+        timestamp: u64,
+    },
+    /// A data stream transfer failed.
+    Failed {
+        /// Unique identifier for this stream.
+        stream_id: u64,
+        /// The remote peer we were transferring with.
+        peer: PeerKeyLocation,
+        /// Bytes transferred before failure.
+        bytes_transferred: u64,
+        /// Reason for failure.
+        reason: String,
+        /// Time elapsed before failure (milliseconds).
+        elapsed_ms: u64,
+        /// Whether we were sending or receiving.
+        direction: TransferDirection,
         timestamp: u64,
     },
 }

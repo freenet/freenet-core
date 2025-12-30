@@ -371,7 +371,18 @@ impl TelemetryWorker {
 
 fn event_kind_to_string(kind: &EventKind) -> String {
     match kind {
-        EventKind::Connect(_) => "connect".to_string(),
+        EventKind::Connect(connect_event) => {
+            use super::ConnectEvent;
+            match connect_event {
+                ConnectEvent::StartConnection { .. } => "connect_start".to_string(),
+                ConnectEvent::Connected { .. } => "connect_connected".to_string(),
+                ConnectEvent::Finished { .. } => "connect_finished".to_string(),
+                ConnectEvent::RequestSent { .. } => "connect_request_sent".to_string(),
+                ConnectEvent::RequestReceived { .. } => "connect_request_received".to_string(),
+                ConnectEvent::ResponseSent { .. } => "connect_response_sent".to_string(),
+                ConnectEvent::ResponseReceived { .. } => "connect_response_received".to_string(),
+            }
+        }
         EventKind::Disconnected { .. } => "disconnect".to_string(),
         EventKind::Put(put_event) => {
             use super::PutEvent;
@@ -400,6 +411,14 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 UpdateEvent::UpdateSuccess { .. } => "update_success".to_string(),
                 UpdateEvent::BroadcastEmitted { .. } => "update_broadcast_emitted".to_string(),
                 UpdateEvent::BroadcastReceived { .. } => "update_broadcast_received".to_string(),
+            }
+        }
+        EventKind::Transfer(transfer_event) => {
+            use super::TransferEvent;
+            match transfer_event {
+                TransferEvent::Started { .. } => "transfer_started".to_string(),
+                TransferEvent::Completed { .. } => "transfer_completed".to_string(),
+                TransferEvent::Failed { .. } => "transfer_failed".to_string(),
             }
         }
         EventKind::Route(_) => "route".to_string(),
@@ -449,6 +468,57 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "type": "finished",
                         "initiator": initiator.to_string(),
                         "location": location.as_f64(),
+                        "elapsed_ms": elapsed_ms,
+                    })
+                }
+                ConnectEvent::RequestSent {
+                    desired_location,
+                    joiner,
+                    target,
+                    ttl,
+                    is_initial,
+                } => {
+                    serde_json::json!({
+                        "type": "request_sent",
+                        "desired_location": desired_location.as_f64(),
+                        "joiner": joiner.to_string(),
+                        "target": target.to_string(),
+                        "ttl": ttl,
+                        "is_initial": is_initial,
+                    })
+                }
+                ConnectEvent::RequestReceived {
+                    desired_location,
+                    joiner,
+                    from_peer,
+                    forwarded_to,
+                    accepted,
+                    ttl,
+                } => {
+                    serde_json::json!({
+                        "type": "request_received",
+                        "desired_location": desired_location.as_f64(),
+                        "joiner": joiner.to_string(),
+                        "from_peer": from_peer.to_string(),
+                        "forwarded_to": forwarded_to.as_ref().map(|p| p.to_string()),
+                        "accepted": accepted,
+                        "ttl": ttl,
+                    })
+                }
+                ConnectEvent::ResponseSent { acceptor, joiner } => {
+                    serde_json::json!({
+                        "type": "response_sent",
+                        "acceptor": acceptor.to_string(),
+                        "joiner": joiner.to_string(),
+                    })
+                }
+                ConnectEvent::ResponseReceived {
+                    acceptor,
+                    elapsed_ms,
+                } => {
+                    serde_json::json!({
+                        "type": "response_received",
+                        "acceptor": acceptor.to_string(),
                         "elapsed_ms": elapsed_ms,
                     })
                 }
@@ -791,6 +861,79 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "key": key.to_string(),
                         "id": id.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+            }
+        }
+        EventKind::Transfer(transfer_event) => {
+            use super::TransferEvent;
+            match transfer_event {
+                TransferEvent::Started {
+                    stream_id,
+                    peer,
+                    contract_instance,
+                    expected_bytes,
+                    direction,
+                    tx_id,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "started",
+                        "stream_id": stream_id,
+                        "peer": peer.to_string(),
+                        "contract_instance": contract_instance.as_ref().map(|c| c.to_string()),
+                        "expected_bytes": expected_bytes,
+                        "direction": format!("{:?}", direction),
+                        "tx_id": tx_id.as_ref().map(|t| t.to_string()),
+                        "timestamp": timestamp,
+                    })
+                }
+                TransferEvent::Completed {
+                    stream_id,
+                    peer,
+                    bytes_transferred,
+                    elapsed_ms,
+                    avg_throughput_bps,
+                    peak_cwnd_bytes,
+                    final_cwnd_bytes,
+                    slowdowns_triggered,
+                    final_srtt_ms,
+                    direction,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "completed",
+                        "stream_id": stream_id,
+                        "peer": peer.to_string(),
+                        "bytes_transferred": bytes_transferred,
+                        "elapsed_ms": elapsed_ms,
+                        "avg_throughput_bps": avg_throughput_bps,
+                        "peak_cwnd_bytes": peak_cwnd_bytes,
+                        "final_cwnd_bytes": final_cwnd_bytes,
+                        "slowdowns_triggered": slowdowns_triggered,
+                        "final_srtt_ms": final_srtt_ms,
+                        "direction": format!("{:?}", direction),
+                        "timestamp": timestamp,
+                    })
+                }
+                TransferEvent::Failed {
+                    stream_id,
+                    peer,
+                    bytes_transferred,
+                    reason,
+                    elapsed_ms,
+                    direction,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "failed",
+                        "stream_id": stream_id,
+                        "peer": peer.to_string(),
+                        "bytes_transferred": bytes_transferred,
+                        "reason": reason,
+                        "elapsed_ms": elapsed_ms,
+                        "direction": format!("{:?}", direction),
                         "timestamp": timestamp,
                     })
                 }
