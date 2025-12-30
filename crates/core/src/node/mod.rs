@@ -370,22 +370,26 @@ impl NodeConfig {
         clients: [BoxedClient; CLIENTS],
     ) -> anyhow::Result<(Node, crate::tracing::EventFlushHandle)> {
         let (event_register, flush_handle) = {
+            use super::tracing::{DynamicRegister, TelemetryReporter};
+
+            let event_reg = EventRegister::new(self.config.event_log());
+            let flush_handle = event_reg.flush_handle();
+
+            let mut registers: Vec<Box<dyn NetEventRegister>> = vec![Box::new(event_reg)];
+
+            // Add OpenTelemetry register if feature enabled
             #[cfg(feature = "trace-ot")]
             {
-                use super::tracing::{CombinedRegister, OTEventRegister};
-                let event_reg = EventRegister::new(self.config.event_log());
-                let flush_handle = event_reg.flush_handle();
-                (
-                    CombinedRegister::new([Box::new(event_reg), Box::new(OTEventRegister::new())]),
-                    flush_handle,
-                )
+                use super::tracing::OTEventRegister;
+                registers.push(Box::new(OTEventRegister::new()));
             }
-            #[cfg(not(feature = "trace-ot"))]
-            {
-                let event_reg = EventRegister::new(self.config.event_log());
-                let flush_handle = event_reg.flush_handle();
-                (event_reg, flush_handle)
+
+            // Add telemetry reporter if enabled in config
+            if let Some(telemetry) = TelemetryReporter::new(&self.config.telemetry) {
+                registers.push(Box::new(telemetry));
             }
+
+            (DynamicRegister::new(registers), flush_handle)
         };
         let cfg = self.config.clone();
         let (node_inner, shutdown_tx) = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(

@@ -470,34 +470,58 @@ async fn test_update_contract(ctx: &mut TestContext) -> TestResult {
     }
 
     // Verify the updated state with GET
+    // The UPDATE response indicates the operation was accepted, but state persistence/propagation
+    // may have a small delay. Poll until the expected version is observed.
     {
-        // Wait for get response from node A
-        let (response_contract, response_state) =
-            get_contract(&mut client_api_a, contract_key, &gateway.temp_dir_path).await?;
-
-        assert_eq!(
-            response_contract.key(),
-            contract_key,
-            "Contract key mismatch in GET response"
-        );
-        assert_eq!(
-            response_contract, contract,
-            "Contract content mismatch in GET response"
-        );
-
-        // Compare the deserialized updated content
-        let response_todo_list: test_utils::TodoList =
-            serde_json::from_slice(response_state.as_ref())
-                .expect("Failed to deserialize response state");
+        const MAX_VERSION_POLL_ATTEMPTS: usize = 10;
+        const VERSION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
         let expected_todo_list: test_utils::TodoList =
             serde_json::from_slice(updated_state.as_ref())
                 .expect("Failed to deserialize expected state");
 
-        assert_eq!(
-            response_todo_list.version, expected_version_after_update,
-            "Version should match"
-        );
+        let mut response_todo_list: Option<test_utils::TodoList> = None;
+
+        for attempt in 1..=MAX_VERSION_POLL_ATTEMPTS {
+            let (response_contract, response_state) =
+                get_contract(&mut client_api_a, contract_key, &gateway.temp_dir_path).await?;
+
+            assert_eq!(
+                response_contract.key(),
+                contract_key,
+                "Contract key mismatch in GET response"
+            );
+            assert_eq!(
+                response_contract, contract,
+                "Contract content mismatch in GET response"
+            );
+
+            let todo_list: test_utils::TodoList = serde_json::from_slice(response_state.as_ref())
+                .expect("Failed to deserialize response state");
+
+            tracing::info!(
+                "Version poll attempt {attempt}/{MAX_VERSION_POLL_ATTEMPTS}: got version {}, expected {}",
+                todo_list.version,
+                expected_version_after_update
+            );
+
+            if todo_list.version == expected_version_after_update {
+                response_todo_list = Some(todo_list);
+                break;
+            }
+
+            if attempt < MAX_VERSION_POLL_ATTEMPTS {
+                tokio::time::sleep(VERSION_POLL_INTERVAL).await;
+            }
+        }
+
+        let response_todo_list = response_todo_list.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Version mismatch after {} attempts: expected {}, never observed",
+                MAX_VERSION_POLL_ATTEMPTS,
+                expected_version_after_update
+            )
+        })?;
 
         assert_eq!(
             response_todo_list.tasks.len(),
@@ -4083,28 +4107,55 @@ async fn test_subscription_pruning_sends_unsubscribed(ctx: &mut TestContext) -> 
     );
     tracing::info!("✓ Peer-A has local client subscription");
 
-    // Verify Gateway has Peer-A as subscriber
-    make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
+    // Verify Gateway has Peer-A as subscriber (with retry for eventual consistency)
+    // The subscription registration may have a small delay due to async processing
+    let max_retries = 10;
+    let mut gateway_subscribers_after_subscribe = Vec::new();
+    for attempt in 0..max_retries {
+        make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
 
-    let gateway_subscribers_after_subscribe = loop {
-        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
-        match resp {
-            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
-                let subs = diag
-                    .contract_states
-                    .get(&contract_key)
-                    .map(|cs| cs.subscriber_peer_ids.clone())
-                    .unwrap_or_default();
-                tracing::info!("Gateway subscribers after subscribe: {:?}", subs);
-                break subs;
+        let subs = loop {
+            let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+            match resp {
+                HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                    let subs = diag
+                        .contract_states
+                        .get(&contract_key)
+                        .map(|cs| cs.subscriber_peer_ids.clone())
+                        .unwrap_or_default();
+                    break subs;
+                }
+                other => tracing::warn!("Unexpected: {:?}", other),
             }
-            other => tracing::warn!("Unexpected: {:?}", other),
+        };
+
+        tracing::info!(
+            "Gateway subscribers after subscribe (attempt {}): {:?}",
+            attempt + 1,
+            subs
+        );
+
+        if subs.contains(&peer_a_peer_id) {
+            gateway_subscribers_after_subscribe = subs;
+            break;
         }
-    };
+
+        if attempt < max_retries - 1 {
+            tracing::info!(
+                "Subscriber not yet registered, retrying in 1s (attempt {}/{})",
+                attempt + 1,
+                max_retries
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        } else {
+            gateway_subscribers_after_subscribe = subs;
+        }
+    }
 
     assert!(
         gateway_subscribers_after_subscribe.contains(&peer_a_peer_id),
-        "Gateway should have Peer-A as subscriber. peer_id={}, subscribers={:?}",
+        "Gateway should have Peer-A as subscriber after {} retries. peer_id={}, subscribers={:?}",
+        max_retries,
         peer_a_peer_id,
         gateway_subscribers_after_subscribe
     );

@@ -87,6 +87,9 @@ pub struct ConfigArgs {
     /// Default: 2x CPU cores, clamped to 4-32.
     #[arg(long, env = "MAX_BLOCKING_THREADS")]
     pub max_blocking_threads: Option<usize>,
+
+    #[command(flatten)]
+    pub telemetry: TelemetryArgs,
 }
 
 impl Default for ConfigArgs {
@@ -124,6 +127,7 @@ impl Default for ConfigArgs {
             id: None,
             version: false,
             max_blocking_threads: None,
+            telemetry: Default::default(),
         }
     }
 }
@@ -287,6 +291,17 @@ impl ConfigArgs {
                 .get_or_insert(cfg.network_api.max_connections);
             self.log_level.get_or_insert(cfg.log_level);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
+            // Merge telemetry config - CLI args override file config
+            // Note: enabled defaults to true via clap, so we only override
+            // if the config file explicitly sets it to false
+            if !cfg.telemetry.enabled {
+                self.telemetry.enabled = false;
+            }
+            if self.telemetry.endpoint.is_none() {
+                self.telemetry
+                    .endpoint
+                    .get_or_insert(cfg.telemetry.endpoint);
+            }
         }
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
@@ -475,6 +490,13 @@ impl ConfigArgs {
             max_blocking_threads: self
                 .max_blocking_threads
                 .unwrap_or_else(default_max_blocking_threads),
+            telemetry: TelemetryConfig {
+                enabled: self.telemetry.enabled,
+                endpoint: self
+                    .telemetry
+                    .endpoint
+                    .unwrap_or_else(|| DEFAULT_TELEMETRY_ENDPOINT.to_string()),
+            },
         };
 
         fs::create_dir_all(this.config_dir())?;
@@ -561,6 +583,9 @@ pub struct Config {
     /// Maximum number of threads for blocking operations (WASM execution, etc.).
     #[serde(default = "default_max_blocking_threads")]
     pub max_blocking_threads: usize,
+    /// Telemetry configuration
+    #[serde(flatten)]
+    pub telemetry: TelemetryConfig,
 }
 
 /// Default max blocking threads: 2x CPU cores, clamped to 4-32.
@@ -851,6 +876,65 @@ pub struct WebsocketApiArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub token_cleanup_interval_seconds: Option<u64>,
+}
+
+/// Default telemetry endpoint (nova.locut.us OTLP collector).
+/// Using domain name for resilience to IP changes.
+pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
+
+#[derive(clap::Parser, Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryArgs {
+    /// Enable telemetry reporting to help improve Freenet (default: true during alpha).
+    /// Telemetry includes operation timing and network topology data, but never contract content.
+    #[arg(
+        long = "telemetry-enabled",
+        env = "FREENET_TELEMETRY_ENABLED",
+        default_value = "true"
+    )]
+    #[serde(rename = "telemetry-enabled", default = "default_telemetry_enabled")]
+    pub enabled: bool,
+
+    /// Telemetry endpoint URL (OTLP/HTTP format)
+    #[arg(long = "telemetry-endpoint", env = "FREENET_TELEMETRY_ENDPOINT")]
+    #[serde(rename = "telemetry-endpoint", skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+impl Default for TelemetryArgs {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: None,
+        }
+    }
+}
+
+fn default_telemetry_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    /// Whether telemetry reporting is enabled
+    #[serde(default = "default_telemetry_enabled", rename = "telemetry-enabled")]
+    pub enabled: bool,
+
+    /// Telemetry endpoint URL
+    #[serde(default = "default_telemetry_endpoint", rename = "telemetry-endpoint")]
+    pub endpoint: String,
+}
+
+fn default_telemetry_endpoint() -> String {
+    DEFAULT_TELEMETRY_ENDPOINT.to_string()
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: DEFAULT_TELEMETRY_ENDPOINT.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
