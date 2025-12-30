@@ -509,6 +509,25 @@ impl ConnectionManager {
         self.prune_connection(addr, false)
     }
 
+    /// Get the duration of an existing connection by address in milliseconds.
+    /// Returns None if the connection doesn't exist.
+    pub fn get_connection_duration_ms(&self, addr: SocketAddr) -> Option<u64> {
+        let loc = {
+            let locations_for_peer = self.location_for_peer.read();
+            locations_for_peer.get(&addr).cloned()?
+        };
+
+        let conns = self.connections_by_location.read();
+        if let Some(conns) = conns.get(&loc) {
+            for conn in conns {
+                if conn.location.socket_addr() == Some(addr) {
+                    return Some(conn.duration_ms());
+                }
+            }
+        }
+        None
+    }
+
     pub fn add_connection(
         &self,
         loc: Location,
@@ -570,9 +589,9 @@ impl ConnectionManager {
 
         {
             let mut cbl = self.connections_by_location.write();
-            cbl.entry(loc).or_default().push(Connection {
-                location: PeerKeyLocation::new(pub_key, addr),
-            });
+            cbl.entry(loc)
+                .or_default()
+                .push(Connection::new(PeerKeyLocation::new(pub_key, addr)));
         }
     }
 
@@ -624,9 +643,7 @@ impl ConnectionManager {
                 peer_location = %loc,
                 "update_peer_identity: connection entry missing; creating placeholder"
             );
-            entry.push(Connection {
-                location: PeerKeyLocation::new(new_pub_key, new_addr),
-            });
+            entry.push(Connection::new(PeerKeyLocation::new(new_pub_key, new_addr)));
         }
 
         true

@@ -20,7 +20,9 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
     ring::{KnownPeerKeyLocation, Location},
+    tracing::{NetEventLog, OperationFailure},
 };
+use either::Either;
 
 pub(crate) struct PutOp {
     pub id: Transaction,
@@ -86,6 +88,15 @@ impl PutOp {
         }
     }
 
+    /// Get the current HTL (remaining hops) for this operation.
+    /// Returns None if the operation is not in AwaitingResponse state.
+    pub(crate) fn get_current_htl(&self) -> Option<usize> {
+        match &self.state {
+            Some(PutState::AwaitingResponse { current_htl, .. }) => Some(*current_htl),
+            _ => None,
+        }
+    }
+
     /// Handle aborted connections by failing the operation immediately.
     ///
     /// PUT operations don't have alternative routes to try. When the connection
@@ -95,6 +106,33 @@ impl PutOp {
             tx = %self.id,
             "Put operation aborted due to connection failure"
         );
+
+        // Extract key and current_htl from state if available
+        let (key, current_htl) = match &self.state {
+            Some(PutState::PrepareRequest { contract, htl, .. }) => {
+                (Some(contract.key()), Some(*htl))
+            }
+            Some(PutState::AwaitingResponse { current_htl, .. }) => (None, Some(*current_htl)),
+            Some(PutState::Finished { key }) => (Some(*key), None),
+            None => (None, None),
+        };
+
+        // Calculate hop_count: max_htl - current_htl
+        let hop_count = current_htl.map(|htl| op_manager.ring.max_hops_to_live.saturating_sub(htl));
+
+        // Emit failure event if we have the key
+        if let Some(key) = key {
+            op_manager
+                .ring
+                .register_events(Either::Left(NetEventLog::put_failure(
+                    &self.id,
+                    &op_manager.ring,
+                    key,
+                    OperationFailure::ConnectionDropped,
+                    hop_count,
+                )))
+                .await;
+        }
 
         // Create an error result to notify the client
         let error_result: crate::client_events::HostResult =
@@ -344,6 +382,7 @@ impl Operation for PutOp {
                         let new_state = Some(PutState::AwaitingResponse {
                             subscribe,
                             next_hop: Some(next_addr),
+                            current_htl: htl,
                         });
 
                         Ok(OperationResult {
@@ -607,6 +646,8 @@ pub enum PutState {
         subscribe: bool,
         /// Next hop address for routing the outbound message
         next_hop: Option<std::net::SocketAddr>,
+        /// Current HTL (remaining hops) for hop_count calculation.
+        current_htl: usize,
     },
     /// Operation completed successfully.
     Finished { key: ContractKey },
@@ -669,6 +710,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
         state: Some(PutState::AwaitingResponse {
             subscribe,
             next_hop: None,
+            current_htl: htl,
         }),
         upstream_addr: None,
     };
@@ -840,6 +882,7 @@ mod tests {
         let op = make_put_op(Some(PutState::AwaitingResponse {
             subscribe: false,
             next_hop: None,
+            current_htl: 10,
         }));
         assert!(
             !op.finalized(),
@@ -873,6 +916,7 @@ mod tests {
         let op = make_put_op(Some(PutState::AwaitingResponse {
             subscribe: false,
             next_hop: None,
+            current_htl: 10,
         }));
         let result = op.to_host_result();
         assert!(
@@ -908,6 +952,7 @@ mod tests {
         let op = make_put_op(Some(PutState::AwaitingResponse {
             subscribe: false,
             next_hop: None,
+            current_htl: 10,
         }));
         assert!(
             !op.is_completed(),

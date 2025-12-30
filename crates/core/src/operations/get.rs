@@ -13,7 +13,9 @@ use crate::{
     node::{NetworkBridge, OpManager},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
+    tracing::{NetEventLog, OperationFailure},
 };
+use either::Either;
 
 use super::{OpEnum, OpError, OpOutcome, OperationResult};
 
@@ -626,6 +628,19 @@ impl GetOp {
                     "GET: Connection aborted, no peers available - local operation fails"
                 );
 
+                // Emit failure event with hop_count
+                let hop_count = Some(op_manager.ring.max_hops_to_live.saturating_sub(current_hop));
+                op_manager
+                    .ring
+                    .register_events(Either::Left(NetEventLog::get_failure(
+                        &self.id,
+                        &op_manager.ring,
+                        instance_id,
+                        OperationFailure::NoPeersAvailable,
+                        hop_count,
+                    )))
+                    .await;
+
                 let failed_op = GetOp {
                     id: self.id,
                     state: None,
@@ -674,6 +689,15 @@ impl GetOp {
     pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.state {
             Some(GetState::AwaitingResponse { next_hop, .. }) => next_hop.socket_addr(),
+            _ => None,
+        }
+    }
+
+    /// Get the current hop count (remaining HTL) for this operation.
+    /// Returns None if the operation is not in AwaitingResponse state.
+    pub(crate) fn get_current_hop(&self) -> Option<usize> {
+        match &self.state {
+            Some(GetState::AwaitingResponse { current_hop, .. }) => Some(*current_hop),
             _ => None,
         }
     }

@@ -218,6 +218,8 @@ impl<'a> NetEventLog<'a> {
             own_loc.pub_key().clone(),
         );
         let connected = PeerKeyLocation::new(peer.pub_key.clone(), peer.addr);
+        let connection_count = ring.connection_manager.connection_count();
+        let is_gateway = ring.connection_manager.is_gateway();
         // Note: location is computed from address, so we don't need to set it separately
         NetEventLog {
             tx: Transaction::NULL,
@@ -227,11 +229,35 @@ impl<'a> NetEventLog<'a> {
                 connected,
                 // None since we don't have transaction timing for this path
                 elapsed_ms: None,
+                connection_type: if is_gateway {
+                    ConnectionType::Gateway
+                } else {
+                    ConnectionType::Direct
+                },
+                latency_ms: None, // RTT not available at this layer
+                this_peer_connection_count: connection_count,
+                initiated_by: None, // Not available in this context
             }),
         }
     }
 
-    pub fn disconnected(ring: &'a Ring, from: &'a PeerId, reason: Option<String>) -> Self {
+    /// Create a disconnected event with full context.
+    ///
+    /// # Arguments
+    /// * `ring` - The ring containing connection state
+    /// * `from` - The peer that was disconnected
+    /// * `reason` - Structured reason for disconnection
+    /// * `connection_duration_ms` - How long the connection was open
+    /// * `bytes_sent` - Bytes sent to the peer during connection
+    /// * `bytes_received` - Bytes received from the peer during connection
+    pub fn disconnected_with_context(
+        ring: &'a Ring,
+        from: &'a PeerId,
+        reason: DisconnectReason,
+        connection_duration_ms: Option<u64>,
+        bytes_sent: Option<u64>,
+        bytes_received: Option<u64>,
+    ) -> Self {
         let own_loc = ring.connection_manager.own_location();
         let peer_id = PeerId::new(
             own_loc
@@ -245,7 +271,79 @@ impl<'a> NetEventLog<'a> {
             kind: EventKind::Disconnected {
                 from: from.clone(),
                 reason,
+                connection_duration_ms,
+                bytes_sent,
+                bytes_received,
             },
+        }
+    }
+
+    /// Create a disconnected event with minimal context (backwards compatible).
+    /// Note: Prefer `disconnected_with_context` with explicit `DisconnectReason` variants.
+    #[allow(dead_code)] // Kept as simpler API for external callers
+    pub fn disconnected(ring: &'a Ring, from: &'a PeerId, reason: Option<String>) -> Self {
+        Self::disconnected_with_context(ring, from, reason.into(), None, None, None)
+    }
+
+    /// Create a Put failure event.
+    pub fn put_failure(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        reason: OperationFailure,
+        hop_count: Option<usize>,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id: peer_id.clone(),
+            kind: EventKind::Put(PutEvent::PutFailure {
+                id: *tx,
+                requester: own_loc.clone(),
+                target: own_loc,
+                key,
+                hop_count,
+                reason,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create a Get failure event.
+    pub fn get_failure(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        reason: OperationFailure,
+        hop_count: Option<usize>,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id: peer_id.clone(),
+            kind: EventKind::Get(GetEvent::GetFailure {
+                id: *tx,
+                requester: own_loc.clone(),
+                instance_id,
+                target: own_loc,
+                hop_count,
+                reason,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
         }
     }
 
@@ -255,6 +353,8 @@ impl<'a> NetEventLog<'a> {
             return Either::Right(vec![]);
         };
         let peer_id = PeerId::new(own_addr, own_loc.pub_key().clone());
+        let connection_count = ring.connection_manager.connection_count();
+        let is_gateway = ring.connection_manager.is_gateway();
         let kind = match msg {
             NetMessage::V1(NetMessageV1::Connect(connect::ConnectMsg::Response {
                 payload,
@@ -267,6 +367,14 @@ impl<'a> NetEventLog<'a> {
                     this: this_peer,
                     connected: payload.acceptor.clone(),
                     elapsed_ms: Some(msg.id().elapsed().as_millis() as u64),
+                    connection_type: if is_gateway {
+                        ConnectionType::Gateway
+                    } else {
+                        ConnectionType::Direct
+                    },
+                    latency_ms: None, // RTT not available in message path
+                    this_peer_connection_count: connection_count,
+                    initiated_by: Some(peer_id.clone()), // We (the joiner) initiated
                 })
             }
             _ => EventKind::Ignored,
@@ -282,6 +390,8 @@ impl<'a> NetEventLog<'a> {
         msg: &'a NetMessageV1,
         op_manager: &'a OpManager,
     ) -> Either<Self, Vec<Self>> {
+        let connection_count = op_manager.ring.connection_manager.connection_count();
+        let is_gateway = op_manager.ring.connection_manager.is_gateway();
         let kind = match msg {
             NetMessageV1::Connect(connect::ConnectMsg::Response { payload, .. }) => {
                 let acceptor = payload.acceptor.clone();
@@ -296,6 +406,13 @@ impl<'a> NetEventLog<'a> {
                 let acceptor_peer_id = PeerId::new(acceptor_addr, acceptor.pub_key().clone());
                 let this_peer_id = PeerId::new(this_addr, this_peer.pub_key().clone());
                 let elapsed_ms = Some(msg.id().elapsed().as_millis() as u64);
+                // The joiner (this_peer) initiated the connection
+                let initiated_by = Some(this_peer_id.clone());
+                let connection_type = if is_gateway {
+                    ConnectionType::Gateway
+                } else {
+                    ConnectionType::Direct
+                };
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
@@ -304,6 +421,10 @@ impl<'a> NetEventLog<'a> {
                             this: acceptor.clone(),
                             connected: this_peer.clone(),
                             elapsed_ms,
+                            connection_type,
+                            latency_ms: None,
+                            this_peer_connection_count: connection_count,
+                            initiated_by: initiated_by.clone(),
                         }),
                     },
                     NetEventLog {
@@ -313,6 +434,10 @@ impl<'a> NetEventLog<'a> {
                             this: this_peer,
                             connected: acceptor,
                             elapsed_ms,
+                            connection_type,
+                            latency_ms: None,
+                            this_peer_connection_count: connection_count,
+                            initiated_by,
                         }),
                     },
                 ];
@@ -334,11 +459,16 @@ impl<'a> NetEventLog<'a> {
             }
             NetMessageV1::Put(PutMsg::Response { id, key }) => {
                 let this_peer = &op_manager.ring.connection_manager.own_location();
+                // Calculate hop_count from operation state: max_htl - current_htl
+                let hop_count = op_manager.get_current_hop(id).map(|current_htl| {
+                    op_manager.ring.max_hops_to_live.saturating_sub(current_htl)
+                });
                 EventKind::Put(PutEvent::PutSuccess {
                     id: *id,
                     requester: this_peer.clone(),
                     target: this_peer.clone(),
                     key: *key,
+                    hop_count,
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -365,11 +495,16 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) if value.state.is_some() => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                // Calculate hop_count from operation state: max_htl - current_hop
+                let hop_count = op_manager.get_current_hop(id).map(|current_hop| {
+                    op_manager.ring.max_hops_to_live.saturating_sub(current_hop)
+                });
                 EventKind::Get(GetEvent::GetSuccess {
                     id: *id,
                     requester: this_peer.clone(),
                     target: this_peer,
                     key: *key,
+                    hop_count,
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -380,11 +515,16 @@ impl<'a> NetEventLog<'a> {
                 result: GetMsgResult::NotFound,
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                // Calculate hop_count from operation state: max_htl - current_hop
+                let hop_count = op_manager.get_current_hop(id).map(|current_hop| {
+                    op_manager.ring.max_hops_to_live.saturating_sub(current_hop)
+                });
                 EventKind::Get(GetEvent::GetNotFound {
                     id: *id,
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
+                    hop_count,
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -415,6 +555,7 @@ impl<'a> NetEventLog<'a> {
                     id: *id,
                     key: *key,
                     at: this_peer.clone(),
+                    hop_count: None, // TODO: Track hop count from operation state
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     requester: this_peer,
@@ -431,6 +572,7 @@ impl<'a> NetEventLog<'a> {
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
+                    hop_count: None, // TODO: Track hop count from operation state
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -559,14 +701,26 @@ impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
                 this,
                 connected,
                 elapsed_ms,
+                connection_type,
+                latency_ms,
+                this_peer_connection_count,
+                initiated_by,
             }) => {
                 let mut attrs = vec![
                     KeyValue::new("phase", "connected"),
                     KeyValue::new("from", format!("{this}")),
                     KeyValue::new("to", format!("{connected}")),
+                    KeyValue::new("connection_type", format!("{connection_type:?}")),
+                    KeyValue::new("connection_count", *this_peer_connection_count as i64),
                 ];
                 if let Some(ms) = elapsed_ms {
                     attrs.push(KeyValue::new("elapsed_ms", *ms as i64));
+                }
+                if let Some(ms) = latency_ms {
+                    attrs.push(KeyValue::new("latency_ms", *ms as i64));
+                }
+                if let Some(initiator) = initiated_by {
+                    attrs.push(KeyValue::new("initiated_by", format!("{initiator}")));
                 }
                 Some(attrs)
             }
@@ -1395,8 +1549,17 @@ pub enum EventKind {
     Ignored,
     Disconnected {
         from: PeerId,
-        /// Reason for disconnection, if known.
-        reason: Option<String>,
+        /// Structured reason for disconnection.
+        reason: DisconnectReason,
+        /// How long the connection was open before disconnecting (milliseconds).
+        /// None if duration tracking is unavailable.
+        connection_duration_ms: Option<u64>,
+        /// Bytes sent to this peer during the connection.
+        /// None if byte tracking is unavailable.
+        bytes_sent: Option<u64>,
+        /// Bytes received from this peer during the connection.
+        /// None if byte tracking is unavailable.
+        bytes_received: Option<u64>,
     },
     /// A transaction timed out without completing.
     Timeout {
@@ -1432,6 +1595,66 @@ impl EventKind {
     }
 }
 
+/// The type of connection between peers.
+///
+/// This helps understand network topology and debug connectivity issues.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum ConnectionType {
+    /// Direct UDP connection between peers.
+    Direct,
+    /// Connection relayed through a gateway or other peer.
+    Relayed,
+    /// Connection to/from a gateway node.
+    Gateway,
+    /// Unknown connection type (for backwards compatibility or when detection fails).
+    #[default]
+    Unknown,
+}
+
+/// Reason for a peer disconnection.
+///
+/// Understanding disconnect reasons is critical for debugging network stability.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum DisconnectReason {
+    /// Connection was explicitly closed by local node.
+    Explicit(String),
+    /// Connection pruned due to topology optimization.
+    Pruned,
+    /// Connection timed out (no response within timeout period).
+    Timeout,
+    /// Network error (transport layer failure).
+    NetworkError(String),
+    /// Peer was unresponsive to keep-alive pings.
+    Unresponsive,
+    /// Connection dropped by the remote peer.
+    RemoteDropped,
+    /// Maximum connection limit reached.
+    ConnectionLimitReached,
+    /// Unknown reason (for backwards compatibility).
+    #[default]
+    Unknown,
+}
+
+/// **Deprecated**: This conversion uses fragile substring matching which can break
+/// if error message formats change. Use DisconnectReason enum variants directly instead.
+///
+/// This impl exists only for backwards compatibility with the `disconnected()` helper.
+/// New code should construct DisconnectReason variants directly.
+impl From<Option<String>> for DisconnectReason {
+    fn from(reason: Option<String>) -> Self {
+        match reason {
+            Some(s) if s.contains("pruned") => DisconnectReason::Pruned,
+            Some(s) if s.contains("timeout") => DisconnectReason::Timeout,
+            Some(s) if s.contains("unresponsive") => DisconnectReason::Unresponsive,
+            Some(s) if s.contains("limit") => DisconnectReason::ConnectionLimitReached,
+            Some(s) => DisconnectReason::Explicit(s),
+            None => DisconnectReason::Unknown,
+        }
+    }
+}
+
 /// Connection lifecycle events.
 ///
 /// Note on event format versioning: New variants are added at the end of enums
@@ -1440,6 +1663,7 @@ impl EventKind {
 /// compatibility is not required.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
+#[allow(clippy::large_enum_variant)] // Connected variant needs PeerKeyLocation for observability
 enum ConnectEvent {
     StartConnection {
         from: PeerId,
@@ -1454,6 +1678,17 @@ enum ConnectEvent {
         /// None when timing information is unavailable (e.g., connection events
         /// without transaction context).
         elapsed_ms: Option<u64>,
+        /// Type of connection (direct, relayed, gateway).
+        connection_type: ConnectionType,
+        /// Smoothed RTT to the peer in milliseconds, if available.
+        /// This is measured via the transport layer's RTT estimation.
+        latency_ms: Option<u64>,
+        /// Number of open connections this peer has after this connection.
+        /// Helps identify if a peer is having widespread connectivity issues.
+        this_peer_connection_count: usize,
+        /// The peer that initiated the connection (joiner).
+        /// Helps trace connection establishment patterns.
+        initiated_by: Option<PeerId>,
     },
     /// Connection process finished.
     /// TODO(#2456): This variant is defined but not currently emitted.
@@ -1464,6 +1699,70 @@ enum ConnectEvent {
         /// Time elapsed since connection started (milliseconds).
         elapsed_ms: Option<u64>,
     },
+}
+
+/// Reason for operation failure.
+///
+/// Understanding failure reasons helps debug network and contract issues.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum OperationFailure {
+    /// Connection to peer dropped during operation.
+    ConnectionDropped,
+    /// Operation exceeded maximum retries.
+    MaxRetriesExceeded { retries: usize },
+    /// HTL (hops to live) exhausted before finding result.
+    HtlExhausted,
+    /// No peers available in the ring to route to.
+    NoPeersAvailable,
+    /// Contract handler returned an error.
+    ContractError(String),
+    /// Operation timed out.
+    Timeout,
+    /// Other failure with description.
+    Other(String),
+}
+
+impl std::fmt::Display for ConnectionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionType::Direct => write!(f, "direct"),
+            ConnectionType::Relayed => write!(f, "relayed"),
+            ConnectionType::Gateway => write!(f, "gateway"),
+            ConnectionType::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl std::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DisconnectReason::Explicit(reason) => write!(f, "explicit: {}", reason),
+            DisconnectReason::Pruned => write!(f, "pruned"),
+            DisconnectReason::Timeout => write!(f, "timeout"),
+            DisconnectReason::NetworkError(err) => write!(f, "network_error: {}", err),
+            DisconnectReason::Unresponsive => write!(f, "unresponsive"),
+            DisconnectReason::RemoteDropped => write!(f, "remote_dropped"),
+            DisconnectReason::ConnectionLimitReached => write!(f, "connection_limit_reached"),
+            DisconnectReason::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl std::fmt::Display for OperationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperationFailure::ConnectionDropped => write!(f, "connection_dropped"),
+            OperationFailure::MaxRetriesExceeded { retries } => {
+                write!(f, "max_retries_exceeded: {}", retries)
+            }
+            OperationFailure::HtlExhausted => write!(f, "htl_exhausted"),
+            OperationFailure::NoPeersAvailable => write!(f, "no_peers_available"),
+            OperationFailure::ContractError(err) => write!(f, "contract_error: {}", err),
+            OperationFailure::Timeout => write!(f, "timeout"),
+            OperationFailure::Other(reason) => write!(f, "other: {}", reason),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -1483,6 +1782,22 @@ enum PutEvent {
         requester: PeerKeyLocation,
         target: PeerKeyLocation,
         key: ContractKey,
+        /// Number of hops the request traversed (initial HTL - remaining HTL).
+        hop_count: Option<usize>,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
+    /// Put operation failed.
+    PutFailure {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        target: PeerKeyLocation,
+        key: ContractKey,
+        /// Number of hops the request traversed before failure.
+        hop_count: Option<usize>,
+        /// Reason for the failure.
+        reason: OperationFailure,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -1564,6 +1879,7 @@ enum UpdateEvent {
 /// - Request initiation
 /// - Success when contract is found
 /// - NotFound when contract doesn't exist after search
+/// - Failure when operation fails due to network/system errors
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum GetEvent {
@@ -1587,6 +1903,8 @@ enum GetEvent {
         target: PeerKeyLocation,
         /// Full contract key (only available after successful retrieval).
         key: ContractKey,
+        /// Number of hops the request traversed.
+        hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -1598,6 +1916,23 @@ enum GetEvent {
         /// Contract instance that was searched for.
         instance_id: ContractInstanceId,
         target: PeerKeyLocation,
+        /// Number of hops the request traversed before exhaustion.
+        hop_count: Option<usize>,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
+    /// Get operation failed due to network or system error.
+    GetFailure {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        /// Contract instance that was searched for.
+        instance_id: ContractInstanceId,
+        target: PeerKeyLocation,
+        /// Number of hops the request traversed before failure.
+        hop_count: Option<usize>,
+        /// Reason for the failure.
+        reason: OperationFailure,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -1633,6 +1968,8 @@ enum SubscribeEvent {
         key: ContractKey,
         /// Location where subscription was established.
         at: PeerKeyLocation,
+        /// Number of hops the request traversed.
+        hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -1645,6 +1982,8 @@ enum SubscribeEvent {
         /// Contract instance that was searched for.
         instance_id: ContractInstanceId,
         target: PeerKeyLocation,
+        /// Number of hops the request traversed before exhaustion.
+        hop_count: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
@@ -2029,6 +2368,10 @@ pub(super) mod test {
                     this: PeerKeyLocation::new(peer_id.pub_key.clone(), peer_id.addr),
                     connected: PeerKeyLocation::new(other.pub_key.clone(), other.addr),
                     elapsed_ms: None,
+                    connection_type: ConnectionType::Direct,
+                    latency_ms: None,
+                    this_peer_connection_count: 0,
+                    initiated_by: None,
                 }),
             }))
         }));

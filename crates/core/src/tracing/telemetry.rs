@@ -371,12 +371,21 @@ fn event_kind_to_string(kind: &EventKind) -> String {
             match put_event {
                 PutEvent::Request { .. } => "put_request".to_string(),
                 PutEvent::PutSuccess { .. } => "put_success".to_string(),
+                PutEvent::PutFailure { .. } => "put_failure".to_string(),
                 PutEvent::BroadcastEmitted { .. } => "put_broadcast_emitted".to_string(),
                 PutEvent::BroadcastReceived { .. } => "put_broadcast_received".to_string(),
             }
         }
-        EventKind::Get(..) => "get_success".to_string(),
-        EventKind::Subscribe(..) => "subscribed".to_string(),
+        EventKind::Get(get_event) => {
+            use super::GetEvent;
+            match get_event {
+                GetEvent::Request { .. } => "get_request".to_string(),
+                GetEvent::GetSuccess { .. } => "get_success".to_string(),
+                GetEvent::GetNotFound { .. } => "get_not_found".to_string(),
+                GetEvent::GetFailure { .. } => "get_failure".to_string(),
+            }
+        }
+        EventKind::Subscribe(_) => "subscribe".to_string(),
         EventKind::Update(update_event) => {
             use super::UpdateEvent;
             match update_event {
@@ -397,38 +406,61 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
         EventKind::Connect(connect_event) => {
             use super::ConnectEvent;
             match connect_event {
-                ConnectEvent::StartConnection { from, .. } => {
+                ConnectEvent::StartConnection { from, is_gateway } => {
                     serde_json::json!({
                         "type": "start_connection",
                         "from": from.to_string(),
+                        "is_gateway": is_gateway,
                     })
                 }
                 ConnectEvent::Connected {
-                    this, connected, ..
+                    this,
+                    connected,
+                    elapsed_ms,
+                    connection_type,
+                    latency_ms,
+                    this_peer_connection_count,
+                    initiated_by,
                 } => {
                     serde_json::json!({
                         "type": "connected",
                         "this_peer": this.to_string(),
                         "connected_peer": connected.to_string(),
+                        "elapsed_ms": elapsed_ms,
+                        "connection_type": connection_type.to_string(),
+                        "latency_ms": latency_ms,
+                        "connection_count": this_peer_connection_count,
+                        "initiated_by": initiated_by.as_ref().map(|p| p.to_string()),
                     })
                 }
                 ConnectEvent::Finished {
                     initiator,
                     location,
-                    ..
+                    elapsed_ms,
                 } => {
                     serde_json::json!({
                         "type": "finished",
                         "initiator": initiator.to_string(),
                         "location": location.as_f64(),
+                        "elapsed_ms": elapsed_ms,
                     })
                 }
             }
         }
-        EventKind::Disconnected { from, .. } => {
+        EventKind::Disconnected {
+            from,
+            reason,
+            connection_duration_ms,
+            bytes_sent,
+            bytes_received,
+        } => {
             serde_json::json!({
                 "type": "disconnected",
                 "from": from.to_string(),
+                "reason": reason.to_string(),
+                "connection_duration_ms": connection_duration_ms,
+                "bytes_sent": bytes_sent,
+                "bytes_received": bytes_received,
             })
         }
         EventKind::Put(put_event) => {
@@ -439,8 +471,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     target,
                     key,
                     id,
+                    htl,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "request",
@@ -448,6 +480,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "key": key.to_string(),
                         "id": id.to_string(),
+                        "htl": htl,
                         "timestamp": timestamp,
                     })
                 }
@@ -456,8 +489,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     target,
                     key,
                     id,
+                    hop_count,
+                    elapsed_ms,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "success",
@@ -465,6 +499,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "key": key.to_string(),
                         "id": id.to_string(),
+                        "hop_count": hop_count,
+                        "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
                 }
@@ -506,6 +542,28 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "timestamp": timestamp,
                     })
                 }
+                PutEvent::PutFailure {
+                    id,
+                    requester,
+                    target,
+                    key,
+                    hop_count,
+                    reason,
+                    elapsed_ms,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "failure",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "target": target.to_string(),
+                        "key": key.to_string(),
+                        "hop_count": hop_count,
+                        "reason": reason.to_string(),
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
+                    })
+                }
             }
         }
         EventKind::Get(get_event) => {
@@ -516,8 +574,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     instance_id,
                     target,
+                    htl,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "get_request",
@@ -525,6 +583,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
+                        "htl": htl,
                         "timestamp": timestamp,
                     })
                 }
@@ -533,30 +592,60 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     target,
                     key,
+                    hop_count,
+                    elapsed_ms,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "get_success",
                         "id": id.to_string(),
-                        "key": key.to_string(),
-                        "timestamp": timestamp,
                         "requester": requester.to_string(),
                         "target": target.to_string(),
+                        "key": key.to_string(),
+                        "hop_count": hop_count,
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
                     })
                 }
                 GetEvent::GetNotFound {
                     id,
                     requester,
                     instance_id,
+                    target,
+                    hop_count,
+                    elapsed_ms,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "get_not_found",
                         "id": id.to_string(),
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
+                        "target": target.to_string(),
+                        "hop_count": hop_count,
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
+                    })
+                }
+                GetEvent::GetFailure {
+                    id,
+                    requester,
+                    instance_id,
+                    target,
+                    hop_count,
+                    reason,
+                    elapsed_ms,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "get_failure",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "target": target.to_string(),
+                        "hop_count": hop_count,
+                        "reason": reason.to_string(),
+                        "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
                 }
@@ -570,8 +659,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     requester,
                     instance_id,
                     target,
+                    htl,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "subscribe_request",
@@ -579,6 +668,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
+                        "htl": htl,
                         "timestamp": timestamp,
                     })
                 }
@@ -586,27 +676,39 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     id,
                     key,
                     at,
+                    hop_count,
+                    elapsed_ms,
                     timestamp,
-                    ..
+                    requester,
                 } => {
                     serde_json::json!({
-                        "type": "subscribed",
+                        "type": "subscribe_success",
                         "id": id.to_string(),
                         "key": key.to_string(),
                         "at": at.to_string(),
+                        "hop_count": hop_count,
+                        "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
+                        "requester": requester.to_string(),
                     })
                 }
                 SubscribeEvent::SubscribeNotFound {
                     id,
+                    requester,
                     instance_id,
+                    target,
+                    hop_count,
+                    elapsed_ms,
                     timestamp,
-                    ..
                 } => {
                     serde_json::json!({
                         "type": "subscribe_not_found",
                         "id": id.to_string(),
+                        "requester": requester.to_string(),
                         "instance_id": instance_id.to_string(),
+                        "target": target.to_string(),
+                        "hop_count": hop_count,
+                        "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
                 }

@@ -178,11 +178,21 @@ impl NetworkBridge for P2pBridge {
             {
                 // Peer from connection manager should have known address
                 if let Ok(known_loc) = KnownPeerKeyLocation::try_from(&peer_loc) {
+                    use crate::tracing::DisconnectReason;
+                    // Capture connection duration before the connection is removed
+                    let connection_duration_ms = self
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .get_connection_duration_ms(peer_addr);
                     self.log_register
-                        .register_events(Either::Left(NetEventLog::disconnected(
+                        .register_events(Either::Left(NetEventLog::disconnected_with_context(
                             &self.op_manager.ring,
                             &PeerId::new(known_loc.socket_addr(), peer_loc.pub_key().clone()),
-                            Some("connection dropped by bridge".to_string()),
+                            DisconnectReason::RemoteDropped,
+                            connection_duration_ms,
+                            None, // bytes_sent not tracked yet
+                            None, // bytes_received not tracked yet
                         )))
                         .await;
                 }
