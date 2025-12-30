@@ -460,6 +460,432 @@ impl<'a> NetEventLog<'a> {
         }
     }
 
+    // ==================== PUT Operation Helpers ====================
+
+    /// Create a Put request event.
+    pub fn put_request(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+        htl: usize,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Put(PutEvent::Request {
+                id: *tx,
+                requester: own_loc,
+                key,
+                target,
+                htl,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create a Put success event.
+    pub fn put_success(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+        hop_count: Option<usize>,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Put(PutEvent::PutSuccess {
+                id: *tx,
+                requester: own_loc,
+                target,
+                key,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create a Put broadcast emitted event.
+    /// Note: PUT operations don't currently use broadcasting (Update handles that),
+    /// but this helper exists for API completeness.
+    #[allow(dead_code)]
+    pub fn put_broadcast_emitted(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        value: WrappedState,
+        broadcast_to: Vec<PeerKeyLocation>,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        let broadcasted_to = broadcast_to.len();
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Put(PutEvent::BroadcastEmitted {
+                id: *tx,
+                upstream: own_loc.clone(),
+                broadcast_to,
+                broadcasted_to,
+                key,
+                value,
+                sender: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create a Put broadcast received event.
+    /// Note: PUT operations don't currently use broadcasting (Update handles that),
+    /// but this helper exists for API completeness.
+    #[allow(dead_code)]
+    pub fn put_broadcast_received(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        requester: PeerKeyLocation,
+        value: WrappedState,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Put(PutEvent::BroadcastReceived {
+                id: *tx,
+                key,
+                requester,
+                value,
+                target: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    // ==================== GET Operation Helpers ====================
+
+    /// Create a Get request event.
+    pub fn get_request(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        target: PeerKeyLocation,
+        htl: usize,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::Request {
+                id: *tx,
+                requester: own_loc,
+                instance_id,
+                target,
+                htl,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create a Get success event.
+    pub fn get_success(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+        hop_count: Option<usize>,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::GetSuccess {
+                id: *tx,
+                requester: own_loc,
+                target,
+                key,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create a Get not found event.
+    pub fn get_not_found(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        hop_count: Option<usize>,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::GetNotFound {
+                id: *tx,
+                requester: own_loc.clone(),
+                instance_id,
+                target: own_loc,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    // ==================== SUBSCRIBE Operation Helpers ====================
+
+    /// Create a Subscribe request event.
+    pub fn subscribe_request(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        target: PeerKeyLocation,
+        htl: usize,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Subscribe(SubscribeEvent::Request {
+                id: *tx,
+                requester: own_loc,
+                instance_id,
+                target,
+                htl,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create a Subscribe success event.
+    pub fn subscribe_success(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        at: PeerKeyLocation,
+        hop_count: Option<usize>,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Subscribe(SubscribeEvent::SubscribeSuccess {
+                id: *tx,
+                key,
+                at,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                requester: own_loc,
+            }),
+        }
+    }
+
+    /// Create a Subscribe not found event.
+    pub fn subscribe_not_found(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        hop_count: Option<usize>,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Subscribe(SubscribeEvent::SubscribeNotFound {
+                id: *tx,
+                requester: own_loc.clone(),
+                instance_id,
+                target: own_loc,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    // ==================== UPDATE Operation Helpers ====================
+
+    /// Create an Update request event.
+    pub fn update_request(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::Request {
+                id: *tx,
+                requester: own_loc,
+                key,
+                target,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create an Update success event.
+    pub fn update_success(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        target: PeerKeyLocation,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::UpdateSuccess {
+                id: *tx,
+                requester: own_loc,
+                target,
+                key,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create an Update broadcast emitted event.
+    pub fn update_broadcast_emitted(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        value: WrappedState,
+        broadcast_to: Vec<PeerKeyLocation>,
+        upstream: PeerKeyLocation,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        let broadcasted_to = broadcast_to.len();
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastEmitted {
+                id: *tx,
+                upstream,
+                broadcast_to,
+                broadcasted_to,
+                key,
+                value,
+                sender: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
+    /// Create an Update broadcast received event.
+    pub fn update_broadcast_received(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        requester: PeerKeyLocation,
+        value: WrappedState,
+    ) -> Self {
+        let own_loc = ring.connection_manager.own_location();
+        let peer_id = PeerId::new(
+            own_loc
+                .socket_addr()
+                .expect("own location should have address"),
+            own_loc.pub_key().clone(),
+        );
+        NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastReceived {
+                id: *tx,
+                key,
+                requester,
+                value,
+                target: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        }
+    }
+
     pub fn from_outbound_msg(msg: &'a NetMessage, ring: &'a Ring) -> Either<Self, Vec<Self>> {
         let own_loc = ring.connection_manager.own_location();
         let Some(own_addr) = own_loc.socket_addr() else {

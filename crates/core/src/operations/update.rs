@@ -11,6 +11,7 @@ use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager},
+    tracing::NetEventLog,
 };
 use std::net::SocketAddr;
 
@@ -251,6 +252,27 @@ impl Operation for UpdateOp {
                             )
                             .await?;
 
+                            // Emit telemetry: UPDATE succeeded at this peer
+                            // Use source_addr to get the requester's PeerKeyLocation
+                            let requester_addr = source_addr.expect(
+                                "remote UpdateMsg::RequestUpdate must have source_addr for telemetry",
+                            );
+                            if let Some(requester_pkl) = op_manager
+                                .ring
+                                .connection_manager
+                                .get_peer_by_addr(requester_addr)
+                            {
+                                op_manager
+                                    .ring
+                                    .register_events(Either::Left(NetEventLog::update_success(
+                                        id,
+                                        &op_manager.ring,
+                                        *key,
+                                        requester_pkl,
+                                    )))
+                                    .await;
+                            }
+
                             if !changed {
                                 tracing::debug!(
                                     tx = %id,
@@ -393,6 +415,25 @@ impl Operation for UpdateOp {
                     // Use source_addr directly instead of PeerKeyLocation lookup
                     let sender_addr = source_addr.expect("BroadcastTo requires source_addr");
                     let self_location = op_manager.ring.connection_manager.own_location();
+
+                    // Emit telemetry: broadcast received from upstream peer
+                    if let Some(requester_pkl) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(sender_addr)
+                    {
+                        op_manager
+                            .ring
+                            .register_events(Either::Left(NetEventLog::update_broadcast_received(
+                                id,
+                                &op_manager.ring,
+                                *key,
+                                requester_pkl,
+                                new_value.clone(),
+                            )))
+                            .await;
+                    }
+
                     tracing::debug!("Attempting contract value update - BroadcastTo - update");
                     let UpdateExecution {
                         value: updated_value,
@@ -454,6 +495,25 @@ impl Operation for UpdateOp {
                     ..
                 } => {
                     let mut broadcasted_to = *broadcasted_to;
+
+                    // Emit telemetry: broadcasting update to subscribers
+                    // Use self.upstream_addr to identify who sent us the update request
+                    let upstream_pkl = self
+                        .upstream_addr
+                        .and_then(|addr| op_manager.ring.connection_manager.get_peer_by_addr(addr))
+                        .unwrap_or_else(|| op_manager.ring.connection_manager.own_location());
+
+                    op_manager
+                        .ring
+                        .register_events(Either::Left(NetEventLog::update_broadcast_emitted(
+                            id,
+                            &op_manager.ring,
+                            *key,
+                            new_value.clone(),
+                            broadcast_to.clone(),
+                            upstream_pkl,
+                        )))
+                        .await;
 
                     let mut broadcasting = Vec::with_capacity(broadcast_to.len());
 
@@ -1187,6 +1247,17 @@ pub(crate) async fn request_update(
     if let Some(stats) = &mut update_op.stats {
         stats.target = Some(target.clone());
     }
+
+    // Emit telemetry: UPDATE request initiated
+    op_manager
+        .ring
+        .register_events(Either::Left(NetEventLog::update_request(
+            &id,
+            &op_manager.ring,
+            key,
+            target.clone(),
+        )))
+        .await;
 
     let msg = UpdateMsg::RequestUpdate {
         id,

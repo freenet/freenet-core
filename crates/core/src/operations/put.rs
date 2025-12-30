@@ -20,7 +20,7 @@ use crate::{
     contract::ContractHandlerEvent,
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
-    ring::{KnownPeerKeyLocation, Location},
+    ring::{KnownPeerKeyLocation, Location, PeerKeyLocation},
     tracing::{NetEventLog, OperationFailure},
 };
 use either::Either;
@@ -263,12 +263,20 @@ impl Operation for PutOp {
         _conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
-        _source_addr: Option<std::net::SocketAddr>,
+        source_addr: Option<std::net::SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
             let id = self.id;
             let upstream_addr = self.upstream_addr;
             let is_originator = upstream_addr.is_none();
+
+            // Look up sender's PeerKeyLocation from source address for telemetry
+            let sender_from_addr = source_addr.and_then(|addr| {
+                op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_location_by_addr(addr)
+            });
 
             // Extract subscribe flag from state (only relevant for originator)
             let subscribe = match &self.state {
@@ -373,6 +381,18 @@ impl Operation for PutOp {
                             "Forwarding PUT to next hop"
                         );
 
+                        // Emit put_request telemetry when forwarding
+                        op_manager
+                            .ring
+                            .register_events(Either::Left(NetEventLog::put_request(
+                                &id,
+                                &op_manager.ring,
+                                key,
+                                PeerKeyLocation::from(next_peer.clone()),
+                                htl.saturating_sub(1),
+                            )))
+                            .await;
+
                         let forward_msg = PutMsg::Request {
                             id,
                             contract: contract.clone(),
@@ -410,6 +430,20 @@ impl Operation for PutOp {
 
                         if is_originator {
                             // We're both originator and final destination
+                            // Emit put_success telemetry with our own location as target
+                            // hop_count is 0 since we stored locally
+                            let own_location = op_manager.ring.connection_manager.own_location();
+                            op_manager
+                                .ring
+                                .register_events(Either::Left(NetEventLog::put_success(
+                                    &id,
+                                    &op_manager.ring,
+                                    key,
+                                    own_location,
+                                    Some(0), // Stored locally, 0 hops
+                                )))
+                                .await;
+
                             // Start subscription if requested
                             if subscribe {
                                 start_subscription_after_put(op_manager, id, key).await;
@@ -458,6 +492,30 @@ impl Operation for PutOp {
                             phase = "complete",
                             "PUT operation completed successfully"
                         );
+
+                        // Emit put_success telemetry
+                        // Calculate hop_count from current_htl in state
+                        let current_htl = match &self.state {
+                            Some(PutState::AwaitingResponse { current_htl, .. }) => {
+                                Some(*current_htl)
+                            }
+                            _ => None,
+                        };
+                        let hop_count = current_htl
+                            .map(|htl| op_manager.ring.max_hops_to_live.saturating_sub(htl));
+
+                        if let Some(sender) = sender_from_addr.clone() {
+                            op_manager
+                                .ring
+                                .register_events(Either::Left(NetEventLog::put_success(
+                                    &id,
+                                    &op_manager.ring,
+                                    *key,
+                                    sender,
+                                    hop_count,
+                                )))
+                                .await;
+                        }
 
                         // Start subscription if requested
                         if subscribe {
