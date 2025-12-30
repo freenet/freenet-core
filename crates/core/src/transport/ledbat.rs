@@ -2843,7 +2843,9 @@ mod tests {
             // Take snapshot at intervals
             if elapsed_ms % sample_interval_ms == 0 || elapsed_ms <= rtt_ms * 2 {
                 let throughput = if elapsed_ms > 0 {
-                    (total_data_kb as f64 * 1024.0 * 8.0) / (elapsed_ms as f64 / 1000.0) / 1_000_000.0
+                    (total_data_kb as f64 * 1024.0 * 8.0)
+                        / (elapsed_ms as f64 / 1000.0)
+                        / 1_000_000.0
                 } else {
                     0.0
                 };
@@ -2893,7 +2895,10 @@ mod tests {
             }
             println!();
         }
-        println!("      0 Mbps ┼{}┬──────────────────────────────────────────►", "─".repeat(width.saturating_sub(45)));
+        println!(
+            "      0 Mbps ┼{}┬──────────────────────────────────────────►",
+            "─".repeat(width.saturating_sub(45))
+        );
         println!("              0                                              time");
     }
 
@@ -2930,24 +2935,41 @@ mod tests {
         println!("\n--- Transfer Summary ---");
         println!("RTT:              50ms");
         println!("Transfer size:    512 KB");
-        println!("Duration:         {} ms ({:.2}s)", duration_ms, duration_ms as f64 / 1000.0);
-        println!("Avg throughput:   {:.2} Mbps",
-            (512.0 * 8.0) / (duration_ms as f64 / 1000.0) / 1000.0);
+        println!(
+            "Duration:         {} ms ({:.2}s)",
+            duration_ms,
+            duration_ms as f64 / 1000.0
+        );
+        println!(
+            "Avg throughput:   {:.2} Mbps",
+            (512.0 * 8.0) / (duration_ms as f64 / 1000.0) / 1000.0
+        );
 
         // Print key snapshots showing slow start growth
         println!("\n--- cwnd Evolution ---");
         println!("{:>8} {:>8} {:>10}", "Time(ms)", "cwnd(KB)", "Data(KB)");
         for snap in &snapshots {
-            println!("{:>8} {:>8} {:>10}", snap.time_ms, snap.cwnd_kb, snap.data_transferred_kb);
+            println!(
+                "{:>8} {:>8} {:>10}",
+                snap.time_ms, snap.cwnd_kb, snap.data_transferred_kb
+            );
         }
 
         // Verify slow start doubled cwnd (initial 37KB should grow)
         let max_cwnd = snapshots.iter().map(|s| s.cwnd_kb).max().unwrap_or(0);
-        assert!(max_cwnd >= 74, "Slow start should double cwnd (37 -> 74+), got max {}KB", max_cwnd);
+        assert!(
+            max_cwnd >= 74,
+            "Slow start should double cwnd (37 -> 74+), got max {}KB",
+            max_cwnd
+        );
 
         // Verify transfer completed
         let final_data = snapshots.last().map(|s| s.data_transferred_kb).unwrap_or(0);
-        assert!(final_data >= 512, "Should have transferred 512KB, got {}KB", final_data);
+        assert!(
+            final_data >= 512,
+            "Should have transferred 512KB, got {}KB",
+            final_data
+        );
     }
 
     /// E2E test: 1MB transfer at 200ms RTT with visualization
@@ -2960,24 +2982,41 @@ mod tests {
         println!("\n--- Transfer Summary ---");
         println!("RTT:              200ms");
         println!("Transfer size:    1 MB");
-        println!("Duration:         {} ms ({:.2}s)", duration_ms, duration_ms as f64 / 1000.0);
-        println!("Avg throughput:   {:.2} Mbps",
-            (1024.0 * 8.0) / (duration_ms as f64 / 1000.0) / 1000.0);
+        println!(
+            "Duration:         {} ms ({:.2}s)",
+            duration_ms,
+            duration_ms as f64 / 1000.0
+        );
+        println!(
+            "Avg throughput:   {:.2} Mbps",
+            (1024.0 * 8.0) / (duration_ms as f64 / 1000.0) / 1000.0
+        );
 
         // Print key snapshots
         println!("\n--- cwnd Evolution ---");
         println!("{:>8} {:>8} {:>10}", "Time(ms)", "cwnd(KB)", "Data(KB)");
         for snap in &snapshots {
-            println!("{:>8} {:>8} {:>10}", snap.time_ms, snap.cwnd_kb, snap.data_transferred_kb);
+            println!(
+                "{:>8} {:>8} {:>10}",
+                snap.time_ms, snap.cwnd_kb, snap.data_transferred_kb
+            );
         }
 
         // Verify slow start worked
         let max_cwnd = snapshots.iter().map(|s| s.cwnd_kb).max().unwrap_or(0);
-        assert!(max_cwnd >= 74, "Slow start should grow cwnd, got max {}KB", max_cwnd);
+        assert!(
+            max_cwnd >= 74,
+            "Slow start should grow cwnd, got max {}KB",
+            max_cwnd
+        );
 
         // Verify transfer completed
         let final_data = snapshots.last().map(|s| s.data_transferred_kb).unwrap_or(0);
-        assert!(final_data >= 1024, "Should have transferred 1MB, got {}KB", final_data);
+        assert!(
+            final_data >= 1024,
+            "Should have transferred 1MB, got {}KB",
+            final_data
+        );
     }
 
     /// Parametrized test for multiple latency scenarios
@@ -2985,20 +3024,21 @@ mod tests {
     /// Uses small transfer sizes (256KB) to keep test execution fast while
     /// still validating slow start behavior at different RTTs.
     #[rstest::rstest]
-    #[case::lan_10ms(10, 256)]       // 256KB @ 10ms
-    #[case::regional_50ms(50, 256)]  // 256KB @ 50ms
+    #[case::lan_10ms(10, 256)] // 256KB @ 10ms
+    #[case::regional_50ms(50, 256)] // 256KB @ 50ms
     #[case::continental_100ms(100, 256)] // 256KB @ 100ms
-    #[case::satellite_200ms(200, 256)]   // 256KB @ 200ms
-    fn test_e2e_latency_scenarios(
-        #[case] rtt_ms: u64,
-        #[case] size_kb: usize,
-    ) {
+    #[case::satellite_200ms(200, 256)] // 256KB @ 200ms
+    fn test_e2e_latency_scenarios(#[case] rtt_ms: u64, #[case] size_kb: usize) {
         let (snapshots, duration_ms) = simulate_transfer_sync(rtt_ms, size_kb, rtt_ms);
 
         let avg_throughput = (size_kb as f64 * 8.0) / (duration_ms as f64 / 1000.0) / 1000.0;
 
         println!("\n{}ms RTT, {}KB transfer:", rtt_ms, size_kb);
-        println!("  Duration: {}ms ({:.2}s)", duration_ms, duration_ms as f64 / 1000.0);
+        println!(
+            "  Duration: {}ms ({:.2}s)",
+            duration_ms,
+            duration_ms as f64 / 1000.0
+        );
         println!("  Throughput: {:.2} Mbps", avg_throughput);
         println!("  Snapshots: {}", snapshots.len());
 
@@ -3007,12 +3047,18 @@ mod tests {
         assert!(
             max_cwnd >= 74,
             "{}ms RTT: Slow start should grow cwnd to 74KB+, got {}KB",
-            rtt_ms, max_cwnd
+            rtt_ms,
+            max_cwnd
         );
 
         // Verify we actually transferred the data
         let final_data = snapshots.last().map(|s| s.data_transferred_kb).unwrap_or(0);
-        assert!(final_data >= size_kb, "Should have transferred {}KB, got {}KB", size_kb, final_data);
+        assert!(
+            final_data >= size_kb,
+            "Should have transferred {}KB, got {}KB",
+            size_kb,
+            final_data
+        );
     }
 
     /// Test that visualizes cwnd evolution through complete slowdown cycle
@@ -3056,7 +3102,11 @@ mod tests {
             timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name));
 
             if !controller.in_slow_start.load(Ordering::Relaxed) {
-                println!("  Slow start exit at {}ms, cwnd={}KB", elapsed_ms, controller.current_cwnd() / 1024);
+                println!(
+                    "  Slow start exit at {}ms, cwnd={}KB",
+                    elapsed_ms,
+                    controller.current_cwnd() / 1024
+                );
                 break;
             }
         }
@@ -3080,7 +3130,11 @@ mod tests {
             timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name));
 
             if state >= 2 {
-                println!("  Slowdown triggered at {}ms, cwnd={}KB", elapsed_ms, controller.current_cwnd() / 1024);
+                println!(
+                    "  Slowdown triggered at {}ms, cwnd={}KB",
+                    elapsed_ms,
+                    controller.current_cwnd() / 1024
+                );
                 break;
             }
         }
@@ -3105,7 +3159,11 @@ mod tests {
             timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name));
 
             if state == 4 {
-                println!("  Ramp-up started at {}ms, cwnd={}KB", elapsed_ms, controller.current_cwnd() / 1024);
+                println!(
+                    "  Ramp-up started at {}ms, cwnd={}KB",
+                    elapsed_ms,
+                    controller.current_cwnd() / 1024
+                );
                 break;
             }
         }
@@ -3129,7 +3187,11 @@ mod tests {
             timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name));
 
             if state == 0 {
-                println!("  Back to normal at {}ms, cwnd={}KB", elapsed_ms, controller.current_cwnd() / 1024);
+                println!(
+                    "  Back to normal at {}ms, cwnd={}KB",
+                    elapsed_ms,
+                    controller.current_cwnd() / 1024
+                );
                 break;
             }
         }
@@ -3158,9 +3220,16 @@ mod tests {
 
         println!("\n✓ Complete slowdown cycle verified");
         println!("  Pre-slowdown: {}KB", pre_slowdown_cwnd);
-        println!("  Frozen: {}KB (expected {}KB)",
-            timeline.iter().filter(|(_, _, s)| *s == "Frozen").map(|(_, c, _)| *c).next().unwrap_or(0),
-            pre_slowdown_cwnd / 4);
+        println!(
+            "  Frozen: {}KB (expected {}KB)",
+            timeline
+                .iter()
+                .filter(|(_, _, s)| *s == "Frozen")
+                .map(|(_, c, _)| *c)
+                .next()
+                .unwrap_or(0),
+            pre_slowdown_cwnd / 4
+        );
         println!("  Recovered: {}KB", final_cwnd / 1024);
     }
 }
