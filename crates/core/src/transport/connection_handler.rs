@@ -662,10 +662,15 @@ impl<S: Socket> UdpPacketsListener<S> {
                     match res.expect("task shouldn't panic") {
                         Ok((outbound_remote_conn, inbound_remote_connection, outbound_ack_packet)) => {
                             let remote_addr = outbound_remote_conn.remote_addr;
-                            ongoing_gw_connections.remove(&remote_addr);
                             let sent_tracker = outbound_remote_conn.sent_tracker.clone();
 
+                            // Issue #2517: Insert into remote_connections BEFORE removing from
+                            // ongoing_gw_connections to prevent race condition. Without this order,
+                            // there's a gap where incoming packets aren't found in either map and
+                            // fall through to RSA decryption, causing spurious "decryption error"
+                            // failures when symmetric packets are misrouted.
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
+                            ongoing_gw_connections.remove(&remote_addr);
 
                             if self.new_connection_notifier
                                 .send(PeerConnection::new(outbound_remote_conn))
@@ -696,6 +701,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // Now we use proper typed error matching.
                             if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
                                 outdated_peer.insert(remote_addr, Instant::now());
+                                // Signal version mismatch for auto-update detection
+                                crate::transport::signal_version_mismatch();
                             }
                             ongoing_gw_connections.remove(&remote_addr);
                             ongoing_connections.remove(&remote_addr);
@@ -750,6 +757,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         direction = "outbound",
                                         "Connection failed due to version mismatch"
                                     );
+                                    // Signal version mismatch for auto-update detection
+                                    crate::transport::signal_version_mismatch();
                                 }
                                 _ => {
                                     tracing::error!(

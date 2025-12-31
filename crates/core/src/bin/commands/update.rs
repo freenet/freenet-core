@@ -19,6 +19,10 @@ pub struct UpdateCommand {
     /// Force update even if already on latest version
     #[arg(long)]
     pub force: bool,
+
+    /// Suppress interactive output (for automated updates)
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 impl UpdateCommand {
@@ -28,13 +32,17 @@ impl UpdateCommand {
     }
 
     async fn run_async(&self, current_version: &str) -> Result<()> {
-        println!("Current version: {}", current_version);
-        println!("Checking for updates...");
+        if !self.quiet {
+            println!("Current version: {}", current_version);
+            println!("Checking for updates...");
+        }
 
         let latest = get_latest_release().await?;
 
         let latest_version = latest.tag_name.trim_start_matches('v');
-        println!("Latest version: {}", latest_version);
+        if !self.quiet {
+            println!("Latest version: {}", latest_version);
+        }
 
         // Use semver for proper version comparison
         let current_ver =
@@ -43,12 +51,14 @@ impl UpdateCommand {
             Version::parse(latest_version).context("Failed to parse latest version as semver")?;
 
         if !self.force && latest_ver <= current_ver {
-            println!("You are already running the latest version.");
+            if !self.quiet {
+                println!("You are already running the latest version.");
+            }
             return Ok(());
         }
 
         if self.check {
-            if latest_ver > current_ver {
+            if latest_ver > current_ver && !self.quiet {
                 println!(
                     "Update available: {} -> {}",
                     current_version, latest_version
@@ -57,7 +67,9 @@ impl UpdateCommand {
             return Ok(());
         }
 
-        println!("Downloading update...");
+        if !self.quiet {
+            println!("Downloading update...");
+        }
         self.download_and_install(&latest).await
     }
 
@@ -87,16 +99,22 @@ impl UpdateCommand {
         let checksums = if let Some(checksums_asset) =
             release.assets.iter().find(|a| a.name == "SHA256SUMS.txt")
         {
-            println!("Downloading checksums...");
+            if !self.quiet {
+                println!("Downloading checksums...");
+            }
             match download_checksums(&checksums_asset.browser_download_url).await {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    eprintln!("Warning: Failed to download checksums: {}. Continuing without verification.", e);
+                    if !self.quiet {
+                        eprintln!("Warning: Failed to download checksums: {}. Continuing without verification.", e);
+                    }
                     None
                 }
             }
         } else {
-            eprintln!("Warning: SHA256SUMS.txt not found in release. Continuing without checksum verification.");
+            if !self.quiet {
+                eprintln!("Warning: SHA256SUMS.txt not found in release. Continuing without checksum verification.");
+            }
             None
         };
 
@@ -104,14 +122,16 @@ impl UpdateCommand {
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
         let archive_path = temp_dir.path().join(&asset_name);
 
-        download_file(&asset.browser_download_url, &archive_path).await?;
+        download_file(&asset.browser_download_url, &archive_path, self.quiet).await?;
 
         // Verify checksum if available
         if let Some(ref checksums) = checksums {
             if let Some(expected_hash) = checksums.get(&asset_name) {
-                println!("Verifying checksum...");
+                if !self.quiet {
+                    println!("Verifying checksum...");
+                }
                 verify_checksum(&archive_path, expected_hash)?;
-            } else {
+            } else if !self.quiet {
                 eprintln!(
                     "Warning: Checksum not found for {}. Continuing without verification.",
                     asset_name
@@ -126,42 +146,49 @@ impl UpdateCommand {
         let current_exe = std::env::current_exe().context("Failed to get current executable")?;
         replace_binary(&extracted_binary, &current_exe)?;
 
-        println!(
-            "Successfully updated to version {}",
-            release.tag_name.trim_start_matches('v')
-        );
-
-        // Automatically restart service if running
-        #[cfg(target_os = "linux")]
-        {
-            if is_systemd_service_active() {
-                println!("Restarting Freenet service...");
-                let status = Command::new("systemctl")
-                    .args(["--user", "restart", "freenet"])
-                    .status();
-                match status {
-                    Ok(s) if s.success() => println!("Service restarted successfully."),
-                    Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
-                    Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
-                }
-            }
+        if !self.quiet {
+            println!(
+                "Successfully updated to version {}",
+                release.tag_name.trim_start_matches('v')
+            );
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            if is_launchd_service_active() {
-                println!("Restarting Freenet service...");
-                // launchctl doesn't have a restart command, so stop + start
-                let _ = Command::new("launchctl")
-                    .args(["stop", "org.freenet.node"])
-                    .status();
-                let status = Command::new("launchctl")
-                    .args(["start", "org.freenet.node"])
-                    .status();
-                match status {
-                    Ok(s) if s.success() => println!("Service restarted successfully."),
-                    Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
-                    Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
+        // Automatically restart service if running
+        // Note: When called from ExecStopPost or wrapper script, we should NOT restart
+        // because systemd/launchd will restart the service automatically.
+        // The quiet flag indicates automated context where we skip manual restart.
+        if !self.quiet {
+            #[cfg(target_os = "linux")]
+            {
+                if is_systemd_service_active() {
+                    println!("Restarting Freenet service...");
+                    let status = Command::new("systemctl")
+                        .args(["--user", "restart", "freenet"])
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => println!("Service restarted successfully."),
+                        Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
+                        Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
+                    }
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                if is_launchd_service_active() {
+                    println!("Restarting Freenet service...");
+                    // launchctl doesn't have a restart command, so stop + start
+                    let _ = Command::new("launchctl")
+                        .args(["stop", "org.freenet.node"])
+                        .status();
+                    let status = Command::new("launchctl")
+                        .args(["start", "org.freenet.node"])
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => println!("Service restarted successfully."),
+                        Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
+                        Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
+                    }
                 }
             }
         }
@@ -320,7 +347,7 @@ fn get_archive_extension() -> &'static str {
     }
 }
 
-async fn download_file(url: &str, dest: &Path) -> Result<()> {
+async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("freenet-updater")
         .build()?;
@@ -347,7 +374,7 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
         file.write_all(&chunk)?;
         downloaded += chunk.len() as u64;
 
-        if total_size > 0 {
+        if !quiet && total_size > 0 {
             let progress = (downloaded as f64 / total_size as f64 * 100.0) as u32;
             // Use ANSI escape to clear to end of line for clean output
             print!("\rDownloading... {}%\x1b[K", progress);
@@ -355,7 +382,9 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
         }
     }
 
-    println!("\rDownload complete.\x1b[K");
+    if !quiet {
+        println!("\rDownload complete.\x1b[K");
+    }
     Ok(())
 }
 
