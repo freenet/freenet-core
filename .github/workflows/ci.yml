@@ -115,7 +115,7 @@ jobs:
       # Use mold linker to avoid rust-lld crashes (see issue #2519)
       # rust-lld occasionally segfaults with "relocation R_X86_64_PLT32 out of range"
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=/usr/bin/mold
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
 
     steps:
       - uses: actions/checkout@v6
@@ -170,7 +170,7 @@ jobs:
       RUST_MIN_STACK: 16777216
       # Use mold linker to avoid rust-lld crashes (see issue #2519)
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=/usr/bin/mold
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
 
     steps:
       - uses: actions/checkout@v6
@@ -240,7 +240,7 @@ jobs:
       RUST_MIN_STACK: 16777216
       # Use mold linker to avoid rust-lld crashes (see issue #2519)
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=/usr/bin/mold
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
 
     steps:
       - uses: actions/checkout@v6
