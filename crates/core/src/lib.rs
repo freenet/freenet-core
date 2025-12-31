@@ -50,7 +50,6 @@ pub mod util;
 mod wasm_runtime;
 
 /// Deterministic simulation testing framework.
-#[cfg(any(test, feature = "simulation"))]
 pub mod simulation;
 
 /// Exports to build a running local node.

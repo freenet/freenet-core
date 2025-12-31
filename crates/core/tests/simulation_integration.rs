@@ -305,7 +305,6 @@ async fn test_peer_label_assignment() {
 // Simulation Module Unit Tests (Imported from primitives)
 // =============================================================================
 
-#[cfg(feature = "simulation")]
 mod simulation_primitives {
     use freenet::simulation::{FaultConfig, SimulationRng, TimeSource, VirtualTime};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
