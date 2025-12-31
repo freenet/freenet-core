@@ -77,6 +77,24 @@ pub enum SubscriptionError {
     MaxSubscribersReached,
 }
 
+/// Result of adding a downstream subscriber.
+#[derive(Debug, PartialEq)]
+pub struct AddDownstreamResult {
+    /// Whether this was a new subscriber (vs a duplicate).
+    pub is_new: bool,
+    /// The current count of downstream subscribers.
+    pub downstream_count: usize,
+    /// The subscriber that was added (with resolved address).
+    pub subscriber: super::PeerKeyLocation,
+}
+
+/// Result of adding a client subscription.
+#[derive(Debug)]
+pub struct AddClientSubscriptionResult {
+    /// Whether this was the first client for this contract (seeding started).
+    pub is_first_client: bool,
+}
+
 /// Result of removing a subscriber, indicating whether upstream notification is needed.
 #[derive(Debug)]
 pub struct RemoveSubscriberResult {
@@ -86,6 +104,12 @@ pub struct RemoveSubscriberResult {
     /// - No more downstream subscribers remain
     /// - No client subscriptions for this contract
     pub notify_upstream: Option<PeerKeyLocation>,
+    /// Whether a subscriber was actually removed.
+    pub removed: bool,
+    /// The role of the removed subscriber (if any).
+    pub removed_role: Option<SubscriberType>,
+    /// Remaining downstream count after removal.
+    pub downstream_count: usize,
 }
 
 /// Result of pruning a peer connection.
@@ -141,12 +165,14 @@ impl SeedingManager {
     /// The `observed_addr` parameter is the transport-level address from which the subscribe
     /// message was received. This is used instead of the address embedded in `subscriber`
     /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
+    ///
+    /// Returns information about the operation for telemetry.
     pub fn add_downstream(
         &self,
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
         observed_addr: Option<ObservedAddr>,
-    ) -> Result<(), SubscriptionError> {
+    ) -> Result<AddDownstreamResult, SubscriptionError> {
         // Use the transport-level address if available
         let subscriber = if let Some(addr) = observed_addr {
             PeerKeyLocation::new(subscriber.pub_key.clone(), addr.socket_addr())
@@ -184,7 +210,11 @@ impl SeedingManager {
                 subscriber = %subscriber.pub_key,
                 "add_downstream: subscriber already registered"
             );
-            return Ok(());
+            return Ok(AddDownstreamResult {
+                is_new: false,
+                downstream_count,
+                subscriber,
+            });
         }
 
         let subscriber_addr = subscriber
@@ -193,18 +223,23 @@ impl SeedingManager {
             .unwrap_or_else(|| "unknown".into());
 
         subs.push(SubscriptionEntry::new(
-            subscriber,
+            subscriber.clone(),
             SubscriberType::Downstream,
         ));
 
+        let new_count = downstream_count + 1;
         info!(
             %contract,
             subscriber = %subscriber_addr,
-            downstream_count = downstream_count + 1,
+            downstream_count = new_count,
             "add_downstream: registered new downstream subscriber"
         );
 
-        Ok(())
+        Ok(AddDownstreamResult {
+            is_new: true,
+            downstream_count: new_count,
+            subscriber,
+        })
     }
 
     /// Set the upstream source for a contract (the peer we get updates FROM).
@@ -319,20 +354,23 @@ impl SeedingManager {
     }
 
     /// Register a client subscription for a contract (WebSocket client subscribed).
+    ///
+    /// Returns information about the operation for telemetry.
     pub fn add_client_subscription(
         &self,
         instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
-    ) {
-        self.client_subscriptions
-            .entry(*instance_id)
-            .or_default()
-            .insert(client_id);
+    ) -> AddClientSubscriptionResult {
+        let mut entry = self.client_subscriptions.entry(*instance_id).or_default();
+        let is_first_client = entry.is_empty();
+        entry.insert(client_id);
         debug!(
             contract = %instance_id,
             %client_id,
+            is_first_client = is_first_client,
             "add_client_subscription: registered client subscription"
         );
+        AddClientSubscriptionResult { is_first_client }
     }
 
     /// Remove a client subscription.
@@ -459,25 +497,35 @@ impl SeedingManager {
         peer: &PeerId,
     ) -> RemoveSubscriberResult {
         let mut notify_upstream = None;
+        let mut removed = false;
+        let mut removed_role = None;
+        let mut downstream_count = 0;
 
         if let Some(mut subs) = self.subscriptions.get_mut(contract) {
             // Find and remove the peer
             if let Some(pos) = subs.iter().position(|e| e.matches_peer(peer)) {
-                let removed = subs.swap_remove(pos);
+                let removed_entry = subs.swap_remove(pos);
+                removed = true;
+                removed_role = Some(removed_entry.role);
 
                 debug!(
                     %contract,
                     peer = %peer,
-                    role = ?removed.role,
+                    role = ?removed_entry.role,
                     "remove_subscriber: removed peer"
                 );
 
+                // Count remaining downstream
+                downstream_count = subs
+                    .iter()
+                    .filter(|e| e.role == SubscriberType::Downstream)
+                    .count();
+
                 // Only check for pruning if we removed a downstream subscriber
-                if removed.role == SubscriberType::Downstream {
-                    let has_downstream = subs.iter().any(|e| e.role == SubscriberType::Downstream);
+                if removed_entry.role == SubscriberType::Downstream {
                     let has_client = self.has_client_subscriptions(contract.id());
 
-                    if !has_downstream && !has_client {
+                    if downstream_count == 0 && !has_client {
                         // Find upstream to notify
                         notify_upstream = subs
                             .iter()
@@ -499,7 +547,12 @@ impl SeedingManager {
             }
         }
 
-        RemoveSubscriberResult { notify_upstream }
+        RemoveSubscriberResult {
+            notify_upstream,
+            removed,
+            removed_role,
+            downstream_count,
+        }
     }
 
     /// Prune all subscriptions for a peer that disconnected (by location).

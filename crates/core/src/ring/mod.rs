@@ -15,7 +15,10 @@ use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 
-pub use seeding::{PruneSubscriptionsResult, RemoveSubscriberResult, SubscriptionError};
+pub use seeding::{
+    AddClientSubscriptionResult, AddDownstreamResult, PruneSubscriptionsResult,
+    RemoveSubscriberResult, SubscriberType, SubscriptionError,
+};
 
 use crate::message::TransactionType;
 use crate::topology::rate::Rate;
@@ -38,11 +41,13 @@ pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod live_tx;
 mod location;
+mod peer_connection_backoff;
 mod peer_key_location;
 mod seeding;
 mod seeding_cache;
 
 use connection_backoff::ConnectionBackoff;
+pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
@@ -367,12 +372,14 @@ impl Ring {
     /// The `observed_addr` parameter is the transport-level address from which the subscribe
     /// message was received. This is used instead of the address embedded in `subscriber`
     /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
+    ///
+    /// Returns information about the operation for telemetry.
     pub fn add_downstream(
         &self,
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
         observed_addr: Option<ObservedAddr>,
-    ) -> Result<(), SubscriptionError> {
+    ) -> Result<AddDownstreamResult, SubscriptionError> {
         self.seeding_manager
             .add_downstream(contract, subscriber, observed_addr)
     }
@@ -405,11 +412,13 @@ impl Ring {
     // ==================== Client Subscription Management ====================
 
     /// Register a client subscription for a contract (WebSocket client subscribed).
+    ///
+    /// Returns information about the operation for telemetry.
     pub fn add_client_subscription(
         &self,
         instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
-    ) {
+    ) -> AddClientSubscriptionResult {
         self.seeding_manager
             .add_client_subscription(instance_id, client_id)
     }

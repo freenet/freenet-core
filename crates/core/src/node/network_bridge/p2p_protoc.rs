@@ -7,7 +7,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -44,7 +44,7 @@ use crate::{
         handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager,
         PeerId,
     },
-    ring::{KnownPeerKeyLocation, PeerKeyLocation},
+    ring::{KnownPeerKeyLocation, PeerConnectionBackoff, PeerKeyLocation},
     tracing::NetEventLog,
 };
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
@@ -1699,6 +1699,13 @@ impl P2pConnManager {
         state: &mut EventListenerState,
         transient: bool,
     ) -> anyhow::Result<()> {
+        // Periodic cleanup of expired backoff entries (every 60 seconds)
+        const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+        if state.last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {
+            state.peer_backoff.cleanup_expired();
+            state.last_backoff_cleanup = Instant::now();
+        }
+
         let mut peer = peer;
         let mut peer_addr = peer
             .socket_addr()
@@ -1885,6 +1892,38 @@ impl P2pConnManager {
             return Ok(());
         }
 
+        // Check if this peer is in backoff due to previous connection failures.
+        // This check is done AFTER the existing connection check above, so that:
+        // 1. If we already have a connection (possibly from inbound), we reuse it
+        // 2. Backoff only blocks NEW outbound connection attempts
+        if !peer_addr.ip().is_unspecified() && state.peer_backoff.is_in_backoff(peer_addr) {
+            let remaining = state
+                .peer_backoff
+                .remaining_backoff(peer_addr)
+                .unwrap_or(Duration::ZERO);
+            tracing::debug!(
+                tx = %tx,
+                peer = %peer,
+                peer_addr = %peer_addr,
+                remaining_secs = remaining.as_secs(),
+                transient,
+                phase = "connect",
+                "Skipping connection attempt - peer in backoff"
+            );
+            callback
+                .send_result(Err(()))
+                .await
+                .inspect_err(|error| {
+                    tracing::debug!(
+                        remote = %peer_addr,
+                        ?error,
+                        "Failed to notify caller about backoff-delayed connection"
+                    );
+                })
+                .ok();
+            return Ok(());
+        }
+
         match state.awaiting_connection.entry(peer_addr) {
             std::collections::hash_map::Entry::Occupied(mut callbacks) => {
                 let txs_entry = state.awaiting_connection_txs.entry(peer_addr).or_default();
@@ -1951,6 +1990,12 @@ impl P2pConnManager {
                 .ring
                 .connection_manager
                 .prune_in_transit_connection(peer_addr);
+
+            // Note: We intentionally do NOT record backoff here. This failure is a LOCAL
+            // channel issue (handshake command queue full), not a failure to connect to the
+            // REMOTE peer. Backoff should only apply to actual connection failures
+            // (OutboundFailed), not local resource contention.
+
             let pending_txs = state.awaiting_connection_txs.remove(&peer_addr);
             if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
                 tracing::debug!(
@@ -2076,6 +2121,12 @@ impl P2pConnManager {
                     transaction = %transaction,
                     "Outbound connection established"
                 );
+
+                // Clear backoff on successful connection
+                if !peer_addr.ip().is_unspecified() {
+                    state.peer_backoff.record_success(peer_addr);
+                }
+
                 // For outbound connections, we always know who we're connecting to
                 self.handle_successful_connection(Some(peer), connection, state, None, false)
                     .await?;
@@ -2114,6 +2165,11 @@ impl P2pConnManager {
                     .ring
                     .connection_manager
                     .prune_in_transit_connection(peer_addr);
+
+                // Record failure for exponential backoff to prevent rapid retries
+                if !peer_addr.ip().is_unspecified() {
+                    state.peer_backoff.record_failure(peer_addr);
+                }
 
                 let pending_txs = state
                     .awaiting_connection_txs
@@ -2858,6 +2914,11 @@ struct EventListenerState {
     awaiting_connection: HashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
     pending_op_results: HashMap<Transaction, Sender<NetMessage>>,
+    /// Per-peer backoff tracking for failed connection attempts.
+    /// Prevents rapid repeated connection attempts to the same peer.
+    peer_backoff: PeerConnectionBackoff,
+    /// Last time peer_backoff was cleaned up.
+    last_backoff_cleanup: Instant,
 }
 
 impl EventListenerState {
@@ -2870,6 +2931,8 @@ impl EventListenerState {
             awaiting_connection: HashMap::new(),
             pending_op_results: HashMap::new(),
             awaiting_connection_txs: HashMap::new(),
+            peer_backoff: PeerConnectionBackoff::new(),
+            last_backoff_cleanup: Instant::now(),
         }
     }
 }
