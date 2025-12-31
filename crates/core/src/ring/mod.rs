@@ -82,6 +82,39 @@ pub(crate) struct Ring {
 //     peer: PeerKey,
 // }
 
+/// Guard that ensures `complete_subscription_request` is called even if the
+/// subscription task panics. This prevents contracts from being stuck in
+/// `pending_subscription_requests` forever.
+struct SubscriptionRecoveryGuard {
+    op_manager: Arc<OpManager>,
+    contract_key: ContractKey,
+    completed: bool,
+}
+
+impl SubscriptionRecoveryGuard {
+    fn complete(mut self, success: bool) {
+        self.op_manager
+            .ring
+            .complete_subscription_request(&self.contract_key, success);
+        self.completed = true;
+    }
+}
+
+impl Drop for SubscriptionRecoveryGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Task panicked or was cancelled before completion - treat as failure
+            tracing::warn!(
+                contract = %self.contract_key,
+                "Subscription recovery task terminated unexpectedly, marking as failed"
+            );
+            self.op_manager
+                .ring
+                .complete_subscription_request(&self.contract_key, false);
+        }
+    }
+}
+
 impl Ring {
     const DEFAULT_MIN_CONNECTIONS: usize = 25;
 
@@ -117,6 +150,11 @@ impl Ring {
 
         // Interval for periodic subscription state telemetry snapshots (1 minute)
         const SUBSCRIPTION_STATE_INTERVAL: Duration = Duration::from_secs(60);
+
+        // Interval for periodic subscription recovery attempts (30 seconds)
+        // This recovers "orphaned seeders" - peers that have contracts in cache
+        // but failed to establish subscription (no upstream in subscription tree)
+        const SUBSCRIPTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
         let ring = Ring {
@@ -155,6 +193,13 @@ impl Ring {
         GlobalExecutor::spawn(Self::emit_subscription_state_telemetry(
             ring.clone(),
             SUBSCRIPTION_STATE_INTERVAL,
+        ));
+
+        // Spawn periodic subscription recovery task to fix "orphaned seeders"
+        // (peers that have contracts cached but aren't in the subscription tree)
+        GlobalExecutor::spawn(Self::recover_orphaned_subscriptions(
+            ring.clone(),
+            SUBSCRIPTION_RECOVERY_INTERVAL,
         ));
 
         Ok(ring)
@@ -242,6 +287,112 @@ impl Ring {
                         .register_events(Either::Left(event))
                         .await;
                 }
+            }
+        }
+    }
+
+    /// Maximum number of subscription recovery attempts per interval.
+    /// This prevents spawning too many concurrent tasks if there are many orphaned contracts.
+    const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 20;
+
+    /// Periodically attempt to recover "orphaned seeders" - contracts we're seeding
+    /// but don't have an upstream subscription for.
+    ///
+    /// This can happen when:
+    /// - The initial subscription after GET/PUT failed (network issues, timeout)
+    /// - Our upstream peer disconnected and we haven't found a new one
+    /// - A race condition left us seeding without subscription
+    ///
+    /// The task respects existing backoff mechanisms to avoid subscription spam.
+    async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
+        let mut interval = tokio::time::interval(interval_duration);
+        // Skip the first immediate tick
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            // Get contracts we're seeding without upstream subscription
+            let orphaned_contracts = ring.contracts_without_upstream();
+
+            if orphaned_contracts.is_empty() {
+                continue;
+            }
+
+            // Get op_manager to spawn subscription requests
+            let Some(op_manager) = ring.upgrade_op_manager() else {
+                tracing::debug!("OpManager not available for subscription recovery");
+                continue;
+            };
+
+            let mut attempted = 0;
+            let mut skipped = 0;
+
+            for contract in orphaned_contracts {
+                // Limit concurrent recovery attempts to avoid overwhelming the network
+                if attempted >= Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL {
+                    tracing::debug!(
+                        limit = Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL,
+                        "Reached max recovery attempts for this interval, remaining will be tried next cycle"
+                    );
+                    break;
+                }
+
+                // Check spam prevention (respects exponential backoff and pending checks)
+                if !ring.can_request_subscription(&contract) {
+                    skipped += 1;
+                    continue;
+                }
+
+                // Mark as pending and spawn subscription request
+                if ring.mark_subscription_pending(contract) {
+                    attempted += 1;
+                    let op_manager_clone = op_manager.clone();
+                    let contract_key = contract;
+
+                    tokio::spawn(async move {
+                        // Guard ensures complete_subscription_request is called even on panic
+                        let guard = SubscriptionRecoveryGuard {
+                            op_manager: op_manager_clone.clone(),
+                            contract_key,
+                            completed: false,
+                        };
+
+                        let instance_id = *contract_key.id();
+                        let sub_op = crate::operations::subscribe::start_op(instance_id);
+                        let result = crate::operations::subscribe::request_subscribe(
+                            &op_manager_clone,
+                            sub_op,
+                        )
+                        .await;
+
+                        let success = result.is_ok();
+                        if success {
+                            tracing::info!(
+                                %contract_key,
+                                "Periodic subscription recovery succeeded"
+                            );
+                        } else if let Err(ref e) = result {
+                            tracing::debug!(
+                                %contract_key,
+                                error = %e,
+                                "Periodic subscription recovery failed (will retry with backoff)"
+                            );
+                        }
+
+                        // Mark as completed so guard doesn't treat it as failure
+                        guard.complete(success);
+                    });
+                }
+            }
+
+            if attempted > 0 || skipped > 0 {
+                tracing::info!(
+                    attempted,
+                    skipped_rate_limited = skipped,
+                    "Periodic subscription recovery: attempted {} re-subscriptions",
+                    attempted
+                );
             }
         }
     }
