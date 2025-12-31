@@ -417,6 +417,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                          Peer likely upgraded. Allowing reconnection."
                                                     );
                                                     outdated_peer.remove(&remote_addr);
+                                                    // Clean up rate-limit tracking now that peer is reconnecting
+                                                    self.last_rsa_attempt.remove(&remote_addr);
                                                     // Don't continue - fall through to process the packet
                                                 } else {
                                                     continue; // Still incompatible version
