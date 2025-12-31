@@ -319,32 +319,10 @@ pub struct SimNetwork {
 
 impl SimNetwork {
     /// Default seed for deterministic simulation
-    const DEFAULT_SEED: u64 = 0xDEADBEEF_CAFEBABE;
-
-    pub async fn new(
-        name: &str,
-        gateways: usize,
-        nodes: usize,
-        ring_max_htl: usize,
-        rnd_if_htl_above: usize,
-        max_connections: usize,
-        min_connections: usize,
-    ) -> Self {
-        Self::with_seed(
-            name,
-            gateways,
-            nodes,
-            ring_max_htl,
-            rnd_if_htl_above,
-            max_connections,
-            min_connections,
-            Self::DEFAULT_SEED,
-        )
-        .await
-    }
+    pub const DEFAULT_SEED: u64 = 0xDEADBEEF_CAFEBABE;
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn with_seed(
+    pub async fn new(
         name: &str,
         gateways: usize,
         nodes: usize,

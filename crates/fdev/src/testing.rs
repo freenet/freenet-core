@@ -153,6 +153,7 @@ async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwo
         .as_ref()
         .cloned()
         .unwrap_or_else(randomize_test_name);
+    let seed = base_config.seed.unwrap_or(SimNetwork::DEFAULT_SEED);
     let mut sim = SimNetwork::new(
         name,
         base_config.gateways,
@@ -161,6 +162,7 @@ async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwo
         base_config.rnd_if_htl_above,
         base_config.max_connections,
         base_config.min_connections,
+        seed,
     )
     .await;
     if let Some(backoff) = base_config.peer_start_backoff_ms {
