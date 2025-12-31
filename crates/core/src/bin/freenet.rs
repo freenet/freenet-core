@@ -106,10 +106,17 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
 ///
 /// This function handles SIGTERM and SIGINT (Ctrl+C) to trigger graceful shutdown,
 /// allowing the node to properly close peer connections and clean up resources.
+///
+/// It also monitors for version mismatches with other peers (especially the gateway).
+/// When a mismatch is detected, it checks GitHub to verify a newer version exists
+/// before returning an UpdateNeededError (which causes exit code 42).
 async fn run_network_node_with_signals(
     node: freenet::Node,
     shutdown_handle: freenet::ShutdownHandle,
 ) -> anyhow::Result<()> {
+    use commands::auto_update::{
+        check_if_update_available, clear_version_mismatch, has_version_mismatch, UpdateNeededError,
+    };
     use tokio::signal;
 
     // Set up SIGTERM handler for Unix systems
@@ -138,11 +145,50 @@ async fn run_network_node_with_signals(
         })
     };
 
-    // Run the node - it will exit when it receives the shutdown signal
-    let result = run_network_node(node).await;
+    // Spawn a task to monitor for version mismatches and check for updates.
+    // This is temporary alpha-testing infrastructure to reduce manual update burden.
+    let (update_tx, mut update_rx) = tokio::sync::oneshot::channel::<String>();
+    let update_check_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
 
-    // Clean up the signal task
+            if has_version_mismatch() {
+                tracing::info!("Version mismatch detected, checking GitHub for updates...");
+                clear_version_mismatch();
+
+                if let Some(new_version) = check_if_update_available(build_info::VERSION).await {
+                    tracing::info!(
+                        new_version = %new_version,
+                        "Newer version confirmed on GitHub, triggering auto-update"
+                    );
+                    let _ = update_tx.send(new_version);
+                    return;
+                }
+            }
+        }
+    });
+
+    // Run the node - it will exit when it receives the shutdown signal or an update is needed
+    let result = tokio::select! {
+        r = run_network_node(node) => r,
+        new_version = &mut update_rx => {
+            match new_version {
+                Ok(version) => {
+                    tracing::info!(version = %version, "Exiting for auto-update");
+                    Err(UpdateNeededError { new_version: version }.into())
+                }
+                Err(_) => {
+                    // Channel closed without sending, shouldn't happen
+                    Ok(())
+                }
+            }
+        }
+    };
+
+    // Clean up tasks
     signal_task.abort();
+    update_check_task.abort();
 
     // Give a moment for final cleanup logging
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -201,10 +247,12 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    use commands::auto_update::{UpdateNeededError, EXIT_CODE_UPDATE_NEEDED};
+
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Some(Command::Service(cmd)) => cmd.run(
             build_info::VERSION,
             build_info::GIT_COMMIT,
@@ -223,6 +271,19 @@ fn main() -> anyhow::Result<()> {
         None => {
             // Default behavior: run with the config from top-level args
             run_node(cli.config)
+        }
+    };
+
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            // Check if this is an "update needed" error from auto-update detection
+            if e.downcast_ref::<UpdateNeededError>().is_some() {
+                eprintln!("Update needed, exiting for service wrapper to handle update...");
+                std::process::exit(EXIT_CODE_UPDATE_NEEDED);
+            }
+            eprintln!("Error: {e:?}");
+            std::process::exit(1);
         }
     }
 }
