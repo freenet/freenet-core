@@ -1578,7 +1578,9 @@ impl TestContext {
                             crate::tracing::EventKind::Lifecycle(..) => ("🚀", "Lifecycle"),
                             crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
                             crate::tracing::EventKind::Timeout { .. } => ("⏱️", "Timeout"),
-                            crate::tracing::EventKind::TransportSnapshot(..) => ("📈", "TransportSnapshot"),
+                            crate::tracing::EventKind::TransportSnapshot(..) => {
+                                ("📈", "TransportSnapshot")
+                            }
                             crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
                         };
 

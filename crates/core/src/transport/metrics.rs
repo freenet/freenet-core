@@ -3,6 +3,10 @@
 //! Instead of emitting telemetry events per-transfer (which could flood the server),
 //! we accumulate metrics and emit periodic snapshots every N seconds.
 //!
+//! Metrics always accumulate (negligible overhead from atomic ops). Snapshots
+//! are only taken by TelemetryWorker when telemetry is enabled - if telemetry
+//! is disabled, no TelemetryWorker runs and `take_snapshot()` is never called.
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -11,7 +15,7 @@
 //! // Record a completed transfer
 //! TRANSPORT_METRICS.record_transfer_completed(&stats);
 //!
-//! // Periodically take snapshots (e.g., every 30 seconds)
+//! // Periodically take snapshots (done by TelemetryWorker when telemetry enabled)
 //! if let Some(snapshot) = TRANSPORT_METRICS.take_snapshot() {
 //!     // Send to telemetry
 //! }
@@ -19,16 +23,12 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
-use std::time::Duration;
 
 /// Global transport metrics instance.
 ///
 /// All peer connections report to this single instance, which aggregates
 /// metrics for periodic telemetry snapshots.
 pub static TRANSPORT_METRICS: LazyLock<TransportMetrics> = LazyLock::new(TransportMetrics::new);
-
-/// Default snapshot interval (30 seconds).
-pub const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Accumulates transport metrics for periodic reporting.
 ///
@@ -40,6 +40,11 @@ pub const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 /// This struct is designed for concurrent updates from multiple connections.
 /// The snapshot operation is not atomic across all fields, but this is
 /// acceptable for telemetry purposes.
+///
+/// # When Telemetry is Disabled
+///
+/// Metrics still accumulate (negligible overhead), but `take_snapshot()`
+/// is never called since TelemetryWorker doesn't run.
 #[derive(Debug)]
 pub struct TransportMetrics {
     // Transfer counters (reset each snapshot)
@@ -57,8 +62,8 @@ pub struct TransportMetrics {
     // LEDBAT stats (peak values during period)
     peak_cwnd_bytes: AtomicU32,
     min_cwnd_bytes: AtomicU32,
-    cwnd_sum: AtomicU64,      // For computing average
-    cwnd_samples: AtomicU32,  // Number of samples
+    cwnd_sum: AtomicU64,     // For computing average
+    cwnd_samples: AtomicU32, // Number of samples
 
     // Slowdowns during period
     slowdowns_triggered: AtomicU32,
@@ -138,19 +143,6 @@ impl TransportMetrics {
         if rtt_us > 0 {
             self.record_rtt_sample(rtt_us);
         }
-    }
-
-    /// Record a failed transfer.
-    pub fn record_transfer_failed(&self, bytes_transferred: u64) {
-        self.transfers_failed.fetch_add(1, Ordering::Relaxed);
-        // Count partial bytes sent before failure
-        self.bytes_sent
-            .fetch_add(bytes_transferred, Ordering::Relaxed);
-    }
-
-    /// Record bytes received (for inbound transfers).
-    pub fn record_bytes_received(&self, bytes: u64) {
-        self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Record a cwnd sample (called periodically or on transfer completion).
@@ -275,7 +267,11 @@ impl TransportMetrics {
             },
             slowdowns_triggered,
             avg_rtt_us,
-            min_rtt_us: if min_rtt_us == u64::MAX { 0 } else { min_rtt_us },
+            min_rtt_us: if min_rtt_us == u64::MAX {
+                0
+            } else {
+                min_rtt_us
+            },
             max_rtt_us,
         })
     }
