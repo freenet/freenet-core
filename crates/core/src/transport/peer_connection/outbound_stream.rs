@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aes_gcm::Aes128Gcm;
 use bytes::Bytes;
@@ -11,7 +11,7 @@ use crate::{
         packet_data,
         sent_packet_tracker::SentPacketTracker,
         symmetric_message::{self},
-        TransportError,
+        TransferStats, TransportError,
     },
     util::time_source::InstantTimeSrc,
 };
@@ -30,6 +30,9 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 40;
 // TODO: unit test
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
 /// piped streams which start forwarding before the stream has been received.
+///
+/// Returns `TransferStats` on success with LEDBAT congestion control metrics
+/// for telemetry purposes.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_stream<S: super::super::Socket>(
     stream_id: StreamId,
@@ -41,7 +44,10 @@ pub(super) async fn send_stream<S: super::super::Socket>(
     sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<InstantTimeSrc>>>,
     token_bucket: Arc<super::super::token_bucket::TokenBucket>,
     ledbat: Arc<super::super::ledbat::LedbatController>,
-) -> Result<(), TransportError> {
+) -> Result<TransferStats, TransportError> {
+    let start_time = Instant::now();
+    let bytes_to_send = stream_to_send.len() as u64;
+
     tracing::debug!(
         stream_id = %stream_id.0,
         length_bytes = stream_to_send.len(),
@@ -162,9 +168,31 @@ pub(super) async fn send_stream<S: super::super::Socket>(
         sent_so_far += 1;
     }
 
-    // tracing::trace!(stream_id = %stream_id.0, total_packets = %sent_so_far, "stream sent");
+    // Gather LEDBAT stats for telemetry
+    let ledbat_stats = ledbat.stats();
+    let elapsed = start_time.elapsed();
 
-    Ok(())
+    tracing::debug!(
+        stream_id = %stream_id.0,
+        total_packets = %sent_so_far,
+        bytes = bytes_to_send,
+        elapsed_ms = elapsed.as_millis(),
+        peak_cwnd_kb = ledbat_stats.peak_cwnd / 1024,
+        final_cwnd_kb = ledbat_stats.cwnd / 1024,
+        slowdowns = ledbat_stats.periodic_slowdowns,
+        "Stream sent"
+    );
+
+    Ok(TransferStats {
+        stream_id: stream_id.0 as u64,
+        remote_addr: destination_addr,
+        bytes_transferred: bytes_to_send,
+        elapsed,
+        peak_cwnd_bytes: ledbat_stats.peak_cwnd as u32,
+        final_cwnd_bytes: ledbat_stats.cwnd as u32,
+        slowdowns_triggered: ledbat_stats.periodic_slowdowns as u32,
+        base_delay: ledbat_stats.base_delay,
+    })
 }
 
 #[cfg(test)]

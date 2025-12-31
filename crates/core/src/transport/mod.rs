@@ -28,9 +28,51 @@ mod received_packet_tracker;
 
 pub mod global_bandwidth;
 pub(crate) mod ledbat;
+pub mod metrics;
 mod sent_packet_tracker;
 mod symmetric_message;
 pub(crate) mod token_bucket;
+
+// Re-export LEDBAT stats for telemetry
+pub use ledbat::LedbatStats;
+// Re-export transport metrics for periodic telemetry snapshots
+pub use metrics::{TransportMetrics, TransportSnapshot, TRANSPORT_METRICS};
+
+use std::time::Duration;
+
+/// Statistics from a completed stream transfer.
+///
+/// Provides metrics for telemetry including LEDBAT congestion control data.
+/// Used to emit TransferEvent telemetry when streams complete.
+#[derive(Debug, Clone)]
+pub struct TransferStats {
+    /// Unique stream identifier.
+    pub stream_id: u64,
+    /// Remote peer address.
+    pub remote_addr: SocketAddr,
+    /// Total bytes transferred.
+    pub bytes_transferred: u64,
+    /// Time elapsed from start to completion.
+    pub elapsed: Duration,
+    /// Peak congestion window during transfer (bytes).
+    pub peak_cwnd_bytes: u32,
+    /// Final congestion window at completion (bytes).
+    pub final_cwnd_bytes: u32,
+    /// Number of LEDBAT slowdowns triggered during transfer.
+    pub slowdowns_triggered: u32,
+    /// Minimum observed RTT (base delay) at completion.
+    pub base_delay: Duration,
+}
+
+impl TransferStats {
+    /// Calculate average throughput in bytes per second.
+    pub fn avg_throughput_bps(&self) -> u64 {
+        if self.elapsed.is_zero() {
+            return 0;
+        }
+        (self.bytes_transferred as f64 / self.elapsed.as_secs_f64()) as u64
+    }
+}
 
 type MessagePayload = bytes::Bytes;
 

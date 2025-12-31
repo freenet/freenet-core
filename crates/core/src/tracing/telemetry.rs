@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 use crate::config::TelemetryConfig;
 use crate::message::Transaction;
 use crate::router::RouteEvent;
+use crate::transport::TRANSPORT_METRICS;
 
 use super::{EventKind, NetEventLog, NetEventRegister, NetLogMessage};
 
@@ -46,6 +47,9 @@ const MAX_EVENTS_PER_SECOND: usize = 10;
 
 /// Initial backoff duration on failure
 const INITIAL_BACKOFF_MS: u64 = 1000;
+
+/// Minimum transport snapshot interval (to prevent spamming telemetry)
+const MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS: u64 = 10;
 
 /// Maximum backoff duration
 const MAX_BACKOFF_MS: u64 = 300_000; // 5 minutes
@@ -104,14 +108,20 @@ impl TelemetryReporter {
         }
 
         let endpoint = config.endpoint.clone();
-        tracing::info!(endpoint = %endpoint, "Telemetry reporting enabled");
+        let transport_snapshot_interval_secs = config.transport_snapshot_interval_secs;
+
+        tracing::info!(
+            endpoint = %endpoint,
+            transport_snapshot_interval_secs,
+            "Telemetry reporting enabled"
+        );
 
         // Channel capacity: 1000 events provides ~100 seconds of buffer at max rate (10 events/sec)
         // plus headroom for bursts. Events are dropped via try_send if channel is full.
         let (sender, receiver) = mpsc::channel(1000);
 
         // Spawn the background worker
-        let worker = TelemetryWorker::new(endpoint, receiver);
+        let worker = TelemetryWorker::new(endpoint, receiver, transport_snapshot_interval_secs);
         tokio::spawn(worker.run());
 
         Some(Self { sender })
@@ -178,10 +188,16 @@ struct TelemetryWorker {
     last_send: Instant,
     events_this_second: usize,
     rate_limit_window_start: Instant,
+    /// Interval for transport snapshots (0 = disabled)
+    transport_snapshot_interval_secs: u64,
 }
 
 impl TelemetryWorker {
-    fn new(endpoint: String, receiver: mpsc::Receiver<TelemetryCommand>) -> Self {
+    fn new(
+        endpoint: String,
+        receiver: mpsc::Receiver<TelemetryCommand>,
+        transport_snapshot_interval_secs: u64,
+    ) -> Self {
         Self {
             endpoint,
             receiver,
@@ -194,11 +210,30 @@ impl TelemetryWorker {
             last_send: Instant::now(),
             events_this_second: 0,
             rate_limit_window_start: Instant::now(),
+            transport_snapshot_interval_secs,
         }
     }
 
     async fn run(mut self) {
         let mut batch_interval = tokio::time::interval(Duration::from_secs(BATCH_INTERVAL_SECS));
+
+        // Transport snapshots are optional (disabled if interval is 0)
+        // Clamp to minimum to prevent spamming telemetry server
+        let snapshot_interval_secs = if self.transport_snapshot_interval_secs == 0 {
+            // Use a long interval but we'll skip the actual snapshot logic
+            u64::MAX / 2 // Effectively disabled
+        } else if self.transport_snapshot_interval_secs < MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS {
+            tracing::warn!(
+                "Transport snapshot interval {}s is below minimum {}s, using minimum",
+                self.transport_snapshot_interval_secs,
+                MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS
+            );
+            MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS
+        } else {
+            self.transport_snapshot_interval_secs
+        };
+        let mut transport_snapshot_interval =
+            tokio::time::interval(Duration::from_secs(snapshot_interval_secs));
 
         loop {
             tokio::select! {
@@ -216,6 +251,21 @@ impl TelemetryWorker {
                 }
                 _ = batch_interval.tick() => {
                     self.flush().await;
+                }
+                _ = transport_snapshot_interval.tick() => {
+                    // Emit transport layer metrics snapshot (only if enabled)
+                    if self.transport_snapshot_interval_secs > 0 {
+                        if let Some(snapshot) = TRANSPORT_METRICS.take_snapshot() {
+                            let event = TelemetryEvent {
+                                timestamp: current_timestamp_ms(),
+                                peer_id: String::new(), // Transport metrics are node-wide, not peer-specific
+                                transaction_id: String::new(), // Not tied to a transaction
+                                event_type: "transport_snapshot".to_string(),
+                                event_data: serde_json::to_value(&snapshot).unwrap_or_default(),
+                            };
+                            self.handle_event(event).await;
+                        }
+                    }
                 }
             }
         }
@@ -445,6 +495,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 PeerLifecycleEvent::Shutdown { .. } => "peer_shutdown".to_string(),
             }
         }
+        EventKind::TransportSnapshot(_) => "transport_snapshot".to_string(),
     }
 }
 
@@ -1135,6 +1186,24 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     })
                 }
             }
+        }
+        EventKind::TransportSnapshot(snapshot) => {
+            serde_json::json!({
+                "type": "transport_snapshot",
+                "transfers_completed": snapshot.transfers_completed,
+                "transfers_failed": snapshot.transfers_failed,
+                "bytes_sent": snapshot.bytes_sent,
+                "bytes_received": snapshot.bytes_received,
+                "avg_transfer_time_ms": snapshot.avg_transfer_time_ms,
+                "peak_throughput_bps": snapshot.peak_throughput_bps,
+                "avg_cwnd_bytes": snapshot.avg_cwnd_bytes,
+                "peak_cwnd_bytes": snapshot.peak_cwnd_bytes,
+                "min_cwnd_bytes": snapshot.min_cwnd_bytes,
+                "slowdowns_triggered": snapshot.slowdowns_triggered,
+                "avg_rtt_us": snapshot.avg_rtt_us,
+                "min_rtt_us": snapshot.min_rtt_us,
+                "max_rtt_us": snapshot.max_rtt_us,
+            })
         }
     }
 }

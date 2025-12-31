@@ -441,6 +441,8 @@ pub struct LedbatController {
     min_cwnd_events: AtomicUsize,
     slow_start_exits: AtomicUsize,
     periodic_slowdowns: AtomicUsize,
+    /// Peak congestion window reached during this controller's lifetime
+    peak_cwnd: AtomicUsize,
 }
 
 impl LedbatController {
@@ -550,7 +552,28 @@ impl LedbatController {
             min_cwnd_events: AtomicUsize::new(0),
             slow_start_exits: AtomicUsize::new(0),
             periodic_slowdowns: AtomicUsize::new(0),
+            peak_cwnd: AtomicUsize::new(config.initial_cwnd),
         }
+    }
+
+    /// Store new cwnd value and update peak_cwnd if this is a new maximum.
+    fn store_cwnd(&self, new_cwnd: usize) {
+        self.cwnd.store(new_cwnd, Ordering::Release);
+        // Update peak if this is a new maximum (lock-free max update)
+        self.peak_cwnd
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current_peak| {
+                if new_cwnd > current_peak {
+                    Some(new_cwnd)
+                } else {
+                    None
+                }
+            })
+            .ok(); // Ignore result - we just want the side effect
+    }
+
+    /// Get the peak congestion window reached during this controller's lifetime.
+    pub fn peak_cwnd(&self) -> usize {
+        self.peak_cwnd.load(Ordering::Relaxed)
     }
 
     /// Calculate dynamic GAIN based on base delay (LEDBAT++ Section 4.2)
@@ -723,7 +746,7 @@ impl LedbatController {
             self.min_cwnd_events.fetch_add(1, Ordering::Relaxed);
         }
 
-        self.cwnd.store(new_cwnd_usize, Ordering::Release);
+        self.store_cwnd(new_cwnd_usize);
 
         // Log significant changes
         let change_abs = (new_cwnd_usize as i64 - current_cwnd as i64).unsigned_abs() as usize;
@@ -773,7 +796,7 @@ impl LedbatController {
             let new_cwnd = (current_cwnd + bytes_acked)
                 .min(target_cwnd)
                 .min(self.max_cwnd);
-            self.cwnd.store(new_cwnd, Ordering::Release);
+            self.store_cwnd(new_cwnd);
             return;
         }
 
@@ -832,7 +855,7 @@ impl LedbatController {
         } else {
             // Exponential growth: cwnd += bytes_acked (doubles per RTT)
             let new_cwnd = (current_cwnd + bytes_acked).min(self.max_cwnd);
-            self.cwnd.store(new_cwnd, Ordering::Release);
+            self.store_cwnd(new_cwnd);
 
             tracing::trace!(
                 old_cwnd_kb = current_cwnd / 1024,
@@ -923,7 +946,7 @@ impl LedbatController {
                 let new_cwnd = (current_cwnd + bytes_acked)
                     .min(target_cwnd)
                     .min(self.max_cwnd);
-                self.cwnd.store(new_cwnd, Ordering::Release);
+                self.store_cwnd(new_cwnd);
                 true
             }
             _ => false, // Unknown state, don't interfere
@@ -1106,14 +1129,17 @@ impl LedbatController {
         );
     }
 
-    /// Get statistics (test-only, for validating controller behavior).
-    #[cfg(test)]
+    /// Get LEDBAT congestion control statistics.
+    ///
+    /// Returns a snapshot of the controller's current state and cumulative statistics.
+    /// Useful for telemetry, debugging, and performance analysis.
     pub fn stats(&self) -> LedbatStats {
         LedbatStats {
             cwnd: self.current_cwnd(),
             flightsize: self.flightsize(),
             queuing_delay: self.queuing_delay(),
             base_delay: self.base_delay(),
+            peak_cwnd: self.peak_cwnd(),
             total_increases: self.total_increases.load(Ordering::Relaxed),
             total_decreases: self.total_decreases.load(Ordering::Relaxed),
             total_losses: self.total_losses.load(Ordering::Relaxed),
@@ -1124,21 +1150,32 @@ impl LedbatController {
     }
 }
 
-/// LEDBAT++ statistics (test-only).
-#[cfg(test)]
+/// LEDBAT++ congestion control statistics.
+///
+/// Provides a snapshot of the controller state for telemetry and debugging.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for debugging and analysis in tests
 pub struct LedbatStats {
+    /// Current congestion window size (bytes).
     pub cwnd: usize,
+    /// Current bytes in flight (unacknowledged).
     pub flightsize: usize,
+    /// Current queuing delay estimate.
     pub queuing_delay: Duration,
+    /// Minimum observed RTT (base delay).
     pub base_delay: Duration,
+    /// Peak congestion window reached during controller lifetime.
+    pub peak_cwnd: usize,
+    /// Total number of cwnd increases.
     pub total_increases: usize,
+    /// Total number of cwnd decreases.
     pub total_decreases: usize,
+    /// Total packet losses detected.
     pub total_losses: usize,
+    /// Times cwnd hit minimum value.
     pub min_cwnd_events: usize,
+    /// Times slow start phase exited.
     pub slow_start_exits: usize,
-    /// Number of periodic slowdowns completed (LEDBAT++ feature)
+    /// Number of periodic slowdowns completed (LEDBAT++ feature).
     pub periodic_slowdowns: usize,
 }
 

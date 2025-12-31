@@ -511,6 +511,10 @@ impl ConfigArgs {
                     .telemetry
                     .endpoint
                     .unwrap_or_else(|| DEFAULT_TELEMETRY_ENDPOINT.to_string()),
+                transport_snapshot_interval_secs: self
+                    .telemetry
+                    .transport_snapshot_interval_secs
+                    .unwrap_or_else(default_transport_snapshot_interval_secs),
                 // Test environments are identified by the --id flag, which is used for
                 // simulated networks and integration tests. We disable telemetry in these
                 // environments to avoid flooding the collector with test data.
@@ -955,6 +959,18 @@ pub struct TelemetryArgs {
     #[arg(long = "telemetry-endpoint", env = "FREENET_TELEMETRY_ENDPOINT")]
     #[serde(rename = "telemetry-endpoint", skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// Interval in seconds for emitting transport layer metric snapshots.
+    /// Set to 0 to disable transport snapshots. Default: 30 seconds.
+    #[arg(
+        long = "transport-snapshot-interval-secs",
+        env = "FREENET_TRANSPORT_SNAPSHOT_INTERVAL_SECS"
+    )]
+    #[serde(
+        rename = "transport-snapshot-interval-secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transport_snapshot_interval_secs: Option<u64>,
 }
 
 impl Default for TelemetryArgs {
@@ -962,6 +978,7 @@ impl Default for TelemetryArgs {
         Self {
             enabled: true,
             endpoint: None,
+            transport_snapshot_interval_secs: None,
         }
     }
 }
@@ -980,10 +997,23 @@ pub struct TelemetryConfig {
     #[serde(default = "default_telemetry_endpoint", rename = "telemetry-endpoint")]
     pub endpoint: String,
 
+    /// Interval in seconds for emitting transport layer metric snapshots.
+    /// Set to 0 to disable transport snapshots.
+    /// Default: 30 seconds.
+    #[serde(
+        default = "default_transport_snapshot_interval_secs",
+        rename = "transport-snapshot-interval-secs"
+    )]
+    pub transport_snapshot_interval_secs: u64,
+
     /// Whether this is a test environment (detected via --id flag).
     /// When true, telemetry is disabled to avoid flooding the collector with test data.
     #[serde(skip)]
     pub is_test_environment: bool,
+}
+
+fn default_transport_snapshot_interval_secs() -> u64 {
+    30
 }
 
 fn default_telemetry_endpoint() -> String {
@@ -995,6 +1025,7 @@ impl Default for TelemetryConfig {
         Self {
             enabled: true,
             endpoint: DEFAULT_TELEMETRY_ENDPOINT.to_string(),
+            transport_snapshot_interval_secs: default_transport_snapshot_interval_secs(),
             is_test_environment: false,
         }
     }

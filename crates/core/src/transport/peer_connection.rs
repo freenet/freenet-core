@@ -47,6 +47,9 @@ use crate::util::time_source::InstantTimeSrc;
 
 type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 
+/// Result type for outbound stream transfers, includes transfer statistics.
+type OutboundStreamResult = std::result::Result<super::TransferStats, TransportError>;
+
 /// The max payload we can send in a single fragment, this MUST be less than packet_data::MAX_DATA_SIZE
 /// since we need to account for the space overhead of SymmetricMessage::StreamFragment metadata.
 /// Measured overhead: 40 bytes (see symmetric_message::stream_fragment_overhead())
@@ -164,7 +167,7 @@ pub struct PeerConnection<S = super::UdpSocket> {
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     inbound_streams: HashMap<StreamId, FastSender<(u32, bytes::Bytes)>>,
     inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
-    outbound_stream_futures: FuturesUnordered<JoinHandle<Result>>,
+    outbound_stream_futures: FuturesUnordered<JoinHandle<OutboundStreamResult>>,
     failure_count: usize,
     first_failure_time: Option<std::time::Instant>,
     last_packet_report_time: Instant,
@@ -715,7 +718,24 @@ impl<S: super::Socket> PeerConnection<S> {
                         );
                         continue
                     };
-                    res.map_err(|e| TransportError::Other(e.into()))??
+                    // Handle task join error
+                    let transfer_result = res.map_err(|e| TransportError::Other(e.into()))?;
+                    // Handle transfer error or get stats
+                    match transfer_result {
+                        Ok(stats) => {
+                            tracing::trace!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = stats.stream_id,
+                                bytes = stats.bytes_transferred,
+                                elapsed_ms = stats.elapsed.as_millis(),
+                                throughput_kbps = stats.avg_throughput_bps() / 1024,
+                                "Outbound stream completed with stats"
+                            );
+                            // Report to global metrics for periodic telemetry snapshots
+                            super::TRANSPORT_METRICS.record_transfer_completed(&stats);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 _ = timeout_check.tick() => {
                     let elapsed = last_received.elapsed();

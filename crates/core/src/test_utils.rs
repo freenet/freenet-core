@@ -1414,6 +1414,7 @@ impl TestContext {
                     crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
                     crate::tracing::EventKind::Timeout { .. } => ("⏱️", "Timeout"),
                     crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
+                    crate::tracing::EventKind::TransportSnapshot(..) => ("📊", "TransportSnapshot"),
                 };
 
                 writeln!(
@@ -1457,6 +1458,7 @@ impl TestContext {
                 crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
                 crate::tracing::EventKind::Timeout { .. } => ("⏱️", "Timeout"),
                 crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
+                crate::tracing::EventKind::TransportSnapshot(..) => ("📊", "TransportSnapshot"),
             };
 
             writeln!(
@@ -1520,6 +1522,7 @@ impl TestContext {
                             crate::tracing::EventKind::Lifecycle(..) => "Lifecycle",
                             crate::tracing::EventKind::Disconnected { .. } => "Disconnect",
                             crate::tracing::EventKind::Timeout { .. } => "Timeout",
+                            crate::tracing::EventKind::TransportSnapshot(..) => "TransportSnapshot",
                             crate::tracing::EventKind::Ignored => "Ignored",
                         };
                         *by_type.entry(type_name.to_string()).or_default() += 1;
@@ -1575,6 +1578,9 @@ impl TestContext {
                             crate::tracing::EventKind::Lifecycle(..) => ("🚀", "Lifecycle"),
                             crate::tracing::EventKind::Disconnected { .. } => ("❌", "Disconnect"),
                             crate::tracing::EventKind::Timeout { .. } => ("⏱️", "Timeout"),
+                            crate::tracing::EventKind::TransportSnapshot(..) => {
+                                ("📈", "TransportSnapshot")
+                            }
                             crate::tracing::EventKind::Ignored => ("⏭️", "Ignored"),
                         };
 
