@@ -48,6 +48,11 @@ pub use telemetry::TelemetryReporter;
 
 /// Compute a short hash of contract state for telemetry.
 /// Returns first 4 bytes of Blake3 hash as 8 hex characters.
+///
+/// This is designed for quick visual comparison in logs and telemetry dashboards,
+/// not for cryptographic verification. With 4 bytes (32 bits), birthday collision
+/// is expected around ~65,000 distinct states. Matching hashes suggest states are
+/// likely identical, but verification requires comparing full states.
 pub fn state_hash_short(state: &WrappedState) -> String {
     let hash = blake3::hash(state.as_ref());
     let bytes = hash.as_bytes();
@@ -3429,5 +3434,45 @@ pub(super) mod test {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_state_hash_short() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        // Test with known input produces consistent 8-char hex output
+        let state = WrappedState::new(vec![1, 2, 3, 4, 5]);
+        let hash = super::state_hash_short(&state);
+
+        // Should be exactly 8 hex chars (4 bytes)
+        assert_eq!(hash.len(), 8, "Hash should be 8 hex characters");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash should only contain hex digits"
+        );
+
+        // Same input produces same output (deterministic)
+        assert_eq!(
+            hash,
+            super::state_hash_short(&state),
+            "Hash should be deterministic"
+        );
+
+        // Different input produces different output
+        let state2 = WrappedState::new(vec![5, 4, 3, 2, 1]);
+        assert_ne!(
+            hash,
+            super::state_hash_short(&state2),
+            "Different states should produce different hashes"
+        );
+
+        // Empty state still produces valid 8-char hash
+        let empty = WrappedState::new(vec![]);
+        let empty_hash = super::state_hash_short(&empty);
+        assert_eq!(
+            empty_hash.len(),
+            8,
+            "Empty state should still produce 8-char hash"
+        );
     }
 }

@@ -210,7 +210,10 @@ impl Operation for UpdateOp {
                     );
 
                     {
-                        // First check if we have the contract locally and capture state for telemetry
+                        // First check if we have the contract locally and capture state for telemetry.
+                        // NOTE: There's a theoretical TOCTOU race where state could change between this
+                        // GetQuery and the update_contract() call. This is acceptable for telemetry
+                        // purposes - the hashes provide debugging visibility, not correctness guarantees.
                         let state_before = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
                                 instance_id: *key.id(),
