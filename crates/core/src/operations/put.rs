@@ -577,6 +577,10 @@ impl Operation for PutOp {
 }
 
 /// Helper to start subscription after PUT completes (only for originator)
+///
+/// Uses `start_subscription_request_async` to avoid blocking the PUT response.
+/// The subscription runs independently - the client gets immediate confirmation
+/// that the contract was stored, while subscription completes in the background.
 async fn start_subscription_after_put(
     op_manager: &OpManager,
     parent_tx: Transaction,
@@ -586,13 +590,17 @@ async fn start_subscription_after_put(
     // at PUT completion, so there's no earlier child operation that could have failed.
     // Keeping it as defensive check in case of race conditions not currently understood.
     if !op_manager.failed_parents().contains(&parent_tx) {
-        let child_tx = super::start_subscription_request(op_manager, parent_tx, key);
+        // Use async variant that doesn't block the PUT response on subscription completion.
+        // This is critical for avoiding timeouts: the PUT has already succeeded (contract stored),
+        // so the client should receive PutResponse immediately rather than waiting for
+        // the subscription to complete (which can take significant time under network delays).
+        let child_tx = super::start_subscription_request_async(op_manager, parent_tx, key);
         tracing::debug!(
             tx = %parent_tx,
             child_tx = %child_tx,
             contract = %key,
             phase = "subscribe",
-            "Started subscription as child operation after PUT"
+            "Started async subscription after PUT (not blocking response)"
         );
     } else {
         tracing::warn!(
