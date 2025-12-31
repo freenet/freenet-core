@@ -138,9 +138,7 @@ impl NetworkBridge for MemoryConnManager {
 
     async fn drop_connection(&mut self, peer_addr: SocketAddr) -> super::ConnResult<()> {
         tracing::debug!("Dropping in-memory connection to {}", peer_addr);
-        // In the in-memory transport, we don't actually need to do anything special
-        // to drop a connection since there are no real network resources.
-        // The connection manager handles the logical disconnection.
+        PEER_REGISTRY.write().unwrap().unregister(&peer_addr);
         Ok(())
     }
 }
