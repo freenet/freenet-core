@@ -105,11 +105,23 @@ impl TransportMetrics {
 
     /// Record a completed outbound transfer.
     pub fn record_transfer_completed(&self, stats: &super::TransferStats) {
-        self.transfers_completed.fetch_add(1, Ordering::Relaxed);
+        // Use saturating arithmetic to prevent overflow (though extremely unlikely
+        // in practice - would require billions of transfers or exabytes of data)
+        self.transfers_completed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(1))
+            })
+            .ok();
         self.bytes_sent
-            .fetch_add(stats.bytes_transferred, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(stats.bytes_transferred))
+            })
+            .ok();
         self.total_transfer_time_ms
-            .fetch_add(stats.elapsed.as_millis() as u64, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(stats.elapsed.as_millis() as u64))
+            })
+            .ok();
 
         // Update throughput peak
         let throughput = stats.avg_throughput_bps();
@@ -136,7 +148,10 @@ impl TransportMetrics {
             .ok();
 
         self.slowdowns_triggered
-            .fetch_add(stats.slowdowns_triggered, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(stats.slowdowns_triggered))
+            })
+            .ok();
 
         // Record RTT sample from base_delay
         let rtt_us = stats.base_delay.as_micros() as u64;
@@ -148,8 +163,15 @@ impl TransportMetrics {
     /// Record a cwnd sample (called periodically or on transfer completion).
     fn record_cwnd_sample(&self, cwnd_bytes: u32) {
         self.cwnd_sum
-            .fetch_add(cwnd_bytes as u64, Ordering::Relaxed);
-        self.cwnd_samples.fetch_add(1, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(cwnd_bytes as u64))
+            })
+            .ok();
+        self.cwnd_samples
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(1))
+            })
+            .ok();
 
         // Update min
         self.min_cwnd_bytes
@@ -165,8 +187,16 @@ impl TransportMetrics {
 
     /// Record an RTT sample in microseconds.
     fn record_rtt_sample(&self, rtt_us: u64) {
-        self.rtt_sum_us.fetch_add(rtt_us, Ordering::Relaxed);
-        self.rtt_samples.fetch_add(1, Ordering::Relaxed);
+        self.rtt_sum_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(rtt_us))
+            })
+            .ok();
+        self.rtt_samples
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(1))
+            })
+            .ok();
 
         // Update min
         self.min_rtt_us
@@ -281,6 +311,12 @@ impl TransportMetrics {
 ///
 /// Emitted every N seconds to provide aggregate transport layer statistics
 /// without flooding the telemetry server with per-transfer events.
+///
+/// # Sentinel Values
+///
+/// - `min_cwnd_bytes`: 0 indicates no cwnd samples were recorded
+/// - `min_rtt_us`: 0 indicates no RTT samples were recorded
+/// - Other fields: 0 is a valid value indicating no activity for that metric
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct TransportSnapshot {
@@ -292,21 +328,21 @@ pub struct TransportSnapshot {
     pub bytes_sent: u64,
     /// Total bytes received during the period.
     pub bytes_received: u64,
-    /// Average transfer time in milliseconds.
+    /// Average transfer time in milliseconds (0 if no transfers).
     pub avg_transfer_time_ms: u64,
     /// Peak throughput observed (bytes per second).
     pub peak_throughput_bps: u64,
-    /// Average congestion window size (bytes).
+    /// Average congestion window size in bytes (0 if no samples).
     pub avg_cwnd_bytes: u32,
     /// Peak congestion window size (bytes).
     pub peak_cwnd_bytes: u32,
-    /// Minimum congestion window size (bytes).
+    /// Minimum congestion window size in bytes (0 if no samples recorded).
     pub min_cwnd_bytes: u32,
     /// Number of LEDBAT slowdowns triggered.
     pub slowdowns_triggered: u32,
-    /// Average RTT in microseconds.
+    /// Average RTT in microseconds (0 if no samples).
     pub avg_rtt_us: u64,
-    /// Minimum RTT in microseconds.
+    /// Minimum RTT in microseconds (0 if no samples recorded).
     pub min_rtt_us: u64,
     /// Maximum RTT in microseconds.
     pub max_rtt_us: u64,
