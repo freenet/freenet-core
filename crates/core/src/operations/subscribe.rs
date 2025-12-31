@@ -24,6 +24,13 @@ use tokio::time::{sleep, Duration};
 /// Used when a subscription arrives before the contract has been propagated via PUT.
 const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
 
+/// Maximum number of retries for peer location lookup.
+/// Used when a Subscribe message arrives before the connection is fully established.
+const PEER_LOOKUP_MAX_RETRIES: u32 = 5;
+
+/// Initial delay for peer location lookup retry (doubles each retry).
+const PEER_LOOKUP_INITIAL_DELAY_MS: u64 = 100;
+
 /// Wait for a contract to become available, using channel-based notification.
 ///
 /// This handles the race condition where a subscription arrives before the contract
@@ -77,6 +84,68 @@ async fn fetch_contract_if_missing(
     // Wait for contract to arrive
     wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
 }
+
+use crate::ring::PeerKeyLocation;
+use std::net::SocketAddr;
+
+/// Wait for peer location to be available, with exponential backoff retry.
+///
+/// This handles the race condition where a Subscribe message arrives before
+/// the connection is fully established (peer is still in transient state).
+/// Returns None only after all retries are exhausted.
+async fn wait_for_peer_location(
+    op_manager: &OpManager,
+    addr: SocketAddr,
+    tx_id: &Transaction,
+) -> Option<PeerKeyLocation> {
+    // Fast path - peer already fully connected
+    if let Some(peer) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_location_by_addr(addr)
+    {
+        return Some(peer);
+    }
+
+    // Retry with exponential backoff
+    let mut delay_ms = PEER_LOOKUP_INITIAL_DELAY_MS;
+    for attempt in 1..=PEER_LOOKUP_MAX_RETRIES {
+        tracing::debug!(
+            tx = %tx_id,
+            %addr,
+            attempt,
+            delay_ms,
+            "subscribe: peer not found, retrying after delay"
+        );
+
+        sleep(Duration::from_millis(delay_ms)).await;
+
+        if let Some(peer) = op_manager
+            .ring
+            .connection_manager
+            .get_peer_location_by_addr(addr)
+        {
+            tracing::debug!(
+                tx = %tx_id,
+                %addr,
+                attempt,
+                "subscribe: peer found after retry"
+            );
+            return Some(peer);
+        }
+
+        delay_ms *= 2; // Exponential backoff
+    }
+
+    tracing::warn!(
+        tx = %tx_id,
+        %addr,
+        retries = PEER_LOOKUP_MAX_RETRIES,
+        "subscribe: peer lookup failed after all retries, connection may be transient"
+    );
+    None
+}
+
 #[derive(Debug)]
 enum SubscribeState {
     /// Prepare the request to subscribe.
@@ -487,10 +556,10 @@ impl Operation for SubscribeOp {
                         // We have the contract - register upstream as subscriber and respond
                         if let Some(requester_addr) = self.requester_addr {
                             // Register the upstream peer as downstream subscriber (they want updates FROM us)
-                            if let Some(upstream_peer) = op_manager
-                                .ring
-                                .connection_manager
-                                .get_peer_location_by_addr(requester_addr)
+                            // Use retry with backoff to handle race condition where Subscribe arrives
+                            // before connection is fully established (peer still transient)
+                            if let Some(upstream_peer) =
+                                wait_for_peer_location(op_manager, requester_addr, id).await
                             {
                                 if let Ok(result) = op_manager.ring.add_downstream(
                                     &key,
@@ -512,26 +581,36 @@ impl Operation for SubscribeOp {
                                         }
                                     }
                                 }
+
+                                tracing::info!(tx = %id, contract = %key, phase = "response", "Subscription fulfilled, sending Response");
+                                return Ok(OperationResult {
+                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                        id: *id,
+                                        instance_id: *instance_id,
+                                        result: SubscribeMsgResult::Subscribed { key },
+                                    })),
+                                    next_hop: Some(requester_addr),
+                                    state: None,
+                                });
                             } else {
+                                // Peer lookup failed after retries - return NotFound so subscriber can retry
+                                // This fixes issue #2518: silent subscription failure when connection is transient
                                 tracing::warn!(
                                     tx = %id,
                                     contract = %key,
                                     requester = %requester_addr,
-                                    "subscribe: failed to lookup peer location for downstream registration, \
-                                     subscriber will NOT receive updates"
+                                    "subscribe: peer lookup failed after retries, returning NotFound"
                                 );
+                                return Ok(OperationResult {
+                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                        id: *id,
+                                        instance_id: *instance_id,
+                                        result: SubscribeMsgResult::NotFound,
+                                    })),
+                                    next_hop: Some(requester_addr),
+                                    state: None,
+                                });
                             }
-
-                            tracing::info!(tx = %id, contract = %key, phase = "response", "Subscription fulfilled, sending Response");
-                            return Ok(OperationResult {
-                                return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                    id: *id,
-                                    instance_id: *instance_id,
-                                    result: SubscribeMsgResult::Subscribed { key },
-                                })),
-                                next_hop: Some(requester_addr),
-                                state: None,
-                            });
                         } else {
                             // We're the originator and have the contract locally
                             tracing::info!(tx = %id, contract = %key, phase = "complete", "Subscribe completed (originator has contract locally)");
@@ -557,10 +636,9 @@ impl Operation for SubscribeOp {
                     {
                         // Contract arrived - handle same as above
                         if let Some(requester_addr) = self.requester_addr {
-                            if let Some(upstream_peer) = op_manager
-                                .ring
-                                .connection_manager
-                                .get_peer_location_by_addr(requester_addr)
+                            // Use retry with backoff for peer lookup (issue #2518)
+                            if let Some(upstream_peer) =
+                                wait_for_peer_location(op_manager, requester_addr, id).await
                             {
                                 if let Ok(result) = op_manager.ring.add_downstream(
                                     &key,
@@ -582,25 +660,34 @@ impl Operation for SubscribeOp {
                                         }
                                     }
                                 }
+
+                                return Ok(OperationResult {
+                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                        id: *id,
+                                        instance_id: *instance_id,
+                                        result: SubscribeMsgResult::Subscribed { key },
+                                    })),
+                                    next_hop: Some(requester_addr),
+                                    state: None,
+                                });
                             } else {
+                                // Peer lookup failed after retries - return NotFound (issue #2518)
                                 tracing::warn!(
                                     tx = %id,
                                     contract = %key,
                                     requester = %requester_addr,
-                                    "subscribe: failed to lookup peer location for downstream registration, \
-                                     subscriber will NOT receive updates"
+                                    "subscribe: peer lookup failed after retries, returning NotFound"
                                 );
+                                return Ok(OperationResult {
+                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
+                                        id: *id,
+                                        instance_id: *instance_id,
+                                        result: SubscribeMsgResult::NotFound,
+                                    })),
+                                    next_hop: Some(requester_addr),
+                                    state: None,
+                                });
                             }
-
-                            return Ok(OperationResult {
-                                return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                    id: *id,
-                                    instance_id: *instance_id,
-                                    result: SubscribeMsgResult::Subscribed { key },
-                                })),
-                                next_hop: Some(requester_addr),
-                                state: None,
-                            });
                         } else {
                             tracing::info!(tx = %id, contract = %key, phase = "complete", "Subscribe completed (originator, contract arrived after wait)");
                             return Ok(OperationResult {
@@ -721,10 +808,9 @@ impl Operation for SubscribeOp {
                             if let Some(requester_addr) = self.requester_addr {
                                 // We're an intermediate node - forward response to the requester
                                 // Register them as downstream (they want updates from us)
-                                if let Some(downstream_peer) = op_manager
-                                    .ring
-                                    .connection_manager
-                                    .get_peer_location_by_addr(requester_addr)
+                                // Use retry with backoff for peer lookup (issue #2518)
+                                if let Some(downstream_peer) =
+                                    wait_for_peer_location(op_manager, requester_addr, msg_id).await
                                 {
                                     if let Ok(result) = op_manager.ring.add_downstream(
                                         key,
@@ -752,30 +838,41 @@ impl Operation for SubscribeOp {
                                             "subscribe: registered requester as downstream subscriber"
                                         );
                                     }
+
+                                    tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
+                                    Ok(OperationResult {
+                                        return_msg: Some(NetMessage::from(
+                                            SubscribeMsg::Response {
+                                                id: *msg_id,
+                                                instance_id: *instance_id,
+                                                result: SubscribeMsgResult::Subscribed {
+                                                    key: *key,
+                                                },
+                                            },
+                                        )),
+                                        next_hop: Some(requester_addr),
+                                        state: None,
+                                    })
                                 } else {
+                                    // Peer lookup failed after retries - return NotFound (issue #2518)
                                     tracing::warn!(
                                         tx = %msg_id,
                                         %key,
                                         requester = %requester_addr,
-                                        "subscribe: failed to lookup peer location for downstream registration, \
-                                         subscriber will NOT receive updates"
+                                        "subscribe: peer lookup failed after retries, returning NotFound"
                                     );
+                                    Ok(OperationResult {
+                                        return_msg: Some(NetMessage::from(
+                                            SubscribeMsg::Response {
+                                                id: *msg_id,
+                                                instance_id: *instance_id,
+                                                result: SubscribeMsgResult::NotFound,
+                                            },
+                                        )),
+                                        next_hop: Some(requester_addr),
+                                        state: None,
+                                    })
                                 }
-
-                                tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
-                                Ok(OperationResult {
-                                    return_msg: Some(NetMessage::from(SubscribeMsg::Response {
-                                        id: *msg_id,
-                                        instance_id: *instance_id,
-                                        result: SubscribeMsgResult::Subscribed { key: *key },
-                                    })),
-                                    next_hop: Some(requester_addr),
-                                    state: Some(OpEnum::Subscribe(SubscribeOp {
-                                        id,
-                                        state: Some(SubscribeState::Completed { key: *key }),
-                                        requester_addr: None,
-                                    })),
-                                })
                             } else {
                                 // We're the originator - return completed state for handle_op_result
                                 tracing::info!(tx = %msg_id, contract = %key, phase = "complete", "Subscribe completed (originator)");
