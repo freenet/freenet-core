@@ -670,6 +670,47 @@ impl SeedingManager {
         self.seeding_cache.read().len()
     }
 
+    /// Get the complete subscription state for all active subscriptions.
+    ///
+    /// Returns a list of tuples containing:
+    /// - Contract key
+    /// - Whether we're locally seeding (have client subscriptions)
+    /// - Optional upstream peer
+    /// - List of downstream subscribers
+    ///
+    /// This is used for periodic telemetry snapshots.
+    pub fn get_all_subscription_states(
+        &self,
+    ) -> Vec<(
+        ContractKey,
+        bool,
+        Option<PeerKeyLocation>,
+        Vec<PeerKeyLocation>,
+    )> {
+        self.subscriptions
+            .iter()
+            .map(|entry| {
+                let contract = *entry.key();
+                let subs = entry.value();
+
+                let is_seeding = self.has_client_subscriptions(contract.id());
+
+                let upstream = subs
+                    .iter()
+                    .find(|e| e.role == SubscriberType::Upstream)
+                    .map(|e| e.peer.clone());
+
+                let downstream: Vec<PeerKeyLocation> = subs
+                    .iter()
+                    .filter(|e| e.role == SubscriberType::Downstream)
+                    .map(|e| e.peer.clone())
+                    .collect();
+
+                (contract, is_seeding, upstream, downstream)
+            })
+            .collect()
+    }
+
     // --- Subscription retry spam prevention ---
 
     /// Check if a subscription request can be made for a contract.

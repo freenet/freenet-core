@@ -1016,7 +1016,6 @@ impl<'a> NetEventLog<'a> {
     }
 
     /// Create a subscription_state snapshot event.
-    #[allow(dead_code)] // Helper available for future use
     pub fn subscription_state(
         ring: &'a Ring,
         key: ContractKey,
