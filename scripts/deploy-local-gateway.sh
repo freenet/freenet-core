@@ -292,31 +292,66 @@ start_service() {
 verify_service() {
     local service_arg="$1"
     local expected_version="$2"
+    local retry_count="${3:-0}"
+    local max_retries=2
 
     case "$SERVICE_MANAGER" in
         systemd)
             # Check if unit file exists by querying systemctl directly
             if systemctl list-unit-files "$service_arg.service" 2>/dev/null | grep -q "$service_arg.service"; then
                 echo -n "  Verifying service status ($service_arg)... "
-                sleep 2  # Give service time to start
-                if systemctl is-active --quiet "$service_arg.service"; then
-                    # Get the PID of the running service
-                    local pid=$(systemctl show -p MainPID --value "$service_arg.service" 2>/dev/null)
+                sleep 3  # Give service time to start
 
-                    if [[ -n "$pid" ]] && [[ "$pid" != "0" ]]; then
+                if systemctl is-active --quiet "$service_arg.service"; then
+                    # Find the actual freenet process, not the wrapper
+                    # MainPID may point to bash if service uses ExecStart with shell
+                    local freenet_pid=$(pgrep -f "freenet.*--is-gateway\|freenet.*network" | head -1)
+
+                    if [[ -z "$freenet_pid" ]]; then
+                        # Fallback to MainPID
+                        freenet_pid=$(systemctl show -p MainPID --value "$service_arg.service" 2>/dev/null)
+                    fi
+
+                    if [[ -n "$freenet_pid" ]] && [[ "$freenet_pid" != "0" ]]; then
                         # CRITICAL: Verify the RUNNING process is using the correct binary
-                        # This catches the case where binary was updated but service wasn't restarted
-                        local running_binary=$(sudo readlink -f /proc/$pid/exe 2>/dev/null || echo "unknown")
+                        local running_binary=$(sudo readlink -f /proc/$freenet_pid/exe 2>/dev/null || echo "unknown")
                         local expected_binary=$(readlink -f "$INSTALL_PATH" 2>/dev/null || echo "$INSTALL_PATH")
+
+                        # Handle case where binary is bash (wrapper script) - look for freenet specifically
+                        if [[ "$running_binary" == *"/bash"* ]] || [[ "$running_binary" == *"/sh"* ]]; then
+                            # Find the actual freenet process spawned by the wrapper
+                            local child_pid=$(pgrep -P "$freenet_pid" -f freenet 2>/dev/null | head -1)
+                            if [[ -n "$child_pid" ]]; then
+                                running_binary=$(sudo readlink -f /proc/$child_pid/exe 2>/dev/null || echo "unknown")
+                                freenet_pid="$child_pid"
+                            else
+                                # Try to find any freenet process
+                                local any_freenet=$(pgrep -f "$INSTALL_PATH" | head -1)
+                                if [[ -n "$any_freenet" ]]; then
+                                    running_binary=$(sudo readlink -f /proc/$any_freenet/exe 2>/dev/null || echo "unknown")
+                                    freenet_pid="$any_freenet"
+                                fi
+                            fi
+                        fi
 
                         if [[ "$running_binary" != "unknown" ]] && [[ "$running_binary" != "$expected_binary" ]]; then
                             echo "✗"
                             echo "  ⚠️  CRITICAL: Running process using DIFFERENT binary!"
-                            echo "     Running process (PID $pid) uses: $running_binary"
-                            echo "     Expected (installed at):         $expected_binary"
-                            echo "     This means the service wasn't properly restarted."
-                            echo "     Try: sudo systemctl restart $service_arg.service"
-                            return 1
+                            echo "     Running process (PID $freenet_pid) uses: $running_binary"
+                            echo "     Expected (installed at):                 $expected_binary"
+
+                            if [[ $retry_count -lt $max_retries ]]; then
+                                echo "  🔄 Auto-restarting service to fix..."
+                                sudo systemctl restart "$service_arg.service"
+                                sleep 2
+                                # Recursive retry
+                                verify_service "$service_arg" "$expected_version" $((retry_count + 1))
+                                return $?
+                            else
+                                echo "  ❌ Failed after $max_retries restart attempts"
+                                echo "     Manual intervention required."
+                                return 1
+                            fi
                         fi
                     fi
 
@@ -334,12 +369,20 @@ verify_service() {
 
                     echo "✓"
                     echo "  ✓ Version: $disk_version"
-                    echo "  ✓ Service: Running (PID ${pid:-unknown})"
-                    echo "  ✓ Binary:  $INSTALL_PATH"
+                    echo "  ✓ Service: Running (PID ${freenet_pid:-unknown})"
+                    echo "  ✓ Binary:  $running_binary"
                 else
                     echo "✗"
                     echo "  ⚠️  Service failed to start"
                     echo "     Check logs with: sudo journalctl -u $service_arg.service -n 50"
+
+                    if [[ $retry_count -lt $max_retries ]]; then
+                        echo "  🔄 Retrying start..."
+                        sudo systemctl start "$service_arg.service"
+                        sleep 2
+                        verify_service "$service_arg" "$expected_version" $((retry_count + 1))
+                        return $?
+                    fi
                     return 1
                 fi
             fi
@@ -410,11 +453,25 @@ for service in "${SERVICES_TO_DEPLOY[@]}"; do
 done
 
 # Verify services
+VERIFICATION_FAILED=false
 if [[ "$DRY_RUN" == "false" ]] && [[ "$SERVICE_MANAGER" == "systemd" ]]; then
     echo
     for service in "${SERVICES_TO_DEPLOY[@]}"; do
-        verify_service "$service" "$BINARY_VERSION" || true
+        if ! verify_service "$service" "$BINARY_VERSION"; then
+            VERIFICATION_FAILED=true
+        fi
     done
+fi
+
+# Exit with error if verification failed
+if [[ "$VERIFICATION_FAILED" == "true" ]]; then
+    echo
+    echo "❌ DEPLOYMENT VERIFICATION FAILED"
+    echo "   Some services are not running the correct binary version."
+    echo "   This can cause version incompatibility errors with peers."
+    echo
+    echo "   Try manually restarting: sudo systemctl restart $SERVICE_NAME"
+    exit 1
 fi
 
 # Clean up reenable list
