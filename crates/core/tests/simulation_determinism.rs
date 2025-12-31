@@ -329,7 +329,7 @@ fn test_virtual_time_wakeup_determinism() {
         for i in 0..10 {
             let deadline = 100 * (10 - i);
             // We call sleep_until to register wakeups (the future is dropped but wakeup is registered)
-            let _ = vt.sleep_until(deadline);
+            drop(vt.sleep_until(deadline));
         }
 
         // Advance and collect triggers

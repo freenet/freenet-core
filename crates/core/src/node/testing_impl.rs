@@ -270,6 +270,8 @@ pub(super) struct Builder<ER> {
     event_register: ER,
     contracts: Vec<(ContractContainer, WrappedState, bool)>,
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
+    /// Seed for deterministic RNG in this node's transport layer
+    pub rng_seed: u64,
 }
 
 impl<ER: NetEventRegister> Builder<ER> {
@@ -279,6 +281,7 @@ impl<ER: NetEventRegister> Builder<ER> {
         event_register: ER,
         contract_handler_name: String,
         add_noise: bool,
+        rng_seed: u64,
     ) -> Builder<ER> {
         Builder {
             config: builder.clone(),
@@ -287,6 +290,7 @@ impl<ER: NetEventRegister> Builder<ER> {
             event_register,
             contracts: Vec::new(),
             contract_subscribers: HashMap::new(),
+            rng_seed,
         }
     }
 }
@@ -309,9 +313,14 @@ pub struct SimNetwork {
     min_connections: usize,
     start_backoff: Duration,
     add_noise: bool,
+    /// Master seed for deterministic RNG - used to derive per-peer seeds
+    seed: u64,
 }
 
 impl SimNetwork {
+    /// Default seed for deterministic simulation
+    const DEFAULT_SEED: u64 = 0xDEADBEEF_CAFEBABE;
+
     pub async fn new(
         name: &str,
         gateways: usize,
@@ -320,6 +329,30 @@ impl SimNetwork {
         rnd_if_htl_above: usize,
         max_connections: usize,
         min_connections: usize,
+    ) -> Self {
+        Self::with_seed(
+            name,
+            gateways,
+            nodes,
+            ring_max_htl,
+            rnd_if_htl_above,
+            max_connections,
+            min_connections,
+            Self::DEFAULT_SEED,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn with_seed(
+        name: &str,
+        gateways: usize,
+        nodes: usize,
+        ring_max_htl: usize,
+        rnd_if_htl_above: usize,
+        max_connections: usize,
+        min_connections: usize,
+        seed: u64,
     ) -> Self {
         assert!(nodes > 0);
         let (user_ev_controller, mut receiver_ch) =
@@ -342,6 +375,7 @@ impl SimNetwork {
             min_connections,
             start_backoff: Duration::from_millis(1),
             add_noise: false,
+            seed,
         };
         net.config_gateways(
             gateways
@@ -351,6 +385,19 @@ impl SimNetwork {
         .await;
         net.config_nodes(nodes).await;
         net
+    }
+
+    /// Derives a deterministic per-peer seed from the master seed and peer index.
+    fn derive_peer_seed(&self, peer_index: usize) -> u64 {
+        // Use a simple but effective mixing function
+        let mut seed = self.seed;
+        seed = seed.wrapping_add(peer_index as u64);
+        seed ^= seed >> 33;
+        seed = seed.wrapping_mul(0xff51afd7ed558ccd);
+        seed ^= seed >> 33;
+        seed = seed.wrapping_mul(0xc4ceb9fe1a85ec53);
+        seed ^= seed >> 33;
+        seed
     }
 }
 
@@ -440,11 +487,13 @@ impl SimNetwork {
                     self.event_listener.clone()
                 }
             };
+            let peer_seed = self.derive_peer_seed(this_config.label.number());
             let gateway = Builder::build(
                 this_node,
                 event_listener,
                 format!("{}-{label}", self.name, label = this_config.label),
                 self.add_noise,
+                peer_seed,
             );
             self.gateways.push((gateway, this_config));
         }
@@ -506,11 +555,13 @@ impl SimNetwork {
                     self.event_listener.clone()
                 }
             };
+            let peer_seed = self.derive_peer_seed(node_no);
             let node = Builder::build(
                 config,
                 event_listener,
                 format!("{}-{label}", self.name),
                 self.add_noise,
+                peer_seed,
             );
             self.nodes.push((node, label));
         }

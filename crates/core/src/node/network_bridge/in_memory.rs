@@ -78,8 +78,9 @@ impl MemoryConnManager {
         log_register: impl NetEventRegister,
         op_manager: Arc<OpManager>,
         add_noise: bool,
+        rng_seed: u64,
     ) -> Self {
-        let transport = InMemoryTransport::new(peer, add_noise);
+        let transport = InMemoryTransport::new(peer, add_noise, rng_seed);
         let msg_queue = Arc::new(Mutex::new(Vec::new()));
 
         let msg_queue_cp = msg_queue.clone();
@@ -173,7 +174,7 @@ struct InMemoryTransport {
 }
 
 impl InMemoryTransport {
-    fn new(interface_peer: PeerId, add_noise: bool) -> Self {
+    fn new(interface_peer: PeerId, add_noise: bool, rng_seed: u64) -> Self {
         let msg_stack_queue = Arc::new(Mutex::new(Vec::new()));
 
         // Create a dedicated channel for this peer
@@ -189,7 +190,8 @@ impl InMemoryTransport {
         let msg_stack_queue_cp = msg_stack_queue.clone();
         let ip = interface_peer.clone();
         GlobalExecutor::spawn(async move {
-            let mut rng = StdRng::seed_from_u64(rand::random());
+            // Use the provided seed for deterministic behavior
+            let mut rng = StdRng::seed_from_u64(rng_seed);
             loop {
                 match rx.try_recv() {
                     Ok(msg) => {
