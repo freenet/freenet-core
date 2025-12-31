@@ -48,6 +48,9 @@ const MAX_EVENTS_PER_SECOND: usize = 10;
 /// Initial backoff duration on failure
 const INITIAL_BACKOFF_MS: u64 = 1000;
 
+/// Minimum transport snapshot interval (to prevent spamming telemetry)
+const MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS: u64 = 10;
+
 /// Maximum backoff duration
 const MAX_BACKOFF_MS: u64 = 300_000; // 5 minutes
 
@@ -215,11 +218,19 @@ impl TelemetryWorker {
         let mut batch_interval = tokio::time::interval(Duration::from_secs(BATCH_INTERVAL_SECS));
 
         // Transport snapshots are optional (disabled if interval is 0)
-        let snapshot_interval_secs = if self.transport_snapshot_interval_secs > 0 {
-            self.transport_snapshot_interval_secs
-        } else {
+        // Clamp to minimum to prevent spamming telemetry server
+        let snapshot_interval_secs = if self.transport_snapshot_interval_secs == 0 {
             // Use a long interval but we'll skip the actual snapshot logic
             u64::MAX / 2 // Effectively disabled
+        } else if self.transport_snapshot_interval_secs < MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS {
+            tracing::warn!(
+                "Transport snapshot interval {}s is below minimum {}s, using minimum",
+                self.transport_snapshot_interval_secs,
+                MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS
+            );
+            MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS
+        } else {
+            self.transport_snapshot_interval_secs
         };
         let mut transport_snapshot_interval =
             tokio::time::interval(Duration::from_secs(snapshot_interval_secs));
