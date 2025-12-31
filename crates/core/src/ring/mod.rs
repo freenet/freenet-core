@@ -41,11 +41,13 @@ pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod live_tx;
 mod location;
+mod peer_connection_backoff;
 mod peer_key_location;
 mod seeding;
 mod seeding_cache;
 
 use connection_backoff::ConnectionBackoff;
+pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
 
 pub use self::live_tx::LiveTransactionTracker;
 pub use connection::Connection;
