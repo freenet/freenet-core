@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 use crate::config::TelemetryConfig;
 use crate::message::Transaction;
 use crate::router::RouteEvent;
+use crate::transport::TRANSPORT_METRICS;
 
 use super::{EventKind, NetEventLog, NetEventRegister, NetLogMessage};
 
@@ -49,6 +50,11 @@ const INITIAL_BACKOFF_MS: u64 = 1000;
 
 /// Maximum backoff duration
 const MAX_BACKOFF_MS: u64 = 300_000; // 5 minutes
+
+/// How often to emit transport layer snapshots (in seconds).
+/// Transport metrics are aggregated globally and emitted periodically to avoid
+/// flooding the telemetry server with per-transfer events.
+const TRANSPORT_SNAPSHOT_INTERVAL_SECS: u64 = 30;
 
 /// Get current timestamp in milliseconds since Unix epoch.
 /// Logs a warning if system time is unavailable (e.g., clock went backwards).
@@ -199,6 +205,8 @@ impl TelemetryWorker {
 
     async fn run(mut self) {
         let mut batch_interval = tokio::time::interval(Duration::from_secs(BATCH_INTERVAL_SECS));
+        let mut transport_snapshot_interval =
+            tokio::time::interval(Duration::from_secs(TRANSPORT_SNAPSHOT_INTERVAL_SECS));
 
         loop {
             tokio::select! {
@@ -216,6 +224,19 @@ impl TelemetryWorker {
                 }
                 _ = batch_interval.tick() => {
                     self.flush().await;
+                }
+                _ = transport_snapshot_interval.tick() => {
+                    // Emit transport layer metrics snapshot
+                    if let Some(snapshot) = TRANSPORT_METRICS.take_snapshot() {
+                        let event = TelemetryEvent {
+                            timestamp: current_timestamp_ms(),
+                            peer_id: String::new(), // Transport metrics are node-wide, not peer-specific
+                            transaction_id: String::new(), // Not tied to a transaction
+                            event_type: "transport_snapshot".to_string(),
+                            event_data: serde_json::to_value(&snapshot).unwrap_or_default(),
+                        };
+                        self.handle_event(event).await;
+                    }
                 }
             }
         }
@@ -445,6 +466,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 PeerLifecycleEvent::Shutdown { .. } => "peer_shutdown".to_string(),
             }
         }
+        EventKind::TransportSnapshot(_) => "transport_snapshot".to_string(),
     }
 }
 
@@ -1135,6 +1157,24 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     })
                 }
             }
+        }
+        EventKind::TransportSnapshot(snapshot) => {
+            serde_json::json!({
+                "type": "transport_snapshot",
+                "transfers_completed": snapshot.transfers_completed,
+                "transfers_failed": snapshot.transfers_failed,
+                "bytes_sent": snapshot.bytes_sent,
+                "bytes_received": snapshot.bytes_received,
+                "avg_transfer_time_ms": snapshot.avg_transfer_time_ms,
+                "peak_throughput_bps": snapshot.peak_throughput_bps,
+                "avg_cwnd_bytes": snapshot.avg_cwnd_bytes,
+                "peak_cwnd_bytes": snapshot.peak_cwnd_bytes,
+                "min_cwnd_bytes": snapshot.min_cwnd_bytes,
+                "slowdowns_triggered": snapshot.slowdowns_triggered,
+                "avg_rtt_us": snapshot.avg_rtt_us,
+                "min_rtt_us": snapshot.min_rtt_us,
+                "max_rtt_us": snapshot.max_rtt_us,
+            })
         }
     }
 }

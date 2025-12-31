@@ -28,12 +28,15 @@ mod received_packet_tracker;
 
 pub mod global_bandwidth;
 pub(crate) mod ledbat;
+pub mod metrics;
 mod sent_packet_tracker;
 mod symmetric_message;
 pub(crate) mod token_bucket;
 
 // Re-export LEDBAT stats for telemetry
 pub use ledbat::LedbatStats;
+// Re-export transport metrics for periodic telemetry snapshots
+pub use metrics::{TransportMetrics, TransportSnapshot, TRANSPORT_METRICS};
 
 use std::time::Duration;
 

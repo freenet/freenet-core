@@ -731,7 +731,8 @@ impl<S: super::Socket> PeerConnection<S> {
                                 throughput_kbps = stats.avg_throughput_bps() / 1024,
                                 "Outbound stream completed with stats"
                             );
-                            // TODO: Expose stats for telemetry via a channel or callback
+                            // Report to global metrics for periodic telemetry snapshots
+                            super::TRANSPORT_METRICS.record_transfer_completed(&stats);
                         }
                         Err(e) => return Err(e),
                     }

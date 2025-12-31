@@ -2298,6 +2298,11 @@ pub enum EventKind {
         id: Transaction,
         timestamp: u64,
     },
+    /// Periodic transport layer metrics snapshot.
+    ///
+    /// Emitted every N seconds (default 30s) with aggregate transport statistics.
+    /// This is more efficient than per-transfer events and provides trend data.
+    TransportSnapshot(crate::transport::TransportSnapshot),
 }
 
 impl EventKind {
@@ -2312,6 +2317,7 @@ impl EventKind {
     const TIMEOUT: u8 = 8;
     const TRANSFER: u8 = 9;
     const LIFECYCLE: u8 = 10;
+    const TRANSPORT_SNAPSHOT: u8 = 11;
 
     const fn varint_id(&self) -> u8 {
         match self {
@@ -2326,6 +2332,7 @@ impl EventKind {
             EventKind::Timeout { .. } => Self::TIMEOUT,
             EventKind::Transfer(_) => Self::TRANSFER,
             EventKind::Lifecycle(_) => Self::LIFECYCLE,
+            EventKind::TransportSnapshot(_) => Self::TRANSPORT_SNAPSHOT,
         }
     }
 }
