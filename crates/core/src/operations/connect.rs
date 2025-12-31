@@ -144,6 +144,15 @@ pub(crate) enum ConnectMsg {
     },
 }
 
+/// Extracts the transaction ID from a ConnectMsg if it's a Request variant.
+/// Used by the event loop to identify locally-initiated connect requests.
+pub(crate) fn extract_connect_request_tx(msg: &ConnectMsg) -> Option<Transaction> {
+    match msg {
+        ConnectMsg::Request { id, .. } => Some(*id),
+        _ => None,
+    }
+}
+
 impl InnerMessage for ConnectMsg {
     fn id(&self) -> &Transaction {
         match self {

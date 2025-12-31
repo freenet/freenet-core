@@ -76,10 +76,13 @@ impl<ER> Builder<ER> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
         // Use the actual configured address for this peer
-        let own_addr = self
-            .config
-            .own_addr
-            .unwrap_or_else(|| (self.config.network_listener_ip, self.config.network_listener_port).into());
+        let own_addr = self.config.own_addr.unwrap_or_else(|| {
+            (
+                self.config.network_listener_ip,
+                self.config.network_listener_port,
+            )
+                .into()
+        });
 
         let conn_manager = MemoryConnManager::new(
             PeerId::new(own_addr, self.config.key_pair.public().clone()),

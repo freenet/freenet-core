@@ -4,7 +4,7 @@ use futures::Future;
 use rand::prelude::IndexedRandom;
 use std::{
     collections::{HashMap, HashSet},
-    net::Ipv6Addr,
+    net::{Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
@@ -766,7 +766,10 @@ use crate::client_events::ClientEventsProxy;
 use crate::contract::OperationMode;
 
 pub(super) trait NetworkBridgeExt: Clone + 'static {
-    fn recv(&mut self) -> impl Future<Output = Result<NetMessage, ConnectionError>> + Send;
+    /// Receive a message and the source address of the sender
+    fn recv(
+        &mut self,
+    ) -> impl Future<Output = Result<(NetMessage, Option<SocketAddr>), ConnectionError>> + Send;
 }
 
 struct RunnerConfig<NB, UsrEv>
@@ -843,7 +846,7 @@ async fn run_event_listener<NB, UsrEv>(
         op_manager,
         mut conn_manager,
         mut notification_channel,
-        mut event_register,
+        event_register,
         mut executor_listener,
         client_wait_for_transaction: mut wait_for_event,
         ..
@@ -857,18 +860,32 @@ where
     let mut pending_from_executor = HashSet::new();
     let mut tx_to_client: HashMap<Transaction, crate::client_events::ClientId> = HashMap::new();
     loop {
-        let msg = tokio::select! {
-            msg = conn_manager.recv() => { msg.map(Either::Left) }
+        let (msg, source_addr) = tokio::select! {
+            msg = conn_manager.recv() => {
+                match msg {
+                    Ok((m, addr)) => {
+                        tracing::debug!(source_addr = ?addr, msg_id = %m.id(), "Received message from network");
+                        (Ok(Either::Left(m)), addr)
+                    },
+                    Err(e) => (Err(anyhow::Error::from(e)), None),
+                }
+            }
             msg = notification_channel.notifications_receiver.recv() => {
                 if let Some(msg) = msg {
-                    Ok(msg)
+                    match &msg {
+                        Either::Left(net_msg) => {
+                            tracing::debug!(msg_id = %net_msg.id(), "Received NetMessage from notification channel (no source_addr)");
+                        }
+                        Either::Right(_) => {}
+                    }
+                    (Ok(msg), None)
                 } else {
                     anyhow::bail!("notification channel shutdown, fatal error");
                 }
             }
             msg = node_controller_rx.recv() => {
                 if let Some(msg) = msg {
-                    Ok(Either::Right(msg))
+                    (Ok(Either::Right(msg)), None)
                 } else {
                     anyhow::bail!("node controller channel shutdown, fatal error");
                 }
@@ -906,6 +923,58 @@ where
 
         if let Ok(Either::Left(NetMessage::V1(NetMessageV1::Aborted(tx)))) = msg {
             super::handle_aborted_op(tx, &op_manager, &gateways).await?;
+        }
+
+        // Handle locally-initiated outbound connect requests:
+        // If we received a ConnectMsg::Request from the notification channel (source_addr = None)
+        // and we have a stored ConnectOp with first_hop, this is OUR outbound request
+        // that needs to be sent to the gateway, not processed locally.
+        if source_addr.is_none() {
+            // Check if this is a Connect Request message
+            let connect_tx = match &msg {
+                Ok(Either::Left(NetMessage::V1(NetMessageV1::Connect(connect_msg)))) => {
+                    connect::extract_connect_request_tx(connect_msg)
+                }
+                _ => None,
+            };
+
+            if let Some(tx_id) = connect_tx {
+                // Check if we have this operation stored (meaning we initiated it)
+                if let Ok(Some(crate::operations::OpEnum::Connect(connect_op))) =
+                    op_manager.pop(&tx_id)
+                {
+                    if let Some(ref first_hop) = connect_op.first_hop {
+                        if let Some(target_addr) = first_hop.socket_addr() {
+                            tracing::debug!(
+                                tx = %tx_id,
+                                target = %target_addr,
+                                "Routing locally-initiated connect request to gateway"
+                            );
+                            // Push the operation back - we still need to track it
+                            if let Err(e) = op_manager
+                                .push(tx_id, crate::operations::OpEnum::Connect(connect_op))
+                                .await
+                            {
+                                tracing::error!(tx = %tx_id, error = %e, "Failed to push connect op back");
+                            }
+                            // Send to the gateway
+                            if let Ok(Either::Left(net_msg)) = msg {
+                                if let Err(e) = conn_manager.send(target_addr, net_msg).await {
+                                    tracing::error!(tx = %tx_id, error = %e, "Failed to send connect request to gateway");
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // Push back if we couldn't route it
+                    if let Err(e) = op_manager
+                        .push(tx_id, crate::operations::OpEnum::Connect(connect_op))
+                        .await
+                    {
+                        tracing::error!(tx = %tx_id, error = %e, "Failed to push connect op back");
+                    }
+                }
+            }
         }
 
         let msg = match msg {
@@ -1007,14 +1076,7 @@ where
                 }
             },
             Err(err) => {
-                super::report_result(
-                    None,
-                    Err(err.into()),
-                    &op_manager,
-                    None,
-                    &mut *event_register as &mut _,
-                )
-                .await;
+                tracing::error!("Error receiving message: {}", err);
                 continue;
             }
         };
@@ -1052,7 +1114,7 @@ where
             conn_manager.clone(),
             event_listener,
             executor_callback,
-            None,
+            source_addr,
         )
         .instrument(span);
         GlobalExecutor::spawn(msg);
