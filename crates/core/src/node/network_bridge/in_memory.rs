@@ -68,8 +68,7 @@ pub(in crate::node) struct MemoryConnManager {
     transport: InMemoryTransport,
     log_register: Arc<dyn NetEventRegister>,
     op_manager: Arc<OpManager>,
-    /// Queue of received messages with their source addresses
-    msg_queue: Arc<Mutex<Vec<(NetMessage, SocketAddr)>>>,
+    msg_queue: Arc<Mutex<Vec<NetMessage>>>,
 }
 
 impl MemoryConnManager {
@@ -91,10 +90,9 @@ impl MemoryConnManager {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                     continue;
                 };
-                let source_addr = msg.origin.addr;
                 let msg_data: NetMessage =
                     bincode::deserialize_from(Cursor::new(msg.data)).unwrap();
-                msg_queue_cp.lock().await.push((msg_data, source_addr));
+                msg_queue_cp.lock().await.push(msg_data);
             }
         });
 
@@ -146,15 +144,15 @@ impl NetworkBridge for MemoryConnManager {
 }
 
 impl NetworkBridgeExt for MemoryConnManager {
-    async fn recv(&mut self) -> Result<(NetMessage, Option<SocketAddr>), ConnectionError> {
+    async fn recv(&mut self) -> Result<NetMessage, ConnectionError> {
         loop {
             let mut queue = self.msg_queue.lock().await;
-            let Some((msg, source_addr)) = queue.pop() else {
+            let Some(msg) = queue.pop() else {
                 std::mem::drop(queue);
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             };
-            return Ok((msg, Some(source_addr)));
+            return Ok(msg);
         }
     }
 }
@@ -184,7 +182,11 @@ impl InMemoryTransport {
         // Register this peer in the global registry
         {
             let mut registry = PEER_REGISTRY.write().unwrap();
-            registry.register(interface_peer.addr, interface_peer.pub_key.clone(), tx);
+            registry.register(
+                interface_peer.addr,
+                interface_peer.pub_key.clone(),
+                tx,
+            );
         }
 
         // Spawn a task to receive messages from our dedicated channel

@@ -18,12 +18,12 @@ async fn test_sim_network_basic_connectivity() {
     // Create a network with 1 gateway and 5 peers
     let mut sim = SimNetwork::new(
         "basic-connectivity",
-        1,  // gateways
-        5,  // nodes
-        7,  // ring_max_htl
-        3,  // rnd_if_htl_above
-        10, // max_connections
-        2,  // min_connections
+        1,     // gateways
+        5,     // nodes
+        7,     // ring_max_htl
+        3,     // rnd_if_htl_above
+        10,    // max_connections
+        2,     // min_connections
     )
     .await;
 
@@ -54,12 +54,12 @@ async fn test_sim_network_peer_registration() {
     // Create a minimal network for quick testing
     let mut sim = SimNetwork::new(
         "peer-registration",
-        1,  // gateways
-        2,  // nodes (small for quick test)
-        7,  // ring_max_htl
-        3,  // rnd_if_htl_above
-        10, // max_connections
-        1,  // min_connections
+        1,     // gateways
+        2,     // nodes (small for quick test)
+        7,     // ring_max_htl
+        3,     // rnd_if_htl_above
+        10,    // max_connections
+        1,     // min_connections
     )
     .await;
 
@@ -74,11 +74,7 @@ async fn test_sim_network_peer_registration() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Check that peers are starting (handles should be running)
-    assert_eq!(
-        handles.len(),
-        3,
-        "Expected 3 peer handles (1 gateway + 2 nodes)"
-    );
+    assert_eq!(handles.len(), 3, "Expected 3 peer handles (1 gateway + 2 nodes)");
 
     // Allow some time for connection attempts
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -94,12 +90,12 @@ async fn test_sim_network_connection_check() {
     // Create a network with 1 gateway and 3 peers
     let mut sim = SimNetwork::new(
         "connection-check",
-        1,  // gateways
-        3,  // nodes
-        7,  // ring_max_htl
-        3,  // rnd_if_htl_above
-        10, // max_connections
-        1,  // min_connections
+        1,     // gateways
+        3,     // nodes
+        7,     // ring_max_htl
+        3,     // rnd_if_htl_above
+        10,    // max_connections
+        1,     // min_connections
     )
     .await;
 
