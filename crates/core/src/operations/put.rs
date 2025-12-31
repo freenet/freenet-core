@@ -600,7 +600,8 @@ async fn start_subscription_after_put(
     // at PUT completion, so there's no earlier child operation that could have failed.
     // Keeping it as defensive check in case of race conditions not currently understood.
     if !op_manager.failed_parents().contains(&parent_tx) {
-        let child_tx = super::start_subscription_request(op_manager, parent_tx, key, blocking_subscription);
+        let child_tx =
+            super::start_subscription_request(op_manager, parent_tx, key, blocking_subscription);
         tracing::debug!(
             tx = %parent_tx,
             child_tx = %child_tx,

@@ -750,7 +750,6 @@ pub struct NetworkArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub streaming_threshold: Option<usize>,
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
