@@ -130,15 +130,9 @@ impl LogFile {
             // Seek to the next record without reading its contents
             let length = DefaultEndian::read_u32(&buf[..4]) as u64;
 
-            match buf[4] {
-                0..=7 => {}
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Unknown event kind",
-                    ))
-                }
-            }
+            // Accept all event kinds - unknown kinds are skipped gracefully
+            // for forward/backward compatibility between versions
+            let _event_kind = buf[4];
 
             if (file.seek(io::SeekFrom::Current(length as i64)).await).is_err() {
                 break;
