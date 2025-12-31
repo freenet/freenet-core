@@ -711,12 +711,9 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
 // Combined with test_get_with_subscribe_flag (which tests local subscribe → local update),
 // this provides full coverage of the executor notification delivery paths.
 //
-// NOTE: This test is disabled due to race conditions in subscription propagation logic.
-// The test expects multiple clients across different nodes to receive subscription updates,
-// but the PUT caching refactor (commits 2cd337b5-0d432347) changed the subscription semantics.
-// Ignored due to recurring flakiness - fails intermittently with timeout waiting for
-// cross-node subscription notifications (Client 3 timeout). See issue #1798.
-#[ignore]
+// NOTE: This test was previously disabled due to race conditions in subscription propagation.
+// Re-enabled to verify if the flakiness (issue #1798, #2494) has been resolved.
+// The test expects multiple clients across different nodes to receive subscription updates.
 #[freenet_test(
     nodes = ["gateway", "node-a", "node-b"],
     timeout_secs = 600,
