@@ -423,8 +423,7 @@ pub(crate) async fn announce_contract_cached(op_manager: &OpManager, key: &Contr
 /// - The client needs immediate confirmation that the contract was stored/fetched
 /// - The subscription can complete asynchronously in the background
 /// - Subscription success/failure doesn't affect the PUT/GET result
-#[allow(dead_code)]
-pub(super) fn start_subscription_request_async(
+fn start_subscription_request_async(
     op_manager: &OpManager,
     parent_tx: Transaction,
     key: ContractKey,
@@ -439,8 +438,7 @@ pub(super) fn start_subscription_request_async(
 ///
 /// This provides stronger atomicity guarantees but may cause timeouts under
 /// poor network conditions.
-#[allow(dead_code)]
-pub(super) fn start_subscription_request_blocking(
+fn start_subscription_request_blocking(
     op_manager: &OpManager,
     parent_tx: Transaction,
     key: ContractKey,
@@ -463,7 +461,11 @@ pub(super) fn start_subscription_request(
     key: ContractKey,
     blocking: bool,
 ) -> Transaction {
-    start_subscription_request_internal(op_manager, parent_tx, key, blocking)
+    if blocking {
+        start_subscription_request_blocking(op_manager, parent_tx, key)
+    } else {
+        start_subscription_request_async(op_manager, parent_tx, key)
+    }
 }
 
 /// Starts a subscription request while allowing callers to opt out of parent tracking.
