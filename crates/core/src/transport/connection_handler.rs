@@ -390,7 +390,46 @@ impl<S: Socket> UdpPacketsListener<S> {
                         Ok((size, remote_addr)) => {
                             if let Some(time) = outdated_peer.get(&remote_addr) {
                                 if time.elapsed() < Duration::from_secs(60 * 10) {
-                                    continue;
+                                    // Peer was marked outdated due to version mismatch.
+                                    // Check if this is a valid intro packet with current version
+                                    // (peer may have upgraded). If so, allow reconnection.
+                                    if size == RSA_INTRO_PACKET_SIZE {
+                                        let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
+                                        // Rate limit RSA decryption to prevent DoS
+                                        let now = Instant::now();
+                                        let rate_limited = self
+                                            .last_rsa_attempt
+                                            .get(&remote_addr)
+                                            .is_some_and(|last| now.duration_since(*last) < RSA_DECRYPTION_RATE_LIMIT);
+
+                                        if !rate_limited {
+                                            self.last_rsa_attempt.insert(remote_addr, now);
+                                            if let Ok(decrypted) = packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
+                                                let decrypted_data = decrypted.data();
+                                                let proto_len = PROTOC_VERSION.len();
+                                                if decrypted_data.len() >= proto_len + 16
+                                                    && decrypted_data[..proto_len] == PROTOC_VERSION
+                                                {
+                                                    // Peer upgraded! Clear outdated status and process packet
+                                                    tracing::info!(
+                                                        peer_addr = %remote_addr,
+                                                        "Outdated peer sent valid intro with current protocol version. \
+                                                         Peer likely upgraded. Allowing reconnection."
+                                                    );
+                                                    outdated_peer.remove(&remote_addr);
+                                                    // Don't continue - fall through to process the packet
+                                                } else {
+                                                    continue; // Still incompatible version
+                                                }
+                                            } else {
+                                                continue; // Not a valid intro packet
+                                            }
+                                        } else {
+                                            continue; // Rate limited
+                                        }
+                                    } else {
+                                        continue; // Not an intro packet size
+                                    }
                                 } else {
                                     outdated_peer.remove(&remote_addr);
                                 }
