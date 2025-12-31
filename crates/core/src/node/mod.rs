@@ -643,7 +643,7 @@ pub(super) async fn process_message<CB>(
     conn_manager: CB,
     event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
-    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+    source_addr: Option<std::net::SocketAddr>,
 ) where
     CB: NetworkBridge,
 {
@@ -657,7 +657,7 @@ pub(super) async fn process_message<CB>(
                 conn_manager,
                 event_listener,
                 executor_callback,
-                pending_op_result,
+                source_addr,
             )
             .await
         }
@@ -760,7 +760,7 @@ async fn process_message_v1<CB>(
     mut conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
-    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+    source_addr: Option<std::net::SocketAddr>,
 ) where
     CB: NetworkBridge,
 {
@@ -780,11 +780,14 @@ async fn process_message_v1<CB>(
                     transaction = %msg.id(),
                     tx_type = %msg.id().transaction_type()
                 );
-                // Legacy path - no source_addr available
-                let op_result =
-                    handle_op_request::<ConnectOp, _>(&op_manager, &mut conn_manager, op, None)
-                        .instrument(span)
-                        .await;
+                let op_result = handle_op_request::<ConnectOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .instrument(span)
+                .await;
 
                 handle_op_not_available!(op_result);
                 return report_result(
@@ -797,23 +800,13 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Put(ref op) => {
-                // Legacy path - no source_addr available
-                let op_result =
-                    handle_op_request::<put::PutOp, _>(&op_manager, &mut conn_manager, op, None)
-                        .await;
-
-                if is_operation_completed(&op_result) {
-                    if let Some(ref op_execution_callback) = pending_op_result {
-                        let tx_id = *op.id();
-                        let _ = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Put((*op).clone())))
-                            .await
-                            .inspect_err(
-                                |err| tracing::error!(%err, %tx_id, "Failed to send message to client"),
-                            );
-                    }
-                }
-
+                let op_result = handle_op_request::<put::PutOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .await;
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
@@ -825,19 +818,13 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Get(ref op) => {
-                // Legacy path - no source_addr available
-                let op_result =
-                    handle_op_request::<get::GetOp, _>(&op_manager, &mut conn_manager, op, None)
-                        .await;
-                if is_operation_completed(&op_result) {
-                    if let Some(ref op_execution_callback) = pending_op_result {
-                        let tx_id = *op.id();
-                        let _ = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Get((*op).clone()))).await.inspect_err(|err|
-                                tracing::error!(%err, %tx_id, "Failed to send message to client")
-                            );
-                    }
-                }
+                let op_result = handle_op_request::<get::GetOp, _>(
+                    &op_manager,
+                    &mut conn_manager,
+                    op,
+                    source_addr,
+                )
+                .await;
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
@@ -849,23 +836,13 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Subscribe(ref op) => {
-                // Legacy path - no source_addr available
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                     &op_manager,
                     &mut conn_manager,
                     op,
-                    None,
+                    source_addr,
                 )
                 .await;
-                if is_operation_completed(&op_result) {
-                    if let Some(ref op_execution_callback) = pending_op_result {
-                        let tx_id = *op.id();
-                        let _ = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Subscribe((*op).clone()))).await.inspect_err(|err|
-                                tracing::error!(%err, %tx_id, "Failed to send message to client")
-                            );
-                    }
-                }
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
@@ -877,23 +854,13 @@ async fn process_message_v1<CB>(
                 .await;
             }
             NetMessageV1::Update(ref op) => {
-                // Legacy path - no source_addr available
                 let op_result = handle_op_request::<update::UpdateOp, _>(
                     &op_manager,
                     &mut conn_manager,
                     op,
-                    None,
+                    source_addr,
                 )
                 .await;
-                if is_operation_completed(&op_result) {
-                    if let Some(ref op_execution_callback) = pending_op_result {
-                        let tx_id = *op.id();
-                        let _ = op_execution_callback
-                                .send(NetMessage::V1(NetMessageV1::Update((*op).clone()))).await.inspect_err(|err|
-                                    tracing::error!(%err, %tx_id, "Failed to send message to client")
-                                );
-                    }
-                }
                 handle_op_not_available!(op_result);
                 return report_result(
                     tx,
