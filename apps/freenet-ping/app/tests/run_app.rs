@@ -1529,4 +1529,3 @@ async fn test_ping_application_loop() -> TestResult {
 
     Ok(())
 }
-
