@@ -1991,10 +1991,10 @@ impl P2pConnManager {
                 .connection_manager
                 .prune_in_transit_connection(peer_addr);
 
-            // Record failure for exponential backoff to prevent rapid retries
-            if !peer_addr.ip().is_unspecified() {
-                state.peer_backoff.record_failure(peer_addr);
-            }
+            // Note: We intentionally do NOT record backoff here. This failure is a LOCAL
+            // channel issue (handshake command queue full), not a failure to connect to the
+            // REMOTE peer. Backoff should only apply to actual connection failures
+            // (OutboundFailed), not local resource contention.
 
             let pending_txs = state.awaiting_connection_txs.remove(&peer_addr);
             if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
