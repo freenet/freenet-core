@@ -158,6 +158,7 @@ trace = ["tracing-subscriber", "tracing-appender"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]
 websocket = ["axum/ws"]
 testing = ["freenet-stdlib/testing"]
+simulation = []  # Enables deterministic simulation testing framework
 console-subscriber = ["dep:console-subscriber"]
 test-network = ["dep:freenet-test-network"]
 bench = []  # Exposes internal test infrastructure for benchmarking

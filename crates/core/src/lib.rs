@@ -49,6 +49,10 @@ pub mod util;
 /// WASM code execution runtime, tailored for the contract and delegate APIs.
 mod wasm_runtime;
 
+/// Deterministic simulation testing framework.
+#[cfg(any(test, feature = "simulation"))]
+pub mod simulation;
+
 /// Exports to build a running local node.
 pub mod local_node {
     use super::*;
