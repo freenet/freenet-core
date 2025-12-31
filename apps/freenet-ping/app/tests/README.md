@@ -88,10 +88,10 @@ Run a specific blocked peers test variant:
 cargo test test_ping_blocked_peers_simple
 ```
 
-Run the large-scale partial connectivity network test (requires the manual test feature because the scenario is still experimental):
+Run the large-scale partial connectivity network test:
 
 ```bash
-cargo test -p freenet-ping-app --features manual-tests --test run_app test_ping_partially_connected_network
+cargo test -p freenet-ping-app --test run_app_partially_connected_network test_ping_partially_connected_network
 ```
 
 ---
