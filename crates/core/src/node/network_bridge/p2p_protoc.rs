@@ -27,7 +27,7 @@ use crate::node::network_bridge::handshake::{
 use crate::node::network_bridge::priority_select;
 use crate::node::MessageProcessor;
 use crate::operations::connect::ConnectMsg;
-use crate::ring::Location;
+use crate::ring::{Location, SubscriptionRecoveryGuard};
 use crate::transport::{
     create_connection_handler, global_bandwidth::GlobalBandwidthManager, OutboundConnectionHandler,
     PeerConnection, TransportError, TransportKeypair, TransportPublicKey,
@@ -2487,6 +2487,13 @@ impl P2pConnManager {
                                     let op_manager = self.bridge.op_manager.clone();
                                     let contract_key = contract;
                                     tokio::spawn(async move {
+                                        // Guard ensures complete_subscription_request is called
+                                        // even if the task panics
+                                        let guard = SubscriptionRecoveryGuard::new(
+                                            op_manager.clone(),
+                                            contract_key,
+                                        );
+
                                         let instance_id = *contract_key.id();
                                         let sub_op =
                                             crate::operations::subscribe::start_op(instance_id);
@@ -2505,9 +2512,7 @@ impl P2pConnManager {
                                                 "Failed to re-establish subscription on peer connect"
                                             );
                                         }
-                                        op_manager
-                                            .ring
-                                            .complete_subscription_request(&contract_key, success);
+                                        guard.complete(success);
                                     });
                                 }
                             }

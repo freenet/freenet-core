@@ -620,15 +620,30 @@ impl SeedingManager {
     }
 
     /// Record an access to a contract in the seeding cache.
+    ///
+    /// Returns the list of contracts that were evicted to make room (if any).
+    /// Also cleans up backoff state for evicted contracts to prevent unbounded
+    /// memory growth.
     pub fn record_contract_access(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
     ) -> Vec<ContractKey> {
-        self.seeding_cache
+        let evicted = self
+            .seeding_cache
             .write()
-            .record_access(key, size_bytes, access_type)
+            .record_access(key, size_bytes, access_type);
+
+        // Clean up backoff state for evicted contracts to prevent unbounded memory growth.
+        // When a contract is evicted from the cache, we no longer need its backoff entry
+        // since we won't be attempting to re-subscribe to it.
+        for evicted_key in &evicted {
+            self.subscription_backoff.remove(evicted_key);
+            self.pending_subscription_requests.remove(evicted_key);
+        }
+
+        evicted
     }
 
     /// Whether this node is currently caching/seeding this contract.

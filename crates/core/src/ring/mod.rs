@@ -9,6 +9,8 @@ use std::{
     sync::{atomic::AtomicU64, Arc, Weak},
     time::{Duration, Instant},
 };
+
+use rand::seq::SliceRandom;
 use tracing::Instrument;
 
 use either::Either;
@@ -85,14 +87,22 @@ pub(crate) struct Ring {
 /// Guard that ensures `complete_subscription_request` is called even if the
 /// subscription task panics. This prevents contracts from being stuck in
 /// `pending_subscription_requests` forever.
-struct SubscriptionRecoveryGuard {
+pub(crate) struct SubscriptionRecoveryGuard {
     op_manager: Arc<OpManager>,
     contract_key: ContractKey,
     completed: bool,
 }
 
 impl SubscriptionRecoveryGuard {
-    fn complete(mut self, success: bool) {
+    pub(crate) fn new(op_manager: Arc<OpManager>, contract_key: ContractKey) -> Self {
+        Self {
+            op_manager,
+            contract_key,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn complete(mut self, success: bool) {
         self.op_manager
             .ring
             .complete_subscription_request(&self.contract_key, success);
@@ -313,11 +323,16 @@ impl Ring {
             interval.tick().await;
 
             // Get contracts we're seeding without upstream subscription
-            let orphaned_contracts = ring.contracts_without_upstream();
+            let mut orphaned_contracts = ring.contracts_without_upstream();
 
             if orphaned_contracts.is_empty() {
                 continue;
             }
+
+            // Shuffle to prevent starvation: without this, the same failing contracts
+            // (first N in iteration order) would always be tried first, blocking later
+            // contracts from ever being attempted when they hit the batch limit.
+            orphaned_contracts.shuffle(&mut rand::rng());
 
             // Get op_manager to spawn subscription requests
             let Some(op_manager) = ring.upgrade_op_manager() else {
@@ -352,11 +367,8 @@ impl Ring {
 
                     tokio::spawn(async move {
                         // Guard ensures complete_subscription_request is called even on panic
-                        let guard = SubscriptionRecoveryGuard {
-                            op_manager: op_manager_clone.clone(),
-                            contract_key,
-                            completed: false,
-                        };
+                        let guard =
+                            SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
 
                         let instance_id = *contract_key.id();
                         let sub_op = crate::operations::subscribe::start_op(instance_id);
