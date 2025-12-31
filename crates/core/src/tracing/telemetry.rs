@@ -403,7 +403,21 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 GetEvent::GetFailure { .. } => "get_failure".to_string(),
             }
         }
-        EventKind::Subscribe(_) => "subscribe".to_string(),
+        EventKind::Subscribe(subscribe_event) => {
+            use super::SubscribeEvent;
+            match subscribe_event {
+                SubscribeEvent::Request { .. } => "subscribe_request".to_string(),
+                SubscribeEvent::SubscribeSuccess { .. } => "subscribe_success".to_string(),
+                SubscribeEvent::SubscribeNotFound { .. } => "subscribe_not_found".to_string(),
+                SubscribeEvent::SeedingStarted { .. } => "seeding_started".to_string(),
+                SubscribeEvent::SeedingStopped { .. } => "seeding_stopped".to_string(),
+                SubscribeEvent::DownstreamAdded { .. } => "downstream_added".to_string(),
+                SubscribeEvent::DownstreamRemoved { .. } => "downstream_removed".to_string(),
+                SubscribeEvent::UpstreamSet { .. } => "upstream_set".to_string(),
+                SubscribeEvent::Unsubscribed { .. } => "unsubscribed".to_string(),
+                SubscribeEvent::SubscriptionState { .. } => "subscription_state".to_string(),
+            }
+        }
         EventKind::Update(update_event) => {
             use super::UpdateEvent;
             match update_event {
@@ -795,6 +809,102 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "hop_count": hop_count,
                         "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::SeedingStarted {
+                    instance_id,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "seeding_started",
+                        "instance_id": instance_id.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::SeedingStopped {
+                    instance_id,
+                    reason,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "seeding_stopped",
+                        "instance_id": instance_id.to_string(),
+                        "reason": format!("{:?}", reason),
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::DownstreamAdded {
+                    key,
+                    subscriber,
+                    downstream_count,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "downstream_added",
+                        "key": key.to_string(),
+                        "subscriber": subscriber.to_string(),
+                        "downstream_count": downstream_count,
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::DownstreamRemoved {
+                    key,
+                    subscriber,
+                    reason,
+                    downstream_count,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "downstream_removed",
+                        "key": key.to_string(),
+                        "subscriber": subscriber.as_ref().map(|s| s.to_string()),
+                        "reason": format!("{:?}", reason),
+                        "downstream_count": downstream_count,
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::UpstreamSet {
+                    key,
+                    upstream,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "upstream_set",
+                        "key": key.to_string(),
+                        "upstream": upstream.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::Unsubscribed {
+                    key,
+                    reason,
+                    upstream,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "unsubscribed",
+                        "key": key.to_string(),
+                        "reason": format!("{:?}", reason),
+                        "upstream": upstream.as_ref().map(|u| u.to_string()),
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::SubscriptionState {
+                    key,
+                    is_seeding,
+                    upstream,
+                    downstream_count,
+                    downstream,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "subscription_state",
+                        "key": key.to_string(),
+                        "is_seeding": is_seeding,
+                        "upstream": upstream.as_ref().map(|u| u.to_string()),
+                        "downstream_count": downstream_count,
+                        "downstream": downstream.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                         "timestamp": timestamp,
                     })
                 }
