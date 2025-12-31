@@ -592,8 +592,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     hop_count,
                     elapsed_ms,
                     timestamp,
+                    state_hash,
                 } => {
-                    serde_json::json!({
+                    let mut json = serde_json::json!({
                         "type": "success",
                         "requester": requester.to_string(),
                         "target": target.to_string(),
@@ -602,7 +603,11 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "hop_count": hop_count,
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
-                    })
+                    });
+                    if let Some(hash) = state_hash {
+                        json["state_hash"] = serde_json::Value::String(hash.clone());
+                    }
+                    json
                 }
                 PutEvent::BroadcastEmitted {
                     upstream,
@@ -695,8 +700,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     hop_count,
                     elapsed_ms,
                     timestamp,
+                    state_hash,
                 } => {
-                    serde_json::json!({
+                    let mut json = serde_json::json!({
                         "type": "get_success",
                         "id": id.to_string(),
                         "requester": requester.to_string(),
@@ -705,7 +711,11 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "hop_count": hop_count,
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
-                    })
+                    });
+                    if let Some(hash) = state_hash {
+                        json["state_hash"] = serde_json::Value::String(hash.clone());
+                    }
+                    json
                 }
                 GetEvent::GetNotFound {
                     id,
@@ -935,15 +945,24 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     key,
                     id,
                     timestamp,
+                    state_hash_before,
+                    state_hash_after,
                 } => {
-                    serde_json::json!({
+                    let mut json = serde_json::json!({
                         "type": "success",
                         "requester": requester.to_string(),
                         "target": target.to_string(),
                         "key": key.to_string(),
                         "id": id.to_string(),
                         "timestamp": timestamp,
-                    })
+                    });
+                    if let Some(hash) = state_hash_before {
+                        json["state_hash_before"] = serde_json::Value::String(hash.clone());
+                    }
+                    if let Some(hash) = state_hash_after {
+                        json["state_hash_after"] = serde_json::Value::String(hash.clone());
+                    }
+                    json
                 }
                 UpdateEvent::BroadcastEmitted {
                     upstream,

@@ -670,6 +670,47 @@ impl SeedingManager {
         self.seeding_cache.read().len()
     }
 
+    /// Get the complete subscription state for all active subscriptions.
+    ///
+    /// Returns a list of tuples containing:
+    /// - Contract key
+    /// - Whether we're locally seeding (have client subscriptions)
+    /// - Optional upstream peer
+    /// - List of downstream subscribers
+    ///
+    /// This is used for periodic telemetry snapshots.
+    pub fn get_all_subscription_states(
+        &self,
+    ) -> Vec<(
+        ContractKey,
+        bool,
+        Option<PeerKeyLocation>,
+        Vec<PeerKeyLocation>,
+    )> {
+        self.subscriptions
+            .iter()
+            .map(|entry| {
+                let contract = *entry.key();
+                let subs = entry.value();
+
+                let is_seeding = self.has_client_subscriptions(contract.id());
+
+                let upstream = subs
+                    .iter()
+                    .find(|e| e.role == SubscriberType::Upstream)
+                    .map(|e| e.peer.clone());
+
+                let downstream: Vec<PeerKeyLocation> = subs
+                    .iter()
+                    .filter(|e| e.role == SubscriberType::Downstream)
+                    .map(|e| e.peer.clone())
+                    .collect();
+
+                (contract, is_seeding, upstream, downstream)
+            })
+            .collect()
+    }
+
     // --- Subscription retry spam prevention ---
 
     /// Check if a subscription request can be made for a contract.
@@ -1418,5 +1459,107 @@ mod tests {
             "Should include contracts with downstream subscribers"
         );
         assert_eq!(contracts[0], contract);
+    }
+
+    // ========== Tests for get_all_subscription_states ==========
+
+    #[test]
+    fn test_get_all_subscription_states_empty() {
+        let manager = SeedingManager::new();
+        let states = manager.get_all_subscription_states();
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_subscription_states_complete() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+        let downstream1 = test_peer_loc(2);
+        let downstream2 = test_peer_loc(3);
+        let client_id = crate::client_events::ClientId::next();
+
+        // Setup: upstream, 2 downstream, and client subscription
+        manager.set_upstream(&contract, upstream.clone());
+        assert!(manager
+            .add_downstream(&contract, downstream1.clone(), None)
+            .is_ok());
+        assert!(manager
+            .add_downstream(&contract, downstream2.clone(), None)
+            .is_ok());
+        manager.add_client_subscription(contract.id(), client_id);
+
+        let states = manager.get_all_subscription_states();
+
+        assert_eq!(states.len(), 1);
+        let (key, is_seeding, upstream_opt, downstream_list) = &states[0];
+
+        assert_eq!(*key, contract);
+        assert!(*is_seeding); // has client subscription
+        assert!(upstream_opt.is_some());
+        assert_eq!(
+            upstream_opt.as_ref().unwrap().socket_addr(),
+            upstream.socket_addr()
+        );
+        assert_eq!(downstream_list.len(), 2);
+    }
+
+    #[test]
+    fn test_get_all_subscription_states_multiple_contracts() {
+        let manager = SeedingManager::new();
+        let contract1 = make_contract_key(1);
+        let contract2 = make_contract_key(2);
+
+        manager.set_upstream(&contract1, test_peer_loc(1));
+        manager.set_upstream(&contract2, test_peer_loc(2));
+        assert!(manager
+            .add_downstream(&contract1, test_peer_loc(3), None)
+            .is_ok());
+
+        let states = manager.get_all_subscription_states();
+
+        assert_eq!(states.len(), 2);
+    }
+
+    #[test]
+    fn test_get_all_subscription_states_upstream_only() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let upstream = test_peer_loc(1);
+
+        // Only upstream, no downstream, no client
+        manager.set_upstream(&contract, upstream.clone());
+
+        let states = manager.get_all_subscription_states();
+
+        assert_eq!(states.len(), 1);
+        let (key, is_seeding, upstream_opt, downstream_list) = &states[0];
+
+        assert_eq!(*key, contract);
+        assert!(!*is_seeding); // no client subscription
+        assert!(upstream_opt.is_some());
+        assert!(downstream_list.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_subscription_states_downstream_only() {
+        let manager = SeedingManager::new();
+        let contract = make_contract_key(1);
+        let downstream = test_peer_loc(1);
+
+        // Only downstream, no upstream, no client
+        assert!(manager
+            .add_downstream(&contract, downstream.clone(), None)
+            .is_ok());
+
+        let states = manager.get_all_subscription_states();
+
+        assert_eq!(states.len(), 1);
+        let (key, is_seeding, upstream_opt, downstream_list) = &states[0];
+
+        assert_eq!(*key, contract);
+        assert!(!*is_seeding); // no client subscription
+        assert!(upstream_opt.is_none());
+        assert_eq!(downstream_list.len(), 1);
     }
 }

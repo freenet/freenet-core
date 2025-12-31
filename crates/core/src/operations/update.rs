@@ -11,7 +11,7 @@ use crate::ring::{Location, PeerKeyLocation, RingError};
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager},
-    tracing::NetEventLog,
+    tracing::{state_hash_short, NetEventLog},
 };
 use std::net::SocketAddr;
 
@@ -210,8 +210,11 @@ impl Operation for UpdateOp {
                     );
 
                     {
-                        // First check if we have the contract locally
-                        let has_contract = match op_manager
+                        // First check if we have the contract locally and capture state for telemetry.
+                        // NOTE: There's a theoretical TOCTOU race where state could change between this
+                        // GetQuery and the update_contract() call. This is acceptable for telemetry
+                        // purposes - the hashes provide debugging visibility, not correctness guarantees.
+                        let state_before = match op_manager
                             .notify_contract_handler(ContractHandlerEvent::GetQuery {
                                 instance_id: *key.id(),
                                 return_contract_code: false,
@@ -219,25 +222,28 @@ impl Operation for UpdateOp {
                             .await
                         {
                             Ok(ContractHandlerEvent::GetResponse {
-                                response: Ok(StoreResponse { state: Some(_), .. }),
+                                response: Ok(StoreResponse { state: Some(s), .. }),
                                 ..
                             }) => {
                                 tracing::debug!(tx = %id, %key, "Contract exists locally, handling UPDATE");
-                                true
+                                Some(s)
                             }
                             _ => {
                                 tracing::debug!(tx = %id, %key, "Contract not found locally");
-                                false
+                                None
                             }
                         };
 
-                        if has_contract {
+                        if state_before.is_some() {
                             // We have the contract - handle UPDATE locally
                             tracing::debug!(
                                 tx = %id,
                                 %key,
                                 "Handling UPDATE locally - contract exists"
                             );
+
+                            // Compute before hash for telemetry
+                            let hash_before = state_before.as_ref().map(state_hash_short);
 
                             // Update contract locally
                             let UpdateExecution {
@@ -251,6 +257,9 @@ impl Operation for UpdateOp {
                                 related_contracts.clone(),
                             )
                             .await?;
+
+                            // Compute after hash for telemetry
+                            let hash_after = Some(state_hash_short(&updated_value));
 
                             // Emit telemetry: UPDATE succeeded at this peer
                             // Use source_addr to get the requester's PeerKeyLocation
@@ -267,6 +276,8 @@ impl Operation for UpdateOp {
                                     &op_manager.ring,
                                     *key,
                                     requester_pkl,
+                                    hash_before,
+                                    hash_after,
                                 ) {
                                     op_manager.ring.register_events(Either::Left(event)).await;
                                 }

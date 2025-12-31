@@ -115,6 +115,9 @@ impl Ring {
         let router = Arc::new(RwLock::new(Router::new(&[])));
         GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone()));
 
+        // Interval for periodic subscription state telemetry snapshots (1 minute)
+        const SUBSCRIPTION_STATE_INTERVAL: Duration = Duration::from_secs(60);
+
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
         let ring = Ring {
             max_hops_to_live,
@@ -147,6 +150,13 @@ impl Ring {
                 .connection_maintenance(event_loop_notifier, live_tx_tracker)
                 .instrument(span),
         );
+
+        // Spawn periodic subscription state telemetry task
+        GlobalExecutor::spawn(Self::emit_subscription_state_telemetry(
+            ring.clone(),
+            SUBSCRIPTION_STATE_INTERVAL,
+        ));
+
         Ok(ring)
     }
 
@@ -197,6 +207,41 @@ impl Ring {
             if !history.is_empty() {
                 let router_ref = &mut *router.write();
                 *router_ref = Router::new(&history);
+            }
+        }
+    }
+
+    /// Periodically emit subscription_state telemetry events for all active subscriptions.
+    ///
+    /// This enables the telemetry dashboard to reconstruct historical subscription trees
+    /// and show accurate subscription state at any point in time.
+    async fn emit_subscription_state_telemetry(ring: Arc<Self>, interval_duration: Duration) {
+        let mut interval = tokio::time::interval(interval_duration);
+        // Skip the first immediate tick
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let subscription_states = ring.get_all_subscription_states();
+
+            if subscription_states.is_empty() {
+                continue;
+            }
+
+            tracing::debug!(
+                subscription_count = subscription_states.len(),
+                "Emitting periodic subscription state telemetry"
+            );
+
+            for (key, is_seeding, upstream, downstream) in subscription_states {
+                if let Some(event) =
+                    NetEventLog::subscription_state(&ring, key, is_seeding, upstream, downstream)
+                {
+                    ring.event_register
+                        .register_events(Either::Left(event))
+                        .await;
+                }
             }
         }
     }
@@ -438,6 +483,26 @@ impl Ring {
     /// This is the actual count of contracts this node is caching/seeding.
     pub fn seeding_contracts_count(&self) -> usize {
         self.seeding_manager.seeding_contracts_count()
+    }
+
+    /// Get the complete subscription state for all active subscriptions.
+    ///
+    /// Returns a list of tuples containing:
+    /// - Contract key
+    /// - Whether we're locally seeding (have client subscriptions)
+    /// - Optional upstream peer
+    /// - List of downstream subscribers
+    ///
+    /// Used for periodic telemetry snapshots.
+    pub fn get_all_subscription_states(
+        &self,
+    ) -> Vec<(
+        ContractKey,
+        bool,
+        Option<PeerKeyLocation>,
+        Vec<PeerKeyLocation>,
+    )> {
+        self.seeding_manager.get_all_subscription_states()
     }
 
     // ==================== Subscription Retry Spam Prevention ====================
