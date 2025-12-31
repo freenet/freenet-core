@@ -6,10 +6,42 @@
 //! Handles the raw sending and receiving of byte packets over the network.
 //! See `architecture.md`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
 use tokio::net::UdpSocket;
+
+// =============================================================================
+// Auto-update version mismatch detection
+// =============================================================================
+//
+// When a peer detects a version mismatch with another peer (typically the gateway),
+// it sets this flag. The node's run loop checks this periodically and triggers
+// a GitHub check to verify if a newer version is actually available.
+//
+// This is temporary alpha-testing infrastructure to reduce the burden of
+// frequent updates during rapid development.
+
+/// Global flag set by transport layer when a version mismatch is detected.
+static VERSION_MISMATCH_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// Signal that a version mismatch was detected with another peer.
+/// Called from the transport layer when a connection fails due to
+/// protocol version incompatibility.
+pub fn signal_version_mismatch() {
+    VERSION_MISMATCH_DETECTED.store(true, Ordering::SeqCst);
+}
+
+/// Check if there's a pending version mismatch that should trigger an update check.
+pub fn has_version_mismatch() -> bool {
+    VERSION_MISMATCH_DETECTED.load(Ordering::SeqCst)
+}
+
+/// Clear the version mismatch flag (called after checking for updates).
+pub fn clear_version_mismatch() {
+    VERSION_MISMATCH_DETECTED.store(false, Ordering::SeqCst);
+}
 
 pub mod connection_handler;
 mod crypto;

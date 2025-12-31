@@ -701,6 +701,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // Now we use proper typed error matching.
                             if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
                                 outdated_peer.insert(remote_addr, Instant::now());
+                                // Signal version mismatch for auto-update detection
+                                crate::transport::signal_version_mismatch();
                             }
                             ongoing_gw_connections.remove(&remote_addr);
                             ongoing_connections.remove(&remote_addr);
@@ -755,6 +757,8 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         direction = "outbound",
                                         "Connection failed due to version mismatch"
                                     );
+                                    // Signal version mismatch for auto-update detection
+                                    crate::transport::signal_version_mismatch();
                                 }
                                 _ => {
                                     tracing::error!(
