@@ -1662,10 +1662,10 @@ impl Operation for GetOp {
                                 tracing::debug!(tx = %id, %key, "Marking contract as seeded");
                                 op_manager.ring.record_get_access(key, value.size() as u64);
                                 super::announce_contract_cached(op_manager, &key).await;
-                                // Use async variant to avoid blocking GET response on subscription
+                                // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                                 let child_tx =
-                                    super::start_subscription_request_async(op_manager, id, key);
-                                tracing::debug!(tx = %id, %child_tx, "started async subscription");
+                                    super::start_subscription_request(op_manager, id, key, false);
+                                tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");
                             }
                         } else {
                             // Only attempt to cache if we have the contract code.
@@ -1693,10 +1693,10 @@ impl Operation for GetOp {
                                             op_manager.ring.record_get_access(key, value.size() as u64);
                                             super::announce_contract_cached(op_manager, &key).await;
 
-                                            // Use async variant to avoid blocking GET response on subscription
+                                            // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                                             let child_tx =
-                                                super::start_subscription_request_async(op_manager, id, key);
-                                            tracing::debug!(tx = %id, %child_tx, "started async subscription");
+                                                super::start_subscription_request(op_manager, id, key, false);
+                                            tracing::debug!(tx = %id, %child_tx, blocking = false, "started subscription");
                                         }
                                     }
                                     ContractHandlerEvent::PutResponse {
