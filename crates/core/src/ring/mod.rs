@@ -734,7 +734,7 @@ impl Ring {
                 .collect();
 
             if neighbor_locations.is_empty() && connections_considered > 0 {
-                tracing::warn!(
+                tracing::debug!(
                     current_connections,
                     connections_considered,
                     live_tx_peers = live_tx_tracker.len(),
