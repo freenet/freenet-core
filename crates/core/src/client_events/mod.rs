@@ -24,6 +24,7 @@ use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
 use crate::operations::{get, put, update, OpError, VisitedPeers};
 use crate::ring::KnownPeerKeyLocation;
+use crate::tracing::NetEventLog;
 use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 // pub(crate) mod admin_endpoints; // TODO: Add axum dependencies
@@ -243,9 +244,15 @@ async fn register_subscription_listener(
                 "Subscriber listener registered successfully"
             );
             // Register client subscription to prevent upstream unsubscription while this client is active
-            op_manager
+            let result = op_manager
                 .ring
                 .add_client_subscription(&instance_id, client_id);
+            // Emit telemetry if this was the first client (seeding started)
+            if result.is_first_client {
+                if let Some(event) = NetEventLog::seeding_started(&op_manager.ring, instance_id) {
+                    op_manager.ring.register_events(Either::Left(event)).await;
+                }
+            }
             Ok(())
         }
         _ => {
@@ -1448,7 +1455,16 @@ async fn process_open_request(
                                     "Subscriber listener registered successfully"
                                 );
                                 // Register client subscription to enable subscription tree pruning on disconnect
-                                op_manager.ring.add_client_subscription(&key, client_id);
+                                let result =
+                                    op_manager.ring.add_client_subscription(&key, client_id);
+                                // Emit telemetry if this was the first client (seeding started)
+                                if result.is_first_client {
+                                    if let Some(event) =
+                                        NetEventLog::seeding_started(&op_manager.ring, key)
+                                    {
+                                        op_manager.ring.register_events(Either::Left(event)).await;
+                                    }
+                                }
                             }
                             _ => {
                                 tracing::error!(

@@ -44,9 +44,9 @@ use crate::{
         connect::{self, ConnectOp},
         get, put, subscribe, update, OpEnum, OpError, OpOutcome,
     },
-    ring::{Location, PeerKeyLocation},
+    ring::{Location, PeerKeyLocation, SubscriberType},
     router::{RouteEvent, RouteOutcome},
-    tracing::{EventRegister, NetEventLog, NetEventRegister},
+    tracing::{DownstreamRemovedReason, EventRegister, NetEventLog, NetEventRegister},
 };
 use crate::{
     config::Config,
@@ -919,6 +919,19 @@ async fn process_message_v1<CB>(
 
                 let result = op_manager.ring.remove_subscriber(key, &peer_id);
 
+                // Emit telemetry for downstream removal
+                if result.removed && result.removed_role == Some(SubscriberType::Downstream) {
+                    if let Some(event) = NetEventLog::downstream_removed(
+                        &op_manager.ring,
+                        *key,
+                        Some(from.clone()),
+                        DownstreamRemovedReason::PeerUnsubscribed,
+                        result.downstream_count,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+                }
+
                 if let Some(upstream) = result.notify_upstream {
                     let upstream_addr = upstream
                         .socket_addr()
@@ -1182,6 +1195,19 @@ where
                 };
 
                 let result = op_manager.ring.remove_subscriber(key, &peer_id);
+
+                // Emit telemetry for downstream removal
+                if result.removed && result.removed_role == Some(SubscriberType::Downstream) {
+                    if let Some(event) = NetEventLog::downstream_removed(
+                        &op_manager.ring,
+                        *key,
+                        Some(from.clone()),
+                        DownstreamRemovedReason::PeerUnsubscribed,
+                        result.downstream_count,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+                }
 
                 if let Some(upstream) = result.notify_upstream {
                     let upstream_addr = upstream
