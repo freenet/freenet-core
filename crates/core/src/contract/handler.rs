@@ -100,19 +100,18 @@ impl ContractHandler for NetworkContractHandler {
     where
         Self: Sized + 'static,
     {
-        // Create a pool of executors sized to available CPU parallelism, clamped to 2-16.
-        // All executors share the same StateStore (ReDb database) via Arc<Database>.
         let parallelism = std::thread::available_parallelism()
             .unwrap_or(NonZeroUsize::new(4).unwrap())
             .get();
-        let clamped = parallelism.clamp(2, 16);
-        let pool_size = NonZeroUsize::new(clamped).unwrap();
 
-        tracing::info!(
-            pool_size = %pool_size,
-            available_parallelism = parallelism,
-            "Creating RuntimePool for contract execution"
-        );
+        // Pool size configurable via FREENET_RUNTIME_POOL_SIZE env var (useful for tests)
+        let pool_size = std::env::var("FREENET_RUNTIME_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(|n| NonZeroUsize::new(n.clamp(1, 16)))
+            .unwrap_or_else(|| NonZeroUsize::new(parallelism.clamp(2, 16)).unwrap());
+
+        tracing::info!(pool_size = %pool_size, "Creating RuntimePool");
 
         let executor = RuntimePool::new(config.clone(), op_sender, op_manager, pool_size).await?;
         Ok(Self { executor, channel })
