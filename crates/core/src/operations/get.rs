@@ -14,7 +14,7 @@ use crate::{
     node::{NetworkBridge, OpManager},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
-    tracing::{NetEventLog, OperationFailure},
+    tracing::{state_hash_short, NetEventLog, OperationFailure},
 };
 use either::Either;
 
@@ -1761,12 +1761,14 @@ impl Operation for GetOp {
                         // Emit get_success telemetry
                         let hop_count =
                             current_hop.map(|h| op_manager.ring.max_hops_to_live.saturating_sub(h));
+                        let hash = Some(state_hash_short(value));
                         if let Some(event) = NetEventLog::get_success(
                             &id,
                             &op_manager.ring,
                             key,
                             sender.clone(),
                             hop_count,
+                            hash,
                         ) {
                             op_manager.ring.register_events(Either::Left(event)).await;
                         }

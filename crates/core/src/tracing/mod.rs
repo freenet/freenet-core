@@ -46,6 +46,17 @@ pub mod event_aggregator;
 pub mod telemetry;
 pub use telemetry::TelemetryReporter;
 
+/// Compute a short hash of contract state for telemetry.
+/// Returns first 4 bytes of Blake3 hash as 8 hex characters.
+pub fn state_hash_short(state: &WrappedState) -> String {
+    let hash = blake3::hash(state.as_ref());
+    let bytes = hash.as_bytes();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 struct ListenerLogId(usize);
@@ -455,6 +466,7 @@ impl<'a> NetEventLog<'a> {
         key: ContractKey,
         target: PeerKeyLocation,
         hop_count: Option<usize>,
+        state_hash: Option<String>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -469,6 +481,7 @@ impl<'a> NetEventLog<'a> {
                 hop_count,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                state_hash,
             }),
         })
     }
@@ -487,6 +500,7 @@ impl<'a> NetEventLog<'a> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
         let broadcasted_to = broadcast_to.len();
+        let state_hash = Some(state_hash_short(&value));
         Some(NetEventLog {
             tx,
             peer_id,
@@ -499,6 +513,7 @@ impl<'a> NetEventLog<'a> {
                 value,
                 sender: own_loc,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                state_hash,
             }),
         })
     }
@@ -516,6 +531,7 @@ impl<'a> NetEventLog<'a> {
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
+        let state_hash = Some(state_hash_short(&value));
         Some(NetEventLog {
             tx,
             peer_id,
@@ -526,6 +542,7 @@ impl<'a> NetEventLog<'a> {
                 value,
                 target: own_loc,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                state_hash,
             }),
         })
     }
@@ -563,6 +580,7 @@ impl<'a> NetEventLog<'a> {
         key: ContractKey,
         target: PeerKeyLocation,
         hop_count: Option<usize>,
+        state_hash: Option<String>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -577,6 +595,7 @@ impl<'a> NetEventLog<'a> {
                 hop_count,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                state_hash,
             }),
         })
     }
@@ -710,6 +729,8 @@ impl<'a> NetEventLog<'a> {
         ring: &'a Ring,
         key: ContractKey,
         target: PeerKeyLocation,
+        state_hash_before: Option<String>,
+        state_hash_after: Option<String>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -722,6 +743,8 @@ impl<'a> NetEventLog<'a> {
                 target,
                 key,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                state_hash_before,
+                state_hash_after,
             }),
         })
     }
@@ -738,6 +761,7 @@ impl<'a> NetEventLog<'a> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
         let broadcasted_to = broadcast_to.len();
+        let state_hash = Some(state_hash_short(&value));
         Some(NetEventLog {
             tx,
             peer_id,
@@ -750,6 +774,7 @@ impl<'a> NetEventLog<'a> {
                 value,
                 sender: own_loc,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                state_hash,
             }),
         })
     }
@@ -764,6 +789,7 @@ impl<'a> NetEventLog<'a> {
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
+        let state_hash = Some(state_hash_short(&value));
         Some(NetEventLog {
             tx,
             peer_id,
@@ -774,6 +800,7 @@ impl<'a> NetEventLog<'a> {
                 value,
                 target: own_loc,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                state_hash,
             }),
         })
     }
@@ -1163,6 +1190,7 @@ impl<'a> NetEventLog<'a> {
                     hop_count,
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    state_hash: None, // Hash not available from message
                 })
             }
             NetMessageV1::Get(GetMsg::Request {
@@ -1199,6 +1227,7 @@ impl<'a> NetEventLog<'a> {
                     hop_count,
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    state_hash: None, // Hash not available from message
                 })
             }
             NetMessageV1::Get(GetMsg::Response {
@@ -1296,6 +1325,7 @@ impl<'a> NetEventLog<'a> {
                     value: new_value.clone(),
                     sender: this_peer, // We are the sender
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    state_hash: None, // Hash not available from message
                 })
             }
             NetMessageV1::Update(UpdateMsg::BroadcastTo { new_value, key, id }) => {
@@ -1307,6 +1337,7 @@ impl<'a> NetEventLog<'a> {
                     value: new_value.clone(),
                     target: this_peer, // We are the target
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    state_hash: None, // Hash not available from message
                 })
             }
             _ => EventKind::Ignored,
@@ -1874,6 +1905,7 @@ async fn send_to_metrics_server(
             target,
             key,
             timestamp,
+            ..
         }) => {
             if let Some(target_addr) = target.socket_addr() {
                 let contract_location = Location::from_contract_key(key.as_bytes());
@@ -2532,6 +2564,8 @@ enum PutEvent {
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
+        /// Short hash of the stored state (first 4 bytes of Blake3, 8 hex chars).
+        state_hash: Option<String>,
     },
     /// Put operation failed.
     PutFailure {
@@ -2559,6 +2593,8 @@ enum PutEvent {
         value: WrappedState,
         sender: PeerKeyLocation,
         timestamp: u64,
+        /// Short hash of the broadcast state (first 4 bytes of Blake3, 8 hex chars).
+        state_hash: Option<String>,
     },
     BroadcastReceived {
         id: Transaction,
@@ -2571,6 +2607,8 @@ enum PutEvent {
         /// target peer
         target: PeerKeyLocation,
         timestamp: u64,
+        /// Short hash of the received state (first 4 bytes of Blake3, 8 hex chars).
+        state_hash: Option<String>,
     },
 }
 
@@ -2590,6 +2628,10 @@ enum UpdateEvent {
         target: PeerKeyLocation,
         key: ContractKey,
         timestamp: u64,
+        /// Short hash of state before update (first 4 bytes of Blake3, 8 hex chars).
+        state_hash_before: Option<String>,
+        /// Short hash of state after update (first 4 bytes of Blake3, 8 hex chars).
+        state_hash_after: Option<String>,
     },
     BroadcastEmitted {
         id: Transaction,
@@ -2603,6 +2645,8 @@ enum UpdateEvent {
         value: WrappedState,
         sender: PeerKeyLocation,
         timestamp: u64,
+        /// Short hash of the broadcast state (first 4 bytes of Blake3, 8 hex chars).
+        state_hash: Option<String>,
     },
     BroadcastReceived {
         id: Transaction,
@@ -2615,6 +2659,8 @@ enum UpdateEvent {
         /// target peer
         target: PeerKeyLocation,
         timestamp: u64,
+        /// Short hash of the received state (first 4 bytes of Blake3, 8 hex chars).
+        state_hash: Option<String>,
     },
 }
 
@@ -2653,6 +2699,8 @@ enum GetEvent {
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
+        /// Short hash of the retrieved state (first 4 bytes of Blake3, 8 hex chars).
+        state_hash: Option<String>,
     },
     /// Contract was not found after exhaustive search.
     GetNotFound {
