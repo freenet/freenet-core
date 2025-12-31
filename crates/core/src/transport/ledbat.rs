@@ -3435,4 +3435,140 @@ mod tests {
             final_cwnd as f64 / rampup_start_cwnd as f64
         );
     }
+
+    /// Test ramp-up with small pre_slowdown_cwnd near min_cwnd.
+    ///
+    /// Edge case: When pre_slowdown_cwnd is close to min_cwnd:
+    /// - pre_slowdown_cwnd = 5000 bytes (close to min_cwnd = 2848)
+    /// - Frozen at 5000/4 = 1250, but clamped to min_cwnd = 2848
+    /// - 85% threshold = 4250 bytes
+    ///
+    /// This tests that the 85% recovery threshold works correctly even when
+    /// the frozen cwnd is clamped to min_cwnd (making the growth ratio smaller).
+    #[tokio::test]
+    async fn test_rampup_with_small_pre_slowdown_cwnd() {
+        let min_cwnd = 2848;
+        let config = LedbatConfig {
+            initial_cwnd: 5_000, // Small, close to min_cwnd
+            min_cwnd,
+            max_cwnd: 10_000_000,
+            ssthresh: 4_000, // Exit slow start quickly
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        controller.on_send(100_000);
+
+        // Phase 1: Establish base_delay and exit slow start
+        let rtt = Duration::from_millis(50);
+        for _ in 0..5 {
+            controller.on_ack(rtt, 1000);
+            tokio::time::sleep(Duration::from_millis(55)).await;
+        }
+
+        assert!(
+            !controller.in_slow_start.load(Ordering::Acquire),
+            "Should have exited slow start"
+        );
+
+        let pre_slowdown_cwnd = controller.current_cwnd();
+        println!("Pre-slowdown cwnd: {} bytes", pre_slowdown_cwnd);
+        println!("min_cwnd: {} bytes", min_cwnd);
+
+        // Verify we're in a small cwnd scenario
+        assert!(
+            pre_slowdown_cwnd < 10_000,
+            "Test expects small cwnd, got {}",
+            pre_slowdown_cwnd
+        );
+
+        // Phase 2: Trigger slowdown
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        controller.on_ack(rtt, 1000);
+
+        // Phase 3: Enter frozen state
+        tokio::time::sleep(Duration::from_millis(55)).await;
+        controller.on_ack(rtt, 1000);
+
+        let frozen_cwnd = controller.current_cwnd();
+        println!(
+            "Frozen cwnd: {} bytes (expected: max({}/4, {}) = {})",
+            frozen_cwnd,
+            pre_slowdown_cwnd,
+            min_cwnd,
+            (pre_slowdown_cwnd / 4).max(min_cwnd)
+        );
+
+        // With small pre_slowdown_cwnd, frozen cwnd should be clamped to min_cwnd
+        assert!(
+            frozen_cwnd >= min_cwnd,
+            "Frozen cwnd should be at least min_cwnd"
+        );
+
+        // Phase 4: Wait for freeze to complete, enter RampingUp
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        controller.on_ack(rtt, 2000);
+
+        assert_eq!(
+            controller.slowdown_state.load(Ordering::Acquire),
+            SlowdownState::RampingUp as u8,
+            "Should be in RampingUp state"
+        );
+
+        let rampup_start_cwnd = controller.current_cwnd();
+        let target_cwnd = controller.pre_slowdown_cwnd.load(Ordering::Acquire);
+        println!(
+            "Ramp-up: start={} bytes, target={} bytes",
+            rampup_start_cwnd, target_cwnd
+        );
+
+        // Phase 5: Simulate high RTT during ramp-up
+        let high_rtt = Duration::from_millis(200);
+
+        let mut ramp_iterations = 0;
+        while controller.slowdown_state.load(Ordering::Acquire) == SlowdownState::RampingUp as u8
+            && ramp_iterations < 20
+        {
+            tokio::time::sleep(Duration::from_millis(55)).await;
+            controller.on_ack(high_rtt, 2000);
+            ramp_iterations += 1;
+
+            println!(
+                "Ramp-up iteration {}: cwnd = {} bytes",
+                ramp_iterations,
+                controller.current_cwnd()
+            );
+        }
+
+        let final_cwnd = controller.current_cwnd();
+        let final_state = controller.slowdown_state.load(Ordering::Acquire);
+
+        println!(
+            "Final: cwnd = {}, state = {}, iterations = {}",
+            final_cwnd, final_state, ramp_iterations
+        );
+
+        // Should recover to at least 85% of target (the threshold we use)
+        let recovery_ratio = final_cwnd as f64 / target_cwnd as f64;
+        assert!(
+            recovery_ratio >= 0.85,
+            "cwnd should recover to at least 85% of target even with small cwnd. \
+             Got {} / {} = {:.1}%",
+            final_cwnd,
+            target_cwnd,
+            recovery_ratio * 100.0
+        );
+
+        // Should return to Normal state
+        assert_eq!(
+            final_state,
+            SlowdownState::Normal as u8,
+            "Should return to Normal state after ramp-up"
+        );
+
+        println!("✓ Small cwnd ramp-up completed successfully");
+    }
 }
