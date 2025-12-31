@@ -413,15 +413,22 @@ pub(crate) async fn announce_contract_cached(op_manager: &OpManager, key: &Contr
     }
 }
 
-/// Initiates a subscription as a child operation of the parent transaction.
-/// Registers the relationship for atomicity tracking and spawns the subscription
-/// task asynchronously to prevent blocking the parent operation.
-fn start_subscription_request(
+/// Initiates a subscription after a PUT or GET completes without blocking the parent.
+///
+/// This does NOT register a parent-child relationship for atomicity tracking,
+/// so the PUT/GET response is sent immediately rather than waiting for the
+/// subscription to complete.
+///
+/// This is appropriate for PUT/GET with subscribe=true, where:
+/// - The client needs immediate confirmation that the contract was stored/fetched
+/// - The subscription can complete asynchronously in the background
+/// - Subscription success/failure doesn't affect the PUT/GET result
+pub(super) fn start_subscription_request_async(
     op_manager: &OpManager,
     parent_tx: Transaction,
     key: ContractKey,
 ) -> Transaction {
-    start_subscription_request_internal(op_manager, parent_tx, key, true)
+    start_subscription_request_internal(op_manager, parent_tx, key, false)
 }
 
 /// Starts a subscription request while allowing callers to opt out of parent tracking.
