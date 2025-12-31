@@ -51,11 +51,6 @@ const INITIAL_BACKOFF_MS: u64 = 1000;
 /// Maximum backoff duration
 const MAX_BACKOFF_MS: u64 = 300_000; // 5 minutes
 
-/// How often to emit transport layer snapshots (in seconds).
-/// Transport metrics are aggregated globally and emitted periodically to avoid
-/// flooding the telemetry server with per-transfer events.
-const TRANSPORT_SNAPSHOT_INTERVAL_SECS: u64 = 30;
-
 /// Get current timestamp in milliseconds since Unix epoch.
 /// Logs a warning if system time is unavailable (e.g., clock went backwards).
 fn current_timestamp_ms() -> u64 {
@@ -110,14 +105,20 @@ impl TelemetryReporter {
         }
 
         let endpoint = config.endpoint.clone();
-        tracing::info!(endpoint = %endpoint, "Telemetry reporting enabled");
+        let transport_snapshot_interval_secs = config.transport_snapshot_interval_secs;
+
+        tracing::info!(
+            endpoint = %endpoint,
+            transport_snapshot_interval_secs,
+            "Telemetry reporting enabled"
+        );
 
         // Channel capacity: 1000 events provides ~100 seconds of buffer at max rate (10 events/sec)
         // plus headroom for bursts. Events are dropped via try_send if channel is full.
         let (sender, receiver) = mpsc::channel(1000);
 
         // Spawn the background worker
-        let worker = TelemetryWorker::new(endpoint, receiver);
+        let worker = TelemetryWorker::new(endpoint, receiver, transport_snapshot_interval_secs);
         tokio::spawn(worker.run());
 
         Some(Self { sender })
@@ -184,10 +185,16 @@ struct TelemetryWorker {
     last_send: Instant,
     events_this_second: usize,
     rate_limit_window_start: Instant,
+    /// Interval for transport snapshots (0 = disabled)
+    transport_snapshot_interval_secs: u64,
 }
 
 impl TelemetryWorker {
-    fn new(endpoint: String, receiver: mpsc::Receiver<TelemetryCommand>) -> Self {
+    fn new(
+        endpoint: String,
+        receiver: mpsc::Receiver<TelemetryCommand>,
+        transport_snapshot_interval_secs: u64,
+    ) -> Self {
         Self {
             endpoint,
             receiver,
@@ -200,13 +207,22 @@ impl TelemetryWorker {
             last_send: Instant::now(),
             events_this_second: 0,
             rate_limit_window_start: Instant::now(),
+            transport_snapshot_interval_secs,
         }
     }
 
     async fn run(mut self) {
         let mut batch_interval = tokio::time::interval(Duration::from_secs(BATCH_INTERVAL_SECS));
+
+        // Transport snapshots are optional (disabled if interval is 0)
+        let snapshot_interval_secs = if self.transport_snapshot_interval_secs > 0 {
+            self.transport_snapshot_interval_secs
+        } else {
+            // Use a long interval but we'll skip the actual snapshot logic
+            u64::MAX / 2 // Effectively disabled
+        };
         let mut transport_snapshot_interval =
-            tokio::time::interval(Duration::from_secs(TRANSPORT_SNAPSHOT_INTERVAL_SECS));
+            tokio::time::interval(Duration::from_secs(snapshot_interval_secs));
 
         loop {
             tokio::select! {
@@ -226,16 +242,18 @@ impl TelemetryWorker {
                     self.flush().await;
                 }
                 _ = transport_snapshot_interval.tick() => {
-                    // Emit transport layer metrics snapshot
-                    if let Some(snapshot) = TRANSPORT_METRICS.take_snapshot() {
-                        let event = TelemetryEvent {
-                            timestamp: current_timestamp_ms(),
-                            peer_id: String::new(), // Transport metrics are node-wide, not peer-specific
-                            transaction_id: String::new(), // Not tied to a transaction
-                            event_type: "transport_snapshot".to_string(),
-                            event_data: serde_json::to_value(&snapshot).unwrap_or_default(),
-                        };
-                        self.handle_event(event).await;
+                    // Emit transport layer metrics snapshot (only if enabled)
+                    if self.transport_snapshot_interval_secs > 0 {
+                        if let Some(snapshot) = TRANSPORT_METRICS.take_snapshot() {
+                            let event = TelemetryEvent {
+                                timestamp: current_timestamp_ms(),
+                                peer_id: String::new(), // Transport metrics are node-wide, not peer-specific
+                                transaction_id: String::new(), // Not tied to a transaction
+                                event_type: "transport_snapshot".to_string(),
+                                event_data: serde_json::to_value(&snapshot).unwrap_or_default(),
+                            };
+                            self.handle_event(event).await;
+                        }
                     }
                 }
             }
