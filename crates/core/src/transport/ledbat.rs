@@ -681,13 +681,27 @@ impl LedbatController {
             return; // No progress
         }
 
-        // Check if in slow start phase
+        // Check for periodic slowdown state machine FIRST (LEDBAT++)
+        // This takes precedence over slow start because during RampingUp phase,
+        // in_slow_start is true but we need the slowdown state machine to handle
+        // the ramp-up logic (which has different exit conditions than initial slow start).
+        if self.enable_periodic_slowdown {
+            let slowdown_state = self.slowdown_state.load(Ordering::Acquire);
+            // If we're in any slowdown state (not Normal), let the state machine handle it
+            if slowdown_state != SlowdownState::Normal as u8
+                && self.check_and_handle_slowdown(bytes_acked_total, queuing_delay, base_delay)
+            {
+                return; // Slowdown handling took over
+            }
+        }
+
+        // Check if in slow start phase (initial slow start, not ramp-up)
         if self.enable_slow_start && self.in_slow_start.load(Ordering::Acquire) {
             self.handle_slow_start(bytes_acked_total, queuing_delay, base_delay);
             return;
         }
 
-        // Check for periodic slowdown (LEDBAT++)
+        // Check for periodic slowdown scheduling (Normal state)
         if self.enable_periodic_slowdown
             && self.check_and_handle_slowdown(bytes_acked_total, queuing_delay, base_delay)
         {
@@ -936,10 +950,29 @@ impl LedbatController {
                 let target_cwnd = self.pre_slowdown_cwnd.load(Ordering::Acquire);
                 let current_cwnd = self.cwnd.load(Ordering::Acquire);
 
-                if current_cwnd >= target_cwnd || queuing_delay > self.target_delay {
-                    // Done ramping up, return to normal operation
+                // Exit ramp-up when target is reached
+                if current_cwnd >= target_cwnd {
                     self.complete_slowdown(now_nanos, base_delay);
                     return false; // Let normal congestion avoidance take over
+                }
+
+                // During ramp-up, queuing is expected as cwnd grows. Only exit early
+                // for queuing_delay if cwnd has recovered substantially (85% of target).
+                // This prevents premature exit on high-latency paths where queuing_delay
+                // can spike temporarily before the queue stabilizes.
+                //
+                // Without this check, ramp-up exits at ~67% recovery on paths where
+                // queuing_delay > target_delay, causing repeated slowdown cycles and
+                // preventing throughput recovery.
+                //
+                // The 85% threshold ensures most of the bandwidth is recovered before
+                // responding to congestion signals. Using 17/20 to avoid floating point.
+                let has_recovered_substantially = current_cwnd * 20 >= target_cwnd * 17; // 85%
+
+                if has_recovered_substantially && queuing_delay > self.target_delay {
+                    // Recovered enough and seeing congestion, exit ramp-up
+                    self.complete_slowdown(now_nanos, base_delay);
+                    return false;
                 }
 
                 // Exponential growth during ramp-up
@@ -3279,5 +3312,142 @@ mod tests {
             pre_slowdown_cwnd / 4
         );
         println!("  Recovered: {}KB", final_cwnd / 1024);
+    }
+
+    /// Regression test: Ramp-up should complete even when queuing_delay > target_delay
+    ///
+    /// This tests the scenario where a high-latency path has persistent queuing:
+    /// - base_delay is measured during low-traffic period (e.g., 50ms)
+    /// - During ramp-up, RTT increases due to queuing (e.g., 200ms)
+    /// - queuing_delay = 200ms - 50ms = 150ms > target_delay (60ms)
+    ///
+    /// BUG: The original code would exit ramp-up immediately when queuing_delay > target,
+    /// causing cwnd to never recover and triggering rapid repeated slowdowns.
+    ///
+    /// FIX: Ramp-up should allow cwnd to grow for a minimum duration before checking
+    /// queuing_delay, giving the connection time to recover.
+    #[tokio::test]
+    async fn test_rampup_completes_with_high_queuing_delay() {
+        let config = LedbatConfig {
+            initial_cwnd: 160_000, // 160KB
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000, // Exit slow start quickly
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        controller.on_send(1_000_000);
+
+        // Phase 1: Establish low base_delay (50ms) during initial slow start
+        // This simulates measuring RTT during a quiet period
+        let low_rtt = Duration::from_millis(50);
+        for _ in 0..4 {
+            controller.on_ack(low_rtt, 1000);
+            tokio::time::sleep(Duration::from_millis(55)).await;
+        }
+
+        // Should have exited slow start
+        assert!(
+            !controller.in_slow_start.load(Ordering::Acquire),
+            "Should have exited slow start"
+        );
+
+        let pre_slowdown_cwnd = controller.current_cwnd();
+        println!("Pre-slowdown cwnd: {} bytes", pre_slowdown_cwnd);
+
+        // Phase 2: Trigger slowdown
+        tokio::time::sleep(Duration::from_millis(110)).await; // Wait for slowdown to trigger (2 RTTs)
+        controller.on_ack(low_rtt, 1000);
+
+        // Phase 3: Go through frozen state
+        tokio::time::sleep(Duration::from_millis(55)).await;
+        controller.on_ack(low_rtt, 1000);
+
+        assert_eq!(
+            controller.slowdown_state.load(Ordering::Acquire),
+            SlowdownState::Frozen as u8,
+            "Should be in Frozen state"
+        );
+
+        // Phase 4: Wait for freeze to complete, enter RampingUp
+        tokio::time::sleep(Duration::from_millis(110)).await; // 2 RTTs for freeze
+        controller.on_ack(low_rtt, 5000);
+
+        assert_eq!(
+            controller.slowdown_state.load(Ordering::Acquire),
+            SlowdownState::RampingUp as u8,
+            "Should be in RampingUp state"
+        );
+
+        let rampup_start_cwnd = controller.current_cwnd();
+        println!("Ramp-up start cwnd: {} bytes", rampup_start_cwnd);
+
+        // Phase 5: Simulate high RTT during ramp-up (queuing builds up)
+        // RTT = 200ms, base_delay = 50ms, so queuing_delay = 150ms >> target (60ms)
+        // BUG: Original code would exit ramp-up immediately here
+        let high_rtt = Duration::from_millis(200);
+
+        // Send multiple ACKs with high RTT to simulate ramp-up under congestion
+        let mut ramp_iterations = 0;
+        let target_cwnd = controller.pre_slowdown_cwnd.load(Ordering::Acquire);
+
+        while controller.slowdown_state.load(Ordering::Acquire) == SlowdownState::RampingUp as u8
+            && ramp_iterations < 30
+        {
+            tokio::time::sleep(Duration::from_millis(55)).await;
+            controller.on_ack(high_rtt, 20_000);
+            ramp_iterations += 1;
+
+            let current_cwnd = controller.current_cwnd();
+            println!(
+                "Ramp-up iteration {}: cwnd = {} bytes, target = {}",
+                ramp_iterations, current_cwnd, target_cwnd
+            );
+        }
+
+        let final_cwnd = controller.current_cwnd();
+        let final_state = controller.slowdown_state.load(Ordering::Acquire);
+
+        println!(
+            "Final: cwnd = {}, state = {}, iterations = {}",
+            final_cwnd, final_state, ramp_iterations
+        );
+
+        // CRITICAL ASSERTION: cwnd should recover to near target_cwnd during ramp-up
+        // The bug causes ramp-up to exit early when queuing_delay > target_delay,
+        // even though some queuing is expected during ramp-up as cwnd grows.
+        //
+        // Without the fix: cwnd only reaches ~67% of target before early exit
+        // With the fix: cwnd should reach at least 90% of target
+        let recovery_ratio = final_cwnd as f64 / target_cwnd as f64;
+        assert!(
+            recovery_ratio >= 0.90,
+            "cwnd should recover to at least 90% of target during ramp-up. \
+             Got {} / {} = {:.1}%. This indicates the bug where high queuing_delay \
+             causes premature ramp-up exit before cwnd fully recovers.",
+            final_cwnd,
+            target_cwnd,
+            recovery_ratio * 100.0
+        );
+
+        // Verify we returned to Normal state (completed the slowdown cycle)
+        assert_eq!(
+            final_state,
+            SlowdownState::Normal as u8,
+            "Should return to Normal state after ramp-up completes"
+        );
+
+        println!("✓ Ramp-up completed successfully despite high queuing_delay");
+        println!("  Iterations: {}", ramp_iterations);
+        println!(
+            "  cwnd growth: {} -> {} bytes ({:.1}x)",
+            rampup_start_cwnd,
+            final_cwnd,
+            final_cwnd as f64 / rampup_start_cwnd as f64
+        );
     }
 }
