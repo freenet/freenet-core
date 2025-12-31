@@ -795,24 +795,9 @@ impl LedbatController {
         let current_cwnd = self.cwnd.load(Ordering::Acquire);
         let ssthresh = self.ssthresh.load(Ordering::Acquire);
 
-        // Check if we're ramping up after a slowdown
-        let slowdown_state = self.slowdown_state.load(Ordering::Acquire);
-        if slowdown_state == SlowdownState::RampingUp as u8 {
-            // During ramp-up, check against pre_slowdown_cwnd target
-            let target_cwnd = self.pre_slowdown_cwnd.load(Ordering::Acquire);
-            if current_cwnd >= target_cwnd || queuing_delay > self.target_delay {
-                // Ramp-up complete, transition to normal operation
-                let now_nanos = self.epoch.elapsed().as_nanos() as u64;
-                self.complete_slowdown(now_nanos, base_delay);
-                return;
-            }
-            // Continue exponential growth during ramp-up
-            let new_cwnd = (current_cwnd + bytes_acked)
-                .min(target_cwnd)
-                .min(self.max_cwnd);
-            self.store_cwnd(new_cwnd);
-            return;
-        }
+        // Note: RampingUp state is now handled by check_and_handle_slowdown() in on_ack(),
+        // which is called before handle_slow_start(). This ensures proper recovery thresholds
+        // are applied during ramp-up (see the 85% threshold in the RampingUp handler).
 
         // Check exit conditions (LEDBAT++ uses 3/4 of target, configured via delay_exit_threshold)
         let delay_threshold =
