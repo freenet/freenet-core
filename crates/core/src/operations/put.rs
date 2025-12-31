@@ -444,8 +444,9 @@ impl Operation for PutOp {
                             }
 
                             // Start subscription if requested
+                            // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                             if subscribe {
-                                start_subscription_after_put(op_manager, id, key).await;
+                                start_subscription_after_put(op_manager, id, key, false).await;
                             }
 
                             Ok(OperationResult {
@@ -517,8 +518,9 @@ impl Operation for PutOp {
                         }
 
                         // Start subscription if requested
+                        // TODO: blocking_subscription should come from ContractRequest once stdlib is updated
                         if subscribe {
-                            start_subscription_after_put(op_manager, id, *key).await;
+                            start_subscription_after_put(op_manager, id, *key, false).await;
                         }
 
                         Ok(OperationResult {
@@ -581,29 +583,32 @@ impl Operation for PutOp {
 
 /// Helper to start subscription after PUT completes (only for originator)
 ///
-/// Uses `start_subscription_request_async` to avoid blocking the PUT response.
-/// The subscription runs independently - the client gets immediate confirmation
-/// that the contract was stored, while subscription completes in the background.
+/// The `blocking_subscription` parameter controls subscription behavior:
+/// - When false (default): subscription completes asynchronously and PUT response
+///   is sent immediately
+/// - When true: PUT response waits for subscription to complete
+///
+/// This parameter is intended to come from the client request (ContractRequest::Put)
+/// once stdlib is updated. For now, callers should pass `false` for non-blocking behavior.
 async fn start_subscription_after_put(
     op_manager: &OpManager,
     parent_tx: Transaction,
     key: ContractKey,
+    blocking_subscription: bool,
 ) {
     // Note: This failed_parents check may be unnecessary since we only spawn the subscription
     // at PUT completion, so there's no earlier child operation that could have failed.
     // Keeping it as defensive check in case of race conditions not currently understood.
     if !op_manager.failed_parents().contains(&parent_tx) {
-        // Use async variant that doesn't block the PUT response on subscription completion.
-        // This is critical for avoiding timeouts: the PUT has already succeeded (contract stored),
-        // so the client should receive PutResponse immediately rather than waiting for
-        // the subscription to complete (which can take significant time under network delays).
-        let child_tx = super::start_subscription_request_async(op_manager, parent_tx, key);
+        let child_tx =
+            super::start_subscription_request(op_manager, parent_tx, key, blocking_subscription);
         tracing::debug!(
             tx = %parent_tx,
             child_tx = %child_tx,
             contract = %key,
+            blocking = blocking_subscription,
             phase = "subscribe",
-            "Started async subscription after PUT (not blocking response)"
+            "Started subscription after PUT"
         );
     } else {
         tracing::warn!(

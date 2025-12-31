@@ -423,12 +423,49 @@ pub(crate) async fn announce_contract_cached(op_manager: &OpManager, key: &Contr
 /// - The client needs immediate confirmation that the contract was stored/fetched
 /// - The subscription can complete asynchronously in the background
 /// - Subscription success/failure doesn't affect the PUT/GET result
-pub(super) fn start_subscription_request_async(
+fn start_subscription_request_async(
     op_manager: &OpManager,
     parent_tx: Transaction,
     key: ContractKey,
 ) -> Transaction {
     start_subscription_request_internal(op_manager, parent_tx, key, false)
+}
+
+/// Initiates a subscription after a PUT or GET completes, blocking the parent operation.
+///
+/// This DOES register a parent-child relationship for atomicity tracking,
+/// so the PUT/GET response waits for the subscription to complete before being sent.
+///
+/// This provides stronger atomicity guarantees but may cause timeouts under
+/// poor network conditions.
+fn start_subscription_request_blocking(
+    op_manager: &OpManager,
+    parent_tx: Transaction,
+    key: ContractKey,
+) -> Transaction {
+    start_subscription_request_internal(op_manager, parent_tx, key, true)
+}
+
+/// Initiates a subscription after a PUT or GET, with configurable blocking behavior.
+///
+/// The `blocking` parameter determines whether to block the parent operation on
+/// subscription completion:
+/// - When false (default): subscription completes asynchronously, PUT/GET responds immediately
+/// - When true: PUT/GET waits for subscription to complete before responding
+///
+/// This flag is intended to be passed from the client request (e.g., ContractRequest::Put)
+/// to allow per-operation control over subscription semantics.
+pub(super) fn start_subscription_request(
+    op_manager: &OpManager,
+    parent_tx: Transaction,
+    key: ContractKey,
+    blocking: bool,
+) -> Transaction {
+    if blocking {
+        start_subscription_request_blocking(op_manager, parent_tx, key)
+    } else {
+        start_subscription_request_async(op_manager, parent_tx, key)
+    }
 }
 
 /// Starts a subscription request while allowing callers to opt out of parent tracking.
