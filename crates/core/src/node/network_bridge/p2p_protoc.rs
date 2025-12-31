@@ -1740,36 +1740,6 @@ impl P2pConnManager {
             );
         }
 
-        // Check if this peer is in backoff due to previous connection failures.
-        // Skip the attempt if we're still in backoff period to prevent rapid retries.
-        if !peer_addr.ip().is_unspecified() && state.peer_backoff.is_in_backoff(peer_addr) {
-            let remaining = state
-                .peer_backoff
-                .remaining_backoff(peer_addr)
-                .unwrap_or(Duration::ZERO);
-            tracing::debug!(
-                tx = %tx,
-                peer = %peer,
-                peer_addr = %peer_addr,
-                remaining_secs = remaining.as_secs(),
-                transient,
-                phase = "connect",
-                "Skipping connection attempt - peer in backoff"
-            );
-            callback
-                .send_result(Err(()))
-                .await
-                .inspect_err(|error| {
-                    tracing::debug!(
-                        remote = %peer_addr,
-                        ?error,
-                        "Failed to notify caller about backoff-delayed connection"
-                    );
-                })
-                .ok();
-            return Ok(());
-        }
-
         tracing::debug!(
             tx = %tx,
             peer = %peer,
@@ -1922,6 +1892,38 @@ impl P2pConnManager {
             return Ok(());
         }
 
+        // Check if this peer is in backoff due to previous connection failures.
+        // This check is done AFTER the existing connection check above, so that:
+        // 1. If we already have a connection (possibly from inbound), we reuse it
+        // 2. Backoff only blocks NEW outbound connection attempts
+        if !peer_addr.ip().is_unspecified() && state.peer_backoff.is_in_backoff(peer_addr) {
+            let remaining = state
+                .peer_backoff
+                .remaining_backoff(peer_addr)
+                .unwrap_or(Duration::ZERO);
+            tracing::debug!(
+                tx = %tx,
+                peer = %peer,
+                peer_addr = %peer_addr,
+                remaining_secs = remaining.as_secs(),
+                transient,
+                phase = "connect",
+                "Skipping connection attempt - peer in backoff"
+            );
+            callback
+                .send_result(Err(()))
+                .await
+                .inspect_err(|error| {
+                    tracing::debug!(
+                        remote = %peer_addr,
+                        ?error,
+                        "Failed to notify caller about backoff-delayed connection"
+                    );
+                })
+                .ok();
+            return Ok(());
+        }
+
         match state.awaiting_connection.entry(peer_addr) {
             std::collections::hash_map::Entry::Occupied(mut callbacks) => {
                 let txs_entry = state.awaiting_connection_txs.entry(peer_addr).or_default();
@@ -1988,6 +1990,12 @@ impl P2pConnManager {
                 .ring
                 .connection_manager
                 .prune_in_transit_connection(peer_addr);
+
+            // Record failure for exponential backoff to prevent rapid retries
+            if !peer_addr.ip().is_unspecified() {
+                state.peer_backoff.record_failure(peer_addr);
+            }
+
             let pending_txs = state.awaiting_connection_txs.remove(&peer_addr);
             if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
                 tracing::debug!(
@@ -2159,7 +2167,9 @@ impl P2pConnManager {
                     .prune_in_transit_connection(peer_addr);
 
                 // Record failure for exponential backoff to prevent rapid retries
-                state.peer_backoff.record_failure(peer_addr);
+                if !peer_addr.ip().is_unspecified() {
+                    state.peer_backoff.record_failure(peer_addr);
+                }
 
                 let pending_txs = state
                     .awaiting_connection_txs
