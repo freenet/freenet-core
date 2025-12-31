@@ -369,6 +369,11 @@ fn generate_wrapper_script(binary_path: &Path) -> String {
         r#"#!/bin/bash
 # Freenet service wrapper for auto-update support.
 # This wrapper monitors exit code 42 (update needed) and runs update before restart.
+# Includes exponential backoff to prevent rapid restart loops on repeated failures.
+
+BACKOFF=10       # Initial backoff in seconds
+MAX_BACKOFF=300  # Maximum backoff (5 minutes)
+CONSECUTIVE_FAILURES=0
 
 while true; do
     "{binary}" network
@@ -376,15 +381,27 @@ while true; do
 
     if [ $EXIT_CODE -eq 42 ]; then
         echo "$(date): Update needed, running freenet update..." >> "$HOME/Library/Logs/freenet/freenet.log"
-        "{binary}" update --quiet
-        sleep 2
+        if "{binary}" update --quiet; then
+            echo "$(date): Update successful, restarting..." >> "$HOME/Library/Logs/freenet/freenet.log"
+            CONSECUTIVE_FAILURES=0
+            BACKOFF=10
+            sleep 2
+        else
+            CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+            echo "$(date): Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..." >> "$HOME/Library/Logs/freenet/freenet.log"
+            sleep $BACKOFF
+            BACKOFF=$((BACKOFF * 2))
+            [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
+        fi
         continue
     elif [ $EXIT_CODE -eq 0 ]; then
         echo "$(date): Normal shutdown" >> "$HOME/Library/Logs/freenet/freenet.log"
         exit 0
     else
-        echo "$(date): Exited with code $EXIT_CODE" >> "$HOME/Library/Logs/freenet/freenet.log"
-        exit $EXIT_CODE
+        echo "$(date): Exited with code $EXIT_CODE, restarting after backoff..." >> "$HOME/Library/Logs/freenet/freenet.log"
+        sleep $BACKOFF
+        BACKOFF=$((BACKOFF * 2))
+        [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
     fi
 done
 "#,
@@ -779,9 +796,12 @@ mod tests {
         assert!(service_content.contains("MemoryMax=2G"));
         assert!(service_content.contains("CPUQuota=200%"));
 
-        // Verify restart configuration
-        assert!(service_content.contains("Restart=on-failure"));
+        // Verify restart configuration (always restart for auto-update support)
+        assert!(service_content.contains("Restart=always"));
         assert!(service_content.contains("RestartSec=10"));
+
+        // Verify auto-update support via ExecStopPost
+        assert!(service_content.contains("ExecStopPost="));
 
         // Verify graceful shutdown timeout is set
         assert!(service_content.contains("TimeoutStopSec=15"));

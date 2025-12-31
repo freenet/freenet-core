@@ -49,14 +49,33 @@ impl std::fmt::Display for UpdateNeededError {
 
 impl std::error::Error for UpdateNeededError {}
 
+/// Result of an update check attempt.
+#[derive(Debug, PartialEq)]
+pub enum UpdateCheckResult {
+    /// Rate limited or too many failures - didn't actually check GitHub.
+    /// The caller should NOT clear the version mismatch flag (preserve it for later).
+    Skipped,
+    /// Checked GitHub, no newer version available.
+    /// The caller should clear the version mismatch flag.
+    NoUpdateAvailable,
+    /// Checked GitHub, newer version confirmed.
+    /// The caller should clear the version mismatch flag.
+    UpdateAvailable(String),
+}
+
 /// Check if an update is available, respecting rate limits and failure counts.
 ///
-/// Returns `Some(version)` if a newer version is confirmed on GitHub,
-/// `None` otherwise (including if GitHub is unreachable - we fail safe).
+/// Returns an `UpdateCheckResult` indicating:
+/// - `Skipped` if rate limited or too many failures (didn't check GitHub)
+/// - `NoUpdateAvailable` if checked but no newer version exists
+/// - `UpdateAvailable(version)` if a newer version is confirmed on GitHub
+///
+/// IMPORTANT: The caller should only clear the version mismatch flag if the
+/// result is NOT `Skipped`. This prevents losing mismatches when rate-limited.
 ///
 /// Security: This function verifies against GitHub, so a malicious peer
 /// claiming a fake version won't trigger an exit.
-pub async fn check_if_update_available(current_version: &str) -> Option<String> {
+pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResult {
     // Don't check if we've failed too many times
     if !should_attempt_update() {
         tracing::debug!(
@@ -64,13 +83,13 @@ pub async fn check_if_update_available(current_version: &str) -> Option<String> 
             max = MAX_UPDATE_FAILURES,
             "Skipping update check - too many previous failures"
         );
-        return None;
+        return UpdateCheckResult::Skipped;
     }
 
     // Rate limit checks
     if !should_check_for_update() {
         tracing::debug!("Skipping update check - checked recently");
-        return None;
+        return UpdateCheckResult::Skipped;
     }
 
     // Record that we're checking now
@@ -87,7 +106,7 @@ pub async fn check_if_update_available(current_version: &str) -> Option<String> 
                         current_version,
                         e
                     );
-                    return None;
+                    return UpdateCheckResult::NoUpdateAvailable;
                 }
             };
 
@@ -95,7 +114,7 @@ pub async fn check_if_update_available(current_version: &str) -> Option<String> 
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("Failed to parse latest version '{}': {}", latest, e);
-                    return None;
+                    return UpdateCheckResult::NoUpdateAvailable;
                 }
             };
 
@@ -107,14 +126,14 @@ pub async fn check_if_update_available(current_version: &str) -> Option<String> 
                 );
                 // Clear failure count since we successfully checked
                 clear_update_failures();
-                Some(latest)
+                UpdateCheckResult::UpdateAvailable(latest)
             } else {
                 tracing::debug!(
                     current = %current_version,
                     latest = %latest,
                     "No newer version available (peer may have claimed fake version)"
                 );
-                None
+                UpdateCheckResult::NoUpdateAvailable
             }
         }
         Err(e) => {
@@ -122,8 +141,9 @@ pub async fn check_if_update_available(current_version: &str) -> Option<String> 
                 "Failed to check GitHub for updates: {}. Continuing to run.",
                 e
             );
-            // Don't count this as a failure - network issues shouldn't prevent future checks
-            None
+            // Treat network errors as "checked but no update" - don't preserve the flag
+            // forever just because GitHub was temporarily unreachable
+            UpdateCheckResult::NoUpdateAvailable
         }
     }
 }

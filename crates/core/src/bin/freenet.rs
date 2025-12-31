@@ -115,7 +115,8 @@ async fn run_network_node_with_signals(
     shutdown_handle: freenet::ShutdownHandle,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
-        check_if_update_available, clear_version_mismatch, has_version_mismatch, UpdateNeededError,
+        check_if_update_available, clear_version_mismatch, has_version_mismatch, UpdateCheckResult,
+        UpdateNeededError,
     };
     use tokio::signal;
 
@@ -155,15 +156,28 @@ async fn run_network_node_with_signals(
 
             if has_version_mismatch() {
                 tracing::info!("Version mismatch detected, checking GitHub for updates...");
-                clear_version_mismatch();
 
-                if let Some(new_version) = check_if_update_available(build_info::VERSION).await {
-                    tracing::info!(
-                        new_version = %new_version,
-                        "Newer version confirmed on GitHub, triggering auto-update"
-                    );
-                    let _ = update_tx.send(new_version);
-                    return;
+                match check_if_update_available(build_info::VERSION).await {
+                    UpdateCheckResult::UpdateAvailable(new_version) => {
+                        // Clear the flag - we've handled this mismatch
+                        clear_version_mismatch();
+                        tracing::info!(
+                            new_version = %new_version,
+                            "Newer version confirmed on GitHub, triggering auto-update"
+                        );
+                        let _ = update_tx.send(new_version);
+                        return;
+                    }
+                    UpdateCheckResult::NoUpdateAvailable => {
+                        // Clear the flag - peer claimed fake version or we're up to date
+                        clear_version_mismatch();
+                        tracing::debug!("No update available, continuing to run");
+                    }
+                    UpdateCheckResult::Skipped => {
+                        // Don't clear the flag - we didn't actually check.
+                        // The mismatch will be rechecked when rate limit expires.
+                        tracing::debug!("Update check skipped (rate limited), will retry later");
+                    }
                 }
             }
         }
@@ -175,7 +189,10 @@ async fn run_network_node_with_signals(
         new_version = &mut update_rx => {
             match new_version {
                 Ok(version) => {
-                    tracing::info!(version = %version, "Exiting for auto-update");
+                    tracing::info!(version = %version, "Initiating graceful shutdown for auto-update");
+                    // Trigger graceful shutdown before exiting with update error.
+                    // This properly closes peer connections instead of just dropping them.
+                    shutdown_handle.shutdown().await;
                     Err(UpdateNeededError { new_version: version }.into())
                 }
                 Err(_) => {
