@@ -479,9 +479,11 @@ impl SimNetwork {
                 config.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
             }
             let port = crate::util::get_free_port().unwrap();
+            let addr = (Ipv6Addr::LOCALHOST, port).into();
             config.network_listener_port = port;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.key_pair = crate::transport::TransportKeypair::new();
+            config.with_own_addr(addr);
             config
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)

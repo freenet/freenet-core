@@ -75,11 +75,14 @@ impl<ER> Builder<ER> {
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
+        // Use the actual configured address for this peer
+        let own_addr = self
+            .config
+            .own_addr
+            .unwrap_or_else(|| (self.config.network_listener_ip, self.config.network_listener_port).into());
+
         let conn_manager = MemoryConnManager::new(
-            PeerId::new(
-                ([127, 0, 0, 1], 0).into(),
-                self.config.key_pair.public().clone(),
-            ),
+            PeerId::new(own_addr, self.config.key_pair.public().clone()),
             self.event_register.clone(),
             op_manager.clone(),
             self.add_noise,
@@ -91,10 +94,7 @@ impl<ER> Builder<ER> {
         );
 
         let mut config = super::RunnerConfig {
-            peer_key: PeerKeyLocation::new(
-                self.config.key_pair.public().clone(),
-                ([127, 0, 0, 1], 0).into(),
-            ),
+            peer_key: PeerKeyLocation::new(self.config.key_pair.public().clone(), own_addr),
             gateways,
             parent_span: Some(parent_span),
             op_manager,
