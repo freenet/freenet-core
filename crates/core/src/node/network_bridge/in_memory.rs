@@ -8,7 +8,7 @@ use std::{
 };
 
 use crossbeam::channel::{self, Sender};
-use rand::{prelude::StdRng, seq::SliceRandom, Rng, SeedableRng};
+use rand::{prelude::StdRng, seq::SliceRandom, SeedableRng};
 use tokio::sync::Mutex;
 
 use super::{ConnectionError, NetworkBridge};
@@ -190,8 +190,6 @@ impl InMemoryTransport {
         let msg_stack_queue_cp = msg_stack_queue.clone();
         let ip = interface_peer.clone();
         GlobalExecutor::spawn(async move {
-            // Use the provided seed for deterministic behavior
-            let mut rng = StdRng::seed_from_u64(rng_seed);
             loop {
                 match rx.try_recv() {
                     Ok(msg) => {
@@ -201,9 +199,22 @@ impl InMemoryTransport {
                             msg.origin
                         );
                         let mut queue = msg_stack_queue_cp.lock().await;
-                        queue.push(msg);
-                        if add_noise && rng.random_bool(0.2) {
-                            queue.shuffle(&mut rng);
+
+                        if add_noise {
+                            // Derive shuffle decision from message content for determinism
+                            // This avoids depending on async arrival order
+                            let msg_hash = Self::hash_message(&msg.data);
+                            queue.push(msg);
+
+                            // ~20% chance to shuffle, based on message content
+                            if msg_hash % 5 == 0 {
+                                // Derive shuffle seed from base seed + message hash
+                                let shuffle_seed = rng_seed.wrapping_add(msg_hash);
+                                let mut shuffle_rng = StdRng::seed_from_u64(shuffle_seed);
+                                queue.shuffle(&mut shuffle_rng);
+                            }
+                        } else {
+                            queue.push(msg);
                         }
                     }
                     Err(channel::TryRecvError::Disconnected) => {
@@ -222,6 +233,20 @@ impl InMemoryTransport {
             interface_peer,
             msg_stack_queue,
         }
+    }
+
+    /// Compute a simple hash of message data for deterministic shuffle decisions.
+    /// Uses FNV-1a for speed (we don't need cryptographic strength here).
+    fn hash_message(data: &[u8]) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        let mut hash = FNV_OFFSET;
+        for byte in data {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
     }
 
     fn send(&self, target: PeerId, message: Vec<u8>) -> Result<(), ConnectionError> {
