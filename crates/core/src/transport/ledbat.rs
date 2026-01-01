@@ -2762,12 +2762,13 @@ mod tests {
     }
 
     /// Parametrized test for slowdown behavior at different RTTs
-    /// Tests: 10ms (LAN), 50ms (regional), 100ms (intercontinental), 200ms (satellite)
+    /// Tests: 10ms (LAN), 50ms (regional), 100ms (intercontinental), 200ms (satellite), 300ms (high-latency WAN)
     #[rstest::rstest]
     #[case::low_latency_10ms(10, 20)]
     #[case::medium_latency_50ms(50, 30)]
     #[case::high_latency_100ms(100, 40)]
     #[case::very_high_latency_200ms(200, 50)]
+    #[case::extreme_latency_300ms(300, 60)]
     #[tokio::test]
     async fn test_slowdown_at_various_latencies(#[case] rtt_ms: u64, #[case] max_iterations: u32) {
         let (post_exit, frozen, final_cwnd, iterations) = test_slowdown_at_rtt(rtt_ms).await;
