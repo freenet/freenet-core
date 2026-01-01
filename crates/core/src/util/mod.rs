@@ -8,7 +8,6 @@ use std::{
     hash::Hash,
     net::{Ipv4Addr, SocketAddr, TcpListener},
     sync::Arc,
-    time::Duration,
 };
 
 use crate::{config::ConfigPaths, node::PeerId};
@@ -67,98 +66,6 @@ pub fn set_cleanup_on_exit(config: Arc<ConfigPaths>) -> Result<(), ctrlc::Error>
 
         std::process::exit(0);
     })
-}
-
-#[derive(Debug, Clone)]
-pub struct Backoff {
-    attempt: usize,
-    max_attempts: usize,
-    base: Duration,
-    ceiling: Duration,
-    strategy: BackoffStrategy,
-}
-
-#[derive(Debug, Clone)]
-enum BackoffStrategy {
-    Exponential,
-    Logarithmic { interval_reduction_factor: f64 },
-}
-
-impl Backoff {
-    pub fn new(base: Duration, ceiling: Duration, max_attempts: usize) -> Self {
-        Backoff {
-            attempt: 0,
-            max_attempts,
-            base,
-            ceiling,
-            strategy: BackoffStrategy::Exponential,
-        }
-    }
-
-    pub fn logarithmic(mut self, interval_reduction_factor: f64) -> Self {
-        self.strategy = BackoffStrategy::Logarithmic {
-            interval_reduction_factor,
-        };
-        self
-    }
-
-    /// Record that we made an attempt and sleep for the appropriate amount
-    /// of time. If the max number of attempts was reached returns none.
-    pub async fn sleep(&mut self) -> Option<()> {
-        if self.attempt == self.max_attempts {
-            None
-        } else {
-            tokio::time::sleep(self.next_attempt()).await;
-            Some(())
-        }
-    }
-
-    pub fn retries(&self) -> usize {
-        self.attempt
-    }
-
-    fn delay(&self) -> Duration {
-        let mut delay = match self.strategy {
-            BackoffStrategy::Exponential => self.exponential_delay(),
-            BackoffStrategy::Logarithmic {
-                interval_reduction_factor,
-            } => self.logarithmic_delay(interval_reduction_factor),
-        };
-        if delay > self.ceiling {
-            delay = self.ceiling;
-        }
-        delay
-    }
-
-    fn exponential_delay(&self) -> Duration {
-        self.base.saturating_mul(1 << self.attempt)
-    }
-
-    fn logarithmic_delay(&self, interval_reduction_factor: f64) -> Duration {
-        const LOG_BASE: f64 = 2.0;
-        Duration::from_millis(
-            ((self.base.as_millis() as f64 * (1.0 + (self.attempt as f64).log(LOG_BASE)))
-                / interval_reduction_factor) as u64,
-        )
-    }
-
-    fn next_attempt(&mut self) -> Duration {
-        let delay = self.delay();
-        self.attempt += 1;
-        delay
-    }
-}
-
-impl Iterator for Backoff {
-    type Item = Duration;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.attempt == self.max_attempts {
-            None
-        } else {
-            Some(self.next_attempt())
-        }
-    }
 }
 
 #[allow(clippy::result_unit_err)]
@@ -256,40 +163,6 @@ impl<T> IterExt for T where T: Iterator {}
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-
-    #[test]
-    fn backoff_logarithmic() {
-        let base = Duration::from_millis(200);
-        let ceiling = Duration::from_secs(2);
-        let max_attempts = 40;
-        let backoff = Backoff::new(base, ceiling, max_attempts).logarithmic(2.0);
-        let total = backoff
-            .into_iter()
-            .reduce(|acc, x| {
-                // println!("next: {:?}", x);
-                acc + x
-            })
-            .unwrap();
-        assert!(
-            total > Duration::from_secs(18) && total < Duration::from_secs(20),
-            "total: {total:?}"
-        );
-
-        let base = Duration::from_millis(600);
-        let ceiling = Duration::from_secs(30);
-        let max_attempts = 40;
-        let backoff = Backoff::new(base, ceiling, max_attempts).logarithmic(1.0);
-
-        // const MAX: Duration = Duration::from_secs(30);
-        let _ = backoff
-            .into_iter()
-            .reduce(|acc, x| {
-                // println!("next: {:?}", x);
-                acc + x
-            })
-            .unwrap();
-        // println!("total: {:?}", total);
-    }
 
     #[test]
     fn randomize_iter() {

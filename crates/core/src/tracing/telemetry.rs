@@ -12,9 +12,9 @@
 //!
 //! ## Design Notes
 //!
-//! ### Why custom backoff instead of `crate::util::Backoff`?
-//! The shared `Backoff` utility is designed for "try N times then give up" scenarios.
-//! Telemetry needs infinite retries with reset-on-success, which is a different pattern.
+//! ### Why custom backoff instead of `crate::util::backoff::ExponentialBackoff`?
+//! The shared `ExponentialBackoff` utility is stateless and designed for finite retry scenarios.
+//! Telemetry needs infinite retries with reset-on-success, which requires different state management.
 //!
 //! ### Why HTTP instead of HTTPS?
 //! TODO(#2456): Enable HTTPS once TLS is configured on the collector server.
