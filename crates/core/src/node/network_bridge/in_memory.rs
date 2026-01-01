@@ -7,6 +7,11 @@ use std::{
     time::Duration,
 };
 
+/// Divisor for determining shuffle probability in noise mode.
+/// When `msg_hash % NOISE_SHUFFLE_DIVISOR == 0`, the message queue is shuffled.
+/// A value of 5 gives approximately 20% shuffle probability.
+const NOISE_SHUFFLE_DIVISOR: u64 = 5;
+
 use crossbeam::channel::{self, Sender};
 use rand::{prelude::StdRng, seq::SliceRandom, SeedableRng};
 use tokio::sync::Mutex;
@@ -206,8 +211,8 @@ impl InMemoryTransport {
                             let msg_hash = Self::hash_message(&msg.data);
                             queue.push(msg);
 
-                            // ~20% chance to shuffle, based on message content
-                            if msg_hash % 5 == 0 {
+                            // Shuffle based on message content (probability ~1/NOISE_SHUFFLE_DIVISOR)
+                            if msg_hash % NOISE_SHUFFLE_DIVISOR == 0 {
                                 // Derive shuffle seed from base seed + message hash
                                 let shuffle_seed = rng_seed.wrapping_add(msg_hash);
                                 let mut shuffle_rng = StdRng::seed_from_u64(shuffle_seed);

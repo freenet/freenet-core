@@ -4,7 +4,7 @@
 //! the scheduler for deterministic message delivery.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -88,8 +88,9 @@ pub struct SimulatedNetwork {
     /// Messages currently in flight
     in_flight: Arc<Mutex<HashMap<EventId, InFlightMessage>>>,
     /// Delivered messages waiting to be consumed (per peer)
+    /// Uses VecDeque for O(1) front removal in recv()
     #[allow(clippy::type_complexity)]
-    delivered: Arc<Mutex<HashMap<SocketAddr, Vec<(SocketAddr, Vec<u8>)>>>>,
+    delivered: Arc<Mutex<HashMap<SocketAddr, VecDeque<(SocketAddr, Vec<u8>)>>>>,
     /// Network statistics
     stats: Arc<Mutex<NetworkStats>>,
 }
@@ -267,7 +268,7 @@ impl SimulatedNetwork {
             delivered
                 .entry(to)
                 .or_default()
-                .push((from, payload));
+                .push_back((from, payload));
         }
 
         // Update stats
@@ -287,14 +288,11 @@ impl SimulatedNetwork {
     }
 
     /// Receives the next message for a peer, if any.
+    /// Uses O(1) pop_front() from VecDeque.
     pub fn recv(&self, peer: SocketAddr) -> Option<(SocketAddr, Vec<u8>)> {
         let mut delivered = self.delivered.lock().unwrap();
         let queue = delivered.get_mut(&peer)?;
-        if queue.is_empty() {
-            None
-        } else {
-            Some(queue.remove(0))
-        }
+        queue.pop_front()
     }
 
     /// Returns the number of pending messages for a peer.

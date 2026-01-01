@@ -351,11 +351,7 @@ impl TimeSource for VirtualTime {
         let id = self.register_wakeup(deadline_nanos);
         let state = self.state.clone();
 
-        Box::pin(VirtualSleep {
-            id,
-            state,
-            registered: false,
-        })
+        Box::pin(VirtualSleep { id, state })
     }
 
     fn timeout<F, T>(&self, duration: Duration, future: F) -> Pin<Box<dyn Future<Output = Option<T>> + Send>>
@@ -379,37 +375,43 @@ impl TimeSource for VirtualTime {
 struct VirtualSleep {
     id: WakeupId,
     state: Arc<VirtualTimeState>,
-    registered: bool,
 }
 
 impl Future for VirtualSleep {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Check if our wakeup has been triggered
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Acquire both locks atomically to prevent TOCTOU race:
+        // Without holding both locks, advance_to() could run between checking
+        // pending_wakeups and registering our waker, causing a missed wakeup.
         let pending = self.state.pending_wakeups.lock().unwrap();
+        let mut pending_wakers = self.state.pending_wakers.lock().unwrap();
+
         let still_pending = pending.iter().any(|w| w.id == self.id);
-        drop(pending);
 
         if !still_pending {
             Poll::Ready(())
         } else {
-            // Register our waker
-            if !self.registered {
-                self.registered = true;
-            }
-            let mut pending_wakers = self.state.pending_wakers.lock().unwrap();
-            if let Some(pos) = pending_wakers.iter().position(|(id, _)| *id == self.id) {
+            // Register our waker while holding both locks
+            let wakeup_id = self.id;
+            if let Some(pos) = pending_wakers.iter().position(|(id, _)| *id == wakeup_id) {
                 pending_wakers[pos].1 = cx.waker().clone();
             } else {
-                pending_wakers.push((self.id, cx.waker().clone()));
+                pending_wakers.push((wakeup_id, cx.waker().clone()));
             }
             Poll::Pending
         }
     }
 }
 
-// Ensure VirtualSleep is Send
+// SAFETY: VirtualSleep is Send because:
+// 1. `id` is a simple Copy type (WakeupId = u64)
+// 2. `state` is Arc<VirtualTimeState> which is Send when VirtualTimeState is Send + Sync
+// 3. VirtualTimeState contains:
+//    - AtomicU64 (Send + Sync)
+//    - Mutex<BinaryHeap<Wakeup>> where Wakeup contains only u64s (Send + Sync)
+//    - Mutex<Vec<(WakeupId, Waker)>> where Waker is Send + Sync
+// All components are Send, so VirtualSleep is safe to send across threads.
 unsafe impl Send for VirtualSleep {}
 
 #[cfg(test)]
