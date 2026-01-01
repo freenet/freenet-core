@@ -114,6 +114,23 @@ struct GatewayConfig {
     location: Location,
 }
 
+/// Summary of a network event for deterministic comparison.
+///
+/// Excludes timestamps which vary between runs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EventSummary {
+    pub tx: crate::message::Transaction,
+    pub peer_addr: std::net::SocketAddr,
+    /// String representation of the event kind for sorting
+    pub event_kind_name: String,
+    /// Contract key if this event involves a contract operation
+    pub contract_key: Option<String>,
+    /// State hash if this event includes state (Put/Update success/broadcast)
+    pub state_hash: Option<String>,
+    /// Full debug representation of the event (for backwards compatibility)
+    pub event_detail: String,
+}
+
 pub struct EventChain<S = watch::Sender<(EventId, TransportPublicKey)>> {
     labels: Vec<(NodeLabel, TransportPublicKey)>,
     user_ev_controller: S,
@@ -270,6 +287,8 @@ pub(super) struct Builder<ER> {
     event_register: ER,
     contracts: Vec<(ContractContainer, WrappedState, bool)>,
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
+    /// Seed for deterministic RNG in this node's transport layer
+    pub rng_seed: u64,
 }
 
 impl<ER: NetEventRegister> Builder<ER> {
@@ -279,6 +298,7 @@ impl<ER: NetEventRegister> Builder<ER> {
         event_register: ER,
         contract_handler_name: String,
         add_noise: bool,
+        rng_seed: u64,
     ) -> Builder<ER> {
         Builder {
             config: builder.clone(),
@@ -287,6 +307,7 @@ impl<ER: NetEventRegister> Builder<ER> {
             event_register,
             contracts: Vec::new(),
             contract_subscribers: HashMap::new(),
+            rng_seed,
         }
     }
 }
@@ -309,9 +330,15 @@ pub struct SimNetwork {
     min_connections: usize,
     start_backoff: Duration,
     add_noise: bool,
+    /// Master seed for deterministic RNG - used to derive per-peer seeds
+    seed: u64,
 }
 
 impl SimNetwork {
+    /// Default seed for deterministic simulation
+    pub const DEFAULT_SEED: u64 = 0xDEADBEEF_CAFEBABE;
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         name: &str,
         gateways: usize,
@@ -320,6 +347,7 @@ impl SimNetwork {
         rnd_if_htl_above: usize,
         max_connections: usize,
         min_connections: usize,
+        seed: u64,
     ) -> Self {
         assert!(nodes > 0);
         let (user_ev_controller, mut receiver_ch) =
@@ -342,6 +370,7 @@ impl SimNetwork {
             min_connections,
             start_backoff: Duration::from_millis(1),
             add_noise: false,
+            seed,
         };
         net.config_gateways(
             gateways
@@ -351,6 +380,19 @@ impl SimNetwork {
         .await;
         net.config_nodes(nodes).await;
         net
+    }
+
+    /// Derives a deterministic per-peer seed from the master seed and peer index.
+    fn derive_peer_seed(&self, peer_index: usize) -> u64 {
+        // Use a simple but effective mixing function
+        let mut seed = self.seed;
+        seed = seed.wrapping_add(peer_index as u64);
+        seed ^= seed >> 33;
+        seed = seed.wrapping_mul(0xff51afd7ed558ccd);
+        seed ^= seed >> 33;
+        seed = seed.wrapping_mul(0xc4ceb9fe1a85ec53);
+        seed ^= seed >> 33;
+        seed
     }
 }
 
@@ -363,6 +405,42 @@ impl SimNetwork {
     #[allow(unused)]
     pub fn with_noise(&mut self) {
         self.add_noise = true;
+    }
+
+    /// Configures fault injection for the network simulation.
+    ///
+    /// This enables deterministic fault injection using the simulation framework's
+    /// `FaultConfig`. Faults include:
+    /// - Message drops (via `message_loss_rate`) - deterministic with seeded RNG
+    /// - Network partitions
+    /// - Node crashes
+    /// - Latency injection (via `latency_range`)
+    ///
+    /// The fault injector uses the network's seed for deterministic behavior.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use freenet::simulation::FaultConfig;
+    /// use std::time::Duration;
+    ///
+    /// let mut sim = SimNetwork::new(...).await;
+    /// sim.with_fault_injection(FaultConfig::builder()
+    ///     .message_loss_rate(0.1)
+    ///     .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
+    ///     .build());
+    /// ```
+    pub fn with_fault_injection(&mut self, config: crate::simulation::FaultConfig) {
+        use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
+        // Use a derived seed for fault injection to maintain determinism
+        let fault_seed = self.seed.wrapping_add(0xFA01_7777);
+        let state = FaultInjectorState::new(config, fault_seed);
+        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
+    }
+
+    /// Clears any configured fault injection.
+    pub fn clear_fault_injection(&mut self) {
+        use crate::node::network_bridge::set_fault_injector;
+        set_fault_injector(None);
     }
 
     #[allow(unused)]
@@ -440,11 +518,13 @@ impl SimNetwork {
                     self.event_listener.clone()
                 }
             };
+            let peer_seed = self.derive_peer_seed(this_config.label.number());
             let gateway = Builder::build(
                 this_node,
                 event_listener,
                 format!("{}-{label}", self.name, label = this_config.label),
                 self.add_noise,
+                peer_seed,
             );
             self.gateways.push((gateway, this_config));
         }
@@ -506,11 +586,13 @@ impl SimNetwork {
                     self.event_listener.clone()
                 }
             };
+            let peer_seed = self.derive_peer_seed(node_no);
             let node = Builder::build(
                 config,
                 event_listener,
                 format!("{}-{label}", self.name),
                 self.add_noise,
+                peer_seed,
             );
             self.nodes.push((node, label));
         }
@@ -672,6 +754,57 @@ impl SimNetwork {
             .binary_search_by(|(label, _)| label.cmp(peer))
             .expect("peer not found");
         self.event_listener.is_connected(&self.labels[pos].1)
+    }
+
+    /// Returns a copy of all network event logs captured during the simulation.
+    ///
+    /// These logs can be used to verify deterministic behavior by comparing
+    /// event sequences across runs with the same seed.
+    pub async fn get_event_logs(&self) -> Vec<crate::tracing::NetLogMessage> {
+        self.event_listener.logs.lock().await.clone()
+    }
+
+    /// Returns event logs filtered and sorted for deterministic comparison.
+    ///
+    /// Events are sorted by (transaction, peer_addr, event_kind_name).
+    /// Timestamps are ignored since they may vary between runs.
+    pub async fn get_deterministic_event_summary(&self) -> Vec<EventSummary> {
+        let logs = self.event_listener.logs.lock().await;
+        let mut summaries: Vec<EventSummary> = logs
+            .iter()
+            .map(|log| {
+                let event_detail = format!("{:?}", log.kind);
+                // Use the structured variant_name() method instead of parsing debug output
+                let event_kind_name = log.kind.variant_name().to_string();
+                // Extract contract key using the structured accessor
+                let contract_key = log.kind.contract_key().map(|k| format!("{:?}", k));
+                // Extract state hash using the structured accessor
+                let state_hash = log.kind.state_hash().map(String::from);
+                EventSummary {
+                    tx: log.tx,
+                    peer_addr: log.peer_id.addr,
+                    event_kind_name,
+                    contract_key,
+                    state_hash,
+                    event_detail,
+                }
+            })
+            .collect();
+        // Sort for deterministic comparison
+        summaries.sort();
+        summaries
+    }
+
+    /// Counts events by type for quick comparison.
+    pub async fn get_event_counts(&self) -> std::collections::HashMap<String, usize> {
+        let logs = self.event_listener.logs.lock().await;
+        let mut counts = std::collections::HashMap::new();
+        for log in logs.iter() {
+            // Use the structured variant_name() method instead of parsing debug output
+            let key = log.kind.variant_name();
+            *counts.entry(key.to_string()).or_insert(0) += 1;
+        }
+        counts
     }
 
     /// Recommended to calling after `check_connectivity` to ensure enough time

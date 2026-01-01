@@ -357,6 +357,7 @@ struct ResendQueueEntry {
 pub(in crate::transport) mod tests {
     use super::*;
     use crate::util::time_source::MockTimeSource;
+    use rstest::rstest;
 
     pub(in crate::transport) fn mock_sent_packet_tracker() -> SentPacketTracker<MockTimeSource> {
         let time_source = MockTimeSource::new(Instant::now());
@@ -376,14 +377,22 @@ pub(in crate::transport) mod tests {
         }
     }
 
-    #[test]
-    fn test_report_sent_packet() {
+    #[rstest]
+    #[case::single_packet(1, vec![1, 2, 3], 1, 1, 1)]
+    #[case::multiple_packets_first(1, vec![1], 1, 1, 1)]
+    fn test_report_sent_packet(
+        #[case] packet_id: PacketId,
+        #[case] payload: Vec<u8>,
+        #[case] expected_pending: usize,
+        #[case] expected_queue: usize,
+        #[case] expected_total_sent: usize,
+    ) {
         let mut tracker = mock_sent_packet_tracker();
-        tracker.report_sent_packet(1, vec![1, 2, 3].into());
-        assert_eq!(tracker.pending_receipts.len(), 1);
-        assert_eq!(tracker.resend_queue.len(), 1);
+        tracker.report_sent_packet(packet_id, payload.into());
+        assert_eq!(tracker.pending_receipts.len(), expected_pending);
+        assert_eq!(tracker.resend_queue.len(), expected_queue);
         assert_eq!(tracker.packet_loss_proportion, 0.0);
-        assert_eq!(tracker.total_packets_sent, 1);
+        assert_eq!(tracker.total_packets_sent, expected_total_sent);
     }
 
     #[test]
@@ -477,26 +486,42 @@ pub(in crate::transport) mod tests {
 
     // RTT Estimation Tests (RFC 6298)
 
-    #[test]
-    fn test_rtt_estimation_first_sample() {
+    #[rstest]
+    #[case::fast_rtt(50, 50, 25, 50)]
+    #[case::slow_rtt(100, 100, 50, 100)]
+    #[case::very_fast_rtt(10, 10, 5, 10)]
+    fn test_rtt_estimation_first_sample(
+        #[case] delay_ms: u64,
+        #[case] expected_srtt_ms: u64,
+        #[case] expected_rttvar_ms: u64,
+        #[case] expected_min_rtt_ms: u64,
+    ) {
         let mut tracker = mock_sent_packet_tracker();
 
         // Send a packet
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
 
-        // Simulate 50ms delay
-        tracker.time_source.advance_time(Duration::from_millis(50));
+        // Simulate delay
+        tracker
+            .time_source
+            .advance_time(Duration::from_millis(delay_ms));
 
         // Receive ACK
         let (ack_info, _) = tracker.report_received_receipts(&[1]);
 
         // Verify first sample (RFC 6298 Section 2.2)
         assert_eq!(ack_info.len(), 1);
-        assert_eq!(ack_info[0].0, Some(Duration::from_millis(50))); // .0 = Some(RTT), .1 = packet size
+        assert_eq!(ack_info[0].0, Some(Duration::from_millis(delay_ms)));
         assert_eq!(ack_info[0].1, 3); // packet size
-        assert_eq!(tracker.smoothed_rtt(), Some(Duration::from_millis(50)));
-        assert_eq!(tracker.rttvar, Duration::from_millis(25)); // R/2
-        assert_eq!(tracker.min_rtt(), Duration::from_millis(50));
+        assert_eq!(
+            tracker.smoothed_rtt(),
+            Some(Duration::from_millis(expected_srtt_ms))
+        );
+        assert_eq!(tracker.rttvar, Duration::from_millis(expected_rttvar_ms)); // R/2
+        assert_eq!(
+            tracker.min_rtt(),
+            Duration::from_millis(expected_min_rtt_ms)
+        );
     }
 
     #[test]
@@ -559,25 +584,27 @@ pub(in crate::transport) mod tests {
         assert!(tracker.rto() <= Duration::from_secs(60));
     }
 
-    #[test]
-    fn test_min_rtt_tracking() {
+    #[rstest]
+    #[case::three_samples(&[100, 50, 150], 50)]
+    #[case::descending(&[200, 100, 50], 50)]
+    #[case::ascending(&[50, 100, 150], 50)]
+    #[case::single_sample(&[75], 75)]
+    fn test_min_rtt_tracking(#[case] rtt_samples: &[u64], #[case] expected_min_rtt_ms: u64) {
         let mut tracker = mock_sent_packet_tracker();
 
-        // Send three packets with different RTTs
-        tracker.report_sent_packet(1, vec![1].into());
-        tracker.time_source.advance_time(Duration::from_millis(100));
-        tracker.report_received_receipts(&[1]);
+        for (i, &rtt_ms) in rtt_samples.iter().enumerate() {
+            let packet_id = (i + 1) as PacketId;
+            tracker.report_sent_packet(packet_id, vec![packet_id as u8].into());
+            tracker
+                .time_source
+                .advance_time(Duration::from_millis(rtt_ms));
+            tracker.report_received_receipts(&[packet_id]);
+        }
 
-        tracker.report_sent_packet(2, vec![2].into());
-        tracker.time_source.advance_time(Duration::from_millis(50)); // Minimum
-        tracker.report_received_receipts(&[2]);
-
-        tracker.report_sent_packet(3, vec![3].into());
-        tracker.time_source.advance_time(Duration::from_millis(150));
-        tracker.report_received_receipts(&[3]);
-
-        // min_rtt should be 50ms
-        assert_eq!(tracker.min_rtt(), Duration::from_millis(50));
+        assert_eq!(
+            tracker.min_rtt(),
+            Duration::from_millis(expected_min_rtt_ms)
+        );
     }
 
     #[test]
@@ -603,28 +630,31 @@ pub(in crate::transport) mod tests {
 
     // RTO Exponential Backoff Tests (RFC 6298 Section 5.5)
 
-    #[test]
-    fn test_rto_backoff_doubles_on_timeout() {
+    #[rstest]
+    #[case::first_timeout(1, 2, 2)]
+    #[case::second_timeout(2, 4, 4)]
+    #[case::third_timeout(3, 8, 8)]
+    #[case::fourth_timeout(4, 16, 16)]
+    fn test_rto_backoff_doubles_on_timeout(
+        #[case] timeout_count: u32,
+        #[case] expected_backoff: u32,
+        #[case] expected_rto_secs: u64,
+    ) {
         let mut tracker = mock_sent_packet_tracker();
 
         // Initial backoff should be 1
         assert_eq!(tracker.rto_backoff(), 1);
         assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
 
-        // First timeout - backoff doubles to 2
-        tracker.on_timeout();
-        assert_eq!(tracker.rto_backoff(), 2);
-        assert_eq!(tracker.effective_rto(), Duration::from_secs(2));
+        for _ in 0..timeout_count {
+            tracker.on_timeout();
+        }
 
-        // Second timeout - backoff doubles to 4
-        tracker.on_timeout();
-        assert_eq!(tracker.rto_backoff(), 4);
-        assert_eq!(tracker.effective_rto(), Duration::from_secs(4));
-
-        // Third timeout - backoff doubles to 8
-        tracker.on_timeout();
-        assert_eq!(tracker.rto_backoff(), 8);
-        assert_eq!(tracker.effective_rto(), Duration::from_secs(8));
+        assert_eq!(tracker.rto_backoff(), expected_backoff);
+        assert_eq!(
+            tracker.effective_rto(),
+            Duration::from_secs(expected_rto_secs)
+        );
     }
 
     #[test]
@@ -643,8 +673,10 @@ pub(in crate::transport) mod tests {
         assert_eq!(tracker.rto_backoff(), MAX_RTO_BACKOFF);
     }
 
-    #[test]
-    fn test_rto_backoff_resets_on_valid_ack() {
+    #[rstest]
+    #[case::non_retransmitted(false)]
+    #[case::retransmitted(true)]
+    fn test_rto_backoff_resets_on_ack(#[case] mark_retransmitted: bool) {
         let mut tracker = mock_sent_packet_tracker();
 
         // Trigger some timeouts
@@ -655,36 +687,18 @@ pub(in crate::transport) mod tests {
         // Send a new packet
         tracker.report_sent_packet(1, vec![1, 2, 3].into());
 
+        if mark_retransmitted {
+            tracker.mark_retransmitted(1);
+        }
+
         // Advance time slightly and receive ACK
         tracker.time_source.advance_time(Duration::from_millis(50));
         tracker.report_received_receipts(&[1]);
 
-        // Backoff should be reset to 1
+        // Backoff should be reset to 1 for both cases
+        // (matching libutp behavior - any ACK resets backoff)
         assert_eq!(tracker.rto_backoff(), 1);
         assert_eq!(tracker.effective_rto(), Duration::from_secs(1));
-    }
-
-    #[test]
-    fn test_rto_backoff_resets_on_retransmitted_ack() {
-        let mut tracker = mock_sent_packet_tracker();
-
-        // Trigger some timeouts to build up backoff
-        tracker.on_timeout();
-        tracker.on_timeout();
-        assert_eq!(tracker.rto_backoff(), 4);
-
-        // Send a packet and mark it as retransmitted
-        tracker.report_sent_packet(1, vec![1, 2, 3].into());
-        tracker.mark_retransmitted(1);
-
-        // Advance time slightly and receive ACK
-        tracker.time_source.advance_time(Duration::from_millis(50));
-        tracker.report_received_receipts(&[1]);
-
-        // Backoff should fully reset on any ACK (matching libutp behavior).
-        // Karn's algorithm only prevents RTT sampling from retransmits, not backoff reset.
-        // Prior art: libutp, Linux TCP, picotcp all reset backoff on any ACK.
-        assert_eq!(tracker.rto_backoff(), 1);
     }
 
     #[test]

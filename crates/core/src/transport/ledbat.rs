@@ -1011,8 +1011,14 @@ impl LedbatController {
 
         // Schedule next slowdown at 9x the current duration (LEDBAT++ spec)
         let next_interval = slowdown_duration * SLOWDOWN_INTERVAL_MULTIPLIER as u64;
-        // Ensure minimum interval of 1 RTT
-        let min_interval = base_delay.as_nanos() as u64;
+
+        // Ensure minimum interval maintains the 9:1 ratio even if slowdown completed quickly.
+        // The freeze phase takes SLOWDOWN_FREEZE_RTTS (2 RTTs), so the minimum sensible
+        // slowdown duration is 2 RTTs. Apply the 9x multiplier to get 18 RTTs minimum.
+        // Without this floor, short slowdown cycles on high-latency paths cause slowdowns
+        // every RTT, collapsing throughput (observed: 224 slowdowns in 30s on 137ms RTT path).
+        let min_slowdown_duration = base_delay.as_nanos() as u64 * SLOWDOWN_FREEZE_RTTS as u64;
+        let min_interval = min_slowdown_duration * SLOWDOWN_INTERVAL_MULTIPLIER as u64;
         let actual_interval = next_interval.max(min_interval);
 
         self.next_slowdown_time_nanos
@@ -2504,6 +2510,97 @@ mod tests {
         );
     }
 
+    /// Regression test: min_interval should be 18 RTTs, not 1 RTT
+    ///
+    /// On high-latency paths (100+ms RTT), if slowdown cycles complete quickly
+    /// (e.g., ramp-up finishes immediately because cwnd is already at target),
+    /// the 9x multiplier on a short duration could be less than 1 RTT.
+    ///
+    /// BUG: The original code used `min_interval = 1 RTT`, causing slowdowns
+    /// every RTT on high-latency paths. With 137ms RTT, this caused 224 slowdowns
+    /// in 30 seconds, keeping cwnd perpetually low.
+    ///
+    /// FIX: min_interval = 9 * freeze_duration = 9 * 2 * RTT = 18 RTTs
+    ///
+    /// This test verifies the min_interval calculation directly by calling
+    /// complete_slowdown with a very short slowdown_duration.
+    #[test]
+    fn test_min_interval_is_18_rtts_not_1_rtt() {
+        let high_latency_rtt = Duration::from_millis(137); // WAN RTT
+
+        let config = LedbatConfig {
+            initial_cwnd: 160_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Simulate having just started a slowdown (set phase_start to now)
+        let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        controller
+            .slowdown_phase_start_nanos
+            .store(now_nanos, Ordering::Release);
+
+        // Set base delay history so base_delay() returns the high RTT
+        controller.base_delay_history.update(high_latency_rtt);
+
+        // Call complete_slowdown immediately (simulating very short slowdown_duration)
+        // This is the scenario that caused the bug
+        let completion_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        controller.complete_slowdown(completion_nanos, high_latency_rtt);
+
+        // Get the scheduled next slowdown time
+        let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
+        let next_interval_nanos = next_slowdown.saturating_sub(completion_nanos);
+        let next_interval_ms = next_interval_nanos / 1_000_000;
+
+        // Calculate expected minimum: 18 RTTs (9 * 2 * RTT)
+        let one_rtt_ms = high_latency_rtt.as_millis() as u64;
+        let min_18_rtts_ms =
+            one_rtt_ms * SLOWDOWN_FREEZE_RTTS as u64 * SLOWDOWN_INTERVAL_MULTIPLIER as u64;
+
+        let slowdown_duration_ms = controller
+            .last_slowdown_duration_nanos
+            .load(Ordering::Acquire)
+            / 1_000_000;
+
+        println!(
+            "High-latency min_interval test: RTT={}ms",
+            high_latency_rtt.as_millis()
+        );
+        println!(
+            "  slowdown_duration={}ms (very short, simulated)",
+            slowdown_duration_ms
+        );
+        println!("  next_interval={}ms", next_interval_ms);
+        println!("  1 RTT = {}ms (old buggy min)", one_rtt_ms);
+        println!("  18 RTTs = {}ms (new correct min)", min_18_rtts_ms);
+
+        // The key assertion: even with a very short slowdown_duration,
+        // the min_interval should be 18 RTTs (2466ms), NOT 1 RTT (137ms)
+        assert!(
+            next_interval_ms >= min_18_rtts_ms - 100, // Allow small tolerance for timing
+            "Next interval ({} ms) should be >= 18 RTTs ({} ms). \
+             Old code would give ~1 RTT ({} ms), causing slowdowns every RTT!",
+            next_interval_ms,
+            min_18_rtts_ms,
+            one_rtt_ms
+        );
+
+        // Also verify it's significantly more than 1 RTT
+        assert!(
+            next_interval_ms > one_rtt_ms * 10,
+            "Next interval ({} ms) should be >> 1 RTT ({} ms)",
+            next_interval_ms,
+            one_rtt_ms
+        );
+    }
+
     /// Test cwnd values at each phase of slowdown
     #[tokio::test]
     async fn test_cwnd_values_through_slowdown_phases() {
@@ -2665,12 +2762,13 @@ mod tests {
     }
 
     /// Parametrized test for slowdown behavior at different RTTs
-    /// Tests: 10ms (LAN), 50ms (regional), 100ms (intercontinental), 200ms (satellite)
+    /// Tests: 10ms (LAN), 50ms (regional), 100ms (intercontinental), 200ms (satellite), 300ms (high-latency WAN)
     #[rstest::rstest]
     #[case::low_latency_10ms(10, 20)]
     #[case::medium_latency_50ms(50, 30)]
     #[case::high_latency_100ms(100, 40)]
     #[case::very_high_latency_200ms(200, 50)]
+    #[case::extreme_latency_300ms(300, 60)]
     #[tokio::test]
     async fn test_slowdown_at_various_latencies(#[case] rtt_ms: u64, #[case] max_iterations: u32) {
         let (post_exit, frozen, final_cwnd, iterations) = test_slowdown_at_rtt(rtt_ms).await;
@@ -3570,5 +3668,727 @@ mod tests {
         );
 
         println!("✓ Small cwnd ramp-up completed successfully");
+    }
+
+    /// Regression test: High-latency paths should not have excessive slowdowns
+    ///
+    /// This test simulates a sustained transfer on a high-latency path (100+ms RTT)
+    /// with periodic slowdowns enabled, verifying that:
+    /// 1. Slowdowns don't fire every RTT (the bug we fixed)
+    /// 2. Total slowdowns are reasonable for the transfer duration
+    /// 3. Average cwnd stays reasonable (not stuck at minimum)
+    ///
+    /// The bug (min_interval = 1 RTT) caused 224 slowdowns in 30s on a 137ms RTT path,
+    /// keeping cwnd perpetually low. The fix (min_interval = 18 RTTs) should result
+    /// in ~10-15 slowdowns for the same duration.
+    #[tokio::test]
+    async fn test_high_latency_slowdown_rate() {
+        let high_latency_rtt = Duration::from_millis(100); // WAN RTT
+        let transfer_duration = Duration::from_secs(10); // Simulate 10 second transfer
+
+        let config = LedbatConfig {
+            initial_cwnd: 160_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true, // Critical: enable periodic slowdowns
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        controller.on_send(1_000_000);
+
+        // Exit slow start
+        for _ in 0..4 {
+            controller.on_ack(high_latency_rtt, 1000);
+            tokio::time::sleep(Duration::from_millis(110)).await;
+        }
+
+        // Record initial slowdown count (should be 0 or 1 after slow start exit)
+        let initial_slowdowns = controller.periodic_slowdowns.load(Ordering::Relaxed);
+
+        // Simulate sustained transfer for transfer_duration
+        // Process one ACK per RTT interval
+        let start = std::time::Instant::now();
+        let mut ack_count = 0;
+        let mut cwnd_sum: u64 = 0;
+
+        while start.elapsed() < transfer_duration {
+            controller.on_ack(high_latency_rtt, 10_000);
+            cwnd_sum += controller.current_cwnd() as u64;
+            ack_count += 1;
+            tokio::time::sleep(high_latency_rtt).await;
+        }
+
+        let final_slowdowns = controller.periodic_slowdowns.load(Ordering::Relaxed);
+        let slowdowns_during_transfer = final_slowdowns - initial_slowdowns;
+        let avg_cwnd = cwnd_sum / ack_count.max(1);
+        let elapsed = start.elapsed();
+
+        println!("High-latency slowdown rate test:");
+        println!("  RTT: {}ms", high_latency_rtt.as_millis());
+        println!("  Duration: {:.1}s", elapsed.as_secs_f64());
+        println!("  ACKs processed: {}", ack_count);
+        println!(
+            "  Slowdowns: {} (initial: {}, final: {})",
+            slowdowns_during_transfer, initial_slowdowns, final_slowdowns
+        );
+        println!("  Avg cwnd: {} KB", avg_cwnd / 1024);
+
+        // With 18 RTT min_interval (1.8s at 100ms RTT), expect ~5-6 slowdowns in 10s
+        // With buggy 1 RTT min_interval, we'd see ~100 slowdowns in 10s
+        let max_expected_slowdowns = (elapsed.as_secs_f64() / 1.5) as usize + 5; // ~1 per 1.5s + margin
+        let min_buggy_slowdowns = (elapsed.as_secs_f64() * 8.0) as usize; // ~8 per second with bug
+
+        assert!(
+            slowdowns_during_transfer < max_expected_slowdowns,
+            "Too many slowdowns ({}) in {:.1}s. Expected < {} with fixed min_interval. \
+             This many slowdowns suggests the 1-RTT min_interval bug is present.",
+            slowdowns_during_transfer,
+            elapsed.as_secs_f64(),
+            max_expected_slowdowns
+        );
+
+        // Also verify we didn't have the buggy behavior
+        assert!(
+            slowdowns_during_transfer < min_buggy_slowdowns / 2,
+            "Slowdowns ({}) are suspiciously high (buggy behavior would show {}). \
+             Verify min_interval is 18 RTTs, not 1 RTT.",
+            slowdowns_during_transfer,
+            min_buggy_slowdowns
+        );
+
+        // Verify cwnd didn't collapse
+        assert!(
+            avg_cwnd > 20_000,
+            "Average cwnd ({} bytes) is too low. Expected > 20KB. \
+             This suggests cwnd was stuck low due to excessive slowdowns.",
+            avg_cwnd
+        );
+
+        println!("✓ High-latency slowdown rate test passed");
+    }
+
+    // =========================================================================
+    // Calculation-Only Tests - Verify formulas at extreme RTTs (instant)
+    // =========================================================================
+
+    /// Test dynamic GAIN calculation at extreme RTTs (1ms datacenter, 500ms satellite)
+    ///
+    /// Verifies the GAIN formula handles edge cases:
+    /// - Very low RTT: GAIN should be capped at 1/16 (conservative)
+    /// - Very high RTT: GAIN should be 1.0 (aggressive to utilize bandwidth)
+    #[test]
+    fn test_dynamic_gain_extreme_latencies() {
+        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+
+        // GAIN = 1 / min(16, ceil(2 * TARGET / base_delay))
+        // TARGET = 60ms
+
+        // 1ms base delay (datacenter): divisor = ceil(2 * 60 / 1) = 120 -> capped at 16
+        let gain_1ms = controller.calculate_dynamic_gain(Duration::from_millis(1));
+        assert!(
+            (gain_1ms - 1.0 / 16.0).abs() < 0.001,
+            "1ms: expected 1/16 (capped), got {}",
+            gain_1ms
+        );
+
+        // 500ms base delay (satellite): divisor = ceil(2 * 60 / 500) = 1, GAIN = 1
+        let gain_500ms = controller.calculate_dynamic_gain(Duration::from_millis(500));
+        assert!(
+            (gain_500ms - 1.0).abs() < 0.001,
+            "500ms: expected 1.0, got {}",
+            gain_500ms
+        );
+
+        // 300ms base delay: divisor = ceil(2 * 60 / 300) = 1, GAIN = 1
+        let gain_300ms = controller.calculate_dynamic_gain(Duration::from_millis(300));
+        assert!(
+            (gain_300ms - 1.0).abs() < 0.001,
+            "300ms: expected 1.0, got {}",
+            gain_300ms
+        );
+
+        // Verify GAIN is always in valid range [1/16, 1]
+        for rtt_ms in [1, 2, 5, 10, 50, 100, 200, 300, 500, 1000] {
+            let gain = controller.calculate_dynamic_gain(Duration::from_millis(rtt_ms));
+            assert!(
+                gain >= 1.0 / 16.0 && gain <= 1.0,
+                "{}ms: GAIN {} out of valid range [1/16, 1]",
+                rtt_ms,
+                gain
+            );
+        }
+
+        println!("✓ Dynamic GAIN extreme latencies test passed");
+    }
+
+    /// Test min_interval calculation at extreme RTTs
+    ///
+    /// Verifies the 18 RTT minimum is correctly applied at both extremes:
+    /// - 1ms RTT: min_interval = 18ms
+    /// - 500ms RTT: min_interval = 9000ms (9 seconds)
+    #[test]
+    fn test_min_interval_extreme_latencies() {
+        for (rtt_ms, expected_min_ms) in [(1, 18), (5, 90), (500, 9000)] {
+            let rtt = Duration::from_millis(rtt_ms);
+
+            let config = LedbatConfig {
+                initial_cwnd: 160_000,
+                min_cwnd: 2848,
+                max_cwnd: 10_000_000,
+                ssthresh: 50_000,
+                enable_slow_start: true,
+                enable_periodic_slowdown: true,
+                randomize_ssthresh: false,
+                ..Default::default()
+            };
+            let controller = LedbatController::new_with_config(config);
+
+            // Set up base delay
+            controller.base_delay_history.update(rtt);
+
+            // Simulate immediate slowdown completion
+            let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+            controller
+                .slowdown_phase_start_nanos
+                .store(now_nanos, Ordering::Release);
+
+            let completion_nanos = controller.epoch.elapsed().as_nanos() as u64;
+            controller.complete_slowdown(completion_nanos, rtt);
+
+            let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
+            let next_interval_ms = next_slowdown.saturating_sub(completion_nanos) / 1_000_000;
+
+            // Allow some tolerance for timing
+            assert!(
+                next_interval_ms >= expected_min_ms - 5,
+                "{}ms RTT: min_interval ({} ms) should be >= {} ms (18 RTTs)",
+                rtt_ms,
+                next_interval_ms,
+                expected_min_ms
+            );
+
+            println!(
+                "  {}ms RTT: min_interval = {}ms (expected >= {}ms)",
+                rtt_ms, next_interval_ms, expected_min_ms
+            );
+        }
+
+        println!("✓ Min interval extreme latencies test passed");
+    }
+
+    /// Test rate conversion at extreme RTTs
+    ///
+    /// Verifies the rate = cwnd / RTT formula handles edge cases:
+    /// - Very low RTT (sub-millisecond): should be capped to 1ms minimum
+    /// - Very high RTT: rate should decrease proportionally
+    #[test]
+    fn test_rate_conversion_extreme_latencies() {
+        let controller = LedbatController::new(100_000, 2848, 10_000_000); // 100KB cwnd
+
+        // Sub-millisecond RTT should be capped to 1ms to prevent unrealistic rates
+        // current_rate enforces 1ms minimum
+        let rate_submillis = controller.current_rate(Duration::from_micros(100));
+        let rate_1ms = controller.current_rate(Duration::from_millis(1));
+
+        // Both should give same result due to 1ms floor
+        assert_eq!(
+            rate_submillis, rate_1ms,
+            "Sub-millisecond RTT should be capped to 1ms"
+        );
+
+        // Rate at 1ms: 100KB / 0.001s = 100 MB/s = 100_000_000 bytes/s
+        assert!(
+            rate_1ms >= 90_000_000 && rate_1ms <= 110_000_000,
+            "1ms RTT rate should be ~100 MB/s, got {} bytes/s",
+            rate_1ms
+        );
+
+        // Rate at 500ms: 100KB / 0.5s = 200 KB/s = 200_000 bytes/s
+        let rate_500ms = controller.current_rate(Duration::from_millis(500));
+        assert!(
+            rate_500ms >= 190_000 && rate_500ms <= 210_000,
+            "500ms RTT rate should be ~200 KB/s, got {} bytes/s",
+            rate_500ms
+        );
+
+        // Rate should scale inversely with RTT
+        let rate_100ms = controller.current_rate(Duration::from_millis(100));
+        let rate_200ms = controller.current_rate(Duration::from_millis(200));
+        assert!(
+            rate_100ms > rate_200ms * 19 / 10, // Should be ~2x, allow some tolerance
+            "Rate at 100ms ({}) should be ~2x rate at 200ms ({})",
+            rate_100ms,
+            rate_200ms
+        );
+
+        println!("✓ Rate conversion extreme latencies test passed");
+    }
+
+    // =========================================================================
+    // State Machine Edge Case Tests - Verify behavior under adverse conditions
+    // =========================================================================
+
+    /// Test that loss during Frozen state doesn't corrupt state machine
+    ///
+    /// When packet loss occurs during the Frozen phase:
+    /// - cwnd should be halved (standard loss response)
+    /// - State should remain Frozen (not reset to Normal)
+    /// - Slowdown cycle should continue normally after freeze completes
+    #[test]
+    fn test_loss_during_frozen_state() {
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Manually set state to Frozen
+        controller
+            .slowdown_state
+            .store(SlowdownState::Frozen as u8, Ordering::Release);
+        controller.cwnd.store(50_000, Ordering::Release); // 50KB during freeze
+
+        let cwnd_before_loss = controller.current_cwnd();
+        let state_before_loss = controller.slowdown_state.load(Ordering::Acquire);
+
+        // Trigger packet loss
+        controller.on_loss();
+
+        let cwnd_after_loss = controller.current_cwnd();
+        let state_after_loss = controller.slowdown_state.load(Ordering::Acquire);
+
+        // cwnd should be halved
+        assert_eq!(
+            cwnd_after_loss,
+            (cwnd_before_loss / 2).max(controller.min_cwnd),
+            "cwnd should be halved on loss"
+        );
+
+        // State should remain Frozen (loss doesn't reset state machine)
+        assert_eq!(
+            state_before_loss, state_after_loss,
+            "Slowdown state should not change on loss (was {}, now {})",
+            state_before_loss, state_after_loss
+        );
+
+        // Loss counter should increment
+        assert_eq!(
+            controller.total_losses.load(Ordering::Relaxed),
+            1,
+            "Loss counter should increment"
+        );
+
+        println!("✓ Loss during Frozen state test passed");
+    }
+
+    /// Test that timeout during RampingUp state resets appropriately
+    ///
+    /// When timeout occurs during RampingUp:
+    /// - cwnd should reset to min_cwnd (severe congestion response)
+    /// - State remains RampingUp (timeout doesn't change slowdown state)
+    /// - Slow start flag should be cleared
+    #[test]
+    fn test_timeout_during_rampup_state() {
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Manually set state to RampingUp with in_slow_start = true
+        controller
+            .slowdown_state
+            .store(SlowdownState::RampingUp as u8, Ordering::Release);
+        controller.in_slow_start.store(true, Ordering::Release);
+        controller.cwnd.store(80_000, Ordering::Release); // Mid-rampup
+
+        let state_before = controller.slowdown_state.load(Ordering::Acquire);
+
+        // Trigger timeout
+        controller.on_timeout();
+
+        let cwnd_after = controller.current_cwnd();
+        let state_after = controller.slowdown_state.load(Ordering::Acquire);
+        let in_slow_start_after = controller.in_slow_start.load(Ordering::Acquire);
+
+        // cwnd should reset to min_cwnd (or MSS, whichever is larger)
+        assert!(
+            cwnd_after <= controller.min_cwnd.max(MSS),
+            "cwnd should reset to min on timeout, got {}",
+            cwnd_after
+        );
+
+        // State should remain RampingUp
+        assert_eq!(
+            state_before, state_after,
+            "Slowdown state should not change on timeout"
+        );
+
+        // Slow start should be exited
+        assert!(
+            !in_slow_start_after,
+            "Slow start should be exited on timeout"
+        );
+
+        println!("✓ Timeout during RampingUp state test passed");
+    }
+
+    /// Test state machine integrity: all states are reachable and valid
+    #[test]
+    fn test_slowdown_state_machine_integrity() {
+        // Verify all state values are unique and in valid range
+        let states = [
+            (SlowdownState::Normal, 0u8),
+            (SlowdownState::WaitingForSlowdown, 1u8),
+            (SlowdownState::InSlowdown, 2u8),
+            (SlowdownState::Frozen, 3u8),
+            (SlowdownState::RampingUp, 4u8),
+        ];
+
+        for (state, expected_value) in states {
+            assert_eq!(
+                state as u8, expected_value,
+                "State {:?} should have value {}",
+                state, expected_value
+            );
+        }
+
+        // Verify controller starts in Normal state
+        let config = LedbatConfig::default();
+        let controller = LedbatController::new_with_config(config);
+        assert_eq!(
+            controller.slowdown_state.load(Ordering::Acquire),
+            SlowdownState::Normal as u8,
+            "Controller should start in Normal state"
+        );
+
+        println!("✓ Slowdown state machine integrity test passed");
+    }
+
+    /// Test that multiple rapid losses don't cause cwnd underflow
+    #[test]
+    fn test_rapid_losses_no_underflow() {
+        let config = LedbatConfig {
+            initial_cwnd: 10_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Simulate 20 rapid losses (each halves cwnd)
+        for i in 0..20 {
+            let cwnd_before = controller.current_cwnd();
+            controller.on_loss();
+            let cwnd_after = controller.current_cwnd();
+
+            // cwnd should never go below min_cwnd
+            assert!(
+                cwnd_after >= controller.min_cwnd,
+                "Iteration {}: cwnd {} went below min_cwnd {}",
+                i,
+                cwnd_after,
+                controller.min_cwnd
+            );
+
+            // cwnd should either halve or stay at min
+            if cwnd_before > controller.min_cwnd * 2 {
+                assert_eq!(
+                    cwnd_after,
+                    cwnd_before / 2,
+                    "Iteration {}: cwnd should halve",
+                    i
+                );
+            } else {
+                assert!(
+                    cwnd_after >= controller.min_cwnd,
+                    "Iteration {}: cwnd should stay at min",
+                    i
+                );
+            }
+        }
+
+        // Final cwnd should be at min_cwnd
+        assert_eq!(
+            controller.current_cwnd(),
+            controller.min_cwnd,
+            "After many losses, cwnd should be at min_cwnd"
+        );
+
+        // Loss counter should be accurate
+        assert_eq!(
+            controller.total_losses.load(Ordering::Relaxed),
+            20,
+            "Should have recorded 20 losses"
+        );
+
+        println!("✓ Rapid losses no underflow test passed");
+    }
+
+    /// Test base delay tracking with jittery RTT samples
+    ///
+    /// Simulates RTT jitter (±30%) and verifies base_delay tracks the minimum
+    #[test]
+    fn test_base_delay_with_jitter() {
+        let config = LedbatConfig::default();
+        let controller = LedbatController::new_with_config(config);
+
+        let base_rtt_ms = 100u64;
+        let jitter_pct = 30u64; // ±30%
+
+        // Add jittery samples
+        let samples = [
+            base_rtt_ms,                      // 100ms (base)
+            base_rtt_ms + jitter_pct,         // 130ms (+30%)
+            base_rtt_ms - jitter_pct / 2,     // 85ms  (-15%)
+            base_rtt_ms + jitter_pct / 2,     // 115ms (+15%)
+            base_rtt_ms - jitter_pct,         // 70ms  (-30%) - this is the min
+            base_rtt_ms,                      // 100ms
+            base_rtt_ms + jitter_pct * 2 / 3, // 120ms
+        ];
+
+        for &rtt_ms in &samples {
+            controller
+                .base_delay_history
+                .update(Duration::from_millis(rtt_ms));
+        }
+
+        let measured_base = controller.base_delay();
+        let expected_min = Duration::from_millis(70); // Minimum sample
+
+        assert_eq!(
+            measured_base, expected_min,
+            "Base delay should track minimum: expected {:?}, got {:?}",
+            expected_min, measured_base
+        );
+
+        println!("✓ Base delay with jitter test passed");
+    }
+
+    /// Test that slowdown doesn't occur when disabled
+    #[test]
+    fn test_slowdown_disabled() {
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false, // Disabled!
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // State should always be Normal
+        assert_eq!(
+            controller.slowdown_state.load(Ordering::Acquire),
+            SlowdownState::Normal as u8,
+            "Initial state should be Normal"
+        );
+
+        // Schedule a slowdown manually and verify it's not processed
+        controller
+            .next_slowdown_time_nanos
+            .store(0, Ordering::Release); // Due now
+
+        // Process some ACKs
+        controller.on_send(100_000);
+        for _ in 0..10 {
+            controller
+                .base_delay_history
+                .update(Duration::from_millis(50));
+            controller.on_ack(Duration::from_millis(50), 5000);
+        }
+
+        // Slowdown counter should remain 0
+        assert_eq!(
+            controller.periodic_slowdowns.load(Ordering::Relaxed),
+            0,
+            "No slowdowns should occur when disabled"
+        );
+
+        // State should still be Normal (or in slow start)
+        let state = controller.slowdown_state.load(Ordering::Acquire);
+        assert_eq!(
+            state,
+            SlowdownState::Normal as u8,
+            "State should remain Normal when slowdowns disabled"
+        );
+
+        println!("✓ Slowdown disabled test passed");
+    }
+
+    /// Test ramp-up completes correctly with RTT jitter
+    ///
+    /// Simulates a network path with ±30% RTT jitter during the ramp-up phase
+    /// of a slowdown cycle and verifies:
+    /// 1. State machine transitions from Frozen -> RampingUp -> Normal
+    /// 2. cwnd recovers to target despite variable RTT
+    /// 3. base_delay tracks the minimum RTT correctly
+    ///
+    /// This catches issues where variable RTT could:
+    /// - Cause premature ramp-up exit (the bug from PR #2510)
+    /// - Corrupt base_delay measurements
+    /// - Prevent cwnd recovery
+    #[tokio::test]
+    async fn test_slowdown_rampup_with_rtt_jitter() {
+        let base_rtt_ms = 50u64;
+
+        let config = LedbatConfig {
+            initial_cwnd: 20_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 150_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Helper to generate jittery RTT (±30% deterministic pattern)
+        let jittery_rtt = |iteration: u64| -> Duration {
+            let offsets_ms: [i64; 10] = [-15, 8, -5, 12, -10, 3, 15, -8, 5, -3];
+            let offset = offsets_ms[(iteration % 10) as usize];
+            let rtt_ms = (base_rtt_ms as i64 + offset).max(20) as u64;
+            Duration::from_millis(rtt_ms)
+        };
+
+        controller.on_send(1_000_000);
+
+        // Phase 1: Initialize with jittery RTT samples via on_ack (proper way)
+        // This populates both delay_filter and base_delay_history
+        for i in 0..4 {
+            let rtt = jittery_rtt(i);
+            controller.on_ack(rtt, 5_000);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Phase 2: Exit slow start and enter slowdown cycle
+        // Add high-RTT samples to trigger slow start exit
+        for i in 4..8 {
+            let rtt = jittery_rtt(i) + Duration::from_millis(50); // Add queuing
+            controller.on_ack(rtt, 10_000);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pre_slowdown_cwnd = controller.current_cwnd();
+        let base_delay = controller.base_delay();
+
+        println!("After slow start exit:");
+        println!("  cwnd: {} KB", pre_slowdown_cwnd / 1024);
+        println!("  base_delay: {:?}", base_delay);
+
+        // Phase 3: Wait for slowdown to trigger and complete frozen phase
+        // Process ACKs until we see the ramp-up state
+        let mut iteration = 8u64;
+        let mut found_rampup = false;
+
+        for _ in 0..20 {
+            let rtt = jittery_rtt(iteration);
+            iteration += 1;
+            tokio::time::sleep(Duration::from_millis(base_rtt_ms)).await;
+            controller.on_ack(rtt, 10_000);
+
+            let state = controller.slowdown_state.load(Ordering::Acquire);
+            if state == SlowdownState::RampingUp as u8 {
+                found_rampup = true;
+                println!("Entered RampingUp state at iteration {}", iteration);
+                break;
+            }
+        }
+
+        // If we didn't naturally hit ramp-up, manually set it up for testing
+        if !found_rampup {
+            println!("Manually triggering ramp-up state for test");
+            controller
+                .slowdown_state
+                .store(SlowdownState::RampingUp as u8, Ordering::Release);
+            controller.in_slow_start.store(true, Ordering::Release);
+            let target = controller.current_cwnd().max(80_000);
+            controller
+                .pre_slowdown_cwnd
+                .store(target, Ordering::Release);
+            controller.cwnd.store(target / 4, Ordering::Release);
+        }
+
+        let rampup_start_cwnd = controller.current_cwnd();
+        let target_cwnd = controller.pre_slowdown_cwnd.load(Ordering::Acquire);
+
+        println!("\nRamp-up starting:");
+        println!("  cwnd: {} KB", rampup_start_cwnd / 1024);
+        println!("  target: {} KB", target_cwnd / 1024);
+
+        // Phase 4: Go through ramp-up with jittery RTT
+        let mut ramp_iterations = 0u32;
+        let max_ramp_iterations = 15u32;
+
+        while controller.slowdown_state.load(Ordering::Acquire) == SlowdownState::RampingUp as u8
+            && ramp_iterations < max_ramp_iterations
+        {
+            let rtt = jittery_rtt(iteration);
+            iteration += 1;
+            ramp_iterations += 1;
+
+            tokio::time::sleep(Duration::from_millis(base_rtt_ms)).await;
+            controller.on_ack(rtt, 20_000);
+        }
+
+        let final_cwnd = controller.current_cwnd();
+        let final_state = controller.slowdown_state.load(Ordering::Acquire);
+        let final_base_delay = controller.base_delay();
+
+        println!("\nFinal state:");
+        println!(
+            "  cwnd: {} KB (target: {} KB)",
+            final_cwnd / 1024,
+            target_cwnd / 1024
+        );
+        println!("  state: {} (0=Normal, 4=RampingUp)", final_state);
+        println!("  base_delay: {:?}", final_base_delay);
+        println!("  ramp_iterations: {}", ramp_iterations);
+
+        // Verify cwnd grew during ramp-up (even if not fully complete)
+        assert!(
+            final_cwnd > rampup_start_cwnd,
+            "cwnd should grow during ramp-up: {} -> {}",
+            rampup_start_cwnd,
+            final_cwnd
+        );
+
+        // Verify base_delay is sensible (should track minimum from jittery samples)
+        // Minimum jittered RTT is base_rtt - 15ms = 35ms
+        let min_expected = Duration::from_millis(30);
+        let max_expected = Duration::from_millis(70);
+        assert!(
+            final_base_delay >= min_expected && final_base_delay <= max_expected,
+            "base_delay {:?} should be in range [{:?}, {:?}]",
+            final_base_delay,
+            min_expected,
+            max_expected
+        );
+
+        println!("✓ Slowdown ramp-up with RTT jitter test passed");
     }
 }

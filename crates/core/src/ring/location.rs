@@ -244,6 +244,7 @@ fn distribute_hash(x: u64) -> u64 {
 
 #[cfg(test)]
 mod test {
+    use rstest::rstest;
     use std::hash::Hash;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -251,65 +252,43 @@ mod test {
 
     // ============ Location construction tests ============
 
-    #[test]
-    fn test_location_new_valid() {
-        let loc = Location::new(0.5);
-        assert_eq!(loc.as_f64(), 0.5);
+    #[rstest]
+    #[case::middle(0.5, 0.5)]
+    #[case::zero(0.0, 0.0)]
+    #[case::one(1.0, 1.0)]
+    #[case::quarter(0.25, 0.25)]
+    fn test_location_new(#[case] input: f64, #[case] expected: f64) {
+        let loc = Location::new(input);
+        assert_eq!(loc.as_f64(), expected);
     }
 
-    #[test]
-    fn test_location_new_boundaries() {
-        // Test boundary values
-        let loc_zero = Location::new(0.0);
-        assert_eq!(loc_zero.as_f64(), 0.0);
-
-        let loc_one = Location::new(1.0);
-        assert_eq!(loc_one.as_f64(), 1.0);
+    #[rstest]
+    #[case::within_range(0.75, 0.75)]
+    #[case::wraps_above_one(1.25, 0.25)]
+    #[case::wraps_far_above(2.5, 0.5)]
+    #[case::negative_wraps(- 0.25, 0.75)]
+    #[case::negative_far_wraps(- 1.25, 0.75)]
+    fn test_location_new_rounded(#[case] input: f64, #[case] expected: f64) {
+        let loc = Location::new_rounded(input);
+        assert!((loc.as_f64() - expected).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn test_location_new_rounded_within_range() {
-        let loc = Location::new_rounded(0.75);
-        assert_eq!(loc.as_f64(), 0.75);
-    }
-
-    #[test]
-    fn test_location_new_rounded_wraps_above_one() {
-        // Values above 1.0 should wrap using rem_euclid
-        let loc = Location::new_rounded(1.25);
-        assert!((loc.as_f64() - 0.25).abs() < f64::EPSILON);
-
-        let loc2 = Location::new_rounded(2.5);
-        assert!((loc2.as_f64() - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_location_new_rounded_wraps_negative() {
-        // Negative values should wrap correctly
-        let loc = Location::new_rounded(-0.25);
-        assert!((loc.as_f64() - 0.75).abs() < f64::EPSILON);
-
-        let loc2 = Location::new_rounded(-1.25);
-        assert!((loc2.as_f64() - 0.75).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_location_try_from_valid() {
-        let loc: Result<Location, _> = 0.5f64.try_into();
-        assert!(loc.is_ok());
-        assert_eq!(loc.unwrap().as_f64(), 0.5);
-    }
-
-    #[test]
-    fn test_location_try_from_invalid_above() {
-        let loc: Result<Location, _> = 1.5f64.try_into();
-        assert!(loc.is_err());
-    }
-
-    #[test]
-    fn test_location_try_from_invalid_below() {
-        let loc: Result<Location, _> = (-0.1f64).try_into();
-        assert!(loc.is_err());
+    #[rstest]
+    #[case::valid_middle(0.5, true, Some(0.5))]
+    #[case::valid_zero(0.0, true, Some(0.0))]
+    #[case::valid_one(1.0, true, Some(1.0))]
+    #[case::invalid_above(1.5, false, None)]
+    #[case::invalid_below(- 0.1, false, None)]
+    fn test_location_try_from(
+        #[case] input: f64,
+        #[case] should_succeed: bool,
+        #[case] expected: Option<f64>,
+    ) {
+        let loc: Result<Location, _> = input.try_into();
+        assert_eq!(loc.is_ok(), should_succeed);
+        if let Some(exp) = expected {
+            assert_eq!(loc.unwrap().as_f64(), exp);
+        }
     }
 
     #[test]
@@ -323,73 +302,57 @@ mod test {
 
     // ============ Location distance tests ============
 
-    #[test]
-    fn test_location_distance_same_location() {
-        let loc = Location::new(0.5);
-        let dist = loc.distance(loc);
-        assert_eq!(dist.as_f64(), 0.0);
+    #[rstest]
+    #[case::same_location(0.5, 0.5, 0.0)]
+    #[case::adjacent(0.0, 0.25, 0.25)]
+    #[case::wrap_around(0.0, 0.9, 0.1)]
+    #[case::exactly_half(0.0, 0.5, 0.5)]
+    #[case::middle_range(0.75, 0.50, 0.25)]
+    fn test_location_distance(#[case] loc1: f64, #[case] loc2: f64, #[case] expected_dist: f64) {
+        let l0 = Location::new(loc1);
+        let l1 = Location::new(loc2);
+        assert_eq!(l0.distance(l1), Distance::new(expected_dist));
     }
 
-    #[test]
-    fn test_location_distance_adjacent() {
-        let l0 = Location::new(0.0);
-        let l1 = Location::new(0.25);
-        assert_eq!(l0.distance(l1), Distance::new(0.25));
-    }
-
-    #[test]
-    fn test_location_distance_wrap_around() {
-        // Distance should wrap around the ring
-        let l0 = Location::new(0.0);
-        let l1 = Location::new(0.9);
-        // Direct distance would be 0.9, but wrap-around is 0.1
-        assert_eq!(l0.distance(l1), Distance::new(0.1));
-    }
-
-    #[test]
-    fn test_location_distance_exactly_half() {
-        let l0 = Location::new(0.0);
-        let l1 = Location::new(0.5);
-        assert_eq!(l0.distance(l1), Distance::new(0.5));
-    }
-
-    #[test]
-    fn test_location_distance_symmetry() {
-        let l0 = Location::new(0.3);
-        let l1 = Location::new(0.7);
+    #[rstest]
+    #[case::forward(0.3, 0.7)]
+    #[case::backward(0.7, 0.3)]
+    #[case::near_boundary(0.1, 0.9)]
+    fn test_location_distance_symmetry(#[case] loc1: f64, #[case] loc2: f64) {
+        let l0 = Location::new(loc1);
+        let l1 = Location::new(loc2);
         assert_eq!(l0.distance(l1), l1.distance(l0));
     }
 
     // ============ Location arithmetic tests ============
 
-    #[test]
-    fn test_location_add_distance() {
-        let loc = Location::new(0.5);
-        let dist = Distance::new(0.1);
-        let (neg, pos) = loc + dist;
+    #[rstest]
+    #[case::middle(0.5, 0.1, 0.4, 0.6)]
+    #[case::near_boundary(0.05, 0.1, - 0.05, 0.15)]
+    #[case::at_zero(0.0, 0.2, - 0.2, 0.2)]
+    fn test_location_add_distance(
+        #[case] loc: f64,
+        #[case] dist: f64,
+        #[case] expected_neg: f64,
+        #[case] expected_pos: f64,
+    ) {
+        let location = Location::new(loc);
+        let distance = Distance::new(dist);
+        let (neg, pos) = location + distance;
 
-        assert!((neg.as_f64() - 0.4).abs() < f64::EPSILON);
-        assert!((pos.as_f64() - 0.6).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_location_add_distance_at_boundary() {
-        let loc = Location::new(0.05);
-        let dist = Distance::new(0.1);
-        let (neg, pos) = loc + dist;
-
-        // neg location wraps to negative (won't be valid without normalization)
-        assert!((neg.as_f64() - (-0.05)).abs() < f64::EPSILON);
-        assert!((pos.as_f64() - 0.15).abs() < f64::EPSILON);
+        assert!((neg.as_f64() - expected_neg).abs() < f64::EPSILON);
+        assert!((pos.as_f64() - expected_pos).abs() < f64::EPSILON);
     }
 
     // ============ Location equality and ordering tests ============
 
-    #[test]
-    fn test_location_equality() {
-        let l1 = Location::new(0.5);
-        let l2 = Location::new(0.5);
-        assert_eq!(l1, l2);
+    #[rstest]
+    #[case::same_value(0.5, 0.5, true)]
+    #[case::different_values(0.3, 0.7, false)]
+    fn test_location_equality(#[case] val1: f64, #[case] val2: f64, #[case] expected_equal: bool) {
+        let l1 = Location::new(val1);
+        let l2 = Location::new(val2);
+        assert_eq!(l1 == l2, expected_equal);
     }
 
     #[test]
@@ -400,10 +363,13 @@ mod test {
         assert_eq!(l1, l2);
     }
 
-    #[test]
-    fn test_location_ordering() {
-        let l1 = Location::new(0.3);
-        let l2 = Location::new(0.7);
+    #[rstest]
+    #[case::ascending(0.3, 0.7)]
+    #[case::near_zero(0.0, 0.1)]
+    #[case::near_one(0.8, 0.9)]
+    fn test_location_ordering(#[case] smaller: f64, #[case] larger: f64) {
+        let l1 = Location::new(smaller);
+        let l2 = Location::new(larger);
         assert!(l1 < l2);
         assert!(l2 > l1);
     }
@@ -464,55 +430,42 @@ mod test {
 
     // ============ Distance tests ============
 
-    #[test]
-    fn test_distance_new_valid() {
-        let d = Distance::new(0.3);
-        assert_eq!(d.as_f64(), 0.3);
+    #[rstest]
+    #[case::valid_small(0.3, 0.3)]
+    #[case::exactly_half(0.5, 0.5)]
+    #[case::normalizes_above_half(0.7, 0.3)]
+    #[case::zero(0.0, 0.0)]
+    fn test_distance_new(#[case] input: f64, #[case] expected: f64) {
+        let d = Distance::new(input);
+        assert!((d.as_f64() - expected).abs() < 1e-10);
     }
 
-    #[test]
-    fn test_distance_new_normalizes_above_half() {
-        // Distance values > 0.5 should be normalized (1.0 - value)
-        let d = Distance::new(0.7);
-        // Use approximate comparison due to floating point
-        assert!((d.as_f64() - 0.3).abs() < 1e-10);
+    #[rstest]
+    #[case::simple_sum(0.1, 0.2, 0.3)]
+    #[case::wraps_above_half(0.3, 0.4, 0.3)]
+    #[case::at_boundary(0.25, 0.25, 0.5)]
+    fn test_distance_add(#[case] d1: f64, #[case] d2: f64, #[case] expected: f64) {
+        let dist1 = Distance::new(d1);
+        let dist2 = Distance::new(d2);
+        let sum = dist1 + dist2;
+        assert!((sum.as_f64() - expected).abs() < 1e-10);
     }
 
-    #[test]
-    fn test_distance_new_exactly_half() {
-        let d = Distance::new(0.5);
-        assert_eq!(d.as_f64(), 0.5);
+    #[rstest]
+    #[case::same_value(0.25, 0.25, true)]
+    #[case::different_values(0.1, 0.3, false)]
+    fn test_distance_equality(#[case] val1: f64, #[case] val2: f64, #[case] expected_equal: bool) {
+        let d1 = Distance::new(val1);
+        let d2 = Distance::new(val2);
+        assert_eq!(d1 == d2, expected_equal);
     }
 
-    #[test]
-    fn test_distance_add() {
-        let d1 = Distance::new(0.1);
-        let d2 = Distance::new(0.2);
-        let sum = d1 + d2;
-        // Use approximate comparison due to floating point
-        assert!((sum.as_f64() - 0.3).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_distance_add_wraps_above_half() {
-        let d1 = Distance::new(0.3);
-        let d2 = Distance::new(0.4);
-        let sum = d1 + d2; // 0.7 > 0.5, so wraps to 0.3
-                           // Use approximate comparison due to floating point
-        assert!((sum.as_f64() - 0.3).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_distance_equality() {
-        let d1 = Distance::new(0.25);
-        let d2 = Distance::new(0.25);
-        assert_eq!(d1, d2);
-    }
-
-    #[test]
-    fn test_distance_ordering() {
-        let d1 = Distance::new(0.1);
-        let d2 = Distance::new(0.3);
+    #[rstest]
+    #[case::ascending(0.1, 0.3)]
+    #[case::near_zero(0.0, 0.1)]
+    fn test_distance_ordering(#[case] smaller: f64, #[case] larger: f64) {
+        let d1 = Distance::new(smaller);
+        let d2 = Distance::new(larger);
         assert!(d1 < d2);
     }
 

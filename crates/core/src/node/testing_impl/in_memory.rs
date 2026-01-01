@@ -89,6 +89,7 @@ impl<ER> Builder<ER> {
             self.event_register.clone(),
             op_manager.clone(),
             self.add_noise,
+            self.rng_seed,
         );
 
         GlobalExecutor::spawn(
