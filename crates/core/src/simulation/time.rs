@@ -101,7 +101,11 @@ pub trait TimeSource: Send + Sync + Clone + 'static {
     fn sleep_until(&self, deadline_nanos: u64) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
     /// Wraps a future with a timeout, returning None if the timeout expires.
-    fn timeout<F, T>(&self, duration: Duration, future: F) -> Pin<Box<dyn Future<Output = Option<T>> + Send>>
+    fn timeout<F, T>(
+        &self,
+        duration: Duration,
+        future: F,
+    ) -> Pin<Box<dyn Future<Output = Option<T>> + Send>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static;
@@ -146,14 +150,16 @@ impl TimeSource for RealTime {
         }
     }
 
-    fn timeout<F, T>(&self, duration: Duration, future: F) -> Pin<Box<dyn Future<Output = Option<T>> + Send>>
+    fn timeout<F, T>(
+        &self,
+        duration: Duration,
+        future: F,
+    ) -> Pin<Box<dyn Future<Output = Option<T>> + Send>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        Box::pin(async move {
-            tokio::time::timeout(duration, future).await.ok()
-        })
+        Box::pin(async move { tokio::time::timeout(duration, future).await.ok() })
     }
 }
 
@@ -354,7 +360,11 @@ impl TimeSource for VirtualTime {
         Box::pin(VirtualSleep { id, state })
     }
 
-    fn timeout<F, T>(&self, duration: Duration, future: F) -> Pin<Box<dyn Future<Output = Option<T>> + Send>>
+    fn timeout<F, T>(
+        &self,
+        duration: Duration,
+        future: F,
+    ) -> Pin<Box<dyn Future<Output = Option<T>> + Send>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,

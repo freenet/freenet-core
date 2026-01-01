@@ -108,11 +108,7 @@ fn check_delivery(from: SocketAddr, to: SocketAddr) -> DeliveryDecision {
 
     // Check if sender or receiver is crashed
     if state.config.is_crashed(&from) || state.config.is_crashed(&to) {
-        tracing::trace!(
-            ?from,
-            ?to,
-            "Fault injector: message dropped (node crashed)"
-        );
+        tracing::trace!(?from, ?to, "Fault injector: message dropped (node crashed)");
         return DeliveryDecision::Drop;
     }
 
@@ -128,22 +124,13 @@ fn check_delivery(from: SocketAddr, to: SocketAddr) -> DeliveryDecision {
 
     // Check message loss rate using seeded RNG for determinism
     if state.config.should_drop_message(&state.rng) {
-        tracing::trace!(
-            ?from,
-            ?to,
-            "Fault injector: message dropped (random loss)"
-        );
+        tracing::trace!(?from, ?to, "Fault injector: message dropped (random loss)");
         return DeliveryDecision::Drop;
     }
 
     // Check for latency injection
     if let Some(latency) = state.config.generate_latency(&state.rng) {
-        tracing::trace!(
-            ?from,
-            ?to,
-            ?latency,
-            "Fault injector: message delayed"
-        );
+        tracing::trace!(?from, ?to, ?latency, "Fault injector: message delayed");
         return DeliveryDecision::DelayedDelivery(latency);
     }
 

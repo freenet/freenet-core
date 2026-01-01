@@ -72,7 +72,9 @@ pub mod dev_tool {
     pub use flatbuffers;
     pub use message::Transaction;
     pub use node::{
-        testing_impl::{EventChain, EventSummary, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork},
+        testing_impl::{
+            EventChain, EventSummary, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork,
+        },
         InitPeerNode, NodeConfig, PeerId,
     };
     pub use ring::Location;

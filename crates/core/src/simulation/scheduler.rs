@@ -6,12 +6,7 @@
 //! 3. Event type (for same timestamp and peer)
 //! 4. Event ID (for complete tie-breaking)
 
-use std::{
-    cmp::Ordering,
-    collections::BinaryHeap,
-    net::SocketAddr,
-    time::Duration,
-};
+use std::{cmp::Ordering, collections::BinaryHeap, net::SocketAddr, time::Duration};
 
 use super::{
     rng::SimulationRng,

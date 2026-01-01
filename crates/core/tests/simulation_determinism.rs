@@ -11,8 +11,8 @@ use std::{
 };
 
 use freenet::simulation::{
-    EventType, FaultConfig, Partition, Scheduler, SimulatedNetwork,
-    SimulatedNetworkConfig, SimulationRng, TimeSource,
+    EventType, FaultConfig, Partition, Scheduler, SimulatedNetwork, SimulatedNetworkConfig,
+    SimulationRng, TimeSource,
 };
 
 fn addr(port: u16) -> SocketAddr {
@@ -47,7 +47,9 @@ fn run_simulation(seed: u64, config: SimulationConfig) -> SimulationResult {
     }
 
     // Create peers
-    let peers: Vec<_> = (0..config.num_peers).map(|i| addr(1000 + i as u16)).collect();
+    let peers: Vec<_> = (0..config.num_peers)
+        .map(|i| addr(1000 + i as u16))
+        .collect();
 
     // Phase 1: Send initial messages based on RNG
     let rng = scheduler.lock().unwrap().rng().clone();
@@ -55,11 +57,7 @@ fn run_simulation(seed: u64, config: SimulationConfig) -> SimulationResult {
         let from_idx = rng.gen_range(0..peers.len());
         let to_idx = rng.gen_range(0..peers.len());
         if from_idx != to_idx {
-            let payload = vec![
-                from_idx as u8,
-                to_idx as u8,
-                rng.gen_u32() as u8,
-            ];
+            let payload = vec![from_idx as u8, to_idx as u8, rng.gen_u32() as u8];
             network.send(peers[from_idx], peers[to_idx], payload);
         }
     }
@@ -173,7 +171,12 @@ fn test_deterministic_replay_basic() {
         "Event log lengths differ"
     );
 
-    for (i, (e1, e2)) in result1.event_log.iter().zip(result2.event_log.iter()).enumerate() {
+    for (i, (e1, e2)) in result1
+        .event_log
+        .iter()
+        .zip(result2.event_log.iter())
+        .enumerate()
+    {
         assert_eq!(
             e1, e2,
             "Event logs differ at index {}: {:?} vs {:?}",
@@ -245,8 +248,14 @@ fn test_different_seeds_produce_different_results() {
     // due to different RNG sequences affecting message timing and ordering
 
     // At minimum, verify that both simulations actually ran
-    assert!(!result1.event_log.is_empty(), "Simulation 1 should have events");
-    assert!(!result2.event_log.is_empty(), "Simulation 2 should have events");
+    assert!(
+        !result1.event_log.is_empty(),
+        "Simulation 1 should have events"
+    );
+    assert!(
+        !result2.event_log.is_empty(),
+        "Simulation 2 should have events"
+    );
 
     // The results should differ in some way (though this isn't strictly guaranteed)
     // We check this probabilistically - extremely unlikely to be identical
@@ -343,7 +352,10 @@ fn test_virtual_time_wakeup_determinism() {
     let triggers1 = run_wakeup_test();
     let triggers2 = run_wakeup_test();
 
-    assert_eq!(triggers1, triggers2, "Wakeup ordering should be deterministic");
+    assert_eq!(
+        triggers1, triggers2,
+        "Wakeup ordering should be deterministic"
+    );
 }
 
 #[test]
@@ -369,11 +381,18 @@ fn test_large_scale_determinism() {
 
     // Full comparison
     assert_eq!(result1.event_log.len(), result2.event_log.len());
-    assert_eq!(result1.messages_delivered.len(), result2.messages_delivered.len());
+    assert_eq!(
+        result1.messages_delivered.len(),
+        result2.messages_delivered.len()
+    );
 
     // Byte-by-byte comparison of all messages
-    for (i, (m1, m2)) in result1.messages_delivered.iter().zip(result2.messages_delivered.iter()).enumerate() {
+    for (i, (m1, m2)) in result1
+        .messages_delivered
+        .iter()
+        .zip(result2.messages_delivered.iter())
+        .enumerate()
+    {
         assert_eq!(m1, m2, "Message {} differs: {:?} vs {:?}", i, m1, m2);
     }
 }
-

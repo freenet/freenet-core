@@ -152,11 +152,7 @@ impl SimulatedNetwork {
         // Check if sender or receiver is crashed
         if fault_config.is_crashed(&from) || fault_config.is_crashed(&to) {
             if self.config.trace_messages {
-                tracing::trace!(
-                    ?from,
-                    ?to,
-                    "Message dropped: node crashed"
-                );
+                tracing::trace!(?from, ?to, "Message dropped: node crashed");
             }
             let mut stats = self.stats.lock().unwrap();
             stats.messages_dropped += 1;
@@ -166,11 +162,7 @@ impl SimulatedNetwork {
         // Check for partition
         if fault_config.is_partitioned(&from, &to, current_time) {
             if self.config.trace_messages {
-                tracing::trace!(
-                    ?from,
-                    ?to,
-                    "Message dropped: network partition"
-                );
+                tracing::trace!(?from, ?to, "Message dropped: network partition");
             }
             let mut stats = self.stats.lock().unwrap();
             stats.messages_partitioned += 1;
@@ -180,11 +172,7 @@ impl SimulatedNetwork {
         // Check for random drop
         if fault_config.should_drop_message(&rng) {
             if self.config.trace_messages {
-                tracing::trace!(
-                    ?from,
-                    ?to,
-                    "Message dropped: random loss"
-                );
+                tracing::trace!(?from, ?to, "Message dropped: random loss");
             }
             let mut stats = self.stats.lock().unwrap();
             stats.messages_dropped += 1;
@@ -245,7 +233,13 @@ impl SimulatedNetwork {
     /// Processes a delivered message event.
     ///
     /// Should be called when the scheduler processes a MessageDelivery event.
-    pub fn process_delivery(&self, event_id: EventId, from: SocketAddr, to: SocketAddr, payload: Vec<u8>) {
+    pub fn process_delivery(
+        &self,
+        event_id: EventId,
+        from: SocketAddr,
+        to: SocketAddr,
+        payload: Vec<u8>,
+    ) {
         // Remove from in-flight
         {
             let mut in_flight = self.in_flight.lock().unwrap();
@@ -265,10 +259,7 @@ impl SimulatedNetwork {
         // Add to delivered queue for the target peer
         {
             let mut delivered = self.delivered.lock().unwrap();
-            delivered
-                .entry(to)
-                .or_default()
-                .push_back((from, payload));
+            delivered.entry(to).or_default().push_back((from, payload));
         }
 
         // Update stats
@@ -384,7 +375,10 @@ impl SimulatedNetwork {
         loop {
             let should_continue = {
                 let scheduler = self.scheduler.lock().unwrap();
-                scheduler.next_event_time().map(|t| t <= target_time).unwrap_or(false)
+                scheduler
+                    .next_event_time()
+                    .map(|t| t <= target_time)
+                    .unwrap_or(false)
             };
 
             if !should_continue {
@@ -563,11 +557,7 @@ mod tests {
         let from = addr(1000);
         let to = addr(2000);
 
-        network.set_fault_config(
-            FaultConfig::builder()
-                .crashed_node(to)
-                .build(),
-        );
+        network.set_fault_config(FaultConfig::builder().crashed_node(to).build());
 
         // Send to crashed node should fail
         let event_id = network.send(from, to, vec![1, 2, 3]);

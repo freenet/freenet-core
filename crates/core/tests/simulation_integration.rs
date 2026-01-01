@@ -23,10 +23,12 @@ use std::time::Duration;
 async fn test_deterministic_replay_events() {
     const SEED: u64 = 0xDEAD_BEEF_1234;
 
-    async fn run_and_capture(name: &str, seed: u64) -> (Vec<(String, usize)>, HashMap<String, usize>) {
+    async fn run_and_capture(
+        name: &str,
+        seed: u64,
+    ) -> (Vec<(String, usize)>, HashMap<String, usize>) {
         let mut sim = SimNetwork::new(
-            name,
-            1,  // gateways
+            name, 1,  // gateways
             3,  // nodes
             7,  // ring_max_htl
             3,  // rnd_if_htl_above
@@ -90,10 +92,7 @@ async fn test_deterministic_replay_events() {
     );
 
     // Log comparison for debugging
-    tracing::info!(
-        "Run 1 events: {:?}\nRun 2 events: {:?}",
-        events1, events2
-    );
+    tracing::info!("Run 1 events: {:?}\nRun 2 events: {:?}", events1, events2);
 
     tracing::info!(
         "Deterministic replay test passed - {} total events captured",
@@ -107,7 +106,10 @@ async fn test_different_seeds_produce_different_events() {
     const SEED_A: u64 = 0x1111_2222_3333;
     const SEED_B: u64 = 0x4444_5555_6666;
 
-    async fn run_and_get_event_summary(name: &str, seed: u64) -> Vec<freenet::dev_tool::EventSummary> {
+    async fn run_and_get_event_summary(
+        name: &str,
+        seed: u64,
+    ) -> Vec<freenet::dev_tool::EventSummary> {
         let mut sim = SimNetwork::new(name, 1, 3, 7, 3, 10, 2, seed).await;
         sim.with_start_backoff(Duration::from_millis(50));
         let _handles = sim
@@ -219,7 +221,10 @@ async fn test_event_summary_ordering() {
     assert!(
         connect_events > 0,
         "Should have Connect events, got event kinds: {:?}",
-        summary.iter().map(|e| &e.event_kind_name).collect::<Vec<_>>()
+        summary
+            .iter()
+            .map(|e| &e.event_kind_name)
+            .collect::<Vec<_>>()
     );
 
     tracing::info!(
@@ -341,7 +346,7 @@ async fn test_event_state_hash_capture() {
 
     // Start network with some contract events
     let _handles = sim
-        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 5, 10)  // 5 contracts, 10 events
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 5, 10) // 5 contracts, 10 events
         .await;
 
     // Wait for events to propagate
@@ -438,7 +443,7 @@ async fn test_eventual_consistency_state_hashes() {
 
     // Start network with contract events to trigger broadcasts
     let _handles = sim
-        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 3, 15)  // 3 contracts, 15 events
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 3, 15) // 3 contracts, 15 events
         .await;
 
     // Wait for events to propagate across the network
@@ -453,9 +458,7 @@ async fn test_eventual_consistency_state_hashes() {
 
     for event in &summary {
         // Use the structured fields instead of parsing debug strings
-        if let (Some(contract_key), Some(state_hash)) =
-            (&event.contract_key, &event.state_hash)
-        {
+        if let (Some(contract_key), Some(state_hash)) = (&event.contract_key, &event.state_hash) {
             contract_state_by_peer
                 .entry(contract_key.clone())
                 .or_default()
@@ -516,10 +519,7 @@ async fn test_eventual_consistency_state_hashes() {
 
     // Verify we at least captured some events
     let total_events: usize = summary.len();
-    assert!(
-        total_events > 0,
-        "Should have captured events during test"
-    );
+    assert!(total_events > 0, "Should have captured events during test");
 
     // Assert convergence: if we have contracts replicated across multiple peers,
     // at least 50% should have converged. This is a lenient threshold because:
@@ -528,7 +528,8 @@ async fn test_eventual_consistency_state_hashes() {
     // A stricter threshold (80-100%) would require longer test duration or
     // deterministic scheduling.
     if total_contracts_with_multiple_peers > 0 {
-        let convergence_rate = consistent_contracts as f64 / total_contracts_with_multiple_peers as f64;
+        let convergence_rate =
+            consistent_contracts as f64 / total_contracts_with_multiple_peers as f64;
         tracing::info!(
             "Convergence rate: {:.1}% ({}/{})",
             convergence_rate * 100.0,
@@ -592,23 +593,11 @@ async fn test_fault_injection_bridge() {
     );
 
     // Run 2: With 50% message loss injected via bridge
-    let mut sim_lossy = SimNetwork::new(
-        "fault-bridge-lossy",
-        1,
-        3,
-        7,
-        3,
-        10,
-        2,
-        SEED,
-    )
-    .await;
+    let mut sim_lossy = SimNetwork::new("fault-bridge-lossy", 1, 3, 7, 3, 10, 2, SEED).await;
     sim_lossy.with_start_backoff(Duration::from_millis(50));
 
     // Inject 50% message loss using the NEW bridge API
-    let fault_config = FaultConfig::builder()
-        .message_loss_rate(0.5)
-        .build();
+    let fault_config = FaultConfig::builder().message_loss_rate(0.5).build();
     sim_lossy.with_fault_injection(fault_config);
 
     let _handles = sim_lossy
@@ -630,10 +619,7 @@ async fn test_fault_injection_bridge() {
 
     // Verify that the bridge is working:
     // 1. Both runs should capture events
-    assert!(
-        normal_total > 0,
-        "Normal run should capture events"
-    );
+    assert!(normal_total > 0, "Normal run should capture events");
     assert!(
         lossy_total > 0,
         "Lossy run should still capture some events"
@@ -667,8 +653,8 @@ async fn test_partition_injection_bridge() {
 
     let mut sim = SimNetwork::new(
         "partition-test",
-        1,  // 1 gateway
-        2,  // 2 nodes
+        1, // 1 gateway
+        2, // 2 nodes
         7,
         3,
         10,
@@ -701,9 +687,7 @@ async fn test_partition_injection_bridge() {
 
     let partition = Partition::new(side_a, side_b).permanent(0);
 
-    let fault_config = FaultConfig::builder()
-        .partition(partition)
-        .build();
+    let fault_config = FaultConfig::builder().partition(partition).build();
 
     // Apply partition via bridge
     sim.with_fault_injection(fault_config);
@@ -743,9 +727,7 @@ async fn test_deterministic_fault_injection() {
         sim.with_start_backoff(Duration::from_millis(50));
 
         // Inject 30% message loss - with seeded RNG this should be deterministic
-        let fault_config = FaultConfig::builder()
-            .message_loss_rate(0.3)
-            .build();
+        let fault_config = FaultConfig::builder().message_loss_rate(0.3).build();
         sim.with_fault_injection(fault_config);
 
         let _handles = sim
@@ -781,7 +763,8 @@ async fn test_deterministic_fault_injection() {
 
     tracing::info!(
         "Deterministic fault injection test: run1={} events, run2={} events",
-        total1, total2
+        total1,
+        total2
     );
     tracing::info!("Deterministic fault injection test passed");
 }
@@ -837,7 +820,10 @@ async fn test_latency_injection() {
 
     tracing::info!(
         "Latency injection test: fast={} events in {:?}, slow={} events in {:?}",
-        fast_total, fast_elapsed, slow_total, slow_elapsed
+        fast_total,
+        fast_elapsed,
+        slow_total,
+        slow_elapsed
     );
 
     // Verify we captured events in both runs
@@ -869,8 +855,12 @@ mod simulation_primitives {
         let rng1 = SimulationRng::new(12345);
         let rng2 = SimulationRng::new(12345);
 
-        let decisions1: Vec<bool> = (0..100).map(|_| config.should_drop_message(&rng1)).collect();
-        let decisions2: Vec<bool> = (0..100).map(|_| config.should_drop_message(&rng2)).collect();
+        let decisions1: Vec<bool> = (0..100)
+            .map(|_| config.should_drop_message(&rng1))
+            .collect();
+        let decisions2: Vec<bool> = (0..100)
+            .map(|_| config.should_drop_message(&rng2))
+            .collect();
 
         assert_eq!(
             decisions1, decisions2,

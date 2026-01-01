@@ -72,7 +72,11 @@ impl SimulationRng {
     pub fn gen_duration(&self, range: std::ops::Range<Duration>) -> Duration {
         let start_nanos = range.start.as_nanos() as u64;
         let end_nanos = range.end.as_nanos() as u64;
-        let nanos = self.inner.lock().unwrap().random_range(start_nanos..end_nanos);
+        let nanos = self
+            .inner
+            .lock()
+            .unwrap()
+            .random_range(start_nanos..end_nanos);
         Duration::from_nanos(nanos)
     }
 
@@ -111,7 +115,10 @@ impl SimulationRng {
     /// consistent.
     pub fn child_with_index(&self, index: u64) -> Self {
         // Derive seed by mixing parent seed with index
-        let derived_seed = self.seed.wrapping_mul(0x517cc1b727220a95).wrapping_add(index);
+        let derived_seed = self
+            .seed
+            .wrapping_mul(0x517cc1b727220a95)
+            .wrapping_add(index);
         Self::new(derived_seed)
     }
 

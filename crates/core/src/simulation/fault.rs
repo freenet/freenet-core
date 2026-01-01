@@ -6,12 +6,7 @@
 //! - Network partitions
 //! - Node crashes
 
-use std::{
-    collections::HashSet,
-    net::SocketAddr,
-    ops::Range,
-    time::Duration,
-};
+use std::{collections::HashSet, net::SocketAddr, ops::Range, time::Duration};
 
 use super::rng::SimulationRng;
 
@@ -138,17 +133,24 @@ impl FaultConfig {
     ///
     /// Returns None if no latency range is configured.
     pub fn generate_latency(&self, rng: &SimulationRng) -> Option<Duration> {
-        self.latency_range.as_ref().map(|range| rng.gen_duration(range.clone()))
+        self.latency_range
+            .as_ref()
+            .map(|range| rng.gen_duration(range.clone()))
     }
 
     /// Returns the base latency (minimum of range) or zero.
     pub fn base_latency(&self) -> Duration {
-        self.latency_range.as_ref().map(|r| r.start).unwrap_or(Duration::ZERO)
+        self.latency_range
+            .as_ref()
+            .map(|r| r.start)
+            .unwrap_or(Duration::ZERO)
     }
 
     /// Checks if communication between two peers is blocked by a partition.
     pub fn is_partitioned(&self, from: &SocketAddr, to: &SocketAddr, current_time: u64) -> bool {
-        self.partitions.iter().any(|p| p.blocks(from, to, current_time))
+        self.partitions
+            .iter()
+            .any(|p| p.blocks(from, to, current_time))
     }
 
     /// Checks if a node has crashed.
@@ -300,9 +302,7 @@ mod tests {
 
     #[test]
     fn test_message_loss_zero() {
-        let config = FaultConfig::builder()
-            .message_loss_rate(0.0)
-            .build();
+        let config = FaultConfig::builder().message_loss_rate(0.0).build();
         let rng = SimulationRng::new(42);
 
         // Should never drop with 0% loss rate
@@ -357,8 +357,8 @@ mod tests {
         let mut side_b = HashSet::new();
         side_b.insert(addr(2000));
 
-        let partition = Partition::new(side_a, side_b)
-            .with_duration(100, Duration::from_nanos(500));
+        let partition =
+            Partition::new(side_a, side_b).with_duration(100, Duration::from_nanos(500));
 
         // Before partition starts
         assert!(!partition.blocks(&addr(1000), &addr(2000), 50));
@@ -372,9 +372,7 @@ mod tests {
 
     #[test]
     fn test_crashed_node() {
-        let config = FaultConfig::builder()
-            .crashed_node(addr(1000))
-            .build();
+        let config = FaultConfig::builder().crashed_node(addr(1000)).build();
         let rng = SimulationRng::new(42);
 
         // Messages from crashed node blocked
@@ -414,9 +412,7 @@ mod tests {
                 .with_duration(0, Duration::from_nanos(100)),
         );
 
-        config.add_partition(
-            Partition::new(side_a, side_b).permanent(0),
-        );
+        config.add_partition(Partition::new(side_a, side_b).permanent(0));
 
         assert_eq!(config.partitions.len(), 2);
 
