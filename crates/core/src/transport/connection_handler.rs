@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::PCK_VERSION;
+use crate::transport::crypto::intro_packet_size;
 use crate::transport::crypto::TransportSecretKey;
-use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
+use crate::transport::packet_data::{AsymmetricX25519, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
 use crate::util::backoff::ExponentialBackoff;
 use aes_gcm::{Aes128Gcm, KeyInit};
@@ -44,14 +45,18 @@ use super::{
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Size of RSA-2048 encrypted intro packets (PKCS#1 v1.5 padding).
-/// RSA-2048 produces 256-byte ciphertext for any input up to 245 bytes.
-/// Used to detect new peer identities from existing addresses (issue #2277).
-const RSA_INTRO_PACKET_SIZE: usize = 256;
+/// Size of protocol version (8 bytes) + symmetric key (16 bytes) = 24 bytes plaintext
+const INTRO_PLAINTEXT_SIZE: usize = 8 + 16;
 
-/// Minimum interval between RSA decryption attempts for the same address.
-/// Prevents CPU exhaustion from attackers sending 256-byte packets.
-const RSA_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
+/// Size of X25519 encrypted intro packets.
+/// Format: ephemeral_public (32) + encrypted_data + ChaCha20Poly1305 tag (16) = 72 bytes
+/// Used to detect new peer identities from existing addresses (issue #2277).
+pub(crate) const X25519_INTRO_PACKET_SIZE: usize = intro_packet_size(INTRO_PLAINTEXT_SIZE);
+
+/// Minimum interval between asymmetric decryption attempts for the same address.
+/// Prevents CPU exhaustion from attackers sending intro-sized packets.
+/// Note: X25519 decryption is ~100x faster than RSA-2048, so this is very conservative.
+const ASYM_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
 
 pub type SerializedMessage = Vec<u8>;
 
@@ -209,7 +214,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             bandwidth_limit,
             global_bandwidth,
             expected_non_gateway: expected_non_gateway.clone(),
-            last_rsa_attempt: HashMap::new(),
+            last_asym_attempt: HashMap::new(),
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -323,8 +328,8 @@ struct UdpPacketsListener<S = UdpSocket> {
     /// When set, per-connection rates are derived from total_limit / active_connections.
     global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
-    /// Rate limiting for RSA decryption attempts to prevent DoS (issue #2277).
-    last_rsa_attempt: HashMap<SocketAddr, Instant>,
+    /// Rate limiting for asymmetric decryption attempts to prevent DoS (issue #2277).
+    last_asym_attempt: HashMap<SocketAddr, Instant>,
 }
 
 type OngoingConnection<S> = (
@@ -397,17 +402,17 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     // Peer was marked outdated due to version mismatch.
                                     // Check if this is a valid intro packet with current version
                                     // (peer may have upgraded). If so, allow reconnection.
-                                    if size == RSA_INTRO_PACKET_SIZE {
+                                    if size == X25519_INTRO_PACKET_SIZE {
                                         let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
-                                        // Rate limit RSA decryption to prevent DoS
+                                        // Rate limit asymmetric decryption to prevent DoS
                                         let now = Instant::now();
                                         let rate_limited = self
-                                            .last_rsa_attempt
+                                            .last_asym_attempt
                                             .get(&remote_addr)
-                                            .is_some_and(|last| now.duration_since(*last) < RSA_DECRYPTION_RATE_LIMIT);
+                                            .is_some_and(|last| now.duration_since(*last) < ASYM_DECRYPTION_RATE_LIMIT);
 
                                         if !rate_limited {
-                                            self.last_rsa_attempt.insert(remote_addr, now);
+                                            self.last_asym_attempt.insert(remote_addr, now);
                                             if let Ok(decrypted) = packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
                                                 let decrypted_data = decrypted.data();
                                                 let proto_len = PROTOC_VERSION.len();
@@ -422,7 +427,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     );
                                                     outdated_peer.remove(&remote_addr);
                                                     // Clean up rate-limit tracking now that peer is reconnecting
-                                                    self.last_rsa_attempt.remove(&remote_addr);
+                                                    self.last_asym_attempt.remove(&remote_addr);
                                                     // Don't continue - fall through to process the packet
                                                 } else {
                                                     continue; // Still incompatible version
@@ -453,24 +458,24 @@ impl<S: Socket> UdpPacketsListener<S> {
 
                             if let Some(remote_conn) = self.remote_connections.remove(&remote_addr) {
                                 // Issue #2277: Check if this is a new intro packet from a peer that
-                                // restarted with a new identity. RSA intro packets are exactly 256 bytes.
+                                // restarted with a new identity. X25519 intro packets are 72 bytes.
                                 // If we can decrypt it as an intro, a new peer is connecting from the
                                 // same IP:port (e.g., NAT assigned the same mapping after restart).
                                 let is_new_identity = if self.is_gateway
-                                    && size == RSA_INTRO_PACKET_SIZE
+                                    && size == X25519_INTRO_PACKET_SIZE
                                 {
-                                    // Rate limit RSA decryption attempts to prevent DoS
+                                    // Rate limit asymmetric decryption attempts to prevent DoS
                                     let now = Instant::now();
                                     let rate_limited = self
-                                        .last_rsa_attempt
+                                        .last_asym_attempt
                                         .get(&remote_addr)
-                                        .is_some_and(|last| now.duration_since(*last) < RSA_DECRYPTION_RATE_LIMIT);
+                                        .is_some_and(|last| now.duration_since(*last) < ASYM_DECRYPTION_RATE_LIMIT);
 
                                     if rate_limited {
                                         false
                                     } else {
-                                        self.last_rsa_attempt.insert(remote_addr, now);
-                                        // Try RSA decryption and validate intro packet structure
+                                        self.last_asym_attempt.insert(remote_addr, now);
+                                        // Try asymmetric decryption and validate intro packet structure
                                         match packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
                                             Ok(decrypted) => {
                                                 // Validate intro packet structure:
@@ -485,12 +490,12 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 } else {
                                                     tracing::debug!(
                                                         peer_addr = %remote_addr,
-                                                        "256-byte packet decrypted but not valid intro structure"
+                                                        "intro packet decrypted but not valid intro structure"
                                                     );
                                                     false
                                                 }
                                             }
-                                            Err(_) => false, // Not an RSA intro packet for us
+                                            Err(_) => false, // Not a valid intro packet for us
                                         }
                                     }
                                 } else {
@@ -504,7 +509,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                          Peer likely restarted with new identity. Resetting session."
                                     );
                                     // Clean up rate-limit tracking for the old peer
-                                    self.last_rsa_attempt.remove(&remote_addr);
+                                    self.last_asym_attempt.remove(&remote_addr);
                                     // Don't reinsert - let the packet fall through to gateway_connection
                                     // which will establish a fresh session with the new peer
                                 } else {
@@ -545,7 +550,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             }
 
                                             // Drop the packet instead of falling through - prevents symmetric packets
-                                            // from being sent to RSA decryption handlers
+                                            // from being sent to asymmetric decryption handlers
                                             continue;
                                         }
                                         Err(fast_channel::TrySendError::Disconnected(_)) => {
@@ -555,7 +560,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 "Connection closed, removing from active connections"
                                             );
                                             // Clean up rate-limit tracking
-                                            self.last_rsa_attempt.remove(&remote_addr);
+                                            self.last_asym_attempt.remove(&remote_addr);
                                             // Don't reinsert - connection is truly dead
                                             continue;
                                         }
@@ -564,17 +569,17 @@ impl<S: Socket> UdpPacketsListener<S> {
                             }
 
                             if let Some(inbound_packet_sender) = ongoing_gw_connections.get(&remote_addr) {
-                                // Issue #2292: Filter out duplicate RSA intro packets during gateway handshake.
-                                // The peer sends multiple RSA intro packets for NAT traversal reliability.
+                                // Issue #2292: Filter out duplicate intro packets during gateway handshake.
+                                // The peer sends multiple intro packets for NAT traversal reliability.
                                 // After we detect a new identity and create a gateway_connection, subsequent
-                                // intro packets (256 bytes) should be ignored - we're waiting for a symmetric
-                                // ACK response which is not 256 bytes.
-                                if size == RSA_INTRO_PACKET_SIZE {
+                                // intro packets should be ignored - we're waiting for a symmetric
+                                // ACK response which is a different size.
+                                if size == X25519_INTRO_PACKET_SIZE {
                                     tracing::debug!(
                                         peer_addr = %remote_addr,
                                         direction = "inbound",
                                         packet_len = size,
-                                        "Ignoring duplicate RSA intro packet during gateway handshake"
+                                        "Ignoring duplicate intro packet during gateway handshake"
                                     );
                                     continue;
                                 }
@@ -595,7 +600,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         // The channel is closed because the handshake task finished,
                                         // but the handshake completion branch hasn't run yet to insert
                                         // into remote_connections. If we remove here, subsequent packets
-                                        // won't be found in either map and will fall through to RSA
+                                        // won't be found in either map and will fall through to asymmetric
                                         // decryption, causing spurious "decryption error" failures.
                                         // Just drop the packet - the handshake completion branch will
                                         // properly clean up by inserting to remote_connections first,
@@ -633,7 +638,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // Check if we already have a gateway connection in progress.
                                 // Note: This guard prevents CREATING duplicate connections. Packets for
                                 // EXISTING ongoing connections are routed above at line 504, where we
-                                // filter duplicate RSA intro packets (issue #2292).
+                                // filter duplicate intro packets (issue #2292).
                                 if ongoing_gw_connections.contains_key(&remote_addr) {
                                     tracing::debug!(
                                         peer_addr = %remote_addr,
@@ -664,7 +669,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 for stale_addr in stale_addrs {
                                     self.remote_connections.remove(&stale_addr);
                                     // Clean up rate-limit tracking for the stale connection
-                                    self.last_rsa_attempt.remove(&stale_addr);
+                                    self.last_asym_attempt.remove(&stale_addr);
                                     tracing::debug!(
                                         stale_peer_addr = %stale_addr,
                                         new_peer_addr = %remote_addr,
@@ -719,7 +724,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // Issue #2517: Insert into remote_connections BEFORE removing from
                             // ongoing_gw_connections to prevent race condition. Without this order,
                             // there's a gap where incoming packets aren't found in either map and
-                            // fall through to RSA decryption, causing spurious "decryption error"
+                            // fall through to asymmetric decryption, causing spurious "decryption error"
                             // failures when symmetric packets are misrouted.
                             self.remote_connections.insert(remote_addr, inbound_remote_connection);
                             ongoing_gw_connections.remove(&remote_addr);
@@ -861,7 +866,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     // it's because the existing one isn't working - trust the caller and replace it.
                     if let Some(_existing_conn) = self.remote_connections.remove(&remote_addr) {
                         // Clean up rate-limit tracking
-                        self.last_rsa_attempt.remove(&remote_addr);
+                        self.last_asym_attempt.remove(&remote_addr);
                         tracing::info!(
                             peer_addr = %remote_addr,
                             direction = "outbound",
@@ -924,15 +929,16 @@ impl<S: Socket> UdpPacketsListener<S> {
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let f = async move {
             let decrypted_intro_packet =
-                secret.decrypt(remote_intro_packet.data()).map_err(|err| {
-                    tracing::debug!(
-                        peer_addr = %remote_addr,
-                        error = %err,
-                        direction = "inbound",
-                        "Failed to decrypt intro packet"
-                    );
-                    err
-                })?;
+                secret
+                    .decrypt(remote_intro_packet.data())
+                    .inspect_err(|err| {
+                        tracing::debug!(
+                            peer_addr = %remote_addr,
+                            error = %err,
+                            direction = "inbound",
+                            "Failed to decrypt intro packet"
+                        );
+                    })?;
 
             let protoc = decrypted_intro_packet
                 .get(..PROTOC_VERSION.len())
@@ -1104,7 +1110,7 @@ impl<S: Socket> UdpPacketsListener<S> {
             /// Initial state of the joinee, at this point NAT has been already traversed
             RemoteInbound {
                 /// Encrypted intro packet for comparison
-                intro_packet: PacketData<AssymetricRSA>,
+                intro_packet: PacketData<AsymmetricX25519>,
             },
         }
 
@@ -1139,7 +1145,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     Aes128Gcm::new_from_slice(outbound_key_bytes).expect("correct length");
                 *outbound_sym_key = Some(outbound_key.clone());
                 *state = ConnectionState::RemoteInbound {
-                    intro_packet: packet.assert_assymetric(),
+                    intro_packet: packet.assert_asymmetric(),
                 };
                 return Ok(());
             }
@@ -1390,7 +1396,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 continue;
                             }
                             ConnectionState::RemoteInbound {
-                                // this is the packet encrypted with out RSA pub key
+                                // this is the packet encrypted with our public key
                                 ref intro_packet,
                                 ..
                             } => {

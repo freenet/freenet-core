@@ -7,7 +7,7 @@ use std::{collections::HashMap, time::Instant};
 
 use parking_lot::RwLock;
 
-use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
+use crate::transport::connection_handler::{NAT_TRAVERSAL_MAX_ATTEMPTS, X25519_INTRO_PACKET_SIZE};
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::fast_channel::{self, FastReceiver, FastSender};
 use crate::transport::packet_data::UnknownEncryption;
@@ -423,13 +423,13 @@ impl<S: super::Socket> PeerConnection<S> {
                     let packet_data = inbound.map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                     last_received = std::time::Instant::now();
 
-                    // Debug logging for 256-byte packets
-                    if packet_data.data().len() == 256 {
+                    // Debug logging for intro-sized packets
+                    if packet_data.data().len() == X25519_INTRO_PACKET_SIZE {
                         tracing::debug!(
                             peer_addr = %self.remote_conn.remote_addr,
                             packet_bytes = ?&packet_data.data()[..32], // First 32 bytes
                             packet_len = packet_data.data().len(),
-                            "Received 256-byte packet"
+                            "Received intro-sized packet"
                         );
                     }
 
@@ -443,19 +443,19 @@ impl<S: super::Socket> PeerConnection<S> {
                             "Failed to decrypt packet, might be an intro packet or a partial packet"
                         );
                     }) else {
-                        // Check if this is a 256-byte RSA intro packet
-                        if packet_data.data().len() == 256 {
+                        // Check if this is an intro packet (X25519 encrypted)
+                        if packet_data.data().len() == X25519_INTRO_PACKET_SIZE {
                             tracing::debug!(
                                 peer_addr = %self.remote_conn.remote_addr,
-                                "Attempting to decrypt potential RSA intro packet"
+                                "Attempting to decrypt potential intro packet"
                             );
 
-                            // Try to decrypt as RSA intro packet
+                            // Try to decrypt as intro packet
                             match self.remote_conn.transport_secret_key.decrypt(packet_data.data()) {
                                 Ok(_decrypted_intro) => {
                                     tracing::debug!(
                                         peer_addr = %self.remote_conn.remote_addr,
-                                        "Successfully decrypted RSA intro packet, sending ACK"
+                                        "Successfully decrypted intro packet, sending ACK"
                                     );
 
                                     // Send ACK response for intro packet
@@ -492,11 +492,11 @@ impl<S: super::Socket> PeerConnection<S> {
                                     // Continue to next packet
                                     continue;
                                 }
-                                Err(rsa_err) => {
+                                Err(decrypt_err) => {
                                     tracing::trace!(
                                         peer_addr = %self.remote_conn.remote_addr,
-                                        error = ?rsa_err,
-                                        "256-byte packet is not a valid RSA intro packet"
+                                        error = ?decrypt_err,
+                                        "intro-sized packet is not a valid intro packet"
                                     );
                                 }
                             }
