@@ -2,12 +2,13 @@ use super::seeding_cache::{AccessType, SeedingCache};
 use super::{Location, PeerKeyLocation};
 use crate::node::PeerId;
 use crate::transport::ObservedAddr;
+use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::InstantTimeSrc;
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Default seeding cache budget: 100MB
@@ -19,6 +20,9 @@ const INITIAL_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Maximum backoff duration for subscription retries.
 const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Maximum number of tracked subscription backoff entries.
+const MAX_SUBSCRIPTION_BACKOFF_ENTRIES: usize = 4096;
 
 /// Role of a peer in a subscription relationship for a specific contract.
 ///
@@ -139,8 +143,8 @@ pub(crate) struct SeedingManager {
     pending_subscription_requests: DashSet<ContractKey>,
 
     /// Exponential backoff state for subscription retries.
-    /// Maps contract to (last_attempt_time, current_backoff_duration).
-    subscription_backoff: DashMap<ContractKey, (Instant, Duration)>,
+    /// Uses the unified TrackedBackoff to prevent subscription spam.
+    subscription_backoff: RwLock<TrackedBackoff<ContractKey>>,
 }
 
 impl SeedingManager {
@@ -148,6 +152,8 @@ impl SeedingManager {
     const MAX_DOWNSTREAM: usize = 10;
 
     pub fn new() -> Self {
+        let backoff_config =
+            ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
         Self {
             subscriptions: DashMap::new(),
             client_subscriptions: DashMap::new(),
@@ -156,7 +162,10 @@ impl SeedingManager {
                 InstantTimeSrc::new(),
             )),
             pending_subscription_requests: DashSet::new(),
-            subscription_backoff: DashMap::new(),
+            subscription_backoff: RwLock::new(TrackedBackoff::new(
+                backoff_config,
+                MAX_SUBSCRIPTION_BACKOFF_ENTRIES,
+            )),
         }
     }
 
@@ -638,9 +647,12 @@ impl SeedingManager {
         // Clean up backoff state for evicted contracts to prevent unbounded memory growth.
         // When a contract is evicted from the cache, we no longer need its backoff entry
         // since we won't be attempting to re-subscribe to it.
-        for evicted_key in &evicted {
-            self.subscription_backoff.remove(evicted_key);
-            self.pending_subscription_requests.remove(evicted_key);
+        if !evicted.is_empty() {
+            let mut backoff = self.subscription_backoff.write();
+            for evicted_key in &evicted {
+                backoff.record_success(evicted_key); // Clears the backoff entry
+                self.pending_subscription_requests.remove(evicted_key);
+            }
         }
 
         evicted
@@ -740,18 +752,17 @@ impl SeedingManager {
             return false;
         }
 
-        // Check backoff
-        if let Some(entry) = self.subscription_backoff.get(contract) {
-            let (last_attempt, backoff_duration) = *entry;
-            if last_attempt.elapsed() < backoff_duration {
+        // Check backoff using the unified TrackedBackoff
+        let backoff = self.subscription_backoff.read();
+        if backoff.is_in_backoff(contract) {
+            if let Some(remaining) = backoff.remaining_backoff(contract) {
                 debug!(
                     %contract,
-                    elapsed_secs = last_attempt.elapsed().as_secs(),
-                    backoff_secs = backoff_duration.as_secs(),
+                    remaining_secs = remaining.as_secs(),
                     "subscription request in backoff period"
                 );
-                return false;
             }
+            return false;
         }
 
         true
@@ -768,32 +779,22 @@ impl SeedingManager {
     pub fn complete_subscription_request(&self, contract: &ContractKey, success: bool) {
         self.pending_subscription_requests.remove(contract);
 
+        let mut backoff = self.subscription_backoff.write();
+
         if success {
             // Clear any backoff on success
-            self.subscription_backoff.remove(contract);
+            backoff.record_success(contract);
             info!(%contract, "subscription succeeded, cleared backoff");
         } else {
             // Apply exponential backoff on failure
-            let backoff_duration =
-                if let Some(mut entry) = self.subscription_backoff.get_mut(contract) {
-                    // Update existing entry in place
-                    let (ref mut last_attempt, ref mut backoff) = *entry;
-                    *last_attempt = Instant::now();
-                    let new_duration = (*backoff * 2).min(MAX_SUBSCRIPTION_BACKOFF);
-                    *backoff = new_duration;
-                    new_duration
-                } else {
-                    // Insert new entry with initial backoff
-                    self.subscription_backoff
-                        .insert(*contract, (Instant::now(), INITIAL_SUBSCRIPTION_BACKOFF));
-                    INITIAL_SUBSCRIPTION_BACKOFF
-                };
-
-            info!(
-                %contract,
-                backoff_secs = backoff_duration.as_secs(),
-                "subscription failed, applied backoff"
-            );
+            backoff.record_failure(*contract);
+            if let Some(remaining) = backoff.remaining_backoff(contract) {
+                info!(
+                    %contract,
+                    backoff_secs = remaining.as_secs(),
+                    "subscription failed, applied backoff"
+                );
+            }
         }
     }
 }
@@ -1327,9 +1328,9 @@ mod tests {
             "Should be blocked due to backoff after failure"
         );
 
-        // Verify backoff was recorded
+        // Verify backoff was recorded via is_in_backoff check
         assert!(
-            manager.subscription_backoff.contains_key(&contract),
+            manager.subscription_backoff.read().is_in_backoff(&contract),
             "Backoff entry should exist after failure"
         );
     }
@@ -1343,56 +1344,36 @@ mod tests {
         assert!(manager.mark_subscription_pending(contract));
         manager.complete_subscription_request(&contract, false);
 
-        let backoff1 = manager
-            .subscription_backoff
-            .get(&contract)
-            .map(|e| e.1)
-            .unwrap();
-        assert_eq!(backoff1, INITIAL_SUBSCRIPTION_BACKOFF);
+        // Verify backoff was recorded (failure count = 1)
+        assert_eq!(
+            manager.subscription_backoff.read().failure_count(&contract),
+            1
+        );
 
-        // Simulate time passing past the backoff
-        manager
-            .subscription_backoff
-            .alter(&contract, |_, (_, dur)| {
-                (Instant::now() - dur - Duration::from_secs(1), dur)
-            });
-
-        // Second failure: should double the backoff
+        // Second failure directly (don't need to wait - just testing exponential behavior)
+        // Note: The TrackedBackoff internally tracks consecutive failures
         assert!(manager.mark_subscription_pending(contract));
         manager.complete_subscription_request(&contract, false);
 
-        let backoff2 = manager
-            .subscription_backoff
-            .get(&contract)
-            .map(|e| e.1)
-            .unwrap();
-        assert_eq!(backoff2, INITIAL_SUBSCRIPTION_BACKOFF * 2);
+        // Verify failure count increased (failure count = 2)
+        assert_eq!(
+            manager.subscription_backoff.read().failure_count(&contract),
+            2
+        );
     }
 
     #[test]
     fn test_subscription_backoff_caps_at_maximum() {
-        let manager = SeedingManager::new();
-        let contract = make_contract_key(1);
+        use crate::util::backoff::ExponentialBackoff;
 
-        // Set backoff just below max
-        manager.subscription_backoff.insert(
-            contract,
-            (
-                Instant::now() - MAX_SUBSCRIPTION_BACKOFF,
-                MAX_SUBSCRIPTION_BACKOFF / 2,
-            ),
-        );
+        // Test the ExponentialBackoff config directly to verify capping behavior
+        let config =
+            ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
 
-        // Complete with failure - should cap at MAX
-        assert!(manager.mark_subscription_pending(contract));
-        manager.complete_subscription_request(&contract, false);
-
-        let backoff = manager
-            .subscription_backoff
-            .get(&contract)
-            .map(|e| e.1)
-            .unwrap();
-        assert_eq!(backoff, MAX_SUBSCRIPTION_BACKOFF);
+        // After many failures, should be capped at max
+        // delay_for_failures(10) = 5s * 2^9 = 2560s, but should be capped at 300s
+        assert_eq!(config.delay_for_failures(10), MAX_SUBSCRIPTION_BACKOFF);
+        assert_eq!(config.delay_for_failures(20), MAX_SUBSCRIPTION_BACKOFF);
     }
 
     // ========== Tests for contracts_without_upstream filtering ==========

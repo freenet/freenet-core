@@ -331,8 +331,6 @@ pub(crate) enum OpError {
     IncorrectTxType(TransactionType, TransactionType),
     #[error("op not present: {0}")]
     OpNotPresent(Transaction),
-    #[error("max number of retries for tx {0} of op type `{1}` reached")]
-    MaxRetriesExceeded(Transaction, TransactionType),
     #[error("op not available")]
     OpNotAvailable(#[from] OpNotAvailable),
 

@@ -71,9 +71,10 @@ pub(crate) struct Plaintext;
 #[derive(Clone, Copy)]
 pub(crate) struct SymmetricAES;
 
-/// Packet is encrypted using assympetric crypto (typically an intro packet)
+/// Packet is encrypted using asymmetric crypto (typically an intro packet)
+/// Uses X25519 static-ephemeral key exchange with ChaCha20Poly1305
 #[derive(Clone, Copy)]
-pub(super) struct AssymetricRSA;
+pub(super) struct AsymmetricX25519;
 
 /// This is used when we don't know the encryption type of the packet, perhaps because we
 /// haven't yet determined whether it is an intro packet.
@@ -82,7 +83,7 @@ pub(crate) struct UnknownEncryption;
 
 impl Encryption for Plaintext {}
 impl Encryption for SymmetricAES {}
-impl Encryption for AssymetricRSA {}
+impl Encryption for AsymmetricX25519 {}
 impl Encryption for UnknownEncryption {}
 
 fn internal_sym_decryption<const N: usize>(
@@ -131,7 +132,7 @@ impl<const N: usize> PacketData<SymmetricAES, N> {
     }
 }
 
-impl<const N: usize> PacketData<AssymetricRSA, N> {
+impl<const N: usize> PacketData<AsymmetricX25519, N> {
     pub(super) fn encrypt_with_pubkey(data: &[u8], remote_key: &TransportPublicKey) -> Self {
         _check_valid_size::<N>();
         let encrypted_data: Vec<u8> = remote_key.encrypt(data);
@@ -206,7 +207,7 @@ impl<const N: usize> PacketData<UnknownEncryption, N> {
 
     pub(super) fn is_intro_packet(
         &self,
-        actual_intro_packet: &PacketData<AssymetricRSA, N>,
+        actual_intro_packet: &PacketData<AsymmetricX25519, N>,
     ) -> bool {
         self.size == actual_intro_packet.size
             && self.data[..self.size] == actual_intro_packet.data[..actual_intro_packet.size]
@@ -229,20 +230,18 @@ impl<const N: usize> PacketData<UnknownEncryption, N> {
     pub(super) fn try_decrypt_asym(
         &self,
         key: &TransportSecretKey,
-    ) -> Result<PacketData<AssymetricRSA, N>, TransportError> {
-        let r = key.decrypt(self.data()).map(|decrypted| {
-            let mut data = [0; N];
-            data[..decrypted.len()].copy_from_slice(&decrypted[..]);
-            PacketData {
-                size: data.len(),
-                data,
-                data_type: PhantomData,
-            }
-        })?;
-        Ok(r)
+    ) -> Result<PacketData<AsymmetricX25519, N>, TransportError> {
+        let decrypted = key.decrypt(self.data())?;
+        let mut data = [0; N];
+        data[..decrypted.len()].copy_from_slice(&decrypted[..]);
+        Ok(PacketData {
+            size: decrypted.len(),
+            data,
+            data_type: PhantomData,
+        })
     }
 
-    pub(super) fn assert_assymetric(&self) -> PacketData<AssymetricRSA, N> {
+    pub(super) fn assert_asymmetric(&self) -> PacketData<AsymmetricX25519, N> {
         PacketData {
             data: self.data,
             size: self.size,

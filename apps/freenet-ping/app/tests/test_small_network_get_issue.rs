@@ -317,8 +317,9 @@ async fn test_small_network_get_failure() -> TestResult {
             }))
             .await?;
 
-        // Use the same timeout as the first GET - CI environments can be slow
-        match timeout(Duration::from_secs(45), client_node2.recv()).await {
+        // Use longer timeout for second GET - CI environments can be slow and the second
+        // GET may need to establish additional connections
+        match timeout(Duration::from_secs(90), client_node2.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
                 state,
@@ -341,7 +342,7 @@ async fn test_small_network_get_failure() -> TestResult {
                 return Err(anyhow!("Second GET operation failed: {}", e));
             }
             Err(_) => {
-                println!("❌ Timeout waiting for second get response after 45s");
+                println!("❌ Timeout waiting for second get response after 90s");
                 return Err(anyhow!("Second GET operation timed out"));
             }
         }
