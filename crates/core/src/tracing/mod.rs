@@ -2335,6 +2335,48 @@ impl EventKind {
             EventKind::TransportSnapshot(_) => Self::TRANSPORT_SNAPSHOT,
         }
     }
+
+    /// Extracts the contract key from this event, if applicable.
+    ///
+    /// Returns the key for Put, Get, Subscribe, and Update events.
+    pub fn contract_key(&self) -> Option<freenet_stdlib::prelude::ContractKey> {
+        match self {
+            EventKind::Put(put) => Some(put.contract_key()),
+            EventKind::Get(get) => get.contract_key(),
+            EventKind::Subscribe(sub) => sub.contract_key(),
+            EventKind::Update(upd) => Some(upd.contract_key()),
+            _ => None,
+        }
+    }
+
+    /// Extracts the state hash from this event, if applicable.
+    ///
+    /// Returns the hash for Put and Update success/broadcast events.
+    pub fn state_hash(&self) -> Option<&str> {
+        match self {
+            EventKind::Put(put) => put.state_hash(),
+            EventKind::Update(upd) => upd.state_hash(),
+            _ => None,
+        }
+    }
+
+    /// Returns the variant name of this event kind.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            EventKind::Connect(_) => "Connect",
+            EventKind::Put(_) => "Put",
+            EventKind::Get(_) => "Get",
+            EventKind::Subscribe(_) => "Subscribe",
+            EventKind::Route(_) => "Route",
+            EventKind::Update(_) => "Update",
+            EventKind::Transfer(_) => "Transfer",
+            EventKind::Lifecycle(_) => "Lifecycle",
+            EventKind::Ignored => "Ignored",
+            EventKind::Disconnected { .. } => "Disconnected",
+            EventKind::Timeout { .. } => "Timeout",
+            EventKind::TransportSnapshot(_) => "TransportSnapshot",
+        }
+    }
 }
 
 /// The type of connection between peers.
@@ -2624,6 +2666,29 @@ enum PutEvent {
     },
 }
 
+impl PutEvent {
+    /// Returns the contract key for this event.
+    fn contract_key(&self) -> ContractKey {
+        match self {
+            PutEvent::Request { key, .. }
+            | PutEvent::PutSuccess { key, .. }
+            | PutEvent::PutFailure { key, .. }
+            | PutEvent::BroadcastEmitted { key, .. }
+            | PutEvent::BroadcastReceived { key, .. } => *key,
+        }
+    }
+
+    /// Returns the state hash if available.
+    fn state_hash(&self) -> Option<&str> {
+        match self {
+            PutEvent::PutSuccess { state_hash, .. }
+            | PutEvent::BroadcastEmitted { state_hash, .. }
+            | PutEvent::BroadcastReceived { state_hash, .. } => state_hash.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 enum UpdateEvent {
@@ -2674,6 +2739,30 @@ enum UpdateEvent {
         /// Short hash of the received state (first 4 bytes of Blake3, 8 hex chars).
         state_hash: Option<String>,
     },
+}
+
+impl UpdateEvent {
+    /// Returns the contract key for this event.
+    fn contract_key(&self) -> ContractKey {
+        match self {
+            UpdateEvent::Request { key, .. }
+            | UpdateEvent::UpdateSuccess { key, .. }
+            | UpdateEvent::BroadcastEmitted { key, .. }
+            | UpdateEvent::BroadcastReceived { key, .. } => *key,
+        }
+    }
+
+    /// Returns the state hash if available (uses state_hash_after for success events).
+    fn state_hash(&self) -> Option<&str> {
+        match self {
+            UpdateEvent::UpdateSuccess {
+                state_hash_after, ..
+            } => state_hash_after.as_deref(),
+            UpdateEvent::BroadcastEmitted { state_hash, .. }
+            | UpdateEvent::BroadcastReceived { state_hash, .. } => state_hash.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// GET operation events for tracking the lifecycle of contract retrieval.
@@ -2742,6 +2831,17 @@ enum GetEvent {
         elapsed_ms: u64,
         timestamp: u64,
     },
+}
+
+impl GetEvent {
+    /// Returns the contract key for this event if available.
+    /// Only GetSuccess has the full key; other variants have instance_id.
+    fn contract_key(&self) -> Option<ContractKey> {
+        match self {
+            GetEvent::GetSuccess { key, .. } => Some(*key),
+            _ => None,
+        }
+    }
 }
 
 /// SUBSCRIBE operation events for tracking the lifecycle of contract subscriptions.
@@ -2883,6 +2983,22 @@ enum SubscribeEvent {
         downstream: Vec<PeerKeyLocation>,
         timestamp: u64,
     },
+}
+
+impl SubscribeEvent {
+    /// Returns the contract key for this event if available.
+    /// Only some variants have the full key; Request and some others have instance_id.
+    fn contract_key(&self) -> Option<ContractKey> {
+        match self {
+            SubscribeEvent::SubscribeSuccess { key, .. }
+            | SubscribeEvent::DownstreamAdded { key, .. }
+            | SubscribeEvent::DownstreamRemoved { key, .. }
+            | SubscribeEvent::UpstreamSet { key, .. }
+            | SubscribeEvent::Unsubscribed { key, .. }
+            | SubscribeEvent::SubscriptionState { key, .. } => Some(*key),
+            _ => None,
+        }
+    }
 }
 
 /// Reason why local seeding stopped for a contract.

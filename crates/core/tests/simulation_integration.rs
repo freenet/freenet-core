@@ -356,26 +356,15 @@ async fn test_event_state_hash_capture() {
         .filter(|e| e.event_kind_name == "Put")
         .collect();
 
-    // Extract state hashes from put success and broadcast events
+    // Extract state hashes using the NEW structured field (no more string parsing!)
     let state_hashes: Vec<&str> = put_events
         .iter()
-        .filter_map(|e| {
-            // Look for state_hash in the event detail
-            if e.event_detail.contains("state_hash: Some(") {
-                // Extract the hash value
-                e.event_detail
-                    .split("state_hash: Some(\"")
-                    .nth(1)
-                    .and_then(|s| s.split('"').next())
-            } else {
-                None
-            }
-        })
+        .filter_map(|e| e.state_hash.as_deref())
         .collect();
 
     // Log what we found for debugging
     tracing::info!(
-        "State hash capture test: {} put events, {} state hashes found",
+        "State hash capture test: {} put events, {} state hashes found (using structured fields)",
         put_events.len(),
         state_hashes.len()
     );
@@ -394,6 +383,17 @@ async fn test_event_state_hash_capture() {
             hash
         );
     }
+
+    // Also verify contract_key structured field is populated
+    let events_with_contract_key = put_events
+        .iter()
+        .filter(|e| e.contract_key.is_some())
+        .count();
+    tracing::info!(
+        "Events with structured contract_key: {}/{}",
+        events_with_contract_key,
+        put_events.len()
+    );
 
     // Verify event capture is working (we should at least see Connect events)
     let connect_events = summary
@@ -446,41 +446,20 @@ async fn test_eventual_consistency_state_hashes() {
 
     let summary = sim.get_deterministic_event_summary().await;
 
-    // Extract (contract_key_fragment, peer_addr, state_hash) from broadcast events
-    // Contract key format in debug: ContractKey(ContractInstanceId(DDD...))
-    // We extract a key fragment for grouping
+    // Extract (contract_key, peer_addr, state_hash) using NEW structured fields!
+    // No more fragile string parsing - use the contract_key and state_hash fields directly
     let mut contract_state_by_peer: HashMap<String, Vec<(std::net::SocketAddr, String)>> =
         HashMap::new();
 
     for event in &summary {
-        // Look for events with state_hash (BroadcastReceived, PutSuccess, UpdateSuccess)
-        if !event.event_detail.contains("state_hash: Some(\"") {
-            continue;
-        }
-
-        // Extract contract key fragment
-        let key_fragment = if event.event_detail.contains("key: ContractKey") {
-            event.event_detail
-                .split("key: ContractKey(ContractInstanceId(")
-                .nth(1)
-                .and_then(|s| s.split(')').next())
-                .map(|s| s.chars().take(16).collect::<String>())
-        } else {
-            None
-        };
-
-        // Extract state hash
-        let state_hash = event.event_detail
-            .split("state_hash: Some(\"")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .map(String::from);
-
-        if let (Some(key), Some(hash)) = (key_fragment, state_hash) {
+        // Use the structured fields instead of parsing debug strings
+        if let (Some(contract_key), Some(state_hash)) =
+            (&event.contract_key, &event.state_hash)
+        {
             contract_state_by_peer
-                .entry(key)
+                .entry(contract_key.clone())
                 .or_default()
-                .push((event.peer_addr, hash));
+                .push((event.peer_addr, state_hash.clone()));
         }
     }
 

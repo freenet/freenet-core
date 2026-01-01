@@ -123,20 +123,27 @@ Future:
   Node A → SimulatedNetwork → Scheduler → SimulatedNetwork → Node B
 ```
 
-### Gap 3: Event Summary Uses Debug Parsing
+### Gap 3: Event Summary Uses Debug Parsing - FIXED
 
-`EventSummary` extracts fields by parsing debug strings:
+~~`EventSummary` extracts fields by parsing debug strings~~ **RESOLVED**
+
+`EventSummary` now has structured `contract_key` and `state_hash` fields:
 
 ```rust
-// Current: fragile string parsing
-event.event_detail.split("state_hash: Some(\"")
-
-// Future: structured fields
 pub struct EventSummary {
-    pub contract_key: Option<ContractKey>,
-    pub state_hash: Option<String>,
+    pub tx: Transaction,
+    pub peer_addr: SocketAddr,
+    pub event_kind_name: String,
+    pub contract_key: Option<String>,   // NEW: structured field
+    pub state_hash: Option<String>,      // NEW: structured field
+    pub event_detail: String,            // kept for backwards compatibility
 }
 ```
+
+Helper methods added to `EventKind`:
+- `variant_name()` - returns event type name
+- `contract_key()` - extracts contract key if applicable
+- `state_hash()` - extracts state hash if applicable
 
 ### Gap 4: No Direct State Query
 

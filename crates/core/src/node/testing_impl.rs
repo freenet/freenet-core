@@ -123,7 +123,11 @@ pub struct EventSummary {
     pub peer_addr: std::net::SocketAddr,
     /// String representation of the event kind for sorting
     pub event_kind_name: String,
-    /// Full debug representation of the event
+    /// Contract key if this event involves a contract operation
+    pub contract_key: Option<String>,
+    /// State hash if this event includes state (Put/Update success/broadcast)
+    pub state_hash: Option<String>,
+    /// Full debug representation of the event (for backwards compatibility)
     pub event_detail: String,
 }
 
@@ -734,20 +738,18 @@ impl SimNetwork {
             .iter()
             .map(|log| {
                 let event_detail = format!("{:?}", log.kind);
-                // Extract just the variant name from debug representation
-                let event_kind_name = event_detail
-                    .split('(')
-                    .next()
-                    .unwrap_or("Unknown")
-                    .split('{')
-                    .next()
-                    .unwrap_or("Unknown")
-                    .trim()
-                    .to_string();
+                // Use the structured variant_name() method instead of parsing debug output
+                let event_kind_name = log.kind.variant_name().to_string();
+                // Extract contract key using the structured accessor
+                let contract_key = log.kind.contract_key().map(|k| format!("{:?}", k));
+                // Extract state hash using the structured accessor
+                let state_hash = log.kind.state_hash().map(String::from);
                 EventSummary {
                     tx: log.tx,
                     peer_addr: log.peer_id.addr,
                     event_kind_name,
+                    contract_key,
+                    state_hash,
                     event_detail,
                 }
             })
@@ -762,16 +764,8 @@ impl SimNetwork {
         let logs = self.event_listener.logs.lock().await;
         let mut counts = std::collections::HashMap::new();
         for log in logs.iter() {
-            // Extract just the variant name from the debug representation
-            let debug_str = format!("{:?}", log.kind);
-            let key = debug_str
-                .split('(')
-                .next()
-                .unwrap_or("Unknown")
-                .split('{')
-                .next()
-                .unwrap_or("Unknown")
-                .trim();
+            // Use the structured variant_name() method instead of parsing debug output
+            let key = log.kind.variant_name();
             *counts.entry(key.to_string()).or_insert(0) += 1;
         }
         counts
