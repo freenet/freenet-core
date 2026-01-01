@@ -204,7 +204,7 @@ impl NodeConfig {
                             attempt = attempt + 1,
                             "Gateway public key is still RSA PEM format, waiting for X25519 conversion..."
                         );
-                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         continue;
                     } else {
                         tracing::warn!(

@@ -3,6 +3,7 @@ use std::path::Path;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::ZeroizeOnDrop;
 
 /// Size of X25519 public key
 pub const X25519_PUBLIC_KEY_SIZE: usize = 32;
@@ -27,10 +28,15 @@ impl TransportKeypair {
         use std::fs::File;
         use std::io::Write;
 
-        let mut file = File::create(path)?;
+        let path = path.as_ref();
+        // Use atomic write: write to temp file, then rename
+        let temp_path = path.with_extension("tmp");
+        let mut file = File::create(&temp_path)?;
         // Save as hex-encoded private key bytes
         let hex = hex::encode(self.secret.0.as_bytes());
         file.write_all(hex.as_bytes())?;
+        file.sync_all()?; // Ensure data is flushed to disk
+        std::fs::rename(&temp_path, path)?;
         Ok(())
     }
 
@@ -134,9 +140,14 @@ impl TransportPublicKey {
         use std::fs::File;
         use std::io::Write;
 
-        let mut file = File::create(path)?;
+        let path = path.as_ref();
+        // Use atomic write: write to temp file, then rename
+        let temp_path = path.with_extension("tmp");
+        let mut file = File::create(&temp_path)?;
         let hex = hex::encode(self.0.as_bytes());
         file.write_all(hex.as_bytes())?;
+        file.sync_all()?; // Ensure data is flushed to disk
+        std::fs::rename(&temp_path, path)?;
         Ok(())
     }
 
@@ -224,8 +235,12 @@ impl std::fmt::Display for TransportPublicKey {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct TransportSecretKey(StaticSecret);
+/// Secret key wrapper that zeroizes memory on drop.
+///
+/// Note: x25519_dalek's StaticSecret implements Zeroize internally when the
+/// `zeroize` feature is enabled (which it is via our dependency).
+#[derive(Clone, ZeroizeOnDrop)]
+pub(crate) struct TransportSecretKey(#[zeroize(skip)] StaticSecret);
 
 impl TransportSecretKey {
     /// Decrypt data that was encrypted with our public key using static-ephemeral X25519.

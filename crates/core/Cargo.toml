@@ -69,6 +69,7 @@ tokio = { features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "proc
 tokio-tungstenite = "0.27.0"
 tower-http = { features = ["fs", "trace"], version = "0.6" }
 ulid = { features = ["serde"], version = "1.1" }
+zeroize = { version = "1.8", features = ["derive"] }
 wasmer = { features = ["sys"], workspace = true }
 wasmer-middlewares = "6.1.0"
 wasmer-compiler-singlepass = { workspace = true }

@@ -50,7 +50,7 @@ const INTRO_PLAINTEXT_SIZE: usize = 8 + 16;
 /// Size of X25519 encrypted intro packets.
 /// Format: ephemeral_public (32) + encrypted_data + ChaCha20Poly1305 tag (16) = 72 bytes
 /// Used to detect new peer identities from existing addresses (issue #2277).
-const X25519_INTRO_PACKET_SIZE: usize = intro_packet_size(INTRO_PLAINTEXT_SIZE);
+pub(crate) const X25519_INTRO_PACKET_SIZE: usize = intro_packet_size(INTRO_PLAINTEXT_SIZE);
 
 /// Minimum interval between asymmetric decryption attempts for the same address.
 /// Prevents CPU exhaustion from attackers sending intro-sized packets.
@@ -486,7 +486,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 } else {
                                                     tracing::debug!(
                                                         peer_addr = %remote_addr,
-                                                        "256-byte packet decrypted but not valid intro structure"
+                                                        "intro packet decrypted but not valid intro structure"
                                                     );
                                                     false
                                                 }

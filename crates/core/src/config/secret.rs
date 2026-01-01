@@ -44,7 +44,7 @@ impl ConfigArgs {
 
 #[derive(Debug, Default, Clone, clap::Parser, serde::Serialize, serde::Deserialize)]
 pub struct SecretArgs {
-    /// Path to the RSA private key for the transport layer.
+    /// Path to the X25519 keypair for the transport layer.
     #[clap(long, value_parser, default_value=None, env = "TRANSPORT_KEYPAIR")]
     pub transport_keypair: Option<PathBuf>,
 
