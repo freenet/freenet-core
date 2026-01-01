@@ -185,31 +185,59 @@ impl NodeConfig {
                 location,
             } = gw;
 
-            let mut key_file = File::open(public_key_path).with_context(|| {
-                format!("failed loading gateway pubkey from {public_key_path:?}")
-            })?;
-            let mut buf = String::new();
-            key_file.read_to_string(&mut buf)?;
-            let buf = buf.trim();
+            // Wait for the public key file to be in X25519 hex format.
+            // The gateway may still be initializing and converting from RSA PEM.
+            let mut key_bytes = None;
+            for attempt in 0..10 {
+                let mut key_file = File::open(public_key_path).with_context(|| {
+                    format!("failed loading gateway pubkey from {public_key_path:?}")
+                })?;
+                let mut buf = String::new();
+                key_file.read_to_string(&mut buf)?;
+                let buf = buf.trim();
 
-            // Check for legacy RSA PEM format
-            if buf.starts_with("-----BEGIN") {
-                tracing::warn!(
-                    public_key_path = ?public_key_path,
-                    "Gateway uses legacy RSA PEM public key format. Skipping this gateway."
-                );
-                continue;
+                // Check for legacy RSA PEM format - gateway may still be initializing
+                if buf.starts_with("-----BEGIN") {
+                    if attempt < 9 {
+                        tracing::debug!(
+                            public_key_path = ?public_key_path,
+                            attempt = attempt + 1,
+                            "Gateway public key is still RSA PEM format, waiting for X25519 conversion..."
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    } else {
+                        tracing::warn!(
+                            public_key_path = ?public_key_path,
+                            "Gateway public key still in RSA PEM format after 5s. Skipping this gateway."
+                        );
+                        break;
+                    }
+                }
+
+                match hex::decode(buf) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        key_bytes = Some(bytes);
+                        break;
+                    }
+                    Ok(bytes) => {
+                        anyhow::bail!(
+                            "invalid gateway pubkey length {} (expected 32) from {public_key_path:?}",
+                            bytes.len()
+                        );
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "failed to decode gateway pubkey hex from {public_key_path:?}: {e}"
+                        );
+                    }
+                }
             }
 
-            let key_bytes = hex::decode(buf).with_context(|| {
-                format!("failed to decode gateway pubkey hex from {public_key_path:?}")
-            })?;
-            if key_bytes.len() != 32 {
-                anyhow::bail!(
-                    "invalid gateway pubkey length {} (expected 32) from {public_key_path:?}",
-                    key_bytes.len()
-                );
-            }
+            let key_bytes = match key_bytes {
+                Some(bytes) => bytes,
+                None => continue, // Skip this gateway
+            };
             let mut key_arr = [0u8; 32];
             key_arr.copy_from_slice(&key_bytes);
             let transport_pub_key = TransportPublicKey::from_bytes(key_arr);
