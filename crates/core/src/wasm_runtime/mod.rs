@@ -3,7 +3,6 @@ mod contract_store;
 mod delegate;
 mod delegate_store;
 mod error;
-#[cfg(test)]
 pub(crate) mod mock_state_storage;
 mod native_api;
 mod runtime;
@@ -18,6 +17,7 @@ pub use contract_store::ContractStore;
 pub(crate) use delegate::DelegateRuntimeInterface;
 pub use delegate_store::DelegateStore;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
+pub(crate) use mock_state_storage::MockStateStorage;
 pub use runtime::{ContractExecError, Runtime};
 pub(crate) use secrets_store::SecretStoreError;
 pub use secrets_store::SecretsStore;

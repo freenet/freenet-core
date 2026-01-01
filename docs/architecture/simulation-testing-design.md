@@ -182,7 +182,7 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 | Post-event verification | Access SimNetwork after events complete |
 | **VirtualTime (always on)** | Time control via `virtual_time()` and `advance_time()` |
 | **Node crash simulation** | `crash_node()` aborts task and blocks messages |
-| **Node restart** | `restart_node()` preserves identity and persisted state |
+| **Node restart** | `restart_node()` preserves identity (keypair, address) |
 
 ### ⚠️ Partially Working
 
@@ -190,12 +190,26 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 |---------|-------|------------|
 | Deterministic execution | Multi-threaded Tokio causes non-determinism | Use lenient assertions (percentages) |
 | Gateway registration race | Nodes may start before gateways ready | 3-phase startup with barrier |
+| **Node state persistence** | State stored on disk (SQLite), not in-memory | See note below |
+
+**Note on Node State Persistence:**
+
+Currently, `restart_node()` preserves the node's **identity** (keypair, address, data directory path)
+but contract state persistence relies on SQLite disk storage. When a node crashes and restarts:
+
+1. **Preserved**: Keypair, network address, data directory path, gateway configs
+2. **On disk**: Contract state stored in SQLite at `data_dir/` (may or may not survive abort)
+3. **Lost**: In-flight transactions, memory caches
+
+For **truly deterministic** state persistence, we need to implement shared in-memory storage
+(using `MockStateStorage`) instead of SQLite. This is tracked as future work.
 
 ### ❌ Not Yet Implemented
 
 | Feature | Impact |
 |---------|--------|
 | Deterministic executor | Full reproducibility impossible |
+| **In-memory state persistence** | Node restart uses disk, not deterministic memory |
 | Clock skew simulation | Can't test time-sensitive bugs |
 | Invariant checking DSL | Manual assertions only |
 | Linearizability checker | Can't prove consistency |
@@ -391,6 +405,7 @@ async fn test_node_crash_recovery() {
 | Non-deterministic execution | Can't reliably reproduce all bugs | High | Open |
 | ~~No node crash/restart~~ | ~~Can't test recovery~~ | ~~Medium~~ | ✅ Done |
 | ~~VirtualTime not used in tests~~ | ~~Missing time-control benefits~~ | ~~Low~~ | ✅ Done |
+| In-memory state persistence | Node restart uses disk, not memory | Medium | Open |
 | No linearizability checking | Can't prove consistency | High | Open |
 | No property-based testing | Manual test case design | Medium | Open |
 
@@ -401,4 +416,9 @@ full deterministic executor (significant effort, following FoundationDB's approa
 **Recently Completed:**
 - VirtualTime always enabled (`virtual_time()`, `advance_time()`)
 - Node crash simulation (`crash_node()`)
-- Node restart with preserved state (`restart_node()`)
+- Node restart with preserved identity (`restart_node()`)
+
+**Known Limitations:**
+- Node restart preserves identity (keypair, address) but contract state is stored on disk
+- For truly deterministic restart, need to implement shared `MockStateStorage`
+- This requires making `Executor` generic over storage type (future work)

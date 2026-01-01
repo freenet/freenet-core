@@ -705,7 +705,7 @@ impl SimNetwork {
         &self.node_addresses
     }
 
-    /// Restarts a crashed node, preserving its persisted state.
+    /// Restarts a crashed node, preserving its identity.
     ///
     /// This method:
     /// 1. Retrieves the saved configuration (keypair, data directory, location)
@@ -713,10 +713,22 @@ impl SimNetwork {
     /// 3. Creates a new node with the same identity
     /// 4. Starts the node task
     ///
-    /// The restarted node will:
-    /// - Have the same keypair/identity as before
-    /// - Load contracts and state from its data directory
-    /// - Connect to the network gateways
+    /// # What's Preserved
+    /// - **Keypair/identity**: Same public key and address
+    /// - **Data directory path**: Same location for any disk-based storage
+    /// - **Network location**: Same ring location
+    /// - **Gateway configs**: Same gateway connections
+    ///
+    /// # What's NOT Preserved (Current Limitation)
+    /// - **In-memory state**: Memory caches are lost on crash
+    /// - **In-flight transactions**: Any pending operations are lost
+    /// - **Contract state**: Currently stored on disk (SQLite), which may or may not
+    ///   survive the abrupt task abort depending on flush timing
+    ///
+    /// # Future Work
+    /// For truly deterministic state persistence, we need to implement shared
+    /// in-memory storage using `MockStateStorage` instead of SQLite. This would
+    /// require making `Executor` generic over the storage type.
     ///
     /// # Arguments
     /// * `label` - The label of the node to restart
@@ -734,7 +746,7 @@ impl SimNetwork {
     /// sim.crash_node(&label);
     /// assert!(sim.is_node_crashed(&label));
     ///
-    /// // Restart it with same identity and persisted state
+    /// // Restart it with same identity
     /// let handle = sim.restart_node::<SmallRng>(&label, 0x5678, 10, 5).await;
     /// assert!(handle.is_some());
     /// assert!(!sim.is_node_crashed(&label));
