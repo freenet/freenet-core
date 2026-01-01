@@ -330,7 +330,10 @@ impl ConfigArgs {
             });
         let gateways_file = config_paths.config_dir.join("gateways.toml");
 
-        let remotely_loaded_gateways = if !self.network_api.skip_load_from_network {
+        // In Local mode, skip all gateway loading since we don't connect to external peers
+        let remotely_loaded_gateways = if mode == OperationMode::Local {
+            Gateways::default()
+        } else if !self.network_api.skip_load_from_network {
             load_gateways_from_index(FREENET_GATEWAYS_INDEX, &config_paths.secrets_dir)
                 .await
                 .inspect_err(|error| {
@@ -359,7 +362,10 @@ impl ConfigArgs {
         };
 
         // Decide which gateways to use based on whether we fetched from network
-        let gateways = if !self.network_api.skip_load_from_network
+        let gateways = if mode == OperationMode::Local {
+            // In Local mode, use empty gateways - no external connections
+            Gateways { gateways: vec![] }
+        } else if !self.network_api.skip_load_from_network
             && !remotely_loaded_gateways.gateways.is_empty()
         {
             // When we successfully fetch gateways from the network, replace local ones entirely
