@@ -1011,8 +1011,14 @@ impl LedbatController {
 
         // Schedule next slowdown at 9x the current duration (LEDBAT++ spec)
         let next_interval = slowdown_duration * SLOWDOWN_INTERVAL_MULTIPLIER as u64;
-        // Ensure minimum interval of 1 RTT
-        let min_interval = base_delay.as_nanos() as u64;
+
+        // Ensure minimum interval maintains the 9:1 ratio even if slowdown completed quickly.
+        // The freeze phase takes SLOWDOWN_FREEZE_RTTS (2 RTTs), so the minimum sensible
+        // slowdown duration is 2 RTTs. Apply the 9x multiplier to get 18 RTTs minimum.
+        // Without this floor, short slowdown cycles on high-latency paths cause slowdowns
+        // every RTT, collapsing throughput (observed: 224 slowdowns in 30s on 137ms RTT path).
+        let min_slowdown_duration = base_delay.as_nanos() as u64 * SLOWDOWN_FREEZE_RTTS as u64;
+        let min_interval = min_slowdown_duration * SLOWDOWN_INTERVAL_MULTIPLIER as u64;
         let actual_interval = next_interval.max(min_interval);
 
         self.next_slowdown_time_nanos
@@ -2504,6 +2510,97 @@ mod tests {
         );
     }
 
+    /// Regression test: min_interval should be 18 RTTs, not 1 RTT
+    ///
+    /// On high-latency paths (100+ms RTT), if slowdown cycles complete quickly
+    /// (e.g., ramp-up finishes immediately because cwnd is already at target),
+    /// the 9x multiplier on a short duration could be less than 1 RTT.
+    ///
+    /// BUG: The original code used `min_interval = 1 RTT`, causing slowdowns
+    /// every RTT on high-latency paths. With 137ms RTT, this caused 224 slowdowns
+    /// in 30 seconds, keeping cwnd perpetually low.
+    ///
+    /// FIX: min_interval = 9 * freeze_duration = 9 * 2 * RTT = 18 RTTs
+    ///
+    /// This test verifies the min_interval calculation directly by calling
+    /// complete_slowdown with a very short slowdown_duration.
+    #[test]
+    fn test_min_interval_is_18_rtts_not_1_rtt() {
+        let high_latency_rtt = Duration::from_millis(137); // WAN RTT
+
+        let config = LedbatConfig {
+            initial_cwnd: 160_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Simulate having just started a slowdown (set phase_start to now)
+        let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        controller
+            .slowdown_phase_start_nanos
+            .store(now_nanos, Ordering::Release);
+
+        // Set base delay history so base_delay() returns the high RTT
+        controller.base_delay_history.update(high_latency_rtt);
+
+        // Call complete_slowdown immediately (simulating very short slowdown_duration)
+        // This is the scenario that caused the bug
+        let completion_nanos = controller.epoch.elapsed().as_nanos() as u64;
+        controller.complete_slowdown(completion_nanos, high_latency_rtt);
+
+        // Get the scheduled next slowdown time
+        let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
+        let next_interval_nanos = next_slowdown.saturating_sub(completion_nanos);
+        let next_interval_ms = next_interval_nanos / 1_000_000;
+
+        // Calculate expected minimum: 18 RTTs (9 * 2 * RTT)
+        let one_rtt_ms = high_latency_rtt.as_millis() as u64;
+        let min_18_rtts_ms =
+            one_rtt_ms * SLOWDOWN_FREEZE_RTTS as u64 * SLOWDOWN_INTERVAL_MULTIPLIER as u64;
+
+        let slowdown_duration_ms = controller
+            .last_slowdown_duration_nanos
+            .load(Ordering::Acquire)
+            / 1_000_000;
+
+        println!(
+            "High-latency min_interval test: RTT={}ms",
+            high_latency_rtt.as_millis()
+        );
+        println!(
+            "  slowdown_duration={}ms (very short, simulated)",
+            slowdown_duration_ms
+        );
+        println!("  next_interval={}ms", next_interval_ms);
+        println!("  1 RTT = {}ms (old buggy min)", one_rtt_ms);
+        println!("  18 RTTs = {}ms (new correct min)", min_18_rtts_ms);
+
+        // The key assertion: even with a very short slowdown_duration,
+        // the min_interval should be 18 RTTs (2466ms), NOT 1 RTT (137ms)
+        assert!(
+            next_interval_ms >= min_18_rtts_ms - 100, // Allow small tolerance for timing
+            "Next interval ({} ms) should be >= 18 RTTs ({} ms). \
+             Old code would give ~1 RTT ({} ms), causing slowdowns every RTT!",
+            next_interval_ms,
+            min_18_rtts_ms,
+            one_rtt_ms
+        );
+
+        // Also verify it's significantly more than 1 RTT
+        assert!(
+            next_interval_ms > one_rtt_ms * 10,
+            "Next interval ({} ms) should be >> 1 RTT ({} ms)",
+            next_interval_ms,
+            one_rtt_ms
+        );
+    }
+
     /// Test cwnd values at each phase of slowdown
     #[tokio::test]
     async fn test_cwnd_values_through_slowdown_phases() {
@@ -3570,5 +3667,106 @@ mod tests {
         );
 
         println!("✓ Small cwnd ramp-up completed successfully");
+    }
+
+    /// Regression test: High-latency paths should not have excessive slowdowns
+    ///
+    /// This test simulates a sustained transfer on a high-latency path (100+ms RTT)
+    /// with periodic slowdowns enabled, verifying that:
+    /// 1. Slowdowns don't fire every RTT (the bug we fixed)
+    /// 2. Total slowdowns are reasonable for the transfer duration
+    /// 3. Average cwnd stays reasonable (not stuck at minimum)
+    ///
+    /// The bug (min_interval = 1 RTT) caused 224 slowdowns in 30s on a 137ms RTT path,
+    /// keeping cwnd perpetually low. The fix (min_interval = 18 RTTs) should result
+    /// in ~10-15 slowdowns for the same duration.
+    #[tokio::test]
+    async fn test_high_latency_slowdown_rate() {
+        let high_latency_rtt = Duration::from_millis(100); // WAN RTT
+        let transfer_duration = Duration::from_secs(10); // Simulate 10 second transfer
+
+        let config = LedbatConfig {
+            initial_cwnd: 160_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true, // Critical: enable periodic slowdowns
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        controller.on_send(1_000_000);
+
+        // Exit slow start
+        for _ in 0..4 {
+            controller.on_ack(high_latency_rtt, 1000);
+            tokio::time::sleep(Duration::from_millis(110)).await;
+        }
+
+        // Record initial slowdown count (should be 0 or 1 after slow start exit)
+        let initial_slowdowns = controller.periodic_slowdowns.load(Ordering::Relaxed);
+
+        // Simulate sustained transfer for transfer_duration
+        // Process one ACK per RTT interval
+        let start = std::time::Instant::now();
+        let mut ack_count = 0;
+        let mut cwnd_sum: u64 = 0;
+
+        while start.elapsed() < transfer_duration {
+            controller.on_ack(high_latency_rtt, 10_000);
+            cwnd_sum += controller.current_cwnd() as u64;
+            ack_count += 1;
+            tokio::time::sleep(high_latency_rtt).await;
+        }
+
+        let final_slowdowns = controller.periodic_slowdowns.load(Ordering::Relaxed);
+        let slowdowns_during_transfer = final_slowdowns - initial_slowdowns;
+        let avg_cwnd = cwnd_sum / ack_count.max(1);
+        let elapsed = start.elapsed();
+
+        println!("High-latency slowdown rate test:");
+        println!("  RTT: {}ms", high_latency_rtt.as_millis());
+        println!("  Duration: {:.1}s", elapsed.as_secs_f64());
+        println!("  ACKs processed: {}", ack_count);
+        println!(
+            "  Slowdowns: {} (initial: {}, final: {})",
+            slowdowns_during_transfer, initial_slowdowns, final_slowdowns
+        );
+        println!("  Avg cwnd: {} KB", avg_cwnd / 1024);
+
+        // With 18 RTT min_interval (1.8s at 100ms RTT), expect ~5-6 slowdowns in 10s
+        // With buggy 1 RTT min_interval, we'd see ~100 slowdowns in 10s
+        let max_expected_slowdowns = (elapsed.as_secs_f64() / 1.5) as usize + 5; // ~1 per 1.5s + margin
+        let min_buggy_slowdowns = (elapsed.as_secs_f64() * 8.0) as usize; // ~8 per second with bug
+
+        assert!(
+            slowdowns_during_transfer < max_expected_slowdowns,
+            "Too many slowdowns ({}) in {:.1}s. Expected < {} with fixed min_interval. \
+             This many slowdowns suggests the 1-RTT min_interval bug is present.",
+            slowdowns_during_transfer,
+            elapsed.as_secs_f64(),
+            max_expected_slowdowns
+        );
+
+        // Also verify we didn't have the buggy behavior
+        assert!(
+            slowdowns_during_transfer < min_buggy_slowdowns / 2,
+            "Slowdowns ({}) are suspiciously high (buggy behavior would show {}). \
+             Verify min_interval is 18 RTTs, not 1 RTT.",
+            slowdowns_during_transfer,
+            min_buggy_slowdowns
+        );
+
+        // Verify cwnd didn't collapse
+        assert!(
+            avg_cwnd > 20_000,
+            "Average cwnd ({} bytes) is too low. Expected > 20KB. \
+             This suggests cwnd was stuck low due to excessive slowdowns.",
+            avg_cwnd
+        );
+
+        println!("✓ High-latency slowdown rate test passed");
     }
 }
