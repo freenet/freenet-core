@@ -3770,4 +3770,466 @@ mod tests {
 
         println!("✓ High-latency slowdown rate test passed");
     }
+
+    // =========================================================================
+    // Calculation-Only Tests - Verify formulas at extreme RTTs (instant)
+    // =========================================================================
+
+    /// Test dynamic GAIN calculation at extreme RTTs (1ms datacenter, 500ms satellite)
+    ///
+    /// Verifies the GAIN formula handles edge cases:
+    /// - Very low RTT: GAIN should be capped at 1/16 (conservative)
+    /// - Very high RTT: GAIN should be 1.0 (aggressive to utilize bandwidth)
+    #[test]
+    fn test_dynamic_gain_extreme_latencies() {
+        let controller = LedbatController::new(10_000, 2848, 10_000_000);
+
+        // GAIN = 1 / min(16, ceil(2 * TARGET / base_delay))
+        // TARGET = 60ms
+
+        // 1ms base delay (datacenter): divisor = ceil(2 * 60 / 1) = 120 -> capped at 16
+        let gain_1ms = controller.calculate_dynamic_gain(Duration::from_millis(1));
+        assert!(
+            (gain_1ms - 1.0 / 16.0).abs() < 0.001,
+            "1ms: expected 1/16 (capped), got {}",
+            gain_1ms
+        );
+
+        // 500ms base delay (satellite): divisor = ceil(2 * 60 / 500) = 1, GAIN = 1
+        let gain_500ms = controller.calculate_dynamic_gain(Duration::from_millis(500));
+        assert!(
+            (gain_500ms - 1.0).abs() < 0.001,
+            "500ms: expected 1.0, got {}",
+            gain_500ms
+        );
+
+        // 300ms base delay: divisor = ceil(2 * 60 / 300) = 1, GAIN = 1
+        let gain_300ms = controller.calculate_dynamic_gain(Duration::from_millis(300));
+        assert!(
+            (gain_300ms - 1.0).abs() < 0.001,
+            "300ms: expected 1.0, got {}",
+            gain_300ms
+        );
+
+        // Verify GAIN is always in valid range [1/16, 1]
+        for rtt_ms in [1, 2, 5, 10, 50, 100, 200, 300, 500, 1000] {
+            let gain = controller.calculate_dynamic_gain(Duration::from_millis(rtt_ms));
+            assert!(
+                gain >= 1.0 / 16.0 && gain <= 1.0,
+                "{}ms: GAIN {} out of valid range [1/16, 1]",
+                rtt_ms,
+                gain
+            );
+        }
+
+        println!("✓ Dynamic GAIN extreme latencies test passed");
+    }
+
+    /// Test min_interval calculation at extreme RTTs
+    ///
+    /// Verifies the 18 RTT minimum is correctly applied at both extremes:
+    /// - 1ms RTT: min_interval = 18ms
+    /// - 500ms RTT: min_interval = 9000ms (9 seconds)
+    #[test]
+    fn test_min_interval_extreme_latencies() {
+        for (rtt_ms, expected_min_ms) in [(1, 18), (5, 90), (500, 9000)] {
+            let rtt = Duration::from_millis(rtt_ms);
+
+            let config = LedbatConfig {
+                initial_cwnd: 160_000,
+                min_cwnd: 2848,
+                max_cwnd: 10_000_000,
+                ssthresh: 50_000,
+                enable_slow_start: true,
+                enable_periodic_slowdown: true,
+                randomize_ssthresh: false,
+                ..Default::default()
+            };
+            let controller = LedbatController::new_with_config(config);
+
+            // Set up base delay
+            controller.base_delay_history.update(rtt);
+
+            // Simulate immediate slowdown completion
+            let now_nanos = controller.epoch.elapsed().as_nanos() as u64;
+            controller
+                .slowdown_phase_start_nanos
+                .store(now_nanos, Ordering::Release);
+
+            let completion_nanos = controller.epoch.elapsed().as_nanos() as u64;
+            controller.complete_slowdown(completion_nanos, rtt);
+
+            let next_slowdown = controller.next_slowdown_time_nanos.load(Ordering::Acquire);
+            let next_interval_ms = next_slowdown.saturating_sub(completion_nanos) / 1_000_000;
+
+            // Allow some tolerance for timing
+            assert!(
+                next_interval_ms >= expected_min_ms - 5,
+                "{}ms RTT: min_interval ({} ms) should be >= {} ms (18 RTTs)",
+                rtt_ms,
+                next_interval_ms,
+                expected_min_ms
+            );
+
+            println!(
+                "  {}ms RTT: min_interval = {}ms (expected >= {}ms)",
+                rtt_ms, next_interval_ms, expected_min_ms
+            );
+        }
+
+        println!("✓ Min interval extreme latencies test passed");
+    }
+
+    /// Test rate conversion at extreme RTTs
+    ///
+    /// Verifies the rate = cwnd / RTT formula handles edge cases:
+    /// - Very low RTT (sub-millisecond): should be capped to 1ms minimum
+    /// - Very high RTT: rate should decrease proportionally
+    #[test]
+    fn test_rate_conversion_extreme_latencies() {
+        let controller = LedbatController::new(100_000, 2848, 10_000_000); // 100KB cwnd
+
+        // Sub-millisecond RTT should be capped to 1ms to prevent unrealistic rates
+        // current_rate enforces 1ms minimum
+        let rate_submillis = controller.current_rate(Duration::from_micros(100));
+        let rate_1ms = controller.current_rate(Duration::from_millis(1));
+
+        // Both should give same result due to 1ms floor
+        assert_eq!(
+            rate_submillis, rate_1ms,
+            "Sub-millisecond RTT should be capped to 1ms"
+        );
+
+        // Rate at 1ms: 100KB / 0.001s = 100 MB/s = 100_000_000 bytes/s
+        assert!(
+            rate_1ms >= 90_000_000 && rate_1ms <= 110_000_000,
+            "1ms RTT rate should be ~100 MB/s, got {} bytes/s",
+            rate_1ms
+        );
+
+        // Rate at 500ms: 100KB / 0.5s = 200 KB/s = 200_000 bytes/s
+        let rate_500ms = controller.current_rate(Duration::from_millis(500));
+        assert!(
+            rate_500ms >= 190_000 && rate_500ms <= 210_000,
+            "500ms RTT rate should be ~200 KB/s, got {} bytes/s",
+            rate_500ms
+        );
+
+        // Rate should scale inversely with RTT
+        let rate_100ms = controller.current_rate(Duration::from_millis(100));
+        let rate_200ms = controller.current_rate(Duration::from_millis(200));
+        assert!(
+            rate_100ms > rate_200ms * 19 / 10, // Should be ~2x, allow some tolerance
+            "Rate at 100ms ({}) should be ~2x rate at 200ms ({})",
+            rate_100ms,
+            rate_200ms
+        );
+
+        println!("✓ Rate conversion extreme latencies test passed");
+    }
+
+    // =========================================================================
+    // State Machine Edge Case Tests - Verify behavior under adverse conditions
+    // =========================================================================
+
+    /// Test that loss during Frozen state doesn't corrupt state machine
+    ///
+    /// When packet loss occurs during the Frozen phase:
+    /// - cwnd should be halved (standard loss response)
+    /// - State should remain Frozen (not reset to Normal)
+    /// - Slowdown cycle should continue normally after freeze completes
+    #[test]
+    fn test_loss_during_frozen_state() {
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Manually set state to Frozen
+        controller
+            .slowdown_state
+            .store(SlowdownState::Frozen as u8, Ordering::Release);
+        controller.cwnd.store(50_000, Ordering::Release); // 50KB during freeze
+
+        let cwnd_before_loss = controller.current_cwnd();
+        let state_before_loss = controller.slowdown_state.load(Ordering::Acquire);
+
+        // Trigger packet loss
+        controller.on_loss();
+
+        let cwnd_after_loss = controller.current_cwnd();
+        let state_after_loss = controller.slowdown_state.load(Ordering::Acquire);
+
+        // cwnd should be halved
+        assert_eq!(
+            cwnd_after_loss,
+            (cwnd_before_loss / 2).max(controller.min_cwnd),
+            "cwnd should be halved on loss"
+        );
+
+        // State should remain Frozen (loss doesn't reset state machine)
+        assert_eq!(
+            state_before_loss, state_after_loss,
+            "Slowdown state should not change on loss (was {}, now {})",
+            state_before_loss, state_after_loss
+        );
+
+        // Loss counter should increment
+        assert_eq!(
+            controller.total_losses.load(Ordering::Relaxed),
+            1,
+            "Loss counter should increment"
+        );
+
+        println!("✓ Loss during Frozen state test passed");
+    }
+
+    /// Test that timeout during RampingUp state resets appropriately
+    ///
+    /// When timeout occurs during RampingUp:
+    /// - cwnd should reset to min_cwnd (severe congestion response)
+    /// - State remains RampingUp (timeout doesn't change slowdown state)
+    /// - Slow start flag should be cleared
+    #[test]
+    fn test_timeout_during_rampup_state() {
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Manually set state to RampingUp with in_slow_start = true
+        controller
+            .slowdown_state
+            .store(SlowdownState::RampingUp as u8, Ordering::Release);
+        controller.in_slow_start.store(true, Ordering::Release);
+        controller.cwnd.store(80_000, Ordering::Release); // Mid-rampup
+
+        let state_before = controller.slowdown_state.load(Ordering::Acquire);
+
+        // Trigger timeout
+        controller.on_timeout();
+
+        let cwnd_after = controller.current_cwnd();
+        let state_after = controller.slowdown_state.load(Ordering::Acquire);
+        let in_slow_start_after = controller.in_slow_start.load(Ordering::Acquire);
+
+        // cwnd should reset to min_cwnd (or MSS, whichever is larger)
+        assert!(
+            cwnd_after <= controller.min_cwnd.max(MSS),
+            "cwnd should reset to min on timeout, got {}",
+            cwnd_after
+        );
+
+        // State should remain RampingUp
+        assert_eq!(
+            state_before, state_after,
+            "Slowdown state should not change on timeout"
+        );
+
+        // Slow start should be exited
+        assert!(
+            !in_slow_start_after,
+            "Slow start should be exited on timeout"
+        );
+
+        println!("✓ Timeout during RampingUp state test passed");
+    }
+
+    /// Test state machine integrity: all states are reachable and valid
+    #[test]
+    fn test_slowdown_state_machine_integrity() {
+        // Verify all state values are unique and in valid range
+        let states = [
+            (SlowdownState::Normal, 0u8),
+            (SlowdownState::WaitingForSlowdown, 1u8),
+            (SlowdownState::InSlowdown, 2u8),
+            (SlowdownState::Frozen, 3u8),
+            (SlowdownState::RampingUp, 4u8),
+        ];
+
+        for (state, expected_value) in states {
+            assert_eq!(
+                state as u8, expected_value,
+                "State {:?} should have value {}",
+                state, expected_value
+            );
+        }
+
+        // Verify controller starts in Normal state
+        let config = LedbatConfig::default();
+        let controller = LedbatController::new_with_config(config);
+        assert_eq!(
+            controller.slowdown_state.load(Ordering::Acquire),
+            SlowdownState::Normal as u8,
+            "Controller should start in Normal state"
+        );
+
+        println!("✓ Slowdown state machine integrity test passed");
+    }
+
+    /// Test that multiple rapid losses don't cause cwnd underflow
+    #[test]
+    fn test_rapid_losses_no_underflow() {
+        let config = LedbatConfig {
+            initial_cwnd: 10_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // Simulate 20 rapid losses (each halves cwnd)
+        for i in 0..20 {
+            let cwnd_before = controller.current_cwnd();
+            controller.on_loss();
+            let cwnd_after = controller.current_cwnd();
+
+            // cwnd should never go below min_cwnd
+            assert!(
+                cwnd_after >= controller.min_cwnd,
+                "Iteration {}: cwnd {} went below min_cwnd {}",
+                i,
+                cwnd_after,
+                controller.min_cwnd
+            );
+
+            // cwnd should either halve or stay at min
+            if cwnd_before > controller.min_cwnd * 2 {
+                assert_eq!(
+                    cwnd_after,
+                    cwnd_before / 2,
+                    "Iteration {}: cwnd should halve",
+                    i
+                );
+            } else {
+                assert!(
+                    cwnd_after >= controller.min_cwnd,
+                    "Iteration {}: cwnd should stay at min",
+                    i
+                );
+            }
+        }
+
+        // Final cwnd should be at min_cwnd
+        assert_eq!(
+            controller.current_cwnd(),
+            controller.min_cwnd,
+            "After many losses, cwnd should be at min_cwnd"
+        );
+
+        // Loss counter should be accurate
+        assert_eq!(
+            controller.total_losses.load(Ordering::Relaxed),
+            20,
+            "Should have recorded 20 losses"
+        );
+
+        println!("✓ Rapid losses no underflow test passed");
+    }
+
+    /// Test base delay tracking with jittery RTT samples
+    ///
+    /// Simulates RTT jitter (±30%) and verifies base_delay tracks the minimum
+    #[test]
+    fn test_base_delay_with_jitter() {
+        let config = LedbatConfig::default();
+        let controller = LedbatController::new_with_config(config);
+
+        let base_rtt_ms = 100u64;
+        let jitter_pct = 30u64; // ±30%
+
+        // Add jittery samples
+        let samples = [
+            base_rtt_ms,                         // 100ms (base)
+            base_rtt_ms + jitter_pct,            // 130ms (+30%)
+            base_rtt_ms - jitter_pct / 2,        // 85ms  (-15%)
+            base_rtt_ms + jitter_pct / 2,        // 115ms (+15%)
+            base_rtt_ms - jitter_pct,            // 70ms  (-30%) - this is the min
+            base_rtt_ms,                         // 100ms
+            base_rtt_ms + jitter_pct * 2 / 3,    // 120ms
+        ];
+
+        for &rtt_ms in &samples {
+            controller.base_delay_history.update(Duration::from_millis(rtt_ms));
+        }
+
+        let measured_base = controller.base_delay();
+        let expected_min = Duration::from_millis(70); // Minimum sample
+
+        assert_eq!(
+            measured_base, expected_min,
+            "Base delay should track minimum: expected {:?}, got {:?}",
+            expected_min, measured_base
+        );
+
+        println!("✓ Base delay with jitter test passed");
+    }
+
+    /// Test that slowdown doesn't occur when disabled
+    #[test]
+    fn test_slowdown_disabled() {
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false, // Disabled!
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+
+        // State should always be Normal
+        assert_eq!(
+            controller.slowdown_state.load(Ordering::Acquire),
+            SlowdownState::Normal as u8,
+            "Initial state should be Normal"
+        );
+
+        // Schedule a slowdown manually and verify it's not processed
+        controller.next_slowdown_time_nanos.store(0, Ordering::Release); // Due now
+
+        // Process some ACKs
+        controller.on_send(100_000);
+        for _ in 0..10 {
+            controller.base_delay_history.update(Duration::from_millis(50));
+            controller.on_ack(Duration::from_millis(50), 5000);
+        }
+
+        // Slowdown counter should remain 0
+        assert_eq!(
+            controller.periodic_slowdowns.load(Ordering::Relaxed),
+            0,
+            "No slowdowns should occur when disabled"
+        );
+
+        // State should still be Normal (or in slow start)
+        let state = controller.slowdown_state.load(Ordering::Acquire);
+        assert_eq!(
+            state,
+            SlowdownState::Normal as u8,
+            "State should remain Normal when slowdowns disabled"
+        );
+
+        println!("✓ Slowdown disabled test passed");
+    }
 }
