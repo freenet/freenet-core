@@ -226,22 +226,29 @@ impl ConfigArgs {
             Self::read_config(path)?
         } else {
             // find default application dir to see if there is a config file
-            let (config, data) = {
+            let (config, data, is_temp_dir) = {
                 match ConfigPathsArgs::default_dirs(self.id.as_deref())? {
                     Either::Left(defaults) => (
                         defaults.config_local_dir().to_path_buf(),
                         defaults.data_local_dir().to_path_buf(),
+                        false,
                     ),
-                    Either::Right(dir) => (dir.clone(), dir),
+                    Either::Right(dir) => (dir.clone(), dir, true),
                 }
             };
             self.config_paths.config_dir = Some(config.clone());
             if self.config_paths.data_dir.is_none() {
                 self.config_paths.data_dir = Some(data);
             }
-            Self::read_config(&config)?.inspect(|_| {
-                tracing::debug!("Found configuration file in default directory");
-            })
+            // Skip reading config from temp directories (test scenarios) - they won't have config files
+            // and may have permission issues from previous runs
+            if is_temp_dir {
+                None
+            } else {
+                Self::read_config(&config)?.inspect(|_| {
+                    tracing::debug!("Found configuration file in default directory");
+                })
+            }
         };
 
         let should_persist = cfg.is_none();
