@@ -1132,11 +1132,25 @@ impl ConfigPathsArgs {
     fn default_dirs(id: Option<&str>) -> std::io::Result<Either<ProjectDirs, PathBuf>> {
         // if id is set, most likely we are running tests or in simulated mode
         let default_dir: Either<_, _> = if cfg!(any(test, debug_assertions)) || id.is_some() {
-            Either::Right(std::env::temp_dir().join(if let Some(id) = id {
+            let base_name = if let Some(id) = id {
                 format!("freenet-{id}")
             } else {
                 "freenet".into()
-            }))
+            };
+            let temp_path = std::env::temp_dir().join(&base_name);
+
+            // Clean up stale temp directories from previous test runs that may have
+            // different permissions (common on shared CI runners). If we can't remove
+            // the stale directory (permission denied, in use, etc.), use a unique
+            // fallback path with process ID to avoid conflicts.
+            if temp_path.exists() && fs::remove_dir_all(&temp_path).is_err() {
+                let unique_path =
+                    std::env::temp_dir().join(format!("{}-{}", base_name, std::process::id()));
+                // Clean up any stale unique path too (unlikely but possible)
+                let _ = fs::remove_dir_all(&unique_path);
+                return Ok(Either::Right(unique_path));
+            }
+            Either::Right(temp_path)
         } else {
             Either::Left(
                 ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
