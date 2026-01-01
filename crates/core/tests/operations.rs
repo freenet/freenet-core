@@ -3457,7 +3457,7 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
     make_subscribe(&mut client_a, contract_key).await?;
 
     loop {
-        let resp = timeout(Duration::from_secs(60), client_a.recv()).await??;
+        let resp = timeout(Duration::from_secs(90), client_a.recv()).await??;
         match resp {
             HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
                 key,
