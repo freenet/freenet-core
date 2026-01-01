@@ -181,6 +181,10 @@ download_release_binary() {
         return 1
     fi
 
+    # Clean up any existing freenet file/directory before extraction
+    # (tar fails if a directory exists where it expects to create a file)
+    rm -rf "${target_dir}/freenet"
+
     # Extract the binary
     if ! tar -xzf "$tar_file" -C "$target_dir"; then
         echo "  ⚠️  Failed to extract release binary" >&2
