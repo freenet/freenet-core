@@ -808,12 +808,9 @@ impl<S: Socket> UdpPacketsListener<S> {
                             // Version mismatches have their own user-friendly error message
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
-                                    tracing::warn!(
-                                        peer_addr = %remote_addr,
-                                        error = %error,
-                                        direction = "outbound",
-                                        "Connection failed due to version mismatch"
-                                    );
+                                    // Log without extra fields - the error message itself contains
+                                    // user-friendly instructions that shouldn't be cluttered
+                                    tracing::warn!(%error);
                                     // Signal version mismatch for auto-update detection
                                     crate::transport::signal_version_mismatch();
                                 }
