@@ -164,12 +164,17 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart={binary} network
-Restart=on-failure
+Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
 # Allow 15 seconds for graceful shutdown before SIGKILL
 # The node handles SIGTERM to properly close peer connections
 TimeoutStopSec=15
+
+# Auto-update: if peer exits with code 42 (version mismatch with gateway),
+# run update before systemd restarts the service. The '-' prefix means
+# ExecStopPost failure won't affect service restart.
+ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
 
 # Logging - write to files for systems without active user journald
 # (headless servers, systems without lingering enabled, etc.)
@@ -319,6 +324,7 @@ fn service_logs(error_only: bool) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn install_service() -> Result<()> {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
     let home_dir = dirs::home_dir().context("Failed to get home directory")?;
@@ -330,7 +336,18 @@ fn install_service() -> Result<()> {
     let log_dir = home_dir.join("Library/Logs/freenet");
     fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
 
-    let plist_content = generate_plist(&exe_path, &log_dir);
+    // Create wrapper script for auto-update support.
+    // launchd doesn't have ExecStopPost like systemd, so we use a wrapper
+    // that checks exit code 42 (update needed) and runs update before restart.
+    let wrapper_dir = home_dir.join(".local/bin");
+    fs::create_dir_all(&wrapper_dir).context("Failed to create wrapper directory")?;
+    let wrapper_path = wrapper_dir.join("freenet-service-wrapper.sh");
+    let wrapper_content = generate_wrapper_script(&exe_path);
+    fs::write(&wrapper_path, wrapper_content).context("Failed to write wrapper script")?;
+    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
+        .context("Failed to make wrapper script executable")?;
+
+    let plist_content = generate_plist(&wrapper_path, &log_dir);
     let plist_path = launch_agents_dir.join("org.freenet.node.plist");
 
     fs::write(&plist_path, plist_content).context("Failed to write plist file")?;
@@ -347,7 +364,55 @@ fn install_service() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn generate_plist(binary_path: &Path, log_dir: &Path) -> String {
+fn generate_wrapper_script(binary_path: &Path) -> String {
+    format!(
+        r#"#!/bin/bash
+# Freenet service wrapper for auto-update support.
+# This wrapper monitors exit code 42 (update needed) and runs update before restart.
+# Includes exponential backoff to prevent rapid restart loops on repeated failures.
+
+BACKOFF=10       # Initial backoff in seconds
+MAX_BACKOFF=300  # Maximum backoff (5 minutes)
+CONSECUTIVE_FAILURES=0
+
+while true; do
+    "{binary}" network
+    EXIT_CODE=$?
+
+    if [ $EXIT_CODE -eq 42 ]; then
+        echo "$(date): Update needed, running freenet update..." >> "$HOME/Library/Logs/freenet/freenet.log"
+        if "{binary}" update --quiet; then
+            echo "$(date): Update successful, restarting..." >> "$HOME/Library/Logs/freenet/freenet.log"
+            CONSECUTIVE_FAILURES=0
+            BACKOFF=10
+            sleep 2
+        else
+            CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+            echo "$(date): Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..." >> "$HOME/Library/Logs/freenet/freenet.log"
+            sleep $BACKOFF
+            BACKOFF=$((BACKOFF * 2))
+            [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
+        fi
+        continue
+    elif [ $EXIT_CODE -eq 0 ]; then
+        echo "$(date): Normal shutdown" >> "$HOME/Library/Logs/freenet/freenet.log"
+        exit 0
+    else
+        echo "$(date): Exited with code $EXIT_CODE, restarting after backoff..." >> "$HOME/Library/Logs/freenet/freenet.log"
+        sleep $BACKOFF
+        BACKOFF=$((BACKOFF * 2))
+        [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
+    fi
+done
+"#,
+        binary = binary_path.display()
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
+    // Note: wrapper_path is the auto-update wrapper script, not the freenet binary directly.
+    // The wrapper handles the loop: run freenet, check exit code, update if needed.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -357,8 +422,7 @@ fn generate_plist(binary_path: &Path, log_dir: &Path) -> String {
     <string>org.freenet.node</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{binary}</string>
-        <string>network</string>
+        <string>{wrapper}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -384,7 +448,7 @@ fn generate_plist(binary_path: &Path, log_dir: &Path) -> String {
 </dict>
 </plist>
 "#,
-        binary = binary_path.display(),
+        wrapper = wrapper_path.display(),
         log_dir = log_dir.display()
     )
 }
@@ -732,9 +796,12 @@ mod tests {
         assert!(service_content.contains("MemoryMax=2G"));
         assert!(service_content.contains("CPUQuota=200%"));
 
-        // Verify restart configuration
-        assert!(service_content.contains("Restart=on-failure"));
+        // Verify restart configuration (always restart for auto-update support)
+        assert!(service_content.contains("Restart=always"));
         assert!(service_content.contains("RestartSec=10"));
+
+        // Verify auto-update support via ExecStopPost
+        assert!(service_content.contains("ExecStopPost="));
 
         // Verify graceful shutdown timeout is set
         assert!(service_content.contains("TimeoutStopSec=15"));

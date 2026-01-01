@@ -523,7 +523,11 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!({
                         "type": "connected",
                         "this_peer": this.to_string(),
+                        "this_peer_id": this.pub_key().to_string(),
+                        "this_peer_addr": this.peer_addr.to_string(),
                         "connected_peer": connected.to_string(),
+                        "connected_peer_id": connected.pub_key().to_string(),
+                        "connected_peer_addr": connected.peer_addr.to_string(),
                         "elapsed_ms": elapsed_ms,
                         "connection_type": connection_type.to_string(),
                         "latency_ms": latency_ms,
@@ -608,6 +612,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             serde_json::json!({
                 "type": "disconnected",
                 "from": from.to_string(),
+                "from_peer_id": from.pub_key.to_string(),
+                "from_peer_addr": from.addr.to_string(),
                 "reason": reason.to_string(),
                 "connection_duration_ms": connection_duration_ms,
                 "bytes_sent": bytes_sent,
