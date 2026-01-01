@@ -39,7 +39,8 @@ impl PeerConnectionBackoff {
 
     /// Create a new backoff tracker with default settings.
     pub fn new() -> Self {
-        let config = ExponentialBackoff::new(Self::DEFAULT_BASE_INTERVAL, Self::DEFAULT_MAX_BACKOFF);
+        let config =
+            ExponentialBackoff::new(Self::DEFAULT_BASE_INTERVAL, Self::DEFAULT_MAX_BACKOFF);
         Self {
             inner: TrackedBackoff::new(config, Self::DEFAULT_MAX_ENTRIES),
         }

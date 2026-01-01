@@ -1367,7 +1367,8 @@ mod tests {
         use crate::util::backoff::ExponentialBackoff;
 
         // Test the ExponentialBackoff config directly to verify capping behavior
-        let config = ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
+        let config =
+            ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
 
         // After many failures, should be capped at max
         // delay_for_failures(10) = 5s * 2^9 = 2560s, but should be capped at 300s
