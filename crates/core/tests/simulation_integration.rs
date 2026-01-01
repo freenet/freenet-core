@@ -514,11 +514,6 @@ async fn test_eventual_consistency_state_hashes() {
         total_contracts_with_multiple_peers
     );
 
-    // We don't strictly assert 100% consistency because:
-    // 1. Network may not be fully connected in short test runs
-    // 2. Some updates may still be in-flight
-    // But we verify the infrastructure works and capture meaningful data
-
     // Verify we at least captured some events
     let total_events: usize = summary.len();
     assert!(
@@ -526,10 +521,26 @@ async fn test_eventual_consistency_state_hashes() {
         "Should have captured events during test"
     );
 
-    // If we have contracts with multiple peers, some should be consistent
+    // Assert convergence: if we have contracts replicated across multiple peers,
+    // at least 50% should have converged. This is a lenient threshold because:
+    // - Short test runs may not allow full propagation
+    // - Multi-threaded tokio introduces timing variance
+    // A stricter threshold (80-100%) would require longer test duration or
+    // deterministic scheduling.
     if total_contracts_with_multiple_peers > 0 {
+        let convergence_rate = consistent_contracts as f64 / total_contracts_with_multiple_peers as f64;
         tracing::info!(
-            "Verified eventual consistency infrastructure: {} contracts tracked across multiple peers",
+            "Convergence rate: {:.1}% ({}/{})",
+            convergence_rate * 100.0,
+            consistent_contracts,
+            total_contracts_with_multiple_peers
+        );
+
+        assert!(
+            convergence_rate >= 0.5,
+            "Expected at least 50% of contracts to converge, got {:.1}% ({}/{})",
+            convergence_rate * 100.0,
+            consistent_contracts,
             total_contracts_with_multiple_peers
         );
     }
