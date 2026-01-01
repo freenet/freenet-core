@@ -68,11 +68,13 @@ impl InMemoryContractStore {
 
     /// Store a contract in memory.
     pub fn store_contract(&self, contract: ContractContainer) -> Result<(), anyhow::Error> {
-        let (key, code, params) = match contract {
+        let (key, code, params) = match &contract {
             ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                 let key = *contract_v1.key();
-                let code = contract_v1.code().clone();
-                let params = contract_v1.params().into_owned();
+                // Clone the code data to get an owned version
+                let code_data = contract_v1.code().data().to_vec();
+                let code = ContractCode::from(code_data);
+                let params = contract_v1.params().clone().into_owned();
                 (key, code, params)
             }
             _ => return Err(anyhow::anyhow!("unsupported contract type")),
@@ -82,7 +84,7 @@ impl InMemoryContractStore {
         let mut inner = self.inner.lock().unwrap();
 
         // Store code by hash (deduplicates same code with different params)
-        inner.code_by_hash.insert(code_hash, Arc::new(code.into_owned()));
+        inner.code_by_hash.insert(code_hash, Arc::new(code));
 
         // Map instance ID to code hash and params
         inner.instance_to_code.insert(*key.id(), (code_hash, params));

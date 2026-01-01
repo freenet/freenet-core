@@ -751,18 +751,21 @@ pub mod test {
 
 pub(super) mod in_memory {
     use super::{
-        super::{executor::OpRequestSender, Executor, MockRuntime},
+        super::{executor::OpRequestSender, storages::Storage, Executor, MockRuntime},
         ContractHandler, ContractHandlerChannel, ContractHandlerHalve,
     };
     use crate::node::OpManager;
+    use crate::wasm_runtime::MockStateStorage;
     use std::sync::Arc;
 
+    /// In-memory contract handler for testing with disk-based storage (default).
     pub(crate) struct MemoryContractHandler {
         channel: ContractHandlerChannel<ContractHandlerHalve>,
-        runtime: Executor<MockRuntime>,
+        runtime: Executor<MockRuntime, Storage>,
     }
 
     impl MemoryContractHandler {
+        /// Create a new handler with disk-based storage (default, for backward compatibility).
         pub async fn new(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
             op_sender: Option<OpRequestSender>,
@@ -778,9 +781,40 @@ pub(super) mod in_memory {
         }
     }
 
+    /// In-memory contract handler with shared in-memory storage for deterministic simulation.
+    ///
+    /// Unlike `MemoryContractHandler` which uses disk-based storage, this handler stores
+    /// all state in memory using `MockStateStorage`. The Arc-based storage can be cloned
+    /// and shared across node restarts to preserve state.
+    pub(crate) struct SimulationContractHandler {
+        channel: ContractHandlerChannel<ContractHandlerHalve>,
+        runtime: Executor<MockRuntime, MockStateStorage>,
+    }
+
+    impl SimulationContractHandler {
+        /// Create a new handler with shared in-memory storage for deterministic simulation.
+        ///
+        /// The `shared_storage` is an Arc-backed storage that persists across node restarts.
+        /// Clone the same `MockStateStorage` instance to share state between restarts.
+        pub async fn new(
+            channel: ContractHandlerChannel<ContractHandlerHalve>,
+            op_sender: Option<OpRequestSender>,
+            op_manager: Option<Arc<OpManager>>,
+            identifier: &str,
+            shared_storage: MockStateStorage,
+        ) -> Self {
+            SimulationContractHandler {
+                channel,
+                runtime: Executor::new_mock_in_memory(identifier, shared_storage, op_sender, op_manager)
+                    .await
+                    .expect("should start mock in-memory executor"),
+            }
+        }
+    }
+
     impl ContractHandler for MemoryContractHandler {
         type Builder = String;
-        type ContractExecutor = Executor<MockRuntime>;
+        type ContractExecutor = Executor<MockRuntime, Storage>;
 
         async fn build(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
@@ -795,6 +829,44 @@ pub(super) mod in_memory {
                 MemoryContractHandler::new(channel, Some(op_sender), Some(op_manager), &identifier)
                     .await,
             )
+        }
+
+        fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
+            &mut self.channel
+        }
+
+        fn executor(&mut self) -> &mut Self::ContractExecutor {
+            &mut self.runtime
+        }
+    }
+
+    /// Builder for simulation contract handler that includes shared storage.
+    pub struct SimulationHandlerBuilder {
+        pub identifier: String,
+        pub shared_storage: MockStateStorage,
+    }
+
+    impl ContractHandler for SimulationContractHandler {
+        type Builder = SimulationHandlerBuilder;
+        type ContractExecutor = Executor<MockRuntime, MockStateStorage>;
+
+        async fn build(
+            channel: ContractHandlerChannel<ContractHandlerHalve>,
+            op_sender: OpRequestSender,
+            op_manager: Arc<OpManager>,
+            builder: Self::Builder,
+        ) -> anyhow::Result<Self>
+        where
+            Self: Sized + 'static,
+        {
+            Ok(SimulationContractHandler::new(
+                channel,
+                Some(op_sender),
+                Some(op_manager),
+                &builder.identifier,
+                builder.shared_storage,
+            )
+            .await)
         }
 
         fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {

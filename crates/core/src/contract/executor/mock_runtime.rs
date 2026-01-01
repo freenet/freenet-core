@@ -92,7 +92,7 @@ impl Executor<MockRuntime, MockStateStorage> {
 /// Common methods for MockRuntime executors (works with any storage type)
 impl<S> Executor<MockRuntime, S>
 where
-    S: StateStorage + Send + 'static,
+    S: StateStorage + Send + Sync + 'static,
     <S as StateStorage>::Error: Into<anyhow::Error>,
 {
     pub async fn handle_request(
@@ -108,7 +108,7 @@ where
 /// ContractExecutor implementation for MockRuntime with any storage type
 impl<S> ContractExecutor for Executor<MockRuntime, S>
 where
-    S: StateStorage + Send + 'static,
+    S: StateStorage + Send + Sync + 'static,
     <S as StateStorage>::Error: Into<anyhow::Error>,
 {
     fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {

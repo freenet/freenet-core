@@ -14,7 +14,8 @@ pub(crate) use executor::{
     Callback, ExecutorToEventLoopChannel, NetworkEventListenerHalve, UpsertResult,
 };
 pub(crate) use handler::{
-    client_responses_channel, contract_handler_channel, in_memory::MemoryContractHandler,
+    client_responses_channel, contract_handler_channel,
+    in_memory::{MemoryContractHandler, SimulationContractHandler, SimulationHandlerBuilder},
     ClientResponsesReceiver, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
     ContractHandlerEvent, NetworkContractHandler, SenderHalve, SessionMessage, StoreResponse,
     WaitingResolution, WaitingTransaction,

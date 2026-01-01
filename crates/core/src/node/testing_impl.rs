@@ -340,6 +340,8 @@ pub struct RestartableNodeConfig {
     pub gateway_configs: Vec<GatewayConfig>,
     /// Seed for deterministic RNG in this node's transport layer
     pub rng_seed: u64,
+    /// Shared in-memory storage for contract state (persists across restarts)
+    pub shared_storage: crate::wasm_runtime::MockStateStorage,
 }
 
 /// A simulated in-memory network topology.
@@ -835,8 +837,11 @@ impl SimNetwork {
             tracing::info_span!("in_mem_node_restart", %label)
         };
 
-        // Start the node task
-        let node_task = async move { builder.run_node(user_events, span).await };
+        // Start the node task with shared storage for state persistence
+        let shared_storage = restart_config.shared_storage.clone();
+        let node_task = async move {
+            builder.run_node_with_shared_storage(user_events, span, shared_storage).await
+        };
         let handle = GlobalExecutor::spawn(node_task);
 
         // Track the new running node
@@ -846,7 +851,7 @@ impl SimNetwork {
             abort_handle: handle.abort_handle(),
         });
 
-        tracing::info!(?label, "Node restarted successfully");
+        tracing::info!(?label, "Node restarted successfully with persisted state");
         Some(handle)
     }
 
@@ -1047,6 +1052,9 @@ impl SimNetwork {
 
             tracing::debug!(peer = %label, addr = %gateway_addr, "starting gateway");
 
+            // Create shared in-memory storage for this node (persists across restarts)
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
             // Save restartable config BEFORE starting (NodeConfig gets consumed)
             self.restartable_configs.insert(label.clone(), RestartableNodeConfig {
                 config: node.config.clone(),
@@ -1054,6 +1062,7 @@ impl SimNetwork {
                 is_gateway: true,
                 gateway_configs: self.all_gateway_configs.clone(),
                 rng_seed: node.rng_seed,
+                shared_storage: shared_storage.clone(),
             });
 
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
@@ -1065,7 +1074,10 @@ impl SimNetwork {
             let span = tracing::info_span!("in_mem_gateway", %label);
             self.labels.push((label.clone(), node.config.key_pair.public().clone()));
 
-            let node_task = async move { node.run_node(user_events, span).await };
+            // Use shared in-memory storage for state persistence across restarts
+            let node_task = async move {
+                node.run_node_with_shared_storage(user_events, span, shared_storage).await
+            };
             let handle = GlobalExecutor::spawn(node_task);
 
             // Track running node for crash/restart
@@ -1127,6 +1139,9 @@ impl SimNetwork {
 
             tracing::debug!(peer = %label, addr = %node_addr, "starting regular node");
 
+            // Create shared in-memory storage for this node (persists across restarts)
+            let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+
             // Save restartable config BEFORE starting (NodeConfig gets consumed)
             self.restartable_configs.insert(label.clone(), RestartableNodeConfig {
                 config: node.config.clone(),
@@ -1134,6 +1149,7 @@ impl SimNetwork {
                 is_gateway: false,
                 gateway_configs: self.all_gateway_configs.clone(),
                 rng_seed: node.rng_seed,
+                shared_storage: shared_storage.clone(),
             });
 
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
@@ -1145,7 +1161,10 @@ impl SimNetwork {
             let span = tracing::info_span!("in_mem_node", %label);
             self.labels.push((label.clone(), node.config.key_pair.public().clone()));
 
-            let node_task = async move { node.run_node(user_events, span).await };
+            // Use shared in-memory storage for state persistence across restarts
+            let node_task = async move {
+                node.run_node_with_shared_storage(user_events, span, shared_storage).await
+            };
             let handle = GlobalExecutor::spawn(node_task);
 
             // Track running node for crash/restart
