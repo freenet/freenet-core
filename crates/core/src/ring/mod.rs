@@ -315,8 +315,17 @@ impl Ring {
     ///
     /// The task respects existing backoff mechanisms to avoid subscription spam.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
+        use rand::Rng;
+
+        // Add random initial delay (30-60 seconds) to prevent synchronized recovery
+        // across all peers. This avoids "thundering herd" problems and prevents the
+        // recovery task from firing at exactly the same time as test stabilization
+        // periods or other network operations that happen at fixed intervals.
+        let initial_delay = Duration::from_secs(rand::rng().random_range(30..=60));
+        tokio::time::sleep(initial_delay).await;
+
         let mut interval = tokio::time::interval(interval_duration);
-        // Skip the first immediate tick
+        // Skip the first immediate tick (we already waited above)
         interval.tick().await;
 
         loop {

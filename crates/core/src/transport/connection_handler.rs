@@ -587,12 +587,19 @@ impl<S: Socket> UdpPacketsListener<S> {
                                         continue;
                                     }
                                     Err(fast_channel::TrySendError::Disconnected(_)) => {
-                                        // Channel closed, remove the connection
-                                        ongoing_gw_connections.remove(&remote_addr);
+                                        // Issue #2528: Do NOT remove from ongoing_gw_connections here.
+                                        // The channel is closed because the handshake task finished,
+                                        // but the handshake completion branch hasn't run yet to insert
+                                        // into remote_connections. If we remove here, subsequent packets
+                                        // won't be found in either map and will fall through to RSA
+                                        // decryption, causing spurious "decryption error" failures.
+                                        // Just drop the packet - the handshake completion branch will
+                                        // properly clean up by inserting to remote_connections first,
+                                        // then removing from ongoing_gw_connections (per issue #2517).
                                         tracing::debug!(
                                             peer_addr = %remote_addr,
                                             direction = "inbound",
-                                            "Ongoing gateway connection channel closed, removing"
+                                            "Ongoing gateway connection channel closed, dropping packet (handshake completing)"
                                         );
                                         continue;
                                     }
