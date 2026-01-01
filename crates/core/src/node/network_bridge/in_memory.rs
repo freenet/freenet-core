@@ -363,6 +363,12 @@ pub fn is_peer_registered(addr: &SocketAddr) -> bool {
     PEER_REGISTRY.read().unwrap().is_registered(addr)
 }
 
+/// Unregisters a peer from the global peer registry.
+/// Used by SimNetwork when a node is crashed or being restarted.
+pub fn unregister_peer(addr: &SocketAddr) {
+    PEER_REGISTRY.write().unwrap().unregister(addr);
+}
+
 /// Global peer registry for all in-memory peers
 static PEER_REGISTRY: LazyLock<RwLock<PeerRegistry>> =
     LazyLock::new(|| RwLock::new(PeerRegistry::default()));

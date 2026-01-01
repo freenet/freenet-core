@@ -72,15 +72,22 @@ async fn example_simulation_test() {
     let summary = sim.get_operation_summary().await;
     assert!(summary.overall_success_rate() > 0.8, "Operations should mostly succeed");
 
-    // Example: Crash a node and verify system handles it
+    // Example: Crash a node and restart it with preserved state
     let all_addrs = sim.all_node_addresses();
-    if let Some(label) = all_addrs.keys().next() {
-        sim.crash_node(label);  // Aborts task, blocks messages
-        assert!(sim.is_node_crashed(label));
+    if let Some(label) = all_addrs.keys().next().cloned() {
+        // Crash the node (aborts task, blocks messages)
+        sim.crash_node(&label);
+        assert!(sim.is_node_crashed(&label));
 
-        // Later, recover (unblocks messages, but task stays aborted)
-        sim.recover_node(label);
-        assert!(!sim.is_node_crashed(label));
+        // Option 1: Simple recovery (unblocks messages, but task stays aborted)
+        // sim.recover_node(&label);
+
+        // Option 2: Full restart with persisted state
+        if sim.can_restart(&label) {
+            let handle = sim.restart_node::<rand::rngs::SmallRng>(&label, 0x5678, 5, 10).await;
+            assert!(handle.is_some(), "Restart should succeed");
+            assert!(!sim.is_node_crashed(&label), "Restarted node is not crashed");
+        }
     }
 }
 ```
@@ -98,7 +105,9 @@ sim.advance_virtual_time()                  // Just deliver pending messages
 // Node Lifecycle
 sim.crash_node(&label)                      // Abort task + block messages
 sim.recover_node(&label)                    // Unblock messages (task stays aborted)
+sim.restart_node::<SmallRng>(&label, seed, max_contracts, iters).await  // Full restart with persisted state
 sim.is_node_crashed(&label)                 // Check crash status
+sim.can_restart(&label)                     // Check if config saved for restart
 sim.node_address(&label)                    // Get node's SocketAddr
 sim.all_node_addresses()                    // All label -> addr mappings
 
@@ -173,6 +182,7 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 | Post-event verification | Access SimNetwork after events complete |
 | **VirtualTime (always on)** | Time control via `virtual_time()` and `advance_time()` |
 | **Node crash simulation** | `crash_node()` aborts task and blocks messages |
+| **Node restart** | `restart_node()` preserves identity and persisted state |
 
 ### ⚠️ Partially Working
 
@@ -180,14 +190,12 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 |---------|-------|------------|
 | Deterministic execution | Multi-threaded Tokio causes non-determinism | Use lenient assertions (percentages) |
 | Gateway registration race | Nodes may start before gateways ready | 3-phase startup with barrier |
-| Node recovery | `recover_node()` clears crash status but doesn't restart task | Requires full restart implementation |
 
 ### ❌ Not Yet Implemented
 
 | Feature | Impact |
 |---------|--------|
 | Deterministic executor | Full reproducibility impossible |
-| **Node restart** | Crashed nodes can't be restarted (only message blocking cleared) |
 | Clock skew simulation | Can't test time-sensitive bugs |
 | Invariant checking DSL | Manual assertions only |
 | Linearizability checker | Can't prove consistency |
@@ -378,14 +386,19 @@ async fn test_node_crash_recovery() {
 
 ## Summary: Current Gaps
 
-| Gap | Impact | Effort |
-|-----|--------|--------|
-| Non-deterministic execution | Can't reliably reproduce all bugs | High |
-| No node crash/restart | Can't test recovery | Medium |
-| VirtualTime not used in tests | Missing time-control benefits | Low |
-| No linearizability checking | Can't prove consistency | High |
-| No property-based testing | Manual test case design | Medium |
+| Gap | Impact | Effort | Status |
+|-----|--------|--------|--------|
+| Non-deterministic execution | Can't reliably reproduce all bugs | High | Open |
+| ~~No node crash/restart~~ | ~~Can't test recovery~~ | ~~Medium~~ | ✅ Done |
+| ~~VirtualTime not used in tests~~ | ~~Missing time-control benefits~~ | ~~Low~~ | ✅ Done |
+| No linearizability checking | Can't prove consistency | High | Open |
+| No property-based testing | Manual test case design | Medium | Open |
 
 The infrastructure is solid for what it tests. The main limitation is non-deterministic
 execution, which requires either accepting probabilistic assertions or implementing a
 full deterministic executor (significant effort, following FoundationDB's approach).
+
+**Recently Completed:**
+- VirtualTime always enabled (`virtual_time()`, `advance_time()`)
+- Node crash simulation (`crash_node()`)
+- Node restart with preserved state (`restart_node()`)

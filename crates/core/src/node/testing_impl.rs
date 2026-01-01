@@ -324,6 +324,24 @@ pub struct RunningNode {
     pub abort_handle: tokio::task::AbortHandle,
 }
 
+/// Configuration saved for node restart.
+///
+/// When a node is started, its configuration is saved here so it can be
+/// restarted with the same identity (keypair), location, and data directory.
+#[derive(Clone)]
+pub struct RestartableNodeConfig {
+    /// The node's configuration (contains keypair, location, data dir, etc.)
+    pub config: NodeConfig,
+    /// The node label
+    pub label: NodeLabel,
+    /// Whether this is a gateway node
+    pub is_gateway: bool,
+    /// Gateway addresses to connect to (for non-gateway nodes)
+    pub gateway_configs: Vec<GatewayConfig>,
+    /// Seed for deterministic RNG in this node's transport layer
+    pub rng_seed: u64,
+}
+
 /// A simulated in-memory network topology.
 pub struct SimNetwork {
     name: String,
@@ -350,6 +368,10 @@ pub struct SimNetwork {
     running_nodes: HashMap<NodeLabel, RunningNode>,
     /// Map from label to socket address for quick lookup
     node_addresses: HashMap<NodeLabel, SocketAddr>,
+    /// Saved configurations for node restart (preserved after crash)
+    restartable_configs: HashMap<NodeLabel, RestartableNodeConfig>,
+    /// All gateway configs (needed for restarting non-gateway nodes)
+    all_gateway_configs: Vec<GatewayConfig>,
 }
 
 impl SimNetwork {
@@ -396,6 +418,8 @@ impl SimNetwork {
             virtual_time,
             running_nodes: HashMap::new(),
             node_addresses: HashMap::new(),
+            restartable_configs: HashMap::new(),
+            all_gateway_configs: Vec::new(),
         };
         net.config_gateways(
             gateways
@@ -681,6 +705,144 @@ impl SimNetwork {
         &self.node_addresses
     }
 
+    /// Restarts a crashed node, preserving its persisted state.
+    ///
+    /// This method:
+    /// 1. Retrieves the saved configuration (keypair, data directory, location)
+    /// 2. Unregisters the old peer from the transport layer
+    /// 3. Creates a new node with the same identity
+    /// 4. Starts the node task
+    ///
+    /// The restarted node will:
+    /// - Have the same keypair/identity as before
+    /// - Load contracts and state from its data directory
+    /// - Connect to the network gateways
+    ///
+    /// # Arguments
+    /// * `label` - The label of the node to restart
+    /// * `seed` - Seed for random event generation
+    /// * `max_contract_num` - Maximum number of contracts for event generation
+    /// * `iterations` - Number of iterations for event generation
+    ///
+    /// # Returns
+    /// * `Some(JoinHandle)` if restart was successful
+    /// * `None` if the node config was not found or restart failed
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Crash a node
+    /// sim.crash_node(&label);
+    /// assert!(sim.is_node_crashed(&label));
+    ///
+    /// // Restart it with same identity and persisted state
+    /// let handle = sim.restart_node::<SmallRng>(&label, 0x5678, 10, 5).await;
+    /// assert!(handle.is_some());
+    /// assert!(!sim.is_node_crashed(&label));
+    /// ```
+    pub async fn restart_node<R>(
+        &mut self,
+        label: &NodeLabel,
+        seed: u64,
+        max_contract_num: usize,
+        iterations: usize,
+    ) -> Option<tokio::task::JoinHandle<anyhow::Result<()>>>
+    where
+        R: crate::client_events::test::RandomEventGenerator + Send + 'static,
+    {
+        use crate::node::network_bridge::in_memory::unregister_peer;
+        use crate::node::network_bridge::get_fault_injector;
+
+        // Get the saved restartable config
+        let restart_config = match self.restartable_configs.get(label) {
+            Some(config) => config.clone(),
+            None => {
+                tracing::warn!(?label, "Cannot restart node: config not found");
+                return None;
+            }
+        };
+
+        // Get the node address
+        let node_addr = match self.node_addresses.get(label) {
+            Some(addr) => *addr,
+            None => {
+                tracing::warn!(?label, "Cannot restart node: address not found");
+                return None;
+            }
+        };
+
+        tracing::info!(?label, ?node_addr, "Restarting node with persisted state");
+
+        // Unregister the old peer from transport (the new node will re-register)
+        unregister_peer(&node_addr);
+
+        // Clear crash status in fault injector
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.config.recover_node(&node_addr);
+        }
+
+        // Create a new Builder with the saved configuration
+        let event_listener = {
+            #[cfg(feature = "trace-ot")]
+            {
+                use crate::tracing::OTEventRegister;
+                CombinedRegister::new([
+                    self.event_listener.trait_clone(),
+                    Box::new(OTEventRegister::new()),
+                ])
+            }
+            #[cfg(not(feature = "trace-ot"))]
+            {
+                self.event_listener.clone()
+            }
+        };
+
+        let builder = Builder::build(
+            restart_config.config.clone(),
+            event_listener,
+            format!("{}-{}", self.name, label),
+            self.add_noise,
+            restart_config.rng_seed,
+        );
+
+        // Calculate total peers for event generation params
+        let total_peer_num = self.labels.len();
+
+        // Create user events for the restarted node
+        let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+            self.receiver_ch.clone(),
+            restart_config.config.key_pair.public().clone(),
+            seed,
+        );
+        user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+
+        // Create the appropriate span
+        let span = if restart_config.is_gateway {
+            tracing::info_span!("in_mem_gateway_restart", %label)
+        } else {
+            tracing::info_span!("in_mem_node_restart", %label)
+        };
+
+        // Start the node task
+        let node_task = async move { builder.run_node(user_events, span).await };
+        let handle = GlobalExecutor::spawn(node_task);
+
+        // Track the new running node
+        self.running_nodes.insert(label.clone(), RunningNode {
+            label: label.clone(),
+            addr: node_addr,
+            abort_handle: handle.abort_handle(),
+        });
+
+        tracing::info!(?label, "Node restarted successfully");
+        Some(handle)
+    }
+
+    /// Checks if a node has a saved configuration for restart.
+    pub fn can_restart(&self, label: &NodeLabel) -> bool {
+        self.restartable_configs.contains_key(label)
+    }
+
     #[allow(unused)]
     pub fn debug(&mut self) {
         self.clean_up_tmp_dirs = false;
@@ -734,6 +896,9 @@ impl SimNetwork {
         configs[0].0.should_connect = false;
 
         let gateways: Vec<_> = configs.iter().map(|(_, gw)| gw.clone()).collect();
+        // Store all gateway configs for use when restarting non-gateway nodes
+        self.all_gateway_configs = gateways.clone();
+
         for (mut this_node, this_config) in configs {
             for GatewayConfig {
                 peer_key_location,
@@ -869,6 +1034,16 @@ impl SimNetwork {
             gateway_addrs.push(gateway_addr);
 
             tracing::debug!(peer = %label, addr = %gateway_addr, "starting gateway");
+
+            // Save restartable config BEFORE starting (NodeConfig gets consumed)
+            self.restartable_configs.insert(label.clone(), RestartableNodeConfig {
+                config: node.config.clone(),
+                label: label.clone(),
+                is_gateway: true,
+                gateway_configs: self.all_gateway_configs.clone(),
+                rng_seed: node.rng_seed,
+            });
+
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 self.receiver_ch.clone(),
                 node.config.key_pair.public().clone(),
@@ -939,6 +1114,16 @@ impl SimNetwork {
                 .expect("Node address should be tracked");
 
             tracing::debug!(peer = %label, addr = %node_addr, "starting regular node");
+
+            // Save restartable config BEFORE starting (NodeConfig gets consumed)
+            self.restartable_configs.insert(label.clone(), RestartableNodeConfig {
+                config: node.config.clone(),
+                label: label.clone(),
+                is_gateway: false,
+                gateway_configs: self.all_gateway_configs.clone(),
+                rng_seed: node.rng_seed,
+            });
+
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 self.receiver_ch.clone(),
                 node.config.key_pair.public().clone(),
