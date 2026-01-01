@@ -33,11 +33,13 @@ impl SymmetricMessage {
         bincode::deserialize(bytes)
     }
 
+    #[allow(dead_code)]
     const ACK_ERROR_MSG: &str = concat!(
         "remote is using a different protocol version, expected version ",
         env!("CARGO_PKG_VERSION")
     );
 
+    #[allow(dead_code)]
     const ACK_ERROR: SymmetricMessage = SymmetricMessage {
         packet_id: Self::FIRST_PACKET_ID,
         confirm_receipt: Vec::new(),
@@ -106,6 +108,7 @@ impl SymmetricMessage {
         *MAX_NUM_CONFIRM_RECEIPTS
     }
 
+    #[allow(dead_code)]
     pub fn ack_error(
         outbound_sym_key: &Aes128Gcm,
     ) -> Result<PacketData<SymmetricAES>, bincode::Error> {

@@ -7,10 +7,10 @@ use std::{collections::HashMap, time::Instant};
 
 use parking_lot::RwLock;
 
-use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
+use crate::transport::connection_handler::{NAT_TRAVERSAL_MAX_ATTEMPTS, PROTOC_VERSION};
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::fast_channel::{self, FastReceiver, FastSender};
-use crate::transport::packet_data::UnknownEncryption;
+use crate::transport::packet_data::{UnknownEncryption, X25519_PUBLIC_KEY_SIZE};
 use crate::transport::sent_packet_tracker::MESSAGE_CONFIRMATION_TIMEOUT;
 use aes_gcm::Aes128Gcm;
 use futures::stream::FuturesUnordered;
@@ -84,6 +84,7 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket> {
     pub(super) inbound_symmetric_key_bytes: [u8; 16],
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
+    #[allow(dead_code)]
     pub(super) transport_secret_key: TransportSecretKey,
     /// LEDBAT congestion controller (RFC 6817) - adapts to network conditions
     pub(super) ledbat: Arc<LedbatController>,
@@ -443,62 +444,63 @@ impl<S: super::Socket> PeerConnection<S> {
                             "Failed to decrypt packet, might be an intro packet or a partial packet"
                         );
                     }) else {
-                        // Check if this is a 256-byte RSA intro packet
-                        if packet_data.data().len() == 256 {
+                        // Check if this is an X25519 intro packet
+                        // Size = protocol_version + ephemeral_public_key (32 bytes)
+                        let expected_intro_size = PROTOC_VERSION.len() + X25519_PUBLIC_KEY_SIZE;
+                        if packet_data.data().len() == expected_intro_size {
                             tracing::debug!(
                                 peer_addr = %self.remote_conn.remote_addr,
-                                "Attempting to decrypt potential RSA intro packet"
+                                "Checking if packet is X25519 intro packet"
                             );
 
-                            // Try to decrypt as RSA intro packet
-                            match self.remote_conn.transport_secret_key.decrypt(packet_data.data()) {
-                                Ok(_decrypted_intro) => {
-                                    tracing::debug!(
-                                        peer_addr = %self.remote_conn.remote_addr,
-                                        "Successfully decrypted RSA intro packet, sending ACK"
-                                    );
+                            // Try to parse as X25519 intro packet
+                            if let Some(_remote_ephemeral_public) = packet_data.try_parse_intro(&PROTOC_VERSION) {
+                                tracing::debug!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    "Successfully parsed X25519 intro packet, sending ACK"
+                                );
 
-                                    // Send ACK response for intro packet
-                                    let ack_packet = SymmetricMessage::ack_ok(
-                                        &self.remote_conn.outbound_symmetric_key,
-                                        self.remote_conn.inbound_symmetric_key_bytes,
-                                        self.remote_conn.remote_addr,
-                                    );
+                                // Derive new symmetric keys using ECDH
+                                // We don't have access to our own public key here, so we use the existing keys
+                                // The intro packet is likely from a peer that restarted and doesn't know
+                                // our existing connection. We ACK with our current keys to maintain consistency.
+                                let ack_packet = SymmetricMessage::ack_ok(
+                                    &self.remote_conn.outbound_symmetric_key,
+                                    self.remote_conn.inbound_symmetric_key_bytes,
+                                    self.remote_conn.remote_addr,
+                                );
 
-                                    if let Ok(ack) = ack_packet {
-                                        if let Err(send_err) = self.remote_conn
-                                            .socket
-                                            .send_to(ack.data(), self.remote_conn.remote_addr)
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                peer_addr = %self.remote_conn.remote_addr,
-                                                error = ?send_err,
-                                                "Failed to send ACK for intro packet"
-                                            );
-                                        } else {
-                                            tracing::debug!(
-                                                peer_addr = %self.remote_conn.remote_addr,
-                                                "Successfully sent ACK for intro packet"
-                                            );
-                                        }
-                                    } else {
+                                if let Ok(ack) = ack_packet {
+                                    if let Err(send_err) = self.remote_conn
+                                        .socket
+                                        .send_to(ack.data(), self.remote_conn.remote_addr)
+                                        .await
+                                    {
                                         tracing::warn!(
                                             peer_addr = %self.remote_conn.remote_addr,
-                                            "Failed to create ACK packet for intro"
+                                            error = ?send_err,
+                                            "Failed to send ACK for intro packet"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            peer_addr = %self.remote_conn.remote_addr,
+                                            "Successfully sent ACK for intro packet"
                                         );
                                     }
-
-                                    // Continue to next packet
-                                    continue;
-                                }
-                                Err(rsa_err) => {
-                                    tracing::trace!(
+                                } else {
+                                    tracing::warn!(
                                         peer_addr = %self.remote_conn.remote_addr,
-                                        error = ?rsa_err,
-                                        "256-byte packet is not a valid RSA intro packet"
+                                        "Failed to create ACK packet for intro"
                                     );
                                 }
+
+                                // Continue to next packet
+                                continue;
+                            } else {
+                                tracing::trace!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    "Packet is not a valid X25519 intro packet"
+                                );
                             }
                         }
                         let now = Instant::now();

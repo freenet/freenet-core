@@ -44,7 +44,7 @@ pub fn clear_version_mismatch() {
 }
 
 pub mod connection_handler;
-mod crypto;
+pub(crate) mod crypto;
 
 /// Mock transport infrastructure for testing and benchmarking.
 /// Provides MockSocket and helper functions to create mock peer connections
@@ -169,8 +169,8 @@ pub enum TransportError {
     IO(#[from] std::io::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
-    #[error(transparent)]
-    PubKeyDecryptionError(#[from] rsa::errors::Error),
+    #[error("Key exchange failed: {0}")]
+    KeyExchangeFailed(Cow<'static, str>),
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
 }

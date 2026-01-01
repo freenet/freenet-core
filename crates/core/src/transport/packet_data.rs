@@ -7,9 +7,6 @@ use rand::{rng, Rng};
 
 use crate::transport::crypto::TransportPublicKey;
 
-use super::crypto::TransportSecretKey;
-use super::TransportError;
-
 /// The maximum size of a received UDP packet, MTU typically is 1500
 pub(in crate::transport) const MAX_PACKET_SIZE: usize = 1500 - UDP_HEADER_SIZE;
 
@@ -20,6 +17,11 @@ const TAG_SIZE: usize = 16;
 
 pub(super) const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - NONCE_SIZE - TAG_SIZE;
 const UDP_HEADER_SIZE: usize = 8;
+
+/// Size of X25519 intro packets: protocol version (variable) + ephemeral public key (32 bytes).
+/// For version "0.1.74" (7 bytes) + 32 = 39 bytes.
+/// We use a range check rather than exact size since protocol version length varies.
+pub(super) const X25519_PUBLIC_KEY_SIZE: usize = 32;
 
 /// Counter-based nonce generation for AES-GCM.
 /// Uses 8 bytes from an atomic counter + 4 random bytes generated at startup.
@@ -71,9 +73,11 @@ pub(crate) struct Plaintext;
 #[derive(Clone, Copy)]
 pub(crate) struct SymmetricAES;
 
-/// Packet is encrypted using assympetric crypto (typically an intro packet)
+/// X25519 intro packet containing ephemeral public key for key exchange.
+/// Unlike RSA, this packet is NOT encrypted - it contains a public key that
+/// the responder uses for ECDH key derivation.
 #[derive(Clone, Copy)]
-pub(super) struct AssymetricRSA;
+pub(super) struct IntroPacket;
 
 /// This is used when we don't know the encryption type of the packet, perhaps because we
 /// haven't yet determined whether it is an intro packet.
@@ -82,7 +86,7 @@ pub(crate) struct UnknownEncryption;
 
 impl Encryption for Plaintext {}
 impl Encryption for SymmetricAES {}
-impl Encryption for AssymetricRSA {}
+impl Encryption for IntroPacket {}
 impl Encryption for UnknownEncryption {}
 
 fn internal_sym_decryption<const N: usize>(
@@ -131,18 +135,30 @@ impl<const N: usize> PacketData<SymmetricAES, N> {
     }
 }
 
-impl<const N: usize> PacketData<AssymetricRSA, N> {
-    pub(super) fn encrypt_with_pubkey(data: &[u8], remote_key: &TransportPublicKey) -> Self {
+impl<const N: usize> PacketData<IntroPacket, N> {
+    /// Create an X25519 intro packet with protocol version and ephemeral public key.
+    /// The packet is NOT encrypted - it's just the public key for ECDH.
+    pub(super) fn create_intro(
+        protoc_version: &[u8],
+        ephemeral_public: &TransportPublicKey,
+    ) -> Self {
         _check_valid_size::<N>();
-        let encrypted_data: Vec<u8> = remote_key.encrypt(data);
-        debug_assert!(encrypted_data.len() <= MAX_PACKET_SIZE);
         let mut data = [0; N];
-        data[..encrypted_data.len()].copy_from_slice(&encrypted_data[..]);
+        let version_len = protoc_version.len();
+        data[..version_len].copy_from_slice(protoc_version);
+        data[version_len..version_len + X25519_PUBLIC_KEY_SIZE]
+            .copy_from_slice(ephemeral_public.as_bytes());
         Self {
             data,
-            size: encrypted_data.len(),
+            size: version_len + X25519_PUBLIC_KEY_SIZE,
             data_type: PhantomData,
         }
+    }
+
+    /// Get the raw bytes of the intro packet for sending.
+    #[allow(dead_code)]
+    pub fn prepared_send(&self) -> Box<[u8]> {
+        self.data[..self.size].into()
     }
 }
 
@@ -204,10 +220,7 @@ impl<const N: usize> PacketData<UnknownEncryption, N> {
         }
     }
 
-    pub(super) fn is_intro_packet(
-        &self,
-        actual_intro_packet: &PacketData<AssymetricRSA, N>,
-    ) -> bool {
+    pub(super) fn is_intro_packet(&self, actual_intro_packet: &PacketData<IntroPacket, N>) -> bool {
         self.size == actual_intro_packet.size
             && self.data[..self.size] == actual_intro_packet.data[..actual_intro_packet.size]
     }
@@ -226,23 +239,38 @@ impl<const N: usize> PacketData<UnknownEncryption, N> {
         })
     }
 
-    pub(super) fn try_decrypt_asym(
+    /// Try to parse as an X25519 intro packet containing protocol version + ephemeral public key.
+    /// Returns the ephemeral public key if the packet matches the expected format.
+    pub(super) fn try_parse_intro(
         &self,
-        key: &TransportSecretKey,
-    ) -> Result<PacketData<AssymetricRSA, N>, TransportError> {
-        let r = key.decrypt(self.data()).map(|decrypted| {
-            let mut data = [0; N];
-            data[..decrypted.len()].copy_from_slice(&decrypted[..]);
-            PacketData {
-                size: data.len(),
-                data,
-                data_type: PhantomData,
-            }
-        })?;
-        Ok(r)
+        expected_protoc_version: &[u8],
+    ) -> Option<TransportPublicKey> {
+        let version_len = expected_protoc_version.len();
+        let expected_size = version_len + X25519_PUBLIC_KEY_SIZE;
+
+        if self.size != expected_size {
+            return None;
+        }
+
+        // Check protocol version
+        if &self.data[..version_len] != expected_protoc_version {
+            return None;
+        }
+
+        // Extract public key
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&self.data[version_len..version_len + X25519_PUBLIC_KEY_SIZE]);
+        Some(TransportPublicKey::from_bytes(key_bytes))
     }
 
-    pub(super) fn assert_assymetric(&self) -> PacketData<AssymetricRSA, N> {
+    /// Check if this could be an intro packet based on size.
+    /// Used for quick filtering before attempting full validation.
+    #[allow(dead_code)]
+    pub(super) fn could_be_intro_packet(&self, protoc_version_len: usize) -> bool {
+        self.size == protoc_version_len + X25519_PUBLIC_KEY_SIZE
+    }
+
+    pub(super) fn assert_intro(&self) -> PacketData<IntroPacket, N> {
         PacketData {
             data: self.data,
             size: self.size,
@@ -324,6 +352,46 @@ mod tests {
             }
             Err(e) => panic!("Decryption failed with error: {e:?}"),
         }
+    }
+
+    #[test]
+    fn test_intro_packet_creation_and_parsing() {
+        use crate::transport::crypto::TransportKeypair;
+
+        let keypair = TransportKeypair::new();
+        let protoc_version = b"0.1.74";
+
+        // Create intro packet
+        let intro: PacketData<IntroPacket, MAX_PACKET_SIZE> =
+            PacketData::create_intro(protoc_version, keypair.public());
+
+        // Verify size: version (6 bytes) + public key (32 bytes)
+        assert_eq!(intro.size, 6 + 32);
+
+        // Parse as unknown packet
+        let unknown: PacketData<UnknownEncryption, MAX_PACKET_SIZE> =
+            PacketData::from_buf(intro.data());
+
+        // Verify we can parse the public key back
+        let parsed_key = unknown.try_parse_intro(protoc_version).unwrap();
+        assert_eq!(parsed_key.as_bytes(), keypair.public().as_bytes());
+    }
+
+    #[test]
+    fn test_intro_packet_wrong_version_fails() {
+        use crate::transport::crypto::TransportKeypair;
+
+        let keypair = TransportKeypair::new();
+        let protoc_version = b"0.1.74";
+
+        let intro: PacketData<IntroPacket, MAX_PACKET_SIZE> =
+            PacketData::create_intro(protoc_version, keypair.public());
+
+        let unknown: PacketData<UnknownEncryption, MAX_PACKET_SIZE> =
+            PacketData::from_buf(intro.data());
+
+        // Wrong version should fail
+        assert!(unknown.try_parse_intro(b"0.1.75").is_none());
     }
 
     fn longest_common_subsequence(a: &[u8], b: &[u8]) -> usize {

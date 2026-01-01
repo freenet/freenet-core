@@ -3,7 +3,6 @@ use std::path::Path;
 use aes_gcm::KeyInit;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::client_api::DelegateRequest;
-use rsa::pkcs8::DecodePrivateKey;
 
 use super::*;
 
@@ -204,28 +203,12 @@ fn read_cipher(path_to_cipher: impl AsRef<Path>) -> std::io::Result<[u8; CIPHER_
 
 fn read_transport_keypair(path_to_key: impl AsRef<Path>) -> std::io::Result<TransportKeypair> {
     let path_to_key = path_to_key.as_ref();
-    let mut key_file = File::open(path_to_key).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("Failed to open key file {}: {e}", path_to_key.display()),
-        )
-    })?;
-    let mut buf = String::new();
-    key_file.read_to_string(&mut buf).map_err(|e| {
+    TransportKeypair::load(path_to_key).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("Failed to read key file {}: {e}", path_to_key.display()),
         )
-    })?;
-
-    let pk = rsa::RsaPrivateKey::from_pkcs8_pem(&buf).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Failed to read key file {}: {e}", path_to_key.display()),
-        )
-    })?;
-
-    Ok::<_, std::io::Error>(TransportKeypair::from_private_key(pk))
+    })
 }
 
 #[cfg(test)]
@@ -238,19 +221,13 @@ mod tests {
         let nonce = [0u8; NONCE_SIZE];
         let cipher = [0u8; CIPHER_SIZE];
 
-        let mut transport_keypair_file = tempfile::NamedTempFile::new().unwrap();
+        let transport_keypair_file = tempfile::NamedTempFile::new().unwrap();
         let mut nonce_file = tempfile::NamedTempFile::new().unwrap();
         let mut cipher_file = tempfile::NamedTempFile::new().unwrap();
 
         // write secrets to files
-        transport_keypair_file
-            .write_all(
-                transport_keypair
-                    .secret()
-                    .to_pkcs8_pem()
-                    .unwrap()
-                    .as_slice(),
-            )
+        transport_keypair
+            .save(transport_keypair_file.path())
             .unwrap();
         nonce_file.write_all(&nonce).unwrap();
         cipher_file.write_all(&cipher).unwrap();

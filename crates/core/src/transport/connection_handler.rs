@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::PCK_VERSION;
-use crate::transport::crypto::TransportSecretKey;
-use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
+use crate::transport::crypto::{derive_symmetric_keys, EphemeralKeypair, TransportSecretKey};
+use crate::transport::packet_data::{IntroPacket, UnknownEncryption, X25519_PUBLIC_KEY_SIZE};
 use crate::transport::symmetric_message::OutboundConnection;
 use aes_gcm::{Aes128Gcm, KeyInit};
 use dashmap::DashSet;
@@ -25,7 +25,7 @@ use tokio::{
     task, task_local,
 };
 use tracing::{span, Instrument};
-use version_cmp::PROTOC_VERSION;
+pub(crate) use version_cmp::PROTOC_VERSION;
 
 use super::{
     crypto::{TransportKeypair, TransportPublicKey},
@@ -43,14 +43,16 @@ use super::{
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Size of RSA-2048 encrypted intro packets (PKCS#1 v1.5 padding).
-/// RSA-2048 produces 256-byte ciphertext for any input up to 245 bytes.
-/// Used to detect new peer identities from existing addresses (issue #2277).
-const RSA_INTRO_PACKET_SIZE: usize = 256;
+/// Size of X25519 intro packets: protocol version + ephemeral public key (32 bytes).
+/// For version "0.1.74" (6 bytes) + 32 = 38 bytes.
+/// Used to detect intro packets from peers (replaces RSA which was 256 bytes).
+fn x25519_intro_packet_size() -> usize {
+    PROTOC_VERSION.len() + X25519_PUBLIC_KEY_SIZE
+}
 
-/// Minimum interval between RSA decryption attempts for the same address.
-/// Prevents CPU exhaustion from attackers sending 256-byte packets.
-const RSA_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
+/// Minimum interval between intro packet processing attempts for the same address.
+/// Prevents resource exhaustion from attackers sending intro-sized packets.
+const INTRO_PACKET_RATE_LIMIT: Duration = Duration::from_secs(1);
 
 pub type SerializedMessage = Vec<u8>;
 
@@ -205,7 +207,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             bandwidth_limit,
             global_bandwidth,
             expected_non_gateway: expected_non_gateway.clone(),
-            last_rsa_attempt: HashMap::new(),
+            last_intro_attempt: HashMap::new(),
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -319,8 +321,8 @@ struct UdpPacketsListener<S = UdpSocket> {
     /// When set, per-connection rates are derived from total_limit / active_connections.
     global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
-    /// Rate limiting for RSA decryption attempts to prevent DoS (issue #2277).
-    last_rsa_attempt: HashMap<SocketAddr, Instant>,
+    /// Rate limiting for intro packet processing to prevent DoS (issue #2277).
+    last_intro_attempt: HashMap<SocketAddr, Instant>,
 }
 
 type OngoingConnection<S> = (
@@ -393,36 +395,29 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     // Peer was marked outdated due to version mismatch.
                                     // Check if this is a valid intro packet with current version
                                     // (peer may have upgraded). If so, allow reconnection.
-                                    if size == RSA_INTRO_PACKET_SIZE {
+                                    if size == x25519_intro_packet_size() {
                                         let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
                                         // Rate limit RSA decryption to prevent DoS
                                         let now = Instant::now();
                                         let rate_limited = self
-                                            .last_rsa_attempt
+                                            .last_intro_attempt
                                             .get(&remote_addr)
-                                            .is_some_and(|last| now.duration_since(*last) < RSA_DECRYPTION_RATE_LIMIT);
+                                            .is_some_and(|last| now.duration_since(*last) < INTRO_PACKET_RATE_LIMIT);
 
                                         if !rate_limited {
-                                            self.last_rsa_attempt.insert(remote_addr, now);
-                                            if let Ok(decrypted) = packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
-                                                let decrypted_data = decrypted.data();
-                                                let proto_len = PROTOC_VERSION.len();
-                                                if decrypted_data.len() >= proto_len + 16
-                                                    && decrypted_data[..proto_len] == PROTOC_VERSION
-                                                {
-                                                    // Peer upgraded! Clear outdated status and process packet
-                                                    tracing::info!(
-                                                        peer_addr = %remote_addr,
-                                                        "Outdated peer sent valid intro with current protocol version. \
-                                                         Peer likely upgraded. Allowing reconnection."
-                                                    );
-                                                    outdated_peer.remove(&remote_addr);
-                                                    // Clean up rate-limit tracking now that peer is reconnecting
-                                                    self.last_rsa_attempt.remove(&remote_addr);
-                                                    // Don't continue - fall through to process the packet
-                                                } else {
-                                                    continue; // Still incompatible version
-                                                }
+                                            self.last_intro_attempt.insert(remote_addr, now);
+                                            // Try to parse as X25519 intro packet
+                                            if let Some(_remote_ephemeral) = packet_data.try_parse_intro(&PROTOC_VERSION) {
+                                                // Valid intro with current protocol version
+                                                tracing::info!(
+                                                    peer_addr = %remote_addr,
+                                                    "Outdated peer sent valid intro with current protocol version. \
+                                                     Peer likely upgraded. Allowing reconnection."
+                                                );
+                                                outdated_peer.remove(&remote_addr);
+                                                // Clean up rate-limit tracking now that peer is reconnecting
+                                                self.last_intro_attempt.remove(&remote_addr);
+                                                // Don't continue - fall through to process the packet
                                             } else {
                                                 continue; // Not a valid intro packet
                                             }
@@ -453,41 +448,21 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // If we can decrypt it as an intro, a new peer is connecting from the
                                 // same IP:port (e.g., NAT assigned the same mapping after restart).
                                 let is_new_identity = if self.is_gateway
-                                    && size == RSA_INTRO_PACKET_SIZE
+                                    && size == x25519_intro_packet_size()
                                 {
                                     // Rate limit RSA decryption attempts to prevent DoS
                                     let now = Instant::now();
                                     let rate_limited = self
-                                        .last_rsa_attempt
+                                        .last_intro_attempt
                                         .get(&remote_addr)
-                                        .is_some_and(|last| now.duration_since(*last) < RSA_DECRYPTION_RATE_LIMIT);
+                                        .is_some_and(|last| now.duration_since(*last) < INTRO_PACKET_RATE_LIMIT);
 
                                     if rate_limited {
                                         false
                                     } else {
-                                        self.last_rsa_attempt.insert(remote_addr, now);
-                                        // Try RSA decryption and validate intro packet structure
-                                        match packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
-                                            Ok(decrypted) => {
-                                                // Validate intro packet structure:
-                                                // 1. Protocol version (PROTOC_VERSION.len() bytes)
-                                                // 2. Outbound symmetric key (16 bytes)
-                                                let decrypted_data = decrypted.data();
-                                                let proto_len = PROTOC_VERSION.len();
-                                                if decrypted_data.len() >= proto_len + 16
-                                                    && decrypted_data[..proto_len] == PROTOC_VERSION
-                                                {
-                                                    true
-                                                } else {
-                                                    tracing::debug!(
-                                                        peer_addr = %remote_addr,
-                                                        "256-byte packet decrypted but not valid intro structure"
-                                                    );
-                                                    false
-                                                }
-                                            }
-                                            Err(_) => false, // Not an RSA intro packet for us
-                                        }
+                                        self.last_intro_attempt.insert(remote_addr, now);
+                                        // Try to parse as X25519 intro packet
+                                        packet_data.try_parse_intro(&PROTOC_VERSION).is_some()
                                     }
                                 } else {
                                     false
@@ -500,7 +475,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                          Peer likely restarted with new identity. Resetting session."
                                     );
                                     // Clean up rate-limit tracking for the old peer
-                                    self.last_rsa_attempt.remove(&remote_addr);
+                                    self.last_intro_attempt.remove(&remote_addr);
                                     // Don't reinsert - let the packet fall through to gateway_connection
                                     // which will establish a fresh session with the new peer
                                 } else {
@@ -551,7 +526,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                 "Connection closed, removing from active connections"
                                             );
                                             // Clean up rate-limit tracking
-                                            self.last_rsa_attempt.remove(&remote_addr);
+                                            self.last_intro_attempt.remove(&remote_addr);
                                             // Don't reinsert - connection is truly dead
                                             continue;
                                         }
@@ -565,7 +540,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 // After we detect a new identity and create a gateway_connection, subsequent
                                 // intro packets (256 bytes) should be ignored - we're waiting for a symmetric
                                 // ACK response which is not 256 bytes.
-                                if size == RSA_INTRO_PACKET_SIZE {
+                                if size == x25519_intro_packet_size() {
                                     tracing::debug!(
                                         peer_addr = %remote_addr,
                                         direction = "inbound",
@@ -660,7 +635,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 for stale_addr in stale_addrs {
                                     self.remote_connections.remove(&stale_addr);
                                     // Clean up rate-limit tracking for the stale connection
-                                    self.last_rsa_attempt.remove(&stale_addr);
+                                    self.last_intro_attempt.remove(&stale_addr);
                                     tracing::debug!(
                                         stale_peer_addr = %stale_addr,
                                         new_peer_addr = %remote_addr,
@@ -668,8 +643,18 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     );
                                 }
 
-                                let inbound_key_bytes = key_from_addr(&remote_addr);
-                                let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
+                                // Parse the X25519 intro packet to get the ephemeral public key
+                                let remote_ephemeral_public = match packet_data.try_parse_intro(&PROTOC_VERSION) {
+                                    Some(pubkey) => pubkey,
+                                    None => {
+                                        tracing::trace!(
+                                            peer_addr = %remote_addr,
+                                            "Received packet is not a valid X25519 intro packet"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, remote_ephemeral_public);
                                 let task = tokio::spawn(gw_ongoing_connection
                                     .instrument(tracing::span!(tracing::Level::DEBUG, "gateway_connection"))
                                     .map_err(move |error| {
@@ -857,7 +842,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                     // it's because the existing one isn't working - trust the caller and replace it.
                     if let Some(_existing_conn) = self.remote_connections.remove(&remote_addr) {
                         // Clean up rate-limit tracking
-                        self.last_rsa_attempt.remove(&remote_addr);
+                        self.last_intro_attempt.remove(&remote_addr);
                         tracing::info!(
                             peer_addr = %remote_addr,
                             direction = "outbound",
@@ -904,14 +889,15 @@ impl<S: Socket> UdpPacketsListener<S> {
     #[allow(clippy::type_complexity)]
     fn gateway_connection(
         &mut self,
-        remote_intro_packet: PacketData<UnknownEncryption>,
+        _remote_intro_packet: PacketData<UnknownEncryption>,
         remote_addr: SocketAddr,
-        inbound_key_bytes: [u8; 16],
+        remote_ephemeral_public: TransportPublicKey,
     ) -> (
         GatewayConnectionFuture<S>,
         FastSender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
+        let this_public = self.this_peer_keypair.public.clone();
         let bandwidth_limit = self.bandwidth_limit;
         let global_bandwidth = self.global_bandwidth.clone();
         let socket = self.socket_listener.clone();
@@ -919,47 +905,30 @@ impl<S: Socket> UdpPacketsListener<S> {
         let (inbound_from_remote, next_inbound) =
             fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
         let f = async move {
-            let decrypted_intro_packet =
-                secret.decrypt(remote_intro_packet.data()).map_err(|err| {
-                    tracing::debug!(
-                        peer_addr = %remote_addr,
-                        error = %err,
-                        direction = "inbound",
-                        "Failed to decrypt intro packet"
-                    );
-                    err
-                })?;
+            // Derive shared secret using ECDH: our secret + their ephemeral public
+            let shared_secret = secret.diffie_hellman(&remote_ephemeral_public);
 
-            let protoc = decrypted_intro_packet
-                .get(..PROTOC_VERSION.len())
-                .ok_or_else(|| TransportError::ConnectionEstablishmentFailure {
-                    cause: "Packet too small to contain protocol version".into(),
-                })?;
+            // Derive symmetric keys from shared secret
+            // The initiator's ephemeral public key is used to determine key ordering
+            // Initiator uses (outbound, inbound) = derive(initiator_pub, responder_pub)
+            // Responder uses (inbound, outbound) = derive(initiator_pub, responder_pub)
+            let (initiator_to_responder, responder_to_initiator) = derive_symmetric_keys(
+                shared_secret.as_bytes(),
+                remote_ephemeral_public.as_bytes(), // initiator's ephemeral public
+                this_public.as_bytes(),             // responder's static public
+            );
 
-            let outbound_key_bytes = decrypted_intro_packet
-                .get(PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16)
-                .ok_or_else(|| TransportError::ConnectionEstablishmentFailure {
-                    cause: "Packet too small to contain outbound key bytes".into(),
-                })?;
-
-            let outbound_key = Aes128Gcm::new_from_slice(outbound_key_bytes).map_err(|_| {
-                TransportError::ConnectionEstablishmentFailure {
-                    cause: "invalid symmetric key".into(),
-                }
-            })?;
-            if protoc != PROTOC_VERSION {
-                let packet = SymmetricMessage::ack_error(&outbound_key)?;
-                socket
-                    .send_to(&packet.prepared_send(), remote_addr)
-                    .await
-                    .map_err(|_| TransportError::ChannelClosed)?;
-                return Err(TransportError::ProtocolVersionMismatch {
-                    expected: PCK_VERSION.to_string(),
-                    actual: PCK_VERSION, // We expected our version, they sent something else
-                });
-            }
+            // As responder:
+            // - inbound_key = key initiator uses to send to us = initiator_to_responder
+            // - outbound_key = key we use to send to initiator = responder_to_initiator
+            let inbound_key_bytes = initiator_to_responder;
+            let outbound_key_bytes = responder_to_initiator;
 
             let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
+            let outbound_key = Aes128Gcm::new(&outbound_key_bytes.into());
+
+            // Send ACK encrypted with our outbound key
+            // Include our inbound key so the peer knows what key to use when sending to us
             let outbound_ack_packet =
                 SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
 
@@ -976,30 +945,63 @@ impl<S: Socket> UdpPacketsListener<S> {
                 .map_err(|_| TransportError::ChannelClosed)?;
 
             // wait until the remote sends the ack packet
-            let timeout = tokio::time::timeout(Duration::from_secs(5), next_inbound.recv_async());
-            match timeout.await {
-                Ok(Ok(packet)) => {
-                    let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
+            // If our ACK was dropped, the peer will resend its intro packet
+            // In that case, we should resend our ACK
+            let mut attempts = 0;
+            const MAX_ATTEMPTS: u32 = 5;
+            loop {
+                let timeout =
+                    tokio::time::timeout(Duration::from_secs(5), next_inbound.recv_async());
+                match timeout.await {
+                    Ok(Ok(packet)) => {
+                        // Try to decrypt - if successful, connection is established
+                        if packet.try_decrypt_sym(&inbound_key).is_ok() {
+                            break;
+                        }
+
+                        // Decryption failed - check if it's a resent intro packet
+                        if packet.try_parse_intro(&PROTOC_VERSION).is_some() {
+                            attempts += 1;
+                            if attempts >= MAX_ATTEMPTS {
+                                return Err(TransportError::ConnectionEstablishmentFailure {
+                                    cause: "max ACK resend attempts reached".into(),
+                                });
+                            }
+                            tracing::trace!(
+                                peer_addr = %remote_addr,
+                                direction = "inbound",
+                                attempts,
+                                "Received resent intro packet, resending ACK"
+                            );
+                            // Resend ACK
+                            socket
+                                .send_to(&outbound_ack_packet.clone().prepared_send(), remote_addr)
+                                .await
+                                .map_err(|_| TransportError::ChannelClosed)?;
+                            continue;
+                        }
+
+                        // Unknown packet type
                         tracing::debug!(
                             peer_addr = %remote_addr,
                             direction = "inbound",
                             packet_len = packet.data().len(),
                             "Failed to decrypt packet with inbound key"
                         );
-                        TransportError::ConnectionEstablishmentFailure {
+                        return Err(TransportError::ConnectionEstablishmentFailure {
                             cause: "invalid symmetric key".into(),
-                        }
-                    })?;
-                }
-                Ok(Err(_)) => {
-                    return Err(TransportError::ConnectionEstablishmentFailure {
-                        cause: "connection closed".into(),
-                    });
-                }
-                Err(_) => {
-                    return Err(TransportError::ConnectionEstablishmentFailure {
-                        cause: "connection timed out waiting for response".into(),
-                    });
+                        });
+                    }
+                    Ok(Err(_)) => {
+                        return Err(TransportError::ConnectionEstablishmentFailure {
+                            cause: "connection closed".into(),
+                        });
+                    }
+                    Err(_) => {
+                        return Err(TransportError::ConnectionEstablishmentFailure {
+                            cause: "connection timed out waiting for response".into(),
+                        });
+                    }
                 }
             }
 
@@ -1099,55 +1101,70 @@ impl<S: Socket> UdpPacketsListener<S> {
             StartOutbound,
             /// Initial state of the joinee, at this point NAT has been already traversed
             RemoteInbound {
-                /// Encrypted intro packet for comparison
-                intro_packet: PacketData<AssymetricRSA>,
+                /// Intro packet for comparison (to detect duplicates)
+                intro_packet: PacketData<IntroPacket>,
             },
         }
 
-        fn decrypt_asym(
+        /// Try to parse an intro packet from the remote peer.
+        /// With X25519, intro packets are unencrypted: PROTOC_VERSION + ephemeral_public_key
+        ///
+        /// For NAT traversal, we use static-to-static DH to ensure both sides derive
+        /// the same keys regardless of packet loss. This trades some forward secrecy
+        /// for reliability in symmetric NAT scenarios.
+        #[allow(clippy::too_many_arguments)]
+        fn try_parse_intro(
             remote_addr: SocketAddr,
             packet: &PacketData<UnknownEncryption>,
             transport_secret_key: &TransportSecretKey,
+            our_static_public: &TransportPublicKey,
+            remote_static_public: &TransportPublicKey,
             outbound_sym_key: &mut Option<Aes128Gcm>,
+            inbound_sym_key: &mut Option<Aes128Gcm>,
+            inbound_sym_key_bytes: &mut Option<[u8; 16]>,
             state: &mut ConnectionState,
         ) -> Result<(), ()> {
-            // probably the first packet to punch through the NAT
-            if let Ok(decrypted_intro_packet) = packet.try_decrypt_asym(transport_secret_key) {
+            // Try to parse as X25519 intro packet
+            if packet.try_parse_intro(&PROTOC_VERSION).is_some() {
                 tracing::debug!(
                     peer_addr = %remote_addr,
                     direction = "outbound",
-                    "Received intro packet"
+                    "Received X25519 intro packet"
                 );
-                let protoc = &decrypted_intro_packet.data()[..PROTOC_VERSION.len()];
-                if protoc != PROTOC_VERSION {
-                    tracing::debug!(
-                        peer_addr = %remote_addr,
-                        remote_protoc = ?protoc,
-                        this_protoc = ?PROTOC_VERSION,
-                        direction = "outbound",
-                        "Remote is using a different protocol version"
-                    );
-                    return Err(());
-                }
-                let outbound_key_bytes =
-                    &decrypted_intro_packet.data()[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
-                let outbound_key =
-                    Aes128Gcm::new_from_slice(outbound_key_bytes).expect("correct length");
-                *outbound_sym_key = Some(outbound_key.clone());
+
+                // For NAT traversal, use static-to-static DH for consistent keys
+                // Both sides derive: our_static.DH(remote_static) = remote_static.DH(our_static)
+                let shared_secret = transport_secret_key.diffie_hellman(remote_static_public);
+
+                // Derive keys using canonical ordering of static public keys
+                let (first_to_second, second_to_first) = derive_symmetric_keys(
+                    shared_secret.as_bytes(),
+                    our_static_public.as_bytes(),
+                    remote_static_public.as_bytes(),
+                );
+
+                // Use keys based on our perspective:
+                // - outbound = what we send to them
+                // - inbound = what they send to us
+                *inbound_sym_key_bytes = Some(second_to_first);
+                *inbound_sym_key = Some(Aes128Gcm::new(&second_to_first.into()));
+                *outbound_sym_key = Some(Aes128Gcm::new(&first_to_second.into()));
+
                 *state = ConnectionState::RemoteInbound {
-                    intro_packet: packet.assert_assymetric(),
+                    intro_packet: packet.assert_intro(),
                 };
                 return Ok(());
             }
             tracing::trace!(
-                peer_addr = %remote_addr,
+                remote_addr = %remote_addr,
                 direction = "outbound",
-                "Failed to decrypt packet"
+                "Packet is not a valid intro packet"
             );
             Err(())
         }
 
         let transport_secret_key = self.this_peer_keypair.secret.clone();
+        let this_public = self.this_peer_keypair.public.clone();
         let bandwidth_limit = self.bandwidth_limit;
         let global_bandwidth = self.global_bandwidth.clone();
         let socket = self.socket_listener.clone();
@@ -1167,16 +1184,44 @@ impl<S: Socket> UdpPacketsListener<S> {
             let mut resend_tick = tokio::time::interval(INITIAL_INTERVAL);
             resend_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-            let inbound_sym_key_bytes = rand::random::<[u8; 16]>();
-            let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
+            // Generate ephemeral keypair for this connection (provides forward secrecy)
+            let ephemeral_keypair = EphemeralKeypair::new();
+            let ephemeral_public = ephemeral_keypair.public.clone();
 
-            let mut outbound_sym_key: Option<Aes128Gcm> = None;
-            let outbound_intro_packet = {
-                let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
-                data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
-                data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
-                PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&data, &remote_public_key)
-            };
+            // Derive symmetric keys from ECDH with remote's static public key
+            // This is for peer-to-gateway connections where gateway uses our ephemeral
+            let shared_secret = ephemeral_keypair.diffie_hellman(&remote_public_key);
+            let (initiator_to_responder, responder_to_initiator) = derive_symmetric_keys(
+                shared_secret.as_bytes(),
+                ephemeral_public.as_bytes(), // our ephemeral (we're initiator)
+                remote_public_key.as_bytes(), // their static
+            );
+
+            // As initiator:
+            // - outbound = initiator_to_responder (what we send to them)
+            // - inbound = responder_to_initiator (what they send to us)
+            let outbound_sym_key_bytes = initiator_to_responder;
+            let mut inbound_sym_key_bytes: Option<[u8; 16]> = Some(responder_to_initiator);
+            let outbound_sym_key = Aes128Gcm::new(&outbound_sym_key_bytes.into());
+            let mut inbound_sym_key: Option<Aes128Gcm> =
+                Some(Aes128Gcm::new(&responder_to_initiator.into()));
+
+            // Pre-compute static-based keys for NAT traversal fallback
+            // This handles the case where the remote already transitioned to static-based keys
+            let static_shared = transport_secret_key.diffie_hellman(&remote_public_key);
+            let (_static_first, static_second) = derive_symmetric_keys(
+                static_shared.as_bytes(),
+                this_public.as_bytes(),
+                remote_public_key.as_bytes(),
+            );
+            let static_inbound_key = Aes128Gcm::new(&static_second.into());
+
+            // For the case where remote sends us an intro packet (we become responder)
+            let mut response_outbound_sym_key: Option<Aes128Gcm> = None;
+
+            // Create intro packet: PROTOC_VERSION + ephemeral_public_key
+            let outbound_intro_packet: PacketData<IntroPacket, MAX_PACKET_SIZE> =
+                PacketData::create_intro(&PROTOC_VERSION, &ephemeral_public);
 
             let mut sent_tracker = SentPacketTracker::new();
 
@@ -1205,9 +1250,14 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 direction = "outbound",
                                 "Sending back protocol version and inbound key to remote"
                             );
+                            // Use response_outbound_sym_key if remote won tiebreaker,
+                            // otherwise use original outbound_sym_key
+                            let ack_encrypt_key = response_outbound_sym_key
+                                .as_ref()
+                                .unwrap_or(&outbound_sym_key);
                             let our_inbound = SymmetricMessage::ack_ok(
-                                outbound_sym_key.as_ref().expect("should be set"),
-                                inbound_sym_key_bytes,
+                                ack_encrypt_key,
+                                inbound_sym_key_bytes.expect("should be set"),
                                 remote_addr,
                             )?;
                             socket
@@ -1241,9 +1291,30 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     packet_len = packet.data().len(),
                                     "Received packet from remote"
                                 );
-                                if let Ok(decrypted_packet) =
-                                    packet.try_decrypt_sym(&inbound_sym_key)
+                                // Try to decrypt with the inbound key we derived
+                                // First try ephemeral-based key (for gateway connections)
+                                // Then try static-based key (for NAT traversal where remote
+                                // already transitioned to static keys)
+                                let inbound_key = inbound_sym_key.as_ref().expect("should be set");
+                                let (decrypted_packet, use_static_keys) = if let Ok(pkt) =
+                                    packet.try_decrypt_sym(inbound_key)
                                 {
+                                    (Some(pkt), false)
+                                } else if let Ok(pkt) = packet.try_decrypt_sym(&static_inbound_key)
+                                {
+                                    // Remote is using static-based keys, switch to static
+                                    (Some(pkt), true)
+                                } else {
+                                    // Can't decrypt - try parsing as intro
+                                    (None, false)
+                                };
+                                if let Some(decrypted_packet) = decrypted_packet {
+                                    if use_static_keys {
+                                        // Switch to static-based keys for response
+                                        inbound_sym_key_bytes = Some(static_second);
+                                        inbound_sym_key =
+                                            Some(Aes128Gcm::new(&static_second.into()));
+                                    }
                                     // the remote got our inbound key, so we know that they are at least at the RemoteInbound state
                                     let symmetric_message =
                                         SymmetricMessage::deser(decrypted_packet.data())?;
@@ -1287,7 +1358,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                             );
                                             let ack_packet = SymmetricMessage::ack_ok(
                                                 &outbound_sym_key,
-                                                inbound_sym_key_bytes,
+                                                inbound_sym_key_bytes.expect("should be set"),
                                                 remote_addr,
                                             )?;
                                             socket
@@ -1333,9 +1404,11 @@ impl<S: Socket> UdpPacketsListener<S> {
                                                     ),
                                                     last_packet_id: Arc::new(AtomicU32::new(0)),
                                                     inbound_packet_recv: inbound_recv,
-                                                    inbound_symmetric_key: inbound_sym_key,
+                                                    inbound_symmetric_key: inbound_sym_key
+                                                        .expect("should be set"),
                                                     inbound_symmetric_key_bytes:
-                                                        inbound_sym_key_bytes,
+                                                        inbound_sym_key_bytes
+                                                            .expect("should be set"),
                                                     my_address: Some(my_address),
                                                     transport_secret_key: transport_secret_key
                                                         .clone(),
@@ -1366,11 +1439,16 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 }
 
                                 // probably the first packet to punch through the NAT
-                                if decrypt_asym(
+                                // Try to parse as X25519 intro packet from remote
+                                if try_parse_intro(
                                     remote_addr,
                                     &packet,
                                     &transport_secret_key,
-                                    &mut outbound_sym_key,
+                                    &this_public,
+                                    &remote_public_key,
+                                    &mut response_outbound_sym_key,
+                                    &mut inbound_sym_key,
+                                    &mut inbound_sym_key_bytes,
                                     &mut state,
                                 )
                                 .is_ok()
@@ -1381,7 +1459,7 @@ impl<S: Socket> UdpPacketsListener<S> {
                                 tracing::trace!(
                                     peer_addr = %remote_addr,
                                     direction = "outbound",
-                                    "Failed to decrypt packet"
+                                    "Failed to parse packet as intro"
                                 );
                                 continue;
                             }
@@ -1427,18 +1505,23 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     direction = "outbound",
                                     "Outbound handshake completed (inbound ack path)"
                                 );
+                                // Use response_outbound_sym_key if remote won tiebreaker,
+                                // otherwise use original outbound_sym_key
+                                let final_outbound_key =
+                                    response_outbound_sym_key.unwrap_or(outbound_sym_key);
                                 return Ok((
                                     RemoteConnection {
-                                        outbound_symmetric_key: outbound_sym_key
-                                            .expect("should be set at this stage"),
+                                        outbound_symmetric_key: final_outbound_key,
                                         remote_addr,
                                         sent_tracker: Arc::new(parking_lot::Mutex::new(
                                             SentPacketTracker::new(),
                                         )),
                                         last_packet_id: Arc::new(AtomicU32::new(0)),
                                         inbound_packet_recv: inbound_recv,
-                                        inbound_symmetric_key: inbound_sym_key,
-                                        inbound_symmetric_key_bytes: inbound_sym_key_bytes,
+                                        inbound_symmetric_key: inbound_sym_key
+                                            .expect("should be set"),
+                                        inbound_symmetric_key_bytes: inbound_sym_key_bytes
+                                            .expect("should be set"),
                                         my_address: None,
                                         transport_secret_key: transport_secret_key.clone(),
                                         ledbat,
@@ -1501,35 +1584,6 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
     }
 }
 
-fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
-    let current_time = chrono::Utc::now();
-    let mut hasher = blake3::Hasher::new();
-    match addr {
-        SocketAddr::V4(v4) => {
-            hasher.update(&v4.ip().octets());
-            hasher.update(&v4.port().to_le_bytes());
-        }
-        SocketAddr::V6(v6) => {
-            hasher.update(&v6.ip().octets());
-            hasher.update(&v6.port().to_le_bytes());
-        }
-    }
-    hasher.update(
-        current_time
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp()
-            .to_le_bytes()
-            .as_ref(),
-    );
-    RANDOM_U64.with(|&random_value| {
-        hasher.update(random_value.as_ref());
-    });
-    hasher.finalize().as_bytes()[..16].try_into().unwrap()
-}
-
 pub(crate) enum ConnectionEvent<S = UdpSocket> {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
@@ -1541,10 +1595,10 @@ struct InboundRemoteConnection {
     inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
 }
 
-mod version_cmp {
+pub(crate) mod version_cmp {
     use crate::config::PCK_VERSION;
 
-    pub(super) const PROTOC_VERSION: [u8; 8] = parse_version_with_flags(PCK_VERSION);
+    pub const PROTOC_VERSION: [u8; 8] = parse_version_with_flags(PCK_VERSION);
 
     const fn parse_version_with_flags(version: &str) -> [u8; 8] {
         let mut major = 0u8;

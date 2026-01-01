@@ -1,32 +1,71 @@
 use std::path::Path;
 
-use rsa::{
-    pkcs8,
-    rand_core::{CryptoRngCore, OsRng},
-    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
-};
 use serde::{Deserialize, Serialize};
+use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// X25519 keypair for transport layer key exchange.
+///
+/// Uses Curve25519 Diffie-Hellman for key exchange, which is:
+/// - ~100-1000x faster than RSA-2048 for key generation and exchange
+/// - 32 bytes vs 256 bytes for public keys
+/// - Used by TLS 1.3, WireGuard, Signal, etc.
+#[derive(Clone)]
 pub struct TransportKeypair {
     pub(super) public: TransportPublicKey,
     pub(super) secret: TransportSecretKey,
 }
 
+impl std::fmt::Debug for TransportKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportKeypair")
+            .field("public", &self.public)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TransportKeypair {
+    fn eq(&self, other: &Self) -> bool {
+        self.public == other.public
+    }
+}
+
+impl Eq for TransportKeypair {}
+
 impl TransportKeypair {
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        use pkcs8::EncodePrivateKey;
         use std::fs::File;
         use std::io::Write;
 
         let mut file = File::create(path)?;
-        let key = self
-            .secret
-            .0
-            .to_pkcs8_pem(pkcs8::LineEnding::default())
-            .unwrap();
-        file.write_all(key.as_bytes())?;
+        // Save as hex-encoded secret key (32 bytes = 64 hex chars)
+        let hex = hex::encode(self.secret.0.as_bytes());
+        file.write_all(hex.as_bytes())?;
         Ok(())
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        use std::fs::File;
+        use std::io::Read;
+
+        let mut file = File::open(path)?;
+        let mut hex = String::new();
+        file.read_to_string(&mut hex)?;
+        let bytes = hex::decode(hex.trim())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if bytes.len() != 32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid key length",
+            ));
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&bytes);
+        let secret = StaticSecret::from(key_bytes);
+        let public = PublicKey::from(&secret);
+        Ok(Self {
+            public: TransportPublicKey(public),
+            secret: TransportSecretKey(secret),
+        })
     }
 }
 
@@ -38,28 +77,17 @@ impl Default for TransportKeypair {
 
 impl TransportKeypair {
     pub fn new() -> Self {
-        let mut rng = OsRng;
-        Self::new_inner(&mut rng)
+        // Generate 32 random bytes and create a StaticSecret from them
+        let random_bytes: [u8; 32] = rand::random();
+        Self::from_secret_bytes(random_bytes)
     }
 
-    pub fn new_with_rng(rng: &mut impl CryptoRngCore) -> Self {
-        Self::new_inner(rng)
-    }
-
-    fn new_inner(rng: &mut impl CryptoRngCore) -> Self {
-        const BITS: usize = 2048;
-        let priv_key = RsaPrivateKey::new(rng, BITS).expect("failed to generate a key");
-        let public = TransportPublicKey(RsaPublicKey::from(&priv_key));
+    pub fn from_secret_bytes(bytes: [u8; 32]) -> Self {
+        let secret = StaticSecret::from(bytes);
+        let public = PublicKey::from(&secret);
         TransportKeypair {
-            public,
-            secret: TransportSecretKey(priv_key),
-        }
-    }
-
-    pub fn from_private_key(priv_key: RsaPrivateKey) -> Self {
-        TransportKeypair {
-            public: TransportPublicKey(RsaPublicKey::from(&priv_key)),
-            secret: TransportSecretKey(priv_key),
+            public: TransportPublicKey(public),
+            secret: TransportSecretKey(secret),
         }
     }
 
@@ -67,37 +95,77 @@ impl TransportKeypair {
         &self.public
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn secret(&self) -> &TransportSecretKey {
         &self.secret
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
-pub struct TransportPublicKey(RsaPublicKey);
+// Custom serialization to make TransportKeypair serializable
+impl Serialize for TransportKeypair {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize the secret key bytes (public key can be derived)
+        let bytes = self.secret.0.as_bytes();
+        bytes.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TransportKeypair {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes: [u8; 32] = Deserialize::deserialize(deserializer)?;
+        Ok(Self::from_secret_bytes(bytes))
+    }
+}
+
+/// X25519 public key (32 bytes).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct TransportPublicKey(pub(super) PublicKey);
 
 impl TransportPublicKey {
-    pub fn encrypt(&self, data: &[u8]) -> Vec<u8> {
-        let mut rng = OsRng;
-        let padding = Pkcs1v15Encrypt;
-        self.0
-            .encrypt(&mut rng, padding, data)
-            .expect("failed to encrypt")
+    /// Get the raw 32-byte public key.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
     }
 
-    /// Save the public key to a file in PEM format.
+    /// Create from raw bytes.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        TransportPublicKey(PublicKey::from(bytes))
+    }
+
+    /// Save the public key to a file in hex format.
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        use pkcs8::EncodePublicKey;
         use std::fs::File;
         use std::io::Write;
 
         let mut file = File::create(path)?;
-        let key = self
-            .0
-            .to_public_key_pem(pkcs8::LineEnding::default())
-            .unwrap();
-        file.write_all(key.as_bytes())?;
+        let hex = hex::encode(self.0.as_bytes());
+        file.write_all(hex.as_bytes())?;
         Ok(())
+    }
+}
+
+impl Serialize for TransportPublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.as_bytes().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TransportPublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes: [u8; 32] = Deserialize::deserialize(deserializer)?;
+        Ok(TransportPublicKey(PublicKey::from(bytes)))
     }
 }
 
@@ -109,50 +177,147 @@ impl std::fmt::Debug for TransportPublicKey {
 
 impl std::fmt::Display for TransportPublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use pkcs8::EncodePublicKey;
-
-        let encoded = self.0.to_public_key_der().map_err(|_| std::fmt::Error)?;
-        let bytes = encoded.as_bytes();
-
-        // For RSA 2048-bit keys, DER encoding is ~294 bytes:
-        // - Bytes 0-~22: DER structure headers (same for all 2048-bit keys)
-        // - Bytes ~23-~279: Modulus (256 bytes of random data)
-        // - Bytes ~280-~293: Exponent (typically 65537, same for all keys)
-        //
-        // To create a short but unique display string, we use 12 bytes from
-        // the middle of the modulus where the actual random data lives.
-        if bytes.len() >= 150 {
-            // Take 12 bytes from the middle of the modulus (around byte 100-112)
-            let mid_start = 100;
-            let to_encode = &bytes[mid_start..mid_start + 12];
-            write!(f, "{}", bs58::encode(to_encode).into_string())
-        } else {
-            // Fallback for smaller keys
-            write!(f, "{}", bs58::encode(bytes).into_string())
-        }
+        // Display first 16 bytes as base58 for a compact representation
+        write!(
+            f,
+            "{}",
+            bs58::encode(&self.0.as_bytes()[..16]).into_string()
+        )
     }
 }
 
-impl From<RsaPublicKey> for TransportPublicKey {
-    fn from(key: RsaPublicKey) -> Self {
-        TransportPublicKey(key)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct TransportSecretKey(RsaPrivateKey);
+/// X25519 secret key for ECDH key exchange.
+#[derive(Clone)]
+pub(crate) struct TransportSecretKey(pub(super) StaticSecret);
 
 impl TransportSecretKey {
-    pub fn decrypt(&self, data: &[u8]) -> rsa::Result<Vec<u8>> {
-        self.0.decrypt(Pkcs1v15Encrypt, data)
+    /// Perform Diffie-Hellman key exchange with a remote public key.
+    /// Returns a 32-byte shared secret.
+    pub fn diffie_hellman(&self, remote_public: &TransportPublicKey) -> SharedSecret {
+        self.0.diffie_hellman(&remote_public.0)
+    }
+}
+
+impl std::fmt::Debug for TransportSecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportSecretKey").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TransportSecretKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_bytes() == other.0.as_bytes()
+    }
+}
+
+impl Eq for TransportSecretKey {}
+
+impl Serialize for TransportSecretKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.as_bytes().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TransportSecretKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes: [u8; 32] = Deserialize::deserialize(deserializer)?;
+        Ok(TransportSecretKey(StaticSecret::from(bytes)))
+    }
+}
+
+/// Ephemeral X25519 keypair for single-use key exchange.
+///
+/// This is used during the handshake to provide forward secrecy.
+/// Each connection generates a new ephemeral keypair.
+///
+/// Note: We use StaticSecret internally because EphemeralSecret requires
+/// rand_core 0.6 which conflicts with our rand version. StaticSecret provides
+/// the same cryptographic properties when used only once.
+pub struct EphemeralKeypair {
+    pub public: TransportPublicKey,
+    secret: StaticSecret,
+}
+
+impl EphemeralKeypair {
+    /// Generate a new ephemeral keypair.
+    pub fn new() -> Self {
+        // Generate random bytes and create a StaticSecret from them
+        // (StaticSecret::from clamps the bytes internally just like EphemeralSecret)
+        let random_bytes: [u8; 32] = rand::random();
+        let secret = StaticSecret::from(random_bytes);
+        let public = PublicKey::from(&secret);
+        Self {
+            public: TransportPublicKey(public),
+            secret,
+        }
     }
 
-    #[cfg(test)]
-    pub fn to_pkcs8_pem(&self) -> Result<Vec<u8>, pkcs8::Error> {
-        use pkcs8::EncodePrivateKey;
-        self.0
-            .to_pkcs8_pem(pkcs8::LineEnding::default())
-            .map(|s| s.as_str().as_bytes().to_vec())
+    /// Perform Diffie-Hellman key exchange and consume the ephemeral keypair.
+    /// Returns a 32-byte shared secret.
+    pub fn diffie_hellman(self, remote_public: &TransportPublicKey) -> SharedSecret {
+        self.secret.diffie_hellman(&remote_public.0)
+    }
+}
+
+impl Default for EphemeralKeypair {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Derive symmetric encryption keys from a shared secret using HKDF.
+///
+/// Returns two 16-byte AES-128 keys:
+/// - first_to_second: Key for messages from first party to second party
+/// - second_to_first: Key for messages from second party to first party
+///
+/// The keys are derived using a canonical ordering of public keys to ensure
+/// both parties derive the same keys regardless of which order they pass them.
+pub fn derive_symmetric_keys(
+    shared_secret: &[u8],
+    first_public: &[u8; 32],
+    second_public: &[u8; 32],
+) -> ([u8; 16], [u8; 16]) {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    // Sort public keys canonically to ensure both parties derive same keys
+    let (lower, higher) = if first_public < second_public {
+        (first_public, second_public)
+    } else {
+        (second_public, first_public)
+    };
+
+    // Build info string using canonical order for domain separation
+    let mut info = Vec::with_capacity(64);
+    info.extend_from_slice(lower);
+    info.extend_from_slice(higher);
+
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+
+    let mut key_material = [0u8; 32];
+    hk.expand(&info, &mut key_material)
+        .expect("32 bytes is valid output length for HKDF-SHA256");
+
+    // lower_to_higher key is first half, higher_to_lower is second half
+    let mut lower_to_higher = [0u8; 16];
+    let mut higher_to_lower = [0u8; 16];
+    lower_to_higher.copy_from_slice(&key_material[..16]);
+    higher_to_lower.copy_from_slice(&key_material[16..]);
+
+    // Return keys in the order that makes sense for the caller
+    if first_public < second_public {
+        // first is "lower", so first_to_second = lower_to_higher
+        (lower_to_higher, higher_to_lower)
+    } else {
+        // first is "higher", so first_to_second = higher_to_lower
+        (higher_to_lower, lower_to_higher)
     }
 }
 
@@ -164,7 +329,7 @@ thread_local! {
 #[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for TransportKeypair {
     fn arbitrary(_u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        // Cache the keypair to avoid expensive RSA generation on each call
+        // Cache the keypair to avoid repeated generation
         Ok(CACHED_KEYPAIR.with(|cached| {
             let mut cached = cached.borrow_mut();
             match &*cached {
@@ -188,31 +353,131 @@ impl<'a> arbitrary::Arbitrary<'a> for TransportPublicKey {
 }
 
 #[cfg(test)]
-#[test]
-fn key_sizes_and_decryption() {
-    let pair = TransportKeypair::new();
-    let sym_key_bytes = rand::random::<[u8; 16]>();
-    // use aes_gcm::KeyInit;
-    // let _sym_key = aes_gcm::aes::Aes128::new(&sym_key_bytes.into());
-    let encrypted: Vec<u8> = pair.public.encrypt(&sym_key_bytes);
-    assert!(
-        encrypted.len() <= super::packet_data::MAX_PACKET_SIZE,
-        "packet size is too big"
-    );
-    let bytes = pair.secret.decrypt(&encrypted).unwrap();
-    assert_eq!(bytes, sym_key_bytes.as_slice());
-}
-
-#[cfg(test)]
-mod display_uniqueness_tests {
+mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     #[test]
-    fn display_produces_unique_strings_for_100_keys() {
-        // Verify the Display impl produces unique strings by checking 100 keys.
-        // This test was added after discovering the original Display impl only
-        // had ~1 byte of entropy (see PR #2233 for details).
+    fn key_generation_is_fast() {
+        use std::time::Instant;
+
+        let start = Instant::now();
+        for _ in 0..100 {
+            let _ = TransportKeypair::new();
+        }
+        let elapsed = start.elapsed();
+
+        // X25519 key generation should be < 1ms per key on average
+        // RSA-2048 takes 50-100ms per key
+        assert!(
+            elapsed.as_millis() < 100,
+            "100 key generations took {}ms (should be < 100ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn diffie_hellman_key_exchange() {
+        let alice = TransportKeypair::new();
+        let bob = TransportKeypair::new();
+
+        // Both sides compute the same shared secret
+        let alice_shared = alice.secret.diffie_hellman(&bob.public);
+        let bob_shared = bob.secret.diffie_hellman(&alice.public);
+
+        assert_eq!(alice_shared.as_bytes(), bob_shared.as_bytes());
+    }
+
+    #[test]
+    fn ephemeral_key_exchange() {
+        let static_keypair = TransportKeypair::new();
+        let ephemeral = EphemeralKeypair::new();
+
+        let ephemeral_public = ephemeral.public.clone();
+        let shared_from_ephemeral = ephemeral.diffie_hellman(&static_keypair.public);
+        let shared_from_static = static_keypair.secret.diffie_hellman(&ephemeral_public);
+
+        assert_eq!(
+            shared_from_ephemeral.as_bytes(),
+            shared_from_static.as_bytes()
+        );
+    }
+
+    #[test]
+    fn symmetric_key_derivation() {
+        let alice = TransportKeypair::new();
+        let bob = TransportKeypair::new();
+
+        let shared = alice.secret.diffie_hellman(&bob.public);
+
+        let (a_to_b, b_to_a) = derive_symmetric_keys(
+            shared.as_bytes(),
+            alice.public.as_bytes(),
+            bob.public.as_bytes(),
+        );
+
+        // Keys should be different
+        assert_ne!(a_to_b, b_to_a);
+
+        // Same derivation with same inputs should produce same keys
+        let (a_to_b_2, b_to_a_2) = derive_symmetric_keys(
+            shared.as_bytes(),
+            alice.public.as_bytes(),
+            bob.public.as_bytes(),
+        );
+        assert_eq!(a_to_b, a_to_b_2);
+        assert_eq!(b_to_a, b_to_a_2);
+
+        // Both parties should derive the same keys regardless of argument order
+        // When Bob calls with (bob, alice), his "first_to_second" is bob_to_alice
+        // and his "second_to_first" is alice_to_bob
+        let (bob_to_alice, alice_to_bob) = derive_symmetric_keys(
+            shared.as_bytes(),
+            bob.public.as_bytes(),
+            alice.public.as_bytes(),
+        );
+        // Both parties should agree on the same keys for each direction
+        assert_eq!(a_to_b, alice_to_bob);
+        assert_eq!(b_to_a, bob_to_alice);
+    }
+
+    #[test]
+    fn public_key_size() {
+        let keypair = TransportKeypair::new();
+        assert_eq!(keypair.public.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn serialization_roundtrip() {
+        let keypair = TransportKeypair::new();
+        let serialized = bincode::serialize(&keypair).unwrap();
+        let deserialized: TransportKeypair = bincode::deserialize(&serialized).unwrap();
+
+        assert_eq!(keypair.public, deserialized.public);
+        assert_eq!(
+            keypair.secret.0.as_bytes(),
+            deserialized.secret.0.as_bytes()
+        );
+    }
+
+    #[test]
+    fn save_and_load_keypair() {
+        let keypair = TransportKeypair::new();
+        let temp_dir = std::env::temp_dir();
+        let key_path = temp_dir.join("test_x25519_keypair.key");
+
+        keypair.save(&key_path).unwrap();
+        let loaded = TransportKeypair::load(&key_path).unwrap();
+
+        assert_eq!(keypair.public, loaded.public);
+        assert_eq!(keypair.secret.0.as_bytes(), loaded.secret.0.as_bytes());
+
+        std::fs::remove_file(&key_path).ok();
+    }
+
+    #[test]
+    fn display_produces_unique_strings() {
+        use std::collections::HashSet;
+
         let mut seen = HashSet::new();
         for i in 0..100 {
             let keypair = TransportKeypair::new();
@@ -224,161 +489,5 @@ mod display_uniqueness_tests {
                 display_str
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod crypto_tests {
-    use super::*;
-    use std::io::Read;
-
-    #[test]
-    fn test_default_creates_valid_keypair() {
-        let keypair = TransportKeypair::default();
-        // Verify we can encrypt/decrypt with the default keypair
-        let data = b"test data";
-        let encrypted = keypair.public.encrypt(data);
-        let decrypted = keypair.secret.decrypt(&encrypted).unwrap();
-        assert_eq!(data.as_slice(), decrypted.as_slice());
-    }
-
-    #[test]
-    fn test_new_with_rng_deterministic() {
-        // Using a seeded RNG should produce the same keypair
-        // Use OsRng which implements the CryptoRngCore trait from the correct rand_core version
-        use rsa::rand_core::OsRng;
-
-        // Create two keypairs with OsRng to verify the method works
-        // (Can't test determinism easily due to rand_core version mismatch)
-        let keypair1 = TransportKeypair::new_with_rng(&mut OsRng);
-        let keypair2 = TransportKeypair::new_with_rng(&mut OsRng);
-
-        // Both should be valid keypairs (different due to randomness)
-        assert_ne!(keypair1, keypair2);
-
-        // But both should work for encryption/decryption
-        let data = b"test";
-        let encrypted1 = keypair1.public.encrypt(data);
-        let decrypted1 = keypair1.secret.decrypt(&encrypted1).unwrap();
-        assert_eq!(data.as_slice(), decrypted1.as_slice());
-
-        let encrypted2 = keypair2.public.encrypt(data);
-        let decrypted2 = keypair2.secret.decrypt(&encrypted2).unwrap();
-        assert_eq!(data.as_slice(), decrypted2.as_slice());
-    }
-
-    #[test]
-    fn test_from_private_key() {
-        let original = TransportKeypair::new();
-        // Extract the private key and reconstruct
-        let pem_bytes = original.secret.to_pkcs8_pem().unwrap();
-
-        use rsa::pkcs8::DecodePrivateKey;
-        let priv_key =
-            RsaPrivateKey::from_pkcs8_pem(std::str::from_utf8(&pem_bytes).unwrap()).unwrap();
-
-        let reconstructed = TransportKeypair::from_private_key(priv_key);
-
-        // The public keys should match
-        assert_eq!(
-            format!("{}", original.public),
-            format!("{}", reconstructed.public)
-        );
-    }
-
-    #[test]
-    fn test_keypair_save_and_load() {
-        let keypair = TransportKeypair::new();
-        let temp_dir = std::env::temp_dir();
-        let key_path = temp_dir.join("test_keypair.pem");
-
-        // Save the keypair
-        keypair.save(&key_path).unwrap();
-
-        // Verify file exists and contains PEM data
-        let mut contents = String::new();
-        std::fs::File::open(&key_path)
-            .unwrap()
-            .read_to_string(&mut contents)
-            .unwrap();
-
-        assert!(contents.contains("-----BEGIN PRIVATE KEY-----"));
-        assert!(contents.contains("-----END PRIVATE KEY-----"));
-
-        // Load the key back and verify it works
-        use rsa::pkcs8::DecodePrivateKey;
-        let loaded_key = RsaPrivateKey::from_pkcs8_pem(&contents).unwrap();
-        let loaded_keypair = TransportKeypair::from_private_key(loaded_key);
-
-        // Test that encryption/decryption works across save/load
-        let data = b"round trip test";
-        let encrypted = keypair.public.encrypt(data);
-        let decrypted = loaded_keypair.secret.decrypt(&encrypted).unwrap();
-        assert_eq!(data.as_slice(), decrypted.as_slice());
-
-        // Cleanup
-        std::fs::remove_file(&key_path).ok();
-    }
-
-    #[test]
-    fn test_public_key_save() {
-        let keypair = TransportKeypair::new();
-        let temp_dir = std::env::temp_dir();
-        let key_path = temp_dir.join("test_pubkey.pem");
-
-        // Save the public key
-        keypair.public.save(&key_path).unwrap();
-
-        // Verify file exists and contains PEM data
-        let mut contents = String::new();
-        std::fs::File::open(&key_path)
-            .unwrap()
-            .read_to_string(&mut contents)
-            .unwrap();
-
-        assert!(contents.contains("-----BEGIN PUBLIC KEY-----"));
-        assert!(contents.contains("-----END PUBLIC KEY-----"));
-
-        // Cleanup
-        std::fs::remove_file(&key_path).ok();
-    }
-
-    #[test]
-    fn test_debug_impl_uses_display() {
-        let keypair = TransportKeypair::new();
-        let display_str = format!("{}", keypair.public);
-        let debug_str = format!("{:?}", keypair.public);
-
-        // Debug should use the Display implementation
-        assert_eq!(display_str, debug_str);
-    }
-
-    #[test]
-    fn test_public_key_from_rsa() {
-        use rsa::rand_core::OsRng;
-        let priv_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-        let pub_key = RsaPublicKey::from(&priv_key);
-
-        let transport_pub: TransportPublicKey = pub_key.into();
-
-        // Verify we can use it for encryption
-        let data = b"test from conversion";
-        let encrypted = transport_pub.encrypt(data);
-
-        // And decrypt with the original private key
-        let decrypted = priv_key.decrypt(Pkcs1v15Encrypt, &encrypted).unwrap();
-        assert_eq!(data.as_slice(), decrypted.as_slice());
-    }
-
-    #[test]
-    fn test_secret_accessor() {
-        let keypair = TransportKeypair::new();
-        let secret = keypair.secret();
-
-        // Verify the secret can decrypt what the public key encrypts
-        let data = b"secret accessor test";
-        let encrypted = keypair.public.encrypt(data);
-        let decrypted = secret.decrypt(&encrypted).unwrap();
-        assert_eq!(data.as_slice(), decrypted.as_slice());
     }
 }

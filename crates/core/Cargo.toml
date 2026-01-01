@@ -73,9 +73,10 @@ wasmer-middlewares = "6.1.0"
 wasmer-compiler-singlepass = { workspace = true }
 xz2 = { version = "0.1" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-rsa = { version = "0.9", features = ["serde", "pem"] }
-pkcs8 = { version = "0.10", features = ["std", "pem"] }
 sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+hex = "0.4"
 
 # Tracing deps
 opentelemetry = "0.31"
