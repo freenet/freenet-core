@@ -111,7 +111,7 @@ use crate::ring::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use crate::tracing::NetEventLog;
 use crate::transport::TransportKeypair;
-use crate::util::{Backoff, Contains, IterExt};
+use crate::util::{Contains, IterExt};
 use freenet_stdlib::client_api::HostResponse;
 
 use super::VisitedPeers;
@@ -786,7 +786,6 @@ pub(crate) struct ConnectOp {
     pub(crate) state: Option<ConnectState>,
     /// The peer we sent/forwarded the connect request to (first hop from joiner's perspective).
     pub(crate) first_hop: Option<Box<PeerKeyLocation>>,
-    pub(crate) backoff: Option<Backoff>,
     pub(crate) desired_location: Option<Location>,
     /// Tracks when we last forwarded this connect to a peer, to avoid hammering the same
     /// neighbors when no acceptors are available. Peers without an entry are treated as
@@ -825,7 +824,6 @@ impl ConnectOp {
         target_connections: usize,
         observed_address: Option<SocketAddr>,
         gateway: Option<PeerKeyLocation>,
-        backoff: Option<Backoff>,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
     ) -> Self {
         let started_without_address = observed_address.is_none();
@@ -840,7 +838,6 @@ impl ConnectOp {
             id,
             state: Some(state),
             first_hop: gateway.map(Box::new),
-            backoff,
             desired_location: Some(desired_location),
             recency: HashMap::new(),
             forward_attempts: HashMap::new(),
@@ -869,7 +866,6 @@ impl ConnectOp {
             id,
             state: Some(state),
             first_hop: None,
-            backoff: None,
             desired_location: None,
             recency: HashMap::new(),
             forward_attempts: HashMap::new(),
@@ -895,10 +891,6 @@ impl ConnectOp {
 
     pub(crate) fn to_host_result(&self) -> HostResult {
         Ok(HostResponse::Ok)
-    }
-
-    pub(crate) fn has_backoff(&self) -> bool {
-        self.backoff.is_some()
     }
 
     pub(crate) fn gateway(&self) -> Option<&PeerKeyLocation> {
@@ -954,7 +946,6 @@ impl ConnectOp {
             target_connections,
             own.socket_addr(),
             Some(target.clone()),
-            None,
             connect_forward_estimator,
         );
 
@@ -1522,7 +1513,6 @@ fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -
                 id: op.id,
                 state: Some(state),
                 first_hop: op.first_hop.clone(),
-                backoff: op.backoff.clone(),
                 desired_location: op.desired_location,
                 recency: op.recency.clone(),
                 forward_attempts: op.forward_attempts.clone(),
@@ -1541,7 +1531,6 @@ fn ring_distance(a: Option<Location>, b: Option<Location>) -> Option<f64> {
 
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
 pub(crate) async fn join_ring_request(
-    backoff: Option<Backoff>,
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
@@ -1565,23 +1554,6 @@ pub(crate) async fn join_ring_request(
         .should_accept(location, gateway_addr)
     {
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
-    }
-
-    let mut backoff = backoff;
-    if let Some(backoff_state) = backoff.as_mut() {
-        tracing::warn!(
-            "Performing a new join, attempt {}",
-            backoff_state.retries() + 1
-        );
-        if backoff_state.sleep().await.is_none() {
-            tracing::error!(phase = "error", "Max number of retries reached");
-            if op_manager.ring.open_connections() == 0 {
-                let tx = Transaction::new::<ConnectMsg>();
-                return Err(OpError::MaxRetriesExceeded(tx, tx.transaction_type()));
-            } else {
-                return Ok(());
-            }
-        }
     }
 
     let own = op_manager.ring.connection_manager.own_location();
@@ -1615,9 +1587,6 @@ pub(crate) async fn join_ring_request(
     }
 
     op.first_hop = Some(Box::new(gateway.clone()));
-    if let Some(backoff) = backoff {
-        op.backoff = Some(backoff);
-    }
 
     tracing::info!(
         gateway = %gateway.pub_key(),
@@ -1695,7 +1664,7 @@ pub(crate) async fn initial_join_procedure(
                     tracing::info!(%gateway, "Attempting connection to gateway");
                     let op_manager = op_manager.clone();
                     select_all.push(async move {
-                        (join_ring_request(None, gateway, &op_manager).await, gateway)
+                        (join_ring_request(gateway, &op_manager).await, gateway)
                     });
                 }
                 select_all
@@ -1839,7 +1808,6 @@ mod tests {
             Transaction::new::<ConnectMsg>(),
             Location::new(0.1),
             1,
-            None,
             None,
             None,
             Arc::new(RwLock::new(ConnectForwardEstimator::new())),

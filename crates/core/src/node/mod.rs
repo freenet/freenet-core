@@ -1411,21 +1411,20 @@ async fn handle_aborted_op(
             // if necessary
             match op_manager.pop(&tx) {
                 Ok(Some(OpEnum::Connect(op)))
-                    if op.has_backoff()
-                        && op_manager.ring.open_connections()
-                            < op_manager.ring.connection_manager.min_connections =>
+                    if op_manager.ring.open_connections()
+                        < op_manager.ring.connection_manager.min_connections =>
                 {
                     let gateway = op.gateway().cloned();
                     if let Some(gateway) = gateway {
                         tracing::warn!("Retry connecting to gateway {}", gateway);
-                        connect::join_ring_request(None, &gateway, op_manager).await?;
+                        connect::join_ring_request(&gateway, op_manager).await?;
                     }
                 }
                 Ok(Some(OpEnum::Connect(_))) => {
                     if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                         tracing::warn!("Retrying joining the ring with an other gateway");
                         if let Some(gateway) = gateways.iter().shuffle().next() {
-                            connect::join_ring_request(None, gateway, op_manager).await?
+                            connect::join_ring_request(gateway, op_manager).await?
                         }
                     }
                 }

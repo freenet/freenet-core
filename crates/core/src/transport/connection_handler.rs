@@ -10,6 +10,7 @@ use crate::config::PCK_VERSION;
 use crate::transport::crypto::TransportSecretKey;
 use crate::transport::packet_data::{AssymetricRSA, UnknownEncryption};
 use crate::transport::symmetric_message::OutboundConnection;
+use crate::util::backoff::ExponentialBackoff;
 use aes_gcm::{Aes128Gcm, KeyInit};
 use dashmap::DashSet;
 use futures::{
@@ -73,7 +74,11 @@ type TraverseNatFuture<S> =
 /// This handles race conditions in test environments where ports are released
 /// and rebound quickly.
 const SOCKET_BIND_MAX_RETRIES: usize = 5;
-const SOCKET_BIND_RETRY_DELAY_MS: u64 = 50;
+
+/// Backoff configuration for socket bind retries.
+/// Base delay of 50ms, max delay of 1s (exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms).
+const SOCKET_BIND_BACKOFF: ExponentialBackoff =
+    ExponentialBackoff::new(Duration::from_millis(50), Duration::from_secs(1));
 
 pub(crate) async fn create_connection_handler<S: Socket>(
     keypair: TransportKeypair,
@@ -131,17 +136,16 @@ async fn bind_socket_with_retry<S: Socket>(
         match S::bind(addr).await {
             Ok(socket) => return Ok(socket),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt + 1 < max_retries => {
+                let delay = SOCKET_BIND_BACKOFF.delay(attempt as u32);
                 tracing::debug!(
                     bind_addr = %addr,
                     attempt = attempt + 1,
                     max_retries,
+                    delay_ms = delay.as_millis(),
                     "Socket bind failed with AddrInUse, retrying after delay"
                 );
                 last_err = Some(e);
-                tokio::time::sleep(Duration::from_millis(
-                    SOCKET_BIND_RETRY_DELAY_MS * (1 << attempt), // exponential backoff
-                ))
-                .await;
+                tokio::time::sleep(delay).await;
             }
             Err(e) => return Err(e.into()),
         }
