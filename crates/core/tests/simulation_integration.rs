@@ -65,12 +65,23 @@ async fn test_deterministic_replay_events() {
     let (conn1, events1) = run_and_capture("deterministic-run1", SEED).await;
     let (conn2, events2) = run_and_capture("deterministic-run2", SEED).await;
 
-    // Both runs should produce the same peer labels (this is deterministic)
-    let labels1: Vec<&String> = conn1.iter().map(|(l, _)| l).collect();
-    let labels2: Vec<&String> = conn2.iter().map(|(l, _)| l).collect();
+    // Both runs should produce the same peer label patterns (this is deterministic)
+    // Labels are "{network_name}-{gateway|node}-{id}", so we extract the suffix pattern
+    fn extract_label_suffix(label: &str) -> &str {
+        // Find the second-to-last hyphen to get "{type}-{id}" suffix
+        if let Some(gateway_pos) = label.find("-gateway-") {
+            &label[gateway_pos + 1..]
+        } else if let Some(node_pos) = label.find("-node-") {
+            &label[node_pos + 1..]
+        } else {
+            label
+        }
+    }
+    let labels1: Vec<&str> = conn1.iter().map(|(l, _)| extract_label_suffix(l)).collect();
+    let labels2: Vec<&str> = conn2.iter().map(|(l, _)| extract_label_suffix(l)).collect();
     assert_eq!(
         labels1, labels2,
-        "Peer labels should be deterministic.\nRun 1: {:?}\nRun 2: {:?}",
+        "Peer label patterns should be deterministic.\nRun 1: {:?}\nRun 2: {:?}",
         labels1, labels2
     );
 
@@ -297,11 +308,11 @@ async fn test_peer_label_assignment() {
     assert_eq!(node_count, 3, "Expected 3 nodes");
     assert_eq!(peers.len(), 5, "Expected 5 total peers");
 
-    // Verify label format
+    // Verify label format: "{network_name}-gateway-{id}" or "{network_name}-node-{id}"
     for (label, _config) in &peers {
         let label_str = label.to_string();
         assert!(
-            label_str.starts_with("gateway-") || label_str.starts_with("node-"),
+            label_str.contains("-gateway-") || label_str.contains("-node-"),
             "Unexpected label format: {}",
             label_str
         );

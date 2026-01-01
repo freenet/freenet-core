@@ -3815,7 +3815,7 @@ mod tests {
         for rtt_ms in [1, 2, 5, 10, 50, 100, 200, 300, 500, 1000] {
             let gain = controller.calculate_dynamic_gain(Duration::from_millis(rtt_ms));
             assert!(
-                gain >= 1.0 / 16.0 && gain <= 1.0,
+                (1.0 / 16.0..=1.0).contains(&gain),
                 "{}ms: GAIN {} out of valid range [1/16, 1]",
                 rtt_ms,
                 gain
@@ -3902,7 +3902,7 @@ mod tests {
 
         // Rate at 1ms: 100KB / 0.001s = 100 MB/s = 100_000_000 bytes/s
         assert!(
-            rate_1ms >= 90_000_000 && rate_1ms <= 110_000_000,
+            (90_000_000..=110_000_000).contains(&rate_1ms),
             "1ms RTT rate should be ~100 MB/s, got {} bytes/s",
             rate_1ms
         );
@@ -3910,7 +3910,7 @@ mod tests {
         // Rate at 500ms: 100KB / 0.5s = 200 KB/s = 200_000 bytes/s
         let rate_500ms = controller.current_rate(Duration::from_millis(500));
         assert!(
-            rate_500ms >= 190_000 && rate_500ms <= 210_000,
+            (190_000..=210_000).contains(&rate_500ms),
             "500ms RTT rate should be ~200 KB/s, got {} bytes/s",
             rate_500ms
         );

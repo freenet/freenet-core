@@ -57,6 +57,8 @@ pub(crate) struct P2pBridge {
     ev_listener_tx: Sender<P2pBridgeEvent>,
     op_manager: Arc<OpManager>,
     log_register: Arc<dyn NetEventRegister>,
+    /// Configured gateways with their public keys, used for key lookup during reconnection.
+    gateways: Arc<Vec<PeerKeyLocation>>,
 }
 
 impl P2pBridge {
@@ -64,6 +66,7 @@ impl P2pBridge {
         sender: Sender<P2pBridgeEvent>,
         op_manager: Arc<OpManager>,
         event_register: EL,
+        gateways: Arc<Vec<PeerKeyLocation>>,
     ) -> Self
     where
         EL: NetEventRegister,
@@ -73,6 +76,7 @@ impl P2pBridge {
             ev_listener_tx: sender,
             op_manager,
             log_register: Arc::new(event_register),
+            gateways,
         }
     }
 
@@ -218,22 +222,42 @@ impl NetworkBridge for P2pBridge {
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
         } else {
-            // No known peer at this address - create a temporary PeerKeyLocation
-            // using our own pub_key as placeholder
-            tracing::warn!(
-                peer_addr = %target_addr,
-                phase = "send",
-                "Sending to unknown peer address - creating temporary PeerKeyLocation"
-            );
-            let temp_peer = PeerKeyLocation::new(
-                (*self.op_manager.ring.connection_manager.pub_key).clone(),
-                target_addr,
-            );
-            self.op_manager.sending_transaction(&temp_peer, &msg);
-            self.ev_listener_tx
-                .send(Left((temp_peer, Box::new(msg))))
-                .await
-                .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
+            // No known peer at this address - try to find the public key from gateways
+            let gateway_peer = self
+                .gateways
+                .iter()
+                .find(|gw| gw.socket_addr() == Some(target_addr))
+                .cloned();
+
+            if let Some(gw_peer) = gateway_peer {
+                tracing::debug!(
+                    peer_addr = %target_addr,
+                    phase = "send",
+                    "Using gateway public key for reconnection"
+                );
+                self.op_manager.sending_transaction(&gw_peer, &msg);
+                self.ev_listener_tx
+                    .send(Left((gw_peer, Box::new(msg))))
+                    .await
+                    .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
+            } else {
+                // Truly unknown peer - log warning and use own key as last resort
+                // This path should rarely be hit in normal operation
+                tracing::warn!(
+                    peer_addr = %target_addr,
+                    phase = "send",
+                    "Sending to unknown peer address with no known public key"
+                );
+                let temp_peer = PeerKeyLocation::new(
+                    (*self.op_manager.ring.connection_manager.pub_key).clone(),
+                    target_addr,
+                );
+                self.op_manager.sending_transaction(&temp_peer, &msg);
+                self.ev_listener_tx
+                    .send(Left((temp_peer, Box::new(msg))))
+                    .await
+                    .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
+            }
         }
         Ok(())
     }
@@ -295,11 +319,17 @@ impl P2pConnManager {
         let listen_port = config.network_listener_port;
         let listener_ip = config.network_listener_ip;
 
-        let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
-        let bridge = P2pBridge::new(tx_bridge_cmd, op_manager, event_listener.clone());
-
         let gateways = config.get_gateways()?;
+        let gateways_arc = Arc::new(gateways.clone());
         let key_pair = config.key_pair.clone();
+
+        let (tx_bridge_cmd, rx_bridge_cmd) = mpsc::channel(100);
+        let bridge = P2pBridge::new(
+            tx_bridge_cmd,
+            op_manager,
+            event_listener.clone(),
+            gateways_arc,
+        );
 
         // Initialize our peer identity before any connection attempts so join requests can
         // reference the correct address.
@@ -578,6 +608,15 @@ impl P2pConnManager {
                                             .ring
                                             .connection_manager
                                             .get_peer_location_by_addr(target_addr)
+                                    });
+
+                                    // If still not found, check if this is a known gateway.
+                                    // Gateways have their public keys configured at startup.
+                                    let target_peer = target_peer.or_else(|| {
+                                        ctx.gateways
+                                            .iter()
+                                            .find(|gw| gw.socket_addr() == Some(target_addr))
+                                            .cloned()
                                     });
 
                                     let Some(target_peer) = target_peer else {

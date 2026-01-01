@@ -170,7 +170,7 @@ pub enum TransportError {
     #[error(transparent)]
     Other(#[from] anyhow::Error),
     #[error(transparent)]
-    PubKeyDecryptionError(#[from] rsa::errors::Error),
+    PubKeyDecryptionError(#[from] crypto::DecryptionError),
     #[error(transparent)]
     Serialization(#[from] bincode::Error),
 }

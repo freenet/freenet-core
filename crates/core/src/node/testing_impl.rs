@@ -49,31 +49,31 @@ pub(crate) type EventId = u32;
 pub struct NodeLabel(Arc<str>);
 
 impl NodeLabel {
-    fn gateway(id: usize) -> Self {
-        Self(format!("gateway-{id}").into())
+    fn gateway(network_name: &str, id: usize) -> Self {
+        Self(format!("{network_name}-gateway-{id}").into())
     }
 
-    fn node(id: usize) -> Self {
-        Self(format!("node-{id}").into())
+    fn node(network_name: &str, id: usize) -> Self {
+        Self(format!("{network_name}-node-{id}").into())
     }
 
     fn is_gateway(&self) -> bool {
-        self.0.starts_with("gateway")
+        self.0.contains("-gateway-")
     }
 
     pub fn is_node(&self) -> bool {
-        self.0.starts_with("node")
+        self.0.contains("-node-")
     }
 
     pub fn number(&self) -> usize {
-        let mut parts = self.0.split('-');
-        assert!(parts.next().is_some());
-        parts
+        // Label format is "{network_name}-{gateway|node}-{id}"
+        // The number is always the last part after the final '-'
+        self.0
+            .rsplit('-')
             .next()
-            .map(|s| s.parse::<usize>())
-            .transpose()
-            .expect("should be an usize")
-            .expect("should have an other part")
+            .expect("should have a number part")
+            .parse::<usize>()
+            .expect("last part should be a number")
     }
 }
 
@@ -452,7 +452,7 @@ impl SimNetwork {
         info!("Building {} gateways", num);
         let mut configs = Vec::with_capacity(num.into());
         for node_no in 0..num.into() {
-            let label = NodeLabel::gateway(node_no);
+            let label = NodeLabel::gateway(&self.name, node_no);
             let port = crate::util::get_free_port().unwrap();
             let keypair = crate::transport::TransportKeypair::new();
             let addr = (Ipv6Addr::LOCALHOST, port).into();
@@ -540,7 +540,7 @@ impl SimNetwork {
             .collect();
 
         for node_no in self.number_of_gateways..num + self.number_of_gateways {
-            let label = NodeLabel::node(node_no);
+            let label = NodeLabel::node(&self.name, node_no);
 
             let config_args = ConfigArgs {
                 id: Some(format!("{label}")),
@@ -711,7 +711,8 @@ impl SimNetwork {
         while elapsed.elapsed() < time_out && (connected.len() as f64 / num_nodes as f64) < percent
         {
             for node in self.number_of_gateways..num_nodes + self.number_of_gateways {
-                if !connected.contains(&node) && self.connected(&NodeLabel::node(node)) {
+                if !connected.contains(&node) && self.connected(&NodeLabel::node(&self.name, node))
+                {
                     connected.insert(node);
                 }
             }
@@ -721,7 +722,7 @@ impl SimNetwork {
             HashSet::from_iter(self.number_of_gateways..num_nodes + self.number_of_gateways);
         let mut missing: Vec<_> = expected
             .difference(&connected)
-            .map(|n| format!("node-{n}"))
+            .map(|n| format!("{}-node-{n}", self.name))
             .collect();
 
         tracing::info!("Number of simulated nodes: {num_nodes}");
