@@ -73,9 +73,10 @@ pub mod dev_tool {
     pub use message::Transaction;
     pub use node::{
         testing_impl::{
-            EventChain, EventSummary, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork,
+            ConvergedContract, ConvergenceResult, DivergedContract, EventChain, EventSummary,
+            NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork,
         },
-        InitPeerNode, NodeConfig, PeerId,
+        InitPeerNode, NetworkStats, NodeConfig, PeerId,
     };
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};

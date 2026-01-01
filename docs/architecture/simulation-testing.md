@@ -94,28 +94,46 @@ SimulatedNetwork
 
 ## Known Gaps
 
-### Gap 1: VirtualTime Not Integrated
+### Gap 1: VirtualTime Partially Integrated - PHASE 2 COMPLETE
 
-The `VirtualTime` abstraction exists but isn't wired into `SimNetwork`:
+~~The `VirtualTime` abstraction exists but isn't wired into `SimNetwork`~~ **PARTIAL FIX**
+
+VirtualTime is now integrated into the fault injection system:
 
 ```rust
-// Current: uses real time
-tokio::time::sleep(Duration::from_secs(3)).await;
+use freenet::simulation::{FaultConfig, VirtualTime};
 
-// Future: would use virtual time
-virtual_time.sleep(Duration::from_secs(3)).await;
+// Create VirtualTime instance
+let vt = VirtualTime::new();
+
+// Configure fault injection with VirtualTime mode
+sim.with_fault_injection_virtual_time(
+    FaultConfig::builder()
+        .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
+        .build(),
+    vt.clone(),
+);
+
+// Messages with latency are queued until VirtualTime advances
+vt.advance(Duration::from_millis(100));
+let delivered = sim.advance_virtual_time();
 ```
 
-**Required for full integration:**
-1. Replace `tokio::time` with `VirtualTime`
-2. Use a deterministic async executor
-3. Control all timing through the scheduler
+**What works (Phase 2):**
+- VirtualTime integration in FaultInjectorState
+- Messages with latency are queued with virtual deadlines
+- `advance_virtual_time()` delivers queued messages
+- Deterministic latency injection
 
-### Gap 2: SimulatedNetwork Not Connected to Nodes - MOSTLY FIXED
+**Still pending (Phase 3):**
+- Replace tokio::time with VirtualTime throughout the codebase
+- Full scheduler-based message ordering
 
-~~`SimulatedNetwork` provides message routing but doesn't connect to actual nodes~~
+### Gap 2: SimulatedNetwork Connected to Nodes - FIXED
 
-**FIX IMPLEMENTED**: A fault injection bridge with deterministic RNG and latency support:
+~~`SimulatedNetwork` provides message routing but doesn't connect to actual nodes~~ **RESOLVED**
+
+**FIX IMPLEMENTED**: A fault injection bridge with deterministic RNG, latency support, and network statistics:
 
 ```
 Current (with bridge):
@@ -125,10 +143,13 @@ Current (with bridge):
            ↓
            FaultInjectorState {
              config: FaultConfig,
-             rng: SimulationRng (seeded for determinism)
+             rng: SimulationRng (seeded for determinism),
+             virtual_time: Option<VirtualTime>,  // NEW
+             pending_deliveries: Vec<PendingDelivery>,  // NEW
+             stats: NetworkStats,  // NEW
            }
            ↓
-           DeliveryDecision::Deliver | DelayedDelivery(duration) | Drop
+           DeliveryDecision::Deliver | DelayedDelivery | QueuedDelivery | Drop
            ↓
            channel (with optional delay) → InMemoryTransport → Node B
 
@@ -139,17 +160,20 @@ Usage:
       .partition(partition)
       .build();
   sim.with_fault_injection(config);  // Uses network's seed for determinism
+
+  // Query network statistics
+  if let Some(stats) = sim.get_network_stats() {
+      println!("Loss rate: {:.1}%", stats.loss_ratio() * 100.0);
+      println!("Dropped: {}", stats.total_dropped());
+  }
 ```
 
 **What works:**
 - Message loss injection - deterministic with seeded RNG
 - Network partitions (blocking messages between peer groups)
 - Node crashes (blocking all messages to/from a node)
-- Latency injection (delays message delivery by configured duration)
-
-**What doesn't work (yet):**
-- VirtualTime integration (latency uses real tokio::time::sleep)
-- Full scheduler-based message ordering
+- Latency injection (real-time or VirtualTime mode)
+- Network statistics tracking (Gap T5 - FIXED)
 
 ### Gap 3: Event Summary Uses Debug Parsing - FIXED
 
@@ -162,8 +186,8 @@ pub struct EventSummary {
     pub tx: Transaction,
     pub peer_addr: SocketAddr,
     pub event_kind_name: String,
-    pub contract_key: Option<String>,   // NEW: structured field
-    pub state_hash: Option<String>,      // NEW: structured field
+    pub contract_key: Option<String>,   // Structured field
+    pub state_hash: Option<String>,      // Structured field
     pub event_detail: String,            // kept for backwards compatibility
 }
 ```
@@ -175,14 +199,14 @@ Helper methods added to `EventKind`:
 
 ### Gap 4: No Direct State Query
 
-Cannot query `StateStore` from tests:
+Cannot query `StateStore` from tests directly. Use event observation:
 
 ```rust
-// Current: only event observation
+// Current: event observation
 let summary = sim.get_deterministic_event_summary().await;
 
-// Future: direct state query
-let states = sim.get_contract_states(key).await;
+// Future (not yet implemented): direct state query
+// let states = sim.get_contract_states(key).await;
 // Returns: HashMap<NodeLabel, Option<WrappedState>>
 ```
 
@@ -236,11 +260,12 @@ async fn test_with_noise() {
 
 ## Future Work
 
-1. **Integrate VirtualTime** - Replace tokio time with VirtualTime
-2. **Connect SimulatedNetwork** - Route messages through scheduler
+1. ~~**Integrate VirtualTime**~~ - PARTIAL: VirtualTime in FaultInjectorState (Phase 2 complete)
+2. ~~**Connect SimulatedNetwork**~~ - DONE: Fault injection bridge with deterministic RNG
 3. **Add StateStore query** - Direct state comparison across peers
 4. ~~**Structured EventSummary**~~ - DONE: Added typed fields
 5. **Single-threaded mode** - Option for `flavor = "current_thread"`
+6. **Phase 3 VirtualTime** - Replace all tokio::time with VirtualTime throughout codebase
 
 ---
 
@@ -265,18 +290,41 @@ This section documents gaps in the current testing infrastructure identified thr
 - Ring topology structure validation
 - These are protocol verification concerns, not typical test requirements
 
-### Gap T2: Eventual Consistency Tests Don't Assert Convergence
+### Gap T2: Eventual Consistency Tests Don't Assert Convergence - FIXED
 
-**Current State:**
-- `test_eventual_consistency_state_hashes()` captures state_hash fields in events
-- Compares final hashes across peers for the same contract key
-- **Explicitly doesn't assert convergence:** "We don't strictly assert 100% consistency"
+~~**Current State:**~~
+~~- `test_eventual_consistency_state_hashes()` captures state_hash fields in events~~
+~~- Compares final hashes across peers for the same contract key~~
+~~- **Explicitly doesn't assert convergence:** "We don't strictly assert 100% consistency"~~
 
-**What's Missing:**
-- Explicit convergence criteria: "all replicas must have state_hash X by time T"
-- Convergence timeout that fails tests if not achieved
-- Causality tracking: verify that updates are applied in consistent order
-- Partition heal verification: "after partition ends, convergence happens within duration D"
+**FIX IMPLEMENTED:** Convergence assertion helpers:
+
+```rust
+// Check current convergence state
+let result = sim.check_convergence().await;
+println!("Converged: {}, Diverged: {}", result.converged.len(), result.diverged.len());
+
+// Wait for convergence with timeout
+let result = sim.await_convergence(
+    Duration::from_secs(30),
+    Duration::from_millis(500),
+    1,  // minimum contracts
+).await;
+
+// Assert convergence or panic with details
+sim.assert_convergence(Duration::from_secs(30), Duration::from_millis(500)).await;
+
+// Get convergence rate
+let rate = sim.convergence_rate().await;
+assert!(rate >= 0.95, "Expected 95%+ convergence");
+```
+
+**What's available now:**
+- `check_convergence()` - instant snapshot of convergence state
+- `await_convergence()` - poll until converged or timeout
+- `assert_convergence()` - assert + panic with detailed diff
+- `convergence_rate()` - numeric ratio for monitoring
+- `ConvergenceResult`, `ConvergedContract`, `DivergedContract` - structured result types
 
 ### Gap T3: State Query Requires Event Inference
 
@@ -302,26 +350,59 @@ This section documents gaps in the current testing infrastructure identified thr
 - Response validation: verify Get returns correct state
 - Broadcast propagation verification: confirm updates reached all subscribers
 
-### Gap T5: Fault Injection Effects Not Measured
+### Gap T5: Fault Injection Effects Not Measured - FIXED
 
-**Current State:**
-- FaultConfig supports message_loss_rate, latency_range, partition, crashed_node
-- Tests verify fault injection doesn't crash the framework, not actual behavior changes
+~~**Current State:**~~
+~~- FaultConfig supports message_loss_rate, latency_range, partition, crashed_node~~
+~~- Tests verify fault injection doesn't crash the framework, not actual behavior changes~~
 
-**What's Missing:**
-- Fault observation: `network.stats()` returns dropped/partitioned/latency counts
-- Message drop rate verification: measure actual drop ratio vs configured rate
-- Recovery verification: "after fault clears, convergence within duration D"
+**FIX IMPLEMENTED:** Network statistics tracking:
+
+```rust
+// Configure fault injection
+sim.with_fault_injection(
+    FaultConfig::builder()
+        .message_loss_rate(0.1)
+        .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
+        .build()
+);
+
+// After running test operations...
+if let Some(stats) = sim.get_network_stats() {
+    println!("Messages sent: {}", stats.messages_sent);
+    println!("Messages delivered: {}", stats.messages_delivered);
+    println!("Dropped (loss): {}", stats.messages_dropped_loss);
+    println!("Dropped (partition): {}", stats.messages_dropped_partition);
+    println!("Dropped (crash): {}", stats.messages_dropped_crash);
+    println!("Total dropped: {}", stats.total_dropped());
+    println!("Loss ratio: {:.1}%", stats.loss_ratio() * 100.0);
+    println!("Average latency: {:?}", stats.average_latency());
+
+    // Verify fault injection worked as expected
+    let actual_loss = stats.loss_ratio();
+    assert!((actual_loss - 0.1).abs() < 0.05, "Loss rate ~10%");
+}
+
+// Reset stats for next phase
+sim.reset_network_stats();
+```
+
+**What's available now:**
+- `NetworkStats` struct with detailed message counters
+- `get_network_stats()` - returns current stats
+- `reset_network_stats()` - reset for new test phase
+- Separate counters for loss, partition, and crash drops
+- Latency tracking metrics
 
 ### Gap Summary Table
 
-| Gap | Severity | Notes |
-|-----|----------|-------|
-| T1: Connectivity verification | LOW | Event logging is sufficient for most cases |
-| T2: Convergence assertions | HIGH | Tests don't fail on non-convergence |
-| T3: Direct state query | MEDIUM | Infer from events (works but indirect) |
-| T4: Operation completion | MEDIUM | Assume success if no crash |
-| T5: Fault effect measurement | MEDIUM | Empirical observation only |
+| Gap | Severity | Status | Notes |
+|-----|----------|--------|-------|
+| T1: Connectivity verification | LOW | Open | Event logging is sufficient for most cases |
+| T2: Convergence assertions | HIGH | **FIXED** | `check_convergence()`, `await_convergence()`, `assert_convergence()` |
+| T3: Direct state query | MEDIUM | Open | Infer from events (works but indirect) |
+| T4: Operation completion | MEDIUM | Open | Assume success if no crash |
+| T5: Fault effect measurement | MEDIUM | **FIXED** | `NetworkStats` with detailed counters |
 
 ---
 
@@ -331,7 +412,7 @@ Integrating VirtualTime with the fault injection bridge requires bridging the ga
 - **VirtualTime**: Synchronous, advances only when explicitly stepped via `advance_to()`
 - **Tokio runtime**: Async, uses real wall-clock time
 
-### Option A: Queue-Based Delayed Delivery (Recommended)
+### Option A: Queue-Based Delayed Delivery - IMPLEMENTED ✓
 
 Instead of spawning async tasks with `tokio::time::sleep`, queue messages with virtual deadlines:
 
@@ -339,8 +420,9 @@ Instead of spawning async tasks with `tokio::time::sleep`, queue messages with v
 pub struct FaultInjectorState {
     pub config: FaultConfig,
     pub rng: SimulationRng,
-    pub virtual_time: Option<VirtualTime>,
-    pub pending_deliveries: Vec<PendingDelivery>,
+    pub virtual_time: Option<VirtualTime>,  // IMPLEMENTED
+    pub pending_deliveries: Vec<PendingDelivery>,  // IMPLEMENTED
+    pub stats: NetworkStats,  // IMPLEMENTED
 }
 
 struct PendingDelivery {

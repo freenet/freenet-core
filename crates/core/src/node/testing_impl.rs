@@ -443,6 +443,82 @@ impl SimNetwork {
         set_fault_injector(None);
     }
 
+    /// Configures fault injection with VirtualTime mode enabled.
+    ///
+    /// VirtualTime mode queues messages with latency injection instead of using
+    /// real-time delays. Use `advance_virtual_time()` to advance time and deliver
+    /// pending messages.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use freenet::simulation::{FaultConfig, VirtualTime};
+    /// use std::time::Duration;
+    ///
+    /// let mut sim = SimNetwork::new(...).await;
+    /// let vt = VirtualTime::new();
+    /// sim.with_fault_injection_virtual_time(
+    ///     FaultConfig::builder()
+    ///         .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
+    ///         .build(),
+    ///     vt.clone(),
+    /// );
+    ///
+    /// // Later, advance time to deliver pending messages
+    /// vt.advance(Duration::from_millis(100));
+    /// let delivered = sim.advance_virtual_time();
+    /// ```
+    pub fn with_fault_injection_virtual_time(
+        &mut self,
+        config: crate::simulation::FaultConfig,
+        virtual_time: crate::simulation::VirtualTime,
+    ) {
+        use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
+        let fault_seed = self.seed.wrapping_add(0xFA01_7777);
+        let state = FaultInjectorState::new(config, fault_seed).with_virtual_time(virtual_time);
+        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
+    }
+
+    /// Advances virtual time and delivers pending messages.
+    ///
+    /// This should be called after advancing the VirtualTime instance to deliver
+    /// messages whose deadlines have passed.
+    ///
+    /// Returns the number of messages delivered.
+    pub fn advance_virtual_time(&mut self) -> usize {
+        use crate::node::network_bridge::get_fault_injector;
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.advance_time()
+        } else {
+            0
+        }
+    }
+
+    /// Returns the current network statistics from fault injection.
+    ///
+    /// These statistics track:
+    /// - Messages sent, delivered, dropped
+    /// - Drop reasons (loss rate, partition, crash)
+    /// - Latency injection metrics
+    ///
+    /// Returns None if fault injection is not configured.
+    pub fn get_network_stats(&self) -> Option<crate::node::network_bridge::NetworkStats> {
+        use crate::node::network_bridge::get_fault_injector;
+        get_fault_injector().map(|injector| {
+            let state = injector.lock().unwrap();
+            state.stats().clone()
+        })
+    }
+
+    /// Resets the network statistics.
+    pub fn reset_network_stats(&mut self) {
+        use crate::node::network_bridge::get_fault_injector;
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.reset_stats();
+        }
+    }
+
     #[allow(unused)]
     pub fn debug(&mut self) {
         self.clean_up_tmp_dirs = false;
@@ -855,6 +931,232 @@ impl SimNetwork {
             tracing::warn!("Average number of connections ({avg_connections}) is low (< {expected_avg_connections})");
         }
         Ok(())
+    }
+
+    /// Checks convergence of contract states across all peers.
+    ///
+    /// Returns a `ConvergenceResult` containing:
+    /// - Which contracts have converged (all replicas have the same state hash)
+    /// - Which contracts have not converged (different state hashes across replicas)
+    /// - Per-contract details of state hashes per peer
+    ///
+    /// This is useful for testing eventual consistency properties.
+    pub async fn check_convergence(&self) -> ConvergenceResult {
+        let summary = self.get_deterministic_event_summary().await;
+
+        // Group (contract_key -> peer_addr -> latest_state_hash)
+        let mut contract_states: HashMap<String, HashMap<SocketAddr, String>> = HashMap::new();
+
+        for event in &summary {
+            if let (Some(contract_key), Some(state_hash)) = (&event.contract_key, &event.state_hash)
+            {
+                // Keep the latest state for each peer/contract pair
+                contract_states
+                    .entry(contract_key.clone())
+                    .or_default()
+                    .insert(event.peer_addr, state_hash.clone());
+            }
+        }
+
+        let mut converged = Vec::new();
+        let mut diverged = Vec::new();
+
+        for (contract_key, peer_states) in contract_states {
+            if peer_states.len() < 2 {
+                // Need at least 2 peers to check convergence
+                continue;
+            }
+
+            let unique_states: HashSet<&String> = peer_states.values().collect();
+
+            if unique_states.len() == 1 {
+                let state = unique_states.into_iter().next().unwrap().clone();
+                converged.push(ConvergedContract {
+                    contract_key,
+                    state_hash: state,
+                    replica_count: peer_states.len(),
+                });
+            } else {
+                diverged.push(DivergedContract {
+                    contract_key,
+                    peer_states: peer_states
+                        .into_iter()
+                        .map(|(addr, hash)| (addr, hash))
+                        .collect(),
+                });
+            }
+        }
+
+        ConvergenceResult { converged, diverged }
+    }
+
+    /// Waits for convergence of contract states, polling at regular intervals.
+    ///
+    /// # Arguments
+    /// * `timeout` - Maximum time to wait for convergence
+    /// * `poll_interval` - How often to check convergence
+    /// * `min_contracts` - Minimum number of contracts that must be replicated (default: 1)
+    ///
+    /// # Returns
+    /// * `Ok(ConvergenceResult)` - If convergence achieved (no diverged contracts)
+    /// * `Err(ConvergenceResult)` - If timeout reached with diverged contracts
+    ///
+    /// # Example
+    /// ```ignore
+    /// let result = sim.await_convergence(
+    ///     Duration::from_secs(30),
+    ///     Duration::from_millis(500),
+    ///     1,
+    /// ).await;
+    ///
+    /// match result {
+    ///     Ok(r) => println!("{} contracts converged", r.converged.len()),
+    ///     Err(r) => panic!("{} contracts still diverged", r.diverged.len()),
+    /// }
+    /// ```
+    pub async fn await_convergence(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+        min_contracts: usize,
+    ) -> Result<ConvergenceResult, ConvergenceResult> {
+        let start = Instant::now();
+
+        loop {
+            let result = self.check_convergence().await;
+
+            // Check if we have enough contracts and all have converged
+            let total_replicated = result.converged.len() + result.diverged.len();
+            if total_replicated >= min_contracts && result.diverged.is_empty() {
+                tracing::info!(
+                    "Convergence achieved: {} contracts converged in {:?}",
+                    result.converged.len(),
+                    start.elapsed()
+                );
+                return Ok(result);
+            }
+
+            // Check timeout
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    "Convergence timeout after {:?}: {} converged, {} diverged",
+                    timeout,
+                    result.converged.len(),
+                    result.diverged.len()
+                );
+                return Err(result);
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Asserts that all replicated contracts have converged.
+    ///
+    /// This is a convenience method that combines `await_convergence` with
+    /// an assertion. It panics if convergence is not achieved.
+    ///
+    /// # Panics
+    /// Panics if convergence is not achieved within the timeout.
+    pub async fn assert_convergence(&self, timeout: Duration, poll_interval: Duration) {
+        match self.await_convergence(timeout, poll_interval, 1).await {
+            Ok(result) => {
+                tracing::info!(
+                    "Convergence assertion passed: {} contracts",
+                    result.converged.len()
+                );
+            }
+            Err(result) => {
+                let diverged_details: Vec<String> = result
+                    .diverged
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "Contract {}: {} different states across {} peers",
+                            d.contract_key,
+                            d.unique_state_count(),
+                            d.peer_states.len()
+                        )
+                    })
+                    .collect();
+
+                panic!(
+                    "Convergence assertion failed after {:?}: {} contracts diverged\n{}",
+                    timeout,
+                    result.diverged.len(),
+                    diverged_details.join("\n")
+                );
+            }
+        }
+    }
+
+    /// Returns the convergence rate as a ratio (0.0 to 1.0).
+    ///
+    /// Convergence rate = converged_contracts / total_replicated_contracts
+    pub async fn convergence_rate(&self) -> f64 {
+        let result = self.check_convergence().await;
+        let total = result.converged.len() + result.diverged.len();
+        if total == 0 {
+            return 1.0; // No contracts replicated yet
+        }
+        result.converged.len() as f64 / total as f64
+    }
+}
+
+/// Result of a convergence check.
+#[derive(Debug, Clone)]
+pub struct ConvergenceResult {
+    /// Contracts where all replicas have the same state hash.
+    pub converged: Vec<ConvergedContract>,
+    /// Contracts where replicas have different state hashes.
+    pub diverged: Vec<DivergedContract>,
+}
+
+impl ConvergenceResult {
+    /// Returns the total number of contracts checked.
+    pub fn total_contracts(&self) -> usize {
+        self.converged.len() + self.diverged.len()
+    }
+
+    /// Returns the convergence rate as a ratio (0.0 to 1.0).
+    pub fn rate(&self) -> f64 {
+        if self.total_contracts() == 0 {
+            return 1.0;
+        }
+        self.converged.len() as f64 / self.total_contracts() as f64
+    }
+
+    /// Returns true if all replicated contracts have converged.
+    pub fn is_converged(&self) -> bool {
+        self.diverged.is_empty()
+    }
+}
+
+/// A contract that has converged (all replicas have the same state).
+#[derive(Debug, Clone)]
+pub struct ConvergedContract {
+    /// The contract key
+    pub contract_key: String,
+    /// The state hash that all replicas have
+    pub state_hash: String,
+    /// Number of replicas that have this state
+    pub replica_count: usize,
+}
+
+/// A contract that has diverged (replicas have different states).
+#[derive(Debug, Clone)]
+pub struct DivergedContract {
+    /// The contract key
+    pub contract_key: String,
+    /// Map of peer address to their state hash
+    pub peer_states: Vec<(SocketAddr, String)>,
+}
+
+impl DivergedContract {
+    /// Returns the number of unique states across replicas.
+    pub fn unique_state_count(&self) -> usize {
+        let unique: HashSet<&String> = self.peer_states.iter().map(|(_, h)| h).collect();
+        unique.len()
     }
 }
 

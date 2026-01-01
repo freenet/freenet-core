@@ -22,7 +22,7 @@ pub(crate) mod p2p_protoc;
 pub(crate) mod priority_select;
 
 // Re-export fault injection types and functions for testing
-pub use in_memory::{set_fault_injector, FaultInjectorState};
+pub use in_memory::{get_fault_injector, set_fault_injector, FaultInjectorState, NetworkStats};
 
 pub(crate) type ConnResult<T> = std::result::Result<T, ConnectionError>;
 
