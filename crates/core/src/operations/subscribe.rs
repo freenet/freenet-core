@@ -562,24 +562,35 @@ impl Operation for SubscribeOp {
                             if let Some(upstream_peer) =
                                 wait_for_peer_location(op_manager, requester_addr, id).await
                             {
-                                if let Ok(result) = op_manager.ring.add_downstream(
+                                match op_manager.ring.add_downstream(
                                     &key,
                                     upstream_peer,
                                     Some(requester_addr.into()),
                                 ) {
-                                    // Emit telemetry for new downstream subscriber
-                                    if result.is_new {
-                                        if let Some(event) = NetEventLog::downstream_added(
-                                            &op_manager.ring,
-                                            key,
-                                            result.subscriber,
-                                            result.downstream_count,
-                                        ) {
-                                            op_manager
-                                                .ring
-                                                .register_events(Either::Left(event))
-                                                .await;
+                                    Ok(result) => {
+                                        // Emit telemetry for new downstream subscriber
+                                        if result.is_new {
+                                            if let Some(event) = NetEventLog::downstream_added(
+                                                &op_manager.ring,
+                                                key,
+                                                result.subscriber,
+                                                result.downstream_count,
+                                            ) {
+                                                op_manager
+                                                    .ring
+                                                    .register_events(Either::Left(event))
+                                                    .await;
+                                            }
                                         }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            tx = %id,
+                                            %key,
+                                            requester = %requester_addr,
+                                            error = ?e,
+                                            "subscribe: rejected downstream registration"
+                                        );
                                     }
                                 }
 
@@ -641,24 +652,35 @@ impl Operation for SubscribeOp {
                             if let Some(upstream_peer) =
                                 wait_for_peer_location(op_manager, requester_addr, id).await
                             {
-                                if let Ok(result) = op_manager.ring.add_downstream(
+                                match op_manager.ring.add_downstream(
                                     &key,
                                     upstream_peer,
                                     Some(requester_addr.into()),
                                 ) {
-                                    // Emit telemetry for new downstream subscriber
-                                    if result.is_new {
-                                        if let Some(event) = NetEventLog::downstream_added(
-                                            &op_manager.ring,
-                                            key,
-                                            result.subscriber,
-                                            result.downstream_count,
-                                        ) {
-                                            op_manager
-                                                .ring
-                                                .register_events(Either::Left(event))
-                                                .await;
+                                    Ok(result) => {
+                                        // Emit telemetry for new downstream subscriber
+                                        if result.is_new {
+                                            if let Some(event) = NetEventLog::downstream_added(
+                                                &op_manager.ring,
+                                                key,
+                                                result.subscriber,
+                                                result.downstream_count,
+                                            ) {
+                                                op_manager
+                                                    .ring
+                                                    .register_events(Either::Left(event))
+                                                    .await;
+                                            }
                                         }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            tx = %id,
+                                            %key,
+                                            requester = %requester_addr,
+                                            error = ?e,
+                                            "subscribe: rejected downstream registration (local contract)"
+                                        );
                                     }
                                 }
 
@@ -787,21 +809,36 @@ impl Operation for SubscribeOp {
                                     .connection_manager
                                     .get_peer_location_by_addr(sender_addr)
                                 {
-                                    op_manager.ring.set_upstream(key, sender_peer.clone());
-                                    // Emit telemetry for upstream set
-                                    if let Some(event) = NetEventLog::upstream_set(
-                                        &op_manager.ring,
-                                        *key,
-                                        sender_peer,
-                                    ) {
-                                        op_manager.ring.register_events(Either::Left(event)).await;
+                                    match op_manager.ring.set_upstream(key, sender_peer.clone()) {
+                                        Ok(()) => {
+                                            // Emit telemetry for upstream set
+                                            if let Some(event) = NetEventLog::upstream_set(
+                                                &op_manager.ring,
+                                                *key,
+                                                sender_peer,
+                                            ) {
+                                                op_manager
+                                                    .ring
+                                                    .register_events(Either::Left(event))
+                                                    .await;
+                                            }
+                                            tracing::debug!(
+                                                tx = %msg_id,
+                                                %key,
+                                                upstream = %sender_addr,
+                                                "subscribe: registered upstream source"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                tx = %msg_id,
+                                                %key,
+                                                upstream = %sender_addr,
+                                                error = ?e,
+                                                "subscribe: rejected upstream registration"
+                                            );
+                                        }
                                     }
-                                    tracing::debug!(
-                                        tx = %msg_id,
-                                        %key,
-                                        upstream = %sender_addr,
-                                        "subscribe: registered upstream source"
-                                    );
                                 }
                             }
 
@@ -813,31 +850,42 @@ impl Operation for SubscribeOp {
                                 if let Some(downstream_peer) =
                                     wait_for_peer_location(op_manager, requester_addr, msg_id).await
                                 {
-                                    if let Ok(result) = op_manager.ring.add_downstream(
+                                    match op_manager.ring.add_downstream(
                                         key,
                                         downstream_peer,
                                         Some(requester_addr.into()),
                                     ) {
-                                        // Emit telemetry for new downstream subscriber
-                                        if result.is_new {
-                                            if let Some(event) = NetEventLog::downstream_added(
-                                                &op_manager.ring,
-                                                *key,
-                                                result.subscriber,
-                                                result.downstream_count,
-                                            ) {
-                                                op_manager
-                                                    .ring
-                                                    .register_events(Either::Left(event))
-                                                    .await;
+                                        Ok(result) => {
+                                            // Emit telemetry for new downstream subscriber
+                                            if result.is_new {
+                                                if let Some(event) = NetEventLog::downstream_added(
+                                                    &op_manager.ring,
+                                                    *key,
+                                                    result.subscriber,
+                                                    result.downstream_count,
+                                                ) {
+                                                    op_manager
+                                                        .ring
+                                                        .register_events(Either::Left(event))
+                                                        .await;
+                                                }
                                             }
+                                            tracing::debug!(
+                                                tx = %msg_id,
+                                                %key,
+                                                downstream = %requester_addr,
+                                                "subscribe: registered requester as downstream subscriber"
+                                            );
                                         }
-                                        tracing::debug!(
-                                            tx = %msg_id,
-                                            %key,
-                                            downstream = %requester_addr,
-                                            "subscribe: registered requester as downstream subscriber"
-                                        );
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                tx = %msg_id,
+                                                %key,
+                                                requester = %requester_addr,
+                                                error = ?e,
+                                                "subscribe: rejected downstream registration (intermediate node)"
+                                            );
+                                        }
                                     }
 
                                     tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");

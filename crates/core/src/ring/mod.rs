@@ -591,19 +591,35 @@ impl Ring {
     /// because NAT peers may embed incorrect (e.g., loopback) addresses in their messages.
     ///
     /// Returns information about the operation for telemetry.
+    ///
+    /// # Errors
+    /// - `SelfReference`: The subscriber address matches our own address
+    /// - `CircularReference`: The subscriber is already our upstream for this contract
+    /// - `MaxSubscribersReached`: Maximum downstream subscribers limit reached
     pub fn add_downstream(
         &self,
         contract: &ContractKey,
         subscriber: PeerKeyLocation,
         observed_addr: Option<ObservedAddr>,
     ) -> Result<AddDownstreamResult, SubscriptionError> {
+        let own_addr = self.connection_manager.get_own_addr();
         self.seeding_manager
-            .add_downstream(contract, subscriber, observed_addr)
+            .add_downstream(contract, subscriber, observed_addr, own_addr)
     }
 
     /// Set the upstream source for a contract (the peer we get updates FROM).
-    pub fn set_upstream(&self, contract: &ContractKey, upstream: PeerKeyLocation) {
-        self.seeding_manager.set_upstream(contract, upstream)
+    ///
+    /// # Errors
+    /// - `SelfReference`: The upstream address matches our own address
+    /// - `CircularReference`: The upstream is already in our downstream list for this contract
+    pub fn set_upstream(
+        &self,
+        contract: &ContractKey,
+        upstream: PeerKeyLocation,
+    ) -> Result<(), SubscriptionError> {
+        let own_addr = self.connection_manager.get_own_addr();
+        self.seeding_manager
+            .set_upstream(contract, upstream, own_addr)
     }
 
     /// Remove a subscriber and check if upstream notification is needed.
