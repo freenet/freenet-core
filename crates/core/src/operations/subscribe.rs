@@ -7,6 +7,7 @@ pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
 use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::node::IsOperationCompleted;
 use crate::tracing::NetEventLog;
+use crate::util::backoff::ExponentialBackoff;
 use crate::{
     client_events::HostResult,
     message::{InnerMessage, NetMessage, Transaction},
@@ -28,8 +29,10 @@ const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
 /// Used when a Subscribe message arrives before the connection is fully established.
 const PEER_LOOKUP_MAX_RETRIES: u32 = 5;
 
-/// Initial delay for peer location lookup retry (doubles each retry).
-const PEER_LOOKUP_INITIAL_DELAY_MS: u64 = 100;
+/// Backoff configuration for peer location lookup retries.
+/// Base delay of 100ms, max delay of 2s (capped to prevent excessive waiting).
+const PEER_LOOKUP_BACKOFF: ExponentialBackoff =
+    ExponentialBackoff::new(Duration::from_millis(100), Duration::from_secs(2));
 
 /// Wait for a contract to become available, using channel-based notification.
 ///
@@ -108,17 +111,17 @@ async fn wait_for_peer_location(
     }
 
     // Retry with exponential backoff
-    let mut delay_ms = PEER_LOOKUP_INITIAL_DELAY_MS;
     for attempt in 1..=PEER_LOOKUP_MAX_RETRIES {
+        let delay = PEER_LOOKUP_BACKOFF.delay(attempt - 1);
         tracing::debug!(
             tx = %tx_id,
             %addr,
             attempt,
-            delay_ms,
+            delay_ms = delay.as_millis(),
             "subscribe: peer not found, retrying after delay"
         );
 
-        sleep(Duration::from_millis(delay_ms)).await;
+        sleep(delay).await;
 
         if let Some(peer) = op_manager
             .ring
@@ -133,8 +136,6 @@ async fn wait_for_peer_location(
             );
             return Some(peer);
         }
-
-        delay_ms *= 2; // Exponential backoff
     }
 
     tracing::warn!(
