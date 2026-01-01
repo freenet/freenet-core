@@ -1488,6 +1488,7 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
         std::io::copy(&mut content.as_ref(), &mut public_key_file)?;
 
         // Validate the public key (hex-encoded X25519 public key, 32 bytes = 64 hex chars)
+        // Also accept legacy RSA PEM keys temporarily for backwards compatibility
         let mut key_file = File::open(&local_path).with_context(|| {
             format!(
                 "failed loading gateway pubkey from {:?}",
@@ -1496,7 +1497,19 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
         })?;
         let mut buf = String::new();
         key_file.read_to_string(&mut buf)?;
-        if let Ok(key_bytes) = hex::decode(buf.trim()) {
+        let buf = buf.trim();
+
+        // Check if it's a legacy RSA PEM public key
+        if buf.starts_with("-----BEGIN") {
+            tracing::warn!(
+                public_key_path = ?gateway.public_key_path,
+                "Gateway uses legacy RSA PEM public key format. \
+                 Gateway needs to be updated to X25519 format. Skipping."
+            );
+            continue;
+        }
+
+        if let Ok(key_bytes) = hex::decode(buf) {
             if key_bytes.len() == 32 {
                 gateway.public_key_path = local_path;
                 valid_gateways.push(gateway.clone());

@@ -190,8 +190,18 @@ impl NodeConfig {
             })?;
             let mut buf = String::new();
             key_file.read_to_string(&mut buf)?;
+            let buf = buf.trim();
 
-            let key_bytes = hex::decode(buf.trim()).with_context(|| {
+            // Check for legacy RSA PEM format
+            if buf.starts_with("-----BEGIN") {
+                tracing::warn!(
+                    public_key_path = ?public_key_path,
+                    "Gateway uses legacy RSA PEM public key format. Skipping this gateway."
+                );
+                continue;
+            }
+
+            let key_bytes = hex::decode(buf).with_context(|| {
                 format!("failed to decode gateway pubkey hex from {public_key_path:?}")
             })?;
             if key_bytes.len() != 32 {

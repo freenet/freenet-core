@@ -202,7 +202,47 @@ fn read_cipher(path_to_cipher: impl AsRef<Path>) -> std::io::Result<[u8; CIPHER_
 }
 
 fn read_transport_keypair(path_to_key: impl AsRef<Path>) -> std::io::Result<TransportKeypair> {
-    TransportKeypair::load(path_to_key)
+    let path = path_to_key.as_ref();
+    match TransportKeypair::load(path) {
+        Ok(keypair) => Ok(keypair),
+        Err(e) => {
+            // Check if this looks like an old RSA PEM key
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if content.trim().starts_with("-----BEGIN") {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "Found RSA PEM key (legacy format). Generating new X25519 keypair. \
+                         The old key file will be overwritten."
+                    );
+                    let keypair = TransportKeypair::new();
+                    keypair.save(path)?;
+
+                    // Also update the public key file if it exists in the same directory
+                    // (freenet-test-network generates keypair.pem and public_key.pem together)
+                    if let Some(parent) = path.parent() {
+                        let public_key_path = parent.join("public_key.pem");
+                        if public_key_path.exists() {
+                            if let Err(e) = keypair.public().save(&public_key_path) {
+                                tracing::warn!(
+                                    path = %public_key_path.display(),
+                                    error = %e,
+                                    "Failed to update public key file"
+                                );
+                            } else {
+                                tracing::info!(
+                                    path = %public_key_path.display(),
+                                    "Updated public key file to X25519 format"
+                                );
+                            }
+                        }
+                    }
+
+                    return Ok(keypair);
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
