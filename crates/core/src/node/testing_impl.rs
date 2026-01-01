@@ -683,24 +683,32 @@ impl SimNetwork {
     where
         R: RandomEventGenerator + Send + 'static,
     {
+        use crate::node::network_bridge::in_memory::is_peer_registered;
+
         let total_peer_num = self.gateways.len() + self.nodes.len();
-        let gw = self.gateways.drain(..).map(|(n, c)| (n, c.label));
         let mut peers = vec![];
-        for (node, label) in gw.chain(self.nodes.drain(..)).collect::<Vec<_>>() {
-            tracing::debug!(peer = %label, "initializing");
+
+        // Phase 1: Start all gateways first and collect their addresses
+        let gateways: Vec<_> = self.gateways.drain(..).collect();
+        let mut gateway_addrs = Vec::with_capacity(gateways.len());
+
+        for (node, config) in gateways {
+            let label = config.label.clone();
+            // Use the peer_key_location address from GatewayConfig - this is the address
+            // that will be registered in the peer registry
+            let gateway_addr = config.peer_key_location.peer_addr.as_known()
+                .expect("Gateway should have known address");
+            gateway_addrs.push(*gateway_addr);
+
+            tracing::debug!(peer = %label, addr = %gateway_addr, "starting gateway");
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 self.receiver_ch.clone(),
                 node.config.key_pair.public().clone(),
                 seed,
             );
             user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
-            let span = if label.is_gateway() {
-                tracing::info_span!("in_mem_gateway", %label)
-            } else {
-                tracing::info_span!("in_mem_node", %label)
-            };
-            self.labels
-                .push((label, node.config.key_pair.public().clone()));
+            let span = tracing::info_span!("in_mem_gateway", %label);
+            self.labels.push((label, node.config.key_pair.public().clone()));
 
             let node_task = async move { node.run_node(user_events, span).await };
             let handle = GlobalExecutor::spawn(node_task);
@@ -708,6 +716,65 @@ impl SimNetwork {
 
             tokio::time::sleep(self.start_backoff).await;
         }
+
+        // Phase 2: Wait for all gateways to be registered in the peer registry
+        // This prevents the race condition where regular nodes try to connect
+        // before gateways are ready to receive connections
+        let registration_timeout = Duration::from_secs(10);
+        let poll_interval = Duration::from_millis(10);
+        let start = std::time::Instant::now();
+
+        'wait_loop: loop {
+            let mut all_registered = true;
+            for addr in &gateway_addrs {
+                if !is_peer_registered(addr) {
+                    all_registered = false;
+                    break;
+                }
+            }
+
+            if all_registered {
+                tracing::debug!("All {} gateways registered", gateway_addrs.len());
+                // Give gateways additional time to fully initialize their event loops
+                // before regular nodes start connecting
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                tracing::debug!("Starting regular nodes");
+                break 'wait_loop;
+            }
+
+            if start.elapsed() > registration_timeout {
+                tracing::warn!(
+                    "Timeout waiting for gateway registration, some may not be ready. \
+                     Registered: {}/{}",
+                    gateway_addrs.iter().filter(|a| is_peer_registered(a)).count(),
+                    gateway_addrs.len()
+                );
+                break 'wait_loop;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // Phase 3: Start all regular nodes
+        let nodes: Vec<_> = self.nodes.drain(..).collect();
+        for (node, label) in nodes {
+            tracing::debug!(peer = %label, "starting regular node");
+            let mut user_events = MemoryEventsGen::<R>::new_with_seed(
+                self.receiver_ch.clone(),
+                node.config.key_pair.public().clone(),
+                seed,
+            );
+            user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
+            let span = tracing::info_span!("in_mem_node", %label);
+            self.labels.push((label, node.config.key_pair.public().clone()));
+
+            let node_task = async move { node.run_node(user_events, span).await };
+            let handle = GlobalExecutor::spawn(node_task);
+            peers.push(handle);
+
+            tokio::time::sleep(self.start_backoff).await;
+        }
+
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
         peers
     }

@@ -351,6 +351,16 @@ impl PeerRegistry {
     fn get_public_key(&self, addr: &SocketAddr) -> Option<TransportPublicKey> {
         self.peers.get(addr).map(|(pk, _)| pk.clone())
     }
+
+    fn is_registered(&self, addr: &SocketAddr) -> bool {
+        self.peers.contains_key(addr)
+    }
+}
+
+/// Checks if a peer is registered in the global peer registry.
+/// Used by SimNetwork to wait for gateways to be ready before starting regular nodes.
+pub fn is_peer_registered(addr: &SocketAddr) -> bool {
+    PEER_REGISTRY.read().unwrap().is_registered(addr)
 }
 
 /// Global peer registry for all in-memory peers
