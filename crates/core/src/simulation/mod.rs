@@ -11,55 +11,115 @@
 //! - **VirtualTime**: Deterministic time that only advances when explicitly stepped
 //! - **SimulationRng**: Seeded RNG for all random decisions during simulation
 //! - **Scheduler**: Deterministic event scheduler processing events in order
-//! - **SimulatedNetwork**: Network layer integrating with the scheduler
 //! - **FaultConfig**: Configuration for fault injection (drops, partitions, latency)
 //!
-//! # Integration with SimNetwork
+//! # Two Simulation Systems
 //!
-//! There are two simulation systems in the codebase:
+//! ## 1. SimNetwork (Production-Ready)
 //!
-//! 1. **`SimNetwork`** (in `testing_impl.rs`): The existing async-based test network
-//!    - Uses tokio async runtime with real time
-//!    - Nodes run as actual async tasks with `InMemoryTransport`
-//!    - Good for integration testing with realistic concurrency
+//! Location: `testing_impl.rs`
 //!
-//! 2. **`SimulatedNetwork`** (this module): Pure deterministic simulation
-//!    - Synchronous, event-driven message delivery
-//!    - Uses `VirtualTime` for fully controlled time progression
-//!    - Good for reproducible bug reproduction and property testing
+//! **What it does:**
+//! - Runs actual Freenet node code as async tasks
+//! - Uses `InMemoryTransport` for fast message passing
+//! - Supports fault injection via `FaultInjectorState`
+//! - Provides convergence checking and operation tracking
 //!
-//! ## Current Integration
+//! **Limitations:**
+//! - Uses tokio's async scheduler (non-deterministic ordering)
+//! - Uses real wall-clock time (timing varies between runs)
 //!
-//! Seeds flow from `SimNetwork` through to:
-//! - Per-peer RNG seeds via `derive_peer_seed()`
-//! - `MemoryConnManager` for transport-level decisions
-//! - `InMemoryTransport` for deterministic noise mode shuffling
+//! **Use for:** Integration testing, end-to-end tests, fdev test mode
 //!
-//! ## Future Integration (TODO)
+//! ## 2. SimulatedNetwork (Experimental - Not Yet Useful)
 //!
-//! To achieve full determinism, `SimNetwork` could be enhanced to:
-//! 1. Use `VirtualTime` instead of `tokio::time`
-//! 2. Route messages through `SimulatedNetwork` for controlled delivery
-//! 3. Use `Scheduler` to order all async events
+//! Location: `simulation/network.rs`
 //!
-//! This would require replacing the tokio runtime with a deterministic executor.
+//! **⚠️ EXPERIMENTAL STATUS:**
+//! This component is a design sketch for future deterministic simulation.
+//! It currently does NOT run actual node code - only abstract message passing.
+//! It cannot test Freenet protocol logic in its current form.
 //!
-//! # Usage
+//! **What it provides:**
+//! - Fully deterministic message delivery via `Scheduler`
+//! - `VirtualTime` for controlled time progression
+//! - A model of what full determinism could look like
+//!
+//! **What's missing to make it useful:**
+//! - Integration with actual node execution
+//! - A deterministic executor to replace tokio
+//! - Wiring to route node operations through the scheduler
+//!
+//! # Achieving Full Determinism (Future Work)
+//!
+//! To run actual node code with deterministic scheduling would require:
+//!
+//! ## Option 1: Deterministic Executor
+//! Replace tokio with a custom executor that processes tasks in deterministic order:
+//! ```ignore
+//! // Conceptual - not implemented
+//! struct DeterministicExecutor {
+//!     scheduler: Scheduler,
+//!     task_queue: BinaryHeap<(Priority, Task)>,
+//! }
+//!
+//! impl DeterministicExecutor {
+//!     fn step(&mut self) {
+//!         // Process one task/event in priority order
+//!         // Advance VirtualTime as needed
+//!     }
+//! }
+//! ```
+//!
+//! ## Option 2: Single-Threaded Tokio + Controlled Yields
+//! Use `tokio::runtime::Builder::new_current_thread()` with explicit yield points:
+//! ```ignore
+//! let rt = tokio::runtime::Builder::new_current_thread()
+//!     .enable_time()  // Could mock with VirtualTime
+//!     .build()?;
+//!
+//! // Run with controlled task ordering via priority channels
+//! ```
+//!
+//! ## Option 3: Simulation Shim Layer
+//! Intercept all I/O and time operations, routing them through the scheduler:
+//! ```ignore
+//! // Replace tokio::time::sleep with:
+//! async fn sim_sleep(duration: Duration) {
+//!     let deadline = VIRTUAL_TIME.now() + duration;
+//!     SCHEDULER.wait_until(deadline).await;
+//! }
+//! ```
+//!
+//! Each option has trade-offs between implementation complexity and fidelity.
+//! See `docs/architecture/simulation-testing.md` for detailed analysis.
+//!
+//! # Current Recommended Usage
+//!
+//! For testing Freenet logic, use `SimNetwork` with fault injection:
 //!
 //! ```ignore
-//! use freenet::simulation::{Scheduler, FaultConfig, VirtualTime};
+//! use freenet::dev_tool::SimNetwork;
+//! use freenet::simulation::FaultConfig;
 //!
-//! // Create a deterministic simulation with seed 42
-//! let mut scheduler = Scheduler::new(42);
+//! // Create network with deterministic seed
+//! let mut sim = SimNetwork::new("test", 1, 3, 10, 7, 10, 5, 0x1234).await;
 //!
-//! // Configure faults
-//! let fault_config = FaultConfig::builder()
-//!     .message_loss_rate(0.01)
-//!     .latency_range(Duration::from_millis(10)..Duration::from_millis(100))
-//!     .build();
+//! // Enable fault injection
+//! sim.with_fault_injection(
+//!     FaultConfig::builder()
+//!         .message_loss_rate(0.05)
+//!         .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
+//!         .build()
+//! );
 //!
-//! // Run simulation
-//! scheduler.run_until(|state| state.all_connected());
+//! // Run operations and check results
+//! let handles = sim.start_with_rand_gen::<SmallRng>(0x1234, 10, 5).await;
+//! sim.await_convergence(Duration::from_secs(30), Duration::from_millis(500), 1).await?;
+//!
+//! // Verify operation success
+//! let summary = sim.get_operation_summary().await;
+//! assert!(summary.overall_success_rate() >= 0.9);
 //! ```
 
 mod fault;

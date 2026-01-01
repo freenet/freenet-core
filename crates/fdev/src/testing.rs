@@ -2,6 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::Error;
 use freenet::dev_tool::SimNetwork;
+use freenet::simulation::FaultConfig;
 
 pub(crate) mod network;
 mod single_process;
@@ -58,6 +59,47 @@ pub struct TestConfig {
     /// Don't start the metrics server for this test run.
     #[arg(long)]
     disable_metrics: bool,
+
+    // =========================================================================
+    // Fault Injection Options
+    // =========================================================================
+    /// Enable fault injection with the specified message loss rate (0.0 to 1.0).
+    /// Example: --message-loss 0.05 for 5% message loss
+    #[arg(long, value_name = "RATE")]
+    message_loss: Option<f64>,
+
+    /// Minimum latency to add to messages in milliseconds.
+    /// Used together with --latency-max to define a range.
+    #[arg(long, value_name = "MS")]
+    latency_min: Option<u64>,
+
+    /// Maximum latency to add to messages in milliseconds.
+    /// Used together with --latency-min to define a range.
+    #[arg(long, value_name = "MS")]
+    latency_max: Option<u64>,
+
+    // =========================================================================
+    // Verification Options
+    // =========================================================================
+    /// Check convergence after test completion with the specified timeout in seconds.
+    /// Example: --check-convergence 30
+    #[arg(long, value_name = "TIMEOUT_SECS")]
+    check_convergence: Option<u64>,
+
+    /// Minimum success rate for operations (0.0 to 1.0).
+    /// Test will fail if success rate is below this threshold.
+    /// Example: --min-success-rate 0.95 for 95% success rate
+    #[arg(long, value_name = "RATE")]
+    min_success_rate: Option<f64>,
+
+    /// Print operation summary after test completion.
+    #[arg(long)]
+    print_summary: bool,
+
+    /// Print network statistics after test completion (requires fault injection).
+    #[arg(long)]
+    print_network_stats: bool,
+
     #[clap(subcommand)]
     /// Execution mode for the test.
     pub command: TestMode,
@@ -84,6 +126,52 @@ impl TestConfig {
     fn seed(&self) -> u64 {
         use rand::RngCore;
         self.seed.unwrap_or_else(|| rand::rng().next_u64())
+    }
+
+    /// Returns true if any fault injection options are configured.
+    fn has_fault_injection(&self) -> bool {
+        self.message_loss.is_some() || self.latency_min.is_some() || self.latency_max.is_some()
+    }
+
+    /// Builds a FaultConfig from the CLI options.
+    fn build_fault_config(&self) -> Option<FaultConfig> {
+        if !self.has_fault_injection() {
+            return None;
+        }
+
+        let mut builder = FaultConfig::builder();
+
+        if let Some(loss_rate) = self.message_loss {
+            builder = builder.message_loss_rate(loss_rate);
+        }
+
+        // Handle latency range
+        match (self.latency_min, self.latency_max) {
+            (Some(min), Some(max)) => {
+                builder = builder.latency_range(
+                    Duration::from_millis(min)..Duration::from_millis(max),
+                );
+            }
+            (Some(min), None) => {
+                // Fixed latency if only min specified
+                builder = builder.fixed_latency(Duration::from_millis(min));
+            }
+            (None, Some(max)) => {
+                // Range from 0 to max
+                builder = builder.latency_range(Duration::ZERO..Duration::from_millis(max));
+            }
+            (None, None) => {}
+        }
+
+        Some(builder.build())
+    }
+
+    /// Returns true if any verification options are configured.
+    fn has_verification(&self) -> bool {
+        self.check_convergence.is_some()
+            || self.min_success_rate.is_some()
+            || self.print_summary
+            || self.print_network_stats
     }
 }
 
@@ -168,6 +256,17 @@ async fn config_sim_network(base_config: &TestConfig) -> anyhow::Result<SimNetwo
     if let Some(backoff) = base_config.peer_start_backoff_ms {
         sim.with_start_backoff(Duration::from_millis(backoff));
     }
+
+    // Apply fault injection if configured
+    if let Some(fault_config) = base_config.build_fault_config() {
+        tracing::info!(
+            "Enabling fault injection: loss={:?}, latency={:?}",
+            base_config.message_loss,
+            base_config.latency_min.zip(base_config.latency_max)
+        );
+        sim.with_fault_injection(fault_config);
+    }
+
     Ok(sim)
 }
 
@@ -193,6 +292,15 @@ mod tests {
             peer_start_backoff_ms: None,
             execution_data: None,
             disable_metrics: true,
+            // Fault injection options
+            message_loss: None,
+            latency_min: None,
+            latency_max: None,
+            // Verification options
+            check_convergence: None,
+            min_success_rate: None,
+            print_summary: false,
+            print_network_stats: false,
             command: TestMode::SingleProcess,
         })
         .await
@@ -203,5 +311,55 @@ mod tests {
             .map(|(lb, c)| (lb, format!("{}", c.key_pair.public())))
             .collect::<Vec<_>>();
         dbg!(keys);
+    }
+
+    #[test]
+    fn test_build_fault_config() {
+        // No fault config if nothing set
+        let config = TestConfig {
+            name: None,
+            seed: None,
+            gateways: 1,
+            nodes: 1,
+            ring_max_htl: 10,
+            rnd_if_htl_above: 7,
+            max_connections: 10,
+            min_connections: 5,
+            max_contract_number: None,
+            events: 100,
+            event_wait_ms: None,
+            connection_wait_ms: None,
+            peer_start_backoff_ms: None,
+            execution_data: None,
+            disable_metrics: true,
+            message_loss: None,
+            latency_min: None,
+            latency_max: None,
+            check_convergence: None,
+            min_success_rate: None,
+            print_summary: false,
+            print_network_stats: false,
+            command: TestMode::SingleProcess,
+        };
+        assert!(config.build_fault_config().is_none());
+        assert!(!config.has_fault_injection());
+
+        // With message loss
+        let config_with_loss = TestConfig {
+            message_loss: Some(0.1),
+            ..config.clone()
+        };
+        assert!(config_with_loss.has_fault_injection());
+        let fault_config = config_with_loss.build_fault_config().unwrap();
+        assert!(fault_config.message_loss_rate > 0.0);
+
+        // With latency range
+        let config_with_latency = TestConfig {
+            latency_min: Some(10),
+            latency_max: Some(50),
+            ..config
+        };
+        assert!(config_with_latency.has_fault_injection());
+        assert!(config_with_latency.build_fault_config().is_some());
     }
 }

@@ -449,8 +449,8 @@ sim.reset_network_stats();
 |-----|----------|--------|-------|
 | T1: Connectivity verification | LOW | Open | Event logging is sufficient for most cases |
 | T2: Convergence assertions | HIGH | **FIXED** | `check_convergence()`, `await_convergence()`, `assert_convergence()` |
-| T3: Direct state query | MEDIUM | Open | Infer from events (works but indirect) |
-| T4: Operation completion | MEDIUM | Open | Assume success if no crash |
+| T3: Direct state query | MEDIUM | Partial | Event-based state hashes via `get_contract_state_hashes()` |
+| T4: Operation completion | MEDIUM | **FIXED** | `get_operation_summary()`, `await_operation_completion()` |
 | T5: Fault effect measurement | MEDIUM | **FIXED** | `NetworkStats` with detailed counters |
 
 ---
@@ -606,3 +606,182 @@ sim_runtime.advance_until_idle();
 | Documentation | Small | `simulation-testing.md` |
 
 **Total: ~1-2 days of focused work**
+
+---
+
+## Deterministic Scheduling Exploration
+
+This section explores what it would take to run actual Freenet node code with fully deterministic scheduling.
+
+### Current State
+
+**SimNetwork** (production-ready):
+- ✅ Runs actual node code
+- ✅ Deterministic fault injection (seeded RNG)
+- ✅ Network stats and convergence checking
+- ❌ Non-deterministic async scheduling (tokio multi-threaded)
+- ❌ Non-deterministic timing (real wall-clock)
+
+**SimulatedNetwork** (experimental):
+- ✅ Fully deterministic message ordering
+- ✅ VirtualTime with precise control
+- ❌ Does NOT run actual node code
+- ❌ Only models abstract message passing
+
+### The Goal
+
+Run actual Freenet protocol code (operations, state machines, contract execution) with:
+1. Deterministic event ordering (same seed → same execution)
+2. Controlled time progression (no wall-clock dependency)
+3. Reproducible test failures
+
+### Approaches
+
+#### Approach 1: Single-Threaded Tokio with Paused Time
+
+**Complexity: Low**
+**Determinism: Partial**
+
+Use tokio's test utilities for coarse-grained control:
+
+```rust
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn deterministic_test() {
+    let mut sim = SimNetwork::new(...).await;
+    sim.with_fault_injection(config);
+
+    // Time is paused - we control when it advances
+    let handles = sim.start_with_rand_gen::<SmallRng>(SEED, 10, 5).await;
+
+    // Advance time in controlled steps
+    for _ in 0..100 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;  // Let tasks run
+    }
+
+    sim.assert_convergence(...).await;
+}
+```
+
+**Limitations:**
+- Task execution order within a time slice is still non-deterministic
+- Cannot interleave message delivery with precise control
+- Good enough for many tests, not for bug reproduction
+
+#### Approach 2: Deterministic Executor (turmoil-style)
+
+**Complexity: High**
+**Determinism: Full**
+
+Replace tokio entirely with a custom deterministic runtime:
+
+```rust
+// Conceptual design
+pub struct DeterministicRuntime {
+    scheduler: Scheduler,
+    time: VirtualTime,
+    tasks: BTreeMap<TaskId, Task>,
+    ready_queue: VecDeque<TaskId>,  // FIFO for determinism
+}
+
+impl DeterministicRuntime {
+    /// Process one task step
+    pub fn step(&mut self) -> bool {
+        // 1. Check for time-based wakeups
+        self.process_wakeups();
+
+        // 2. Run one ready task
+        if let Some(task_id) = self.ready_queue.pop_front() {
+            self.poll_task(task_id);
+            return true;
+        }
+
+        // 3. If no tasks ready, advance time to next event
+        if let Some(next_time) = self.scheduler.next_event_time() {
+            self.time.advance_to(next_time);
+            return true;
+        }
+
+        false  // Simulation complete
+    }
+
+    /// Run until condition or deadlock
+    pub fn run_until<F>(&mut self, condition: F) -> Result<(), SimError>
+    where
+        F: Fn(&Self) -> bool,
+    {
+        while !condition(self) {
+            if !self.step() {
+                return Err(SimError::Deadlock);
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+**Implementation Requirements:**
+1. Custom Future executor with deterministic task ordering
+2. Shim for `tokio::time` operations (sleep, timeout, interval)
+3. Shim for channel operations (mpsc, oneshot, broadcast)
+4. Shim for I/O operations (replaced with InMemoryTransport)
+5. Thread-local context for runtime access
+
+**Estimated Effort:** 2-4 weeks
+
+**Reference:** [turmoil](https://github.com/tokio-rs/turmoil) - deterministic testing for distributed systems
+
+#### Approach 3: Record-Replay
+
+**Complexity: Medium**
+**Determinism: Replay only**
+
+Record all non-deterministic decisions during a test run, replay them later:
+
+```rust
+pub struct RecordingRuntime {
+    inner: tokio::Runtime,
+    log: Vec<NonDetEvent>,
+}
+
+pub enum NonDetEvent {
+    TaskScheduled { task_id: u64, time: Instant },
+    ChannelRecv { channel_id: u64, result: Option<Vec<u8>> },
+    TimeNow { value: Instant },
+}
+
+// During recording, capture all non-deterministic events
+// During replay, return recorded values instead of real ones
+```
+
+**Limitations:**
+- Only reproduces existing failures, doesn't prevent new ones
+- Recording overhead
+- Log files can be large
+
+### Recommended Path Forward
+
+**Short-term (fdev improvements):**
+1. Add fault injection config to fdev CLI ✓ (implementing)
+2. Add operation tracking/reporting ✓ (implementing)
+3. Add convergence assertions ✓ (implementing)
+4. Use single-threaded tokio for better reproducibility
+
+**Medium-term (better determinism):**
+1. Add `#[tokio::test(flavor = "current_thread", start_paused = true)]` support
+2. Integrate VirtualTime with tokio pause for message ordering
+3. Add seeded task ID assignment for consistent ordering
+
+**Long-term (full determinism):**
+1. Evaluate turmoil for inspiration
+2. Build deterministic executor if needed
+3. Or: Accept that current level is "good enough" for most testing
+
+### When Full Determinism Matters
+
+Full determinism is most valuable for:
+- **Bug reproduction:** "This failed on CI, let me reproduce locally"
+- **Property testing:** "Run 10,000 variations and find edge cases"
+- **Formal verification:** "Prove this never deadlocks"
+
+For typical integration testing, SimNetwork + fault injection is sufficient.
