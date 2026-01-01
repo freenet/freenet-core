@@ -1,39 +1,15 @@
-//! Exponential backoff for failed connection attempts.
+//! Exponential backoff for failed connection attempts by location.
 //!
 //! When connection attempts fail (either due to routing failure or connect operation failure),
 //! we apply exponential backoff before retrying to avoid spamming small/saturated networks.
+//!
+//! This module uses location buckets to group nearby locations together, reducing memory
+//! usage while still providing effective backoff for clustered targets.
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
+use std::time::Duration;
 
 use super::Location;
-
-/// Tracks backoff state for failed connection targets.
-///
-/// Uses exponential backoff: `base_interval * 2^(consecutive_failures-1)` capped at `max_backoff`.
-/// First failure = base_interval, second = 2x, third = 4x, etc.
-#[derive(Debug)]
-pub struct ConnectionBackoff {
-    /// Failed targets with their backoff state
-    failed_targets: HashMap<LocationBucket, BackoffState>,
-    /// Base backoff interval (delay after first failure)
-    base_interval: Duration,
-    /// Maximum backoff interval (cap)
-    max_backoff: Duration,
-    /// Maximum number of tracked entries (LRU eviction when exceeded)
-    max_entries: usize,
-}
-
-/// Backoff state for a target location.
-#[derive(Debug, Clone)]
-struct BackoffState {
-    /// Number of consecutive failures
-    consecutive_failures: u32,
-    /// When the last failure occurred
-    last_failure: Instant,
-    /// When retry is allowed
-    retry_after: Instant,
-}
 
 /// Bucket for location - we group nearby locations to avoid tracking too many entries.
 /// Uses 256 buckets across the [0, 1] ring.
@@ -54,6 +30,18 @@ impl LocationBucket {
     }
 }
 
+/// Tracks backoff state for failed connection targets by location.
+///
+/// Uses exponential backoff: `base_interval * 2^(consecutive_failures-1)` capped at `max_backoff`.
+/// First failure = base_interval, second = 2x, third = 4x, etc.
+///
+/// Locations are grouped into 256 buckets to reduce memory usage while still providing
+/// effective backoff for nearby targets.
+#[derive(Debug)]
+pub struct ConnectionBackoff {
+    inner: TrackedBackoff<LocationBucket>,
+}
+
 impl Default for ConnectionBackoff {
     fn default() -> Self {
         Self::new()
@@ -72,22 +60,18 @@ impl ConnectionBackoff {
 
     /// Create a new backoff tracker with default settings.
     pub fn new() -> Self {
+        let config = ExponentialBackoff::new(Self::DEFAULT_BASE_INTERVAL, Self::DEFAULT_MAX_BACKOFF);
         Self {
-            failed_targets: HashMap::new(),
-            base_interval: Self::DEFAULT_BASE_INTERVAL,
-            max_backoff: Self::DEFAULT_MAX_BACKOFF,
-            max_entries: Self::DEFAULT_MAX_ENTRIES,
+            inner: TrackedBackoff::new(config, Self::DEFAULT_MAX_ENTRIES),
         }
     }
 
     /// Create a new backoff tracker with custom settings.
     #[cfg(test)]
     pub fn with_config(base_interval: Duration, max_backoff: Duration, max_entries: usize) -> Self {
+        let config = ExponentialBackoff::new(base_interval, max_backoff);
         Self {
-            failed_targets: HashMap::new(),
-            base_interval,
-            max_backoff,
-            max_entries,
+            inner: TrackedBackoff::new(config, max_entries),
         }
     }
 
@@ -96,11 +80,7 @@ impl ConnectionBackoff {
     /// Returns `true` if we should skip this target, `false` if we can attempt connection.
     pub fn is_in_backoff(&self, target: Location) -> bool {
         let bucket = LocationBucket::from_location(target);
-        if let Some(state) = self.failed_targets.get(&bucket) {
-            Instant::now() < state.retry_after
-        } else {
-            false
-        }
+        self.inner.is_in_backoff(&bucket)
     }
 
     /// Record a connection failure for a target location.
@@ -108,37 +88,16 @@ impl ConnectionBackoff {
     /// Increments the failure count and calculates the next retry time.
     pub fn record_failure(&mut self, target: Location) {
         let bucket = LocationBucket::from_location(target);
-        let now = Instant::now();
+        let failures_before = self.inner.failure_count(&bucket);
+        self.inner.record_failure(bucket);
 
-        // Get or create the state and update failure count
-        let consecutive_failures = {
-            let state = self.failed_targets.entry(bucket).or_insert(BackoffState {
-                consecutive_failures: 0,
-                last_failure: now,
-                retry_after: now,
-            });
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-            state.last_failure = now;
-            state.consecutive_failures
-        };
-
-        // Calculate backoff: base * 2^failures, capped at max
-        let backoff = self.calculate_backoff(consecutive_failures);
-
-        // Update retry_after
-        if let Some(state) = self.failed_targets.get_mut(&bucket) {
-            state.retry_after = now + backoff;
-        }
-
+        let backoff = self.inner.config().delay_for_failures(failures_before + 1);
         tracing::debug!(
             bucket = bucket.0,
-            failures = consecutive_failures,
+            failures = failures_before + 1,
             backoff_secs = backoff.as_secs(),
             "Connection target in backoff"
         );
-
-        // Evict oldest entries if we exceed max
-        self.evict_if_needed();
     }
 
     /// Record a successful connection to a target location.
@@ -146,52 +105,10 @@ impl ConnectionBackoff {
     /// Clears the backoff state for that location bucket.
     pub fn record_success(&mut self, target: Location) {
         let bucket = LocationBucket::from_location(target);
-        if self.failed_targets.remove(&bucket).is_some() {
+        if self.inner.failure_count(&bucket) > 0 {
             tracing::debug!(bucket = bucket.0, "Connection target backoff cleared");
         }
-    }
-
-    /// Calculate backoff duration for a given failure count.
-    ///
-    /// Uses formula: base_interval * 2^(consecutive_failures - 1)
-    /// - 1st failure: base_interval (5s default)
-    /// - 2nd failure: 2 * base_interval (10s)
-    /// - 3rd failure: 4 * base_interval (20s)
-    /// - etc., capped at max_backoff
-    fn calculate_backoff(&self, consecutive_failures: u32) -> Duration {
-        if consecutive_failures == 0 {
-            return Duration::ZERO;
-        }
-        // Cap the exponent to avoid overflow (consecutive_failures - 1, max 10)
-        let exponent = (consecutive_failures - 1).min(10);
-        let multiplier = 1u64 << exponent; // 2^(consecutive_failures - 1)
-        let backoff = self.base_interval.saturating_mul(multiplier as u32);
-
-        // Cap at max backoff
-        if backoff > self.max_backoff {
-            self.max_backoff
-        } else {
-            backoff
-        }
-    }
-
-    /// Evict oldest entries until we're at or below max_entries.
-    fn evict_if_needed(&mut self) {
-        while self.failed_targets.len() > self.max_entries {
-            // Find and remove the entry with oldest last_failure
-            let oldest = self
-                .failed_targets
-                .iter()
-                .min_by_key(|(_, state)| state.last_failure)
-                .map(|(bucket, _)| *bucket);
-
-            if let Some(bucket) = oldest {
-                self.failed_targets.remove(&bucket);
-            } else {
-                // No entries to remove (shouldn't happen, but avoid infinite loop)
-                break;
-            }
-        }
+        self.inner.record_success(&bucket);
     }
 
     /// Clean up expired backoff entries (those past their retry time and stale).
@@ -200,16 +117,14 @@ impl ConnectionBackoff {
     /// in backoff for longer than max_backoff (i.e., stale entries that haven't
     /// had recent failures). Called periodically to prevent unbounded growth.
     pub fn cleanup_expired(&mut self) {
-        let now = Instant::now();
+        self.inner.cleanup_expired();
+    }
 
-        // Remove entries that:
-        // 1. Are past their retry time AND
-        // 2. Have been in backoff for at least max_backoff (stale)
-        self.failed_targets.retain(|_, state| {
-            let is_past_retry = now >= state.retry_after;
-            let is_stale = now.duration_since(state.last_failure) > self.max_backoff;
-            !(is_past_retry && is_stale)
-        });
+    /// Get the failure count for a location (for testing).
+    #[cfg(test)]
+    fn failure_count(&self, target: Location) -> u32 {
+        let bucket = LocationBucket::from_location(target);
+        self.inner.failure_count(&bucket)
     }
 }
 
@@ -247,31 +162,22 @@ mod tests {
 
     #[test]
     fn test_exponential_backoff_calculation() {
-        let backoff =
-            ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
+        let config = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
 
-        // Formula: base * 2^(n-1)
-        // 1st failure: 1s * 2^0 = 1s
-        assert_eq!(backoff.calculate_backoff(1), Duration::from_secs(1));
-        // 2nd failure: 1s * 2^1 = 2s
-        assert_eq!(backoff.calculate_backoff(2), Duration::from_secs(2));
-        // 3rd failure: 1s * 2^2 = 4s
-        assert_eq!(backoff.calculate_backoff(3), Duration::from_secs(4));
-        // 4th failure: 1s * 2^3 = 8s
-        assert_eq!(backoff.calculate_backoff(4), Duration::from_secs(8));
+        // Formula: base * 2^(n-1) via delay_for_failures
+        assert_eq!(config.delay_for_failures(1), Duration::from_secs(1));
+        assert_eq!(config.delay_for_failures(2), Duration::from_secs(2));
+        assert_eq!(config.delay_for_failures(3), Duration::from_secs(4));
+        assert_eq!(config.delay_for_failures(4), Duration::from_secs(8));
     }
 
     #[test]
     fn test_backoff_capped_at_max() {
-        let backoff = ConnectionBackoff::with_config(
-            Duration::from_secs(10),
-            Duration::from_secs(60), // Max 60 seconds
-            256,
-        );
+        let config = ExponentialBackoff::new(Duration::from_secs(10), Duration::from_secs(60));
 
         // After many failures, should be capped at 60s
-        assert_eq!(backoff.calculate_backoff(10), Duration::from_secs(60));
-        assert_eq!(backoff.calculate_backoff(20), Duration::from_secs(60));
+        assert_eq!(config.delay_for_failures(10), Duration::from_secs(60));
+        assert_eq!(config.delay_for_failures(20), Duration::from_secs(60));
     }
 
     #[test]
@@ -315,7 +221,7 @@ mod tests {
         }
 
         // Should have at most max_entries
-        assert!(backoff.failed_targets.len() <= 10);
+        assert!(backoff.inner.len() <= 10);
     }
 
     #[test]
@@ -324,25 +230,13 @@ mod tests {
             ConnectionBackoff::with_config(Duration::from_secs(1), Duration::from_secs(300), 256);
 
         let loc = Location::new(0.5);
-        let bucket = LocationBucket::from_location(loc);
 
         // First failure
         backoff.record_failure(loc);
-        let first_failures = backoff
-            .failed_targets
-            .get(&bucket)
-            .unwrap()
-            .consecutive_failures;
+        assert_eq!(backoff.failure_count(loc), 1);
 
         // Second failure
         backoff.record_failure(loc);
-        let second_failures = backoff
-            .failed_targets
-            .get(&bucket)
-            .unwrap()
-            .consecutive_failures;
-
-        assert_eq!(first_failures, 1);
-        assert_eq!(second_failures, 2);
+        assert_eq!(backoff.failure_count(loc), 2);
     }
 }

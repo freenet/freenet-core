@@ -1,3 +1,4 @@
+pub(crate) mod backoff;
 pub(crate) mod time_source;
 pub(crate) mod workspace;
 
