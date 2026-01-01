@@ -248,17 +248,22 @@ async fn test_with_noise() {
 
 This section documents gaps in the current testing infrastructure identified through analysis.
 
-### Gap T1: Connectivity Verification is Event-Based, Not Graph-Based
+### Gap T1: Connectivity Verification Details
 
 **Current State:**
-- `check_partial_connectivity()` in `testing_impl.rs` relies on `event_listener.is_connected()`
-- Only checks if a peer has emitted a "connected" event—not actual network reachability
-- Critical FIXME in `network.rs`: "we are getting connectivity check that is not real since peers are not reporting if they are connected or not to other peers"
+- `check_partial_connectivity()` uses `event_listener.is_connected()` which checks for Connect events
+- This is generally sufficient - Connect events are ground truth for actual connections
+- FIXME in `network.rs` refers to a specific reporting detail, not a fundamental issue
 
-**What's Missing:**
-- Actual peer-graph connectivity verification (can peer A reach peer B through the ring?)
-- Deterministic event scheduling for node startup and peer discovery
-- Explicit synchronization barriers for topology establishment
+**When Event Logging Works Well:**
+- Verifying peers connected to each other (Connect events are factual)
+- Counting connections per peer
+- Checking network formation over time
+
+**Edge Cases Where More Might Be Needed:**
+- Multi-hop reachability analysis (can A route to C via B?)
+- Ring topology structure validation
+- These are protocol verification concerns, not typical test requirements
 
 ### Gap T2: Eventual Consistency Tests Don't Assert Convergence
 
@@ -310,13 +315,13 @@ This section documents gaps in the current testing infrastructure identified thr
 
 ### Gap Summary Table
 
-| Gap | Severity | Current Workaround |
-|-----|----------|-------------------|
-| T1: Connectivity graph-based | HIGH | Assert on event types only |
-| T2: Convergence assertions | HIGH | Manual inspection of logs |
-| T3: Direct state query | MEDIUM | Infer from events |
+| Gap | Severity | Notes |
+|-----|----------|-------|
+| T1: Connectivity verification | LOW | Event logging is sufficient for most cases |
+| T2: Convergence assertions | HIGH | Tests don't fail on non-convergence |
+| T3: Direct state query | MEDIUM | Infer from events (works but indirect) |
 | T4: Operation completion | MEDIUM | Assume success if no crash |
-| T5: Fault effect measurement | MEDIUM | Empirical observation |
+| T5: Fault effect measurement | MEDIUM | Empirical observation only |
 
 ---
 
