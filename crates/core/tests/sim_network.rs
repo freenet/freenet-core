@@ -24,6 +24,7 @@ async fn test_sim_network_basic_connectivity() {
         3,  // rnd_if_htl_above
         10, // max_connections
         2,  // min_connections
+        SimNetwork::DEFAULT_SEED,
     )
     .await;
 
@@ -60,6 +61,7 @@ async fn test_sim_network_peer_registration() {
         3,  // rnd_if_htl_above
         10, // max_connections
         1,  // min_connections
+        SimNetwork::DEFAULT_SEED,
     )
     .await;
 
@@ -100,6 +102,7 @@ async fn test_sim_network_connection_check() {
         3,  // rnd_if_htl_above
         10, // max_connections
         1,  // min_connections
+        SimNetwork::DEFAULT_SEED,
     )
     .await;
 

@@ -49,6 +49,9 @@ pub mod util;
 /// WASM code execution runtime, tailored for the contract and delegate APIs.
 mod wasm_runtime;
 
+/// Deterministic simulation testing framework.
+pub mod simulation;
+
 /// Exports to build a running local node.
 pub mod local_node {
     use super::*;
@@ -69,7 +72,9 @@ pub mod dev_tool {
     pub use flatbuffers;
     pub use message::Transaction;
     pub use node::{
-        testing_impl::{EventChain, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork},
+        testing_impl::{
+            EventChain, EventSummary, NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork,
+        },
         InitPeerNode, NodeConfig, PeerId,
     };
     pub use ring::Location;
