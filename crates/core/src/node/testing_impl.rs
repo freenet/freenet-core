@@ -114,6 +114,19 @@ struct GatewayConfig {
     location: Location,
 }
 
+/// Summary of a network event for deterministic comparison.
+///
+/// Excludes timestamps which vary between runs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EventSummary {
+    pub tx: crate::message::Transaction,
+    pub peer_addr: std::net::SocketAddr,
+    /// String representation of the event kind for sorting
+    pub event_kind_name: String,
+    /// Full debug representation of the event
+    pub event_detail: String,
+}
+
 pub struct EventChain<S = watch::Sender<(EventId, TransportPublicKey)>> {
     labels: Vec<(NodeLabel, TransportPublicKey)>,
     user_ev_controller: S,
@@ -701,6 +714,67 @@ impl SimNetwork {
             .binary_search_by(|(label, _)| label.cmp(peer))
             .expect("peer not found");
         self.event_listener.is_connected(&self.labels[pos].1)
+    }
+
+    /// Returns a copy of all network event logs captured during the simulation.
+    ///
+    /// These logs can be used to verify deterministic behavior by comparing
+    /// event sequences across runs with the same seed.
+    pub async fn get_event_logs(&self) -> Vec<crate::tracing::NetLogMessage> {
+        self.event_listener.logs.lock().await.clone()
+    }
+
+    /// Returns event logs filtered and sorted for deterministic comparison.
+    ///
+    /// Events are sorted by (transaction, peer_addr, event_kind_name).
+    /// Timestamps are ignored since they may vary between runs.
+    pub async fn get_deterministic_event_summary(&self) -> Vec<EventSummary> {
+        let logs = self.event_listener.logs.lock().await;
+        let mut summaries: Vec<EventSummary> = logs
+            .iter()
+            .map(|log| {
+                let event_detail = format!("{:?}", log.kind);
+                // Extract just the variant name from debug representation
+                let event_kind_name = event_detail
+                    .split('(')
+                    .next()
+                    .unwrap_or("Unknown")
+                    .split('{')
+                    .next()
+                    .unwrap_or("Unknown")
+                    .trim()
+                    .to_string();
+                EventSummary {
+                    tx: log.tx,
+                    peer_addr: log.peer_id.addr,
+                    event_kind_name,
+                    event_detail,
+                }
+            })
+            .collect();
+        // Sort for deterministic comparison
+        summaries.sort();
+        summaries
+    }
+
+    /// Counts events by type for quick comparison.
+    pub async fn get_event_counts(&self) -> std::collections::HashMap<String, usize> {
+        let logs = self.event_listener.logs.lock().await;
+        let mut counts = std::collections::HashMap::new();
+        for log in logs.iter() {
+            // Extract just the variant name from the debug representation
+            let debug_str = format!("{:?}", log.kind);
+            let key = debug_str
+                .split('(')
+                .next()
+                .unwrap_or("Unknown")
+                .split('{')
+                .next()
+                .unwrap_or("Unknown")
+                .trim();
+            *counts.entry(key.to_string()).or_insert(0) += 1;
+        }
+        counts
     }
 
     /// Recommended to calling after `check_connectivity` to ensure enough time
