@@ -1,11 +1,20 @@
 use std::path::Path;
 
-use rsa::{
-    pkcs8,
-    rand_core::{CryptoRngCore, OsRng},
-    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
-};
+use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
 use serde::{Deserialize, Serialize};
+use x25519_dalek::{PublicKey, StaticSecret};
+
+/// Size of X25519 public key
+pub const X25519_PUBLIC_KEY_SIZE: usize = 32;
+
+/// Size of ChaCha20Poly1305 authentication tag
+const CHACHA_TAG_SIZE: usize = 16;
+
+/// Size of encrypted intro packet:
+/// ephemeral_public (32) + encrypted_data + tag (16)
+pub const fn intro_packet_size(plaintext_len: usize) -> usize {
+    X25519_PUBLIC_KEY_SIZE + plaintext_len + CHACHA_TAG_SIZE
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransportKeypair {
@@ -15,18 +24,43 @@ pub struct TransportKeypair {
 
 impl TransportKeypair {
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        use pkcs8::EncodePrivateKey;
         use std::fs::File;
         use std::io::Write;
 
         let mut file = File::create(path)?;
-        let key = self
-            .secret
-            .0
-            .to_pkcs8_pem(pkcs8::LineEnding::default())
-            .unwrap();
-        file.write_all(key.as_bytes())?;
+        // Save as hex-encoded private key bytes
+        let hex = hex::encode(self.secret.0.as_bytes());
+        file.write_all(hex.as_bytes())?;
         Ok(())
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        use std::fs::File;
+        use std::io::Read;
+
+        let mut file = File::open(path)?;
+        let mut hex_str = String::new();
+        file.read_to_string(&mut hex_str)?;
+
+        let bytes = hex::decode(hex_str.trim())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        if bytes.len() != 32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid key length",
+            ));
+        }
+
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&bytes);
+        let secret = StaticSecret::from(key_bytes);
+        let public = PublicKey::from(&secret);
+
+        Ok(TransportKeypair {
+            public: TransportPublicKey(public),
+            secret: TransportSecretKey(secret),
+        })
     }
 }
 
@@ -38,28 +72,13 @@ impl Default for TransportKeypair {
 
 impl TransportKeypair {
     pub fn new() -> Self {
-        let mut rng = OsRng;
-        Self::new_inner(&mut rng)
-    }
-
-    pub fn new_with_rng(rng: &mut impl CryptoRngCore) -> Self {
-        Self::new_inner(rng)
-    }
-
-    fn new_inner(rng: &mut impl CryptoRngCore) -> Self {
-        const BITS: usize = 2048;
-        let priv_key = RsaPrivateKey::new(rng, BITS).expect("failed to generate a key");
-        let public = TransportPublicKey(RsaPublicKey::from(&priv_key));
+        // Generate random bytes for the secret key
+        let secret_bytes: [u8; 32] = rand::random();
+        let secret = StaticSecret::from(secret_bytes);
+        let public = PublicKey::from(&secret);
         TransportKeypair {
-            public,
-            secret: TransportSecretKey(priv_key),
-        }
-    }
-
-    pub fn from_private_key(priv_key: RsaPrivateKey) -> Self {
-        TransportKeypair {
-            public: TransportPublicKey(RsaPublicKey::from(&priv_key)),
-            secret: TransportSecretKey(priv_key),
+            public: TransportPublicKey(public),
+            secret: TransportSecretKey(secret),
         }
     }
 
@@ -73,31 +92,118 @@ impl TransportKeypair {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
-pub struct TransportPublicKey(RsaPublicKey);
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct TransportPublicKey(PublicKey);
 
 impl TransportPublicKey {
+    /// Encrypt data using static-ephemeral X25519 key exchange.
+    ///
+    /// Returns: ephemeral_public (32 bytes) || ciphertext || tag (16 bytes)
+    ///
+    /// The encryption uses:
+    /// 1. Generate ephemeral X25519 keypair
+    /// 2. Compute shared_secret = ECDH(ephemeral_private, recipient_static_public)
+    /// 3. Use shared_secret as ChaCha20Poly1305 key with zero nonce (safe because key is unique per message)
+    /// 4. Return ephemeral_public || AEAD_encrypt(data)
     pub fn encrypt(&self, data: &[u8]) -> Vec<u8> {
-        let mut rng = OsRng;
-        let padding = Pkcs1v15Encrypt;
-        self.0
-            .encrypt(&mut rng, padding, data)
-            .expect("failed to encrypt")
+        // Generate ephemeral keypair using random bytes
+        let ephemeral_bytes: [u8; 32] = rand::random();
+        let ephemeral_secret = StaticSecret::from(ephemeral_bytes);
+        let ephemeral_public = PublicKey::from(&ephemeral_secret);
+
+        // Compute shared secret
+        let shared_secret = ephemeral_secret.diffie_hellman(&self.0);
+
+        // Use shared secret as ChaCha20Poly1305 key
+        let cipher = ChaCha20Poly1305::new(shared_secret.as_bytes().into());
+
+        // Zero nonce is safe because we use a fresh ephemeral key for each encryption
+        let nonce = Nonce::default();
+
+        let ciphertext = cipher.encrypt(&nonce, data).expect("encryption failure");
+
+        // Prepend ephemeral public key
+        let mut result = Vec::with_capacity(X25519_PUBLIC_KEY_SIZE + ciphertext.len());
+        result.extend_from_slice(ephemeral_public.as_bytes());
+        result.extend_from_slice(&ciphertext);
+        result
     }
 
-    /// Save the public key to a file in PEM format.
+    /// Save the public key to a file in hex format.
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        use pkcs8::EncodePublicKey;
         use std::fs::File;
         use std::io::Write;
 
         let mut file = File::create(path)?;
-        let key = self
-            .0
-            .to_public_key_pem(pkcs8::LineEnding::default())
-            .unwrap();
-        file.write_all(key.as_bytes())?;
+        let hex = hex::encode(self.0.as_bytes());
+        file.write_all(hex.as_bytes())?;
         Ok(())
+    }
+
+    /// Get the raw bytes of the public key
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    /// Create from raw bytes
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        TransportPublicKey(PublicKey::from(bytes))
+    }
+}
+
+// Custom Serialize/Deserialize for TransportPublicKey
+impl Serialize for TransportPublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(self.0.as_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for TransportPublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, Visitor};
+
+        struct PublicKeyVisitor;
+
+        impl<'de> Visitor<'de> for PublicKeyVisitor {
+            type Value = TransportPublicKey;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("32 bytes for X25519 public key")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                if v.len() != 32 {
+                    return Err(E::custom(format!("expected 32 bytes, got {}", v.len())));
+                }
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(v);
+                Ok(TransportPublicKey(PublicKey::from(bytes)))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = [0u8; 32];
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| Error::invalid_length(i, &self))?;
+                }
+                Ok(TransportPublicKey(PublicKey::from(bytes)))
+            }
+        }
+
+        deserializer.deserialize_bytes(PublicKeyVisitor)
     }
 }
 
@@ -109,50 +215,136 @@ impl std::fmt::Debug for TransportPublicKey {
 
 impl std::fmt::Display for TransportPublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use pkcs8::EncodePublicKey;
+        // Use first 12 bytes of public key encoded in base58 for display
+        write!(
+            f,
+            "{}",
+            bs58::encode(&self.0.as_bytes()[..12]).into_string()
+        )
+    }
+}
 
-        let encoded = self.0.to_public_key_der().map_err(|_| std::fmt::Error)?;
-        let bytes = encoded.as_bytes();
+#[derive(Clone)]
+pub(crate) struct TransportSecretKey(StaticSecret);
 
-        // For RSA 2048-bit keys, DER encoding is ~294 bytes:
-        // - Bytes 0-~22: DER structure headers (same for all 2048-bit keys)
-        // - Bytes ~23-~279: Modulus (256 bytes of random data)
-        // - Bytes ~280-~293: Exponent (typically 65537, same for all keys)
-        //
-        // To create a short but unique display string, we use 12 bytes from
-        // the middle of the modulus where the actual random data lives.
-        if bytes.len() >= 150 {
-            // Take 12 bytes from the middle of the modulus (around byte 100-112)
-            let mid_start = 100;
-            let to_encode = &bytes[mid_start..mid_start + 12];
-            write!(f, "{}", bs58::encode(to_encode).into_string())
-        } else {
-            // Fallback for smaller keys
-            write!(f, "{}", bs58::encode(bytes).into_string())
+impl TransportSecretKey {
+    /// Decrypt data that was encrypted with our public key using static-ephemeral X25519.
+    ///
+    /// Input format: ephemeral_public (32 bytes) || ciphertext || tag (16 bytes)
+    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, DecryptionError> {
+        if data.len() < X25519_PUBLIC_KEY_SIZE + CHACHA_TAG_SIZE {
+            return Err(DecryptionError::InvalidLength);
+        }
+
+        // Extract ephemeral public key
+        let mut ephemeral_bytes = [0u8; 32];
+        ephemeral_bytes.copy_from_slice(&data[..X25519_PUBLIC_KEY_SIZE]);
+        let ephemeral_public = PublicKey::from(ephemeral_bytes);
+
+        // Compute shared secret
+        let shared_secret = self.0.diffie_hellman(&ephemeral_public);
+
+        // Use shared secret as ChaCha20Poly1305 key
+        let cipher = ChaCha20Poly1305::new(shared_secret.as_bytes().into());
+
+        // Zero nonce (same as encryption)
+        let nonce = Nonce::default();
+
+        // Decrypt the ciphertext
+        let ciphertext = &data[X25519_PUBLIC_KEY_SIZE..];
+        cipher
+            .decrypt(&nonce, ciphertext)
+            .map_err(|_| DecryptionError::DecryptionFailed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecryptionError {
+    InvalidLength,
+    DecryptionFailed,
+}
+
+impl std::fmt::Display for DecryptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecryptionError::InvalidLength => write!(f, "invalid ciphertext length"),
+            DecryptionError::DecryptionFailed => write!(f, "decryption failed"),
         }
     }
 }
 
-impl From<RsaPublicKey> for TransportPublicKey {
-    fn from(key: RsaPublicKey) -> Self {
-        TransportPublicKey(key)
+impl std::error::Error for DecryptionError {}
+
+// Implement equality for TransportSecretKey by comparing derived public keys
+impl PartialEq for TransportSecretKey {
+    fn eq(&self, other: &Self) -> bool {
+        PublicKey::from(&self.0) == PublicKey::from(&other.0)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct TransportSecretKey(RsaPrivateKey);
+impl Eq for TransportSecretKey {}
 
-impl TransportSecretKey {
-    pub fn decrypt(&self, data: &[u8]) -> rsa::Result<Vec<u8>> {
-        self.0.decrypt(Pkcs1v15Encrypt, data)
+impl std::fmt::Debug for TransportSecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportSecretKey")
+            .field("public", &PublicKey::from(&self.0))
+            .finish()
     }
+}
 
-    #[cfg(test)]
-    pub fn to_pkcs8_pem(&self) -> Result<Vec<u8>, pkcs8::Error> {
-        use pkcs8::EncodePrivateKey;
-        self.0
-            .to_pkcs8_pem(pkcs8::LineEnding::default())
-            .map(|s| s.as_str().as_bytes().to_vec())
+// Custom Serialize/Deserialize for TransportSecretKey
+impl Serialize for TransportSecretKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(self.0.as_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for TransportSecretKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, Visitor};
+
+        struct SecretKeyVisitor;
+
+        impl<'de> Visitor<'de> for SecretKeyVisitor {
+            type Value = TransportSecretKey;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("32 bytes for X25519 secret key")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                if v.len() != 32 {
+                    return Err(E::custom(format!("expected 32 bytes, got {}", v.len())));
+                }
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(v);
+                Ok(TransportSecretKey(StaticSecret::from(bytes)))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = [0u8; 32];
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| Error::invalid_length(i, &self))?;
+                }
+                Ok(TransportSecretKey(StaticSecret::from(bytes)))
+            }
+        }
+
+        deserializer.deserialize_bytes(SecretKeyVisitor)
     }
 }
 
@@ -164,7 +356,7 @@ thread_local! {
 #[cfg(test)]
 impl<'a> arbitrary::Arbitrary<'a> for TransportKeypair {
     fn arbitrary(_u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        // Cache the keypair to avoid expensive RSA generation on each call
+        // Cache the keypair to avoid repeated generation
         Ok(CACHED_KEYPAIR.with(|cached| {
             let mut cached = cached.borrow_mut();
             match &*cached {
@@ -192,13 +384,15 @@ impl<'a> arbitrary::Arbitrary<'a> for TransportPublicKey {
 fn key_sizes_and_decryption() {
     let pair = TransportKeypair::new();
     let sym_key_bytes = rand::random::<[u8; 16]>();
-    // use aes_gcm::KeyInit;
-    // let _sym_key = aes_gcm::aes::Aes128::new(&sym_key_bytes.into());
     let encrypted: Vec<u8> = pair.public.encrypt(&sym_key_bytes);
+
+    // X25519 intro packet: 32 (ephemeral pub) + 16 (data) + 16 (tag) = 64 bytes
+    assert_eq!(encrypted.len(), intro_packet_size(16));
     assert!(
         encrypted.len() <= super::packet_data::MAX_PACKET_SIZE,
         "packet size is too big"
     );
+
     let bytes = pair.secret.decrypt(&encrypted).unwrap();
     assert_eq!(bytes, sym_key_bytes.as_slice());
 }
@@ -210,9 +404,6 @@ mod display_uniqueness_tests {
 
     #[test]
     fn display_produces_unique_strings_for_100_keys() {
-        // Verify the Display impl produces unique strings by checking 100 keys.
-        // This test was added after discovering the original Display impl only
-        // had ~1 byte of entropy (see PR #2233 for details).
         let mut seen = HashSet::new();
         for i in 0..100 {
             let keypair = TransportKeypair::new();
@@ -243,72 +434,25 @@ mod crypto_tests {
     }
 
     #[test]
-    fn test_new_with_rng_deterministic() {
-        // Using a seeded RNG should produce the same keypair
-        // Use OsRng which implements the CryptoRngCore trait from the correct rand_core version
-        use rsa::rand_core::OsRng;
-
-        // Create two keypairs with OsRng to verify the method works
-        // (Can't test determinism easily due to rand_core version mismatch)
-        let keypair1 = TransportKeypair::new_with_rng(&mut OsRng);
-        let keypair2 = TransportKeypair::new_with_rng(&mut OsRng);
-
-        // Both should be valid keypairs (different due to randomness)
-        assert_ne!(keypair1, keypair2);
-
-        // But both should work for encryption/decryption
-        let data = b"test";
-        let encrypted1 = keypair1.public.encrypt(data);
-        let decrypted1 = keypair1.secret.decrypt(&encrypted1).unwrap();
-        assert_eq!(data.as_slice(), decrypted1.as_slice());
-
-        let encrypted2 = keypair2.public.encrypt(data);
-        let decrypted2 = keypair2.secret.decrypt(&encrypted2).unwrap();
-        assert_eq!(data.as_slice(), decrypted2.as_slice());
-    }
-
-    #[test]
-    fn test_from_private_key() {
-        let original = TransportKeypair::new();
-        // Extract the private key and reconstruct
-        let pem_bytes = original.secret.to_pkcs8_pem().unwrap();
-
-        use rsa::pkcs8::DecodePrivateKey;
-        let priv_key =
-            RsaPrivateKey::from_pkcs8_pem(std::str::from_utf8(&pem_bytes).unwrap()).unwrap();
-
-        let reconstructed = TransportKeypair::from_private_key(priv_key);
-
-        // The public keys should match
-        assert_eq!(
-            format!("{}", original.public),
-            format!("{}", reconstructed.public)
-        );
-    }
-
-    #[test]
     fn test_keypair_save_and_load() {
         let keypair = TransportKeypair::new();
         let temp_dir = std::env::temp_dir();
-        let key_path = temp_dir.join("test_keypair.pem");
+        let key_path = temp_dir.join("test_x25519_keypair.key");
 
         // Save the keypair
         keypair.save(&key_path).unwrap();
 
-        // Verify file exists and contains PEM data
+        // Verify file exists and contains hex data
         let mut contents = String::new();
         std::fs::File::open(&key_path)
             .unwrap()
             .read_to_string(&mut contents)
             .unwrap();
 
-        assert!(contents.contains("-----BEGIN PRIVATE KEY-----"));
-        assert!(contents.contains("-----END PRIVATE KEY-----"));
+        assert_eq!(contents.len(), 64); // 32 bytes as hex = 64 chars
 
-        // Load the key back and verify it works
-        use rsa::pkcs8::DecodePrivateKey;
-        let loaded_key = RsaPrivateKey::from_pkcs8_pem(&contents).unwrap();
-        let loaded_keypair = TransportKeypair::from_private_key(loaded_key);
+        // Load the key back
+        let loaded_keypair = TransportKeypair::load(&key_path).unwrap();
 
         // Test that encryption/decryption works across save/load
         let data = b"round trip test";
@@ -324,20 +468,19 @@ mod crypto_tests {
     fn test_public_key_save() {
         let keypair = TransportKeypair::new();
         let temp_dir = std::env::temp_dir();
-        let key_path = temp_dir.join("test_pubkey.pem");
+        let key_path = temp_dir.join("test_x25519_pubkey.key");
 
         // Save the public key
         keypair.public.save(&key_path).unwrap();
 
-        // Verify file exists and contains PEM data
+        // Verify file exists and contains hex data
         let mut contents = String::new();
         std::fs::File::open(&key_path)
             .unwrap()
             .read_to_string(&mut contents)
             .unwrap();
 
-        assert!(contents.contains("-----BEGIN PUBLIC KEY-----"));
-        assert!(contents.contains("-----END PUBLIC KEY-----"));
+        assert_eq!(contents.len(), 64); // 32 bytes as hex = 64 chars
 
         // Cleanup
         std::fs::remove_file(&key_path).ok();
@@ -354,23 +497,6 @@ mod crypto_tests {
     }
 
     #[test]
-    fn test_public_key_from_rsa() {
-        use rsa::rand_core::OsRng;
-        let priv_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-        let pub_key = RsaPublicKey::from(&priv_key);
-
-        let transport_pub: TransportPublicKey = pub_key.into();
-
-        // Verify we can use it for encryption
-        let data = b"test from conversion";
-        let encrypted = transport_pub.encrypt(data);
-
-        // And decrypt with the original private key
-        let decrypted = priv_key.decrypt(Pkcs1v15Encrypt, &encrypted).unwrap();
-        assert_eq!(data.as_slice(), decrypted.as_slice());
-    }
-
-    #[test]
     fn test_secret_accessor() {
         let keypair = TransportKeypair::new();
         let secret = keypair.secret();
@@ -380,5 +506,66 @@ mod crypto_tests {
         let encrypted = keypair.public.encrypt(data);
         let decrypted = secret.decrypt(&encrypted).unwrap();
         assert_eq!(data.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_intro_packet_size() {
+        // Protocol version (8) + symmetric key (16) = 24 bytes plaintext
+        // Encrypted: 32 (ephemeral pub) + 24 (data) + 16 (tag) = 72 bytes
+        assert_eq!(intro_packet_size(24), 72);
+
+        // Compare to old RSA: 256 bytes
+        // New X25519: 72 bytes (3.5x smaller!)
+    }
+
+    #[test]
+    fn test_public_key_serialization() {
+        let keypair = TransportKeypair::new();
+
+        // Serialize
+        let serialized = bincode::serialize(&keypair.public).unwrap();
+
+        // Deserialize
+        let deserialized: TransportPublicKey = bincode::deserialize(&serialized).unwrap();
+
+        // Should be equal
+        assert_eq!(keypair.public, deserialized);
+    }
+
+    #[test]
+    fn test_decryption_error_invalid_length() {
+        let keypair = TransportKeypair::new();
+
+        // Too short - less than ephemeral public key + tag
+        let short_data = [0u8; 40];
+        let result = keypair.secret.decrypt(&short_data);
+        assert_eq!(result.unwrap_err(), DecryptionError::InvalidLength);
+    }
+
+    #[test]
+    fn test_decryption_error_wrong_key() {
+        let keypair1 = TransportKeypair::new();
+        let keypair2 = TransportKeypair::new();
+
+        let data = b"test data";
+        let encrypted = keypair1.public.encrypt(data);
+
+        // Try to decrypt with wrong key
+        let result = keypair2.secret.decrypt(&encrypted);
+        assert_eq!(result.unwrap_err(), DecryptionError::DecryptionFailed);
+    }
+
+    #[test]
+    fn test_decryption_error_tampered_ciphertext() {
+        let keypair = TransportKeypair::new();
+
+        let data = b"test data";
+        let mut encrypted = keypair.public.encrypt(data);
+
+        // Tamper with ciphertext
+        encrypted[40] ^= 0xFF;
+
+        let result = keypair.secret.decrypt(&encrypted);
+        assert_eq!(result.unwrap_err(), DecryptionError::DecryptionFailed);
     }
 }

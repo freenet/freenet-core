@@ -13,7 +13,6 @@ use anyhow::Context;
 use directories::ProjectDirs;
 use either::Either;
 use itertools::Itertools;
-use pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -1488,7 +1487,7 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
         let content = public_key_response.bytes().await?;
         std::io::copy(&mut content.as_ref(), &mut public_key_file)?;
 
-        // Validate the public key
+        // Validate the public key (hex-encoded X25519 public key, 32 bytes = 64 hex chars)
         let mut key_file = File::open(&local_path).with_context(|| {
             format!(
                 "failed loading gateway pubkey from {:?}",
@@ -1497,13 +1496,21 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
         })?;
         let mut buf = String::new();
         key_file.read_to_string(&mut buf)?;
-        if rsa::RsaPublicKey::from_public_key_pem(&buf).is_ok() {
-            gateway.public_key_path = local_path;
-            valid_gateways.push(gateway.clone());
+        if let Ok(key_bytes) = hex::decode(buf.trim()) {
+            if key_bytes.len() == 32 {
+                gateway.public_key_path = local_path;
+                valid_gateways.push(gateway.clone());
+            } else {
+                tracing::warn!(
+                    public_key_path = ?gateway.public_key_path,
+                    "Invalid public key length {} (expected 32), ignoring",
+                    key_bytes.len()
+                );
+            }
         } else {
             tracing::warn!(
                 public_key_path = ?gateway.public_key_path,
-                "Invalid public key found in remote gateway file, ignoring"
+                "Invalid public key hex encoding in remote gateway file, ignoring"
             );
         }
     }
@@ -1516,10 +1523,8 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
 mod tests {
     use httptest::{matchers::*, responders::*, Expectation, Server};
 
-    use pkcs8::EncodePublicKey;
-    use rsa::RsaPublicKey;
-
     use crate::node::NodeConfig;
+    use crate::transport::TransportKeypair;
 
     use super::*;
 
@@ -1556,14 +1561,12 @@ mod tests {
 
         let url = server.url_str("/gateways");
 
-        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 256).unwrap();
-        let key = key
-            .to_public_key()
-            .to_public_key_pem(pkcs8::LineEnding::default())
-            .unwrap();
+        // Generate a valid X25519 public key in hex format
+        let keypair = TransportKeypair::new();
+        let key_hex = hex::encode(keypair.public().as_bytes());
         server.expect(
             Expectation::matching(request::path("/path/to/public_key.pem"))
-                .respond_with(status_code(200).body(key.as_str().to_string())),
+                .respond_with(status_code(200).body(key_hex)),
         );
 
         let pub_keys_dir = tempfile::tempdir().unwrap();
@@ -1607,6 +1610,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires gateway keys to be updated to X25519 format (issue #2531)"]
     async fn test_remote_freenet_gateways() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let gateways = load_gateways_from_index(FREENET_GATEWAYS_INDEX, tmp_dir.path())
@@ -1616,10 +1620,15 @@ mod tests {
 
         for gw in gateways.gateways {
             assert!(gw.public_key_path.exists());
-            assert!(RsaPublicKey::from_public_key_pem(
-                &std::fs::read_to_string(gw.public_key_path).unwrap(),
-            )
-            .is_ok());
+            // Validate the public key is in hex format (32 bytes = 64 hex chars)
+            let key_contents = std::fs::read_to_string(&gw.public_key_path).unwrap();
+            let key_bytes =
+                hex::decode(key_contents.trim()).expect("Gateway public key should be valid hex");
+            assert_eq!(
+                key_bytes.len(),
+                32,
+                "Gateway public key should be 32 bytes (X25519)"
+            );
             let socket = NodeConfig::parse_socket_addr(&gw.address).await.unwrap();
             // Don't test for specific port since it's randomly assigned
             assert!(socket.port() > 1024); // Ensure we're using unprivileged ports

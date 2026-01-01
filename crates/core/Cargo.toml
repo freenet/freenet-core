@@ -45,6 +45,7 @@ flatbuffers = "25.9"
 futures = "0.3"
 semver = { version = "1",  features = ["serde"] }
 headers = "0.4"
+hex = "0.4"
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
 hostname = "0.4"
 itertools = "0.14"
@@ -73,8 +74,7 @@ wasmer-middlewares = "6.1.0"
 wasmer-compiler-singlepass = { workspace = true }
 xz2 = { version = "0.1" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-rsa = { version = "0.9", features = ["serde", "pem"] }
-pkcs8 = { version = "0.10", features = ["std", "pem"] }
+x25519-dalek = { workspace = true }
 sha2 = "0.10"
 
 # Tracing deps

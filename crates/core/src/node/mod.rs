@@ -53,7 +53,6 @@ use crate::{
     message::{MessageStats, NetMessageV1},
 };
 use freenet_stdlib::client_api::DelegateRequest;
-use rsa::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
@@ -192,8 +191,18 @@ impl NodeConfig {
             let mut buf = String::new();
             key_file.read_to_string(&mut buf)?;
 
-            let pub_key = rsa::RsaPublicKey::from_public_key_pem(&buf)?;
-            let transport_pub_key = TransportPublicKey::from(pub_key);
+            let key_bytes = hex::decode(buf.trim()).with_context(|| {
+                format!("failed to decode gateway pubkey hex from {public_key_path:?}")
+            })?;
+            if key_bytes.len() != 32 {
+                anyhow::bail!(
+                    "invalid gateway pubkey length {} (expected 32) from {public_key_path:?}",
+                    key_bytes.len()
+                );
+            }
+            let mut key_arr = [0u8; 32];
+            key_arr.copy_from_slice(&key_bytes);
+            let transport_pub_key = TransportPublicKey::from_bytes(key_arr);
 
             // Skip if this gateway's public key matches our own
             if &transport_pub_key == own_pub_key {
