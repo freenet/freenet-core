@@ -3,7 +3,6 @@ use std::path::Path;
 use aes_gcm::KeyInit;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::client_api::DelegateRequest;
-use rsa::pkcs8::DecodePrivateKey;
 
 use super::*;
 
@@ -45,7 +44,7 @@ impl ConfigArgs {
 
 #[derive(Debug, Default, Clone, clap::Parser, serde::Serialize, serde::Deserialize)]
 pub struct SecretArgs {
-    /// Path to the RSA private key for the transport layer.
+    /// Path to the X25519 keypair for the transport layer.
     #[clap(long, value_parser, default_value=None, env = "TRANSPORT_KEYPAIR")]
     pub transport_keypair: Option<PathBuf>,
 
@@ -203,29 +202,47 @@ fn read_cipher(path_to_cipher: impl AsRef<Path>) -> std::io::Result<[u8; CIPHER_
 }
 
 fn read_transport_keypair(path_to_key: impl AsRef<Path>) -> std::io::Result<TransportKeypair> {
-    let path_to_key = path_to_key.as_ref();
-    let mut key_file = File::open(path_to_key).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("Failed to open key file {}: {e}", path_to_key.display()),
-        )
-    })?;
-    let mut buf = String::new();
-    key_file.read_to_string(&mut buf).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("Failed to read key file {}: {e}", path_to_key.display()),
-        )
-    })?;
+    let path = path_to_key.as_ref();
+    match TransportKeypair::load(path) {
+        Ok(keypair) => Ok(keypair),
+        Err(e) => {
+            // Check if this looks like an old RSA PEM key
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if content.trim().starts_with("-----BEGIN") {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "Found RSA PEM key (legacy format). Generating new X25519 keypair. \
+                         The old key file will be overwritten."
+                    );
+                    let keypair = TransportKeypair::new();
+                    keypair.save(path)?;
 
-    let pk = rsa::RsaPrivateKey::from_pkcs8_pem(&buf).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Failed to read key file {}: {e}", path_to_key.display()),
-        )
-    })?;
+                    // Also update the public key file if it exists in the same directory
+                    // (freenet-test-network generates keypair.pem and public_key.pem together)
+                    if let Some(parent) = path.parent() {
+                        let public_key_path = parent.join("public_key.pem");
+                        if public_key_path.exists() {
+                            if let Err(e) = keypair.public().save(&public_key_path) {
+                                tracing::warn!(
+                                    path = %public_key_path.display(),
+                                    error = %e,
+                                    "Failed to update public key file"
+                                );
+                            } else {
+                                tracing::info!(
+                                    path = %public_key_path.display(),
+                                    "Updated public key file to X25519 format"
+                                );
+                            }
+                        }
+                    }
 
-    Ok::<_, std::io::Error>(TransportKeypair::from_private_key(pk))
+                    return Ok(keypair);
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -238,19 +255,13 @@ mod tests {
         let nonce = [0u8; NONCE_SIZE];
         let cipher = [0u8; CIPHER_SIZE];
 
-        let mut transport_keypair_file = tempfile::NamedTempFile::new().unwrap();
+        let transport_keypair_file = tempfile::NamedTempFile::new().unwrap();
         let mut nonce_file = tempfile::NamedTempFile::new().unwrap();
         let mut cipher_file = tempfile::NamedTempFile::new().unwrap();
 
-        // write secrets to files
-        transport_keypair_file
-            .write_all(
-                transport_keypair
-                    .secret()
-                    .to_pkcs8_pem()
-                    .unwrap()
-                    .as_slice(),
-            )
+        // write secrets to files using hex format (new X25519 format)
+        transport_keypair
+            .save(transport_keypair_file.path())
             .unwrap();
         nonce_file.write_all(&nonce).unwrap();
         cipher_file.write_all(&cipher).unwrap();
