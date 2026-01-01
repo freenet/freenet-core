@@ -239,5 +239,234 @@ async fn test_with_noise() {
 1. **Integrate VirtualTime** - Replace tokio time with VirtualTime
 2. **Connect SimulatedNetwork** - Route messages through scheduler
 3. **Add StateStore query** - Direct state comparison across peers
-4. **Structured EventSummary** - Proper typed fields instead of parsing
+4. ~~**Structured EventSummary**~~ - DONE: Added typed fields
 5. **Single-threaded mode** - Option for `flavor = "current_thread"`
+
+---
+
+## Test Infrastructure Gaps (fdev & SimNetwork)
+
+This section documents gaps in the current testing infrastructure identified through analysis.
+
+### Gap T1: Connectivity Verification is Event-Based, Not Graph-Based
+
+**Current State:**
+- `check_partial_connectivity()` in `testing_impl.rs` relies on `event_listener.is_connected()`
+- Only checks if a peer has emitted a "connected" event—not actual network reachability
+- Critical FIXME in `network.rs`: "we are getting connectivity check that is not real since peers are not reporting if they are connected or not to other peers"
+
+**What's Missing:**
+- Actual peer-graph connectivity verification (can peer A reach peer B through the ring?)
+- Deterministic event scheduling for node startup and peer discovery
+- Explicit synchronization barriers for topology establishment
+
+### Gap T2: Eventual Consistency Tests Don't Assert Convergence
+
+**Current State:**
+- `test_eventual_consistency_state_hashes()` captures state_hash fields in events
+- Compares final hashes across peers for the same contract key
+- **Explicitly doesn't assert convergence:** "We don't strictly assert 100% consistency"
+
+**What's Missing:**
+- Explicit convergence criteria: "all replicas must have state_hash X by time T"
+- Convergence timeout that fails tests if not achieved
+- Causality tracking: verify that updates are applied in consistent order
+- Partition heal verification: "after partition ends, convergence happens within duration D"
+
+### Gap T3: State Query Requires Event Inference
+
+**Current State:**
+- State verification happens only through event capture
+- `node_connectivity()` returns connections from event_listener logs, not actual peer ring state
+- No direct query API for peer state
+
+**What's Missing:**
+- Test API: `sim.peer_state(peer_label, contract_key) -> Result<WrappedState>`
+- Consensus verification: `sim.verify_contract_replicas(contract_key) -> Result<HashSet<StateHash>>`
+- State audit trail: `sim.get_state_history(contract_key) -> Vec<(Timestamp, Peer, Hash)>`
+
+### Gap T4: Operations Generated But Not Verified to Complete
+
+**Current State:**
+- EventChain generates operations but doesn't verify they execute
+- Tests count events captured but don't verify operations succeeded
+- Operations can silently fail and test still passes
+
+**What's Missing:**
+- Operation completion tracking: "X out of Y operations completed successfully"
+- Response validation: verify Get returns correct state
+- Broadcast propagation verification: confirm updates reached all subscribers
+
+### Gap T5: Fault Injection Effects Not Measured
+
+**Current State:**
+- FaultConfig supports message_loss_rate, latency_range, partition, crashed_node
+- Tests verify fault injection doesn't crash the framework, not actual behavior changes
+
+**What's Missing:**
+- Fault observation: `network.stats()` returns dropped/partitioned/latency counts
+- Message drop rate verification: measure actual drop ratio vs configured rate
+- Recovery verification: "after fault clears, convergence within duration D"
+
+### Gap Summary Table
+
+| Gap | Severity | Current Workaround |
+|-----|----------|-------------------|
+| T1: Connectivity graph-based | HIGH | Assert on event types only |
+| T2: Convergence assertions | HIGH | Manual inspection of logs |
+| T3: Direct state query | MEDIUM | Infer from events |
+| T4: Operation completion | MEDIUM | Assume success if no crash |
+| T5: Fault effect measurement | MEDIUM | Empirical observation |
+
+---
+
+## VirtualTime Integration Plan
+
+Integrating VirtualTime with the fault injection bridge requires bridging the gap between:
+- **VirtualTime**: Synchronous, advances only when explicitly stepped via `advance_to()`
+- **Tokio runtime**: Async, uses real wall-clock time
+
+### Option A: Queue-Based Delayed Delivery (Recommended)
+
+Instead of spawning async tasks with `tokio::time::sleep`, queue messages with virtual deadlines:
+
+```rust
+pub struct FaultInjectorState {
+    pub config: FaultConfig,
+    pub rng: SimulationRng,
+    pub virtual_time: Option<VirtualTime>,
+    pub pending_deliveries: Vec<PendingDelivery>,
+}
+
+struct PendingDelivery {
+    deadline: u64,  // virtual nanos
+    msg: MessageOnTransit,
+    target_addr: SocketAddr,
+}
+
+enum DeliveryDecision {
+    Deliver,
+    DelayedDelivery(Duration),  // Current: real time
+    QueuedDelivery(u64),        // NEW: virtual deadline
+    Drop,
+}
+```
+
+**Changes Required:**
+
+1. **Add VirtualTime to FaultInjectorState** (optional field)
+2. **Queue messages when VirtualTime is enabled:**
+   ```rust
+   if let Some(latency) = config.generate_latency(&rng) {
+       if let Some(ref vt) = state.virtual_time {
+           let deadline = vt.now_nanos() + latency.as_nanos() as u64;
+           state.pending_deliveries.push(PendingDelivery { deadline, msg, target_addr });
+           return DeliveryDecision::QueuedDelivery(deadline);
+       } else {
+           return DeliveryDecision::DelayedDelivery(latency);
+       }
+   }
+   ```
+
+3. **Add time advancement method:**
+   ```rust
+   impl FaultInjectorState {
+       pub fn advance_time(&mut self) -> usize {
+           let Some(ref vt) = self.virtual_time else { return 0 };
+
+           let now = vt.now_nanos();
+           let mut delivered = 0;
+
+           // Drain messages with deadline <= now
+           while let Some(idx) = self.pending_deliveries.iter()
+               .position(|p| p.deadline <= now)
+           {
+               let pending = self.pending_deliveries.remove(idx);
+               let registry = PEER_REGISTRY.read().unwrap();
+               let _ = registry.send(pending.target_addr, pending.msg);
+               delivered += 1;
+           }
+           delivered
+       }
+   }
+   ```
+
+4. **Add API to SimNetwork:**
+   ```rust
+   impl SimNetwork {
+       /// Enables VirtualTime mode for deterministic latency injection.
+       pub fn with_virtual_time(&mut self) {
+           // Store VirtualTime instance
+       }
+
+       /// Advances virtual time to next pending wakeup and delivers messages.
+       pub fn advance_virtual_time(&mut self) -> usize {
+           // Advance VirtualTime, deliver pending messages
+       }
+   }
+   ```
+
+### Option B: Tokio's pause/advance API
+
+Tokio provides `tokio::time::pause()` and `tokio::time::advance()`:
+
+```rust
+#[tokio::test(start_paused = true)]
+async fn test_with_controlled_time() {
+    // Time is paused, sleep won't progress until we advance
+    let sleep = tokio::time::sleep(Duration::from_secs(100));
+
+    tokio::time::advance(Duration::from_secs(50)).await;
+    // sleep still pending
+
+    tokio::time::advance(Duration::from_secs(50)).await;
+    // sleep completes
+}
+```
+
+**Pros:** Works with existing tokio ecosystem
+**Cons:** Coarser control than VirtualTime, still uses Duration not precise nanos
+
+### Option C: Full Runtime Replacement (turmoil-style)
+
+Replace the entire runtime with a deterministic simulation runtime:
+
+```rust
+// Instead of tokio::spawn
+sim_runtime.spawn(async { ... });
+
+// All I/O and time goes through simulation
+sim_runtime.advance_until_idle();
+```
+
+**Pros:** Complete determinism
+**Cons:** Major refactoring, different from production code path
+
+### Recommended Approach
+
+**Phase 1** (Current): Real-time latency injection ✅
+- Uses `tokio::time::sleep` for delays
+- Deterministic drop decisions via seeded RNG
+
+**Phase 2** (Proposed): Optional VirtualTime mode
+- Add `FaultInjectorState.virtual_time: Option<VirtualTime>`
+- Queue delayed messages when VirtualTime enabled
+- Tests explicitly advance time with `sim.advance_virtual_time()`
+- Falls back to real-time when VirtualTime not configured
+
+**Phase 3** (Future): Tokio pause integration
+- Use `#[tokio::test(start_paused = true)]` for deterministic tests
+- Combine with VirtualTime for message ordering control
+
+### Implementation Estimate
+
+| Task | Effort | Files |
+|------|--------|-------|
+| Add VirtualTime to FaultInjectorState | Small | `in_memory.rs` |
+| Add pending_deliveries queue | Small | `in_memory.rs` |
+| Add advance_time() method | Small | `in_memory.rs` |
+| Add with_virtual_time() to SimNetwork | Small | `testing_impl.rs` |
+| Add tests | Medium | `simulation_integration.rs` |
+| Documentation | Small | `simulation-testing.md` |
+
+**Total: ~1-2 days of focused work**
