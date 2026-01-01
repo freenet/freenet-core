@@ -22,85 +22,132 @@ use crate::{
     message::NetMessage,
     node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager, PeerId},
     ring::PeerKeyLocation,
-    simulation::FaultConfig,
+    simulation::{FaultConfig, SimulationRng},
     tracing::NetEventLog,
     transport::TransportPublicKey,
 };
+
+/// State for deterministic fault injection.
+///
+/// Contains both the fault configuration and a seeded RNG for reproducible
+/// fault injection decisions.
+pub struct FaultInjectorState {
+    /// The fault configuration (message loss, partitions, crashes, latency)
+    pub config: FaultConfig,
+    /// Seeded RNG for deterministic fault decisions
+    pub rng: SimulationRng,
+}
+
+impl FaultInjectorState {
+    /// Creates a new fault injector state with the given config and seed.
+    pub fn new(config: FaultConfig, seed: u64) -> Self {
+        Self {
+            config,
+            rng: SimulationRng::new(seed),
+        }
+    }
+}
 
 /// Shared fault injector for controlling message delivery in tests.
 ///
 /// When set, messages are checked against the fault configuration before delivery.
 /// This enables deterministic fault injection without replacing the transport layer.
-static FAULT_INJECTOR: LazyLock<RwLock<Option<Arc<std::sync::Mutex<FaultConfig>>>>> =
+static FAULT_INJECTOR: LazyLock<RwLock<Option<Arc<std::sync::Mutex<FaultInjectorState>>>>> =
     LazyLock::new(|| RwLock::new(None));
 
 /// Sets the global fault injector for in-memory transport.
 ///
 /// When set, all `MemoryConnManager` instances will check messages against
 /// this configuration before delivery, allowing tests to inject:
-/// - Message drops (loss rate)
+/// - Message drops (loss rate) - deterministic with seeded RNG
 /// - Network partitions
 /// - Node crashes
+/// - Latency injection
 ///
 /// # Example
 /// ```ignore
 /// use freenet::simulation::FaultConfig;
+/// use freenet::node::network_bridge::FaultInjectorState;
 ///
 /// let config = FaultConfig::builder()
 ///     .message_loss_rate(0.1)
+///     .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
 ///     .build();
-/// set_fault_injector(Some(Arc::new(std::sync::Mutex::new(config))));
+/// let state = FaultInjectorState::new(config, 12345); // seeded for determinism
+/// set_fault_injector(Some(Arc::new(std::sync::Mutex::new(state))));
 /// ```
-pub fn set_fault_injector(config: Option<Arc<std::sync::Mutex<FaultConfig>>>) {
-    *FAULT_INJECTOR.write().unwrap() = config;
+pub fn set_fault_injector(state: Option<Arc<std::sync::Mutex<FaultInjectorState>>>) {
+    *FAULT_INJECTOR.write().unwrap() = state;
 }
 
 /// Returns the current fault injector, if set.
-pub fn get_fault_injector() -> Option<Arc<std::sync::Mutex<FaultConfig>>> {
+pub fn get_fault_injector() -> Option<Arc<std::sync::Mutex<FaultInjectorState>>> {
     FAULT_INJECTOR.read().unwrap().clone()
 }
 
-/// Checks if a message should be dropped based on the fault configuration.
+/// Result of checking whether a message should be delivered.
+#[derive(Debug)]
+enum DeliveryDecision {
+    /// Deliver immediately
+    Deliver,
+    /// Deliver after the specified delay
+    DelayedDelivery(Duration),
+    /// Drop the message
+    Drop,
+}
+
+/// Checks if a message should be delivered and with what delay.
 ///
-/// Returns true if the message should be delivered, false if it should be dropped.
-fn should_deliver_message(from: SocketAddr, to: SocketAddr) -> bool {
+/// Returns a DeliveryDecision indicating whether to deliver, delay, or drop.
+fn check_delivery(from: SocketAddr, to: SocketAddr) -> DeliveryDecision {
     let Some(injector) = get_fault_injector() else {
-        return true; // No fault injection configured
+        return DeliveryDecision::Deliver; // No fault injection configured
     };
 
-    let config = injector.lock().unwrap();
+    let state = injector.lock().unwrap();
 
     // Check if sender or receiver is crashed
-    if config.is_crashed(&from) || config.is_crashed(&to) {
+    if state.config.is_crashed(&from) || state.config.is_crashed(&to) {
         tracing::trace!(
             ?from,
             ?to,
             "Fault injector: message dropped (node crashed)"
         );
-        return false;
+        return DeliveryDecision::Drop;
     }
 
     // Check for partition (using 0 as current time since we don't have virtual time here)
-    if config.is_partitioned(&from, &to, 0) {
+    if state.config.is_partitioned(&from, &to, 0) {
         tracing::trace!(
             ?from,
             ?to,
             "Fault injector: message dropped (network partition)"
         );
-        return false;
+        return DeliveryDecision::Drop;
     }
 
-    // Check message loss rate (uses thread-local RNG for simplicity)
-    if config.should_drop_message_random() {
+    // Check message loss rate using seeded RNG for determinism
+    if state.config.should_drop_message(&state.rng) {
         tracing::trace!(
             ?from,
             ?to,
             "Fault injector: message dropped (random loss)"
         );
-        return false;
+        return DeliveryDecision::Drop;
     }
 
-    true
+    // Check for latency injection
+    if let Some(latency) = state.config.generate_latency(&state.rng) {
+        tracing::trace!(
+            ?from,
+            ?to,
+            ?latency,
+            "Fault injector: message delayed"
+        );
+        return DeliveryDecision::DelayedDelivery(latency);
+    }
+
+    DeliveryDecision::Deliver
 }
 
 /// Registry that maps socket addresses to their dedicated message channels.
@@ -333,10 +380,37 @@ impl InMemoryTransport {
 
     fn send(&self, target: PeerId, message: Vec<u8>) -> Result<(), ConnectionError> {
         // Check fault injector before sending
-        if !should_deliver_message(self.interface_peer.addr, target.addr) {
-            // Message dropped by fault injection - return success to caller
-            // (from sender's perspective, the message was sent)
-            return Ok(());
+        match check_delivery(self.interface_peer.addr, target.addr) {
+            DeliveryDecision::Drop => {
+                // Message dropped by fault injection - return success to caller
+                // (from sender's perspective, the message was sent)
+                return Ok(());
+            }
+            DeliveryDecision::DelayedDelivery(delay) => {
+                // Delay the message delivery
+                let msg = MessageOnTransit {
+                    origin: self.interface_peer.clone(),
+                    target: target.clone(),
+                    data: message,
+                };
+                let target_addr = target.addr;
+
+                // Spawn a task to deliver after delay
+                GlobalExecutor::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let registry = PEER_REGISTRY.read().unwrap();
+                    if let Err(e) = registry.send(target_addr, msg) {
+                        tracing::trace!(
+                            "Delayed message delivery failed: {} (peer may have disconnected)",
+                            e
+                        );
+                    }
+                });
+                return Ok(());
+            }
+            DeliveryDecision::Deliver => {
+                // Immediate delivery
+            }
         }
 
         let msg = MessageOnTransit {

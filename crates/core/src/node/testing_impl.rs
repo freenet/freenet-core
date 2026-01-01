@@ -411,22 +411,30 @@ impl SimNetwork {
     ///
     /// This enables deterministic fault injection using the simulation framework's
     /// `FaultConfig`. Faults include:
-    /// - Message drops (via `message_loss_rate`)
+    /// - Message drops (via `message_loss_rate`) - deterministic with seeded RNG
     /// - Network partitions
     /// - Node crashes
+    /// - Latency injection (via `latency_range`)
+    ///
+    /// The fault injector uses the network's seed for deterministic behavior.
     ///
     /// # Example
     /// ```ignore
     /// use freenet::simulation::FaultConfig;
+    /// use std::time::Duration;
     ///
     /// let mut sim = SimNetwork::new(...).await;
     /// sim.with_fault_injection(FaultConfig::builder()
     ///     .message_loss_rate(0.1)
+    ///     .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
     ///     .build());
     /// ```
     pub fn with_fault_injection(&mut self, config: crate::simulation::FaultConfig) {
-        use crate::node::network_bridge::set_fault_injector;
-        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(config))));
+        use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
+        // Use a derived seed for fault injection to maintain determinism
+        let fault_seed = self.seed.wrapping_add(0xFA01_7777);
+        let state = FaultInjectorState::new(config, fault_seed);
+        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
     }
 
     /// Clears any configured fault injection.

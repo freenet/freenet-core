@@ -111,38 +111,44 @@ virtual_time.sleep(Duration::from_secs(3)).await;
 2. Use a deterministic async executor
 3. Control all timing through the scheduler
 
-### Gap 2: SimulatedNetwork Not Connected to Nodes - PARTIALLY FIXED
+### Gap 2: SimulatedNetwork Not Connected to Nodes - MOSTLY FIXED
 
 ~~`SimulatedNetwork` provides message routing but doesn't connect to actual nodes~~
 
-**PARTIAL FIX IMPLEMENTED**: A fault injection bridge now connects `FaultConfig` to `InMemoryTransport`:
+**FIX IMPLEMENTED**: A fault injection bridge with deterministic RNG and latency support:
 
 ```
 Current (with bridge):
   Node A → InMemoryTransport.send()
            ↓
-           should_deliver_message() ← checks FAULT_INJECTOR static
+           check_delivery(from, to) ← uses FaultInjectorState
            ↓
-           FaultConfig.is_crashed() / is_partitioned() / should_drop_message_random()
+           FaultInjectorState {
+             config: FaultConfig,
+             rng: SimulationRng (seeded for determinism)
+           }
            ↓
-           channel → InMemoryTransport → Node B
+           DeliveryDecision::Deliver | DelayedDelivery(duration) | Drop
+           ↓
+           channel (with optional delay) → InMemoryTransport → Node B
 
 Usage:
   let config = FaultConfig::builder()
       .message_loss_rate(0.1)
+      .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
       .partition(partition)
       .build();
-  sim.with_fault_injection(config);
+  sim.with_fault_injection(config);  // Uses network's seed for determinism
 ```
 
 **What works:**
-- Message loss injection (random drops)
+- Message loss injection - deterministic with seeded RNG
 - Network partitions (blocking messages between peer groups)
 - Node crashes (blocking all messages to/from a node)
+- Latency injection (delays message delivery by configured duration)
 
 **What doesn't work (yet):**
-- Deterministic fault injection (uses thread-local RNG, not seeded RNG)
-- Latency injection (VirtualTime not integrated)
+- VirtualTime integration (latency uses real tokio::time::sleep)
 - Full scheduler-based message ordering
 
 ### Gap 3: Event Summary Uses Debug Parsing - FIXED
