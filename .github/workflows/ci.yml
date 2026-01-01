@@ -148,6 +148,59 @@ jobs:
         # Output is captured and only shown for failing tests (default cargo test behavior)
         run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8
 
+  # Quick simulation test for every PR
+  # Validates network connectivity, operation success, and convergence
+  # See issue #2498 for details
+  simulation_test:
+    name: Simulation Test
+    runs-on: self-hosted
+    timeout-minutes: 10
+    needs: fmt_check  # Run in parallel with test_all
+    # Skip on merge_group - PR already passed full tests
+    # Skip on release PRs - they only bump versions, main already passed CI
+    if: |
+      github.event_name != 'merge_group' &&
+      !startsWith(github.head_ref, 'release/v')
+
+    env:
+      # Show info-level logs to see simulation progress
+      RUST_LOG: info
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUST_MIN_STACK: 16777216
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clean test directories
+        run: |
+          rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
+
+      - name: Run Simulation Tests
+        # Run simulation integration tests that validate:
+        # - Deterministic replay with same seed
+        # - Fault injection (message loss, latency)
+        # - Network connectivity establishment
+        # - Event capture and ordering
+        # Single-threaded for deterministic behavior
+        run: |
+          cargo test -p freenet --test simulation_integration \
+            --no-default-features --features trace,websocket,redb \
+            -- --test-threads=1
+          cargo test -p freenet --test sim_network \
+            --no-default-features --features trace,websocket,redb \
+            -- --test-threads=1
+
   six_peer_regression:
     name: six-peer-regression
     needs: fmt_check  # Changed from test_all to avoid dependency skip cascade
