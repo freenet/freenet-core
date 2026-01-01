@@ -813,9 +813,46 @@ impl SimNetwork {
 
     /// Start an event chain for this simulation. Allows passing a different controller for the peers.
     ///
+    /// This method borrows the SimNetwork, allowing you to call verification methods
+    /// (like `check_convergence()`, `get_operation_summary()`) after events complete.
+    ///
     /// If done make sure you set the proper receiving side for the controller. For example in the
     /// nodes built through the [`build_peers`](`Self::build_peers`) method.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut stream = sim.event_chain(100, None);
+    /// while stream.next().await.is_some() {
+    ///     tokio::time::sleep(Duration::from_millis(100)).await;
+    /// }
+    /// drop(stream); // Drop the stream before verification
+    /// let result = sim.check_convergence().await; // sim is still usable!
+    /// ```
     pub fn event_chain(
+        &mut self,
+        total_events: u32,
+        controller: Option<watch::Sender<(EventId, TransportPublicKey)>>,
+    ) -> EventChain {
+        let user_ev_controller = controller.unwrap_or_else(|| {
+            self.user_ev_controller
+                .take()
+                .expect("controller should be set")
+        });
+        // Clone labels - SimNetwork retains ownership for verification methods
+        let labels = self.labels.clone();
+        // EventChain no longer handles cleanup - SimNetwork's Drop does
+        EventChain::new(labels, user_ev_controller, total_events, false)
+    }
+
+    /// Consumes the SimNetwork and returns an event chain.
+    ///
+    /// Use this when you don't need to access SimNetwork after events complete.
+    /// For post-event verification, use [`event_chain`](Self::event_chain) instead.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use event_chain(&mut self) instead to retain access to SimNetwork for verification"
+    )]
+    pub fn into_event_chain(
         mut self,
         total_events: u32,
         controller: Option<watch::Sender<(EventId, TransportPublicKey)>>,
@@ -823,11 +860,11 @@ impl SimNetwork {
         let user_ev_controller = controller.unwrap_or_else(|| {
             self.user_ev_controller
                 .take()
-                .expect("controller should be ser")
+                .expect("controller should be set")
         });
         let labels = std::mem::take(&mut self.labels);
         let debug_val = self.clean_up_tmp_dirs;
-        self.clean_up_tmp_dirs = false; // set to false to avoid cleaning up the tmp dirs
+        self.clean_up_tmp_dirs = false; // EventChain handles cleanup
         EventChain::new(labels, user_ev_controller, total_events, debug_val)
     }
 

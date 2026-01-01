@@ -3,9 +3,104 @@
 This document describes the current state of simulation testing in Freenet Core,
 identifies gaps, and outlines the ideal design for deterministic distributed systems testing.
 
+## Quick Start: Using the Test Infrastructure
+
+### Running SimNetwork Tests
+
+```bash
+# Run all simulation tests
+cargo test -p freenet --test simulation_integration
+
+# Run with logging
+RUST_LOG=info cargo test -p freenet --test simulation_integration -- --nocapture
+
+# Run fdev single-process simulation
+cargo run -p fdev -- test --gateways 1 --nodes 5 --events 100 single-process
+```
+
+### Key Test Patterns
+
+```rust
+use freenet::dev_tool::{SimNetwork, FaultConfig, VirtualTime};
+use std::time::Duration;
+
+#[tokio::test]
+async fn example_simulation_test() {
+    const SEED: u64 = 0xDEAD_BEEF;
+
+    // Create network
+    let mut sim = SimNetwork::new(
+        "test-name",
+        1,   // gateways
+        4,   // nodes
+        7,   // ring_max_htl
+        3,   // rnd_if_htl_above
+        10,  // max_connections
+        2,   // min_connections
+        SEED,
+    ).await;
+
+    // Optional: Configure fault injection
+    sim.with_fault_injection(
+        FaultConfig::builder()
+            .message_loss_rate(0.1)
+            .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
+            .build()
+    );
+
+    // Start the network
+    let _handles = sim.start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 5, 10).await;
+
+    // Wait for connectivity
+    sim.check_partial_connectivity(Duration::from_secs(30), 0.8)?;
+
+    // Generate events (event_chain now borrows, doesn't consume)
+    let mut stream = sim.event_chain(100, None);
+    while stream.next().await.is_some() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(stream);  // Release borrow
+
+    // Verification - sim is still usable!
+    let result = sim.check_convergence().await;
+    assert!(result.is_converged(), "Contracts should converge");
+
+    let summary = sim.get_operation_summary().await;
+    assert!(summary.overall_success_rate() > 0.8, "Operations should mostly succeed");
+}
+```
+
+### Available Verification APIs
+
+```rust
+// Convergence checking
+sim.check_convergence().await               // Immediate check
+sim.await_convergence(timeout, poll, min)   // Wait for convergence
+sim.convergence_rate().await                // Get rate (0.0-1.0)
+sim.assert_convergence(timeout, poll)       // Panic if not converged
+
+// Operation tracking
+sim.get_operation_summary().await           // Detailed stats
+sim.operation_success_rate().await          // Overall rate
+sim.operation_completion_status().await     // (completed, pending)
+sim.await_operation_completion(timeout, poll)
+sim.assert_operation_success_rate(min_rate)
+
+// State inspection
+sim.get_contract_state_hashes().await       // contract -> peer -> hash
+sim.get_contract_distribution().await       // Where contracts are stored
+sim.get_event_counts().await                // Event counts by type
+sim.get_deterministic_event_summary().await // Sorted event list
+
+// Network stats (requires fault injection)
+sim.get_network_stats()                     // Messages sent/dropped/delayed
+```
+
+---
+
 ## Current State
 
-### What SimNetwork Actually Tests
+### What SimNetwork Tests
 
 The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provides:
 
@@ -13,51 +108,91 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 2. **Fault Injection**: Message loss, latency injection, network partitions
 3. **Event Capture**: Records all network events for analysis
 4. **Deterministic Seeding**: Same seed produces reproducible random behavior
+5. **Post-Event Verification**: `event_chain()` now borrows, allowing verification after events complete
 
-### Current Test Coverage
+### Test Files
 
-| Test File | What It Tests | Assertions |
-|-----------|---------------|------------|
-| `simulation_integration.rs` | Deterministic replay, fault injection, event capture | Strict |
-| `sim_network.rs` | Basic connectivity, peer registration | Lenient (logs warnings) |
+| Test File | What It Tests | Status |
+|-----------|---------------|--------|
+| `simulation_integration.rs` | Deterministic replay, fault injection, event capture, convergence | Active |
+| `sim_network.rs` | CI-focused tests with assertions | Active (`#[ignore]` for now) |
 
-### What We're NOT Testing
+### Recent Improvements
 
-1. **Node Lifecycle**: Crashes, restarts, graceful shutdown
-2. **Node Churn**: Nodes joining/leaving during operations
-3. **State Convergence Under Faults**: Do all nodes agree after network heals?
-4. **Invariant Checking**: Are protocol invariants maintained at all times?
-5. **Linearizability**: Do operations appear atomic and ordered?
-
----
-
-## The Problem: Non-Deterministic Execution
-
-Current tests run on a real multi-threaded Tokio runtime, which means:
-
-- **Thread scheduling is non-deterministic**: Same test can produce different interleavings
-- **Timing-dependent bugs are hard to reproduce**: Race conditions may not trigger consistently
-- **No control over "virtual time"**: Can't fast-forward or pause execution
-- **Assertions must be probabilistic**: "90% success rate" instead of "exactly this state"
-
-### Example: The InMemoryTransport Drop Bug
-
-We discovered that `InMemoryTransport` gets dropped after some connections complete,
-causing subsequent connection attempts to fail. This is a race condition that:
-- Sometimes manifests, sometimes doesn't
-- Depends on thread scheduling
-- Cannot be reliably reproduced with a seed alone
+1. **`event_chain(&mut self)` refactor**: No longer consumes SimNetwork, enabling post-test verification
+2. **Verification APIs**: `check_convergence()`, `get_operation_summary()`, etc.
+3. **Fault injection bridge**: `FaultConfig` from simulation module works with `SimNetwork`
+4. **fdev verification**: `--check-convergence`, `--min-success-rate`, `--print-summary` flags
 
 ---
 
-## Ideal Simulation Framework Design
+## What's Working vs. What Needs Work
 
-### Goal: Deterministic Execution with Full Control
+### ✅ Working Well
 
-Given the same seed, the simulation should produce **exactly the same sequence of events
-and final state**, every time, on any machine.
+| Feature | Description |
+|---------|-------------|
+| In-memory transport | Channel-based message passing |
+| Seeded RNG | Reproducible random behavior (within limitations) |
+| Fault injection | Message loss, latency, partitions |
+| Event capture | Full event logging with timestamps |
+| Convergence checking | Verify contract state consistency |
+| Operation tracking | Success/failure rates per operation type |
+| Post-event verification | Access SimNetwork after events complete |
 
-### Architecture: Event-Driven Simulation
+### ⚠️ Partially Working
+
+| Feature | Issue | Workaround |
+|---------|-------|------------|
+| Deterministic execution | Multi-threaded Tokio causes non-determinism | Use lenient assertions (percentages) |
+| VirtualTime mode | Exists but not used in tests | Available via `with_fault_injection_virtual_time()` |
+| Gateway registration race | Nodes may start before gateways ready | 3-phase startup with barrier |
+
+### ❌ Not Yet Implemented
+
+| Feature | Impact |
+|---------|--------|
+| Deterministic executor | Full reproducibility impossible |
+| Node crash/restart | Can't test recovery scenarios |
+| Clock skew simulation | Can't test time-sensitive bugs |
+| Invariant checking DSL | Manual assertions only |
+| Linearizability checker | Can't prove consistency |
+| Property-based test integration | No automatic shrinking |
+
+---
+
+## The Core Problem: Non-Deterministic Execution
+
+Current tests run on multi-threaded Tokio, meaning:
+
+- **Thread scheduling varies**: Same seed can produce different event orderings
+- **Race conditions**: Bugs may not reproduce consistently
+- **No time control**: Can't fast-forward or step through execution
+- **Probabilistic assertions**: "90% success" instead of "exactly this state"
+
+### Why This Matters
+
+A truly deterministic simulator would allow:
+
+```rust
+// Dream API:
+let mut sim = DeterministicSimulator::new(SEED);
+sim.run_until_quiescent();
+assert_eq!(sim.contract_state("key"), expected_state);  // Exact match, every time
+```
+
+Instead we have:
+
+```rust
+// Current reality:
+tokio::time::sleep(Duration::from_secs(5)).await;  // Hope this is enough
+let rate = sim.convergence_rate().await;
+assert!(rate > 0.8, "Should mostly converge");  // Probabilistic
+```
+
+---
+
+## Ideal Event-Driven Simulation Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -72,128 +207,78 @@ and final state**, every time, on any machine.
 ┌─────────────────────────────────────────────────────────────┐
 │                    Deterministic Executor                    │
 │  - Single-threaded execution                                │
-│  - Events processed in deterministic order                  │
+│  - Events processed in (time, sequence) order               │
 │  - No real I/O or timers                                    │
 └─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                         Node Pool                           │
-│  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐           │
-│  │ Node 0 │  │ Node 1 │  │ Node 2 │  │ Node 3 │  ...      │
-│  └────────┘  └────────┘  └────────┘  └────────┘           │
-└─────────────────────────────────────────────────────────────┘
 ```
 
-### Key Components
+### Key Insight: Events, Not Threads
 
-#### 1. Virtual Clock
-- No `tokio::time::sleep` or real timers
-- All time references go through `VirtualTime`
-- Simulation can advance time instantly or in controlled steps
+Instead of spawning tasks that run concurrently:
 
 ```rust
-impl VirtualTime {
-    fn now(&self) -> Instant { self.current_time }
-    fn advance(&mut self, duration: Duration) { ... }
-    fn advance_to_next_event(&mut self) { ... }
-}
+// Current (non-deterministic):
+tokio::spawn(node1.run());
+tokio::spawn(node2.run());
+// Order depends on thread scheduling
 ```
 
-#### 2. Deterministic Event Queue
-- All async operations become events in a priority queue
-- Events ordered by (virtual_time, sequence_number) for determinism
-- Ties broken by insertion order (sequence number)
+Use an event queue with deterministic ordering:
 
 ```rust
-struct Event {
-    time: VirtualTime,
-    sequence: u64,  // For deterministic tie-breaking
-    kind: EventKind,
-}
-
-enum EventKind {
-    MessageDelivery { from: NodeId, to: NodeId, msg: NetMessage },
-    TimerFired { node: NodeId, timer_id: u64 },
-    NodeCrash { node: NodeId },
-    NodeRestart { node: NodeId },
-    UserOperation { op: Operation },
-}
-```
-
-#### 3. Fault Injection (Enhanced)
-
-Current:
-- Message loss (random drop)
-- Latency (random delay)
-- Partitions (block between peers)
-
-Needed:
-- **Node crashes**: Immediate termination, state loss
-- **Node restarts**: Resume with persisted state only
-- **Slow nodes**: One node processes events 10x slower
-- **Byzantine behavior**: Node sends conflicting messages
-- **Clock skew**: Nodes have different virtual times
-
-#### 4. State Snapshots & Invariant Checking
-
-At any point, we should be able to:
-
-```rust
-// Take a snapshot of all node states
-let snapshot = sim.snapshot_all_states();
-
-// Check invariants
-sim.assert_invariant(|states| {
-    // All nodes that have contract X should have the same state
-    let contract_states: Vec<_> = states
-        .iter()
-        .filter_map(|s| s.get_contract(contract_key))
-        .collect();
-
-    contract_states.windows(2).all(|w| w[0] == w[1])
-});
-
-// Check convergence
-sim.assert_eventually(Duration::from_secs(10), |states| {
-    // After healing partition, states should converge
-    states_are_consistent(states)
-});
-```
-
----
-
-## Test Scenarios We Should Support
-
-### 1. Basic Protocol Correctness
-
-```rust
-#[test]
-fn test_put_get_single_contract() {
-    let mut sim = Simulation::new(seed);
-    sim.add_gateway();
-    sim.add_nodes(5);
-    sim.start();
-
-    // Put a contract from node 0
-    let contract = sim.node(0).put(contract_data).await;
-
-    // Advance time until operation completes
-    sim.advance_until_quiescent();
-
-    // All nodes should be able to get it
-    for node in sim.nodes() {
-        let state = node.get(contract.key()).await;
-        assert_eq!(state, contract_data);
+// Ideal (deterministic):
+loop {
+    let event = event_queue.pop();  // Ordered by (time, sequence_number)
+    match event {
+        MessageDelivery { to, msg } => to.receive(msg),
+        TimerFired { node, callback } => node.handle_timer(callback),
+        NodeCrash { node } => node.crash(),
     }
 }
 ```
 
-### 2. Convergence After Network Partition
+---
+
+## Implementation Roadmap
+
+### Phase 1: Better Use of Existing APIs (Current)
+
+- ✅ Refactor `event_chain` to not consume SimNetwork
+- ✅ Use `await_convergence()` instead of arbitrary sleeps
+- ✅ Add verification to fdev single-process mode
+- 🔲 Use VirtualTime in tests (infrastructure exists)
+- 🔲 Single-threaded test runtime for more determinism
+
+### Phase 2: Enhanced Fault Injection
+
+- 🔲 Node crash simulation (stop processing, drop state)
+- 🔲 Node restart simulation (resume with persisted state)
+- 🔲 Slow node simulation (delayed event processing)
+- 🔲 Clock skew simulation
+
+### Phase 3: Deterministic Executor (Major Effort)
+
+- 🔲 Replace `tokio::spawn` with event queue insertions
+- 🔲 Replace all timers with virtual time
+- 🔲 Single-threaded execution loop
+- 🔲 Verify: same seed → identical event sequence
+
+### Phase 4: Invariant Framework
+
+- 🔲 State snapshot API (query contract states across all nodes)
+- 🔲 Invariant assertion DSL
+- 🔲 Linearizability checker (based on Jepsen's Knossos)
+- 🔲 Property-based test integration
+
+---
+
+## Test Scenario Examples
+
+### Convergence After Partition
 
 ```rust
 #[test]
-fn test_convergence_after_partition() {
+async fn test_convergence_after_partition() {
     let mut sim = Simulation::new(seed);
     sim.add_nodes(6);
     sim.start();
@@ -215,19 +300,15 @@ fn test_convergence_after_partition() {
     sim.advance_until_quiescent();
 
     // Assert: all nodes have the same state (conflict resolved)
-    let states: Vec<_> = sim.nodes()
-        .map(|n| n.get(contract.key()))
-        .collect();
-
-    assert!(states.windows(2).all(|w| w[0] == w[1]));
+    sim.assert_all_states_equal(contract.key());
 }
 ```
 
-### 3. Node Crash Recovery
+### Node Crash Recovery
 
 ```rust
 #[test]
-fn test_node_crash_recovery() {
+async fn test_node_crash_recovery() {
     let mut sim = Simulation::new(seed);
     sim.add_nodes(5);
     sim.start();
@@ -236,134 +317,19 @@ fn test_node_crash_recovery() {
     let contract = sim.node(0).put(data).await;
     sim.advance_until_quiescent();
 
-    // Crash nodes 0 and 1 (the ones that might have it)
+    // Crash nodes 0 and 1
     sim.crash_node(0);
     sim.crash_node(1);
 
     // Remaining nodes should still serve the contract
-    let state = sim.node(2).get(contract.key()).await;
-    assert!(state.is_ok());
+    assert!(sim.node(2).get(contract.key()).await.is_ok());
 
-    // Restart node 0
+    // Restart node 0, it should recover from peers
     sim.restart_node(0);
     sim.advance_until_quiescent();
-
-    // Node 0 should recover the contract from peers
-    let state = sim.node(0).get(contract.key()).await;
-    assert_eq!(state, data);
+    assert_eq!(sim.node(0).get(contract.key()).await, data);
 }
 ```
-
-### 4. Concurrent Updates (Conflict Resolution)
-
-```rust
-#[test]
-fn test_concurrent_updates_converge() {
-    let mut sim = Simulation::new(seed);
-    sim.add_nodes(5);
-    sim.start();
-
-    let contract = sim.node(0).put(initial).await;
-    sim.advance_until_quiescent();
-
-    // Simultaneously update from multiple nodes
-    sim.node(0).update(contract.key(), update_0);
-    sim.node(1).update(contract.key(), update_1);
-    sim.node(2).update(contract.key(), update_2);
-
-    // Don't advance yet - let updates race
-    sim.advance_until_quiescent();
-
-    // All nodes should have converged to the same state
-    // (whatever the conflict resolution produces)
-    sim.assert_all_states_equal(contract.key());
-}
-```
-
-### 5. Message Loss Resilience
-
-```rust
-#[test]
-fn test_operation_succeeds_under_message_loss() {
-    let mut sim = Simulation::new(seed);
-    sim.add_nodes(10);
-    sim.start();
-
-    // 20% message loss
-    sim.set_message_loss_rate(0.2);
-
-    let contract = sim.node(0).put(data).await;
-
-    // Should eventually succeed despite losses
-    sim.advance_until_quiescent_or_timeout(Duration::from_secs(30));
-
-    // At least some nodes should have it
-    let replication_count = sim.nodes()
-        .filter(|n| n.has_contract(contract.key()))
-        .count();
-
-    assert!(replication_count >= 3, "Contract should replicate despite losses");
-}
-```
-
-### 6. Linearizability Check
-
-```rust
-#[test]
-fn test_operations_are_linearizable() {
-    let mut sim = Simulation::new(seed);
-    sim.add_nodes(5);
-    sim.start();
-
-    // Enable history recording
-    let history = sim.record_history();
-
-    // Perform concurrent operations
-    for i in 0..100 {
-        let node = sim.random_node();
-        node.update(contract.key(), format!("update-{}", i));
-    }
-
-    sim.advance_until_quiescent();
-
-    // Check that the history is linearizable
-    // (there exists a sequential ordering consistent with all observations)
-    assert!(history.is_linearizable());
-}
-```
-
----
-
-## Implementation Path
-
-### Phase 1: Deterministic Executor (High Priority)
-
-Replace multi-threaded Tokio with single-threaded, event-driven execution:
-
-1. Create `DeterministicExecutor` that processes one event at a time
-2. Replace all `tokio::time::*` with virtual time
-3. Replace all `tokio::spawn` with event queue insertions
-4. Verify: same seed → same event sequence
-
-### Phase 2: Enhanced Fault Injection
-
-1. Node crash/restart simulation
-2. Clock skew simulation
-3. Slow node simulation (delayed event processing)
-4. Disk/storage failures
-
-### Phase 3: Invariant Framework
-
-1. State snapshot API
-2. Invariant assertion DSL
-3. Convergence checking helpers
-4. Linearizability checker (based on Jepsen's Knossos)
-
-### Phase 4: Property-Based Testing
-
-1. Integration with `proptest` or `quickcheck`
-2. Generate random operation sequences
-3. Shrinking to find minimal failing cases
 
 ---
 
@@ -373,16 +339,19 @@ Replace multi-threaded Tokio with single-threaded, event-driven execution:
 - [Turmoil](https://github.com/tokio-rs/turmoil) - Tokio's deterministic network simulation
 - [Jepsen](https://jepsen.io/) - Distributed systems testing methodology
 - [TLA+](https://lamport.azurewebsites.net/tla/tla.html) - Formal specification and model checking
-- [Maelstrom](https://github.com/jepsen-io/maelstrom) - Workbench for learning distributed systems
 
 ---
 
-## Current Gaps Summary
+## Summary: Current Gaps
 
-| Gap | Impact | Effort to Fix |
-|-----|--------|---------------|
-| Non-deterministic execution | Can't reliably reproduce bugs | High (need deterministic executor) |
+| Gap | Impact | Effort |
+|-----|--------|--------|
+| Non-deterministic execution | Can't reliably reproduce all bugs | High |
 | No node crash/restart | Can't test recovery | Medium |
-| No invariant checking | Can't verify correctness | Medium |
+| VirtualTime not used in tests | Missing time-control benefits | Low |
 | No linearizability checking | Can't prove consistency | High |
-| Race condition in InMemoryTransport | Tests fail intermittently | Medium (fix drop timing) |
+| No property-based testing | Manual test case design | Medium |
+
+The infrastructure is solid for what it tests. The main limitation is non-deterministic
+execution, which requires either accepting probabilistic assertions or implementing a
+full deterministic executor (significant effort, following FoundationDB's approach).

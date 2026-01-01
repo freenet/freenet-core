@@ -106,7 +106,7 @@ pub struct TestConfig {
 }
 
 impl TestConfig {
-    fn get_connection_check_params(&self) -> (Duration, f64) {
+    pub(crate) fn get_connection_check_params(&self) -> (Duration, f64) {
         let conns_per_gw = (self.nodes / self.gateways) as f64;
         let conn_percent = (conns_per_gw / self.nodes as f64).min(0.99);
         let connectivity_timeout =
@@ -123,7 +123,7 @@ impl TestConfig {
         (connectivity_timeout, conn_percent)
     }
 
-    fn seed(&self) -> u64 {
+    pub(crate) fn seed(&self) -> u64 {
         use rand::RngCore;
         self.seed.unwrap_or_else(|| rand::rng().next_u64())
     }
@@ -166,13 +166,6 @@ impl TestConfig {
         Some(builder.build())
     }
 
-    /// Returns true if any verification options are configured.
-    fn has_verification(&self) -> bool {
-        self.check_convergence.is_some()
-            || self.min_success_rate.is_some()
-            || self.print_summary
-            || self.print_network_stats
-    }
 }
 
 fn randomize_test_name() -> String {

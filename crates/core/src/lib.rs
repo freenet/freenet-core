@@ -82,6 +82,12 @@ pub mod dev_tool {
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
     pub use wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
+
+    // Re-export simulation types for test infrastructure
+    pub use crate::simulation::{
+        FaultConfig, FaultConfigBuilder, Partition, SimulationRng, TimeSource, VirtualTime,
+        WakeupId,
+    };
 }
 
 pub mod test_utils;

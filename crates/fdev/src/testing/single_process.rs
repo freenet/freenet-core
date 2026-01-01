@@ -21,7 +21,7 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         .unwrap_or(Duration::from_millis(200));
     let (connectivity_timeout, network_connection_percent) = config.get_connection_check_params();
 
-    // Check connectivity first, before moving the network
+    // Check connectivity first
     tracing::info!(
         "Waiting for network to be sufficiently connected ({}ms timeout, {}%)",
         connectivity_timeout.as_millis(),
@@ -29,21 +29,13 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
     );
     simulated_network.check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
 
-    // Run verification before consuming the network (if configured)
-    // We need to do this before event_chain consumes the network
-    let has_verification = config.has_verification();
+    // event_chain now borrows &mut self, so we can still access simulated_network after
+    let mut stream = simulated_network.event_chain(events, None);
 
-    // event_chain takes ownership, so we need to spawn the task with the network
-    let events_generated = tokio::task::spawn(async move {
-        let mut stream = simulated_network.event_chain(events, None);
-        while stream.next().await.is_some() {
-            tokio::time::sleep(next_event_wait_time).await;
-        }
-        // Return the network for verification (event_chain returns it via stream drop)
-        Ok::<_, super::Error>(())
-    });
+    // Track whether events completed normally
+    let mut events_completed = false;
 
-    let join_peer_tasks = async move {
+    let join_peer_tasks = async {
         let mut futs = futures::stream::FuturesUnordered::from_iter(join_handles);
         while let Some(join_handle) = futs.next().await {
             join_handle??;
@@ -53,7 +45,6 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
 
     let ctrl_c = signal::ctrl_c();
 
-    tokio::pin!(events_generated);
     tokio::pin!(join_peer_tasks);
     tokio::pin!(ctrl_c);
 
@@ -62,29 +53,29 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
     loop {
         tokio::select! {
             _ = &mut ctrl_c  /* SIGINT handling */ => {
+                tracing::info!("Received Ctrl+C, shutting down...");
                 break;
             }
-            res = &mut events_generated => {
-                match res? {
-                    Ok(()) => {
-                        tracing::info!("Test events generated successfully");
-                        *events_generated = tokio::task::spawn(futures::future::pending::<anyhow::Result<()>>());
-                        continue;
+            event = stream.next() => {
+                match event {
+                    Some(_event_id) => {
+                        tokio::time::sleep(next_event_wait_time).await;
                     }
-                    Err(err) => {
-                        test_result = Err(err);
-                        break;
+                    None => {
+                        tracing::info!("All {} events generated successfully", events);
+                        events_completed = true;
+                        // Continue to wait for peer tasks or ctrl+c
                     }
                 }
             }
             finalized = &mut join_peer_tasks => {
                 match finalized {
                     Ok(_) => {
-                        tracing::info!("Test finalized successfully");
+                        tracing::info!("All peer tasks finalized successfully");
                         break;
                     }
                     Err(e) => {
-                        tracing::error!("Test finalized with error: {}", e);
+                        tracing::error!("Peer tasks finalized with error: {}", e);
                         test_result = Err(e);
                         break;
                     }
@@ -93,18 +84,147 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         }
     }
 
-    // Note: Verification cannot be done here because event_chain consumed the network.
-    // The fault injection options still work - they're applied before event_chain runs.
-    // For post-test verification, we would need to refactor event_chain to not take ownership.
-    // TODO: Consider refactoring event_chain to borrow &mut self and return verification data.
-    if has_verification {
-        tracing::warn!(
-            "Post-test verification options (--print-summary, --check-convergence, --min-success-rate) \
-             cannot be run because event_chain consumes the network. \
-             Fault injection (--message-loss, --latency-*) is still applied. \
-             For verification, use the metrics server or check the test logs."
-        );
+    // Drop the stream to release the borrow on simulated_network
+    drop(stream);
+
+    // Now we can perform verification since we still have access to simulated_network
+    if test_result.is_ok() && events_completed {
+        test_result = run_verification(config, &simulated_network).await;
     }
 
     test_result
+}
+
+/// Run post-test verification based on config options.
+async fn run_verification(
+    config: &super::TestConfig,
+    network: &freenet::dev_tool::SimNetwork,
+) -> Result<(), super::Error> {
+    // Print operation summary if requested
+    if config.print_summary {
+        let summary = network.get_operation_summary().await;
+        tracing::info!("=== Operation Summary ===");
+        tracing::info!(
+            "Put: {}/{} succeeded ({:.1}% success rate)",
+            summary.put.succeeded,
+            summary.put.completed(),
+            summary.put.success_rate() * 100.0
+        );
+        tracing::info!(
+            "Get: {}/{} succeeded ({:.1}% success rate)",
+            summary.get.succeeded,
+            summary.get.completed(),
+            summary.get.success_rate() * 100.0
+        );
+        tracing::info!(
+            "Subscribe: {}/{} succeeded ({:.1}% success rate)",
+            summary.subscribe.succeeded,
+            summary.subscribe.completed(),
+            summary.subscribe.success_rate() * 100.0
+        );
+        tracing::info!(
+            "Update: {}/{} succeeded ({:.1}% success rate)",
+            summary.update.succeeded,
+            summary.update.completed(),
+            summary.update.success_rate() * 100.0
+        );
+        tracing::info!(
+            "Overall: {}/{} succeeded ({:.1}% success rate), {} timeouts",
+            summary.total_succeeded(),
+            summary.total_completed(),
+            summary.overall_success_rate() * 100.0,
+            summary.timeouts
+        );
+    }
+
+    // Print network stats if requested (requires fault injection)
+    if config.print_network_stats {
+        if let Some(stats) = network.get_network_stats() {
+            tracing::info!("=== Network Statistics ===");
+            tracing::info!(
+                "Messages: {} sent, {} delivered, {} dropped ({:.1}% loss)",
+                stats.messages_sent,
+                stats.messages_delivered,
+                stats.total_dropped(),
+                stats.loss_ratio() * 100.0
+            );
+            if stats.total_dropped() > 0 {
+                tracing::info!(
+                    "Drop reasons: {} loss, {} partition, {} crash",
+                    stats.messages_dropped_loss,
+                    stats.messages_dropped_partition,
+                    stats.messages_dropped_crash
+                );
+            }
+            if stats.messages_delayed_delivered > 0 {
+                tracing::info!(
+                    "Latency: {} delayed messages, avg {:?}",
+                    stats.messages_delayed_delivered,
+                    stats.average_latency()
+                );
+            }
+        } else {
+            tracing::warn!("Network stats not available (fault injection not configured)");
+        }
+    }
+
+    // Check minimum success rate
+    if let Some(min_rate) = config.min_success_rate {
+        let summary = network.get_operation_summary().await;
+        let actual_rate = summary.overall_success_rate();
+        if actual_rate < min_rate {
+            let msg = format!(
+                "Success rate {:.1}% is below minimum threshold {:.1}%",
+                actual_rate * 100.0,
+                min_rate * 100.0
+            );
+            tracing::error!("{}", msg);
+            return Err(anyhow::anyhow!(msg).into());
+        }
+        tracing::info!(
+            "Success rate check passed: {:.1}% >= {:.1}%",
+            actual_rate * 100.0,
+            min_rate * 100.0
+        );
+    }
+
+    // Check convergence
+    if let Some(timeout_secs) = config.check_convergence {
+        let timeout = Duration::from_secs(timeout_secs);
+        let poll_interval = Duration::from_millis(500);
+
+        tracing::info!("Checking convergence (timeout: {}s)...", timeout_secs);
+
+        match network.await_convergence(timeout, poll_interval, 1).await {
+            Ok(result) => {
+                tracing::info!(
+                    "Convergence check passed: {} contracts converged, {} diverged",
+                    result.converged.len(),
+                    result.diverged.len()
+                );
+            }
+            Err(result) => {
+                let msg = format!(
+                    "Convergence check failed: {} contracts converged, {} still diverged",
+                    result.converged.len(),
+                    result.diverged.len()
+                );
+                tracing::error!("{}", msg);
+
+                // Log details of diverged contracts
+                for diverged in &result.diverged {
+                    tracing::error!(
+                        "  Contract {} has {} different states across {} peers",
+                        diverged.contract_key,
+                        diverged.unique_state_count(),
+                        diverged.peer_states.len()
+                    );
+                }
+
+                return Err(anyhow::anyhow!(msg).into());
+            }
+        }
+    }
+
+    Ok(())
 }
