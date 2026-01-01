@@ -124,6 +124,7 @@ impl FaultInjectorState {
     }
 
     /// Returns the current VirtualTime if enabled.
+    #[allow(dead_code)] // Part of public API for future use
     pub fn virtual_time(&self) -> Option<&VirtualTime> {
         self.virtual_time.as_ref()
     }
@@ -236,7 +237,8 @@ pub enum DeliveryDecision {
     QueuedDelivery {
         /// Virtual time deadline in nanoseconds
         deadline: u64,
-        /// Latency added
+        /// Latency added (stored for debugging/logging purposes)
+        #[allow(dead_code)]
         latency: Duration,
     },
     /// Drop the message with reason

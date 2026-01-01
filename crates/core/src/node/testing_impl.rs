@@ -1101,6 +1101,223 @@ impl SimNetwork {
         }
         result.converged.len() as f64 / total as f64
     }
+
+    // =========================================================================
+    // Gap 4: Direct State Query API (event-based)
+    // =========================================================================
+
+    /// Returns the latest known state hash for each contract on each peer.
+    ///
+    /// This provides a view of contract state distribution across the network
+    /// by examining event logs. Returns a map of contract_key -> (peer_addr -> state_hash).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let states = sim.get_contract_state_hashes().await;
+    /// for (contract, peer_states) in states {
+    ///     println!("Contract {}: {} replicas", contract, peer_states.len());
+    ///     for (peer, hash) in peer_states {
+    ///         println!("  {}: {}", peer, hash);
+    ///     }
+    /// }
+    /// ```
+    pub async fn get_contract_state_hashes(
+        &self,
+    ) -> HashMap<String, HashMap<SocketAddr, String>> {
+        let summary = self.get_deterministic_event_summary().await;
+
+        let mut contract_states: HashMap<String, HashMap<SocketAddr, String>> = HashMap::new();
+
+        for event in &summary {
+            if let (Some(contract_key), Some(state_hash)) = (&event.contract_key, &event.state_hash)
+            {
+                // Keep the latest state for each peer/contract pair
+                contract_states
+                    .entry(contract_key.clone())
+                    .or_default()
+                    .insert(event.peer_addr, state_hash.clone());
+            }
+        }
+
+        contract_states
+    }
+
+    /// Returns a list of contracts and the peers that have them.
+    ///
+    /// This is useful for checking contract distribution across the network.
+    pub async fn get_contract_distribution(&self) -> Vec<ContractDistribution> {
+        let states = self.get_contract_state_hashes().await;
+        states
+            .into_iter()
+            .map(|(contract_key, peer_states)| ContractDistribution {
+                contract_key,
+                replica_count: peer_states.len(),
+                peers: peer_states.keys().cloned().collect(),
+            })
+            .collect()
+    }
+
+    // =========================================================================
+    // Gap T4: Operation Completion Tracking
+    // =========================================================================
+
+    /// Returns a summary of operation completion status.
+    ///
+    /// This tracks Put, Get, Subscribe, and Update operations from request to
+    /// completion (success or failure).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let summary = sim.get_operation_summary().await;
+    /// println!("Put: {}/{} completed ({:.1}% success)",
+    ///     summary.put.completed(),
+    ///     summary.put.requested,
+    ///     summary.put.success_rate() * 100.0);
+    /// ```
+    pub async fn get_operation_summary(&self) -> OperationSummary {
+        let logs = self.event_listener.logs.lock().await;
+
+        let mut summary = OperationSummary::default();
+
+        for log in logs.iter() {
+            match &log.kind {
+                // Put operations
+                crate::tracing::EventKind::Put(put_event) => {
+                    use crate::tracing::PutEvent;
+                    match put_event {
+                        PutEvent::Request { .. } => summary.put.requested += 1,
+                        PutEvent::PutSuccess { .. } => summary.put.succeeded += 1,
+                        PutEvent::PutFailure { .. } => summary.put.failed += 1,
+                        PutEvent::BroadcastEmitted { .. } => summary.put.broadcasts_emitted += 1,
+                        PutEvent::BroadcastReceived { .. } => summary.put.broadcasts_received += 1,
+                    }
+                }
+                // Get operations
+                crate::tracing::EventKind::Get(get_event) => {
+                    use crate::tracing::GetEvent;
+                    match get_event {
+                        GetEvent::Request { .. } => summary.get.requested += 1,
+                        GetEvent::GetSuccess { .. } => summary.get.succeeded += 1,
+                        GetEvent::GetFailure { .. } => summary.get.failed += 1,
+                        _ => {}
+                    }
+                }
+                // Subscribe operations
+                crate::tracing::EventKind::Subscribe(sub_event) => {
+                    use crate::tracing::SubscribeEvent;
+                    match sub_event {
+                        SubscribeEvent::Request { .. } => summary.subscribe.requested += 1,
+                        SubscribeEvent::SubscribeSuccess { .. } => {
+                            summary.subscribe.succeeded += 1
+                        }
+                        SubscribeEvent::SubscribeNotFound { .. } => summary.subscribe.failed += 1,
+                        _ => {}
+                    }
+                }
+                // Update operations (no UpdateFailure variant exists)
+                crate::tracing::EventKind::Update(update_event) => {
+                    use crate::tracing::UpdateEvent;
+                    match update_event {
+                        UpdateEvent::Request { .. } => summary.update.requested += 1,
+                        UpdateEvent::UpdateSuccess { .. } => summary.update.succeeded += 1,
+                        UpdateEvent::BroadcastReceived { .. } => {
+                            summary.update.broadcasts_received += 1
+                        }
+                        _ => {}
+                    }
+                }
+                // Timeouts
+                crate::tracing::EventKind::Timeout { .. } => {
+                    summary.timeouts += 1;
+                }
+                _ => {}
+            }
+        }
+
+        summary
+    }
+
+    /// Checks if all requested operations have completed (either succeeded or failed).
+    ///
+    /// Returns (completed, pending) counts.
+    pub async fn operation_completion_status(&self) -> (usize, usize) {
+        let summary = self.get_operation_summary().await;
+        let completed = summary.total_completed();
+        let requested = summary.total_requested();
+        let pending = requested.saturating_sub(completed);
+        (completed, pending)
+    }
+
+    /// Returns the overall operation success rate (0.0 to 1.0).
+    pub async fn operation_success_rate(&self) -> f64 {
+        let summary = self.get_operation_summary().await;
+        summary.overall_success_rate()
+    }
+
+    /// Waits for all operations to complete, up to a timeout.
+    ///
+    /// # Returns
+    /// * `Ok(OperationSummary)` - If all operations completed
+    /// * `Err(OperationSummary)` - If timeout reached with pending operations
+    pub async fn await_operation_completion(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<OperationSummary, OperationSummary> {
+        let start = Instant::now();
+
+        loop {
+            let summary = self.get_operation_summary().await;
+            let (completed, pending) = (summary.total_completed(), summary.total_requested());
+
+            // All operations completed (or none requested)
+            if pending == 0 || completed >= pending {
+                return Ok(summary);
+            }
+
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    "Operation completion timeout: {} completed, {} pending",
+                    completed,
+                    pending.saturating_sub(completed)
+                );
+                return Err(summary);
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Asserts that operation success rate meets the threshold.
+    ///
+    /// # Panics
+    /// Panics if success rate is below the threshold.
+    pub async fn assert_operation_success_rate(&self, min_rate: f64) {
+        let summary = self.get_operation_summary().await;
+        let rate = summary.overall_success_rate();
+
+        if rate < min_rate {
+            panic!(
+                "Operation success rate {:.1}% is below threshold {:.1}%\n\
+                 Put: {}/{} ({:.1}%), Get: {}/{} ({:.1}%), \
+                 Subscribe: {}/{} ({:.1}%), Update: {}/{} ({:.1}%)",
+                rate * 100.0,
+                min_rate * 100.0,
+                summary.put.succeeded,
+                summary.put.completed(),
+                summary.put.success_rate() * 100.0,
+                summary.get.succeeded,
+                summary.get.completed(),
+                summary.get.success_rate() * 100.0,
+                summary.subscribe.succeeded,
+                summary.subscribe.completed(),
+                summary.subscribe.success_rate() * 100.0,
+                summary.update.succeeded,
+                summary.update.completed(),
+                summary.update.success_rate() * 100.0,
+            );
+        }
+    }
 }
 
 /// Result of a convergence check.
@@ -1157,6 +1374,174 @@ impl DivergedContract {
     pub fn unique_state_count(&self) -> usize {
         let unique: HashSet<&String> = self.peer_states.iter().map(|(_, h)| h).collect();
         unique.len()
+    }
+}
+
+// =============================================================================
+// Gap 4: Contract Distribution Types
+// =============================================================================
+
+/// Information about how a contract is distributed across the network.
+#[derive(Debug, Clone)]
+pub struct ContractDistribution {
+    /// The contract key
+    pub contract_key: String,
+    /// Number of replicas
+    pub replica_count: usize,
+    /// Peers that have this contract
+    pub peers: Vec<SocketAddr>,
+}
+
+// =============================================================================
+// Gap T4: Operation Tracking Types
+// =============================================================================
+
+/// Summary of operation completion status across the network.
+#[derive(Debug, Clone, Default)]
+pub struct OperationSummary {
+    /// Put operation statistics
+    pub put: PutOperationStats,
+    /// Get operation statistics
+    pub get: OperationStats,
+    /// Subscribe operation statistics
+    pub subscribe: OperationStats,
+    /// Update operation statistics
+    pub update: UpdateOperationStats,
+    /// Total number of timed-out operations
+    pub timeouts: usize,
+}
+
+impl OperationSummary {
+    /// Returns total number of operations requested.
+    pub fn total_requested(&self) -> usize {
+        self.put.requested + self.get.requested + self.subscribe.requested + self.update.requested
+    }
+
+    /// Returns total number of operations completed (succeeded + failed).
+    pub fn total_completed(&self) -> usize {
+        self.put.completed()
+            + self.get.completed()
+            + self.subscribe.completed()
+            + self.update.completed()
+    }
+
+    /// Returns total number of successful operations.
+    pub fn total_succeeded(&self) -> usize {
+        self.put.succeeded + self.get.succeeded + self.subscribe.succeeded + self.update.succeeded
+    }
+
+    /// Returns total number of failed operations.
+    pub fn total_failed(&self) -> usize {
+        self.put.failed + self.get.failed + self.subscribe.failed + self.update.failed
+    }
+
+    /// Returns overall success rate (0.0 to 1.0).
+    pub fn overall_success_rate(&self) -> f64 {
+        let completed = self.total_completed();
+        if completed == 0 {
+            return 1.0; // No operations completed yet
+        }
+        self.total_succeeded() as f64 / completed as f64
+    }
+
+    /// Returns true if all requested operations have completed.
+    pub fn all_completed(&self) -> bool {
+        self.total_completed() >= self.total_requested()
+    }
+}
+
+/// Statistics for a basic operation type (Get, Subscribe).
+#[derive(Debug, Clone, Default)]
+pub struct OperationStats {
+    /// Number of operations requested
+    pub requested: usize,
+    /// Number of operations that succeeded
+    pub succeeded: usize,
+    /// Number of operations that failed
+    pub failed: usize,
+}
+
+impl OperationStats {
+    /// Returns total completed operations (succeeded + failed).
+    pub fn completed(&self) -> usize {
+        self.succeeded + self.failed
+    }
+
+    /// Returns success rate (0.0 to 1.0).
+    pub fn success_rate(&self) -> f64 {
+        let completed = self.completed();
+        if completed == 0 {
+            return 1.0;
+        }
+        self.succeeded as f64 / completed as f64
+    }
+}
+
+/// Statistics for Put operations (includes broadcast tracking).
+#[derive(Debug, Clone, Default)]
+pub struct PutOperationStats {
+    /// Number of Put operations requested
+    pub requested: usize,
+    /// Number of Put operations that succeeded
+    pub succeeded: usize,
+    /// Number of Put operations that failed
+    pub failed: usize,
+    /// Number of broadcasts emitted
+    pub broadcasts_emitted: usize,
+    /// Number of broadcasts received by peers
+    pub broadcasts_received: usize,
+}
+
+impl PutOperationStats {
+    /// Returns total completed operations (succeeded + failed).
+    pub fn completed(&self) -> usize {
+        self.succeeded + self.failed
+    }
+
+    /// Returns success rate (0.0 to 1.0).
+    pub fn success_rate(&self) -> f64 {
+        let completed = self.completed();
+        if completed == 0 {
+            return 1.0;
+        }
+        self.succeeded as f64 / completed as f64
+    }
+
+    /// Returns broadcast propagation rate (received / emitted).
+    pub fn broadcast_propagation_rate(&self) -> f64 {
+        if self.broadcasts_emitted == 0 {
+            return 1.0;
+        }
+        self.broadcasts_received as f64 / self.broadcasts_emitted as f64
+    }
+}
+
+/// Statistics for Update operations (includes broadcast tracking).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOperationStats {
+    /// Number of Update operations requested
+    pub requested: usize,
+    /// Number of Update operations that succeeded
+    pub succeeded: usize,
+    /// Number of Update operations that failed
+    pub failed: usize,
+    /// Number of update broadcasts received by subscribers
+    pub broadcasts_received: usize,
+}
+
+impl UpdateOperationStats {
+    /// Returns total completed operations (succeeded + failed).
+    pub fn completed(&self) -> usize {
+        self.succeeded + self.failed
+    }
+
+    /// Returns success rate (0.0 to 1.0).
+    pub fn success_rate(&self) -> f64 {
+        let completed = self.completed();
+        if completed == 0 {
+            return 1.0;
+        }
+        self.succeeded as f64 / completed as f64
     }
 }
 

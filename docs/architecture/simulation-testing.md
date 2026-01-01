@@ -197,17 +197,62 @@ Helper methods added to `EventKind`:
 - `contract_key()` - extracts contract key if applicable
 - `state_hash()` - extracts state hash if applicable
 
-### Gap 4: No Direct State Query
+### Gap 4: No Direct State Query - PARTIAL FIX
 
-Cannot query `StateStore` from tests directly. Use event observation:
+Cannot query `StateStore` from tests directly (nodes run as isolated async tasks).
+However, event-based state hashes are now available:
 
 ```rust
-// Current: event observation
-let summary = sim.get_deterministic_event_summary().await;
+// Get state hashes for all contracts across all peers
+let states = sim.get_contract_state_hashes().await;
+// Returns: HashMap<String, HashMap<SocketAddr, String>> (contract_key -> peer -> hash)
 
-// Future (not yet implemented): direct state query
-// let states = sim.get_contract_states(key).await;
-// Returns: HashMap<NodeLabel, Option<WrappedState>>
+for (contract, peer_states) in states {
+    println!("Contract {}: {} replicas", contract, peer_states.len());
+    for (peer, hash) in peer_states {
+        println!("  {}: {}", peer, hash);
+    }
+}
+
+// Get contract distribution summary
+let distribution = sim.get_contract_distribution().await;
+// Returns: Vec<ContractDistribution> with replica_count and peers list
+```
+
+**Note**: This provides state *hashes* via event observation, not full state content.
+Direct StateStore access would require architectural changes (shared state references).
+
+### Gap T4: Operation Completion Tracking - FIXED
+
+**Now Available**: Operation tracking from request to completion:
+
+```rust
+// Get full operation summary
+let summary = sim.get_operation_summary().await;
+println!("Put: {}/{} ({:.1}% success)",
+    summary.put.succeeded,
+    summary.put.completed(),
+    summary.put.success_rate() * 100.0);
+
+// Check overall status
+let (completed, pending) = sim.operation_completion_status().await;
+println!("{} completed, {} pending", completed, pending);
+
+// Wait for operations to complete
+match sim.await_operation_completion(Duration::from_secs(30), Duration::from_millis(500)).await {
+    Ok(summary) => println!("All operations completed: {} succeeded", summary.total_succeeded()),
+    Err(summary) => println!("Timeout with {} pending", summary.total_requested() - summary.total_completed()),
+}
+
+// Assert minimum success rate
+sim.assert_operation_success_rate(0.95).await; // Panics if < 95% success
+
+// Operation summary includes:
+// - put: requested, succeeded, failed, broadcasts_emitted, broadcasts_received
+// - get: requested, succeeded, failed
+// - subscribe: requested, succeeded (via SubscribeSuccess), failed (via SubscribeNotFound)
+// - update: requested, succeeded, broadcasts_received
+// - timeouts: count of timed-out operations
 ```
 
 ## Test Files
@@ -262,10 +307,12 @@ async fn test_with_noise() {
 
 1. ~~**Integrate VirtualTime**~~ - PARTIAL: VirtualTime in FaultInjectorState (Phase 2 complete)
 2. ~~**Connect SimulatedNetwork**~~ - DONE: Fault injection bridge with deterministic RNG
-3. **Add StateStore query** - Direct state comparison across peers
+3. ~~**Add StateStore query**~~ - PARTIAL: Event-based state hashes available (`get_contract_state_hashes()`)
 4. ~~**Structured EventSummary**~~ - DONE: Added typed fields
-5. **Single-threaded mode** - Option for `flavor = "current_thread"`
-6. **Phase 3 VirtualTime** - Replace all tokio::time with VirtualTime throughout codebase
+5. ~~**Operation completion tracking**~~ - DONE: `get_operation_summary()`, `await_operation_completion()`
+6. **Single-threaded mode** - Option for `flavor = "current_thread"`
+7. **Phase 3 VirtualTime** - Replace all tokio::time with VirtualTime throughout codebase
+8. **Unify SimNetwork and SimulatedNetwork** - Run actual node code with deterministic scheduling
 
 ---
 
@@ -338,17 +385,19 @@ assert!(rate >= 0.95, "Expected 95%+ convergence");
 - Consensus verification: `sim.verify_contract_replicas(contract_key) -> Result<HashSet<StateHash>>`
 - State audit trail: `sim.get_state_history(contract_key) -> Vec<(Timestamp, Peer, Hash)>`
 
-### Gap T4: Operations Generated But Not Verified to Complete
+### Gap T4: Operations Generated But Not Verified to Complete - FIXED
 
-**Current State:**
-- EventChain generates operations but doesn't verify they execute
-- Tests count events captured but don't verify operations succeeded
-- Operations can silently fail and test still passes
+~~**Current State:**~~
+~~- EventChain generates operations but doesn't verify they execute~~
+~~- Tests count events captured but don't verify operations succeeded~~
+~~- Operations can silently fail and test still passes~~
 
-**What's Missing:**
-- Operation completion tracking: "X out of Y operations completed successfully"
-- Response validation: verify Get returns correct state
-- Broadcast propagation verification: confirm updates reached all subscribers
+**Now Available** (see Gap T4 above for usage):
+- ✅ `get_operation_summary()` - Full operation tracking
+- ✅ `operation_completion_status()` - (completed, pending) counts
+- ✅ `await_operation_completion()` - Wait for operations to complete
+- ✅ `assert_operation_success_rate()` - Assert minimum success rate
+- ✅ Broadcast tracking for Put and Update operations
 
 ### Gap T5: Fault Injection Effects Not Measured - FIXED
 

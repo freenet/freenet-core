@@ -73,8 +73,9 @@ pub mod dev_tool {
     pub use message::Transaction;
     pub use node::{
         testing_impl::{
-            ConvergedContract, ConvergenceResult, DivergedContract, EventChain, EventSummary,
-            NetworkPeer, NodeLabel, PeerMessage, PeerStatus, SimNetwork,
+            ContractDistribution, ConvergedContract, ConvergenceResult, DivergedContract,
+            EventChain, EventSummary, NetworkPeer, NodeLabel, OperationStats, OperationSummary,
+            PeerMessage, PeerStatus, PutOperationStats, SimNetwork, UpdateOperationStats,
         },
         InitPeerNode, NetworkStats, NodeConfig, PeerId,
     };
