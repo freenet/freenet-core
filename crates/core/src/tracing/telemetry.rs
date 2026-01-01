@@ -475,6 +475,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 UpdateEvent::UpdateSuccess { .. } => "update_success".to_string(),
                 UpdateEvent::BroadcastEmitted { .. } => "update_broadcast_emitted".to_string(),
                 UpdateEvent::BroadcastReceived { .. } => "update_broadcast_received".to_string(),
+                UpdateEvent::BroadcastApplied { .. } => "update_broadcast_applied".to_string(),
             }
         }
         EventKind::Transfer(transfer_event) => {
@@ -1058,6 +1059,31 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "id": id.to_string(),
                         "timestamp": timestamp,
                     })
+                }
+                UpdateEvent::BroadcastApplied {
+                    id,
+                    key,
+                    target,
+                    timestamp,
+                    state_hash_before,
+                    state_hash_after,
+                    changed,
+                } => {
+                    let mut json = serde_json::json!({
+                        "type": "broadcast_applied",
+                        "id": id.to_string(),
+                        "key": key.to_string(),
+                        "target": target.to_string(),
+                        "timestamp": timestamp,
+                        "changed": changed,
+                    });
+                    if let Some(hash) = state_hash_before {
+                        json["state_hash_before"] = serde_json::Value::String(hash.clone());
+                    }
+                    if let Some(hash) = state_hash_after {
+                        json["state_hash_after"] = serde_json::Value::String(hash.clone());
+                    }
+                    json
                 }
             }
         }
