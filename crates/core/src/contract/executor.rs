@@ -759,7 +759,13 @@ impl<R> Executor<R> {
     }
 
     pub fn test_data_dir(identifier: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("freenet-executor-{identifier}"))
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "freenet-executor-{identifier}-{}-{unique_id}",
+            std::process::id()
+        ))
     }
 
     /// Create all stores including StateStore. Used when creating a standalone executor.
