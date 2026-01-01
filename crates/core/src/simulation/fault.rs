@@ -123,6 +123,17 @@ impl FaultConfig {
         self.message_loss_rate > 0.0 && rng.gen_bool(self.message_loss_rate)
     }
 
+    /// Returns true if a message should be dropped, using thread-local RNG.
+    ///
+    /// This is useful for the in-memory transport bridge where we don't
+    /// have access to the simulation's deterministic RNG.
+    /// Note: This is non-deterministic; use `should_drop_message` with
+    /// a seeded RNG for deterministic fault injection.
+    pub fn should_drop_message_random(&self) -> bool {
+        use rand::Rng;
+        self.message_loss_rate > 0.0 && rand::rng().random_bool(self.message_loss_rate)
+    }
+
     /// Generates a latency duration for a message.
     ///
     /// Returns None if no latency range is configured.

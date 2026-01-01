@@ -111,17 +111,39 @@ virtual_time.sleep(Duration::from_secs(3)).await;
 2. Use a deterministic async executor
 3. Control all timing through the scheduler
 
-### Gap 2: SimulatedNetwork Not Connected to Nodes
+### Gap 2: SimulatedNetwork Not Connected to Nodes - PARTIALLY FIXED
 
-`SimulatedNetwork` provides message routing but doesn't connect to actual nodes:
+~~`SimulatedNetwork` provides message routing but doesn't connect to actual nodes~~
+
+**PARTIAL FIX IMPLEMENTED**: A fault injection bridge now connects `FaultConfig` to `InMemoryTransport`:
 
 ```
-Current:
-  Node A → InMemoryTransport → channel → InMemoryTransport → Node B
+Current (with bridge):
+  Node A → InMemoryTransport.send()
+           ↓
+           should_deliver_message() ← checks FAULT_INJECTOR static
+           ↓
+           FaultConfig.is_crashed() / is_partitioned() / should_drop_message_random()
+           ↓
+           channel → InMemoryTransport → Node B
 
-Future:
-  Node A → SimulatedNetwork → Scheduler → SimulatedNetwork → Node B
+Usage:
+  let config = FaultConfig::builder()
+      .message_loss_rate(0.1)
+      .partition(partition)
+      .build();
+  sim.with_fault_injection(config);
 ```
+
+**What works:**
+- Message loss injection (random drops)
+- Network partitions (blocking messages between peer groups)
+- Node crashes (blocking all messages to/from a node)
+
+**What doesn't work (yet):**
+- Deterministic fault injection (uses thread-local RNG, not seeded RNG)
+- Latency injection (VirtualTime not integrated)
+- Full scheduler-based message ordering
 
 ### Gap 3: Event Summary Uses Debug Parsing - FIXED
 

@@ -22,9 +22,86 @@ use crate::{
     message::NetMessage,
     node::{testing_impl::NetworkBridgeExt, NetEventRegister, OpManager, PeerId},
     ring::PeerKeyLocation,
+    simulation::FaultConfig,
     tracing::NetEventLog,
     transport::TransportPublicKey,
 };
+
+/// Shared fault injector for controlling message delivery in tests.
+///
+/// When set, messages are checked against the fault configuration before delivery.
+/// This enables deterministic fault injection without replacing the transport layer.
+static FAULT_INJECTOR: LazyLock<RwLock<Option<Arc<std::sync::Mutex<FaultConfig>>>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Sets the global fault injector for in-memory transport.
+///
+/// When set, all `MemoryConnManager` instances will check messages against
+/// this configuration before delivery, allowing tests to inject:
+/// - Message drops (loss rate)
+/// - Network partitions
+/// - Node crashes
+///
+/// # Example
+/// ```ignore
+/// use freenet::simulation::FaultConfig;
+///
+/// let config = FaultConfig::builder()
+///     .message_loss_rate(0.1)
+///     .build();
+/// set_fault_injector(Some(Arc::new(std::sync::Mutex::new(config))));
+/// ```
+pub fn set_fault_injector(config: Option<Arc<std::sync::Mutex<FaultConfig>>>) {
+    *FAULT_INJECTOR.write().unwrap() = config;
+}
+
+/// Returns the current fault injector, if set.
+pub fn get_fault_injector() -> Option<Arc<std::sync::Mutex<FaultConfig>>> {
+    FAULT_INJECTOR.read().unwrap().clone()
+}
+
+/// Checks if a message should be dropped based on the fault configuration.
+///
+/// Returns true if the message should be delivered, false if it should be dropped.
+fn should_deliver_message(from: SocketAddr, to: SocketAddr) -> bool {
+    let Some(injector) = get_fault_injector() else {
+        return true; // No fault injection configured
+    };
+
+    let config = injector.lock().unwrap();
+
+    // Check if sender or receiver is crashed
+    if config.is_crashed(&from) || config.is_crashed(&to) {
+        tracing::trace!(
+            ?from,
+            ?to,
+            "Fault injector: message dropped (node crashed)"
+        );
+        return false;
+    }
+
+    // Check for partition (using 0 as current time since we don't have virtual time here)
+    if config.is_partitioned(&from, &to, 0) {
+        tracing::trace!(
+            ?from,
+            ?to,
+            "Fault injector: message dropped (network partition)"
+        );
+        return false;
+    }
+
+    // Check message loss rate (uses thread-local RNG for simplicity)
+    if config.should_drop_message_random() {
+        tracing::trace!(
+            ?from,
+            ?to,
+            "Fault injector: message dropped (random loss)"
+        );
+        return false;
+    }
+
+    true
+}
 
 /// Registry that maps socket addresses to their dedicated message channels.
 /// This enables direct peer-to-peer message routing without busy-polling.
@@ -255,6 +332,13 @@ impl InMemoryTransport {
     }
 
     fn send(&self, target: PeerId, message: Vec<u8>) -> Result<(), ConnectionError> {
+        // Check fault injector before sending
+        if !should_deliver_message(self.interface_peer.addr, target.addr) {
+            // Message dropped by fault injection - return success to caller
+            // (from sender's perspective, the message was sent)
+            return Ok(());
+        }
+
         let msg = MessageOnTransit {
             origin: self.interface_peer.clone(),
             target: target.clone(),

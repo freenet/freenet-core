@@ -407,6 +407,34 @@ impl SimNetwork {
         self.add_noise = true;
     }
 
+    /// Configures fault injection for the network simulation.
+    ///
+    /// This enables deterministic fault injection using the simulation framework's
+    /// `FaultConfig`. Faults include:
+    /// - Message drops (via `message_loss_rate`)
+    /// - Network partitions
+    /// - Node crashes
+    ///
+    /// # Example
+    /// ```ignore
+    /// use freenet::simulation::FaultConfig;
+    ///
+    /// let mut sim = SimNetwork::new(...).await;
+    /// sim.with_fault_injection(FaultConfig::builder()
+    ///     .message_loss_rate(0.1)
+    ///     .build());
+    /// ```
+    pub fn with_fault_injection(&mut self, config: crate::simulation::FaultConfig) {
+        use crate::node::network_bridge::set_fault_injector;
+        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(config))));
+    }
+
+    /// Clears any configured fault injection.
+    pub fn clear_fault_injection(&mut self) {
+        use crate::node::network_bridge::set_fault_injector;
+        set_fault_injector(None);
+    }
+
     #[allow(unused)]
     pub fn debug(&mut self) {
         self.clean_up_tmp_dirs = false;
