@@ -75,7 +75,8 @@ pub mod dev_tool {
         testing_impl::{
             ContractDistribution, ConvergedContract, ConvergenceResult, DivergedContract,
             EventChain, EventSummary, NetworkPeer, NodeLabel, OperationStats, OperationSummary,
-            PeerMessage, PeerStatus, PutOperationStats, SimNetwork, UpdateOperationStats,
+            PeerMessage, PeerStatus, PutOperationStats, RunningNode, SimNetwork,
+            UpdateOperationStats,
         },
         InitPeerNode, NetworkStats, NodeConfig, PeerId,
     };

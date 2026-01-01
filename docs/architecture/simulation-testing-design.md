@@ -21,14 +21,14 @@ cargo run -p fdev -- test --gateways 1 --nodes 5 --events 100 single-process
 ### Key Test Patterns
 
 ```rust
-use freenet::dev_tool::{SimNetwork, FaultConfig, VirtualTime};
+use freenet::dev_tool::{SimNetwork, FaultConfig, TimeSource};
 use std::time::Duration;
 
 #[tokio::test]
 async fn example_simulation_test() {
     const SEED: u64 = 0xDEAD_BEEF;
 
-    // Create network
+    // Create network - VirtualTime is always enabled
     let mut sim = SimNetwork::new(
         "test-name",
         1,   // gateways
@@ -40,7 +40,10 @@ async fn example_simulation_test() {
         SEED,
     ).await;
 
-    // Optional: Configure fault injection
+    // VirtualTime is available immediately
+    assert_eq!(sim.virtual_time().now_nanos(), 0);
+
+    // Optional: Configure fault injection (VirtualTime automatically used)
     sim.with_fault_injection(
         FaultConfig::builder()
             .message_loss_rate(0.1)
@@ -57,7 +60,8 @@ async fn example_simulation_test() {
     // Generate events (event_chain now borrows, doesn't consume)
     let mut stream = sim.event_chain(100, None);
     while stream.next().await.is_some() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Advance virtual time and deliver pending messages
+        sim.advance_time(Duration::from_millis(100));
     }
     drop(stream);  // Release borrow
 
@@ -67,12 +71,37 @@ async fn example_simulation_test() {
 
     let summary = sim.get_operation_summary().await;
     assert!(summary.overall_success_rate() > 0.8, "Operations should mostly succeed");
+
+    // Example: Crash a node and verify system handles it
+    let all_addrs = sim.all_node_addresses();
+    if let Some(label) = all_addrs.keys().next() {
+        sim.crash_node(label);  // Aborts task, blocks messages
+        assert!(sim.is_node_crashed(label));
+
+        // Later, recover (unblocks messages, but task stays aborted)
+        sim.recover_node(label);
+        assert!(!sim.is_node_crashed(label));
+    }
 }
 ```
 
 ### Available Verification APIs
 
 ```rust
+// Virtual Time (always available)
+sim.virtual_time()                          // Get VirtualTime reference
+sim.virtual_time().now_nanos()              // Current virtual time
+sim.virtual_time().advance(duration)        // Advance time
+sim.advance_time(duration)                  // Advance + deliver pending messages
+sim.advance_virtual_time()                  // Just deliver pending messages
+
+// Node Lifecycle
+sim.crash_node(&label)                      // Abort task + block messages
+sim.recover_node(&label)                    // Unblock messages (task stays aborted)
+sim.is_node_crashed(&label)                 // Check crash status
+sim.node_address(&label)                    // Get node's SocketAddr
+sim.all_node_addresses()                    // All label -> addr mappings
+
 // Convergence checking
 sim.check_convergence().await               // Immediate check
 sim.await_convergence(timeout, poll, min)   // Wait for convergence
@@ -92,8 +121,9 @@ sim.get_contract_distribution().await       // Where contracts are stored
 sim.get_event_counts().await                // Event counts by type
 sim.get_deterministic_event_summary().await // Sorted event list
 
-// Network stats (requires fault injection)
+// Network stats (always available with VirtualTime)
 sim.get_network_stats()                     // Messages sent/dropped/delayed
+sim.reset_network_stats()                   // Reset counters
 ```
 
 ---
@@ -123,6 +153,8 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 2. **Verification APIs**: `check_convergence()`, `get_operation_summary()`, etc.
 3. **Fault injection bridge**: `FaultConfig` from simulation module works with `SimNetwork`
 4. **fdev verification**: `--check-convergence`, `--min-success-rate`, `--print-summary` flags
+5. **VirtualTime always enabled**: `virtual_time()` accessor for time control, `advance_time()` convenience method
+6. **Node crash API**: `crash_node()`, `recover_node()`, `is_node_crashed()` for testing failure scenarios
 
 ---
 
@@ -139,21 +171,23 @@ The `SimNetwork` infrastructure (`crates/core/src/node/testing_impl.rs`) provide
 | Convergence checking | Verify contract state consistency |
 | Operation tracking | Success/failure rates per operation type |
 | Post-event verification | Access SimNetwork after events complete |
+| **VirtualTime (always on)** | Time control via `virtual_time()` and `advance_time()` |
+| **Node crash simulation** | `crash_node()` aborts task and blocks messages |
 
 ### ⚠️ Partially Working
 
 | Feature | Issue | Workaround |
 |---------|-------|------------|
 | Deterministic execution | Multi-threaded Tokio causes non-determinism | Use lenient assertions (percentages) |
-| VirtualTime mode | Exists but not used in tests | Available via `with_fault_injection_virtual_time()` |
 | Gateway registration race | Nodes may start before gateways ready | 3-phase startup with barrier |
+| Node recovery | `recover_node()` clears crash status but doesn't restart task | Requires full restart implementation |
 
 ### ❌ Not Yet Implemented
 
 | Feature | Impact |
 |---------|--------|
 | Deterministic executor | Full reproducibility impossible |
-| Node crash/restart | Can't test recovery scenarios |
+| **Node restart** | Crashed nodes can't be restarted (only message blocking cleared) |
 | Clock skew simulation | Can't test time-sensitive bugs |
 | Invariant checking DSL | Manual assertions only |
 | Linearizability checker | Can't prove consistency |

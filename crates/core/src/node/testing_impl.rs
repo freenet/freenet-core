@@ -30,6 +30,7 @@ use crate::{
     node::{InitPeerNode, NetEventRegister, NodeConfig},
     operations::connect,
     ring::{Distance, Location, PeerKeyLocation},
+    simulation::{FaultConfig, VirtualTime},
     tracing::TestEventListener,
     transport::TransportPublicKey,
 };
@@ -312,6 +313,17 @@ impl<ER: NetEventRegister> Builder<ER> {
     }
 }
 
+/// Information about a running node, used for crash/restart operations.
+#[derive(Debug)]
+pub struct RunningNode {
+    /// The label identifying this node
+    pub label: NodeLabel,
+    /// Socket address for fault injection
+    pub addr: SocketAddr,
+    /// Handle to abort the running task (AbortHandle can be cloned and used independently)
+    pub abort_handle: tokio::task::AbortHandle,
+}
+
 /// A simulated in-memory network topology.
 pub struct SimNetwork {
     name: String,
@@ -332,6 +344,12 @@ pub struct SimNetwork {
     add_noise: bool,
     /// Master seed for deterministic RNG - used to derive per-peer seeds
     seed: u64,
+    /// VirtualTime for deterministic simulation - always enabled
+    virtual_time: VirtualTime,
+    /// Running nodes indexed by label for crash/restart operations
+    running_nodes: HashMap<NodeLabel, RunningNode>,
+    /// Map from label to socket address for quick lookup
+    node_addresses: HashMap<NodeLabel, SocketAddr>,
 }
 
 impl SimNetwork {
@@ -353,6 +371,10 @@ impl SimNetwork {
         let (user_ev_controller, mut receiver_ch) =
             watch::channel((0, TransportKeypair::new().public().clone()));
         receiver_ch.borrow_and_update();
+
+        // VirtualTime is always enabled for deterministic simulation
+        let virtual_time = VirtualTime::new();
+
         let mut net = Self {
             name: name.into(),
             clean_up_tmp_dirs: true,
@@ -371,6 +393,9 @@ impl SimNetwork {
             start_backoff: Duration::from_millis(1),
             add_noise: false,
             seed,
+            virtual_time,
+            running_nodes: HashMap::new(),
+            node_addresses: HashMap::new(),
         };
         net.config_gateways(
             gateways
@@ -379,7 +404,22 @@ impl SimNetwork {
         )
         .await;
         net.config_nodes(nodes).await;
+
+        // Auto-configure fault injection with VirtualTime enabled
+        // Users can call with_fault_injection() to customize
+        net.init_default_fault_injection();
+
         net
+    }
+
+    /// Initializes the default fault injection with VirtualTime but no faults.
+    /// Users can call with_fault_injection() to add message loss, latency, etc.
+    fn init_default_fault_injection(&mut self) {
+        use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
+        let fault_seed = self.seed.wrapping_add(0xFA01_7777);
+        let state =
+            FaultInjectorState::new(FaultConfig::default(), fault_seed).with_virtual_time(self.virtual_time.clone());
+        set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
     }
 
     /// Derives a deterministic per-peer seed from the master seed and peer index.
@@ -407,6 +447,25 @@ impl SimNetwork {
         self.add_noise = true;
     }
 
+    /// Returns the VirtualTime instance for this simulation.
+    ///
+    /// VirtualTime is always enabled. Use this to advance time and control
+    /// message delivery timing.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut sim = SimNetwork::new(...).await;
+    ///
+    /// // Advance virtual time by 100ms
+    /// sim.virtual_time().advance(Duration::from_millis(100));
+    ///
+    /// // Deliver pending messages
+    /// let delivered = sim.advance_virtual_time();
+    /// ```
+    pub fn virtual_time(&self) -> &VirtualTime {
+        &self.virtual_time
+    }
+
     /// Configures fault injection for the network simulation.
     ///
     /// This enables deterministic fault injection using the simulation framework's
@@ -416,7 +475,7 @@ impl SimNetwork {
     /// - Node crashes
     /// - Latency injection (via `latency_range`)
     ///
-    /// The fault injector uses the network's seed for deterministic behavior.
+    /// VirtualTime is automatically used for deterministic latency injection.
     ///
     /// # Example
     /// ```ignore
@@ -428,50 +487,38 @@ impl SimNetwork {
     ///     .message_loss_rate(0.1)
     ///     .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
     ///     .build());
+    ///
+    /// // Advance time and deliver pending messages
+    /// sim.virtual_time().advance(Duration::from_millis(100));
+    /// sim.advance_virtual_time();
     /// ```
-    pub fn with_fault_injection(&mut self, config: crate::simulation::FaultConfig) {
+    pub fn with_fault_injection(&mut self, config: FaultConfig) {
         use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
         // Use a derived seed for fault injection to maintain determinism
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
-        let state = FaultInjectorState::new(config, fault_seed);
+        // Always use VirtualTime for deterministic behavior
+        let state =
+            FaultInjectorState::new(config, fault_seed).with_virtual_time(self.virtual_time.clone());
         set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
     }
 
-    /// Clears any configured fault injection.
+    /// Clears any configured fault injection and resets to default (VirtualTime only).
     pub fn clear_fault_injection(&mut self) {
-        use crate::node::network_bridge::set_fault_injector;
-        set_fault_injector(None);
+        self.init_default_fault_injection();
     }
 
-    /// Configures fault injection with VirtualTime mode enabled.
+    /// Configures fault injection with a custom VirtualTime instance.
     ///
-    /// VirtualTime mode queues messages with latency injection instead of using
-    /// real-time delays. Use `advance_virtual_time()` to advance time and deliver
-    /// pending messages.
+    /// This is useful if you want to use a shared VirtualTime across multiple
+    /// simulations or have more control over time advancement.
     ///
-    /// # Example
-    /// ```ignore
-    /// use freenet::simulation::{FaultConfig, VirtualTime};
-    /// use std::time::Duration;
-    ///
-    /// let mut sim = SimNetwork::new(...).await;
-    /// let vt = VirtualTime::new();
-    /// sim.with_fault_injection_virtual_time(
-    ///     FaultConfig::builder()
-    ///         .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
-    ///         .build(),
-    ///     vt.clone(),
-    /// );
-    ///
-    /// // Later, advance time to deliver pending messages
-    /// vt.advance(Duration::from_millis(100));
-    /// let delivered = sim.advance_virtual_time();
-    /// ```
-    pub fn with_fault_injection_virtual_time(
-        &mut self,
-        config: crate::simulation::FaultConfig,
-        virtual_time: crate::simulation::VirtualTime,
-    ) {
+    /// For most cases, use [`with_fault_injection`](Self::with_fault_injection) instead,
+    /// which uses the built-in VirtualTime.
+    #[deprecated(
+        since = "0.1.0",
+        note = "VirtualTime is now always enabled. Use with_fault_injection() and virtual_time() instead."
+    )]
+    pub fn with_fault_injection_virtual_time(&mut self, config: FaultConfig, virtual_time: VirtualTime) {
         use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         let state = FaultInjectorState::new(config, fault_seed).with_virtual_time(virtual_time);
@@ -494,14 +541,23 @@ impl SimNetwork {
         }
     }
 
+    /// Advances virtual time by the given duration and delivers pending messages.
+    ///
+    /// This is a convenience method combining `virtual_time().advance()` and
+    /// `advance_virtual_time()`.
+    ///
+    /// Returns the number of messages delivered.
+    pub fn advance_time(&mut self, duration: Duration) -> usize {
+        self.virtual_time.advance(duration);
+        self.advance_virtual_time()
+    }
+
     /// Returns the current network statistics from fault injection.
     ///
     /// These statistics track:
     /// - Messages sent, delivered, dropped
     /// - Drop reasons (loss rate, partition, crash)
     /// - Latency injection metrics
-    ///
-    /// Returns None if fault injection is not configured.
     pub fn get_network_stats(&self) -> Option<crate::node::network_bridge::NetworkStats> {
         use crate::node::network_bridge::get_fault_injector;
         get_fault_injector().map(|injector| {
@@ -519,6 +575,112 @@ impl SimNetwork {
         }
     }
 
+    // =========================================================================
+    // Node Lifecycle Management (Crash/Restart)
+    // =========================================================================
+
+    /// Crashes a node, stopping its execution and blocking all messages to/from it.
+    ///
+    /// The node's task is aborted and all messages to/from its address are dropped.
+    /// In-flight operations will fail. Use [`restart_node`](Self::restart_node) to
+    /// bring the node back (note: restart is not yet implemented).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut sim = SimNetwork::new(...).await;
+    /// let handles = sim.start_with_rand_gen::<SmallRng>(seed, 10, 5).await;
+    ///
+    /// // Crash node "node-0"
+    /// sim.crash_node(&NodeLabel::node(0));
+    ///
+    /// // Messages to/from this node will be dropped
+    /// // Other nodes should handle the failure gracefully
+    /// ```
+    pub fn crash_node(&mut self, label: &NodeLabel) -> bool {
+        use crate::node::network_bridge::get_fault_injector;
+
+        // Get the node's address
+        let addr = match self.node_addresses.get(label) {
+            Some(addr) => *addr,
+            None => {
+                tracing::warn!(?label, "Cannot crash node: address not found");
+                return false;
+            }
+        };
+
+        // Mark as crashed in fault injector
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.config.crash_node(addr);
+            tracing::info!(?label, ?addr, "Node marked as crashed in fault injector");
+        }
+
+        // Abort the running task if we have a handle
+        if let Some(running) = self.running_nodes.remove(label) {
+            running.abort_handle.abort();
+            tracing::info!(?label, "Node task aborted");
+            true
+        } else {
+            tracing::warn!(?label, "Node not found in running_nodes (may not be started yet)");
+            false
+        }
+    }
+
+    /// Recovers a crashed node, allowing messages to flow again.
+    ///
+    /// This removes the node from the crashed set, but does NOT restart the node's
+    /// execution. The node will not process messages, but other nodes can attempt
+    /// to reach it (messages won't be dropped due to crash status).
+    ///
+    /// For full restart, see the roadmap in `docs/architecture/simulation-testing-design.md`.
+    pub fn recover_node(&mut self, label: &NodeLabel) -> bool {
+        use crate::node::network_bridge::get_fault_injector;
+
+        let addr = match self.node_addresses.get(label) {
+            Some(addr) => addr,
+            None => {
+                tracing::warn!(?label, "Cannot recover node: address not found");
+                return false;
+            }
+        };
+
+        if let Some(injector) = get_fault_injector() {
+            let mut state = injector.lock().unwrap();
+            state.config.recover_node(addr);
+            tracing::info!(?label, ?addr, "Node recovered (no longer marked as crashed)");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Checks if a node is currently marked as crashed.
+    pub fn is_node_crashed(&self, label: &NodeLabel) -> bool {
+        use crate::node::network_bridge::get_fault_injector;
+
+        let addr = match self.node_addresses.get(label) {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        if let Some(injector) = get_fault_injector() {
+            let state = injector.lock().unwrap();
+            state.config.is_crashed(addr)
+        } else {
+            false
+        }
+    }
+
+    /// Returns the socket address for a node label, if known.
+    pub fn node_address(&self, label: &NodeLabel) -> Option<SocketAddr> {
+        self.node_addresses.get(label).copied()
+    }
+
+    /// Returns all node labels and their addresses.
+    pub fn all_node_addresses(&self) -> &HashMap<NodeLabel, SocketAddr> {
+        &self.node_addresses
+    }
+
     #[allow(unused)]
     pub fn debug(&mut self) {
         self.clean_up_tmp_dirs = false;
@@ -531,9 +693,12 @@ impl SimNetwork {
             let label = NodeLabel::gateway(&self.name, node_no);
             let port = crate::util::get_free_port().unwrap();
             let keypair = crate::transport::TransportKeypair::new();
-            let addr = (Ipv6Addr::LOCALHOST, port).into();
+            let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
             let location = Location::random();
+
+            // Track address for crash/restart operations
+            self.node_addresses.insert(label.clone(), addr);
 
             let config_args = ConfigArgs {
                 id: Some(format!("{label}")),
@@ -635,7 +800,7 @@ impl SimNetwork {
                 config.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
             }
             let port = crate::util::get_free_port().unwrap();
-            let addr = (Ipv6Addr::LOCALHOST, port).into();
+            let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             config.network_listener_port = port;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.key_pair = crate::transport::TransportKeypair::new();
@@ -644,6 +809,9 @@ impl SimNetwork {
                 .max_hops_to_live(self.ring_max_htl)
                 .rnd_if_htl_above(self.rnd_if_htl_above)
                 .max_number_of_connections(self.max_connections);
+
+            // Track address for crash/restart operations
+            self.node_addresses.insert(label.clone(), addr);
 
             self.event_listener
                 .add_node(label.clone(), config.key_pair.public().clone());
@@ -696,9 +864,9 @@ impl SimNetwork {
             let label = config.label.clone();
             // Use the peer_key_location address from GatewayConfig - this is the address
             // that will be registered in the peer registry
-            let gateway_addr = config.peer_key_location.peer_addr.as_known()
+            let gateway_addr = *config.peer_key_location.peer_addr.as_known()
                 .expect("Gateway should have known address");
-            gateway_addrs.push(*gateway_addr);
+            gateway_addrs.push(gateway_addr);
 
             tracing::debug!(peer = %label, addr = %gateway_addr, "starting gateway");
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
@@ -708,10 +876,18 @@ impl SimNetwork {
             );
             user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
             let span = tracing::info_span!("in_mem_gateway", %label);
-            self.labels.push((label, node.config.key_pair.public().clone()));
+            self.labels.push((label.clone(), node.config.key_pair.public().clone()));
 
             let node_task = async move { node.run_node(user_events, span).await };
             let handle = GlobalExecutor::spawn(node_task);
+
+            // Track running node for crash/restart
+            self.running_nodes.insert(label.clone(), RunningNode {
+                label: label.clone(),
+                addr: gateway_addr,
+                abort_handle: handle.abort_handle(),
+            });
+
             peers.push(handle);
 
             tokio::time::sleep(self.start_backoff).await;
@@ -758,7 +934,11 @@ impl SimNetwork {
         // Phase 3: Start all regular nodes
         let nodes: Vec<_> = self.nodes.drain(..).collect();
         for (node, label) in nodes {
-            tracing::debug!(peer = %label, "starting regular node");
+            // Get node address from tracked addresses
+            let node_addr = self.node_addresses.get(&label).copied()
+                .expect("Node address should be tracked");
+
+            tracing::debug!(peer = %label, addr = %node_addr, "starting regular node");
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 self.receiver_ch.clone(),
                 node.config.key_pair.public().clone(),
@@ -766,10 +946,18 @@ impl SimNetwork {
             );
             user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
             let span = tracing::info_span!("in_mem_node", %label);
-            self.labels.push((label, node.config.key_pair.public().clone()));
+            self.labels.push((label.clone(), node.config.key_pair.public().clone()));
 
             let node_task = async move { node.run_node(user_events, span).await };
             let handle = GlobalExecutor::spawn(node_task);
+
+            // Track running node for crash/restart
+            self.running_nodes.insert(label.clone(), RunningNode {
+                label: label.clone(),
+                addr: node_addr,
+                abort_handle: handle.abort_handle(),
+            });
+
             peers.push(handle);
 
             tokio::time::sleep(self.start_backoff).await;
