@@ -610,6 +610,15 @@ impl P2pConnManager {
                                             .get_peer_location_by_addr(target_addr)
                                     });
 
+                                    // If still not found, check if this is a known gateway.
+                                    // Gateways have their public keys configured at startup.
+                                    let target_peer = target_peer.or_else(|| {
+                                        ctx.gateways
+                                            .iter()
+                                            .find(|gw| gw.socket_addr() == Some(target_addr))
+                                            .cloned()
+                                    });
+
                                     let Some(target_peer) = target_peer else {
                                         // Can't establish connection without peer info.
                                         // This happens when the connection was dropped before we could
