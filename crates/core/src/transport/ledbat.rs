@@ -7770,5 +7770,202 @@ mod tests {
                 }
             }
         }
+
+        // =====================================================================
+        // Additional edge case tests requested in PR review
+        // =====================================================================
+
+        // Cwnd bounds enforcement: min_cwnd <= cwnd <= max_cwnd after all operations.
+        //
+        // This invariant must hold after on_ack, on_loss, and on_timeout.
+        proptest! {
+            #[test]
+            fn cwnd_bounds_enforced_after_timeout(
+                initial_cwnd_kb in 10u64..1000,
+                min_cwnd in 1000usize..5000,
+                max_cwnd in 1_000_000usize..10_000_000
+            ) {
+                let initial_cwnd = (initial_cwnd_kb * 1024) as usize;
+                let initial_cwnd = initial_cwnd.clamp(min_cwnd, max_cwnd);
+
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd,
+                    max_cwnd,
+                    ssthresh: max_cwnd / 2,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: false,
+                    randomize_ssthresh: false,
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Trigger timeout (most aggressive cwnd reduction)
+                controller.on_timeout();
+
+                let cwnd_after = controller.current_cwnd();
+                prop_assert!(
+                    cwnd_after >= min_cwnd,
+                    "cwnd {} < min_cwnd {} after timeout",
+                    cwnd_after, min_cwnd
+                );
+                prop_assert!(
+                    cwnd_after <= max_cwnd,
+                    "cwnd {} > max_cwnd {} after timeout",
+                    cwnd_after, max_cwnd
+                );
+            }
+        }
+
+        // Cwnd bounds enforced after loss events.
+        proptest! {
+            #[test]
+            fn cwnd_bounds_enforced_after_loss(
+                initial_cwnd_kb in 10u64..1000,
+                min_cwnd in 1000usize..5000,
+                max_cwnd in 1_000_000usize..10_000_000,
+                num_losses in 1u32..10
+            ) {
+                let initial_cwnd = (initial_cwnd_kb * 1024) as usize;
+                let initial_cwnd = initial_cwnd.clamp(min_cwnd, max_cwnd);
+
+                let config = LedbatConfig {
+                    initial_cwnd,
+                    min_cwnd,
+                    max_cwnd,
+                    ssthresh: max_cwnd / 2,
+                    enable_slow_start: true,
+                    enable_periodic_slowdown: false,
+                    randomize_ssthresh: false,
+                    ..Default::default()
+                };
+                let controller = LedbatController::new_with_config(config);
+
+                // Trigger multiple losses
+                for _ in 0..num_losses {
+                    controller.on_loss();
+                }
+
+                let cwnd_after = controller.current_cwnd();
+                prop_assert!(
+                    cwnd_after >= min_cwnd,
+                    "cwnd {} < min_cwnd {} after {} losses",
+                    cwnd_after, min_cwnd, num_losses
+                );
+                prop_assert!(
+                    cwnd_after <= max_cwnd,
+                    "cwnd {} > max_cwnd {} after {} losses",
+                    cwnd_after, max_cwnd, num_losses
+                );
+            }
+        }
+
+        // Flightsize non-negativity: flightsize uses saturating subtraction.
+        //
+        // Random send/ack sequences should never produce negative flightsize.
+        proptest! {
+            #[test]
+            fn flightsize_never_negative(
+                sends in proptest::collection::vec(1000usize..10000, 1..20),
+                acks in proptest::collection::vec(1000usize..15000, 1..25)
+            ) {
+                let controller = LedbatController::new(100_000, 2848, 10_000_000);
+
+                // Simulate random send/ack pattern
+                for &bytes in &sends {
+                    controller.on_send(bytes);
+                }
+
+                // ACKs may exceed what was sent (simulating duplicate ACKs, etc.)
+                for &bytes in &acks {
+                    controller.on_ack_without_rtt(bytes);
+
+                    // Flightsize should never be negative (saturating subtraction)
+                    let flightsize = controller.flightsize();
+                    prop_assert!(
+                        flightsize < usize::MAX / 2,  // Would wrap to huge value if negative
+                        "Flightsize {} appears to have wrapped negative",
+                        flightsize
+                    );
+                }
+
+                // Final check
+                let final_flightsize = controller.flightsize();
+                prop_assert!(
+                    final_flightsize < usize::MAX / 2,
+                    "Final flightsize {} appears negative",
+                    final_flightsize
+                );
+            }
+        }
+
+        // Base delay only decreases or stays stable when new samples arrive.
+        //
+        // Adding an RTT sample should only decrease base_delay if the sample
+        // is smaller than the current minimum. Larger samples are ignored.
+        // (Note: base_delay CAN increase due to bucket expiration over time,
+        // but within immediate sample processing, it should only decrease.)
+        proptest! {
+            #[test]
+            fn base_delay_only_decreases_on_smaller_samples(
+                initial_rtt_ms in 50u64..200,
+                sample_rtt_ms in 10u64..300
+            ) {
+                let controller = LedbatController::new(100_000, 2848, 10_000_000);
+
+                // Establish initial base delay
+                let initial_rtt = Duration::from_millis(initial_rtt_ms);
+                controller.on_ack(initial_rtt, 1000);
+                let base_delay_before = controller.base_delay();
+
+                // Add new sample
+                let sample_rtt = Duration::from_millis(sample_rtt_ms);
+                controller.on_ack(sample_rtt, 1000);
+                let base_delay_after = controller.base_delay();
+
+                if sample_rtt_ms < initial_rtt_ms {
+                    // Smaller sample should decrease base delay
+                    prop_assert!(
+                        base_delay_after <= base_delay_before,
+                        "Base delay increased from {:?} to {:?} despite smaller sample {}ms < {}ms",
+                        base_delay_before, base_delay_after, sample_rtt_ms, initial_rtt_ms
+                    );
+                } else {
+                    // Larger sample should not increase base delay
+                    prop_assert!(
+                        base_delay_after <= base_delay_before,
+                        "Base delay increased from {:?} to {:?} on larger sample {}ms >= {}ms",
+                        base_delay_before, base_delay_after, sample_rtt_ms, initial_rtt_ms
+                    );
+                }
+            }
+        }
+
+        // Base delay converges to minimum across multiple samples.
+        proptest! {
+            #[test]
+            fn base_delay_converges_to_minimum(
+                samples in proptest::collection::vec(10u64..500, 5..20)
+            ) {
+                let controller = LedbatController::new(100_000, 2848, 10_000_000);
+
+                // Feed all samples
+                for &rtt_ms in &samples {
+                    let rtt = Duration::from_millis(rtt_ms);
+                    controller.on_ack(rtt, 1000);
+                }
+
+                let base_delay = controller.base_delay();
+                let expected_min = samples.iter().copied().min().unwrap();
+
+                // Base delay should be at or below the minimum sample
+                // (could be lower if there's a fallback or timing issue)
+                prop_assert!(
+                    base_delay.as_millis() as u64 <= expected_min + 1,  // +1ms tolerance
+                    "Base delay {:?} > minimum sample {}ms",
+                    base_delay, expected_min
+                );
+            }
+        }
     }
 }
