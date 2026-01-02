@@ -249,6 +249,11 @@ impl AtomicCongestionState {
         match CongestionState::from_u8(value) {
             Some(state) => state,
             None => {
+                // This should never happen - indicates memory corruption or a serious bug
+                tracing::error!(
+                    value,
+                    "CRITICAL: Invalid congestion state value - possible memory corruption"
+                );
                 debug_assert!(false, "Invalid congestion state value: {}", value);
                 // In release, fall back to CongestionAvoidance as safest default
                 CongestionState::CongestionAvoidance
@@ -294,6 +299,12 @@ impl AtomicCongestionState {
     /// Transition to RampingUp state.
     fn enter_ramping_up(&self) {
         self.store(CongestionState::RampingUp);
+    }
+}
+
+impl std::fmt::Debug for AtomicCongestionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AtomicCongestionState({:?})", self.load())
     }
 }
 
@@ -511,6 +522,15 @@ impl AtomicBaseDelayHistory {
 ///
 /// This controller is fully lock-free, using atomic operations for all state.
 /// No mutexes are held on the hot path (on_ack, on_send).
+///
+/// ## Thread Safety
+///
+/// Individual atomic operations are lock-free and thread-safe. However,
+/// compound state transitions (e.g., state change + associated variable updates)
+/// are NOT atomic. In practice, this controller is designed to be accessed from
+/// a single tokio task per connection. For strictly concurrent access from
+/// multiple threads, external synchronization may be required to prevent
+/// interleaved state machine transitions (e.g., `on_timeout` racing with `on_ack`).
 ///
 /// ## Slow Start Phase
 ///
@@ -4327,6 +4347,31 @@ mod tests {
                 state as u8, expected_value,
                 "State {:?} should have value {}",
                 state, expected_value
+            );
+        }
+
+        // Verify from_u8 returns None for invalid values
+        assert!(
+            CongestionState::from_u8(6).is_none(),
+            "from_u8(6) should return None"
+        );
+        assert!(
+            CongestionState::from_u8(100).is_none(),
+            "from_u8(100) should return None"
+        );
+        assert!(
+            CongestionState::from_u8(255).is_none(),
+            "from_u8(255) should return None"
+        );
+
+        // Verify from_u8 works for valid values
+        for (expected_state, value) in states {
+            assert_eq!(
+                CongestionState::from_u8(value),
+                Some(expected_state),
+                "from_u8({}) should return Some({:?})",
+                value,
+                expected_state
             );
         }
 
