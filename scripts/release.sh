@@ -1249,5 +1249,19 @@ fi
 
 echo "- Update any dependent projects to use the new version"
 echo
+echo "⚠️  IMPORTANT: Post-release log review required!"
+echo "   Wait 10-15 minutes for gateways to auto-update, then check logs on:"
+echo "   - nova.locut.us (gateway)"
+echo "   - vega.locut.us (gateway)"
+echo "   - technic (home peer)"
+echo
+echo "   Quick check commands:"
+echo "   ssh freenet@nova.locut.us 'freenet --version && tail -100 ~/.local/state/freenet/freenet.\$(date +%Y-%m-%d).log | grep -iE \"error|warn\" | tail -10'"
+echo "   ssh freenet@vega.locut.us 'freenet --version && tail -100 ~/.local/state/freenet/freenet.\$(date +%Y-%m-%d).log | grep -iE \"error|warn\" | tail -10'"
+echo "   ssh ian@technic 'freenet --version && tail -100 ~/.local/state/freenet/freenet.\$(date +%Y-%m-%d).log | grep -iE \"error|warn\" | tail -10'"
+echo
+echo "   Look for: log spam, rapid log growth, new error patterns"
+echo "   See: ~/.claude/skills/freenet-release/SKILL.md for full checklist"
+echo
 echo "State file: $STATE_FILE"
 echo "  (Can be deleted now that release is complete)"
