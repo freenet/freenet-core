@@ -29,7 +29,9 @@ use crate::{
         connect::ConnectForwardEstimator, get::GetOp, orphan_streams::OrphanStreamRegistry,
         put::PutOp, subscribe::SubscribeOp, update::UpdateOp, OpEnum, OpError,
     },
-    ring::{ConnectionManager, LiveTransactionTracker, PeerKeyLocation, Ring},
+    ring::{
+        ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff, PeerKeyLocation, Ring,
+    },
 };
 
 use super::{
@@ -245,6 +247,9 @@ pub(crate) struct OpManager {
     /// Size threshold in bytes above which streaming is used.
     /// Only applies when `streaming_enabled` is true.
     pub streaming_threshold: usize,
+    /// Backoff tracker for failed gateway connection attempts.
+    /// Used to implement exponential backoff when retrying connections.
+    pub gateway_backoff: Arc<Mutex<PeerConnectionBackoff>>,
 }
 
 impl Clone for OpManager {
@@ -266,6 +271,7 @@ impl Clone for OpManager {
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             streaming_enabled: self.streaming_enabled,
             streaming_threshold: self.streaming_threshold,
+            gateway_backoff: self.gateway_backoff.clone(),
         }
     }
 }
@@ -354,6 +360,7 @@ impl OpManager {
             orphan_stream_registry: Arc::new(OrphanStreamRegistry::new()),
             streaming_enabled,
             streaming_threshold,
+            gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
         })
     }
 

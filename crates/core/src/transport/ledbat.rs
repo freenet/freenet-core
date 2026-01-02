@@ -4708,10 +4708,10 @@ mod tests {
         // Phase 1: Establish original base delay at 20ms
         let old_rtt = Duration::from_millis(20);
         println!("\n--- Phase 1: Original path @ 20ms ---");
-        for i in 0..BASE_HISTORY_SIZE as usize {
+        for i in 0..BASE_HISTORY_SIZE {
             controller.on_ack(old_rtt, 3000);
             tokio::time::sleep(Duration::from_millis(25)).await;
-            if i == BASE_HISTORY_SIZE as usize - 1 {
+            if i == BASE_HISTORY_SIZE - 1 {
                 println!(
                     "  Established base_delay: {:?}, cwnd: {} KB",
                     controller.base_delay(),
@@ -4737,7 +4737,7 @@ mod tests {
 
         // Need enough samples to age out the old base delay
         // The base delay history keeps BASE_HISTORY_SIZE samples
-        for i in 0..(BASE_HISTORY_SIZE as usize * 2) {
+        for i in 0..(BASE_HISTORY_SIZE * 2) {
             tokio::time::sleep(Duration::from_millis(85)).await;
             controller.on_ack(new_rtt, 3000);
 
