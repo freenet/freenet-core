@@ -53,6 +53,7 @@ mod crypto;
 pub use connection_handler::mock_transport;
 /// High-performance channels for transport layer.
 pub mod fast_channel;
+pub mod in_memory_socket;
 mod packet_data;
 pub mod peer_connection;
 // todo: optimize trackers
@@ -149,6 +150,13 @@ pub use self::{
 pub use self::peer_connection::{
     streaming::{StreamError, StreamHandle, StreamRegistry, StreamingInboundStream},
     streaming_buffer::{InsertError, LockFreeStreamBuffer},
+};
+
+// In-memory socket for testing with production event loop
+pub use self::in_memory_socket::{
+    clear_socket_registry, get_socket_fault_injector, is_socket_registered,
+    set_socket_fault_injector, unregister_socket, InMemorySocket, PendingPacket,
+    SocketFaultInjector, SocketNetworkStats,
 };
 
 #[derive(Debug, thiserror::Error)]

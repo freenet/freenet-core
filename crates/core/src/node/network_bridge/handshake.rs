@@ -5,6 +5,8 @@
 //! connection attempts to/from the event loop. Higher-level routing decisions now live inside
 //! `ConnectOp`.
 
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,31 +15,30 @@ use std::time::Duration;
 
 use futures::Stream;
 use parking_lot::RwLock;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::dev_tool::{Location, Transaction};
 use crate::node::network_bridge::ConnectionError;
 use crate::ring::{ConnectionManager, PeerKeyLocation};
 use crate::router::Router;
-use std::collections::HashMap;
-
-use crate::transport::{InboundConnectionHandler, OutboundConnectionHandler, PeerConnection};
+use crate::transport::{InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, Socket};
 
 /// Events emitted by the handshake driver.
 #[derive(Debug)]
-pub(crate) enum Event {
+pub(crate) enum Event<S = UdpSocket> {
     /// A remote peer initiated or completed a connection to us.
     InboundConnection {
         transaction: Option<Transaction>,
         peer: Option<PeerKeyLocation>,
-        connection: PeerConnection,
+        connection: PeerConnection<S>,
         transient: bool,
     },
     /// An outbound connection attempt succeeded.
     OutboundEstablished {
         transaction: Transaction,
         peer: PeerKeyLocation,
-        connection: PeerConnection,
+        connection: PeerConnection<S>,
         transient: bool,
     },
     /// An outbound connection attempt failed.
@@ -79,15 +80,16 @@ impl CommandSender {
 }
 
 /// Stream wrapper around the asynchronous handshake driver.
-pub(crate) struct HandshakeHandler {
-    events_rx: mpsc::Receiver<Event>,
+pub(crate) struct HandshakeHandler<S = UdpSocket> {
+    events_rx: mpsc::Receiver<Event<S>>,
+    _phantom: PhantomData<S>,
 }
 
-impl HandshakeHandler {
+impl<S: Socket> HandshakeHandler<S> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        inbound: InboundConnectionHandler,
-        outbound: OutboundConnectionHandler,
+        inbound: InboundConnectionHandler<S>,
+        outbound: OutboundConnectionHandler<S>,
         _connection_manager: ConnectionManager,
         _router: Arc<RwLock<Router>>,
         _this_location: Option<Location>,
@@ -104,17 +106,18 @@ impl HandshakeHandler {
         (
             HandshakeHandler {
                 events_rx: event_rx,
+                _phantom: PhantomData,
             },
             CommandSender(cmd_tx),
         )
     }
 }
 
-impl Stream for HandshakeHandler {
-    type Item = Event;
+impl<S: Unpin> Stream for HandshakeHandler<S> {
+    type Item = Event<S>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.events_rx).poll_recv(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().events_rx).poll_recv(cx)
     }
 }
 
@@ -188,11 +191,11 @@ impl ExpectedInboundTracker {
     }
 }
 
-async fn run_driver(
-    mut inbound: InboundConnectionHandler,
-    outbound: OutboundConnectionHandler,
+async fn run_driver<S: Socket>(
+    mut inbound: InboundConnectionHandler<S>,
+    outbound: OutboundConnectionHandler<S>,
     mut commands_rx: mpsc::Receiver<Command>,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::Sender<Event<S>>,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     use tokio::select;
@@ -248,9 +251,9 @@ async fn run_driver(
     }
 }
 
-fn spawn_outbound(
-    outbound: OutboundConnectionHandler,
-    events_tx: mpsc::Sender<Event>,
+fn spawn_outbound<S: Socket>(
+    outbound: OutboundConnectionHandler<S>,
+    events_tx: mpsc::Sender<Event<S>>,
     peer: PeerKeyLocation,
     transaction: Transaction,
     transient: bool,
@@ -265,7 +268,7 @@ fn spawn_outbound(
         let connect_future = handler
             .connect(peer_for_connect.pub_key.clone(), addr)
             .await;
-        let result: Result<PeerConnection, ConnectionError> =
+        let result: Result<PeerConnection<S>, ConnectionError> =
             match tokio::time::timeout(Duration::from_secs(10), connect_future).await {
                 Ok(res) => res.map_err(|err| err.into()),
                 Err(_) => Err(ConnectionError::Timeout),
