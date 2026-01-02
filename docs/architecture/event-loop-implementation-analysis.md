@@ -253,3 +253,73 @@ Implement Option 1 (Extract Shared Handler Module) to prevent future divergence.
 
 6. **`QueryConnections`/`QuerySubscriptions`/`QueryNodeDiagnostics`** - Testing impl panics
    - Impact: Diagnostic queries not tested (likely acceptable)
+
+## Implementation Progress (Option 2)
+
+We are implementing Option 2 (Unified Event Loop with Pluggable Transport) using `InMemorySocket`.
+
+### Completed
+
+1. **InMemorySocket** (`crates/core/src/transport/in_memory_socket.rs`)
+   - Implements the `Socket` trait for in-memory packet routing
+   - Global registry for socket address → inbox mapping
+   - Packet-level fault injection via `SocketFaultInjector`
+   - VirtualTime integration for deterministic latency
+
+2. **Generic HandshakeHandler** (`crates/core/src/node/network_bridge/handshake.rs`)
+   - Made `Event<S>`, `HandshakeHandler<S>` generic over socket type
+   - Default type parameter preserves backward compatibility
+
+### Remaining Work
+
+3. **Make `priority_select.rs` generic**
+   - `SelectResult::Handshake` needs to carry `Event<S>`
+   - `PrioritySelectStream` needs socket type parameter
+
+4. **Make `p2p_protoc.rs` generic**
+   - `run_event_listener` → `run_event_listener::<S: Socket>`
+   - `handle_handshake_action` → generic over socket
+   - `handle_successful_connection` → generic over socket
+   - `peer_connection_listener` → generic over socket
+
+5. **Update SimNetwork**
+   - Use `P2pConnManager::run_event_listener::<InMemorySocket>`
+   - Wire up `SocketFaultInjector` instead of message-level fault injection
+
+6. **Cleanup**
+   - Remove `MemoryConnManager`
+   - Remove `testing_impl::run_event_listener`
+   - Remove `NetworkBridgeExt` trait
+
+### Type Propagation Map
+
+```
+InMemorySocket
+    ↓
+create_connection_handler::<InMemorySocket>()
+    ↓
+(OutboundConnectionHandler<InMemorySocket>, InboundConnectionHandler<InMemorySocket>)
+    ↓
+HandshakeHandler<InMemorySocket>
+    ↓
+Event<InMemorySocket>
+    ↓
+SelectResult::Handshake(Event<InMemorySocket>)
+    ↓
+PrioritySelectStream<HandshakeHandler<InMemorySocket>, ...>
+    ↓
+handle_handshake_action(Event<InMemorySocket>, ...)
+    ↓
+handle_successful_connection(PeerConnection<InMemorySocket>, ...)
+    ↓
+peer_connection_listener(PeerConnection<InMemorySocket>, ...)
+```
+
+### Estimated Remaining Effort
+
+- `priority_select.rs` changes: ~50 lines
+- `p2p_protoc.rs` generic changes: ~200 lines
+- SimNetwork integration: ~100 lines
+- Cleanup: -500 lines (net reduction)
+
+Total: Approximately 1 week of focused work.
