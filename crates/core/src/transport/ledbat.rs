@@ -7001,4 +7001,417 @@ mod tests {
             snaps.len()
         );
     }
+
+    // ============================================================================
+    // Regression Tests for Minimum cwnd Slowdown Trap (Nacho's Root Cause Analysis)
+    // ============================================================================
+    //
+    // These tests catch the bug where slowdowns fire even when cwnd is at minimum,
+    // creating a trap where cwnd can never grow:
+    //
+    // 1. Slowdowns trigger even when cwnd <= min_cwnd * SLOWDOWN_REDUCTION_FACTOR
+    // 2. When pre_slowdown_cwnd == min_cwnd, ramp-up completes instantly
+    // 3. Next slowdown schedules just 18 RTTs away
+    // 4. LEDBAT growth is sub-linear (~16 RTTs to double), but slowdowns every 18 RTTs
+    // 5. Result: cwnd barely grows before being reset again
+    //
+    // The 67-slowdown bug in production was a symptom of this trap.
+
+    /// Regression test: Slowdowns should be skipped when cwnd is too small to reduce.
+    ///
+    /// When cwnd <= min_cwnd * SLOWDOWN_REDUCTION_FACTOR, a slowdown would have no
+    /// meaningful effect (cwnd/4 clamps to min_cwnd). The slowdown should be skipped
+    /// and the interval extended to allow cwnd to grow.
+    ///
+    /// This test FAILS on the buggy implementation and PASSES after the fix.
+    #[test]
+    fn test_harness_slowdown_skipped_when_cwnd_at_minimum() {
+        let min_cwnd = 2_848;
+        let config = LedbatConfig {
+            initial_cwnd: min_cwnd, // Start at minimum
+            min_cwnd,
+            max_cwnd: 500_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+
+        let condition = NetworkCondition::custom(135, None, 0.0); // High RTT like production
+        let mut harness = LedbatTestHarness::new(config.clone(), condition, 12345);
+
+        // Inject a timeout to reset cwnd to minimum and trigger recovery
+        harness.inject_timeout();
+
+        let post_timeout = harness.snapshot();
+        assert_eq!(
+            post_timeout.cwnd, min_cwnd,
+            "cwnd should be at minimum after timeout"
+        );
+
+        // Run for enough RTTs that a slowdown would normally trigger (>20 RTTs)
+        // but since cwnd is at minimum, slowdowns should be skipped
+        let snapshots = harness.run_rtts(50, 100_000);
+
+        // Count slowdowns that occurred while cwnd was at/near minimum
+        let mut futile_slowdowns = 0;
+        let mut prev_slowdowns = post_timeout.periodic_slowdowns;
+
+        for snap in &snapshots {
+            if snap.periodic_slowdowns > prev_slowdowns {
+                // A slowdown was triggered
+                if snap.cwnd <= min_cwnd * SLOWDOWN_REDUCTION_FACTOR {
+                    futile_slowdowns += 1;
+                }
+            }
+            prev_slowdowns = snap.periodic_slowdowns;
+        }
+
+        // With the fix, no slowdowns should trigger when cwnd is too small
+        // Note: This assertion may fail on the current buggy code, which is the point!
+        assert_eq!(
+            futile_slowdowns,
+            0,
+            "Slowdowns should be skipped when cwnd <= min_cwnd * {} ({}). \
+             Found {} futile slowdowns.",
+            SLOWDOWN_REDUCTION_FACTOR,
+            min_cwnd * SLOWDOWN_REDUCTION_FACTOR,
+            futile_slowdowns
+        );
+
+        // Cwnd should have been able to grow since slowdowns were skipped
+        let final_cwnd = snapshots.last().unwrap().cwnd;
+        println!(
+            "After 50 RTTs from minimum: cwnd grew from {}KB to {}KB",
+            min_cwnd / 1024,
+            final_cwnd / 1024
+        );
+    }
+
+    /// Regression test: cwnd must be able to grow from minimum despite slowdown schedule.
+    ///
+    /// This reproduces the production bug: after timeout recovery, cwnd should be able
+    /// to grow without being trapped by futile slowdowns every 18 RTTs.
+    ///
+    /// Expected: cwnd at least doubles within 50 RTTs when starting from minimum.
+    #[test]
+    fn test_harness_cwnd_can_grow_from_minimum() {
+        let min_cwnd = 2_848;
+        let config = LedbatConfig {
+            initial_cwnd: 50_000, // Will be reset by timeout
+            min_cwnd,
+            max_cwnd: 500_000,
+            ssthresh: 100_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+
+        let condition = NetworkCondition::custom(135, None, 0.0);
+        let mut harness = LedbatTestHarness::new(config, condition, 99999);
+
+        // Run briefly to establish state, then timeout to reset to minimum
+        harness.run_rtts(10, 50_000);
+        harness.inject_timeout();
+
+        let post_timeout_cwnd = harness.snapshot().cwnd;
+        assert_eq!(
+            post_timeout_cwnd, min_cwnd,
+            "Timeout should reset to min_cwnd"
+        );
+
+        // Run for 50 RTTs - cwnd should be able to grow significantly
+        // LEDBAT slow start doubles cwnd per RTT, so 50 RTTs is plenty
+        let snapshots = harness.run_rtts(50, 100_000);
+
+        let final_cwnd = snapshots.last().unwrap().cwnd;
+        let slowdowns = snapshots.last().unwrap().periodic_slowdowns;
+
+        // Cwnd should have at least doubled from minimum
+        let expected_min_growth = min_cwnd * 2;
+        assert!(
+            final_cwnd >= expected_min_growth,
+            "cwnd should at least double from {} to {} within 50 RTTs, but only reached {}. \
+             {} slowdowns occurred - this suggests the minimum cwnd trap bug.",
+            min_cwnd,
+            expected_min_growth,
+            final_cwnd,
+            slowdowns
+        );
+
+        println!(
+            "Growth from minimum: {}KB -> {}KB ({:.1}x) in 50 RTTs ({} slowdowns)",
+            min_cwnd / 1024,
+            final_cwnd / 1024,
+            final_cwnd as f64 / min_cwnd as f64,
+            slowdowns
+        );
+    }
+
+    /// Regression test: Instant ramp-up completion when pre_slowdown_cwnd == min_cwnd.
+    ///
+    /// When cwnd is already at minimum and a slowdown triggers:
+    /// - pre_slowdown_cwnd = min_cwnd
+    /// - frozen_cwnd = max(min_cwnd / 4, min_cwnd) = min_cwnd
+    /// - Ramp-up target = min_cwnd, current = min_cwnd → instant completion
+    /// - Next slowdown scheduled 18 RTTs away
+    ///
+    /// This creates a trap where slowdowns fire every 18 RTTs with no recovery time.
+    #[test]
+    fn test_harness_instant_rampup_trap() {
+        let min_cwnd = 2_848;
+        let config = LedbatConfig {
+            initial_cwnd: min_cwnd,
+            min_cwnd,
+            max_cwnd: 500_000,
+            ssthresh: 100_000,
+            enable_slow_start: false, // Skip slow start to test pure slowdown behavior
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+
+        let condition = NetworkCondition::custom(135, None, 0.0);
+        let mut harness = LedbatTestHarness::new(config.clone(), condition, 77777);
+
+        // Verify starting state
+        let initial = harness.snapshot();
+        assert_eq!(initial.cwnd, min_cwnd);
+        assert_eq!(initial.state, CongestionState::CongestionAvoidance);
+
+        // Run for 100 RTTs (enough for multiple slowdown cycles if they trigger)
+        let snapshots = harness.run_rtts(100, 100_000);
+
+        // Analyze the trap: if slowdowns fire while cwnd stays at minimum, we're trapped
+        let slowdowns = snapshots.last().unwrap().periodic_slowdowns;
+        let final_cwnd = snapshots.last().unwrap().cwnd;
+
+        // Count how many RTTs were spent at minimum cwnd
+        let rtts_at_minimum = snapshots.iter().filter(|s| s.cwnd == min_cwnd).count();
+
+        // If more than half the RTTs were at minimum AND multiple slowdowns fired,
+        // that indicates the trap
+        let trap_detected = rtts_at_minimum > 50 && slowdowns > 3;
+
+        if trap_detected {
+            println!(
+                "TRAP DETECTED: {} slowdowns fired, spent {}/100 RTTs at minimum cwnd ({}KB)",
+                slowdowns,
+                rtts_at_minimum,
+                min_cwnd / 1024
+            );
+        }
+
+        // The fix should prevent this trap
+        assert!(
+            !trap_detected,
+            "Instant ramp-up trap detected: {} slowdowns with {}/100 RTTs at minimum. \
+             cwnd should be able to grow when slowdowns are futile.",
+            slowdowns, rtts_at_minimum
+        );
+
+        println!(
+            "No trap: final cwnd = {}KB after 100 RTTs ({} slowdowns, {} RTTs at minimum)",
+            final_cwnd / 1024,
+            slowdowns,
+            rtts_at_minimum
+        );
+    }
+
+    /// Regression test: Slowdown scheduling after timeout should not block recovery.
+    ///
+    /// After a timeout:
+    /// 1. cwnd resets to minimum
+    /// 2. State goes to SlowStart
+    /// 3. Any previously scheduled slowdown should be cleared
+    /// 4. Recovery should proceed without immediate slowdown interference
+    #[test]
+    fn test_harness_timeout_clears_scheduled_slowdown() {
+        let min_cwnd = 2_848;
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd,
+            max_cwnd: 500_000,
+            ssthresh: 80_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+
+        let condition = NetworkCondition::custom(100, None, 0.0);
+        let mut harness = LedbatTestHarness::new(config, condition, 11111);
+
+        // Run until we've had at least one slowdown (establishes next_slowdown_time)
+        let _ = harness.run_until_slowdown(200, 100_000);
+
+        let pre_timeout = harness.snapshot();
+        println!(
+            "Before timeout: cwnd={}KB, slowdowns={}, state={:?}",
+            pre_timeout.cwnd / 1024,
+            pre_timeout.periodic_slowdowns,
+            pre_timeout.state
+        );
+
+        // Inject timeout
+        harness.inject_timeout();
+
+        let post_timeout = harness.snapshot();
+        assert_eq!(post_timeout.cwnd, min_cwnd);
+        assert_eq!(post_timeout.state, CongestionState::SlowStart);
+
+        // Run for 30 RTTs - enough time for recovery without immediate slowdown
+        // (18 RTT min_interval means no new slowdown should fire for a while)
+        let recovery_snaps = harness.run_rtts(30, 100_000);
+
+        // Check if a slowdown fired immediately after timeout (bug behavior)
+        let slowdowns_during_recovery =
+            recovery_snaps.last().unwrap().periodic_slowdowns - pre_timeout.periodic_slowdowns;
+
+        // After timeout, we should have time to recover before next slowdown
+        // If slowdown fires in first 18 RTTs while cwnd is still small, that's the bug
+        let early_slowdown_while_small = recovery_snaps.iter().take(18).any(|s| {
+            s.periodic_slowdowns > pre_timeout.periodic_slowdowns && s.cwnd < min_cwnd * 4
+        });
+
+        assert!(
+            !early_slowdown_while_small,
+            "Slowdown fired during early recovery while cwnd was still small. \
+             Timeout should clear scheduled slowdowns to allow recovery."
+        );
+
+        let final_cwnd = recovery_snaps.last().unwrap().cwnd;
+        println!(
+            "Recovery after timeout: cwnd grew from {}KB to {}KB in 30 RTTs ({} new slowdowns)",
+            min_cwnd / 1024,
+            final_cwnd / 1024,
+            slowdowns_during_recovery
+        );
+    }
+
+    /// Test: LEDBAT growth rate is compatible with slowdown interval.
+    ///
+    /// This validates Nacho's math: LEDBAT congestion avoidance takes ~16 RTTs
+    /// to double cwnd, but slowdowns happen every 18 RTTs. The system should
+    /// still make progress despite this tight margin.
+    ///
+    /// Key insight: If slowdowns reset cwnd before it can grow meaningfully,
+    /// throughput suffers. The fix should skip futile slowdowns to allow growth.
+    #[test]
+    fn test_harness_growth_rate_vs_slowdown_interval() {
+        let config = LedbatConfig {
+            initial_cwnd: 50_000,
+            min_cwnd: 2_848,
+            max_cwnd: 500_000,
+            ssthresh: 200_000,
+            enable_slow_start: false, // Test pure congestion avoidance
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+
+        // Test at the production RTT where the bug manifested
+        let condition = NetworkCondition::custom(135, None, 0.0);
+        let mut harness = LedbatTestHarness::new(config.clone(), condition, 33333);
+
+        // Run for 100 RTTs and track growth between slowdowns
+        let snapshots = harness.run_rtts(100, 100_000);
+
+        // Calculate average cwnd across all snapshots
+        let avg_cwnd: f64 =
+            snapshots.iter().map(|s| s.cwnd as f64).sum::<f64>() / snapshots.len() as f64;
+
+        let final_snap = snapshots.last().unwrap();
+
+        println!(
+            "135ms RTT over 100 RTTs: avg_cwnd = {}KB, final = {}KB, slowdowns = {}",
+            avg_cwnd as usize / 1024,
+            final_snap.cwnd / 1024,
+            final_snap.periodic_slowdowns
+        );
+
+        // Average cwnd should be significantly above minimum
+        // This fails if slowdowns keep resetting cwnd before it can grow
+        assert!(
+            avg_cwnd > (config.initial_cwnd as f64 * 0.8),
+            "Average cwnd ({}KB) should stay near initial ({}KB), \
+             but slowdowns are preventing sustained throughput",
+            avg_cwnd as usize / 1024,
+            config.initial_cwnd / 1024
+        );
+    }
+
+    /// Stress test: 250 RTTs at high latency (reproduces production scenario).
+    ///
+    /// Simulates the exact scenario from production:
+    /// - 135ms RTT
+    /// - 33.8 seconds of transfer (~250 RTTs)
+    /// - Should have bounded slowdowns AND sustained throughput
+    #[test]
+    fn test_harness_production_scenario_250_rtts() {
+        let min_cwnd = 2_848;
+        let config = LedbatConfig {
+            initial_cwnd: 38_000,
+            min_cwnd,
+            max_cwnd: 1_000_000,
+            ssthresh: 102_400,
+            enable_slow_start: true,
+            enable_periodic_slowdown: true,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+
+        let condition = NetworkCondition::custom(135, Some(0.1), 0.001); // Realistic jitter + loss
+        let mut harness = LedbatTestHarness::new(config.clone(), condition, 42);
+
+        let snapshots = harness.run_rtts(250, 100_000);
+
+        let final_snap = snapshots.last().unwrap();
+
+        // Key metrics from the production bug report
+        let total_slowdowns = final_snap.periodic_slowdowns;
+
+        // Calculate total bytes transferred (sum of cwnds as proxy for throughput)
+        let total_bytes: usize = snapshots.iter().map(|s| s.cwnd).sum();
+
+        // Time spent at minimum cwnd
+        let rtts_at_minimum = snapshots.iter().filter(|s| s.cwnd <= min_cwnd * 2).count();
+
+        println!("Production scenario (250 RTTs at 135ms):");
+        println!("  Total slowdowns: {}", total_slowdowns);
+        println!("  Final cwnd: {}KB", final_snap.cwnd / 1024);
+        println!(
+            "  Total throughput proxy: {}MB",
+            total_bytes / (1024 * 1024)
+        );
+        println!("  RTTs at/near minimum: {}/250", rtts_at_minimum);
+
+        // Assertions based on expected behavior after fix:
+        // 1. Slowdowns bounded (we already test this elsewhere)
+        assert!(
+            total_slowdowns <= 20,
+            "Too many slowdowns: {} (expected <= 20)",
+            total_slowdowns
+        );
+
+        // 2. NOT stuck at minimum for majority of time
+        assert!(
+            rtts_at_minimum < 50,
+            "Spent too much time at minimum cwnd: {}/250 RTTs. \
+             This indicates the minimum cwnd trap.",
+            rtts_at_minimum
+        );
+
+        // 3. Reasonable throughput achieved
+        let expected_min_bytes = 250 * 30_000; // 30KB avg per RTT minimum
+        assert!(
+            total_bytes >= expected_min_bytes,
+            "Throughput too low: {}MB (expected >= {}MB). \
+             Futile slowdowns are destroying throughput.",
+            total_bytes / (1024 * 1024),
+            expected_min_bytes / (1024 * 1024)
+        );
+    }
 }
