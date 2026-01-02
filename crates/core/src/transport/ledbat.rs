@@ -123,27 +123,65 @@ impl Default for LedbatConfig {
 /// We use u64::MAX since no valid RTT would ever be this large (~584 years).
 const EMPTY_DELAY_NANOS: u64 = u64::MAX;
 
-/// Periodic slowdown state machine (LEDBAT++ Section 4.4)
+/// Unified congestion control state machine.
 ///
-/// The slowdown mechanism works as follows:
-/// 1. After initial slow start exit, wait 2 RTTs (WaitingForSlowdown)
-/// 2. Enter slowdown: save cwnd to ssthresh, reduce to min_cwnd (InSlowdown)
-/// 3. Freeze at min_cwnd for 2 RTTs to re-measure base delay (Frozen)
-/// 4. Ramp back up using slow start until reaching ssthresh (RampingUp)
-/// 5. Return to normal operation, schedule next slowdown at 9x duration (Normal)
+/// This enum consolidates the previous `in_slow_start` boolean and `SlowdownState`
+/// into a single state machine, preventing conflicting state combinations that
+/// caused bugs (e.g., PR #2510 where `in_slow_start=true` during `RampingUp`
+/// bypassed the slowdown handler).
+///
+/// ## State Transitions
+///
+/// ```text
+/// ┌─────────────┐
+/// │  SlowStart  │──────────────────────────────────────┐
+/// └──────┬──────┘                                      │
+///        │ (ssthresh or delay exit)                    │
+///        ▼                                             │
+/// ┌──────────────────────┐                             │
+/// │ CongestionAvoidance  │◄────────────────────────────┤
+/// └──────────┬───────────┘                             │
+///            │ (scheduled slowdown time)               │
+///            ▼                                         │
+/// ┌────────────────────────┐                           │
+/// │  WaitingForSlowdown    │                           │
+/// └──────────┬─────────────┘                           │
+///            │ (wait complete)                         │
+///            ▼                                         │
+/// ┌──────────────┐                                     │
+/// │  InSlowdown  │                                     │
+/// └──────┬───────┘                                     │
+///        │ (immediate transition)                      │
+///        ▼                                             │
+/// ┌──────────┐                                         │
+/// │  Frozen  │                                         │
+/// └────┬─────┘                                         │
+///      │ (freeze duration complete)                    │
+///      ▼                                               │
+/// ┌────────────┐                                       │
+/// │  RampingUp │───────────────────────────────────────┘
+/// └────────────┘   (target reached → CongestionAvoidance)
+///
+/// Timeout from any state → SlowStart (for recovery)
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-enum SlowdownState {
-    /// Normal operation, no slowdown pending
-    Normal = 0,
-    /// Waiting N RTTs before starting slowdown
-    WaitingForSlowdown = 1,
-    /// In slowdown: cwnd reduced to minimum, waiting to freeze
-    InSlowdown = 2,
-    /// Frozen at minimum cwnd, re-measuring base delay
-    Frozen = 3,
-    /// Ramping back up using slow start
-    RampingUp = 4,
+enum CongestionState {
+    /// Initial slow start phase: exponential cwnd growth until ssthresh
+    /// or delay threshold is reached.
+    SlowStart = 0,
+    /// Normal LEDBAT++ congestion avoidance: delay-based cwnd adjustment.
+    CongestionAvoidance = 1,
+    /// Waiting N RTTs before starting periodic slowdown (LEDBAT++ fairness).
+    WaitingForSlowdown = 2,
+    /// In slowdown: cwnd reduced proportionally, transitioning to frozen.
+    InSlowdown = 3,
+    /// Frozen at reduced cwnd for N RTTs to re-measure base delay.
+    Frozen = 4,
+    /// Ramping back up using exponential growth after slowdown.
+    /// This state uses slow-start-like growth but with different exit
+    /// conditions (target cwnd rather than ssthresh/delay).
+    RampingUp = 5,
 }
 
 /// Lock-free delay filter: MIN over recent samples (RFC 6817 Section 4.2).
@@ -400,12 +438,11 @@ pub struct LedbatController {
     /// Slow start threshold (bytes)
     ssthresh: AtomicUsize,
 
-    /// Are we in slow start phase?
-    in_slow_start: AtomicBool,
-
-    // ===== LEDBAT++ Periodic Slowdown State =====
-    /// Current slowdown state (stored as u8, maps to SlowdownState)
-    slowdown_state: AtomicU8,
+    // ===== Unified Congestion State Machine =====
+    /// Current congestion control state (stored as u8, maps to CongestionState).
+    /// This single field replaces the previous `in_slow_start` boolean and
+    /// `SlowdownState` enum, ensuring unambiguous state transitions.
+    congestion_state: AtomicU8,
 
     /// Time when current slowdown phase started (nanos since epoch)
     slowdown_phase_start_nanos: AtomicU64,
@@ -430,7 +467,6 @@ pub struct LedbatController {
     allowed_increase_packets: usize,
     min_cwnd: usize,
     max_cwnd: usize,
-    enable_slow_start: bool,
     delay_exit_threshold: f64,
     enable_periodic_slowdown: bool,
 
@@ -528,9 +564,12 @@ impl LedbatController {
             epoch: Instant::now(),
             bytes_acked_since_update: AtomicUsize::new(0),
             ssthresh: AtomicUsize::new(ssthresh),
-            in_slow_start: AtomicBool::new(config.enable_slow_start),
-            // LEDBAT++ periodic slowdown state
-            slowdown_state: AtomicU8::new(SlowdownState::Normal as u8),
+            // Unified congestion state: start in SlowStart or CongestionAvoidance
+            congestion_state: AtomicU8::new(if config.enable_slow_start {
+                CongestionState::SlowStart as u8
+            } else {
+                CongestionState::CongestionAvoidance as u8
+            }),
             slowdown_phase_start_nanos: AtomicU64::new(0),
             slowdown_rtt_count: AtomicU32::new(0),
             last_slowdown_duration_nanos: AtomicU64::new(0),
@@ -542,7 +581,6 @@ impl LedbatController {
             allowed_increase_packets: 2, // RFC 6817 default
             min_cwnd: config.min_cwnd,
             max_cwnd: config.max_cwnd,
-            enable_slow_start: config.enable_slow_start,
             delay_exit_threshold: config.delay_exit_threshold,
             enable_periodic_slowdown: config.enable_periodic_slowdown,
             // Statistics
@@ -681,31 +719,35 @@ impl LedbatController {
             return; // No progress
         }
 
-        // Check for periodic slowdown state machine FIRST (LEDBAT++)
-        // This takes precedence over slow start because during RampingUp phase,
-        // in_slow_start is true but we need the slowdown state machine to handle
-        // the ramp-up logic (which has different exit conditions than initial slow start).
-        if self.enable_periodic_slowdown {
-            let slowdown_state = self.slowdown_state.load(Ordering::Acquire);
-            // If we're in any slowdown state (not Normal), let the state machine handle it
-            if slowdown_state != SlowdownState::Normal as u8
-                && self.check_and_handle_slowdown(bytes_acked_total, queuing_delay, base_delay)
-            {
-                return; // Slowdown handling took over
+        // Unified state machine dispatch - single check, no overlapping flags
+        let state = self.congestion_state.load(Ordering::Acquire);
+        match state {
+            s if s == CongestionState::SlowStart as u8 => {
+                // Initial slow start: exponential growth
+                self.handle_slow_start(bytes_acked_total, queuing_delay, base_delay);
+                return;
             }
-        }
-
-        // Check if in slow start phase (initial slow start, not ramp-up)
-        if self.enable_slow_start && self.in_slow_start.load(Ordering::Acquire) {
-            self.handle_slow_start(bytes_acked_total, queuing_delay, base_delay);
-            return;
-        }
-
-        // Check for periodic slowdown scheduling (Normal state)
-        if self.enable_periodic_slowdown
-            && self.check_and_handle_slowdown(bytes_acked_total, queuing_delay, base_delay)
-        {
-            return; // Slowdown handling took over
+            s if s == CongestionState::WaitingForSlowdown as u8
+                || s == CongestionState::InSlowdown as u8
+                || s == CongestionState::Frozen as u8
+                || s == CongestionState::RampingUp as u8 =>
+            {
+                // Slowdown state machine handles these states
+                if self.handle_congestion_state(bytes_acked_total, queuing_delay, base_delay) {
+                    return;
+                }
+                // Fall through to congestion avoidance if state completed
+            }
+            s if s == CongestionState::CongestionAvoidance as u8 => {
+                // Check for scheduled slowdown trigger
+                if self.enable_periodic_slowdown
+                    && self.handle_congestion_state(bytes_acked_total, queuing_delay, base_delay)
+                {
+                    return;
+                }
+                // Fall through to congestion avoidance
+            }
+            _ => {} // Unknown state, proceed with congestion avoidance
         }
 
         // LEDBAT++ congestion avoidance (draft-irtf-iccrg-ledbat-plus-plus Section 4.2)
@@ -787,17 +829,13 @@ impl LedbatController {
     ///
     /// On initial slow start exit, schedules the first periodic slowdown (LEDBAT++).
     fn handle_slow_start(&self, bytes_acked: usize, queuing_delay: Duration, base_delay: Duration) {
-        // Early exit if no longer in slow start (race: loss/timeout occurred)
-        if !self.in_slow_start.load(Ordering::Acquire) {
+        // Early exit if no longer in SlowStart state (race: timeout occurred)
+        if self.congestion_state.load(Ordering::Acquire) != CongestionState::SlowStart as u8 {
             return;
         }
 
         let current_cwnd = self.cwnd.load(Ordering::Acquire);
         let ssthresh = self.ssthresh.load(Ordering::Acquire);
-
-        // Note: RampingUp state is now handled by check_and_handle_slowdown() in on_ack(),
-        // which is called before handle_slow_start(). This ensures proper recovery thresholds
-        // are applied during ramp-up (see the 85% threshold in the RampingUp handler).
 
         // Check exit conditions (LEDBAT++ uses 3/4 of target, configured via delay_exit_threshold)
         let delay_threshold =
@@ -805,8 +843,6 @@ impl LedbatController {
         let should_exit = current_cwnd >= ssthresh || queuing_delay > delay_threshold;
 
         if should_exit {
-            // Exit slow start
-            self.in_slow_start.store(false, Ordering::Release);
             self.slow_start_exits.fetch_add(1, Ordering::Relaxed);
 
             // Conservative reduction on exit (optional, can be tuned)
@@ -826,13 +862,18 @@ impl LedbatController {
                 let delay_nanos = base_delay.as_nanos() as u64 * SLOWDOWN_DELAY_RTTS as u64;
                 self.next_slowdown_time_nanos
                     .store(now_nanos + delay_nanos, Ordering::Release);
-                self.slowdown_state
-                    .store(SlowdownState::WaitingForSlowdown as u8, Ordering::Release);
+                // Transition to WaitingForSlowdown state
+                self.congestion_state
+                    .store(CongestionState::WaitingForSlowdown as u8, Ordering::Release);
 
                 tracing::debug!(
                     delay_ms = delay_nanos / 1_000_000,
                     "LEDBAT++ scheduling initial slowdown after slow start exit"
                 );
+            } else {
+                // No periodic slowdown, just go to CongestionAvoidance
+                self.congestion_state
+                    .store(CongestionState::CongestionAvoidance as u8, Ordering::Release);
             }
 
             let exit_reason = if current_cwnd >= ssthresh {
@@ -866,20 +907,23 @@ impl LedbatController {
         }
     }
 
-    /// Check and handle periodic slowdown state machine (LEDBAT++ Section 4.4).
+    /// Handle congestion state machine transitions.
     ///
-    /// Returns true if the slowdown logic handled this update (caller should return).
-    fn check_and_handle_slowdown(
+    /// This unified handler replaces the previous overlapping `in_slow_start` and
+    /// `SlowdownState` flags, ensuring unambiguous state transitions.
+    ///
+    /// Returns true if the state machine handled this update (caller should return).
+    fn handle_congestion_state(
         &self,
         bytes_acked: usize,
         queuing_delay: Duration,
         base_delay: Duration,
     ) -> bool {
         let now_nanos = self.epoch.elapsed().as_nanos() as u64;
-        let state = self.slowdown_state.load(Ordering::Acquire);
+        let state = self.congestion_state.load(Ordering::Acquire);
 
         match state {
-            s if s == SlowdownState::Normal as u8 => {
+            s if s == CongestionState::CongestionAvoidance as u8 => {
                 // Check if it's time for the next scheduled slowdown
                 let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
                 if now_nanos >= next_slowdown && next_slowdown != u64::MAX {
@@ -888,7 +932,7 @@ impl LedbatController {
                 }
                 false
             }
-            s if s == SlowdownState::WaitingForSlowdown as u8 => {
+            s if s == CongestionState::WaitingForSlowdown as u8 => {
                 // Check if wait period is over
                 let next_slowdown = self.next_slowdown_time_nanos.load(Ordering::Acquire);
                 if now_nanos >= next_slowdown {
@@ -897,25 +941,24 @@ impl LedbatController {
                 }
                 false
             }
-            s if s == SlowdownState::InSlowdown as u8 => {
+            s if s == CongestionState::InSlowdown as u8 => {
                 // Just entered slowdown, transition to frozen state
-                self.slowdown_state
-                    .store(SlowdownState::Frozen as u8, Ordering::Release);
+                self.congestion_state
+                    .store(CongestionState::Frozen as u8, Ordering::Release);
                 self.slowdown_rtt_count.store(0, Ordering::Release);
                 self.slowdown_phase_start_nanos
                     .store(now_nanos, Ordering::Release);
                 true
             }
-            s if s == SlowdownState::Frozen as u8 => {
+            s if s == CongestionState::Frozen as u8 => {
                 // Frozen at reduced cwnd, counting RTTs until we can ramp up
                 let phase_start = self.slowdown_phase_start_nanos.load(Ordering::Acquire);
                 let freeze_duration = base_delay.as_nanos() as u64 * SLOWDOWN_FREEZE_RTTS as u64;
 
                 if now_nanos.saturating_sub(phase_start) >= freeze_duration {
-                    // Done freezing, start ramping up
-                    self.slowdown_state
-                        .store(SlowdownState::RampingUp as u8, Ordering::Release);
-                    self.in_slow_start.store(true, Ordering::Release);
+                    // Done freezing, start ramping up (single state transition)
+                    self.congestion_state
+                        .store(CongestionState::RampingUp as u8, Ordering::Release);
                     tracing::debug!(
                         cwnd_kb = self.cwnd.load(Ordering::Relaxed) / 1024,
                         "LEDBAT++ slowdown: starting ramp-up phase"
@@ -930,15 +973,15 @@ impl LedbatController {
                 self.cwnd.store(frozen_cwnd, Ordering::Release);
                 true
             }
-            s if s == SlowdownState::RampingUp as u8 => {
-                // Ramping up using slow start until reaching pre_slowdown_cwnd
+            s if s == CongestionState::RampingUp as u8 => {
+                // Ramping up using exponential growth until reaching pre_slowdown_cwnd
                 let target_cwnd = self.pre_slowdown_cwnd.load(Ordering::Acquire);
                 let current_cwnd = self.cwnd.load(Ordering::Acquire);
 
                 // Exit ramp-up when target is reached
                 if current_cwnd >= target_cwnd {
                     self.complete_slowdown(now_nanos, base_delay);
-                    return false; // Let normal congestion avoidance take over
+                    return false; // Let congestion avoidance take over
                 }
 
                 // During ramp-up, queuing is expected as cwnd grows. Only exit early
@@ -967,7 +1010,7 @@ impl LedbatController {
                 self.store_cwnd(new_cwnd);
                 true
             }
-            _ => false, // Unknown state, don't interfere
+            _ => false, // SlowStart or unknown state, don't interfere
         }
     }
 
@@ -985,9 +1028,9 @@ impl LedbatController {
         let slowdown_cwnd = (current_cwnd / SLOWDOWN_REDUCTION_FACTOR).max(self.min_cwnd);
         self.cwnd.store(slowdown_cwnd, Ordering::Release);
 
-        // Update state
-        self.slowdown_state
-            .store(SlowdownState::InSlowdown as u8, Ordering::Release);
+        // Transition to InSlowdown state
+        self.congestion_state
+            .store(CongestionState::InSlowdown as u8, Ordering::Release);
         self.slowdown_phase_start_nanos
             .store(now_nanos, Ordering::Release);
         self.periodic_slowdowns.fetch_add(1, Ordering::Relaxed);
@@ -1024,10 +1067,9 @@ impl LedbatController {
         self.next_slowdown_time_nanos
             .store(now_nanos + actual_interval, Ordering::Release);
 
-        // Return to normal operation
-        self.slowdown_state
-            .store(SlowdownState::Normal as u8, Ordering::Release);
-        self.in_slow_start.store(false, Ordering::Release);
+        // Return to CongestionAvoidance state (single state transition)
+        self.congestion_state
+            .store(CongestionState::CongestionAvoidance as u8, Ordering::Release);
 
         tracing::debug!(
             slowdown_duration_ms = slowdown_duration / 1_000_000,
@@ -1040,7 +1082,7 @@ impl LedbatController {
     ///
     /// RFC 6817 Section 2.4.1: halve cwnd on loss.
     ///
-    /// Also exits slow start if currently in that phase.
+    /// Transitions to CongestionAvoidance state if in SlowStart.
     ///
     /// **Note:** Currently not called in production - the transport layer uses
     /// [`on_timeout`] for retransmissions. This method is for future fast-retransmit
@@ -1050,8 +1092,11 @@ impl LedbatController {
     pub fn on_loss(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
 
-        // Exit slow start on loss
-        if self.in_slow_start.swap(false, Ordering::AcqRel) {
+        // Exit slow start on loss → go to CongestionAvoidance
+        let state = self.congestion_state.load(Ordering::Acquire);
+        if state == CongestionState::SlowStart as u8 {
+            self.congestion_state
+                .store(CongestionState::CongestionAvoidance as u8, Ordering::Release);
             self.slow_start_exits.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -1072,16 +1117,13 @@ impl LedbatController {
     ///
     /// RFC 6817: Reset to 1 * MSS on timeout.
     ///
-    /// After resetting cwnd, we re-enter slow start to enable fast recovery.
-    /// Without this, the connection would be stuck in congestion avoidance
-    /// mode with minimum cwnd. On high-RTT paths with zero queuing delay,
-    /// congestion avoidance growth is extremely slow (~150 bytes per RTT),
-    /// causing transfers to stall for tens of seconds.
+    /// After resetting cwnd, we transition to SlowStart for fast recovery.
+    /// This is a clean state transition that cannot conflict with other states.
     ///
     /// This follows standard TCP RTO recovery behavior (RFC 5681):
     /// - Reset cwnd to min_cwnd
     /// - Set ssthresh to max(old_cwnd/2, 2*min_cwnd)
-    /// - Re-enter slow start for exponential recovery
+    /// - Enter SlowStart state for exponential recovery
     pub fn on_timeout(&self) {
         self.total_losses.fetch_add(1, Ordering::Relaxed);
 
@@ -1097,11 +1139,11 @@ impl LedbatController {
         let new_ssthresh = (old_cwnd / 2).max(self.min_cwnd * 2);
         self.ssthresh.store(new_ssthresh, Ordering::Release);
 
-        // Re-enter slow start for fast (exponential) recovery
-        // Without this, we'd be stuck in congestion avoidance with very slow
-        // linear growth, especially on high-RTT paths with zero queuing delay
-        // where off_target ≈ 0 means almost no congestion avoidance growth.
-        self.in_slow_start.store(true, Ordering::Release);
+        // Transition to SlowStart for fast (exponential) recovery.
+        // This is a single atomic state change - no separate in_slow_start flag
+        // that could conflict with the slowdown state machine.
+        self.congestion_state
+            .store(CongestionState::SlowStart as u8, Ordering::Release);
 
         // Only log when cwnd actually changes to avoid spam when already at minimum
         if old_cwnd != new_cwnd {
@@ -1109,7 +1151,7 @@ impl LedbatController {
                 old_cwnd_kb = old_cwnd / 1024,
                 new_cwnd_kb = new_cwnd / 1024,
                 new_ssthresh_kb = new_ssthresh / 1024,
-                "LEDBAT retransmission timeout - reset to min_cwnd, re-entering slow start"
+                "LEDBAT retransmission timeout - reset to min_cwnd, entering SlowStart"
             );
         }
     }
@@ -2078,17 +2120,17 @@ mod tests {
         assert!(!controller.enable_periodic_slowdown);
     }
 
-    /// Test periodic slowdown state machine initialization
+    /// Test congestion state machine initialization
     #[test]
-    fn test_periodic_slowdown_initial_state() {
+    fn test_congestion_state_initial_state() {
         let controller = LedbatController::new(10_000, 2848, 10_000_000);
 
-        // Initial state should be Normal
-        let state = controller.slowdown_state.load(Ordering::Relaxed);
+        // Initial state should be SlowStart (default config has enable_slow_start=true)
+        let state = controller.congestion_state.load(Ordering::Relaxed);
         assert_eq!(
             state,
-            SlowdownState::Normal as u8,
-            "Initial slowdown state should be Normal"
+            CongestionState::SlowStart as u8,
+            "Initial state should be SlowStart when enable_slow_start=true"
         );
 
         // initial_slow_start_completed should be false
@@ -2120,15 +2162,16 @@ mod tests {
         );
     }
 
-    /// Test slowdown state enum values
+    /// Test congestion state enum values
     #[test]
-    fn test_slowdown_state_values() {
+    fn test_congestion_state_values() {
         // Verify enum values for state machine
-        assert_eq!(SlowdownState::Normal as u8, 0);
-        assert_eq!(SlowdownState::WaitingForSlowdown as u8, 1);
-        assert_eq!(SlowdownState::InSlowdown as u8, 2);
-        assert_eq!(SlowdownState::Frozen as u8, 3);
-        assert_eq!(SlowdownState::RampingUp as u8, 4);
+        assert_eq!(CongestionState::SlowStart as u8, 0);
+        assert_eq!(CongestionState::CongestionAvoidance as u8, 1);
+        assert_eq!(CongestionState::WaitingForSlowdown as u8, 2);
+        assert_eq!(CongestionState::InSlowdown as u8, 3);
+        assert_eq!(CongestionState::Frozen as u8, 4);
+        assert_eq!(CongestionState::RampingUp as u8, 5);
     }
 
     /// Integration test: slow start exit schedules initial slowdown
@@ -2170,12 +2213,13 @@ mod tests {
         controller.on_ack(Duration::from_millis(20), 1000);
 
         // Should have exited slow start (cwnd grew past ssthresh)
-        let in_slow_start = controller.in_slow_start.load(Ordering::Acquire);
+        let state = controller.congestion_state.load(Ordering::Acquire);
         let cwnd = controller.current_cwnd();
         assert!(
-            !in_slow_start,
-            "Should have exited slow start (cwnd={}, ssthresh=20000)",
-            cwnd
+            state != CongestionState::SlowStart as u8,
+            "Should have exited slow start (cwnd={}, ssthresh=20000, state={})",
+            cwnd,
+            state
         );
 
         // Should have marked initial slow start as completed
@@ -2194,10 +2238,10 @@ mod tests {
         );
 
         // State should be WaitingForSlowdown
-        let state = controller.slowdown_state.load(Ordering::Acquire);
+        let state = controller.congestion_state.load(Ordering::Acquire);
         assert_eq!(
             state,
-            SlowdownState::WaitingForSlowdown as u8,
+            CongestionState::WaitingForSlowdown as u8,
             "State should be WaitingForSlowdown"
         );
     }
@@ -2251,8 +2295,9 @@ mod tests {
         );
 
         // Should still be in slow start
-        assert!(
-            controller.in_slow_start.load(Ordering::Acquire),
+        assert_eq!(
+            controller.congestion_state.load(Ordering::Acquire),
+            CongestionState::SlowStart as u8,
             "Should still be in slow start (cwnd={}, ssthresh=500000)",
             cwnd_after_2
         );
@@ -2292,7 +2337,7 @@ mod tests {
         controller.on_ack(Duration::from_millis(20), 1000);
 
         assert!(
-            !controller.in_slow_start.load(Ordering::Acquire),
+            controller.congestion_state.load(Ordering::Acquire) != CongestionState::SlowStart as u8,
             "Should have exited slow start"
         );
 
@@ -2305,9 +2350,9 @@ mod tests {
         controller.on_ack(Duration::from_millis(20), 1000);
 
         // Should now be in slowdown
-        let state = controller.slowdown_state.load(Ordering::Acquire);
+        let state = controller.congestion_state.load(Ordering::Acquire);
         assert!(
-            state == SlowdownState::InSlowdown as u8 || state == SlowdownState::Frozen as u8,
+            state == CongestionState::InSlowdown as u8 || state == CongestionState::Frozen as u8,
             "Should be in slowdown state, got {}",
             state
         );
@@ -2366,7 +2411,7 @@ mod tests {
         controller.on_ack(Duration::from_millis(20), 1000);
 
         assert!(
-            !controller.in_slow_start.load(Ordering::Acquire),
+            controller.congestion_state.load(Ordering::Acquire) != CongestionState::SlowStart as u8,
             "Should have exited slow start"
         );
         let pre_slowdown_cwnd = controller.current_cwnd();
@@ -2379,7 +2424,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         controller.on_ack(Duration::from_millis(20), 1000);
 
-        let state = controller.slowdown_state.load(Ordering::Acquire);
+        let state = controller.congestion_state.load(Ordering::Acquire);
         println!("Phase 2 - After wait: state = {}", state);
 
         // Phase 3: Enter frozen state
@@ -2387,7 +2432,7 @@ mod tests {
         controller.on_ack(Duration::from_millis(20), 1000);
 
         let frozen_cwnd = controller.current_cwnd();
-        let state = controller.slowdown_state.load(Ordering::Acquire);
+        let state = controller.congestion_state.load(Ordering::Acquire);
         println!(
             "Phase 3 - Frozen: cwnd = {}, state = {}",
             frozen_cwnd, state
@@ -2395,7 +2440,7 @@ mod tests {
 
         assert_eq!(
             state,
-            SlowdownState::Frozen as u8,
+            CongestionState::Frozen as u8,
             "Should be in Frozen state"
         );
 
@@ -2412,13 +2457,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         controller.on_ack(Duration::from_millis(20), 5000);
 
-        let state = controller.slowdown_state.load(Ordering::Acquire);
+        let state = controller.congestion_state.load(Ordering::Acquire);
         println!("Phase 4 - After freeze: state = {}", state);
 
         // Should now be ramping up
         assert_eq!(
             state,
-            SlowdownState::RampingUp as u8,
+            CongestionState::RampingUp as u8,
             "Should be in RampingUp state"
         );
 
@@ -2436,7 +2481,7 @@ mod tests {
         controller.on_ack(Duration::from_millis(20), 1000);
 
         let final_cwnd = controller.current_cwnd();
-        let final_state = controller.slowdown_state.load(Ordering::Acquire);
+        let final_state = controller.congestion_state.load(Ordering::Acquire);
         println!(
             "Phase 5 - After ramp-up: cwnd = {}, state = {}, iterations = {}",
             final_cwnd, final_state, ramp_iterations
@@ -2445,7 +2490,7 @@ mod tests {
         // Should have returned to normal
         assert_eq!(
             final_state,
-            SlowdownState::Normal as u8,
+            CongestionState::CongestionAvoidance as u8,
             "Should be back to Normal state"
         );
 
@@ -3034,7 +3079,7 @@ mod tests {
                 snapshots.push(StateSnapshot {
                     time_ms: elapsed_ms,
                     cwnd_kb: controller.current_cwnd() / 1024,
-                    state: controller.slowdown_state.load(Ordering::Relaxed),
+                    state: controller.congestion_state.load(Ordering::Relaxed),
                     throughput_mbps: throughput,
                     data_transferred_kb: total_data_kb,
                 });
@@ -3273,7 +3318,7 @@ mod tests {
             elapsed_ms += 100;
             controller.on_ack(rtt, 20_000);
 
-            let state = controller.slowdown_state.load(Ordering::Relaxed);
+            let state = controller.congestion_state.load(Ordering::Relaxed);
             let state_name = match state {
                 0 => "Normal",
                 1 => "Waiting",
@@ -3284,7 +3329,7 @@ mod tests {
             };
             timeline.push((elapsed_ms, controller.current_cwnd() / 1024, state_name));
 
-            if !controller.in_slow_start.load(Ordering::Relaxed) {
+            if controller.congestion_state.load(Ordering::Relaxed) != CongestionState::SlowStart as u8 {
                 println!(
                     "  Slow start exit at {}ms, cwnd={}KB",
                     elapsed_ms,
@@ -3301,7 +3346,7 @@ mod tests {
             elapsed_ms += 100;
             controller.on_ack(rtt, 10_000);
 
-            let state = controller.slowdown_state.load(Ordering::Relaxed);
+            let state = controller.congestion_state.load(Ordering::Relaxed);
             let state_name = match state {
                 0 => "Normal",
                 1 => "Waiting",
@@ -3330,7 +3375,7 @@ mod tests {
             elapsed_ms += 100;
             controller.on_ack(rtt, 5_000);
 
-            let state = controller.slowdown_state.load(Ordering::Relaxed);
+            let state = controller.congestion_state.load(Ordering::Relaxed);
             let state_name = match state {
                 0 => "Normal",
                 1 => "Waiting",
@@ -3358,7 +3403,7 @@ mod tests {
             elapsed_ms += 100;
             controller.on_ack(rtt, 30_000);
 
-            let state = controller.slowdown_state.load(Ordering::Relaxed);
+            let state = controller.congestion_state.load(Ordering::Relaxed);
             let state_name = match state {
                 0 => "Normal",
                 1 => "Waiting",
@@ -3389,9 +3434,13 @@ mod tests {
             println!("{:>8} {:>10} {:>12} {}", t, cwnd, state, bar);
         }
 
-        // Verify the cycle completed
-        let final_state = controller.slowdown_state.load(Ordering::Relaxed);
-        assert_eq!(final_state, 0, "Should return to Normal state");
+        // Verify the cycle completed (should be in CongestionAvoidance)
+        let final_state = controller.congestion_state.load(Ordering::Relaxed);
+        assert_eq!(
+            final_state,
+            CongestionState::CongestionAvoidance as u8,
+            "Should return to CongestionAvoidance state after slowdown cycle"
+        );
 
         let final_cwnd = controller.current_cwnd();
         assert!(
@@ -3454,7 +3503,7 @@ mod tests {
 
         // Should have exited slow start
         assert!(
-            !controller.in_slow_start.load(Ordering::Acquire),
+            controller.congestion_state.load(Ordering::Acquire) != CongestionState::SlowStart as u8,
             "Should have exited slow start"
         );
 
@@ -3470,8 +3519,8 @@ mod tests {
         controller.on_ack(low_rtt, 1000);
 
         assert_eq!(
-            controller.slowdown_state.load(Ordering::Acquire),
-            SlowdownState::Frozen as u8,
+            controller.congestion_state.load(Ordering::Acquire),
+            CongestionState::Frozen as u8,
             "Should be in Frozen state"
         );
 
@@ -3480,8 +3529,8 @@ mod tests {
         controller.on_ack(low_rtt, 5000);
 
         assert_eq!(
-            controller.slowdown_state.load(Ordering::Acquire),
-            SlowdownState::RampingUp as u8,
+            controller.congestion_state.load(Ordering::Acquire),
+            CongestionState::RampingUp as u8,
             "Should be in RampingUp state"
         );
 
@@ -3497,7 +3546,7 @@ mod tests {
         let mut ramp_iterations = 0;
         let target_cwnd = controller.pre_slowdown_cwnd.load(Ordering::Acquire);
 
-        while controller.slowdown_state.load(Ordering::Acquire) == SlowdownState::RampingUp as u8
+        while controller.congestion_state.load(Ordering::Acquire) == CongestionState::RampingUp as u8
             && ramp_iterations < 30
         {
             tokio::time::sleep(Duration::from_millis(55)).await;
@@ -3512,7 +3561,7 @@ mod tests {
         }
 
         let final_cwnd = controller.current_cwnd();
-        let final_state = controller.slowdown_state.load(Ordering::Acquire);
+        let final_state = controller.congestion_state.load(Ordering::Acquire);
 
         println!(
             "Final: cwnd = {}, state = {}, iterations = {}",
@@ -3539,7 +3588,7 @@ mod tests {
         // Verify we returned to Normal state (completed the slowdown cycle)
         assert_eq!(
             final_state,
-            SlowdownState::Normal as u8,
+            CongestionState::CongestionAvoidance as u8,
             "Should return to Normal state after ramp-up completes"
         );
 
@@ -3587,7 +3636,7 @@ mod tests {
         }
 
         assert!(
-            !controller.in_slow_start.load(Ordering::Acquire),
+            controller.congestion_state.load(Ordering::Acquire) != CongestionState::SlowStart as u8,
             "Should have exited slow start"
         );
 
@@ -3630,8 +3679,8 @@ mod tests {
         controller.on_ack(rtt, 2000);
 
         assert_eq!(
-            controller.slowdown_state.load(Ordering::Acquire),
-            SlowdownState::RampingUp as u8,
+            controller.congestion_state.load(Ordering::Acquire),
+            CongestionState::RampingUp as u8,
             "Should be in RampingUp state"
         );
 
@@ -3646,7 +3695,7 @@ mod tests {
         let high_rtt = Duration::from_millis(200);
 
         let mut ramp_iterations = 0;
-        while controller.slowdown_state.load(Ordering::Acquire) == SlowdownState::RampingUp as u8
+        while controller.congestion_state.load(Ordering::Acquire) == CongestionState::RampingUp as u8
             && ramp_iterations < 20
         {
             tokio::time::sleep(Duration::from_millis(55)).await;
@@ -3661,7 +3710,7 @@ mod tests {
         }
 
         let final_cwnd = controller.current_cwnd();
-        let final_state = controller.slowdown_state.load(Ordering::Acquire);
+        let final_state = controller.congestion_state.load(Ordering::Acquire);
 
         println!(
             "Final: cwnd = {}, state = {}, iterations = {}",
@@ -3682,7 +3731,7 @@ mod tests {
         // Should return to Normal state
         assert_eq!(
             final_state,
-            SlowdownState::Normal as u8,
+            CongestionState::CongestionAvoidance as u8,
             "Should return to Normal state after ramp-up"
         );
 
@@ -3973,18 +4022,18 @@ mod tests {
 
         // Manually set state to Frozen
         controller
-            .slowdown_state
-            .store(SlowdownState::Frozen as u8, Ordering::Release);
+            .congestion_state
+            .store(CongestionState::Frozen as u8, Ordering::Release);
         controller.cwnd.store(50_000, Ordering::Release); // 50KB during freeze
 
         let cwnd_before_loss = controller.current_cwnd();
-        let state_before_loss = controller.slowdown_state.load(Ordering::Acquire);
+        let state_before_loss = controller.congestion_state.load(Ordering::Acquire);
 
         // Trigger packet loss
         controller.on_loss();
 
         let cwnd_after_loss = controller.current_cwnd();
-        let state_after_loss = controller.slowdown_state.load(Ordering::Acquire);
+        let state_after_loss = controller.congestion_state.load(Ordering::Acquire);
 
         // cwnd should be halved
         assert_eq!(
@@ -4034,21 +4083,17 @@ mod tests {
         };
         let controller = LedbatController::new_with_config(config);
 
-        // Manually set state to RampingUp with in_slow_start = true
+        // Manually set state to RampingUp
         controller
-            .slowdown_state
-            .store(SlowdownState::RampingUp as u8, Ordering::Release);
-        controller.in_slow_start.store(true, Ordering::Release);
+            .congestion_state
+            .store(CongestionState::RampingUp as u8, Ordering::Release);
         controller.cwnd.store(80_000, Ordering::Release); // Mid-rampup
-
-        let state_before = controller.slowdown_state.load(Ordering::Acquire);
 
         // Trigger timeout
         controller.on_timeout();
 
         let cwnd_after = controller.current_cwnd();
-        let state_after = controller.slowdown_state.load(Ordering::Acquire);
-        let in_slow_start_after = controller.in_slow_start.load(Ordering::Acquire);
+        let state_after = controller.congestion_state.load(Ordering::Acquire);
         let ssthresh_after = controller.ssthresh.load(Ordering::Acquire);
 
         // cwnd should reset to min_cwnd (or MSS, whichever is larger)
@@ -4058,17 +4103,12 @@ mod tests {
             cwnd_after
         );
 
-        // State should remain RampingUp
+        // With unified state machine, timeout always transitions to SlowStart
+        // for fast exponential recovery
         assert_eq!(
-            state_before, state_after,
-            "Slowdown state should not change on timeout"
-        );
-
-        // Slow start should be re-enabled for fast recovery
-        // (This changed: previously timeout exited slow start, now it re-enters)
-        assert!(
-            in_slow_start_after,
-            "Slow start should be enabled after timeout for fast recovery"
+            state_after,
+            CongestionState::SlowStart as u8,
+            "Should transition to SlowStart on timeout for fast recovery"
         );
 
         // ssthresh should be set to half the pre-timeout cwnd
@@ -4082,14 +4122,15 @@ mod tests {
 
     /// Test state machine integrity: all states are reachable and valid
     #[test]
-    fn test_slowdown_state_machine_integrity() {
+    fn test_congestion_state_machine_integrity() {
         // Verify all state values are unique and in valid range
         let states = [
-            (SlowdownState::Normal, 0u8),
-            (SlowdownState::WaitingForSlowdown, 1u8),
-            (SlowdownState::InSlowdown, 2u8),
-            (SlowdownState::Frozen, 3u8),
-            (SlowdownState::RampingUp, 4u8),
+            (CongestionState::SlowStart, 0u8),
+            (CongestionState::CongestionAvoidance, 1u8),
+            (CongestionState::WaitingForSlowdown, 2u8),
+            (CongestionState::InSlowdown, 3u8),
+            (CongestionState::Frozen, 4u8),
+            (CongestionState::RampingUp, 5u8),
         ];
 
         for (state, expected_value) in states {
@@ -4101,15 +4142,28 @@ mod tests {
         }
 
         // Verify controller starts in Normal state
+        // Default config has enable_slow_start=true, so starts in SlowStart
         let config = LedbatConfig::default();
         let controller = LedbatController::new_with_config(config);
         assert_eq!(
-            controller.slowdown_state.load(Ordering::Acquire),
-            SlowdownState::Normal as u8,
-            "Controller should start in Normal state"
+            controller.congestion_state.load(Ordering::Acquire),
+            CongestionState::SlowStart as u8,
+            "Controller should start in SlowStart state when enable_slow_start=true"
         );
 
-        println!("✓ Slowdown state machine integrity test passed");
+        // With slow start disabled, should start in CongestionAvoidance
+        let config_no_ss = LedbatConfig {
+            enable_slow_start: false,
+            ..LedbatConfig::default()
+        };
+        let controller_no_ss = LedbatController::new_with_config(config_no_ss);
+        assert_eq!(
+            controller_no_ss.congestion_state.load(Ordering::Acquire),
+            CongestionState::CongestionAvoidance as u8,
+            "Controller should start in CongestionAvoidance state when enable_slow_start=false"
+        );
+
+        println!("✓ Congestion state machine integrity test passed");
     }
 
     /// Test that multiple rapid losses don't cause cwnd underflow
@@ -4224,18 +4278,18 @@ mod tests {
             min_cwnd: 2848,
             max_cwnd: 10_000_000,
             ssthresh: 50_000,
-            enable_slow_start: true,
+            enable_slow_start: false, // Disabled to start in CongestionAvoidance
             enable_periodic_slowdown: false, // Disabled!
             randomize_ssthresh: false,
             ..Default::default()
         };
         let controller = LedbatController::new_with_config(config);
 
-        // State should always be Normal
+        // State should be CongestionAvoidance (slow start disabled)
         assert_eq!(
-            controller.slowdown_state.load(Ordering::Acquire),
-            SlowdownState::Normal as u8,
-            "Initial state should be Normal"
+            controller.congestion_state.load(Ordering::Acquire),
+            CongestionState::CongestionAvoidance as u8,
+            "Initial state should be CongestionAvoidance"
         );
 
         // Schedule a slowdown manually and verify it's not processed
@@ -4259,12 +4313,12 @@ mod tests {
             "No slowdowns should occur when disabled"
         );
 
-        // State should still be Normal (or in slow start)
-        let state = controller.slowdown_state.load(Ordering::Acquire);
+        // State should still be CongestionAvoidance
+        let state = controller.congestion_state.load(Ordering::Acquire);
         assert_eq!(
             state,
-            SlowdownState::Normal as u8,
-            "State should remain Normal when slowdowns disabled"
+            CongestionState::CongestionAvoidance as u8,
+            "State should remain CongestionAvoidance when slowdowns disabled"
         );
 
         println!("✓ Slowdown disabled test passed");
@@ -4342,8 +4396,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(base_rtt_ms)).await;
             controller.on_ack(rtt, 10_000);
 
-            let state = controller.slowdown_state.load(Ordering::Acquire);
-            if state == SlowdownState::RampingUp as u8 {
+            let state = controller.congestion_state.load(Ordering::Acquire);
+            if state == CongestionState::RampingUp as u8 {
                 found_rampup = true;
                 println!("Entered RampingUp state at iteration {}", iteration);
                 break;
@@ -4354,9 +4408,8 @@ mod tests {
         if !found_rampup {
             println!("Manually triggering ramp-up state for test");
             controller
-                .slowdown_state
-                .store(SlowdownState::RampingUp as u8, Ordering::Release);
-            controller.in_slow_start.store(true, Ordering::Release);
+                .congestion_state
+                .store(CongestionState::RampingUp as u8, Ordering::Release);
             let target = controller.current_cwnd().max(80_000);
             controller
                 .pre_slowdown_cwnd
@@ -4375,7 +4428,7 @@ mod tests {
         let mut ramp_iterations = 0u32;
         let max_ramp_iterations = 15u32;
 
-        while controller.slowdown_state.load(Ordering::Acquire) == SlowdownState::RampingUp as u8
+        while controller.congestion_state.load(Ordering::Acquire) == CongestionState::RampingUp as u8
             && ramp_iterations < max_ramp_iterations
         {
             let rtt = jittery_rtt(iteration);
@@ -4387,7 +4440,7 @@ mod tests {
         }
 
         let final_cwnd = controller.current_cwnd();
-        let final_state = controller.slowdown_state.load(Ordering::Acquire);
+        let final_state = controller.congestion_state.load(Ordering::Acquire);
         let final_base_delay = controller.base_delay();
 
         println!("\nFinal state:");
@@ -4521,10 +4574,11 @@ mod tests {
             recovered_cwnd
         );
 
-        // Also verify we're in slow start mode (in_slow_start should be true)
-        assert!(
-            controller.in_slow_start.load(Ordering::Relaxed),
-            "Should be in slow start after timeout for fast recovery"
+        // Also verify we're in SlowStart state
+        assert_eq!(
+            controller.congestion_state.load(Ordering::Relaxed),
+            CongestionState::SlowStart as u8,
+            "Should be in SlowStart state after timeout for fast recovery"
         );
 
         println!(
@@ -5177,10 +5231,11 @@ mod tests {
             post_timeout_cwnd
         );
 
-        // Verify slow start re-enabled for fast recovery
-        assert!(
-            controller.in_slow_start.load(Ordering::Relaxed),
-            "Slow start should be re-enabled after timeout"
+        // Verify SlowStart state re-enabled for fast recovery
+        assert_eq!(
+            controller.congestion_state.load(Ordering::Relaxed),
+            CongestionState::SlowStart as u8,
+            "SlowStart state should be set after timeout"
         );
 
         // Phase 4: Recovery with improving conditions
