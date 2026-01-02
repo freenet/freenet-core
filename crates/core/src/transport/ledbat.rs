@@ -4550,6 +4550,8 @@ mod tests {
     //
     // Implementation notes:
     // - Duration comparisons use tolerance where exact equality is fragile.
+    // - Tests use wall-clock sleep() because LEDBAT internally uses std::time::Instant
+    //   for epoch timing, which is not affected by tokio's mock time.
     // =========================================================================
 
     /// Helper for approximate Duration comparison with tolerance.
