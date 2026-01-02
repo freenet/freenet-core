@@ -7452,6 +7452,12 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        // Tolerance constants for consistent error bounds across tests
+        const RATE_TOLERANCE_PERCENT: f64 = 0.01; // 1% tolerance for rate calculations
+        const RATIO_TOLERANCE: f64 = 0.01; // Tolerance for ratio comparisons (2x, 0.5x)
+        const GAIN_TOLERANCE: f64 = 0.0001; // High precision for GAIN formula
+        const DURATION_TOLERANCE_MS: u64 = 1; // 1ms tolerance for duration comparisons
+
         // Regression test (issue #2559): min_interval must be at least 18 RTTs.
         //
         // The bug: min_interval was 1 RTT instead of 18 RTTs, causing
@@ -7554,8 +7560,8 @@ mod tests {
                 let effective_rtt = rtt.max(Duration::from_millis(1));
                 let expected_rate = (cwnd as f64 / effective_rtt.as_secs_f64()) as usize;
 
-                // Allow 1% tolerance for floating point
-                let tolerance = expected_rate / 100 + 1;
+                // Allow tolerance for floating point precision
+                let tolerance = (expected_rate as f64 * RATE_TOLERANCE_PERCENT) as usize + 1;
                 prop_assert!(
                     (rate as i64 - expected_rate as i64).unsigned_abs() <= tolerance as u64,
                     "Rate {} != expected {} (±{}) at {}KB cwnd, {}ms RTT",
@@ -7590,7 +7596,7 @@ mod tests {
                 let actual_ratio = rate2 as f64 / rate1 as f64;
 
                 prop_assert!(
-                    (actual_ratio - expected_ratio).abs() < 0.01,
+                    (actual_ratio - expected_ratio).abs() < RATIO_TOLERANCE,
                     "Rate ratio {} != expected {} when cwnd doubled",
                     actual_ratio, expected_ratio
                 );
@@ -7621,7 +7627,7 @@ mod tests {
                 let actual_ratio = rate2 as f64 / rate1 as f64;
 
                 prop_assert!(
-                    (actual_ratio - expected_ratio).abs() < 0.01,
+                    (actual_ratio - expected_ratio).abs() < RATIO_TOLERANCE,
                     "Rate ratio {} != expected {} when RTT doubled from {}ms to {}ms",
                     actual_ratio, expected_ratio, rtt_ms, rtt_ms * 2
                 );
@@ -7702,7 +7708,7 @@ mod tests {
                 let actual_gain = controller.calculate_dynamic_gain(base_delay);
 
                 prop_assert!(
-                    (actual_gain - expected_gain).abs() < 0.0001,
+                    (actual_gain - expected_gain).abs() < GAIN_TOLERANCE,
                     "GAIN {} != expected {} at {}ms base delay (divisor: raw={}, clamped={})",
                     actual_gain, expected_gain, base_delay_ms, raw_divisor, expected_divisor
                 );
@@ -7961,7 +7967,7 @@ mod tests {
                 // Base delay should be at or below the minimum sample
                 // (could be lower if there's a fallback or timing issue)
                 prop_assert!(
-                    base_delay.as_millis() as u64 <= expected_min + 1,  // +1ms tolerance
+                    base_delay.as_millis() as u64 <= expected_min + DURATION_TOLERANCE_MS,
                     "Base delay {:?} > minimum sample {}ms",
                     base_delay, expected_min
                 );
