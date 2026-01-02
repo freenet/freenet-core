@@ -3301,13 +3301,36 @@ pub mod tracer {
             .add_directive("stretto=off".parse().expect("infallible"))
             .add_directive("sqlx=error".parse().expect("infallible"));
 
+        // Get rate limit from environment or use default (1000 events/sec)
+        let rate_limit: u64 = std::env::var("FREENET_LOG_RATE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(crate::util::rate_limit_layer::DEFAULT_MAX_EVENTS_PER_SECOND);
+
+        // Rate limiting is disabled in tests and debug builds to avoid masking issues
+        let rate_limit_enabled = !cfg!(any(test, debug_assertions))
+            && std::env::var("FREENET_DISABLE_LOG_RATE_LIMIT").is_err();
+
+        // Create rate limiter (shared across all layers)
+        let rate_limiter = if rate_limit_enabled {
+            Some(crate::util::rate_limit_layer::RateLimiter::new(rate_limit))
+        } else {
+            None
+        };
+
         if use_file_logging {
             if let Some(log_dir) = get_log_dir() {
                 // Create log directory if it doesn't exist
                 if let Err(e) = std::fs::create_dir_all(&log_dir) {
                     eprintln!("Warning: Failed to create log directory: {e}");
                     // Fall back to stdout logging
-                    return init_stdout_tracer(default_filter, to_stderr, use_json, filter_layer);
+                    return init_stdout_tracer(
+                        default_filter,
+                        to_stderr,
+                        use_json,
+                        filter_layer,
+                        rate_limiter,
+                    );
                 }
 
                 // Create rolling file appender for main log
@@ -3338,34 +3361,68 @@ pub mod tracer {
                     ));
                 }
 
-                // Create layers for main and error logs
-                let main_layer = tracing_subscriber::fmt::layer()
-                    .with_level(true)
-                    .with_ansi(false) // No ANSI colors in log files
-                    .with_writer(main_writer)
-                    .with_filter(filter_layer);
+                // Apply rate limiting as a global filter if enabled
+                // Layers must be created after the rate filter to ensure type compatibility
+                if let Some(rate_limiter) = rate_limiter.clone() {
+                    let rate_filter =
+                        tracing_subscriber::filter::filter_fn(move |_| rate_limiter.should_allow());
+                    let base = Registry::default().with(rate_filter);
 
-                // Error layer only captures WARN and above
-                let error_filter = tracing_subscriber::EnvFilter::builder()
-                    .with_default_directive(LevelFilter::WARN.into())
-                    .from_env_lossy();
+                    // Create layers for main and error logs (typed against rate-filtered registry)
+                    let main_layer = tracing_subscriber::fmt::layer()
+                        .with_level(true)
+                        .with_ansi(false)
+                        .with_writer(main_writer.clone())
+                        .with_filter(filter_layer);
 
-                let error_layer = tracing_subscriber::fmt::layer()
-                    .with_level(true)
-                    .with_ansi(false)
-                    .with_writer(error_writer)
-                    .with_filter(error_filter);
+                    let error_filter = tracing_subscriber::EnvFilter::builder()
+                        .with_default_directive(LevelFilter::WARN.into())
+                        .from_env_lossy();
 
-                let subscriber = Registry::default().with(main_layer).with(error_layer);
-                tracing::subscriber::set_global_default(subscriber)
-                    .expect("Error setting subscriber");
+                    let error_layer = tracing_subscriber::fmt::layer()
+                        .with_level(true)
+                        .with_ansi(false)
+                        .with_writer(error_writer.clone())
+                        .with_filter(error_filter);
+
+                    let subscriber = base.with(main_layer).with(error_layer);
+                    tracing::subscriber::set_global_default(subscriber)
+                        .expect("Error setting subscriber");
+                } else {
+                    // Create layers for main and error logs (typed against plain registry)
+                    let main_layer = tracing_subscriber::fmt::layer()
+                        .with_level(true)
+                        .with_ansi(false)
+                        .with_writer(main_writer)
+                        .with_filter(filter_layer);
+
+                    let error_filter = tracing_subscriber::EnvFilter::builder()
+                        .with_default_directive(LevelFilter::WARN.into())
+                        .from_env_lossy();
+
+                    let error_layer = tracing_subscriber::fmt::layer()
+                        .with_level(true)
+                        .with_ansi(false)
+                        .with_writer(error_writer)
+                        .with_filter(error_filter);
+
+                    let subscriber = Registry::default().with(main_layer).with(error_layer);
+                    tracing::subscriber::set_global_default(subscriber)
+                        .expect("Error setting subscriber");
+                }
 
                 return Ok(());
             }
         }
 
         // Fall back to stdout/stderr logging
-        init_stdout_tracer(default_filter, to_stderr, use_json, filter_layer)
+        init_stdout_tracer(
+            default_filter,
+            to_stderr,
+            use_json,
+            filter_layer,
+            rate_limiter,
+        )
     }
 
     fn init_stdout_tracer(
@@ -3373,45 +3430,66 @@ pub mod tracer {
         to_stderr: bool,
         use_json: bool,
         filter_layer: tracing_subscriber::EnvFilter,
+        rate_limiter: Option<crate::util::rate_limit_layer::RateLimiter>,
     ) -> anyhow::Result<()> {
         use tracing_subscriber::layer::SubscriberExt;
 
-        let layer = if to_stderr {
-            if use_json {
+        // Helper to create the format layer
+        fn make_layer<
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        >(
+            to_stderr: bool,
+            use_json: bool,
+        ) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync> {
+            if to_stderr {
+                if use_json {
+                    tracing_subscriber::fmt::layer()
+                        .with_level(true)
+                        .json()
+                        .with_file(cfg!(any(test, debug_assertions)))
+                        .with_line_number(cfg!(any(test, debug_assertions)))
+                        .with_writer(std::io::stderr)
+                        .boxed()
+                } else {
+                    let layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
+                    let layer = if cfg!(any(test, debug_assertions)) {
+                        layer.with_file(true).with_line_number(true)
+                    } else {
+                        layer
+                    };
+                    layer.with_writer(std::io::stderr).boxed()
+                }
+            } else if use_json {
                 tracing_subscriber::fmt::layer()
                     .with_level(true)
                     .json()
                     .with_file(cfg!(any(test, debug_assertions)))
                     .with_line_number(cfg!(any(test, debug_assertions)))
-                    .with_writer(std::io::stderr)
                     .boxed()
             } else {
                 let layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
-                let layer = if cfg!(any(test, debug_assertions)) {
-                    layer.with_file(true).with_line_number(true)
+                if cfg!(any(test, debug_assertions)) {
+                    layer.with_file(true).with_line_number(true).boxed()
                 } else {
-                    layer
-                };
-                layer.with_writer(std::io::stderr).boxed()
+                    layer.boxed()
+                }
             }
-        } else if use_json {
-            tracing_subscriber::fmt::layer()
-                .with_level(true)
-                .json()
-                .with_file(cfg!(any(test, debug_assertions)))
-                .with_line_number(cfg!(any(test, debug_assertions)))
-                .boxed()
-        } else {
-            let layer = tracing_subscriber::fmt::layer().with_level(true).pretty();
-            if cfg!(any(test, debug_assertions)) {
-                layer.with_file(true).with_line_number(true).boxed()
-            } else {
-                layer.boxed()
-            }
-        };
+        }
 
-        let subscriber = Registry::default().with(layer.with_filter(filter_layer));
-        tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
+        // Apply rate limiting as a global filter if enabled
+        // Layers must be created after the rate filter to ensure type compatibility
+        if let Some(rate_limiter) = rate_limiter {
+            let rate_filter =
+                tracing_subscriber::filter::filter_fn(move |_| rate_limiter.should_allow());
+            let base = Registry::default().with(rate_filter);
+            let layer = make_layer(to_stderr, use_json);
+            let subscriber = base.with(layer.with_filter(filter_layer));
+            tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
+        } else {
+            let layer = make_layer(to_stderr, use_json);
+            let subscriber = Registry::default().with(layer.with_filter(filter_layer));
+            tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
+        }
         Ok(())
     }
 }
