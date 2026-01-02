@@ -152,17 +152,15 @@ async fn test_different_seeds_produce_different_events() {
 // Test 2: Fault Injection with Deterministic Behavior
 // =============================================================================
 
-/// Tests that fault injection (via add_noise) produces deterministic results.
+/// Tests that simulation produces deterministic results with the same seed.
 ///
-/// Noise mode now derives shuffle decisions from message content (not arrival timing),
-/// making it fully deterministic with the same seed.
+/// VirtualTime is always enabled, making simulation fully deterministic.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn test_fault_injection_deterministic() {
     const SEED: u64 = 0xFA01_7777_1234;
 
-    async fn run_with_noise(name: &str, seed: u64) -> HashMap<String, usize> {
+    async fn run_simulation(name: &str, seed: u64) -> HashMap<String, usize> {
         let mut sim = SimNetwork::new(name, 1, 3, 7, 3, 10, 2, seed).await;
-        sim.with_noise();
         sim.with_start_backoff(Duration::from_millis(50));
 
         let _handles = sim
@@ -173,27 +171,24 @@ async fn test_fault_injection_deterministic() {
         sim.get_event_counts().await
     }
 
-    let events1 = run_with_noise("fault-run1", SEED).await;
-    let events2 = run_with_noise("fault-run2", SEED).await;
+    let events1 = run_simulation("fault-run1", SEED).await;
+    let events2 = run_simulation("fault-run2", SEED).await;
 
-    // Verify noise mode captures events
+    // Verify simulation captures events
     let total_events: usize = events1.values().sum();
-    assert!(
-        total_events > 0,
-        "Should capture events even with noise enabled"
-    );
+    assert!(total_events > 0, "Should capture events during simulation");
 
-    // Verify same event types are captured (noise affects ordering, not event generation)
+    // Verify same event types are captured
     let types1: std::collections::HashSet<&String> = events1.keys().collect();
     let types2: std::collections::HashSet<&String> = events2.keys().collect();
     assert_eq!(
         types1, types2,
-        "Event types should be consistent with noise.\nRun 1: {:?}\nRun 2: {:?}",
+        "Event types should be consistent.\nRun 1: {:?}\nRun 2: {:?}",
         events1, events2
     );
 
     tracing::info!(
-        "Fault injection determinism test passed - {} events captured",
+        "Simulation determinism test passed - {} events captured",
         total_events
     );
 }

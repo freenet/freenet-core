@@ -292,14 +292,19 @@ async fn test_deterministic_replay() {
 
 ```rust
 #[tokio::test]
-async fn test_with_noise() {
+async fn test_with_fault_injection() {
     let mut sim = SimNetwork::new("fault-test", 1, 3, ..., SEED).await;
-    sim.with_noise(); // Enable deterministic noise mode
+
+    // Configure fault injection with message loss and latency
+    sim.with_fault_injection(FaultConfig::builder()
+        .message_loss_rate(0.1)  // 10% packet loss
+        .latency_range(Duration::from_millis(10)..Duration::from_millis(50))
+        .build());
 
     let _handles = sim.start_with_rand_gen::<SmallRng>(SEED, 5, 10).await;
 
-    // Noise mode shuffles ~20% of messages deterministically
-    // based on message content hash
+    // VirtualTime ensures deterministic delivery timing
+    sim.advance_virtual_time();
 }
 ```
 
