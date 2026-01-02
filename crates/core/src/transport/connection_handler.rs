@@ -677,6 +677,25 @@ impl<S: Socket> UdpPacketsListener<S> {
                                     );
                                 }
 
+                                // Issue #2528: Rate limit gateway intro handler to prevent decryption storms.
+                                // When a connection closes, subsequent symmetric packets fall through here.
+                                // Without rate limiting, each packet triggers asymmetric decryption which
+                                // fails (causing "decryption failed" errors) and blocks legitimate reconnects.
+                                let now = Instant::now();
+                                let rate_limited = self
+                                    .last_asym_attempt
+                                    .get(&remote_addr)
+                                    .is_some_and(|last| now.duration_since(*last) < ASYM_DECRYPTION_RATE_LIMIT);
+                                if rate_limited {
+                                    tracing::trace!(
+                                        peer_addr = %remote_addr,
+                                        direction = "inbound",
+                                        "Rate limiting gateway intro attempt"
+                                    );
+                                    continue;
+                                }
+                                self.last_asym_attempt.insert(remote_addr, now);
+
                                 let inbound_key_bytes = key_from_addr(&remote_addr);
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
                                 let task = tokio::spawn(gw_ongoing_connection
