@@ -56,12 +56,12 @@ log() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-    # Console output
+    # Console output (to stderr so it doesn't interfere with function return values)
     case "$level" in
-        INFO)  echo -e "${GREEN}[INFO]${NC} $message" ;;
-        WARN)  echo -e "${YELLOW}[WARN]${NC} $message" ;;
-        ERROR) echo -e "${RED}[ERROR]${NC} $message" ;;
-        DEBUG) [[ "$VERBOSE" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $message" ;;
+        INFO)  echo -e "${GREEN}[INFO]${NC} $message" >&2 ;;
+        WARN)  echo -e "${YELLOW}[WARN]${NC} $message" >&2 ;;
+        ERROR) echo -e "${RED}[ERROR]${NC} $message" >&2 ;;
+        DEBUG) [[ "$VERBOSE" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $message" >&2 ;;
     esac
 
     # File logging (if writable)
