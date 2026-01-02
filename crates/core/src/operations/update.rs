@@ -457,6 +457,18 @@ impl Operation for UpdateOp {
                     .await?;
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
+                    // Emit telemetry: broadcast applied with resulting state
+                    if let Some(event) = NetEventLog::update_broadcast_applied(
+                        id,
+                        &op_manager.ring,
+                        *key,
+                        new_value,
+                        &updated_value,
+                        changed,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+
                     if !changed {
                         tracing::debug!(
                             tx = %id,
