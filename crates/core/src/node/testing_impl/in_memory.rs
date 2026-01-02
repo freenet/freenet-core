@@ -102,12 +102,7 @@ impl<ER> Builder<ER> {
         .await?;
 
         // Append contracts before starting
-        append_contracts(
-            &op_manager,
-            self.contracts,
-            self.contract_subscribers,
-        )
-        .await?;
+        append_contracts(&op_manager, self.contracts, self.contract_subscribers).await?;
 
         // Start join procedure for non-gateway nodes
         let join_task = if !gateways.is_empty() && !self.config.is_gateway {
@@ -240,12 +235,7 @@ impl<ER> Builder<ER> {
         .await?;
 
         // Append contracts before starting
-        append_contracts(
-            &op_manager,
-            self.contracts,
-            self.contract_subscribers,
-        )
-        .await?;
+        append_contracts(&op_manager, self.contracts, self.contract_subscribers).await?;
 
         // Start join procedure for non-gateway nodes
         let join_task = if !gateways.is_empty() && !self.config.is_gateway {
@@ -314,11 +304,7 @@ async fn append_contracts(
         tracing::debug!(
             "Appended contract {} to peer {}",
             key,
-            op_manager
-                .ring
-                .connection_manager
-                .get_own_addr()
-                .unwrap()
+            op_manager.ring.connection_manager.get_own_addr().unwrap()
         );
         if subscription {
             op_manager.ring.seed_contract(key, state_size);

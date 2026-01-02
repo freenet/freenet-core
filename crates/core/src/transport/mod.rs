@@ -264,8 +264,9 @@ pub(crate) trait PeerConnectionApi: Send {
     ///
     /// Returns the deserialized message bytes. The caller is responsible for
     /// deserializing into the appropriate message type.
-    fn recv(&mut self)
-        -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>;
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>;
 }
 
 #[cfg(test)]

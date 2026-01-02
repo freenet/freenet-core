@@ -287,17 +287,10 @@ impl SocketInbox {
 }
 
 /// Global registry for in-memory sockets.
+#[derive(Default)]
 struct SocketRegistry {
     /// Maps socket address to inbox
     sockets: HashMap<SocketAddr, Arc<Mutex<SocketInbox>>>,
-}
-
-impl Default for SocketRegistry {
-    fn default() -> Self {
-        Self {
-            sockets: HashMap::new(),
-        }
-    }
 }
 
 impl SocketRegistry {
@@ -375,7 +368,11 @@ impl Socket for InMemorySocket {
 
         tracing::debug!(addr = %addr, "InMemorySocket bound");
 
-        Ok(Self { addr, inbox, notify })
+        Ok(Self {
+            addr,
+            inbox,
+            notify,
+        })
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -526,9 +523,7 @@ mod tests {
         let addr2: SocketAddr = "127.0.0.1:10004".parse().unwrap();
 
         // Configure 100% message loss
-        let config = FaultConfigBuilder::default()
-            .message_loss_rate(1.0)
-            .build();
+        let config = FaultConfigBuilder::default().message_loss_rate(1.0).build();
         let injector = Arc::new(std::sync::Mutex::new(SocketFaultInjector::new(config, 42)));
         set_socket_fault_injector(Some(injector.clone()));
 

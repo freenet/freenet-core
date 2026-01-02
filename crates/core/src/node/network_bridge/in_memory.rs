@@ -397,7 +397,6 @@ pub fn unregister_peer(addr: &SocketAddr) {
 static PEER_REGISTRY: LazyLock<RwLock<PeerRegistry>> =
     LazyLock::new(|| RwLock::new(PeerRegistry::default()));
 
-
 /// A message in transit between peers in the in-memory transport.
 #[derive(Clone, Debug)]
 pub struct MessageOnTransit {

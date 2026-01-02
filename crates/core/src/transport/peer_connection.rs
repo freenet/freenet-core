@@ -1435,15 +1435,17 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
     fn send_message(
         &mut self,
         msg: crate::message::NetMessage,
-    ) -> std::pin::Pin<Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+    > {
         Box::pin(async move { self.send(msg).await })
     }
 
     fn recv(
         &mut self,
-    ) -> std::pin::Pin<Box<dyn futures::Future<Output = Result<Vec<u8>, super::TransportError>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn futures::Future<Output = Result<Vec<u8>, super::TransportError>> + Send + '_>,
+    > {
         Box::pin(async move { PeerConnection::recv(self).await })
     }
 }
