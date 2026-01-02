@@ -2438,9 +2438,48 @@ where
                 }
                 NodeEvent::ClientDisconnected { client_id } => {
                     tracing::debug!(%client_id, "Client disconnected");
-                    op_manager
+                    let notifications = op_manager
                         .ring
                         .remove_client_from_all_subscriptions(client_id);
+
+                    // Send Unsubscribed messages to upstream peers for subscription tree pruning
+                    if !notifications.is_empty() {
+                        let own_location = op_manager.ring.connection_manager.own_location();
+                        for (contract_key, upstream) in notifications {
+                            let Some(upstream_addr) = upstream.socket_addr() else {
+                                tracing::error!(
+                                    %contract_key,
+                                    upstream_key = %upstream.pub_key,
+                                    "Cannot send Unsubscribed: upstream address unknown"
+                                );
+                                continue;
+                            };
+
+                            let unsubscribe_msg = NetMessage::V1(NetMessageV1::Unsubscribed {
+                                transaction: Transaction::new::<
+                                    crate::operations::subscribe::SubscribeMsg,
+                                >(),
+                                key: contract_key,
+                                from: own_location.clone(),
+                            });
+
+                            if let Err(e) = conn_manager.send(upstream_addr, unsubscribe_msg).await
+                            {
+                                tracing::warn!(
+                                    %contract_key,
+                                    %upstream_addr,
+                                    error = %e,
+                                    "Failed to send Unsubscribed to upstream after client disconnect"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    %contract_key,
+                                    %upstream_addr,
+                                    "Sent Unsubscribed to upstream after client disconnect"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
             },
