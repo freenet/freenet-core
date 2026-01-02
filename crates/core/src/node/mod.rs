@@ -1693,6 +1693,7 @@ pub async fn run_local_node(
             request,
             notification_channel,
             token,
+            attested_contract,
             ..
         } = req;
         tracing::debug!(client_id = %id, ?token, "Received OpenRequest -> {request}");
@@ -1704,11 +1705,9 @@ pub async fn run_local_node(
                     .await
             }
             ClientRequest::DelegateOp(op) => {
-                let attested_contract = token.and_then(|token| {
-                    gw.attested_contracts
-                        .get(&token)
-                        .map(|entry| entry.value().contract_id)
-                });
+                // Use the attested_contract already resolved by WebSocket/HttpGateway
+                // instead of re-looking up from gw.attested_contracts (which could fail
+                // if the token expired between WebSocket connect and this request)
                 let op_name = match op {
                     DelegateRequest::RegisterDelegate { .. } => "RegisterDelegate",
                     DelegateRequest::ApplicationMessages { .. } => "ApplicationMessages",

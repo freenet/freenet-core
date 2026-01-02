@@ -3607,43 +3607,54 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
     tracing::info!("Step 4: Disconnecting peer-a (triggers pruning)");
     drop(client_a);
 
-    tracing::info!("Waiting for disconnect processing...");
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
     tracing::info!("Step 4.5: Verifying peer-a removed from gateway's subscribers");
 
-    make_node_diagnostics(&mut client_gw, gw_diag_config).await?;
+    // Use retry loop since unsubscribe propagation may take time in CI
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
 
-    let gateway_subscribers_after = loop {
-        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
-        match resp {
-            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
-                let contract_state = diag.contract_states.get(&contract_key);
-                let subscribers = contract_state
-                    .map(|cs| cs.subscriber_peer_ids.clone())
-                    .unwrap_or_default();
-                tracing::info!(
-                    "Gateway subscribers for contract (after disconnect): {:?}",
-                    subscribers
-                );
-                break subscribers;
+        let subscribers = loop {
+            let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+            match resp {
+                HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                    let contract_state = diag.contract_states.get(&contract_key);
+                    let subs = contract_state
+                        .map(|cs| cs.subscriber_peer_ids.clone())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        "Gateway subscribers for contract (after disconnect): {:?}",
+                        subs
+                    );
+                    break subs;
+                }
+                other => {
+                    tracing::warn!(
+                        "Gateway: unexpected response while getting subscribers after disconnect: {:?}",
+                        other
+                    );
+                }
             }
-            other => {
-                tracing::warn!(
-                    "Gateway: unexpected response while getting subscribers after disconnect: {:?}",
-                    other
-                );
-            }
+        };
+
+        if !subscribers.contains(&peer_a_peer_id) {
+            break;
         }
-    };
 
-    assert!(
-        !gateway_subscribers_after.contains(&peer_a_peer_id),
-        "Peer-a should NOT be in gateway's subscriber list after disconnect. \
-         peer_id {} found in {:?}",
-        peer_a_peer_id,
-        gateway_subscribers_after
-    );
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "Timeout waiting for peer-a to be removed from gateway's subscriber list. \
+                 peer_id {} still in {:?}",
+                peer_a_peer_id, subscribers
+            );
+        }
+
+        tracing::info!(
+            "Peer-a still in gateway subscribers, retrying in 1s... (current: {:?})",
+            subscribers
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 
     tracing::info!("Subscription tree pruning test passed");
     Ok(())
@@ -3897,37 +3908,49 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
     tracing::info!("Step 6: Disconnecting second client (pruning SHOULD occur)");
     drop(client_a2);
 
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Use retry loop since unsubscribe propagation may take time in CI
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        make_node_diagnostics(&mut client_gw, gw_diag_config.clone()).await?;
 
-    make_node_diagnostics(&mut client_gw, gw_diag_config).await?;
+        let subscribers = loop {
+            let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
+            match resp {
+                HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
+                    let contract_state = diag.contract_states.get(&contract_key);
+                    let subs = contract_state
+                        .map(|cs| cs.subscriber_peer_ids.clone())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        "Gateway subscribers (after second client disconnect): {:?}",
+                        subs
+                    );
+                    break subs;
+                }
+                other => {
+                    tracing::warn!("Gateway: unexpected response: {:?}", other);
+                }
+            }
+        };
 
-    let gateway_subscribers_final = loop {
-        let resp = timeout(Duration::from_secs(10), client_gw.recv()).await??;
-        match resp {
-            HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
-                let contract_state = diag.contract_states.get(&contract_key);
-                let subscribers = contract_state
-                    .map(|cs| cs.subscriber_peer_ids.clone())
-                    .unwrap_or_default();
-                tracing::info!(
-                    "Gateway subscribers (after second client disconnect): {:?}",
-                    subscribers
-                );
-                break subscribers;
-            }
-            other => {
-                tracing::warn!("Gateway: unexpected response: {:?}", other);
-            }
+        if !subscribers.contains(&peer_a_peer_id) {
+            break;
         }
-    };
 
-    assert!(
-        !gateway_subscribers_final.contains(&peer_a_peer_id),
-        "Peer-a should NOT be in gateway's subscriber list after both clients disconnect. \
-         peer_id {} found in {:?}",
-        peer_a_peer_id,
-        gateway_subscribers_final
-    );
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "Timeout waiting for peer-a to be removed from gateway's subscriber list after both clients disconnect. \
+                 peer_id {} still in {:?}",
+                peer_a_peer_id, subscribers
+            );
+        }
+
+        tracing::info!(
+            "Peer-a still in gateway subscribers, retrying in 1s... (current: {:?})",
+            subscribers
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 
     tracing::info!("Multiple clients prevent premature pruning test passed");
     Ok(())
