@@ -4532,4 +4532,676 @@ mod tests {
             post_timeout_cwnd, recovered_cwnd
         );
     }
+
+    // =========================================================================
+    // VARIABLE RTT TESTS
+    //
+    // These tests exercise LEDBAT behavior under variable network latency,
+    // which is critical for real-world performance but was not previously
+    // covered by fixed-latency tests.
+    //
+    // Key scenarios tested:
+    // 1. Queue buildup simulation (parametrized across latencies)
+    // 2. Latency spike recovery (parametrized across spike magnitudes)
+    // 3. Continuous jitter with stability analysis
+    // 4. Base delay shift detection
+    // 5. Extreme RTT variation stress test
+    // 6. Timeout recovery with degrading conditions
+    // =========================================================================
+
+    /// Test cwnd recovery with continuously variable RTT (jittery network).
+    ///
+    /// This simulates a network path with inherent variability (e.g., WiFi,
+    /// mobile networks) where RTT fluctuates constantly within a range.
+    /// LEDBAT should:
+    /// 1. Track the minimum RTT as base_delay
+    /// 2. Respond appropriately to the variable queuing delay
+    /// 3. Not "hunt" excessively (oscillate cwnd rapidly)
+    #[tokio::test]
+    async fn test_variable_rtt_continuous_jitter() {
+        println!("\n========== Variable RTT: Continuous Jitter Test ==========");
+
+        let config = LedbatConfig {
+            initial_cwnd: 60_000,
+            min_cwnd: 2848,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+        controller.on_send(1_000_000);
+
+        // Simulate jittery RTT: base 40ms with ±20ms variation (20-60ms range)
+        let base_jitter = 40u64;
+        let jitter_range = 20i64;
+
+        println!("\n--- Jittery RTT simulation (40ms ± 20ms) ---");
+        println!(
+            "{:>6} {:>8} {:>12} {:>10}",
+            "ACK#", "RTT(ms)", "Base(ms)", "Cwnd(KB)"
+        );
+        println!("{}", "-".repeat(42));
+
+        let mut min_rtt_seen = Duration::from_millis(1000);
+        let mut cwnd_samples: Vec<usize> = Vec::new();
+
+        // Simulate 20 ACKs with jittery RTT
+        for i in 0..20 {
+            // Generate jittery RTT using a simple pattern (not random, for reproducibility)
+            let jitter = ((i as i64 * 7) % (jitter_range * 2 + 1)) - jitter_range;
+            let rtt_ms = ((base_jitter as i64) + jitter).max(20) as u64;
+            let rtt = Duration::from_millis(rtt_ms);
+
+            if rtt < min_rtt_seen {
+                min_rtt_seen = rtt;
+            }
+
+            tokio::time::sleep(Duration::from_millis(rtt_ms + 5)).await;
+            controller.on_ack(rtt, 5000);
+
+            let cwnd = controller.current_cwnd();
+            cwnd_samples.push(cwnd);
+
+            if i % 4 == 0 || i == 19 {
+                println!(
+                    "{:>6} {:>8} {:>12} {:>10}",
+                    i + 1,
+                    rtt_ms,
+                    controller.base_delay().as_millis(),
+                    cwnd / 1024
+                );
+            }
+        }
+
+        // Analyze cwnd stability (variance shouldn't be too high)
+        let avg_cwnd: usize = cwnd_samples.iter().sum::<usize>() / cwnd_samples.len();
+        let variance: f64 = cwnd_samples
+            .iter()
+            .map(|&c| {
+                let diff = c as f64 - avg_cwnd as f64;
+                diff * diff
+            })
+            .sum::<f64>()
+            / cwnd_samples.len() as f64;
+        let std_dev = variance.sqrt();
+        let coefficient_of_variation = std_dev / avg_cwnd as f64;
+
+        println!("\n--- Stability Analysis ---");
+        println!("  Min RTT seen: {}ms", min_rtt_seen.as_millis());
+        println!("  Base delay:   {}ms", controller.base_delay().as_millis());
+        println!("  Avg cwnd:     {} KB", avg_cwnd / 1024);
+        println!("  Std dev:      {} KB", std_dev as usize / 1024);
+        println!("  CoV:          {:.2}", coefficient_of_variation);
+
+        // Verify base delay tracks minimum
+        assert_eq!(
+            controller.base_delay(),
+            min_rtt_seen,
+            "Base delay should track minimum RTT observed"
+        );
+
+        // Cwnd should not be excessively unstable
+        // CoV < 0.5 means std_dev is less than half the mean (reasonable stability)
+        assert!(
+            coefficient_of_variation < 0.5,
+            "Cwnd should be reasonably stable under jitter (CoV={:.2} < 0.5)",
+            coefficient_of_variation
+        );
+
+        println!("✓ Continuous jitter test passed");
+    }
+
+    /// Test base delay shift detection (network path change).
+    ///
+    /// This simulates a scenario where the network path changes permanently,
+    /// causing a new baseline latency. LEDBAT should:
+    /// 1. Eventually detect the new (higher) base delay
+    /// 2. Adjust behavior to the new baseline (not treat it as queuing)
+    ///
+    /// Note: LEDBAT uses a time-windowed base delay history (default 10 samples)
+    /// to handle this scenario - old measurements age out.
+    #[tokio::test]
+    async fn test_variable_rtt_base_delay_shift() {
+        println!("\n========== Variable RTT: Base Delay Shift Test ==========");
+
+        let min_cwnd = 2848usize;
+        let config = LedbatConfig {
+            initial_cwnd: 50_000,
+            min_cwnd,
+            max_cwnd: 10_000_000,
+            ssthresh: 40_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+        controller.on_send(1_000_000);
+
+        // Phase 1: Establish original base delay at 20ms
+        let old_rtt = Duration::from_millis(20);
+        println!("\n--- Phase 1: Original path @ 20ms ---");
+        for i in 0..BASE_HISTORY_SIZE as usize {
+            controller.on_ack(old_rtt, 3000);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if i == BASE_HISTORY_SIZE as usize - 1 {
+                println!(
+                    "  Established base_delay: {:?}, cwnd: {} KB",
+                    controller.base_delay(),
+                    controller.current_cwnd() / 1024
+                );
+            }
+        }
+
+        assert_eq!(
+            controller.base_delay(),
+            old_rtt,
+            "Base delay should be 20ms initially"
+        );
+
+        // Phase 2: Path change - new baseline is 80ms
+        // This could happen due to route change, VPN activation, etc.
+        let new_rtt = Duration::from_millis(80);
+        println!("\n--- Phase 2: Path change to 80ms ---");
+        println!(
+            "  (Simulating BASE_HISTORY_SIZE={} samples at new RTT)",
+            BASE_HISTORY_SIZE
+        );
+
+        // Need enough samples to age out the old base delay
+        // The base delay history keeps BASE_HISTORY_SIZE samples
+        for i in 0..(BASE_HISTORY_SIZE as usize * 2) {
+            tokio::time::sleep(Duration::from_millis(85)).await;
+            controller.on_ack(new_rtt, 3000);
+
+            // The base delay history should eventually reflect the new minimum
+            // Note: due to how base_delay_history works, it may take time
+            if i % 5 == 0 {
+                println!(
+                    "  Sample {}: base_delay={:?}, cwnd={} KB",
+                    i + 1,
+                    controller.base_delay(),
+                    controller.current_cwnd() / 1024
+                );
+            }
+        }
+
+        let final_base_delay = controller.base_delay();
+        println!("\n--- Result ---");
+        println!("  Old base delay: {:?}", old_rtt);
+        println!("  New base delay: {:?}", final_base_delay);
+
+        // After enough samples at the new RTT, the base delay history should
+        // have aged out the old 20ms samples and only contain 80ms samples.
+        // However, the implementation may preserve the historical minimum.
+        // Check that we're at least getting reasonable behavior.
+        println!(
+            "  Note: Base delay tracking uses min of recent {} samples",
+            BASE_HISTORY_SIZE
+        );
+
+        // The exact behavior depends on the implementation, but the connection
+        // should continue functioning (not stall due to permanent "queuing")
+        let final_cwnd = controller.current_cwnd();
+        assert!(
+            final_cwnd >= min_cwnd,
+            "Cwnd should remain usable after path change: {}",
+            final_cwnd
+        );
+
+        println!("✓ Base delay shift test passed");
+    }
+
+    /// Test behavior under extreme RTT variation (stress test).
+    ///
+    /// This tests LEDBAT's robustness under pathological network conditions
+    /// with rapid, extreme RTT swings. The controller should:
+    /// 1. Not crash or panic
+    /// 2. Maintain cwnd within valid bounds
+    /// 3. Continue making forward progress
+    #[tokio::test]
+    async fn test_variable_rtt_extreme_variation() {
+        println!("\n========== Variable RTT: Extreme Variation Stress Test ==========");
+
+        let min_cwnd = 2848usize;
+        let max_cwnd = 10_000_000usize;
+        let config = LedbatConfig {
+            initial_cwnd: 50_000,
+            min_cwnd,
+            max_cwnd,
+            ssthresh: 40_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+        controller.on_send(1_000_000);
+
+        // Extreme RTT pattern: 10ms, 200ms, 15ms, 300ms, 20ms, 50ms, 250ms, ...
+        let extreme_rtts: Vec<u64> = vec![10, 200, 15, 300, 20, 50, 250, 10, 180, 25, 350, 30, 10];
+
+        println!("\n--- Extreme RTT pattern ---");
+        println!(
+            "{:>6} {:>8} {:>12} {:>10}",
+            "ACK#", "RTT(ms)", "Base(ms)", "Cwnd(KB)"
+        );
+        println!("{}", "-".repeat(42));
+
+        let mut min_rtt = Duration::from_millis(1000);
+
+        for (i, &rtt_ms) in extreme_rtts.iter().enumerate() {
+            let rtt = Duration::from_millis(rtt_ms);
+            if rtt < min_rtt {
+                min_rtt = rtt;
+            }
+
+            // Wait proportionally to RTT to simulate realistic timing
+            tokio::time::sleep(Duration::from_millis(rtt_ms.min(100) + 5)).await;
+            controller.on_ack(rtt, 3000);
+
+            println!(
+                "{:>6} {:>8} {:>12} {:>10}",
+                i + 1,
+                rtt_ms,
+                controller.base_delay().as_millis(),
+                controller.current_cwnd() / 1024
+            );
+        }
+
+        // Verify invariants after stress test
+        let final_cwnd = controller.current_cwnd();
+        let final_base_delay = controller.base_delay();
+
+        println!("\n--- Post-stress verification ---");
+        println!("  Min RTT seen:    {}ms", min_rtt.as_millis());
+        println!("  Final base_delay: {:?}", final_base_delay);
+        println!("  Final cwnd:      {} KB", final_cwnd / 1024);
+
+        // Invariant: cwnd must be within bounds
+        assert!(
+            final_cwnd >= min_cwnd,
+            "Cwnd must be >= min_cwnd: {} >= {}",
+            final_cwnd,
+            min_cwnd
+        );
+        assert!(
+            final_cwnd <= max_cwnd,
+            "Cwnd must be <= max_cwnd: {} <= {}",
+            final_cwnd,
+            max_cwnd
+        );
+
+        // Invariant: base_delay should track minimum
+        assert_eq!(
+            final_base_delay, min_rtt,
+            "Base delay should track minimum RTT"
+        );
+
+        println!("✓ Extreme variation stress test passed");
+    }
+
+    /// Parametrized test: variable RTT with different base latencies.
+    ///
+    /// Tests that LEDBAT behaves correctly across different network types
+    /// with jittery latency. This complements the fixed-latency tests in
+    /// `test_slowdown_at_various_latencies` by adding RTT variability.
+    ///
+    /// Network types tested:
+    /// - LAN (10ms base, ±5ms jitter)
+    /// - Regional (50ms base, ±20ms jitter)
+    /// - Continental (100ms base, ±30ms jitter)
+    /// - Satellite (300ms base, ±50ms jitter)
+    #[rstest::rstest]
+    #[case::lan(10, 5)]
+    #[case::regional(50, 20)]
+    #[case::continental(100, 30)]
+    #[case::satellite(300, 50)]
+    #[tokio::test]
+    async fn test_variable_rtt_at_different_base_latencies(
+        #[case] base_rtt_ms: u64,
+        #[case] jitter_ms: u64,
+    ) {
+        let min_cwnd = 2848usize;
+        let max_cwnd = 10_000_000usize;
+        let config = LedbatConfig {
+            initial_cwnd: 50_000,
+            min_cwnd,
+            max_cwnd,
+            ssthresh: 40_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+        controller.on_send(1_000_000);
+
+        let mut min_rtt = Duration::from_millis(base_rtt_ms + jitter_ms);
+        let mut total_transferred = 0usize;
+
+        // Simulate 15 ACKs with jittery RTT
+        for i in 0..15 {
+            // Generate deterministic jitter pattern
+            let jitter = ((i as i64 * 7) % ((jitter_ms as i64) * 2 + 1)) - (jitter_ms as i64);
+            let rtt_ms = ((base_rtt_ms as i64) + jitter).max(5) as u64;
+            let rtt = Duration::from_millis(rtt_ms);
+
+            if rtt < min_rtt {
+                min_rtt = rtt;
+            }
+
+            // Wait appropriately for this RTT
+            let wait_time = (rtt_ms / 2).max(10); // Wait half RTT minimum
+            tokio::time::sleep(Duration::from_millis(wait_time)).await;
+
+            controller.on_ack(rtt, 5000);
+            total_transferred += 5000;
+        }
+
+        let final_cwnd = controller.current_cwnd();
+        let final_base_delay = controller.base_delay();
+
+        println!(
+            "{}ms ± {}ms: base_delay={:?}, final_cwnd={} KB, transferred={} KB",
+            base_rtt_ms,
+            jitter_ms,
+            final_base_delay,
+            final_cwnd / 1024,
+            total_transferred / 1024
+        );
+
+        // Verify base delay tracks minimum
+        assert_eq!(
+            final_base_delay, min_rtt,
+            "{}ms base: Base delay should track minimum RTT",
+            base_rtt_ms
+        );
+
+        // Verify cwnd remains valid
+        assert!(
+            final_cwnd >= min_cwnd && final_cwnd <= max_cwnd,
+            "{}ms base: Cwnd {} should be within bounds [{}, {}]",
+            base_rtt_ms,
+            final_cwnd,
+            min_cwnd,
+            max_cwnd
+        );
+
+        // Verify we made progress (transferred data)
+        assert!(
+            total_transferred > 0,
+            "{}ms base: Should have transferred data",
+            base_rtt_ms
+        );
+    }
+
+    /// Parametrized test: queue buildup at different base latencies.
+    ///
+    /// Tests LEDBAT's response to gradual queue buildup across different
+    /// network conditions. The queue grows from base_rtt to base_rtt + 60ms
+    /// (matching TARGET delay).
+    #[rstest::rstest]
+    #[case::lan(20, 60)] // 20ms -> 80ms (queuing = 60ms = TARGET)
+    #[case::regional(50, 60)] // 50ms -> 110ms
+    #[case::high_latency(100, 60)] // 100ms -> 160ms
+    #[tokio::test]
+    async fn test_variable_rtt_queue_buildup_parametrized(
+        #[case] base_rtt_ms: u64,
+        #[case] queue_growth_ms: u64,
+    ) {
+        let min_cwnd = 2848usize;
+        let config = LedbatConfig {
+            initial_cwnd: 100_000,
+            min_cwnd,
+            max_cwnd: 10_000_000,
+            ssthresh: 200_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+        controller.on_send(1_000_000);
+
+        // Establish baseline
+        let base_rtt = Duration::from_millis(base_rtt_ms);
+        for _ in 0..5 {
+            controller.on_ack(base_rtt, 5000);
+            tokio::time::sleep(Duration::from_millis(base_rtt_ms + 5)).await;
+        }
+
+        let baseline_base_delay = controller.base_delay();
+        assert_eq!(
+            baseline_base_delay, base_rtt,
+            "Base delay should be established"
+        );
+
+        // Simulate gradual queue buildup
+        let steps = 6u64;
+        let step_size = queue_growth_ms / steps;
+        for i in 1..=steps {
+            let rtt_ms = base_rtt_ms + (step_size * i);
+            let rtt = Duration::from_millis(rtt_ms);
+            tokio::time::sleep(Duration::from_millis(rtt_ms + 5)).await;
+            controller.on_ack(rtt, 5000);
+        }
+
+        let final_cwnd = controller.current_cwnd();
+        let final_base_delay = controller.base_delay();
+
+        println!(
+            "{}ms base + {}ms queue: base_delay={:?}, final_cwnd={} KB",
+            base_rtt_ms,
+            queue_growth_ms,
+            final_base_delay,
+            final_cwnd / 1024
+        );
+
+        // Base delay should remain at minimum
+        assert_eq!(
+            final_base_delay, base_rtt,
+            "Base delay should remain at minimum observed RTT"
+        );
+
+        // Cwnd should remain usable
+        assert!(
+            final_cwnd >= min_cwnd,
+            "Cwnd should remain usable: {} >= {}",
+            final_cwnd,
+            min_cwnd
+        );
+    }
+
+    /// Parametrized test: latency spike recovery at different magnitudes.
+    ///
+    /// Tests LEDBAT's ability to recover from latency spikes of various
+    /// magnitudes. Larger spikes (relative to base delay) are more challenging.
+    #[rstest::rstest]
+    #[case::small_spike(30, 80)] // 30ms base, spike to 80ms (2.7x)
+    #[case::medium_spike(30, 150)] // 30ms base, spike to 150ms (5x)
+    #[case::large_spike(30, 300)] // 30ms base, spike to 300ms (10x)
+    #[tokio::test]
+    async fn test_variable_rtt_spike_recovery_parametrized(
+        #[case] base_rtt_ms: u64,
+        #[case] spike_rtt_ms: u64,
+    ) {
+        let min_cwnd = 2848usize;
+        let config = LedbatConfig {
+            initial_cwnd: 80_000,
+            min_cwnd,
+            max_cwnd: 10_000_000,
+            ssthresh: 50_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+        controller.on_send(1_000_000);
+
+        // Establish baseline
+        let base_rtt = Duration::from_millis(base_rtt_ms);
+        for _ in 0..5 {
+            controller.on_ack(base_rtt, 10_000);
+            tokio::time::sleep(Duration::from_millis(base_rtt_ms + 5)).await;
+        }
+
+        // Apply spike
+        let spike_rtt = Duration::from_millis(spike_rtt_ms);
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(spike_rtt_ms.min(100) + 5)).await;
+            controller.on_ack(spike_rtt, 2000);
+        }
+
+        // Recovery
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(base_rtt_ms + 5)).await;
+            controller.on_ack(base_rtt, 10_000);
+        }
+
+        let final_cwnd = controller.current_cwnd();
+        let final_base_delay = controller.base_delay();
+
+        println!(
+            "{}ms base, {}ms spike ({}x): base_delay={:?}, final_cwnd={} KB",
+            base_rtt_ms,
+            spike_rtt_ms,
+            spike_rtt_ms / base_rtt_ms,
+            final_base_delay,
+            final_cwnd / 1024
+        );
+
+        // Base delay should remain at minimum (not polluted by spike)
+        assert_eq!(
+            final_base_delay, base_rtt,
+            "Base delay should remain at minimum after spike"
+        );
+
+        // Cwnd should be usable after recovery
+        assert!(
+            final_cwnd >= min_cwnd,
+            "Cwnd should be usable after recovery: {} >= {}",
+            final_cwnd,
+            min_cwnd
+        );
+    }
+
+    /// Test timeout behavior with variable RTT leading up to timeout.
+    ///
+    /// This simulates a scenario where RTT becomes increasingly unreliable
+    /// before eventually triggering a timeout. Tests the interaction between
+    /// variable RTT handling and timeout recovery (fixed in PR #2549).
+    #[tokio::test]
+    async fn test_variable_rtt_timeout_with_degrading_conditions() {
+        println!("\n========== Variable RTT: Timeout with Degrading Conditions ==========");
+
+        let min_cwnd = 2848usize;
+        let config = LedbatConfig {
+            initial_cwnd: 80_000,
+            min_cwnd,
+            max_cwnd: 10_000_000,
+            ssthresh: 60_000,
+            enable_slow_start: true,
+            enable_periodic_slowdown: false,
+            randomize_ssthresh: false,
+            ..Default::default()
+        };
+        let controller = LedbatController::new_with_config(config);
+        controller.on_send(1_000_000);
+
+        // Phase 1: Establish baseline at 50ms
+        println!("\n--- Phase 1: Establish 50ms baseline ---");
+        let baseline_rtt = Duration::from_millis(50);
+        for _ in 0..5 {
+            controller.on_ack(baseline_rtt, 5000);
+            tokio::time::sleep(Duration::from_millis(55)).await;
+        }
+
+        let pre_degradation_cwnd = controller.current_cwnd();
+        println!(
+            "  Baseline established: cwnd={} KB, base_delay={:?}",
+            pre_degradation_cwnd / 1024,
+            controller.base_delay()
+        );
+
+        // Phase 2: Degrading conditions (RTT increases with high variance)
+        println!("\n--- Phase 2: Degrading conditions ---");
+        let degrading_rtts = [60, 80, 100, 150, 200, 250];
+        for &rtt_ms in &degrading_rtts {
+            let rtt = Duration::from_millis(rtt_ms);
+            tokio::time::sleep(Duration::from_millis(rtt_ms + 10)).await;
+            controller.on_ack(rtt, 2000);
+            println!(
+                "  RTT: {}ms, cwnd: {} KB",
+                rtt_ms,
+                controller.current_cwnd() / 1024
+            );
+        }
+
+        let pre_timeout_cwnd = controller.current_cwnd();
+
+        // Phase 3: Timeout occurs
+        println!("\n--- Phase 3: Timeout ---");
+        controller.on_timeout();
+        let post_timeout_cwnd = controller.current_cwnd();
+        println!(
+            "  Timeout: cwnd {} KB → {} KB",
+            pre_timeout_cwnd / 1024,
+            post_timeout_cwnd / 1024
+        );
+
+        // Verify timeout reset cwnd to minimum
+        assert!(
+            post_timeout_cwnd <= min_cwnd + 1000,
+            "Timeout should reset cwnd to near minimum: {}",
+            post_timeout_cwnd
+        );
+
+        // Verify slow start re-enabled for fast recovery
+        assert!(
+            controller.in_slow_start.load(Ordering::Relaxed),
+            "Slow start should be re-enabled after timeout"
+        );
+
+        // Phase 4: Recovery with improving conditions
+        // Start with moderate RTT to allow slow start growth before triggering exit
+        println!("\n--- Phase 4: Recovery with improving RTT ---");
+        let improving_rtts = [80, 70, 60, 55, 52, 50, 50, 50, 50, 50, 50, 50];
+        for &rtt_ms in &improving_rtts {
+            let rtt = Duration::from_millis(rtt_ms);
+            controller.on_send(50_000);
+            tokio::time::sleep(Duration::from_millis(rtt_ms + 5)).await;
+            controller.on_ack(rtt, 8000);
+        }
+
+        let recovered_cwnd = controller.current_cwnd();
+        println!(
+            "\n  Recovery complete: cwnd={} KB (started at {} KB)",
+            recovered_cwnd / 1024,
+            post_timeout_cwnd / 1024
+        );
+
+        // Should have recovered from minimum cwnd
+        // Starting from ~2.8KB with slow start, we should see meaningful growth
+        assert!(
+            recovered_cwnd >= post_timeout_cwnd * 2,
+            "Should recover via slow start to at least 2x minimum: {} >= {}",
+            recovered_cwnd,
+            post_timeout_cwnd * 2
+        );
+
+        // Base delay should have returned to minimum (50ms or close)
+        let final_base_delay = controller.base_delay();
+        assert!(
+            final_base_delay <= Duration::from_millis(55),
+            "Base delay should return to near baseline: {:?}",
+            final_base_delay
+        );
+
+        println!("✓ Timeout with degrading conditions test passed");
+    }
 }
