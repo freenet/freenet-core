@@ -22,6 +22,7 @@ use crate::{
 use super::{Builder, RunnerConfig};
 
 impl<ER> Builder<ER> {
+    #[allow(dead_code)]
     pub async fn run_node<UsrEv>(
         self,
         user_events: UsrEv,

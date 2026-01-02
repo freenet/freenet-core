@@ -805,9 +805,14 @@ pub(super) mod in_memory {
         ) -> Self {
             SimulationContractHandler {
                 channel,
-                runtime: Executor::new_mock_in_memory(identifier, shared_storage, op_sender, op_manager)
-                    .await
-                    .expect("should start mock in-memory executor"),
+                runtime: Executor::new_mock_in_memory(
+                    identifier,
+                    shared_storage,
+                    op_sender,
+                    op_manager,
+                )
+                .await
+                .expect("should start mock in-memory executor"),
             }
         }
     }

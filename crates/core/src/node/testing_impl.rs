@@ -109,7 +109,8 @@ impl<'a> From<&'a str> for NodeLabel {
 }
 
 #[derive(Clone)]
-struct GatewayConfig {
+pub(crate) struct GatewayConfig {
+    #[allow(dead_code)]
     label: NodeLabel,
     peer_key_location: PeerKeyLocation,
     location: Location,
@@ -332,11 +333,13 @@ pub struct RunningNode {
 pub struct RestartableNodeConfig {
     /// The node's configuration (contains keypair, location, data dir, etc.)
     pub config: NodeConfig,
-    /// The node label
+    /// The node label (reserved for future use in restart scenarios)
+    #[allow(dead_code)]
     pub label: NodeLabel,
     /// Whether this is a gateway node
     pub is_gateway: bool,
     /// Gateway addresses to connect to (for non-gateway nodes)
+    #[allow(dead_code)]
     pub gateway_configs: Vec<GatewayConfig>,
     /// Seed for deterministic RNG in this node's transport layer
     pub rng_seed: u64,
@@ -443,8 +446,8 @@ impl SimNetwork {
     fn init_default_fault_injection(&mut self) {
         use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
-        let state =
-            FaultInjectorState::new(FaultConfig::default(), fault_seed).with_virtual_time(self.virtual_time.clone());
+        let state = FaultInjectorState::new(FaultConfig::default(), fault_seed)
+            .with_virtual_time(self.virtual_time.clone());
         set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
     }
 
@@ -523,8 +526,8 @@ impl SimNetwork {
         // Use a derived seed for fault injection to maintain determinism
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         // Always use VirtualTime for deterministic behavior
-        let state =
-            FaultInjectorState::new(config, fault_seed).with_virtual_time(self.virtual_time.clone());
+        let state = FaultInjectorState::new(config, fault_seed)
+            .with_virtual_time(self.virtual_time.clone());
         set_fault_injector(Some(std::sync::Arc::new(std::sync::Mutex::new(state))));
     }
 
@@ -544,7 +547,11 @@ impl SimNetwork {
         since = "0.1.0",
         note = "VirtualTime is now always enabled. Use with_fault_injection() and virtual_time() instead."
     )]
-    pub fn with_fault_injection_virtual_time(&mut self, config: FaultConfig, virtual_time: VirtualTime) {
+    pub fn with_fault_injection_virtual_time(
+        &mut self,
+        config: FaultConfig,
+        virtual_time: VirtualTime,
+    ) {
         use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         let state = FaultInjectorState::new(config, fault_seed).with_virtual_time(virtual_time);
@@ -647,7 +654,10 @@ impl SimNetwork {
             tracing::info!(?label, "Node task aborted");
             true
         } else {
-            tracing::warn!(?label, "Node not found in running_nodes (may not be started yet)");
+            tracing::warn!(
+                ?label,
+                "Node not found in running_nodes (may not be started yet)"
+            );
             false
         }
     }
@@ -673,7 +683,11 @@ impl SimNetwork {
         if let Some(injector) = get_fault_injector() {
             let mut state = injector.lock().unwrap();
             state.config.recover_node(addr);
-            tracing::info!(?label, ?addr, "Node recovered (no longer marked as crashed)");
+            tracing::info!(
+                ?label,
+                ?addr,
+                "Node recovered (no longer marked as crashed)"
+            );
             true
         } else {
             false
@@ -763,8 +777,8 @@ impl SimNetwork {
     where
         R: crate::client_events::test::RandomEventGenerator + Send + 'static,
     {
-        use crate::node::network_bridge::in_memory::unregister_peer;
         use crate::node::network_bridge::get_fault_injector;
+        use crate::node::network_bridge::in_memory::unregister_peer;
 
         // Get the saved restartable config
         let restart_config = match self.restartable_configs.get(label) {
@@ -840,16 +854,21 @@ impl SimNetwork {
         // Start the node task with shared storage for state persistence
         let shared_storage = restart_config.shared_storage.clone();
         let node_task = async move {
-            builder.run_node_with_shared_storage(user_events, span, shared_storage).await
+            builder
+                .run_node_with_shared_storage(user_events, span, shared_storage)
+                .await
         };
         let handle = GlobalExecutor::spawn(node_task);
 
         // Track the new running node
-        self.running_nodes.insert(label.clone(), RunningNode {
-            label: label.clone(),
-            addr: node_addr,
-            abort_handle: handle.abort_handle(),
-        });
+        self.running_nodes.insert(
+            label.clone(),
+            RunningNode {
+                label: label.clone(),
+                addr: node_addr,
+                abort_handle: handle.abort_handle(),
+            },
+        );
 
         tracing::info!(?label, "Node restarted successfully with persisted state");
         Some(handle)
@@ -1046,7 +1065,10 @@ impl SimNetwork {
             let label = config.label.clone();
             // Use the peer_key_location address from GatewayConfig - this is the address
             // that will be registered in the peer registry
-            let gateway_addr = *config.peer_key_location.peer_addr.as_known()
+            let gateway_addr = *config
+                .peer_key_location
+                .peer_addr
+                .as_known()
                 .expect("Gateway should have known address");
             gateway_addrs.push(gateway_addr);
 
@@ -1056,14 +1078,17 @@ impl SimNetwork {
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
 
             // Save restartable config BEFORE starting (NodeConfig gets consumed)
-            self.restartable_configs.insert(label.clone(), RestartableNodeConfig {
-                config: node.config.clone(),
-                label: label.clone(),
-                is_gateway: true,
-                gateway_configs: self.all_gateway_configs.clone(),
-                rng_seed: node.rng_seed,
-                shared_storage: shared_storage.clone(),
-            });
+            self.restartable_configs.insert(
+                label.clone(),
+                RestartableNodeConfig {
+                    config: node.config.clone(),
+                    label: label.clone(),
+                    is_gateway: true,
+                    gateway_configs: self.all_gateway_configs.clone(),
+                    rng_seed: node.rng_seed,
+                    shared_storage: shared_storage.clone(),
+                },
+            );
 
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 self.receiver_ch.clone(),
@@ -1072,20 +1097,25 @@ impl SimNetwork {
             );
             user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
             let span = tracing::info_span!("in_mem_gateway", %label);
-            self.labels.push((label.clone(), node.config.key_pair.public().clone()));
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
 
             // Use shared in-memory storage for state persistence across restarts
             let node_task = async move {
-                node.run_node_with_shared_storage(user_events, span, shared_storage).await
+                node.run_node_with_shared_storage(user_events, span, shared_storage)
+                    .await
             };
             let handle = GlobalExecutor::spawn(node_task);
 
             // Track running node for crash/restart
-            self.running_nodes.insert(label.clone(), RunningNode {
-                label: label.clone(),
-                addr: gateway_addr,
-                abort_handle: handle.abort_handle(),
-            });
+            self.running_nodes.insert(
+                label.clone(),
+                RunningNode {
+                    label: label.clone(),
+                    addr: gateway_addr,
+                    abort_handle: handle.abort_handle(),
+                },
+            );
 
             peers.push(handle);
 
@@ -1121,7 +1151,10 @@ impl SimNetwork {
                 tracing::warn!(
                     "Timeout waiting for gateway registration, some may not be ready. \
                      Registered: {}/{}",
-                    gateway_addrs.iter().filter(|a| is_peer_registered(a)).count(),
+                    gateway_addrs
+                        .iter()
+                        .filter(|a| is_peer_registered(a))
+                        .count(),
                     gateway_addrs.len()
                 );
                 break 'wait_loop;
@@ -1134,7 +1167,10 @@ impl SimNetwork {
         let nodes: Vec<_> = self.nodes.drain(..).collect();
         for (node, label) in nodes {
             // Get node address from tracked addresses
-            let node_addr = self.node_addresses.get(&label).copied()
+            let node_addr = self
+                .node_addresses
+                .get(&label)
+                .copied()
                 .expect("Node address should be tracked");
 
             tracing::debug!(peer = %label, addr = %node_addr, "starting regular node");
@@ -1143,14 +1179,17 @@ impl SimNetwork {
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
 
             // Save restartable config BEFORE starting (NodeConfig gets consumed)
-            self.restartable_configs.insert(label.clone(), RestartableNodeConfig {
-                config: node.config.clone(),
-                label: label.clone(),
-                is_gateway: false,
-                gateway_configs: self.all_gateway_configs.clone(),
-                rng_seed: node.rng_seed,
-                shared_storage: shared_storage.clone(),
-            });
+            self.restartable_configs.insert(
+                label.clone(),
+                RestartableNodeConfig {
+                    config: node.config.clone(),
+                    label: label.clone(),
+                    is_gateway: false,
+                    gateway_configs: self.all_gateway_configs.clone(),
+                    rng_seed: node.rng_seed,
+                    shared_storage: shared_storage.clone(),
+                },
+            );
 
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 self.receiver_ch.clone(),
@@ -1159,20 +1198,25 @@ impl SimNetwork {
             );
             user_events.rng_params(label.number(), total_peer_num, max_contract_num, iterations);
             let span = tracing::info_span!("in_mem_node", %label);
-            self.labels.push((label.clone(), node.config.key_pair.public().clone()));
+            self.labels
+                .push((label.clone(), node.config.key_pair.public().clone()));
 
             // Use shared in-memory storage for state persistence across restarts
             let node_task = async move {
-                node.run_node_with_shared_storage(user_events, span, shared_storage).await
+                node.run_node_with_shared_storage(user_events, span, shared_storage)
+                    .await
             };
             let handle = GlobalExecutor::spawn(node_task);
 
             // Track running node for crash/restart
-            self.running_nodes.insert(label.clone(), RunningNode {
-                label: label.clone(),
-                addr: node_addr,
-                abort_handle: handle.abort_handle(),
-            });
+            self.running_nodes.insert(
+                label.clone(),
+                RunningNode {
+                    label: label.clone(),
+                    addr: node_addr,
+                    abort_handle: handle.abort_handle(),
+                },
+            );
 
             peers.push(handle);
 
@@ -1487,15 +1531,15 @@ impl SimNetwork {
             } else {
                 diverged.push(DivergedContract {
                     contract_key,
-                    peer_states: peer_states
-                        .into_iter()
-                        .map(|(addr, hash)| (addr, hash))
-                        .collect(),
+                    peer_states: peer_states.into_iter().collect(),
                 });
             }
         }
 
-        ConvergenceResult { converged, diverged }
+        ConvergenceResult {
+            converged,
+            diverged,
+        }
     }
 
     /// Waits for convergence of contract states, polling at regular intervals.
@@ -1629,9 +1673,7 @@ impl SimNetwork {
     ///     }
     /// }
     /// ```
-    pub async fn get_contract_state_hashes(
-        &self,
-    ) -> HashMap<String, HashMap<SocketAddr, String>> {
+    pub async fn get_contract_state_hashes(&self) -> HashMap<String, HashMap<SocketAddr, String>> {
         let summary = self.get_deterministic_event_summary().await;
 
         let mut contract_states: HashMap<String, HashMap<SocketAddr, String>> = HashMap::new();
@@ -1715,9 +1757,7 @@ impl SimNetwork {
                     use crate::tracing::SubscribeEvent;
                     match sub_event {
                         SubscribeEvent::Request { .. } => summary.subscribe.requested += 1,
-                        SubscribeEvent::SubscribeSuccess { .. } => {
-                            summary.subscribe.succeeded += 1
-                        }
+                        SubscribeEvent::SubscribeSuccess { .. } => summary.subscribe.succeeded += 1,
                         SubscribeEvent::SubscribeNotFound { .. } => summary.subscribe.failed += 1,
                         _ => {}
                     }

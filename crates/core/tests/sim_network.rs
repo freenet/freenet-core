@@ -171,14 +171,15 @@ async fn ci_quick_simulation() {
     let result = run_ci_simulation(
         "ci-quick-sim",
         SEED,
-        1,   // gateways
-        4,   // nodes (1 + 4 = 5 total - small for reliable CI)
-        20,  // events (contract operations)
-        3,   // max contracts
-        Duration::from_secs(45),  // connectivity timeout
-        Duration::from_secs(30),  // convergence timeout
-        0.80, // min success rate (80% to account for timing issues in CI)
-    ).await;
+        1,                       // gateways
+        4,                       // nodes (1 + 4 = 5 total - small for reliable CI)
+        20,                      // events (contract operations)
+        3,                       // max contracts
+        Duration::from_secs(45), // connectivity timeout
+        Duration::from_secs(30), // convergence timeout
+        0.80,                    // min success rate (80% to account for timing issues in CI)
+    )
+    .await;
 
     if let Err(failure) = result {
         // Print seed and failure details for reproduction
@@ -199,6 +200,7 @@ async fn ci_quick_simulation() {
 /// Runs a CI simulation with the given parameters and validates all assertions.
 ///
 /// Returns Ok(()) on success, Err(message) on any failure.
+#[allow(clippy::too_many_arguments)]
 async fn run_ci_simulation(
     name: &str,
     seed: u64,
@@ -213,18 +215,18 @@ async fn run_ci_simulation(
     let total_peers = gateways + nodes;
     tracing::info!(
         "Creating {} network: {} gateways + {} nodes = {} total",
-        name, gateways, nodes, total_peers
+        name,
+        gateways,
+        nodes,
+        total_peers
     );
 
     // Create network with deterministic seed
     let mut sim = SimNetwork::new(
-        name,
-        gateways,
-        nodes,
-        10,  // ring_max_htl - higher for reliable routing
-        7,   // rnd_if_htl_above
-        15,  // max_connections - allow more connections for reliability
-        2,   // min_connections
+        name, gateways, nodes, 10, // ring_max_htl - higher for reliable routing
+        7,  // rnd_if_htl_above
+        15, // max_connections - allow more connections for reliability
+        2,  // min_connections
         seed,
     )
     .await;
@@ -259,22 +261,31 @@ async fn run_ci_simulation(
     let operation_timeout = Duration::from_secs(20);
     let poll_interval = Duration::from_millis(500);
 
-    match sim.await_operation_completion(operation_timeout, poll_interval).await {
+    match sim
+        .await_operation_completion(operation_timeout, poll_interval)
+        .await
+    {
         Ok(summary) => {
             tracing::info!(
                 "Operations completed: put={}/{}, get={}/{}, subscribe={}/{}",
-                summary.put.completed(), summary.put.requested,
-                summary.get.completed(), summary.get.requested,
-                summary.subscribe.completed(), summary.subscribe.requested
+                summary.put.completed(),
+                summary.put.requested,
+                summary.get.completed(),
+                summary.get.requested,
+                summary.subscribe.completed(),
+                summary.subscribe.requested
             );
         }
         Err(summary) => {
             // Log but continue - some operations may time out but we still check success rate
             tracing::warn!(
                 "Some operations pending: put={}/{}, get={}/{}, subscribe={}/{}",
-                summary.put.completed(), summary.put.requested,
-                summary.get.completed(), summary.get.requested,
-                summary.subscribe.completed(), summary.subscribe.requested
+                summary.put.completed(),
+                summary.put.requested,
+                summary.get.completed(),
+                summary.get.requested,
+                summary.subscribe.completed(),
+                summary.subscribe.requested
             );
         }
     }
@@ -297,9 +308,15 @@ async fn run_ci_simulation(
              Put: {}/{} ({:.1}%), Get: {}/{} ({:.1}%), Subscribe: {}/{} ({:.1}%)",
             success_rate * 100.0,
             min_success_rate * 100.0,
-            summary.put.succeeded, summary.put.completed(), summary.put.success_rate() * 100.0,
-            summary.get.succeeded, summary.get.completed(), summary.get.success_rate() * 100.0,
-            summary.subscribe.succeeded, summary.subscribe.completed(), summary.subscribe.success_rate() * 100.0,
+            summary.put.succeeded,
+            summary.put.completed(),
+            summary.put.success_rate() * 100.0,
+            summary.get.succeeded,
+            summary.get.completed(),
+            summary.get.success_rate() * 100.0,
+            summary.subscribe.succeeded,
+            summary.subscribe.completed(),
+            summary.subscribe.success_rate() * 100.0,
         ));
     }
 
@@ -308,7 +325,10 @@ async fn run_ci_simulation(
     // Step 4: Check convergence (eventual consistency)
     tracing::info!("Checking convergence...");
 
-    match sim.await_convergence(convergence_timeout, Duration::from_millis(500), 1).await {
+    match sim
+        .await_convergence(convergence_timeout, Duration::from_millis(500), 1)
+        .await
+    {
         Ok(result) => {
             tracing::info!(
                 "Convergence check PASSED: {} contracts converged, {} diverged",
@@ -321,7 +341,8 @@ async fn run_ci_simulation(
             for diverged in &result.diverged {
                 tracing::warn!(
                     "Contract {} has {} different states across peers",
-                    diverged.contract_key, diverged.peer_states.len()
+                    diverged.contract_key,
+                    diverged.peer_states.len()
                 );
             }
 
@@ -374,14 +395,15 @@ async fn extended_simulation() {
     let result = run_ci_simulation(
         "extended-sim",
         SEED,
-        2,    // gateways
-        18,   // nodes (2 + 18 = 20 total)
-        200,  // events
-        10,   // max contracts
-        Duration::from_secs(60),  // connectivity timeout
-        Duration::from_secs(60),  // convergence timeout
-        0.90, // min success rate
-    ).await;
+        2,                       // gateways
+        18,                      // nodes (2 + 18 = 20 total)
+        200,                     // events
+        10,                      // max contracts
+        Duration::from_secs(60), // connectivity timeout
+        Duration::from_secs(60), // convergence timeout
+        0.90,                    // min success rate
+    )
+    .await;
 
     if let Err(failure) = result {
         eprintln!("\n============================================================");

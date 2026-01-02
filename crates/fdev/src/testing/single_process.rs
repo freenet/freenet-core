@@ -27,7 +27,8 @@ pub(super) async fn run(config: &super::TestConfig) -> anyhow::Result<(), super:
         connectivity_timeout.as_millis(),
         network_connection_percent * 100.0
     );
-    simulated_network.check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
+    simulated_network
+        .check_partial_connectivity(connectivity_timeout, network_connection_percent)?;
 
     // event_chain now borrows &mut self, so we can still access simulated_network after
     let mut stream = simulated_network.event_chain(events, None);
@@ -179,7 +180,7 @@ async fn run_verification(
                 min_rate * 100.0
             );
             tracing::error!("{}", msg);
-            return Err(anyhow::anyhow!(msg).into());
+            return Err(anyhow::anyhow!(msg));
         }
         tracing::info!(
             "Success rate check passed: {:.1}% >= {:.1}%",
@@ -221,7 +222,7 @@ async fn run_verification(
                     );
                 }
 
-                return Err(anyhow::anyhow!(msg).into());
+                return Err(anyhow::anyhow!(msg));
             }
         }
     }

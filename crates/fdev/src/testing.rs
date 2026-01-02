@@ -148,9 +148,8 @@ impl TestConfig {
         // Handle latency range
         match (self.latency_min, self.latency_max) {
             (Some(min), Some(max)) => {
-                builder = builder.latency_range(
-                    Duration::from_millis(min)..Duration::from_millis(max),
-                );
+                builder =
+                    builder.latency_range(Duration::from_millis(min)..Duration::from_millis(max));
             }
             (Some(min), None) => {
                 // Fixed latency if only min specified
@@ -165,7 +164,6 @@ impl TestConfig {
 
         Some(builder.build())
     }
-
 }
 
 fn randomize_test_name() -> String {

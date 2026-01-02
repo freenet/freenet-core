@@ -655,14 +655,16 @@ mod tests {
 
     #[test]
     fn test_network_stats_calculations() {
-        let mut stats = NetworkStats::default();
-        stats.messages_sent = 100;
-        stats.messages_delivered = 80;
-        stats.messages_dropped_loss = 10;
-        stats.messages_dropped_partition = 5;
-        stats.messages_dropped_crash = 5;
-        stats.messages_delayed_delivered = 20;
-        stats.total_latency_nanos = 200_000_000; // 200ms total
+        let stats = NetworkStats {
+            messages_sent: 100,
+            messages_delivered: 80,
+            messages_dropped_loss: 10,
+            messages_dropped_partition: 5,
+            messages_dropped_crash: 5,
+            messages_queued: 0,
+            messages_delayed_delivered: 20,
+            total_latency_nanos: 200_000_000, // 200ms total
+        };
 
         assert_eq!(stats.total_dropped(), 20);
         assert!((stats.loss_ratio() - 0.2).abs() < 0.001);

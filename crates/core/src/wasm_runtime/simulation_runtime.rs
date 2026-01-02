@@ -31,11 +31,13 @@ use super::mock_state_storage::MockStateStorage;
 /// Unlike `ContractStore` which persists WASM files to disk, this stores
 /// everything in memory using HashMaps. The Arc wrapper allows sharing
 /// across node restarts.
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub struct InMemoryContractStore {
     inner: Arc<Mutex<InMemoryContractStoreInner>>,
 }
 
+#[allow(dead_code)]
 #[derive(Default)]
 struct InMemoryContractStoreInner {
     /// Map from code hash to contract code
@@ -44,6 +46,7 @@ struct InMemoryContractStoreInner {
     instance_to_code: HashMap<ContractInstanceId, (CodeHash, Parameters<'static>)>,
 }
 
+#[allow(dead_code)]
 impl InMemoryContractStore {
     pub fn new() -> Self {
         Self::default()
@@ -87,7 +90,9 @@ impl InMemoryContractStore {
         inner.code_by_hash.insert(code_hash, Arc::new(code));
 
         // Map instance ID to code hash and params
-        inner.instance_to_code.insert(*key.id(), (code_hash, params));
+        inner
+            .instance_to_code
+            .insert(*key.id(), (code_hash, params));
 
         Ok(())
     }
@@ -122,6 +127,7 @@ impl InMemoryContractStore {
 ///
 /// This is designed to be cloned and shared across node restarts.
 /// All internal storage uses Arc, so clones share the same data.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct SimulationStores {
     /// In-memory contract code storage
@@ -136,6 +142,7 @@ impl Default for SimulationStores {
     }
 }
 
+#[allow(dead_code)]
 impl SimulationStores {
     /// Create a new set of empty simulation stores.
     pub fn new() -> Self {
@@ -156,6 +163,7 @@ impl SimulationStores {
 }
 
 /// Summary of simulation stores state (for debugging).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SimulationStoresSummary {
     pub contract_count: usize,
@@ -182,7 +190,7 @@ mod tests {
 
         // Should be fetchable
         let key = contract.key();
-        let fetched = store.fetch_contract(&key, &params);
+        let fetched = store.fetch_contract(key, &params);
         assert!(fetched.is_some());
 
         assert_eq!(store.contract_count(), 1);
@@ -205,7 +213,7 @@ mod tests {
 
         // Should be visible in the clone
         let key = contract.key();
-        let fetched = store2.fetch_contract(&key, &params);
+        let fetched = store2.fetch_contract(key, &params);
         assert!(fetched.is_some(), "Cloned store should see the same data");
     }
 
@@ -224,6 +232,9 @@ mod tests {
         let stores2 = stores1.clone();
 
         // Data should be shared
-        assert_eq!(stores1.contract_store.contract_count(), stores2.contract_store.contract_count());
+        assert_eq!(
+            stores1.contract_store.contract_count(),
+            stores2.contract_store.contract_count()
+        );
     }
 }
