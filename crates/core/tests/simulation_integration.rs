@@ -963,10 +963,10 @@ async fn test_node_crash_recovery() {
     let all_addrs = sim.all_node_addresses();
     assert!(!all_addrs.is_empty(), "Should have tracked node addresses");
 
-    // Find a non-gateway node (one that starts with "node-")
+    // Find a non-gateway node (one that contains "-node-")
     let node_to_crash = all_addrs
         .keys()
-        .find(|label| format!("{}", label).starts_with("node-"))
+        .find(|label| label.is_node())
         .cloned()
         .expect("Should have at least one regular node");
 
@@ -1110,7 +1110,7 @@ async fn test_node_restart() {
     // Find a non-gateway node to restart
     let node_to_restart = all_addrs
         .keys()
-        .find(|label| format!("{}", label).starts_with("node-"))
+        .find(|label| label.is_node())
         .cloned()
         .expect("Should have at least one regular node");
 
