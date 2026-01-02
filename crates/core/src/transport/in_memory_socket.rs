@@ -319,6 +319,15 @@ pub struct InMemorySocket {
     notify: Arc<tokio::sync::Notify>,
 }
 
+impl std::fmt::Debug for InMemorySocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemorySocket")
+            .field("network_name", &self.network_name)
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Socket for InMemorySocket {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
         let network_name = get_address_network(&addr).ok_or_else(|| {
