@@ -3605,7 +3605,10 @@ async fn test_subscription_tree_pruning(ctx: &mut TestContext) -> TestResult {
     }
 
     tracing::info!("Step 4: Disconnecting peer-a (triggers pruning)");
-    drop(client_a);
+    // Use explicit disconnect instead of drop() to avoid race condition.
+    // The WebApi::drop() spawns an async task which may not complete before
+    // the request_handler exits due to response channel closure.
+    client_a.disconnect("test cleanup").await;
 
     tracing::info!("Step 4.5: Verifying peer-a removed from gateway's subscribers");
 
@@ -3869,7 +3872,7 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
 
     // Step 5: Disconnect first client - peer-a should STILL be in subscribers
     tracing::info!("Step 5: Disconnecting first client (pruning should NOT occur)");
-    drop(client_a1);
+    client_a1.disconnect("test cleanup").await;
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -3906,7 +3909,7 @@ async fn test_multiple_clients_prevent_premature_pruning(ctx: &mut TestContext) 
 
     // Step 6: Disconnect second client - peer-a should be REMOVED
     tracing::info!("Step 6: Disconnecting second client (pruning SHOULD occur)");
-    drop(client_a2);
+    client_a2.disconnect("test cleanup").await;
 
     // Use retry loop since unsubscribe propagation may take time in CI
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -4186,7 +4189,8 @@ async fn test_subscription_pruning_sends_unsubscribed(ctx: &mut TestContext) -> 
     tracing::info!("Step 5: Disconnecting Peer-A's client - this should trigger pruning");
     tracing::info!("  Expected: Peer-A sends Unsubscribed to Gateway");
 
-    drop(client_a);
+    // Use explicit disconnect instead of drop() to avoid race condition.
+    client_a.disconnect("test cleanup").await;
 
     // Wait for disconnect to be processed and Unsubscribed to be sent/received
     tokio::time::sleep(Duration::from_secs(10)).await;

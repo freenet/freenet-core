@@ -1457,7 +1457,6 @@ async fn handle_aborted_op(
         TransactionType::Connect => {
             // attempt to establish a connection failed, this could be a fatal error since the node
             // is useless without connecting to the network, we will retry with exponential backoff
-            // if necessary
             match op_manager.pop(&tx) {
                 Ok(Some(OpEnum::Connect(op)))
                     if op_manager.ring.open_connections()
@@ -1465,7 +1464,25 @@ async fn handle_aborted_op(
                 {
                     let gateway = op.gateway().cloned();
                     if let Some(gateway) = gateway {
-                        tracing::warn!("Retry connecting to gateway {}", gateway);
+                        // Record failure and apply backoff if we know the address
+                        if let Some(peer_addr) = gateway.peer_addr.as_known() {
+                            let backoff_duration = {
+                                let mut backoff = op_manager.gateway_backoff.lock();
+                                backoff.record_failure(*peer_addr);
+                                backoff.remaining_backoff(*peer_addr)
+                            };
+
+                            if let Some(duration) = backoff_duration {
+                                tracing::info!(
+                                    gateway = %gateway,
+                                    backoff_secs = duration.as_secs(),
+                                    "Gateway connection failed, waiting before retry"
+                                );
+                                tokio::time::sleep(duration).await;
+                            }
+                        }
+
+                        tracing::debug!("Retrying connection to gateway {}", gateway);
                         connect::join_ring_request(&gateway, op_manager).await?;
                     }
                 }
