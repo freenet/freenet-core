@@ -658,7 +658,6 @@ async fn test_fault_injection_bridge() {
 async fn test_partition_injection_bridge() {
     use freenet::simulation::{FaultConfig, Partition};
     use std::collections::HashSet;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     const SEED: u64 = 0xDA27_1710;
 
@@ -688,13 +687,26 @@ async fn test_partition_injection_bridge() {
 
     tracing::info!("Pre-partition: {} events", pre_total);
 
-    // Create a partition - this is a demonstration of the API
-    // In practice, you'd use actual peer addresses from the network
-    let mut side_a = HashSet::new();
-    side_a.insert(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50000));
+    // Get actual node addresses from the simulation
+    let all_addrs = sim.all_node_addresses();
+    assert!(
+        all_addrs.len() >= 2,
+        "Need at least 2 nodes for partition test"
+    );
 
-    let mut side_b = HashSet::new();
-    side_b.insert(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50001));
+    // Create a partition using real addresses from the simulation
+    // Put half the nodes on each side
+    let addrs: Vec<_> = all_addrs.values().copied().collect();
+    let mid = addrs.len() / 2;
+
+    let side_a: HashSet<_> = addrs[..mid].iter().copied().collect();
+    let side_b: HashSet<_> = addrs[mid..].iter().copied().collect();
+
+    tracing::info!(
+        "Creating partition: side_a={:?}, side_b={:?}",
+        side_a,
+        side_b
+    );
 
     let partition = Partition::new(side_a, side_b).permanent(0);
 
@@ -1169,4 +1181,154 @@ async fn test_node_restart() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     tracing::info!("Node restart test completed successfully");
+}
+
+/// Tests edge cases for crash/restart operations.
+///
+/// This verifies:
+/// 1. Crashing a non-existent node returns false
+/// 2. Recovering a non-existent node returns false
+/// 3. is_node_crashed returns false for unknown nodes
+/// 4. can_restart returns false for unknown nodes
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_crash_restart_edge_cases() {
+    use freenet::dev_tool::{NodeLabel, SimNetwork};
+
+    const SEED: u64 = 0xED6E_CA5E;
+
+    let mut sim = SimNetwork::new(
+        "crash-edge-cases",
+        1,  // gateways
+        2,  // nodes
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        10, // max_connections
+        2,  // min_connections
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Start the network
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+        .await;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Test with a non-existent node label (using valid format but unknown network)
+    let fake_label: NodeLabel = "node-999".into();
+
+    // Crashing non-existent node should return false
+    assert!(
+        !sim.crash_node(&fake_label),
+        "crash_node should return false for non-existent node"
+    );
+
+    // Recovering non-existent node should return false
+    assert!(
+        !sim.recover_node(&fake_label),
+        "recover_node should return false for non-existent node"
+    );
+
+    // is_node_crashed should return false for unknown nodes
+    assert!(
+        !sim.is_node_crashed(&fake_label),
+        "is_node_crashed should return false for unknown node"
+    );
+
+    // can_restart should return false for unknown nodes
+    assert!(
+        !sim.can_restart(&fake_label),
+        "can_restart should return false for unknown node"
+    );
+
+    // node_address should return None for unknown nodes
+    assert!(
+        sim.node_address(&fake_label).is_none(),
+        "node_address should return None for unknown node"
+    );
+
+    tracing::info!("Edge case tests completed successfully");
+}
+
+/// Tests that creating a network with zero nodes panics.
+#[test_log::test(tokio::test)]
+#[should_panic(expected = "assertion failed")]
+async fn test_zero_nodes_panics() {
+    use freenet::dev_tool::SimNetwork;
+
+    // This should panic because nodes must be > 0
+    let _sim = SimNetwork::new(
+        "zero-nodes-test",
+        1, // gateways
+        0, // nodes - invalid!
+        7,
+        3,
+        10,
+        2,
+        0xDEAD,
+    )
+    .await;
+}
+
+/// Tests that creating a network with zero gateways panics.
+#[test_log::test(tokio::test)]
+#[should_panic(expected = "should have at least one gateway")]
+async fn test_zero_gateways_panics() {
+    use freenet::dev_tool::SimNetwork;
+
+    // This should panic because gateways must be > 0
+    let _sim = SimNetwork::new(
+        "zero-gateways-test",
+        0, // gateways - invalid!
+        2, // nodes
+        7,
+        3,
+        10,
+        2,
+        0xDEAD,
+    )
+    .await;
+}
+
+/// Tests that a minimal network with 1 gateway and 1 node works.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_minimal_network() {
+    use freenet::dev_tool::SimNetwork;
+
+    const SEED: u64 = 0x0101_0401;
+
+    // Create minimal network: 1 gateway, 1 node
+    let mut sim = SimNetwork::new(
+        "minimal-test",
+        1, // 1 gateway
+        1, // 1 node
+        7,
+        3,
+        10,
+        2,
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Start the network
+    let handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+        .await;
+
+    // Should have 2 nodes (1 gateway + 1 regular node)
+    assert_eq!(handles.len(), 2, "Should have exactly 2 nodes");
+
+    // Let network stabilize
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Verify node addresses are tracked
+    let all_addrs = sim.all_node_addresses();
+    assert_eq!(all_addrs.len(), 2, "Should track 2 node addresses");
+
+    tracing::info!("Minimal network test passed");
 }
