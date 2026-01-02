@@ -810,6 +810,35 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create an Update broadcast applied event.
+    ///
+    /// This captures the state after applying a broadcast update locally,
+    /// enabling state convergence monitoring across the network.
+    pub fn update_broadcast_applied(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        state_before: &WrappedState,
+        state_after: &WrappedState,
+        changed: bool,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastApplied {
+                id: *tx,
+                key,
+                target: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                state_hash_before: Some(state_hash_short(state_before)),
+                state_hash_after: Some(state_hash_short(state_after)),
+                changed,
+            }),
+        })
+    }
+
     /// Create a peer startup event.
     ///
     /// This should be called once when the node starts and is ready to participate in the network.
@@ -2739,6 +2768,23 @@ enum UpdateEvent {
         /// Short hash of the received state (first 4 bytes of Blake3, 8 hex chars).
         state_hash: Option<String>,
     },
+    /// Emitted after a broadcast update has been applied locally.
+    /// This captures the resulting state after the delta/merge operation,
+    /// enabling state convergence monitoring across the network.
+    BroadcastApplied {
+        id: Transaction,
+        /// key of the contract which value was updated
+        key: ContractKey,
+        /// this peer (where the update was applied)
+        target: PeerKeyLocation,
+        timestamp: u64,
+        /// Short hash of the incoming broadcast state (before merge).
+        state_hash_before: Option<String>,
+        /// Short hash of the resulting state (after merge).
+        state_hash_after: Option<String>,
+        /// Whether the local state actually changed after applying the update.
+        changed: bool,
+    },
 }
 
 impl UpdateEvent {
@@ -2748,14 +2794,18 @@ impl UpdateEvent {
             UpdateEvent::Request { key, .. }
             | UpdateEvent::UpdateSuccess { key, .. }
             | UpdateEvent::BroadcastEmitted { key, .. }
-            | UpdateEvent::BroadcastReceived { key, .. } => *key,
+            | UpdateEvent::BroadcastReceived { key, .. }
+            | UpdateEvent::BroadcastApplied { key, .. } => *key,
         }
     }
 
-    /// Returns the state hash if available (uses state_hash_after for success events).
+    /// Returns the state hash if available (uses state_hash_after for success/applied events).
     fn state_hash(&self) -> Option<&str> {
         match self {
             UpdateEvent::UpdateSuccess {
+                state_hash_after, ..
+            }
+            | UpdateEvent::BroadcastApplied {
                 state_hash_after, ..
             } => state_hash_after.as_deref(),
             UpdateEvent::BroadcastEmitted { state_hash, .. }
